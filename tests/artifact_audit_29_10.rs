@@ -22,13 +22,8 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 }
 
 fn find_compiler() -> PathBuf {
-    for candidate in ["target/debug/armfortas", "target/release/armfortas"] {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return path;
-        }
-    }
-    panic!("cannot find armfortas binary — run `cargo build` first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn compile_binary(compiler: &Path, source: &Path, opt_flag: &str, output: &Path) {

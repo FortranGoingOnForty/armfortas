@@ -20,16 +20,8 @@ use std::process::Command;
 const FORTSH_COMPILED_FLOOR: usize = 14;
 
 fn find_compiler() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
-        return PathBuf::from(path);
-    }
-    for c in &["target/debug/armfortas", "target/release/armfortas"] {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap();
-        }
-    }
-    panic!("armfortas binary not found");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn find_fortsh() -> Option<PathBuf> {

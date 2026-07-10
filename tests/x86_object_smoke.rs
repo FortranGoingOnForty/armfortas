@@ -21,13 +21,8 @@ const PROGRAMS: &[&str] = &[
 ];
 
 fn compiler() -> PathBuf {
-    for dir in ["target/debug", "../target/debug"] {
-        let p = Path::new(dir).join("armfortas");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("armfortas binary not built — run cargo build first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn programs_dir() -> PathBuf {

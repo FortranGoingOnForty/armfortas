@@ -11,10 +11,9 @@
 //! `clang` is absent.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -44,69 +43,13 @@ fn clang_available() -> bool {
 }
 
 fn find_compiler() -> PathBuf {
-    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
-        return PathBuf::from(p);
-    }
-    for c in &["target/release/armfortas", "target/debug/armfortas"] {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap();
-        }
-    }
-    panic!("armfortas binary not found — build it first");
-}
-
-fn newest_mtime(path: &Path) -> Option<SystemTime> {
-    let meta = fs::metadata(path).ok()?;
-    let mut newest = meta.modified().ok()?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(path).ok()? {
-            let entry = entry.ok()?;
-            if let Some(child) = newest_mtime(&entry.path()) {
-                if child > newest {
-                    newest = child;
-                }
-            }
-        }
-    }
-    Some(newest)
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn find_runtime_lib() -> PathBuf {
-    let root = PathBuf::from(".");
-    // Rebuild the runtime archive if the sources are newer.
-    let runtime_dir = root.join("runtime");
-    if runtime_dir.join("Cargo.toml").exists() {
-        let debug_archive = root.join("target/debug/libarmfortas_rt.a");
-        let archive_mtime = fs::metadata(&debug_archive)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let stale = match (newest_mtime(&runtime_dir), archive_mtime) {
-            (Some(src), Some(arc)) => src > arc,
-            _ => !debug_archive.exists(),
-        };
-        if stale {
-            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-            let out = Command::new(cargo)
-                .args(["build", "-p", "armfortas-rt"])
-                .output()
-                .expect("cannot rebuild libarmfortas_rt.a");
-            assert!(
-                out.status.success(),
-                "cannot rebuild libarmfortas_rt.a:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
-    for candidate in [
-        root.join("target/debug/libarmfortas_rt.a"),
-        root.join("target/release/libarmfortas_rt.a"),
-    ] {
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    panic!("cannot find libarmfortas_rt.a — build with `cargo build -p armfortas-rt` first");
+    armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile")
 }
 
 fn run(cmd: &mut Command, what: &str) {

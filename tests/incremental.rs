@@ -24,13 +24,8 @@ fn unique_dir() -> PathBuf {
 }
 
 fn find_compiler() -> PathBuf {
-    for c in &["target/release/armfortas", "target/debug/armfortas"] {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap();
-        }
-    }
-    panic!("armfortas binary not found");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn compile(compiler: &Path, source: &Path, obj: &Path, search: &Path) {

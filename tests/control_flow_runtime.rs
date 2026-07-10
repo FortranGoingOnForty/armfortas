@@ -7,22 +7,8 @@ use std::time::{Duration, Instant};
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn compiler(name: &str) -> PathBuf {
-    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{}", name)) {
-        return PathBuf::from(path);
-    }
-    let candidate = PathBuf::from("target/debug").join(name);
-    if candidate.exists() {
-        return std::fs::canonicalize(candidate).expect("cannot canonicalize debug compiler path");
-    }
-    let candidate = PathBuf::from("target/release").join(name);
-    if candidate.exists() {
-        return std::fs::canonicalize(candidate)
-            .expect("cannot canonicalize release compiler path");
-    }
-    panic!(
-        "compiler binary '{}' not built — run `cargo build --bins` first",
-        name
-    );
+    armfortas::testing::built_binary(name)
+        .unwrap_or_else(|| panic!("compiler binary '{name}' not built for this test profile"))
 }
 
 fn unique_path(stem: &str, ext: &str) -> PathBuf {

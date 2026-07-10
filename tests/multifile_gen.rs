@@ -20,30 +20,13 @@ fn unique_dir(prefix: &str) -> PathBuf {
 }
 
 fn find_compiler() -> PathBuf {
-    // CARGO_BIN_EXE points at the binary built for THIS test profile;
-    // the path probes below can hit a stale binary from the other
-    // profile (a release armfortas predating module-global emission
-    // failed every multifile test while the debug build was fine).
-    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
-        return PathBuf::from(p);
-    }
-    for c in &["target/release/armfortas", "target/debug/armfortas"] {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap();
-        }
-    }
-    panic!("armfortas binary not found");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn find_runtime() -> PathBuf {
-    for dir in &["target/release", "target/debug"] {
-        let p = PathBuf::from(dir).join("libarmfortas_rt.a");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("libarmfortas_rt.a not found");
+    armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile")
 }
 
 fn compile_file(compiler: &Path, source: &Path, output: &Path, search_dir: &Path, opt: &str) {

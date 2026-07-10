@@ -10,40 +10,17 @@
 //! hosts (the CI jobs install it), and a counted skip elsewhere only
 //! if genuinely absent.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn compiler() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_armfortas") {
-        return PathBuf::from(path);
-    }
-    for dir in [
-        "target/debug",
-        "../target/debug",
-        "target/release",
-        "../target/release",
-    ] {
-        let p = Path::new(dir).join("armfortas");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("armfortas binary not built — run cargo build first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn runtime_lib() -> PathBuf {
-    for dir in [
-        "target/debug",
-        "../target/debug",
-        "target/release",
-        "../target/release",
-    ] {
-        let p = Path::new(dir).join("libarmfortas_rt.a");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("libarmfortas_rt.a not found — run cargo build first");
+    armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile")
 }
 
 /// Per-host C compiler: clang everywhere we support (cc is clang on

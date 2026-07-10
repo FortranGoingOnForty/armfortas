@@ -15,22 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn compiler(name: &str) -> PathBuf {
-    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{}", name)) {
-        return PathBuf::from(path);
-    }
-    let candidate = PathBuf::from("target/debug").join(name);
-    if candidate.exists() {
-        return std::fs::canonicalize(candidate).expect("cannot canonicalize debug compiler path");
-    }
-    let candidate = PathBuf::from("target/release").join(name);
-    if candidate.exists() {
-        return std::fs::canonicalize(candidate)
-            .expect("cannot canonicalize release compiler path");
-    }
-    panic!(
-        "compiler binary '{}' not built — run `cargo build --bins` first",
-        name
-    );
+    armfortas::testing::built_binary(name)
+        .unwrap_or_else(|| panic!("compiler binary '{name}' not built for this test profile"))
 }
 
 fn unique_path(stem: &str, ext: &str) -> PathBuf {
@@ -26204,13 +26190,8 @@ fn afs_runtime_path_env_overrides_runtime_discovery() {
     // Point $AFS_RUNTIME_PATH at a directory that DOES contain the
     // real runtime and verify compilation still succeeds — exercises
     // the override branch end-to-end without hiding the real runtime.
-    let rt = PathBuf::from("target/release/libarmfortas_rt.a");
-    if !rt.exists() {
-        // Skip silently when running off a tree that only has a
-        // debug runtime — CI has both; a contributor's fresh clone
-        // with only `cargo build` will hit release.
-        return;
-    }
+    let rt = armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile");
     let rt_dir = rt.parent().unwrap().to_path_buf();
     let src = write_program("program p\n  print *, 11\nend program\n", "f90");
     let out = unique_path("rtpath", "bin");

@@ -24,13 +24,8 @@ use armfortas::target::{Arch, ObjectFormat, TargetSpec};
 const OPT_LEVELS: &[&str] = &["-O0", "-O2", "-O3"];
 
 fn compiler() -> PathBuf {
-    for dir in ["target/debug", "../target/debug"] {
-        let p = Path::new(dir).join("armfortas");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("armfortas binary not built — run cargo build first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 fn programs_dir() -> PathBuf {
@@ -76,7 +71,9 @@ fn host_osabi() -> u8 {
 /// rewrite as afs-as tests/common/elf.rs.
 fn canonicalize_nop_fill(text: &[u8]) -> Vec<u8> {
     const NOPS: [&[u8]; 11] = [
-        &[0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[
+            0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
         &[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
         &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
         &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -169,12 +166,11 @@ fn compare(tag: &str, gas: &ObjectFile, ours: &ObjectFile) -> Option<String> {
                 None => return Some(format!("{}: section {} missing from ours", tag, name)),
                 Some(o) if o != g => {
                     if g.2 != o.2 {
-                        let first = g
-                            .2
-                            .iter()
-                            .zip(o.2.iter())
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(g.2.len().min(o.2.len()));
+                        let first =
+                            g.2.iter()
+                                .zip(o.2.iter())
+                                .position(|(a, b)| a != b)
+                                .unwrap_or(g.2.len().min(o.2.len()));
                         let lo = first.saturating_sub(8);
                         return Some(format!(
                             "{}: {} bytes diverge at {} (gas len {}, ours {})\n  gas:  {:02x?}\n  ours: {:02x?}",

@@ -12,34 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tool(names: &[&str]) -> Option<PathBuf> {
-    for dir in ["target/debug", "../target/debug"] {
-        for n in names {
-            let p = Path::new(dir).join(n);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    names
+        .iter()
+        .find_map(|name| armfortas::testing::built_binary(name))
 }
 
 fn runtime_lib() -> Option<PathBuf> {
-    // Prefer the profile this test was built in to avoid a stale
-    // cross-profile archive (the find_runtime lesson).
-    let order: &[&str] = if cfg!(debug_assertions) {
-        &["target/debug", "target/release"]
-    } else {
-        &["target/release", "target/debug"]
-    };
-    for dir in order {
-        for base in [".", ".."] {
-            let p = Path::new(base).join(dir).join("libarmfortas_rt.a");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    armfortas::testing::built_runtime_archive()
 }
 
 /// FreeBSD crt + static libc set, or None (skip) when unavailable.
@@ -93,7 +72,15 @@ fn static_link_args(
     for p in [&inp.libc, &inp.libgcc_eh, &inp.libthr] {
         a.push(p.display().to_string());
     }
-    for l in ["-lm", "-lexecinfo", "-lkvm", "-lmemstat", "-lprocstat", "-ldevstat", "-lutil"] {
+    for l in [
+        "-lm",
+        "-lexecinfo",
+        "-lkvm",
+        "-lmemstat",
+        "-lprocstat",
+        "-ldevstat",
+        "-lutil",
+    ] {
         a.push(l.into());
     }
     a.push("--end-group".into());
@@ -107,10 +94,6 @@ fn skip(test: &str, reason: &str) {
 
 #[test]
 fn afs_ld_statically_links_and_runs_fortran() {
-    let (Some(afs_ld), Some(armfortas)) = (tool(&["afs-ld"]), tool(&["armfortas"])) else {
-        skip("afs_ld_statically_links_and_runs_fortran", "afs-ld or armfortas not built");
-        return;
-    };
     let Some(inp) = freebsd_static_inputs() else {
         skip(
             "afs_ld_statically_links_and_runs_fortran",
@@ -118,10 +101,9 @@ fn afs_ld_statically_links_and_runs_fortran() {
         );
         return;
     };
-    let Some(rt) = runtime_lib() else {
-        skip("afs_ld_statically_links_and_runs_fortran", "libarmfortas_rt.a not built");
-        return;
-    };
+    let afs_ld = tool(&["afs-ld"]).expect("afs-ld binary not built for this test profile");
+    let armfortas = tool(&["armfortas"]).expect("armfortas binary not built for this test profile");
+    let rt = runtime_lib().expect("libarmfortas_rt.a not built for this test profile");
 
     let dir = std::env::temp_dir().join(format!("afs_static_gate_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -154,23 +136,47 @@ fn afs_ld_statically_links_and_runs_fortran() {
         .arg(&obj)
         .output()
         .expect("run armfortas");
-    assert!(c.status.success(), "armfortas -c: {}", String::from_utf8_lossy(&c.stderr));
+    assert!(
+        c.status.success(),
+        "armfortas -c: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
 
     // Link statically with afs-ld and run.
     let out = dir.join("prog");
     let args = static_link_args(&inp, &rt, &obj, &out, &[]);
-    let l = Command::new(&afs_ld).args(&args).output().expect("run afs-ld");
-    assert!(l.status.success(), "afs-ld static link: {}", String::from_utf8_lossy(&l.stderr));
+    let l = Command::new(&afs_ld)
+        .args(&args)
+        .output()
+        .expect("run afs-ld");
+    assert!(
+        l.status.success(),
+        "afs-ld static link: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
 
     let run = Command::new(&out).output().expect("run static binary");
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert_eq!(run.status.code(), Some(0), "exit code; stderr: {}", String::from_utf8_lossy(&run.stderr));
-    assert!(stdout.contains("sum=") && stdout.contains("OK"), "unexpected output: {stdout:?}");
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "exit code; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        stdout.contains("sum=") && stdout.contains("OK"),
+        "unexpected output: {stdout:?}"
+    );
 
     // Byte-determinism across two afs-ld links.
     let out2 = dir.join("prog2");
     let args2 = static_link_args(&inp, &rt, &obj, &out2, &[]);
-    assert!(Command::new(&afs_ld).args(&args2).output().unwrap().status.success());
+    assert!(Command::new(&afs_ld)
+        .args(&args2)
+        .output()
+        .unwrap()
+        .status
+        .success());
     assert_eq!(
         std::fs::read(&out).unwrap(),
         std::fs::read(&out2).unwrap(),

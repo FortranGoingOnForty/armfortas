@@ -358,37 +358,10 @@ fn extract_multifile_link(source: &str) -> Option<Vec<String>> {
     None
 }
 
-fn candidate_target_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors() {
-            let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if matches!(name, "debug" | "release") {
-                dirs.push(ancestor.to_path_buf());
-                break;
-            }
-        }
-    }
-    for dir in ["target/release", "target/debug"] {
-        let candidate = PathBuf::from(dir);
-        if !dirs.iter().any(|existing| existing == &candidate) {
-            dirs.push(candidate);
-        }
-    }
-    dirs
-}
-
 /// Find the static runtime library.
 fn find_runtime() -> PathBuf {
-    for dir in candidate_target_dirs() {
-        let p = dir.join("libarmfortas_rt.a");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("libarmfortas_rt.a not found — run `cargo build` first");
+    armfortas::testing::built_runtime_archive()
+        .expect("libarmfortas_rt.a not built for this test profile")
 }
 
 /// Get the macOS SDK path for linking. Only reachable behind the
@@ -1873,15 +1846,8 @@ fn flexible_whitespace_match_at(text: &str, pattern: &str) -> bool {
 
 /// Find the armfortas binary.
 fn find_compiler() -> PathBuf {
-    for dir in candidate_target_dirs() {
-        let p = dir.join("armfortas");
-        if p.exists() {
-            return fs::canonicalize(&p).unwrap_or_else(|e| {
-                panic!("cannot canonicalize compiler path {}: {}", p.display(), e)
-            });
-        }
-    }
-    panic!("cannot find armfortas binary — run `cargo build` first");
+    armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary not built for this test profile")
 }
 
 /// Find the test_programs directory.
@@ -3413,13 +3379,7 @@ fn match_checks_keeps_repeated_spaces_literal() {
         line_num: 1,
         pattern: "values  7".into(),
     }];
-    assert!(match_checks(
-        &checks,
-        " values           7\n",
-        "inline.f90 [O0]",
-        "CHECK",
-    )
-    .is_err());
+    assert!(match_checks(&checks, " values           7\n", "inline.f90 [O0]", "CHECK",).is_err());
     match_checks(&checks, " values  7\n", "inline.f90 [O0]", "CHECK").unwrap();
 }
 
@@ -5609,7 +5569,9 @@ fn qualifier_first_active_xfail_wins() {
     );
     let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
     assert_eq!(
-        extract_xfail(src, "t.f90", &musl, "-O2").unwrap().as_deref(),
+        extract_xfail(src, "t.f90", &musl, "-O2")
+            .unwrap()
+            .as_deref(),
         Some("linux reason")
     );
 }
