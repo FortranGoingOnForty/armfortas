@@ -48258,6 +48258,48 @@ fn try_lower_alloc_return_call_into_descriptor_view(
     true
 }
 
+fn finalize_allocatable_derived_array_assignment_lhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    dest_info: &LocalInfo,
+    dest_desc: ValueId,
+) {
+    let Some(layout) = dest_info
+        .derived_type
+        .as_deref()
+        .and_then(|type_name| ctx.type_layouts.get(type_name))
+    else {
+        return;
+    };
+    finalize_derived_descriptor_storage_if_allocated(
+        b,
+        ctx.st,
+        ctx.internal_funcs,
+        Some(ctx.contained_host_refs),
+        &ctx.locals,
+        dest_desc,
+        layout,
+    );
+}
+
+fn prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    dest_info: &LocalInfo,
+    dest_desc: ValueId,
+    stat_addr: ValueId,
+) {
+    let Some(layout) = dest_info
+        .derived_type
+        .as_deref()
+        .and_then(|type_name| ctx.type_layouts.get(type_name))
+    else {
+        return;
+    };
+    finalize_allocatable_derived_array_assignment_lhs(b, ctx, dest_info, dest_desc);
+    deallocate_derived_descriptor_components(b, dest_desc, layout, ctx.type_layouts, stat_addr);
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 pub(super) fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -48408,6 +48450,9 @@ pub(super) fn lower_array_assign(
                     Some(ctx.descriptor_params),
                 ) {
                     if !derived_array_needs_deep_copy {
+                        finalize_allocatable_derived_array_assignment_lhs(
+                            b, ctx, dest_info, dest_desc,
+                        );
                         b.call(
                             FuncRef::External("afs_assign_allocatable".into()),
                             vec![dest_desc, src_desc],
@@ -48429,6 +48474,9 @@ pub(super) fn lower_array_assign(
                             let stat = b.alloca(IrType::Int(IntWidth::I32));
                             let zero32 = b.const_i32(0);
                             b.store(zero32, stat);
+                            prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+                                b, ctx, dest_info, dest_desc, stat,
+                            );
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
                                 vec![dest_desc, stat],
@@ -48593,9 +48641,12 @@ pub(super) fn lower_array_assign(
                             return;
                         }
                     }
-                    if call_mentions_dest {
+                    if call_mentions_dest || dest_info.derived_type.is_some() {
                         let tmp_desc = zeroed_array_temp_descriptor(b);
                         lower_alloc_return_call_into_desc(b, ctx, tmp_desc, callee_name, call_args);
+                        finalize_allocatable_derived_array_assignment_lhs(
+                            b, ctx, dest_info, dest_desc,
+                        );
                         b.call(
                             FuncRef::External("afs_assign_allocatable".into()),
                             vec![dest_desc, tmp_desc],
@@ -48717,6 +48768,7 @@ pub(super) fn lower_array_assign(
                         return;
                     }
                 }
+                finalize_allocatable_derived_array_assignment_lhs(b, ctx, dest_info, dest_desc);
                 b.call(
                     FuncRef::External("afs_assign_allocatable".into()),
                     vec![dest_desc, assign_src_desc],
@@ -48764,6 +48816,9 @@ pub(super) fn lower_array_assign(
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);
+                    prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+                        b, ctx, dest_info, dest_desc, stat,
+                    );
                     b.call(
                         FuncRef::External("afs_deallocate_array".into()),
                         vec![dest_desc, stat],
@@ -48856,6 +48911,9 @@ pub(super) fn lower_array_assign(
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);
+                    prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+                        b, ctx, dest_info, dest_desc, stat,
+                    );
                     b.call(
                         FuncRef::External("afs_deallocate_array".into()),
                         vec![dest_desc, stat],
