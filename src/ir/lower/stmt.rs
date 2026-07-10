@@ -2266,10 +2266,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 {
                                     let dst = array_descriptor_addr(b, &info);
                                     let src = class_star_descriptor_source(b, ctx, value);
-                                    b.call(
-                                        FuncRef::External("afs_assign_allocatable".into()),
-                                        vec![dst, src],
-                                        IrType::Void,
+                                    copy_unlimited_polymorphic_allocatable_descriptor(
+                                        b,
+                                        dst,
+                                        src,
+                                        ctx.type_layouts,
                                     );
                                 } else if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
@@ -2875,10 +2876,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 {
                                     let dst = array_descriptor_addr(b, &info);
                                     let src = class_star_descriptor_source(b, ctx, value);
-                                    b.call(
-                                        FuncRef::External("afs_assign_allocatable".into()),
-                                        vec![dst, src],
-                                        IrType::Void,
+                                    copy_unlimited_polymorphic_allocatable_descriptor(
+                                        b,
+                                        dst,
+                                        src,
+                                        ctx.type_layouts,
                                     );
                                 } else if info.by_ref {
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
@@ -3749,10 +3751,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && field.dims.is_empty()
                                 {
                                     let src = class_star_descriptor_source(b, ctx, value);
-                                    b.call(
-                                        FuncRef::External("afs_assign_allocatable".into()),
-                                        vec![field_ptr, src],
-                                        IrType::Void,
+                                    copy_unlimited_polymorphic_allocatable_descriptor(
+                                        b,
+                                        field_ptr,
+                                        src,
+                                        ctx.type_layouts,
                                     );
                                 } else if field.allocatable
                                     && !field.pointer

@@ -49703,6 +49703,43 @@ fn derived_assignment_deep_copies_nested_class_star_allocatable_state() {
 }
 
 #[test]
+fn direct_class_star_assignment_deep_copies_dynamic_allocatable_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=direct_class_star_assignment_deep_copies_dynamic_allocatable_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: payload_t\n    integer, allocatable :: values(:)\n  end type\n  class(*), allocatable :: source, assigned, sourced\n\n  allocate(payload_t :: source)\n  select type (item => source)\n  type is (payload_t)\n    item%values = [10, 20]\n  class default\n    error stop 1\n  end select\n\n  assigned = source\n  allocate(sourced, source=source)\n\n  select type (item => source)\n  type is (payload_t)\n    item%values = [90, 99]\n  class default\n    error stop 2\n  end select\n\n  select type (item => assigned)\n  type is (payload_t)\n    if (.not. allocated(item%values)) error stop 3\n    if (any(item%values /= [10, 20])) error stop 4\n  class default\n    error stop 5\n  end select\n\n  select type (item => sourced)\n  type is (payload_t)\n    if (.not. allocated(item%values)) error stop 6\n    if (any(item%values /= [10, 20])) error stop 7\n  class default\n    error stop 8\n  end select\n\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("direct_class_star_alloc_component_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("direct class(*) allocatable-component copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "direct class(*) allocatable-component copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("direct class(*) allocatable-component copy run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "direct class(*) allocatable-component copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_class_star_allocatable_component_assignment_copies_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

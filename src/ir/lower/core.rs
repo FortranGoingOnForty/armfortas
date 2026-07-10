@@ -55789,12 +55789,14 @@ fn release_unlimited_polymorphic_allocatable_descriptor(
     b.set_block(done_bb);
 }
 
-fn copy_unlimited_polymorphic_allocatable_descriptor(
+pub(super) fn copy_unlimited_polymorphic_allocatable_descriptor(
     b: &mut FuncBuilder,
     dest_desc: ValueId,
     source_desc: ValueId,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
+    let (source_desc, snapshot_desc) =
+        stabilize_dynamic_scalar_assignment_source(b, dest_desc, source_desc, "", type_layouts);
     let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     let zero_i32 = b.const_i32(0);
     b.store(zero_i32, stat_addr);
@@ -55805,10 +55807,18 @@ fn copy_unlimited_polymorphic_allocatable_descriptor(
         IrType::Int(IntWidth::I32),
     );
     let source_is_allocated = b.icmp(CmpOp::Ne, source_allocated, zero_i32);
+    let source_base = b.load_typed(
+        source_desc,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let source_base_raw = b.ptr_to_int(source_base);
+    let zero_i64 = b.const_i64(0);
+    let source_has_base = b.icmp(CmpOp::Ne, source_base_raw, zero_i64);
+    let source_is_present = b.or(source_is_allocated, source_has_base);
     let copy_bb = b.create_block("class_star_component_copy");
     let clear_bb = b.create_block("class_star_component_clear");
     let done_bb = b.create_block("class_star_component_copy_done");
-    b.cond_branch(source_is_allocated, copy_bb, vec![], clear_bb, vec![]);
+    b.cond_branch(source_is_present, copy_bb, vec![], clear_bb, vec![]);
 
     b.set_block(clear_bb);
     let finalize = b.const_i32(1);
@@ -55828,6 +55838,13 @@ fn copy_unlimited_polymorphic_allocatable_descriptor(
     b.branch(done_bb, vec![]);
 
     b.set_block(done_bb);
+    let skip_finalization = b.const_i32(0);
+    release_unlimited_polymorphic_allocatable_descriptor(
+        b,
+        snapshot_desc,
+        stat_addr,
+        skip_finalization,
+    );
 }
 
 fn emit_allocatable_derived_array_component_copy(
@@ -57387,6 +57404,10 @@ pub(super) fn emit_allocatable_source_copy_on_success(
                 );
                 true
             }
+            Some(ScalarAllocSourceCopyPlan::UnlimitedPolymorphic) => {
+                emit_dynamic_derived_scalar_copy(b, dest_desc, source_desc, "", type_layouts);
+                true
+            }
             None => false,
         };
 
@@ -57562,6 +57583,7 @@ pub(super) fn expr_type_layout<'a>(
 pub(super) enum ScalarAllocSourceCopyPlan {
     Static(String),
     Dynamic(String),
+    UnlimitedPolymorphic,
 }
 
 pub(super) fn expr_scalar_alloc_source_copy_plan(
@@ -57575,7 +57597,15 @@ pub(super) fn expr_scalar_alloc_source_copy_plan(
             return Some(ScalarAllocSourceCopyPlan::Static(layout.name.clone()));
         }
     }
-    operator_expr_type_info(expr, Some(locals), st, Some(type_layouts))
+    let type_info = operator_expr_type_info(expr, Some(locals), st, Some(type_layouts));
+    if matches!(
+        type_info,
+        Some(crate::sema::symtab::TypeInfo::ClassStar)
+            | Some(crate::sema::symtab::TypeInfo::TypeStar)
+    ) {
+        return Some(ScalarAllocSourceCopyPlan::UnlimitedPolymorphic);
+    }
+    type_info
         .and_then(|ti| abstract_layout_base_type(type_layouts, &ti))
         .map(ScalarAllocSourceCopyPlan::Dynamic)
 }
