@@ -26187,6 +26187,13 @@ fn fdefault_real_8_changes_default_kind() {
 
 #[test]
 fn afs_runtime_path_env_overrides_runtime_discovery() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=afs_runtime_path_env_overrides_runtime_discovery count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
     // Point $AFS_RUNTIME_PATH at a directory that DOES contain the
     // real runtime and verify compilation still succeeds — exercises
     // the override branch end-to-end without hiding the real runtime.
