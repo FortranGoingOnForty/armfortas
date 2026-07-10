@@ -17,6 +17,7 @@
 .fackr/
 .refs/
 target/
+.cargo-target/
 tests/reports/
 CLAUDE.md
 AGENTS.md

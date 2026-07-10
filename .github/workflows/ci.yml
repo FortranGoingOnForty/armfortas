@@ -10,6 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: .cargo-target
 
 jobs:
   # Detect whether a change can affect the afs-as assembler suite. afs-as
@@ -289,7 +290,7 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build -p armfortas-rt
+      - run: cargo build -p armfortas-rt -p afs-as
       - run: cargo test -p afs-ld --all-targets -- --nocapture
 
   # ---- Sprint x01: non-macOS hosts. Compiler + lib suite run for real;
@@ -363,6 +364,7 @@ jobs:
           # for ELF assembly (until afs-as x86 lands in x14).
           prepare: pkg install -y rust binutils bash
           run: |
+            export CARGO_TARGET_DIR="$PWD/.cargo-target"
             cargo build --workspace
             cargo test -p armfortas --lib
             # --exact: the bare substring also matches the _o1.._ofast
