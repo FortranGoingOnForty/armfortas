@@ -40,6 +40,13 @@ OPT="-O2"
 BSS_SENTINEL="test_programs/ar6_bss_module_data.f90"
 BSS_SENTINEL_MAX_BYTES=$((32 * 1024 * 1024))
 
+for fixture in "${PROGRAMS[@]}" "$BSS_SENTINEL"; do
+    if [ ! -f "$fixture" ]; then
+        echo "FAIL: missing mandatory benchmark fixture: $fixture" >&2
+        exit 1
+    fi
+done
+
 if [ ! -x "$COMPILER" ]; then
     echo "Build the compiler first: cargo build --release"
     exit 1
@@ -125,10 +132,6 @@ check_bss_size_guard() {
 echo "Benchmarking ${#PROGRAMS[@]} programs at $OPT..."
 RESULTS=""
 for prog in "${PROGRAMS[@]}"; do
-    if [ ! -f "$prog" ]; then
-        echo "  SKIP: $prog (not found)"
-        continue
-    fi
     result=$(compile_and_measure "$prog")
     echo "  $result"
     RESULTS="$RESULTS$result"$'\n'
