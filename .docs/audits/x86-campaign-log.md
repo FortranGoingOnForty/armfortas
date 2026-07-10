@@ -73,6 +73,10 @@ follow-up checkpoint:
 - `ar4_char_bytes.f90` remains active on ELF targets; macOS is
   target-qualified XFAIL because Darwin rejects raw `0xe9` filename bytes
   before runtime I/O begins.
+- The musl skip gate now classifies `driver_temp_paths` with the other
+  native-run suites that cannot execute until the musl link path lands.
+- The Ubuntu benchmark baseline now reflects the current CI-linked binary
+  sizes after the driver/runtime link path changes.
 
 Verification for the CI follow-up:
 
