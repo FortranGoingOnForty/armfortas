@@ -43,9 +43,11 @@ fn skip(test: &str, count: usize) -> bool {
     if host_is_x86_elf() {
         return false;
     }
-    eprintln!(
-        "\nHARNESS_SKIP suite=x86_object_smoke test={} count={} reason=\"needs an x86_64 ELF host with system as\"",
-        test, count
+    armfortas::testing::report_harness_skip(
+        "x86_object_smoke",
+        test,
+        count,
+        "needs an x86_64 ELF host with system as",
     );
     true
 }

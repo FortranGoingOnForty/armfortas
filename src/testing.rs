@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +65,34 @@ pub fn built_artifact(file_name: &str) -> Option<PathBuf> {
 /// Find the runtime archive built in the same Cargo profile as this test.
 pub fn built_runtime_archive() -> Option<PathBuf> {
     built_artifact("libarmfortas_rt.a")
+}
+
+fn harness_skip_line(suite: &str, test: &str, count: usize, reason: &str) -> String {
+    format!("\nHARNESS_SKIP suite={suite} test={test} count={count} reason=\"{reason}\"\n")
+}
+
+/// Report a platform-gated test as one write so parallel libtest output cannot
+/// split the machine-readable accounting record.
+pub fn report_harness_skip(suite: &str, test: &str, count: usize, reason: &str) {
+    assert!(count > 0, "HARNESS_SKIP counts must be positive");
+    let line = harness_skip_line(suite, test, count, reason);
+    std::io::stderr()
+        .lock()
+        .write_all(line.as_bytes())
+        .expect("write HARNESS_SKIP record");
+}
+
+#[cfg(test)]
+mod harness_skip_tests {
+    use super::harness_skip_line;
+
+    #[test]
+    fn record_is_rendered_as_one_complete_line() {
+        assert_eq!(
+            harness_skip_line("suite", "case", 7, "platform gate"),
+            "\nHARNESS_SKIP suite=suite test=case count=7 reason=\"platform gate\"\n"
+        );
+    }
 }
 
 /// Whether this host can assemble, link, and run armfortas-produced
