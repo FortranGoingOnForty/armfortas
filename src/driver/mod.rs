@@ -13,12 +13,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
+use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
@@ -2534,14 +2534,14 @@ fn find_runtime_lib() -> Result<String, String> {
 
     // 2. Cargo workspace — when running out of the build tree.
     if let Some(workspace_root) = find_workspace_root() {
-        if let Some(candidate) = fresh_runtime_lib(&workspace_root) {
+        let profile = RuntimeProfile::current();
+        if let Some(candidate) = fresh_runtime_lib(&workspace_root, profile) {
             return Ok(candidate.to_string_lossy().into_owned());
         }
-        maybe_refresh_runtime_lib(&workspace_root)?;
-        for candidate in runtime_lib_candidates(&workspace_root) {
-            if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
-            }
+        maybe_refresh_runtime_lib(&workspace_root, profile)?;
+        let candidate = runtime_lib_candidate(&workspace_root, profile);
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().into_owned());
         }
     }
 
@@ -2612,20 +2612,23 @@ fn find_libsystem_tbd() -> Result<String, String> {
     }
 }
 
-fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
+fn maybe_refresh_runtime_lib(
+    workspace_root: &Path,
+    profile: RuntimeProfile,
+) -> Result<(), String> {
     let runtime_dir = workspace_root.join("runtime");
     if !runtime_dir.join("Cargo.toml").exists() {
         return Ok(());
     }
 
-    if fresh_runtime_lib(workspace_root).is_some() {
+    if fresh_runtime_lib(workspace_root, profile).is_some() {
         return Ok(());
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let output = Command::new(cargo)
         .current_dir(workspace_root)
-        .args(["build", "-p", "armfortas-rt"])
+        .args(profile.cargo_build_args())
         .output()
         .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
     if output.status.success() {
@@ -2636,41 +2639,6 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
-}
-
-fn runtime_lib_candidates(workspace_root: &Path) -> [PathBuf; 2] {
-    [
-        workspace_root.join("target/debug/libarmfortas_rt.a"),
-        workspace_root.join("target/release/libarmfortas_rt.a"),
-    ]
-}
-
-fn fresh_runtime_lib(workspace_root: &Path) -> Option<PathBuf> {
-    let runtime_dir = workspace_root.join("runtime");
-    let source_mtime = newest_mtime(&runtime_dir)?;
-    runtime_lib_candidates(workspace_root)
-        .into_iter()
-        .find(|candidate| {
-            fs::metadata(candidate)
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .is_some_and(|mtime| mtime >= source_mtime)
-        })
-}
-
-fn newest_mtime(path: &Path) -> Option<SystemTime> {
-    let meta = fs::metadata(path).ok()?;
-    let mut newest = meta.modified().ok()?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(path).ok()? {
-            let entry = entry.ok()?;
-            let child = newest_mtime(&entry.path())?;
-            if child > newest {
-                newest = child;
-            }
-        }
-    }
-    Some(newest)
 }
 
 fn find_workspace_root() -> Option<PathBuf> {
@@ -2714,41 +2682,6 @@ mod tests {
         let opts = Options::from_args(&args).expect("driver should accept -Os");
         assert_eq!(opts.opt_level, OptLevel::Os);
         assert_eq!(opts.input, PathBuf::from("hello.f90"));
-    }
-
-    #[test]
-    fn fresh_runtime_lib_accepts_release_archive_when_debug_is_stale() {
-        let unique = format!(
-            "armfortas_rt_release_only_{}_{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
-        let debug_archive = root.join("target/debug/libarmfortas_rt.a");
-        let release_archive = root.join("target/release/libarmfortas_rt.a");
-
-        fs::create_dir_all(debug_archive.parent().unwrap()).unwrap();
-        fs::write(&debug_archive, b"stale debug archive").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        let runtime_dir = root.join("runtime");
-        fs::create_dir_all(&runtime_dir).unwrap();
-        fs::write(
-            runtime_dir.join("Cargo.toml"),
-            b"[package]\nname = \"rt\"\n",
-        )
-        .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        fs::create_dir_all(release_archive.parent().unwrap()).unwrap();
-        fs::write(&release_archive, b"fresh release archive").unwrap();
-
-        assert_eq!(fresh_runtime_lib(&root), Some(release_archive));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
