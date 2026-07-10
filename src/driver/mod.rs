@@ -1760,11 +1760,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             .map_err(|e| format!("cannot determine current directory for temp output: {}", e))?
             .join(&out_path)
     };
-    let stem = out_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "afs".to_string());
     let token = {
         let bytes = temp_identity_path.as_os_str().as_encoded_bytes();
         let mut h: u64 = 0xcbf29ce484222325;
@@ -1774,11 +1769,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         h
     };
-    let asm_path = std::env::temp_dir().join(format!("armfortas_{}_{:016x}.s", stem, token));
+    let asm_path = std::env::temp_dir().join(format!("armfortas_{:016x}.s", token));
     let obj_path = if opts.emit_obj {
         out_path.clone()
     } else {
-        std::env::temp_dir().join(format!("armfortas_{}_{:016x}.o", stem, token))
+        std::env::temp_dir().join(format!("armfortas_{:016x}.o", token))
     };
 
     let _asm_cleanup = RemoveFileOnDrop(asm_path.clone());

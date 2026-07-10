@@ -109,6 +109,38 @@ fn temporary_assembly_is_removed_after_success_and_failure() {
 }
 
 #[test]
+fn valid_long_output_basename_does_not_expand_temporary_name() {
+    let compiler = compiler();
+    let dir = unique_dir("long_output_basename");
+    let temp_dir = dir.join("tmp");
+    std::fs::create_dir_all(&temp_dir).expect("cannot create temporary directory");
+    let source = dir.join("p.f90");
+    std::fs::write(&source, "program p\nend program\n").expect("cannot write source");
+    let output = dir.join(format!("{}.o", "x".repeat(230)));
+
+    let result = Command::new(&compiler)
+        .env("TMPDIR", &temp_dir)
+        .args(["-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "valid long output basename failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.is_file(), "long-named object was not written");
+    assert!(
+        temporary_codegen_files(&temp_dir).is_empty(),
+        "long output retained temporary codegen files"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn parallel_relative_outputs_with_same_basename_keep_separate_temps() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
