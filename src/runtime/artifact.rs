@@ -34,16 +34,21 @@ impl RuntimeProfile {
 }
 
 pub(crate) fn runtime_lib_candidate(workspace_root: &Path, profile: RuntimeProfile) -> PathBuf {
-    cargo_target_dir(workspace_root)
-        .join(profile.directory())
-        .join("libarmfortas_rt.a")
-}
-
-fn cargo_target_dir(workspace_root: &Path) -> PathBuf {
-    cargo_target_dir_from(
+    runtime_lib_candidate_from(
         workspace_root,
+        profile,
         std::env::var_os("CARGO_TARGET_DIR").as_deref(),
     )
+}
+
+fn runtime_lib_candidate_from(
+    workspace_root: &Path,
+    profile: RuntimeProfile,
+    configured_target: Option<&OsStr>,
+) -> PathBuf {
+    cargo_target_dir_from(workspace_root, configured_target)
+        .join(profile.directory())
+        .join("libarmfortas_rt.a")
 }
 
 fn cargo_target_dir_from(workspace_root: &Path, configured: Option<&OsStr>) -> PathBuf {
@@ -59,8 +64,20 @@ fn cargo_target_dir_from(workspace_root: &Path, configured: Option<&OsStr>) -> P
 }
 
 pub(crate) fn fresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> Option<PathBuf> {
+    fresh_runtime_lib_from(
+        workspace_root,
+        profile,
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    )
+}
+
+fn fresh_runtime_lib_from(
+    workspace_root: &Path,
+    profile: RuntimeProfile,
+    configured_target: Option<&OsStr>,
+) -> Option<PathBuf> {
     let source_mtime = newest_mtime(&workspace_root.join("runtime"))?;
-    let candidate = runtime_lib_candidate(workspace_root, profile);
+    let candidate = runtime_lib_candidate_from(workspace_root, profile, configured_target);
     fs::metadata(&candidate)
         .ok()
         .and_then(|meta| meta.modified().ok())
@@ -106,16 +123,19 @@ mod tests {
         fs::write(runtime_dir.join("Cargo.toml"), b"[package]\nname='rt'\n").unwrap();
         std::thread::sleep(Duration::from_millis(20));
 
-        let debug = runtime_lib_candidate(&root, RuntimeProfile::Debug);
-        let release = runtime_lib_candidate(&root, RuntimeProfile::Release);
+        let debug = runtime_lib_candidate_from(&root, RuntimeProfile::Debug, None);
+        let release = runtime_lib_candidate_from(&root, RuntimeProfile::Release, None);
         fs::create_dir_all(debug.parent().unwrap()).unwrap();
         fs::create_dir_all(release.parent().unwrap()).unwrap();
         fs::write(&debug, b"debug").unwrap();
         fs::write(&release, b"release").unwrap();
 
-        assert_eq!(fresh_runtime_lib(&root, RuntimeProfile::Debug), Some(debug));
         assert_eq!(
-            fresh_runtime_lib(&root, RuntimeProfile::Release),
+            fresh_runtime_lib_from(&root, RuntimeProfile::Debug, None),
+            Some(debug)
+        );
+        assert_eq!(
+            fresh_runtime_lib_from(&root, RuntimeProfile::Release, None),
             Some(release)
         );
         let _ = fs::remove_dir_all(root);
@@ -129,11 +149,14 @@ mod tests {
         fs::write(runtime_dir.join("Cargo.toml"), b"[package]\nname='rt'\n").unwrap();
         std::thread::sleep(Duration::from_millis(20));
 
-        let debug = runtime_lib_candidate(&root, RuntimeProfile::Debug);
+        let debug = runtime_lib_candidate_from(&root, RuntimeProfile::Debug, None);
         fs::create_dir_all(debug.parent().unwrap()).unwrap();
         fs::write(&debug, b"debug").unwrap();
 
-        assert_eq!(fresh_runtime_lib(&root, RuntimeProfile::Release), None);
+        assert_eq!(
+            fresh_runtime_lib_from(&root, RuntimeProfile::Release, None),
+            None
+        );
         assert_eq!(
             RuntimeProfile::Release.cargo_build_args(),
             &["build", "-p", "armfortas-rt", "--release"]
