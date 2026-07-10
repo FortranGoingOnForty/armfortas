@@ -214,6 +214,57 @@ fn combined_compile_preserves_target_and_preprocessor_options() {
 }
 
 #[test]
+fn combined_link_keeps_equal_basename_sources_distinct() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=combined_link_keeps_equal_basename_sources_distinct count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(
+        dir.join("a/unit.f90"),
+        "subroutine alpha()\n  print *, 1\nend subroutine\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b/unit.f90"),
+        "subroutine beta()\n  print *, 2\nend subroutine\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.f90"),
+        "program p\n  call alpha()\n  call beta()\nend program\n",
+    )
+    .unwrap();
+
+    let binary = dir.join("same_basename");
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["a/unit.f90", "b/unit.f90", "main.f90", "-o"])
+        .arg(&binary)
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "combined link failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = run_binary(&binary);
+    assert!(
+        output_contains_expected(&output, "1 2"),
+        "equal-basename sources produced the wrong program:\n{output}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn basic_module_variable_and_subroutine() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

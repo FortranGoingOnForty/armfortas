@@ -2422,12 +2422,7 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
             src.with_extension("o")
         } else {
             let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-            let stem = src
-                .file_stem()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or("out");
-            tmp_dir.join(format!("{}.o", stem))
+            tmp_dir.join(format!("source_{}.o", idx))
         };
 
         // Preserve every compilation-affecting option. Only orchestration
