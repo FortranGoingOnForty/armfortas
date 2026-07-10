@@ -25,6 +25,47 @@ use crate::parser::Parser;
 use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
 
+/// Return the profile directory that contains the running Cargo test.
+///
+/// Integration tests live in `<profile>/deps`; workspace binaries and static
+/// libraries are siblings of that directory. Deriving this from the running
+/// executable also handles custom target directories and Cargo configuration.
+pub fn cargo_profile_dir() -> Option<PathBuf> {
+    cargo_profile_dir_for_executable(&std::env::current_exe().ok()?)
+}
+
+fn cargo_profile_dir_for_executable(executable: &Path) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    if parent.file_name() == Some(std::ffi::OsStr::new("deps")) {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
+/// Find a workspace binary built in the same Cargo profile as this test.
+pub fn built_binary(name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    built_artifact(&file_name)
+}
+
+/// Find a workspace artifact built in the same Cargo profile as this test.
+pub fn built_artifact(file_name: &str) -> Option<PathBuf> {
+    let candidate = cargo_profile_dir()?.join(file_name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Find the runtime archive built in the same Cargo profile as this test.
+pub fn built_runtime_archive() -> Option<PathBuf> {
+    built_artifact("libarmfortas_rt.a")
+}
+
 /// Whether this host can assemble, link, and run armfortas-produced
 /// binaries natively (sprint x01). arm64-macos always; x86_64 ELF
 /// glibc/FreeBSD since x09 opened the optimizing levels (x06 built the
@@ -1128,10 +1169,7 @@ fn find_runtime_lib() -> Result<String, String> {
     Err("cannot find libarmfortas_rt.a — build with 'cargo build -p armfortas-rt'".into())
 }
 
-fn maybe_refresh_runtime_lib(
-    workspace_root: &Path,
-    profile: RuntimeProfile,
-) -> Result<(), String> {
+fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> Result<(), String> {
     let runtime_dir = workspace_root.join("runtime");
     if !runtime_dir.join("Cargo.toml").exists() {
         return Ok(());

@@ -28,7 +28,7 @@ set -euo pipefail
 # tree arrives by rsync) and already runs from the root.
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
-COMPILER="./target/release/armfortas"
+COMPILER="${CARGO_TARGET_DIR:-target}/release/armfortas"
 PROGRAMS=(
     test_programs/array_bulk_kernels.f90
     test_programs/module_init.f90

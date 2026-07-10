@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -33,10 +34,28 @@ impl RuntimeProfile {
 }
 
 pub(crate) fn runtime_lib_candidate(workspace_root: &Path, profile: RuntimeProfile) -> PathBuf {
-    workspace_root
-        .join("target")
+    cargo_target_dir(workspace_root)
         .join(profile.directory())
         .join("libarmfortas_rt.a")
+}
+
+fn cargo_target_dir(workspace_root: &Path) -> PathBuf {
+    cargo_target_dir_from(
+        workspace_root,
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    )
+}
+
+fn cargo_target_dir_from(workspace_root: &Path, configured: Option<&OsStr>) -> PathBuf {
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return workspace_root.join("target");
+    };
+    let configured = PathBuf::from(configured);
+    if configured.is_absolute() {
+        configured
+    } else {
+        workspace_root.join(configured)
+    }
 }
 
 pub(crate) fn fresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> Option<PathBuf> {
@@ -120,5 +139,19 @@ mod tests {
             &["build", "-p", "armfortas-rt", "--release"]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_target_directory_honors_absolute_and_relative_overrides() {
+        let root = Path::new("/workspace");
+        assert_eq!(cargo_target_dir_from(root, None), root.join("target"));
+        assert_eq!(
+            cargo_target_dir_from(root, Some(OsStr::new("build/cargo"))),
+            root.join("build/cargo")
+        );
+        assert_eq!(
+            cargo_target_dir_from(root, Some(OsStr::new("/tmp/armfortas-target"))),
+            PathBuf::from("/tmp/armfortas-target")
+        );
     }
 }
