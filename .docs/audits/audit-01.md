@@ -36,7 +36,7 @@ Severity meanings used here:
 
 ### AUD01-001 - Multi-file compilation silently resets target and preprocessing options
 
-**Severity:** Critical  
+**Severity:** Critical
 **Area:** driver orchestration
 
 **Evidence:** `compile_multi` constructs each child job from
@@ -81,14 +81,14 @@ The multi-file command exited 1 at `#error AUDIT_FLAG was dropped`; the
 single-file control exited 0.
 
 **Expected:** every per-source child job inherits all compilation-affecting
-options from the parent.  
+options from the parent.
 **Impact:** cross-compilation can silently produce host-ABI objects, and valid
-multi-file preprocessed builds fail or select the wrong source branches.  
+multi-file preprocessed builds fail or select the wrong source branches.
 **Confidence:** High.
 
 ### AUD01-002 - Same-basename sources overwrite one multi-file temporary object
 
-**Severity:** High  
+**Severity:** High
 **Area:** driver orchestration
 
 **Evidence:** link-mode multi-file builds use one PID-scoped directory
@@ -110,14 +110,14 @@ same `/tmp/afs_multi_<pid>/unit.o` and an undefined reference to `alpha`.
 The gfortran control linked and printed `1` then `2`.
 
 **Expected:** temporary object identity includes the complete source identity
-or another unique key.  
+or another unique key.
 **Impact:** valid projects with repeated conventional basenames cannot be
-linked in one invocation.  
+linked in one invocation.
 **Confidence:** High.
 
 ### AUD01-003 - Dependency scanning treats inactive preprocessor branches as real edges
 
-**Severity:** High  
+**Severity:** High
 **Area:** dependency scanning
 
 **Evidence:** `scan_file` reads raw UTF-8 text and applies a line-prefix scan
@@ -152,14 +152,14 @@ The combined command exited 1 with `circular module dependency detected among:
 b.F90, a.F90`; compiling in the real dependency order succeeded.
 
 **Expected:** dependency discovery sees the same preprocessed source as the
-compiler, or conservatively avoids inventing impossible cycles.  
+compiler, or conservatively avoids inventing impossible cycles.
 **Impact:** valid unordered multi-source invocations are rejected; macros and
-includes can similarly hide real definitions or dependencies from the graph.  
+includes can similarly hide real definitions or dependencies from the graph.
 **Confidence:** High.
 
 ### AUD01-004 - Legal comment gaps bypass statement warnings and the hard cap
 
-**Severity:** High  
+**Severity:** High
 **Area:** source limits / preprocessing
 
 **Evidence:** both hard-cap accounting (`src/driver/conformance.rs:60-103`)
@@ -193,14 +193,14 @@ preprocessed line of 2,026,352 characters. The configured hard cap is
 
 **Expected:** the comment lines are skipped while continuation state and
 statement character totals remain active; this input must hit the hard-cap
-diagnostic.  
+diagnostic.
 **Impact:** the scanner's stated guarantee that oversized statements cannot
-reach recursive front-end passes is false.  
+reach recursive front-end passes is false.
 **Confidence:** High.
 
 ### AUD01-005 - Every compile reserves a 2 GiB thread stack and can panic before compilation
 
-**Severity:** High  
+**Severity:** High
 **Area:** reliability / driver
 
 **Evidence:** `cli_entry` unconditionally requests a 2 GiB stack and calls
@@ -222,14 +222,14 @@ unavailable`. The 2.5 GiB control exited 0.
 
 **Expected:** tiny inputs do not require a 2 GiB virtual stack reservation;
 spawn failure must at minimum become a structured compiler error with a
-documented exit code.  
+documented exit code.
 **Impact:** ordinary constrained containers, CI workers, and high-parallelism
-builds can fail before reading source.  
+builds can fail before reading source.
 **Confidence:** High.
 
 ### AUD01-006 - The `#if` evaluator rejects valid mixed arithmetic and can ICE on overflow
 
-**Severity:** High  
+**Severity:** High
 **Area:** preprocessing
 
 **Evidence:** additive parsing searches for `+` before `-` and passes the
@@ -238,7 +238,7 @@ multiplicative parsing similarly searches operator classes independently
 (`src/preprocess/mod.rs:1125-1147`). Arithmetic uses checked debug-profile
 `i64` operations without overflow handling.
 
-**Exact reproductions:** 
+**Exact reproductions:**
 
 ```fortran
 #if 10 + 5 - 2 == 13
@@ -270,14 +270,14 @@ add with overflow`). Both gfortran controls completed; overflow produced a
 warning rather than a crash.
 
 **Expected:** standard preprocessor precedence/associativity and defined
-integer handling, never a compiler panic.  
+integer handling, never a compiler panic.
 **Impact:** valid build-configuration expressions fail, and adversarial or
-generated constants crash debug compiler builds.  
+generated constants crash debug compiler builds.
 **Confidence:** High.
 
 ### AUD01-007 - Function-like macro argument splitting ignores quoted strings
 
-**Severity:** High  
+**Severity:** High
 **Area:** preprocessing
 
 **Evidence:** `expand_function_macro` tracks only parenthesis depth while
@@ -303,14 +303,14 @@ armfortas exited 0 but emitted `print *, "a`; gfortran emitted
 `print *, "a,b"`.
 
 **Expected:** commas and parentheses inside quoted preprocessing tokens do not
-split macro arguments.  
+split macro arguments.
 **Impact:** preprocessing silently truncates source and commonly produces a
-later, misleading lexer error.  
+later, misleading lexer error.
 **Confidence:** High.
 
 ### AUD01-008 - Fixed-form `PRINT` with a numeric FORMAT label is tokenized as an identifier
 
-**Severity:** High  
+**Severity:** High
 **Area:** fixed-form lexing
 
 **Evidence:** fixed-form text is whitespace-collapsed, then keyword-prefix
@@ -337,13 +337,13 @@ armfortas exited 1 at line 2 with `unexpected expression statement`.
 The gfortran control exited 0 and printed `OK`.
 
 **Expected:** `PRINT` is recognized as the statement keyword and `10` as its
-format label.  
-**Impact:** a core fixed-form/F77 formatted-I/O spelling is unusable.  
+format label.
+**Impact:** a core fixed-form/F77 formatted-I/O spelling is unusable.
 **Confidence:** High.
 
 ### AUD01-009 - ARM64 Mach-O compile-only cross-targeting invokes the host assembler
 
-**Severity:** High  
+**Severity:** High
 **Area:** target driver orchestration
 
 **Evidence:** ELF targets have explicit cross-assembly handling and the
@@ -363,14 +363,14 @@ AArch64 instructions such as `stp x29,x30` as unknown.
 
 **Expected:** compile-only cross-targeting uses an ARM64/Mach-O-capable
 in-process assembler, or rejects the unsupported route before invoking the
-host assembler.  
+host assembler.
 **Impact:** the advertised ARM64 compile-only cross-target path cannot produce
-an object from Linux.  
+an object from Linux.
 **Confidence:** High.
 
 ### AUD01-010 - `CARGO_TARGET_DIR` breaks runtime-linked integration tests
 
-**Severity:** High  
+**Severity:** High
 **Area:** test/CI reliability
 
 **Evidence:** `tests/multifile.rs:37-54` searches only relative
@@ -400,15 +400,15 @@ the test exited 101 and panicked at `tests/multifile.rs:54` with
 `libarmfortas_rt.a not found`.
 
 **Expected:** tests and shared runtime lookup honor Cargo's active target
-directory or locate artifacts relative to Cargo-provided executable paths.  
+directory or locate artifacts relative to Cargo-provided executable paths.
 **Impact:** out-of-tree Cargo builds and CI cache layouts fail despite having
-successfully built the required runtime.  
+successfully built the required runtime.
 **Confidence:** High for the integration-test failure; the complete driver
 failure matrix was not independently exercised.
 
 ### AUD01-011 - Preprocessor source maps are generated but discarded by diagnostics
 
-**Severity:** Medium  
+**Severity:** Medium
 **Area:** free-form/fixed-form lexing and diagnostics
 
 **Evidence:** `PreprocOutput` carries a per-output-line source map at
@@ -441,14 +441,14 @@ directive. For fixed form, an `@` on continuation line 4 was reported at line
 3. The gfortran controls identified the actual file and physical lines.
 
 **Expected:** transformed spans are remapped through `source_map`, including
-included filenames and continuation offsets.  
+included filenames and continuation offsets.
 **Impact:** editor navigation and diagnostic snippets point at unrelated
-source, obscuring the actual error.  
+source, obscuring the actual error.
 **Confidence:** High.
 
 ### AUD01-012 - `#line` does not affect `__LINE__` or `__FILE__`
 
-**Severity:** Medium  
+**Severity:** Medium
 **Area:** preprocessing
 
 **Evidence:** `do_line` records only a `line_override` for source-map entries
@@ -476,14 +476,14 @@ armfortas emitted `3, "line.F90"`; gfortran emitted
 `101, "virtual-source.F90"`.
 
 **Expected:** `#line` changes the presumed line and file used by subsequent
-predefined macros and diagnostics.  
+predefined macros and diagnostics.
 **Impact:** generated sources embed wrong location metadata and cannot redirect
-diagnostics to their logical source.  
+diagnostics to their logical source.
 **Confidence:** High.
 
 ### AUD01-013 - Non-UTF-8 source is mutated at top level and rejected in includes
 
-**Severity:** Medium  
+**Severity:** Medium
 **Area:** source ingestion / preprocessing
 
 **Evidence:** the driver deliberately uses `String::from_utf8_lossy` for the
@@ -512,14 +512,14 @@ preserved `ff`. The include case exited 1 with `stream did not contain valid
 UTF-8`; gfortran preserved and processed the include.
 
 **Expected:** the claimed non-UTF-8 acceptance is byte-preserving and
-consistent between primary and included source.  
+consistent between primary and included source.
 **Impact:** string data can silently change length/value, while harmless
-high-byte comments in includes break otherwise accepted builds.  
+high-byte comments in includes break otherwise accepted builds.
 **Confidence:** High.
 
 ### AUD01-014 - Make depfiles omit included prerequisites
 
-**Severity:** Medium  
+**Severity:** Medium
 **Area:** dependency generation
 
 **Evidence:** `write_dependency_file` always writes only `opts.input` after
@@ -543,14 +543,14 @@ main.o: main.F90
 
 **Expected:** `value.inc` is a prerequisite, so changing it rebuilds
 `main.o`; module interface dependencies should likewise be represented where
-the supported dialect requires them.  
+the supported dialect requires them.
 **Impact:** incremental and parallel builds can retain stale objects after an
-included source changes.  
+included source changes.
 **Confidence:** High for omitted `#include` prerequisites.
 
 ### AUD01-015 - Program-unit terminating names are consumed without validation
 
-**Severity:** Medium  
+**Severity:** Medium
 **Area:** parsing
 
 **Evidence:** `parse_program` records the opening name at
@@ -576,15 +576,15 @@ armfortas exited 0 and emitted an AST. gfortran exited 1 with
 `Expected label 'p' for END PROGRAM statement`.
 
 **Expected:** when both opening and closing names are present, they must match
-case-insensitively.  
+case-insensitively.
 **Impact:** structurally invalid source is accepted, masking copy/paste and
 generated-source errors. The same helper is shared by other named program
-units and constructs.  
+units and constructs.
 **Confidence:** High.
 
 ### AUD01-016 - Quote-bearing Hollerith FORMAT text is silently changed
 
-**Severity:** Medium  
+**Severity:** Medium
 **Area:** fixed-form lexing
 
 **Evidence:** `protect_hollerith` rewrites `nH...` as a single-quoted string
@@ -611,9 +611,9 @@ gfortran -std=legacy write-hollerith-quote.f -o whq-gf
 armfortas exited 0 but printed a blank record. The gfortran control printed
 `'A'` (with the expected deleted-feature warning).
 
-**Expected:** the three Hollerith payload characters are emitted verbatim.  
+**Expected:** the three Hollerith payload characters are emitted verbatim.
 **Impact:** legacy/F77 FORMAT output silently changes when the payload contains
-a quote.  
+a quote.
 **Confidence:** High.
 
 ## Coverage gaps
