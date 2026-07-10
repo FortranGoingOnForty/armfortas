@@ -49666,6 +49666,43 @@ fn optional_allocatable_intent_out_array_assignment_reallocates() {
 }
 
 #[test]
+fn derived_assignment_deep_copies_nested_class_star_allocatable_state() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_assignment_deep_copies_nested_class_star_allocatable_state count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: payload_t\n    integer, allocatable :: values(:)\n  end type\n  type :: value_t\n    class(*), allocatable :: payload\n  end type\ncontains\n  subroutine copy_then_change_source(independent)\n    logical, intent(out) :: independent\n    type(value_t) :: source, copied\n    allocate(payload_t :: source%payload)\n    select type (payload => source%payload)\n    type is (payload_t)\n      payload%values = [42]\n    class default\n      error stop 1\n    end select\n    copied = source\n    select type (payload => source%payload)\n    type is (payload_t)\n      payload%values(1) = 99\n    class default\n      error stop 2\n    end select\n    independent = .false.\n    select type (payload => copied%payload)\n    type is (payload_t)\n      independent = allocated(payload%values) .and. payload%values(1) == 42\n    end select\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  logical :: independent\n  call copy_then_change_source(independent)\n  if (.not. independent) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_copy_nested_class_star_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested class(*) derived-copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested class(*) derived-copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("nested class(*) derived-copy run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "nested class(*) derived-copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_class_star_allocatable_component_assignment_copies_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

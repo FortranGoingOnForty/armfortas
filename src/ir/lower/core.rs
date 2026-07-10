@@ -54194,6 +54194,15 @@ fn emit_deallocate_derived_storage_components_inline(
         }
 
         if field.allocatable && field.size == 392 {
+            if matches!(
+                field.type_info,
+                crate::sema::symtab::TypeInfo::ClassStar | crate::sema::symtab::TypeInfo::TypeStar
+            ) {
+                release_unlimited_polymorphic_allocatable_descriptor(
+                    b, field_ptr, stat_addr, finalize,
+                );
+                continue;
+            }
             if let Some(nested_name) = field_derived_type_name(field) {
                 if let Some(nested_layout) = registry.get(&nested_name) {
                     finalize_derived_descriptor_storage_if_allocated_direct(
@@ -55638,6 +55647,18 @@ fn emit_derived_value_copy_inline(
         }
 
         if field.allocatable && field.size == 392 {
+            if matches!(
+                field.type_info,
+                crate::sema::symtab::TypeInfo::ClassStar | crate::sema::symtab::TypeInfo::TypeStar
+            ) {
+                copy_unlimited_polymorphic_allocatable_descriptor(
+                    b,
+                    dest_field,
+                    src_field,
+                    type_layouts,
+                );
+                continue;
+            }
             // Intrinsic assignment of derived values must deep-copy
             // allocatable components instead of aliasing their
             // descriptors. A raw memcpy here makes sibling copies of
@@ -55713,6 +55734,100 @@ fn emit_derived_value_copy_inline(
 
         emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
     }
+}
+
+fn release_unlimited_polymorphic_allocatable_descriptor(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    stat_addr: ValueId,
+    finalize: ValueId,
+) {
+    let allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero_i32 = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero_i32);
+    let release_bb = b.create_block("class_star_release_present");
+    let done_bb = b.create_block("class_star_release_done");
+    b.cond_branch(is_allocated, release_bb, vec![], done_bb, vec![]);
+
+    b.set_block(release_bb);
+    let should_finalize = b.icmp(CmpOp::Ne, finalize, zero_i32);
+    let finalize_bb = b.create_block("class_star_release_finalize");
+    let dealloc_bb = b.create_block("class_star_release_dealloc");
+    b.cond_branch(should_finalize, finalize_bb, vec![], dealloc_bb, vec![]);
+
+    b.set_block(finalize_bb);
+    call_descriptor_vtable_thunk_with_fallback(
+        b,
+        desc,
+        VTABLE_FINALIZE_DESCRIPTOR_OFFSET,
+        vec![desc],
+        |_| {},
+    );
+    b.branch(dealloc_bb, vec![]);
+
+    b.set_block(dealloc_bb);
+    let desc_arg = ptr_i8_value(b, desc);
+    call_descriptor_vtable_thunk_with_fallback(
+        b,
+        desc,
+        VTABLE_DEALLOC_DESCRIPTOR_OFFSET,
+        vec![desc_arg, stat_addr, finalize],
+        |_| {},
+    );
+    b.store(zero_i32, stat_addr);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![desc, stat_addr],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
+}
+
+fn copy_unlimited_polymorphic_allocatable_descriptor(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+    let zero_i32 = b.const_i32(0);
+    b.store(zero_i32, stat_addr);
+
+    let source_allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let source_is_allocated = b.icmp(CmpOp::Ne, source_allocated, zero_i32);
+    let copy_bb = b.create_block("class_star_component_copy");
+    let clear_bb = b.create_block("class_star_component_clear");
+    let done_bb = b.create_block("class_star_component_copy_done");
+    b.cond_branch(source_is_allocated, copy_bb, vec![], clear_bb, vec![]);
+
+    b.set_block(clear_bb);
+    let finalize = b.const_i32(1);
+    release_unlimited_polymorphic_allocatable_descriptor(b, dest_desc, stat_addr, finalize);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let finalize = b.const_i32(1);
+    release_unlimited_polymorphic_allocatable_descriptor(b, dest_desc, stat_addr, finalize);
+    b.store(zero_i32, stat_addr);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![dest_desc, source_desc, stat_addr],
+        IrType::Void,
+    );
+    emit_dynamic_derived_scalar_copy(b, dest_desc, source_desc, "", type_layouts);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
 }
 
 fn emit_allocatable_derived_array_component_copy(
