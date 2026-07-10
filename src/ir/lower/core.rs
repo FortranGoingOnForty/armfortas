@@ -379,15 +379,18 @@ fn bound_proc_slot_target_symbol(
     }
 }
 
-/// Emit one constant vtable per concrete (and abstract, for parent
-/// chaining) derived type with bound procedures. Layout:
-///   `[type_tag i64, parent_vtable_ptr, slot_0, slot_1, ...]`
+/// Emit one constant vtable per derived type. Layout:
+///   `[type_tag i64, parent_vtable_ptr, finalize_desc, dealloc_desc,
+///     copy_value, copy_array_desc, slot_0, slot_1, ...]`
 /// Slots are in `bound_procs` binding order — parent bindings first in
 /// parent order, then new bindings; an override has already replaced the
 /// inherited slot in place (see `compute_layout`). A slot with no visible
 /// target (deferred binding on an abstract type) is null. Dispatch loads
-/// the table pointer from descriptor offset 32, then slot `index` at byte
-/// offset `16 + index*8`, and indirect-calls it.
+/// the table pointer from descriptor offset 384, then slot `index` at byte
+/// offset `VTABLE_HEADER_BYTES + index*8`, and indirect-calls it. The two
+/// lifecycle and two copy thunks make dynamic ownership open-world: a caller
+/// compiled against a parent type does not need to enumerate later extension
+/// types.
 pub(super) fn emit_type_bound_vtables(
     module: &mut Module,
     units: &[SpannedUnit],
@@ -405,7 +408,6 @@ pub(super) fn emit_type_bound_vtables(
     let mut layouts: Vec<_> = type_layouts
         .layouts
         .values()
-        .filter(|layout| !layout.bound_procs.is_empty())
         .filter(|layout| {
             layout
                 .owner_module
@@ -425,10 +427,14 @@ pub(super) fn emit_type_bound_vtables(
         if module.globals.iter().any(|g| g.name == symbol) {
             continue;
         }
-        let mut slots: Vec<QuadSlot> = Vec::with_capacity(layout.bound_procs.len() + 2);
-        // Header: type tag, then the parent's vtable pointer (for a
-        // future runtime EXTENDS fast path), or null when the parent has
-        // no bound procedures of its own.
+        let mut slots: Vec<QuadSlot> = Vec::with_capacity(layout.bound_procs.len() + 6);
+        // Header: type tag, parent metadata, finalization thunk, component
+        // cleanup thunk, scalar copy thunk, array copy thunk. Ownerless
+        // procedure-local types cannot use an out-of-line lifecycle thunk
+        // because their FINAL procedures may require host-closure arguments;
+        // those slots remain null and callers use the closure-aware static
+        // fallback. Copy helpers do not invoke user procedures, so their
+        // vtable slots are valid for ownerless extension types as well.
         slots.push(QuadSlot::Int(layout.type_tag as i64));
         let parent_vtable = layout
             .parent
@@ -438,6 +444,48 @@ pub(super) fn emit_type_bound_vtables(
         slots.push(match parent_vtable {
             Some(sym) => QuadSlot::Sym(sym),
             None => QuadSlot::Int(0),
+        });
+        let has_external_lifecycle_helpers = layout.owner_module.is_some();
+        slots.push(
+            if has_external_lifecycle_helpers
+                && derived_layout_needs_finalization(layout, type_layouts)
+            {
+                QuadSlot::Sym(derived_memory_helper_symbol(
+                    layout,
+                    DerivedMemoryHelperKind::FinalizeDescriptor,
+                ))
+            } else {
+                QuadSlot::Int(0)
+            },
+        );
+        slots.push(
+            if has_external_lifecycle_helpers
+                && derived_layout_needs_component_deallocation(layout, type_layouts)
+            {
+                QuadSlot::Sym(derived_memory_helper_symbol(
+                    layout,
+                    DerivedMemoryHelperKind::DeallocDescriptor,
+                ))
+            } else {
+                QuadSlot::Int(0)
+            },
+        );
+        let needs_deep_copy = derived_layout_needs_deep_copy(layout, type_layouts);
+        slots.push(if needs_deep_copy {
+            QuadSlot::Sym(derived_memory_helper_symbol(
+                layout,
+                DerivedMemoryHelperKind::CopyValue,
+            ))
+        } else {
+            QuadSlot::Int(0)
+        });
+        slots.push(if needs_deep_copy {
+            QuadSlot::Sym(derived_memory_helper_symbol(
+                layout,
+                DerivedMemoryHelperKind::CopyArrayDescriptor,
+            ))
+        } else {
+            QuadSlot::Int(0)
         });
         for bp in &layout.bound_procs {
             slots.push(
@@ -465,6 +513,7 @@ pub(super) fn emit_type_bound_vtables(
 #[derive(Clone, Copy)]
 enum DerivedMemoryHelperKind {
     Init,
+    FinalizeDescriptor,
     DeallocStorage,
     DeallocDescriptor,
     CopyValue,
@@ -475,6 +524,7 @@ impl DerivedMemoryHelperKind {
     fn suffix(self) -> &'static str {
         match self {
             Self::Init => "init",
+            Self::FinalizeDescriptor => "finalize_desc",
             Self::DeallocStorage => "dealloc_storage",
             Self::DeallocDescriptor => "dealloc_desc",
             Self::CopyValue => "copy_value",
@@ -627,11 +677,15 @@ fn emit_derived_memory_helpers(
 
     for layout in layouts {
         let needs_init = derived_layout_needs_runtime_initialization(layout, type_layouts);
+        let needs_finalization = derived_layout_needs_finalization(layout, type_layouts);
         let needs_dealloc = derived_layout_needs_component_deallocation(layout, type_layouts);
         let needs_copy = derived_layout_needs_deep_copy(layout, type_layouts);
 
         if needs_init {
             emit_derived_init_helper(module, layout, type_layouts);
+        }
+        if needs_finalization && layout.owner_module.is_some() {
+            emit_derived_finalize_descriptor_helper(module, layout, type_layouts);
         }
         if needs_dealloc {
             emit_derived_dealloc_storage_helper(module, layout, type_layouts);
@@ -669,6 +723,27 @@ fn emit_derived_init_helper(
         let base = func.params[0].id;
         let mut b = FuncBuilder::new(&mut func, module.layout);
         emit_initialize_derived_storage_inline(&mut b, base, layout, type_layouts);
+        b.ret_void();
+    }
+    finish_helper_function(module, func);
+}
+
+fn emit_derived_finalize_descriptor_helper(
+    module: &mut Module,
+    layout: &crate::sema::type_layout::TypeLayout,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let name = derived_memory_helper_symbol(layout, DerivedMemoryHelperKind::FinalizeDescriptor);
+    if helper_already_emitted(module, &name) {
+        return;
+    }
+    let params = vec![helper_param("desc", 0, ptr_i8_ty())];
+    let mut func = Function::new(name, params, IrType::Void);
+    func.internal_only = false;
+    {
+        let desc = func.params[0].id;
+        let mut b = FuncBuilder::new(&mut func, module.layout);
+        finalize_derived_array_descriptor_storage_direct(&mut b, desc, layout, type_layouts);
         b.ret_void();
     }
     finish_helper_function(module, func);
@@ -798,9 +873,14 @@ fn emit_derived_copy_array_descriptor_helper(
     finish_helper_function(module, func);
 }
 
-/// Byte offset of slot 0 within a vtable (past the `[tag, parent]`
-/// header). Slot `i` lives at `VTABLE_HEADER_BYTES + i * 8`.
-pub(super) const VTABLE_HEADER_BYTES: i64 = 16;
+pub(super) const VTABLE_FINALIZE_DESCRIPTOR_OFFSET: i64 = 16;
+pub(super) const VTABLE_DEALLOC_DESCRIPTOR_OFFSET: i64 = 24;
+pub(super) const VTABLE_COPY_VALUE_OFFSET: i64 = 32;
+pub(super) const VTABLE_COPY_ARRAY_DESCRIPTOR_OFFSET: i64 = 40;
+
+/// Byte offset of slot 0 within a vtable (past the metadata header).
+/// Slot `i` lives at `VTABLE_HEADER_BYTES + i * 8`.
+pub(super) const VTABLE_HEADER_BYTES: i64 = 48;
 
 /// Recursively walk `unit` and, for every contained subprogram, record
 /// the ordered list of immediate-host-local variable names it reads or
@@ -1387,15 +1467,15 @@ pub(super) fn complex_result_kind(
 
 /// Walk a program unit and any nested `contains` to collect the
 /// names of functions whose result variable is lowered through the
-/// 384-byte array descriptor hidden-result ABI. Scalar character
+/// 392-byte array descriptor hidden-result ABI. Scalar character
 /// results use the 32-byte string descriptor ABI and are
 /// intentionally excluded here.
 ///
 /// Audit6 BLOCKING-1: a function `function f() result(r); integer,
 /// allocatable :: r(:)` cannot be returned by value through the
-/// usual scalar result alloca — the descriptor is 384 bytes and
+/// usual scalar result alloca — the descriptor is 392 bytes and
 /// the type system needs to know about it at every call site.
-/// We model this with a hidden first `ptr<[i8 x 384]>` parameter
+/// We model this with a hidden first `ptr<[i8 x 392]>` parameter
 /// that the caller passes in, and the function writes its result
 /// into that descriptor.
 pub(super) fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<String>) {
@@ -1732,7 +1812,7 @@ pub(super) fn arg_uses_descriptor_from_decls(
                     // element address and trusts the caller-side shape /
                     // stride information passed alongside (typically `lda`).
                     // Treating them as descriptor-bearing means the callee
-                    // emits a 384-byte memcpy to copy the descriptor on
+                    // emits a 392-byte memcpy to copy the descriptor on
                     // entry and computes element addresses via descriptor
                     // metadata, yielding `descriptor_base + 16` for `a(1,1)`
                     // — which is the descriptor's own bytes, not the array
@@ -1760,7 +1840,7 @@ pub(super) fn arg_uses_descriptor_from_decls(
                 {
                     // Scalar polymorphic dummies (`class(name)` and the
                     // unlimited `class(*)`) are passed by descriptor —
-                    // the callee receives a 384-byte block. Flagging
+                    // the callee receives a 392-byte block. Flagging
                     // them here lets the call site route through
                     // `lower_arg_descriptor` so the actual is forwarded
                     // as a descriptor pointer; without the ClassStar
@@ -2542,7 +2622,7 @@ pub(super) fn by_ref_storage_ir_type(
     is_derived: bool,
 ) -> IrType {
     if uses_descriptor {
-        descriptor_ptr_ir_type(384)
+        descriptor_ptr_ir_type(392)
     } else if uses_string_descriptor {
         descriptor_ptr_ir_type(32)
     } else if is_derived {
@@ -4406,7 +4486,7 @@ pub(super) fn collect_module_globals(
                 let declared_rank = array_spec.map(|specs| specs.len()).unwrap_or(0);
 
                 // Module-level allocatable and pointer arrays both
-                // live in a 384-byte descriptor slot. For pointers
+                // live in a 392-byte descriptor slot. For pointers
                 // we also mark allocatable=true so the existing
                 // descriptor helpers treat the global storage as the
                 // descriptor body rather than an extra layer of
@@ -4422,7 +4502,7 @@ pub(super) fn collect_module_globals(
                     } else {
                         ir_ty.clone()
                     };
-                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: desc_ty,
@@ -7908,7 +7988,7 @@ pub(super) fn install_one_global(
         vec![]
     };
     let addr_ty = if info.allocatable {
-        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)
+        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)
     } else if info.deferred_char {
         IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32)
     } else if info.is_pointer {
@@ -17620,7 +17700,7 @@ pub(super) fn try_defined_assignment(
     //
     // Surfaced in stdlib_error's `error_handling`: `ierr_out = ierr`
     // (both class(state_type)) generated a state_assign_state call
-    // whose first arg was the slot address (ptr<ptr<[i8 x 384]>>)
+    // whose first arg was the slot address (ptr<ptr<[i8 x 392]>>)
     // instead of the descriptor pointer. Inside state_assign_state
     // the body re-loaded the slot as if it were the descriptor and
     // GEP'd at the where_at offset against fixed-length char data
@@ -17729,7 +17809,7 @@ pub(super) fn try_defined_assignment(
     // For an array actual whose formal is assumed-shape (`v(:)` etc.),
     // F2018 §15.5.2 requires a descriptor.  Without this, the user
     // assignment received the array's raw data pointer and read its
-    // first 384 bytes as the descriptor — manifesting as junk
+    // first 392 bytes as the descriptor — manifesting as junk
     // (rank=77M, base=0x0101010101010101 etc.).  stdlib_bitsets'
     // `set0 = logical1` (overloaded `assign_logint8_64`) is the
     // motivating repro.
@@ -20622,7 +20702,7 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     };
 
     // Single-table dispatch: load the vtable pointer from the
-    // descriptor (offset 32), index slot `slot_index` past the
+    // descriptor (offset 384), index slot `slot_index` past the
     // `[tag, parent]` header, and indirect-call the loaded code pointer.
     // No tag-comparison chain — the table carries the dynamic type's
     // target directly, including across TUs that never saw the type's
@@ -20798,7 +20878,7 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
             {
                 return None;
             }
-            if field.size != 384 {
+            if field.size != 392 {
                 return None;
             }
             let base_type = abstract_layout_base_type(tl, &field.type_info)?;
@@ -20850,7 +20930,7 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
             let elem_size = load_array_desc_i64_field(b, arr_desc, 8);
             let tag = load_array_desc_type_tag(b, arr_desc);
             let vtable = load_array_desc_vtable_ptr(b, arr_desc);
-            let view = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let view = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             store_scalar_polymorphic_descriptor_view(
                 b,
                 view,
@@ -21474,7 +21554,7 @@ pub(super) fn arg_matches_declared(
     // check via `defined_assignment_arg_semantic_match`; this IR-level
     // check is a backup. For an *array* actual passed by descriptor
     // (logical(int32), allocatable :: lv2(:)) the actual_ir arrives as
-    // a fixed byte buffer (Array(I8, 384)) rather than the declared
+    // a fixed byte buffer (Array(I8, 392)) rather than the declared
     // element type (Bool). Without peeling, `lv2 = set` rejected
     // `logint32_assign_64` and the assignment fell into a scalar
     // broadcast path that crashed dereferencing the descriptor.
@@ -21501,7 +21581,7 @@ pub(super) fn arg_matches_declared(
 fn descriptor_carrier_ir_type(actual_ir: &IrType) -> bool {
     match actual_ir {
         IrType::Ptr(inner) => descriptor_carrier_ir_type(inner),
-        IrType::Array(inner, 384) => matches!(inner.as_ref(), IrType::Int(IntWidth::I8)),
+        IrType::Array(inner, 392) => matches!(inner.as_ref(), IrType::Int(IntWidth::I8)),
         _ => false,
     }
 }
@@ -21612,7 +21692,7 @@ pub(super) fn ir_types_dispatch_equal(decl: &IrType, actual: &IrType) -> bool {
         (decl, IrType::Ptr(p)) => ir_types_dispatch_equal(decl, p),
         (IrType::Ptr(p), actual) => ir_types_dispatch_equal(p, actual),
         (IrType::Array(e1, _), IrType::Array(e2, _)) => ir_types_dispatch_equal(e1, e2),
-        // Array actuals routed through a 384-byte descriptor arrive as
+        // Array actuals routed through a 392-byte descriptor arrive as
         // `[i8 x N]`; rank checking elsewhere already enforces that an
         // array formal received an array actual, so peel the outer
         // Array layer here so e.g. a logical(int8) array formal
@@ -21749,7 +21829,7 @@ pub(super) fn c_f_pointer_target(
                 return None;
             }
             let elem_ty = type_info_to_storage_ir_type(&field.type_info, ctx.type_layouts);
-            Some((field_ptr, elem_ty, field.size == 384))
+            Some((field_ptr, elem_ty, field.size == 392))
         }
         _ => None,
     }
@@ -22131,7 +22211,7 @@ pub(super) fn install_runtime_dim_bounds(
 /// the caller's lower (typically 1), and `arr(0)` trips a bounds check
 /// "index 0 outside [1, N]".
 ///
-/// Rebase strategy: allocate a fresh 384-byte local descriptor, memcpy
+/// Rebase strategy: allocate a fresh 392-byte local descriptor, memcpy
 /// from the caller's pointer, patch each overridden dim's `lower_bound`
 /// and `upper_bound` (extent preserved), then redirect the dummy's slot
 /// to the local descriptor.  All downstream lookups (`compute_flat_elem_offset`,
@@ -22149,7 +22229,7 @@ pub(super) fn install_assumed_shape_lower_overrides(
     // Per F2018 §15.5.2.4(13), every assumed-shape dim has its own
     // local lower bound: the declared one if specified, else 1 — the
     // caller's bounds are NOT visible inside the procedure. We rebase
-    // the descriptor view by allocating a local 384-byte copy of the
+    // the descriptor view by allocating a local 392-byte copy of the
     // caller's descriptor and rewriting each AssumedShape dim's lower
     // (and adjusting upper to preserve extent). base_addr / stride
     // are preserved by the memcpy so element writes still propagate
@@ -22244,7 +22324,7 @@ pub(super) fn install_assumed_shape_lower_overrides(
 
             let slot = info.addr;
             let original_desc_ptr = b.load(slot);
-            let local_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let local_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
 
             // For optional dummies, the actual may be absent — caller
             // passes a null descriptor pointer in that case. Guard the
@@ -22264,7 +22344,7 @@ pub(super) fn install_assumed_shape_lower_overrides(
                 None
             };
 
-            let bytes = b.const_i64(384);
+            let bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memcpy".into()),
                 vec![local_desc, original_desc_ptr, bytes],
@@ -22392,8 +22472,8 @@ pub(super) fn install_explicit_shape_dummy_rebase(
             let rank = specs.len() as i32;
             let slot = info.addr;
             let original_desc_ptr = b.load(slot);
-            let local_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-            let bytes = b.const_i64(384);
+            let local_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+            let bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memcpy".into()),
                 vec![local_desc, original_desc_ptr, bytes],
@@ -22939,7 +23019,7 @@ pub(super) fn derived_type_name_for_result_var(
 /// Does the named variable in `decls` carry the ALLOCATABLE attribute
 /// (either on the type-decl attrs or the entity)? Used by host-association
 /// closure-passing to decide whether the hidden pointer param should
-/// carry a descriptor (384 bytes) or a raw element pointer.
+/// carry a descriptor (392 bytes) or a raw element pointer.
 pub(super) fn decl_is_allocatable(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     use crate::ast::decl::Attribute;
     let key = name.to_lowercase();
@@ -23089,7 +23169,9 @@ pub(super) fn clear_intent_out_derived_params(
                     closure_locals,
                     desc,
                     layout,
+                    type_layouts,
                 );
+                deallocate_derived_descriptor_components(b, desc, layout, type_layouts, stat);
                 clear_derived_array_storage_for_intent_out_dynamic(
                     b,
                     storage,
@@ -23105,9 +23187,11 @@ pub(super) fn clear_intent_out_derived_params(
                     internal_funcs,
                     contained_host_refs,
                     closure_locals,
+                    type_layouts,
                     layout,
                     storage,
                 );
+                deallocate_derived_storage_components(b, storage, layout, type_layouts, stat);
                 clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
             }
             b.branch(bb_skip, vec![]);
@@ -23132,7 +23216,9 @@ pub(super) fn clear_intent_out_derived_params(
                 closure_locals,
                 desc,
                 layout,
+                type_layouts,
             );
+            deallocate_derived_descriptor_components(b, desc, layout, type_layouts, stat);
             clear_derived_array_storage_for_intent_out_dynamic(
                 b,
                 storage,
@@ -23148,9 +23234,11 @@ pub(super) fn clear_intent_out_derived_params(
                 internal_funcs,
                 contained_host_refs,
                 closure_locals,
+                type_layouts,
                 layout,
                 storage,
             );
+            deallocate_derived_storage_components(b, storage, layout, type_layouts, stat);
             clear_derived_storage_for_intent_out(b, storage, layout, type_layouts, stat);
         }
     }
@@ -23212,7 +23300,9 @@ pub(super) fn clear_intent_out_allocatable_array_params(
                         closure_locals,
                         desc,
                         layout,
+                        type_layouts,
                     );
+                    deallocate_derived_descriptor_components(b, desc, layout, type_layouts, stat);
                 }
             }
             b.call(
@@ -23237,7 +23327,9 @@ pub(super) fn clear_intent_out_allocatable_array_params(
                     closure_locals,
                     desc,
                     layout,
+                    type_layouts,
                 );
+                deallocate_derived_descriptor_components(b, desc, layout, type_layouts, stat);
             }
         }
         b.call(
@@ -23320,7 +23412,7 @@ pub(super) struct HostRefParamInfo {
     dims: Vec<(i64, i64)>,
     char_kind: CharKind,
     derived_type: Option<String>,
-    /// True when the host var is represented by a 384-byte
+    /// True when the host var is represented by a 392-byte
     /// ArrayDescriptor (assumed-shape, deferred, allocatable array).
     descriptor_arg: bool,
     /// True when the host var is a deferred-length scalar character
@@ -23838,7 +23930,7 @@ pub(super) fn descriptor_param_mask_for_lookup(
     let proc_mask = cache.get(&proc_name).cloned();
     // The cache is authoritative. For an external call it is the `.amod`
     // `descriptor` attr, derived from the callee's real lowered IR param type
-    // (Ptr(Array(i8, 384)) == a runtime descriptor); for a local call it is
+    // (Ptr(Array(i8, 392)) == a runtime descriptor); for a local call it is
     // `arg_uses_descriptor_from_decls` over the callee's real declarations.
     // The scope reconstruction below rebuilds an assumed-size `(*)` (or
     // explicit-shape `(n)`) dummy as AssumedShape, which
@@ -24351,7 +24443,7 @@ pub(super) fn callee_hidden_result_abi(
         find_linkable_symbol_any_scope(st, &key).filter(|sym| is_linkable_callable_symbol(sym))?;
     // Rank check must come BEFORE the Character match arm: a function
     // returning `character :: cstr(N)` is rank-1, and the caller has to
-    // allocate a 384-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)
+    // allocate a 392-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)
     // for the hidden result so the callee's afs_allocate_array prologue
     // sees a real descriptor with elem_size and dim metadata.
     if sym.attrs.result_rank > 0 {
@@ -26349,25 +26441,151 @@ fn emit_direct_final_proc_call(b: &mut FuncBuilder, final_proc: &str, finalized_
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_derived_storage(
     b: &mut FuncBuilder,
     st: &SymbolTable,
     internal_funcs: &HashMap<String, u32>,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     closure_locals: &HashMap<String, LocalInfo>,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
     layout: &crate::sema::type_layout::TypeLayout,
     finalized_addr: ValueId,
 ) {
-    if let Some(final_proc) = layout.final_procs.iter().find(|proc| proc.rank == 0) {
+    let mut emit_final = |b: &mut FuncBuilder, final_proc: &str, addr: ValueId| {
         emit_final_proc_call(
             b,
             st,
             internal_funcs,
             contained_host_refs,
             closure_locals,
-            &final_proc.name,
-            finalized_addr,
+            final_proc,
+            addr,
         );
+    };
+    finalize_derived_storage_with(b, registry, layout, finalized_addr, &mut emit_final);
+}
+
+fn finalize_derived_storage_with<F>(
+    b: &mut FuncBuilder,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    finalized_addr: ValueId,
+    emit_final: &mut F,
+) where
+    F: FnMut(&mut FuncBuilder, &str, ValueId),
+{
+    if let Some(final_proc) = layout.final_procs.iter().find(|proc| proc.rank == 0) {
+        emit_final(b, &final_proc.name, finalized_addr);
+    }
+    finalize_nonallocatable_components_of_storage_with(
+        b,
+        registry,
+        layout,
+        finalized_addr,
+        emit_final,
+    );
+    if let Some(parent) = layout.parent.as_deref().and_then(|name| registry.get(name)) {
+        finalize_derived_storage_with(b, registry, parent, finalized_addr, emit_final);
+    }
+}
+
+fn layout_own_fields<'a>(
+    layout: &'a crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> &'a [crate::sema::type_layout::FieldLayout] {
+    let inherited = layout
+        .parent
+        .as_deref()
+        .and_then(|name| registry.get(name))
+        .map_or(0, |parent| parent.fields.len());
+    &layout.fields[inherited.min(layout.fields.len())..]
+}
+
+fn materialize_contiguous_derived_array_descriptor(
+    b: &mut FuncBuilder,
+    base: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    dims: &[(i64, i64)],
+) -> ValueId {
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let zero32 = b.const_i32(0);
+    let bytes = b.const_i64(392);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![desc, zero32, bytes],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let base = ptr_i8_value(b, base);
+    store_byte_aggregate_field(b, desc, 0, ptr_i8_ty(), base);
+    let elem_bytes = b.const_i64(layout.size as i64);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes);
+    let rank = b.const_i32(dims.len() as i32);
+    store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
+    let contiguous = b.const_i32(2);
+    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), contiguous);
+
+    let mut stride = 1i64;
+    for (index, (lower, extent)) in dims.iter().copied().enumerate() {
+        let offset = 24 + index as i64 * 24;
+        let lower_value = b.const_i64(lower);
+        let upper_value = b.const_i64(lower + extent - 1);
+        let stride_value = b.const_i64(stride);
+        store_byte_aggregate_field(b, desc, offset, IrType::Int(IntWidth::I64), lower_value);
+        store_byte_aggregate_field(b, desc, offset + 8, IrType::Int(IntWidth::I64), upper_value);
+        store_byte_aggregate_field(
+            b,
+            desc,
+            offset + 16,
+            IrType::Int(IntWidth::I64),
+            stride_value,
+        );
+        stride = stride.saturating_mul(extent.max(0));
+    }
+    desc
+}
+
+fn finalize_nonallocatable_components_of_storage_with<F>(
+    b: &mut FuncBuilder,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    layout: &crate::sema::type_layout::TypeLayout,
+    finalized_addr: ValueId,
+    emit_final: &mut F,
+) where
+    F: FnMut(&mut FuncBuilder, &str, ValueId),
+{
+    for field in layout_own_fields(layout, registry) {
+        if field.pointer || field.allocatable {
+            continue;
+        }
+        let Some(nested_name) = field_derived_type_name(field) else {
+            continue;
+        };
+        let Some(nested_layout) = registry.get(&nested_name) else {
+            continue;
+        };
+        if !derived_layout_needs_finalization(nested_layout, registry) {
+            continue;
+        }
+        let offset = b.const_i64(field.offset as i64);
+        let field_ptr = b.gep(finalized_addr, vec![offset], IrType::Int(IntWidth::I8));
+        if field.dims.is_empty() {
+            finalize_derived_storage_with(b, registry, nested_layout, field_ptr, emit_final);
+        } else {
+            let desc = materialize_contiguous_derived_array_descriptor(
+                b,
+                field_ptr,
+                nested_layout,
+                &field.dims,
+            );
+            finalize_derived_array_descriptor_storage_with(
+                b,
+                desc,
+                nested_layout,
+                registry,
+                emit_final,
+            );
+        }
     }
 }
 
@@ -26399,7 +26617,7 @@ fn finalize_derived_array_storage_dynamic_with<F>(
 
     b.set_block(bb_body);
     let byte_off = array_descriptor_flat_element_offset(b, desc, body_idx);
-    let elem_bytes = b.const_i64(layout.size as i64);
+    let elem_bytes = descriptor_elem_size(b, desc);
     let byte_off = b.imul(byte_off, elem_bytes);
     let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
     emit_final(b, &final_proc.name, elem_ptr);
@@ -26409,6 +26627,59 @@ fn finalize_derived_array_storage_dynamic_with<F>(
     b.branch(bb_check, vec![next_idx]);
 
     b.set_block(bb_exit);
+}
+
+fn finalize_nonallocatable_components_of_array_with<F>(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    emit_final: &mut F,
+) where
+    F: FnMut(&mut FuncBuilder, &str, ValueId),
+{
+    let has_finalizable_component = layout_own_fields(layout, registry).iter().any(|field| {
+        !field.pointer
+            && !field.allocatable
+            && field_derived_type_name(field)
+                .and_then(|name| registry.get(&name))
+                .is_some_and(|nested| derived_layout_needs_finalization(nested, registry))
+    });
+    if !has_finalizable_component {
+        return;
+    }
+
+    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
+    let base_addr = b.load_typed(desc, ptr_i8_ty());
+    let elem_bytes = descriptor_elem_size(b, desc);
+    let zero = b.const_i64(0);
+    let check_bb = b.create_block("derived_array_component_final_check");
+    let index = b.add_block_param(check_bb, IrType::Int(IntWidth::I64));
+    let body_bb = b.create_block("derived_array_component_final_body");
+    let body_index = b.add_block_param(body_bb, IrType::Int(IntWidth::I64));
+    let done_bb = b.create_block("derived_array_component_final_done");
+    b.branch(check_bb, vec![zero]);
+
+    b.set_block(check_bb);
+    let done = b.icmp(CmpOp::Ge, index, elem_count);
+    b.cond_branch(done, done_bb, vec![], body_bb, vec![index]);
+
+    b.set_block(body_bb);
+    let element_offset = array_descriptor_flat_element_offset(b, desc, body_index);
+    let byte_offset = b.imul(element_offset, elem_bytes);
+    let element_ptr = b.gep(base_addr, vec![byte_offset], IrType::Int(IntWidth::I8));
+    finalize_nonallocatable_components_of_storage_with(
+        b,
+        registry,
+        layout,
+        element_ptr,
+        emit_final,
+    );
+    let one = b.const_i64(1);
+    let next = b.iadd(body_index, one);
+    b.branch(check_bb, vec![next]);
+
+    b.set_block(done_bb);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -26494,10 +26765,145 @@ fn array_descriptor_flat_element_offset(
     b.load(offset_addr)
 }
 
+fn copy_array_record_prefixes(
+    b: &mut FuncBuilder,
+    source_desc: ValueId,
+    source_elem_bytes: ValueId,
+    dest_desc: ValueId,
+    dest_elem_bytes: ValueId,
+    copy_bytes: ValueId,
+) {
+    let total = array_descriptor_total_elements_dynamic(b, source_desc);
+    let source_base = b.load_typed(source_desc, ptr_i8_ty());
+    let dest_base = b.load_typed(dest_desc, ptr_i8_ty());
+    let zero = b.const_i64(0);
+    let check_bb = b.create_block("parent_final_copy_check");
+    let index = b.add_block_param(check_bb, IrType::Int(IntWidth::I64));
+    let body_bb = b.create_block("parent_final_copy_body");
+    let body_index = b.add_block_param(body_bb, IrType::Int(IntWidth::I64));
+    let done_bb = b.create_block("parent_final_copy_done");
+    b.branch(check_bb, vec![zero]);
+
+    b.set_block(check_bb);
+    let done = b.icmp(CmpOp::Ge, index, total);
+    b.cond_branch(done, done_bb, vec![], body_bb, vec![index]);
+
+    b.set_block(body_bb);
+    let source_element = array_descriptor_flat_element_offset(b, source_desc, body_index);
+    let source_byte_offset = b.imul(source_element, source_elem_bytes);
+    let source_ptr = b.gep(
+        source_base,
+        vec![source_byte_offset],
+        IrType::Int(IntWidth::I8),
+    );
+    let dest_element = array_descriptor_flat_element_offset(b, dest_desc, body_index);
+    let dest_byte_offset = b.imul(dest_element, dest_elem_bytes);
+    let dest_ptr = b.gep(dest_base, vec![dest_byte_offset], IrType::Int(IntWidth::I8));
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![dest_ptr, source_ptr, copy_bytes],
+        ptr_i8_ty(),
+    );
+    let one = b.const_i64(1);
+    let next = b.iadd(body_index, one);
+    b.branch(check_bb, vec![next]);
+
+    b.set_block(done_bb);
+}
+
+fn finalize_parent_array_descriptor_with<F>(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    parent: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    emit_final: &mut F,
+) where
+    F: FnMut(&mut FuncBuilder, &str, ValueId),
+{
+    let physical_elem_bytes = descriptor_elem_size(b, desc);
+    let parent_elem_bytes = b.const_i64(parent.size as i64);
+    let already_parent_sized = b.icmp(CmpOp::Eq, physical_elem_bytes, parent_elem_bytes);
+    let direct_bb = b.create_block("parent_final_desc_direct");
+    let materialize_bb = b.create_block("parent_final_desc_materialize");
+    let done_bb = b.create_block("parent_final_desc_done");
+    b.cond_branch(
+        already_parent_sized,
+        direct_bb,
+        vec![],
+        materialize_bb,
+        vec![],
+    );
+
+    b.set_block(direct_bb);
+    finalize_derived_array_descriptor_storage_with(b, desc, parent, registry, emit_final);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(materialize_bb);
+    let shape_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let packed_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let descriptor_bytes = b.const_i64(392);
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![shape_desc, desc, descriptor_bytes],
+        ptr_i8_ty(),
+    );
+    store_byte_aggregate_field(
+        b,
+        shape_desc,
+        8,
+        IrType::Int(IntWidth::I64),
+        parent_elem_bytes,
+    );
+    let zero32 = b.const_i32(0);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![packed_desc, zero32, descriptor_bytes],
+        ptr_i8_ty(),
+    );
+    let zero64 = b.const_i64(0);
+    let null_stat = b.int_to_ptr(zero64, IrType::Int(IntWidth::I32));
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![packed_desc, shape_desc, null_stat],
+        IrType::Void,
+    );
+    let parent_tag = b.const_i64(parent.type_tag as i64);
+    store_array_desc_type_tag(b, packed_desc, parent_tag);
+    if let Some(parent_vtable) = type_layout_vtable_value(b, parent) {
+        store_array_desc_vtable_ptr(b, packed_desc, parent_vtable);
+    }
+    copy_array_record_prefixes(
+        b,
+        desc,
+        physical_elem_bytes,
+        packed_desc,
+        parent_elem_bytes,
+        parent_elem_bytes,
+    );
+    finalize_derived_array_descriptor_storage_with(b, packed_desc, parent, registry, emit_final);
+    copy_array_record_prefixes(
+        b,
+        packed_desc,
+        parent_elem_bytes,
+        desc,
+        physical_elem_bytes,
+        parent_elem_bytes,
+    );
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![packed_desc, null_stat],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
+}
+
 fn finalize_derived_array_descriptor_storage_with<F>(
     b: &mut FuncBuilder,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
     emit_final: &mut F,
 ) where
     F: FnMut(&mut FuncBuilder, &str, ValueId),
@@ -26509,41 +26915,45 @@ fn finalize_derived_array_descriptor_storage_with<F>(
         .collect();
     if rank_specific.is_empty() {
         finalize_derived_array_storage_dynamic_with(b, layout, desc, emit_final);
-        return;
-    }
+    } else {
+        let rank_ptr_offset = b.const_i64(16);
+        let rank_ptr = b.gep(desc, vec![rank_ptr_offset], IrType::Int(IntWidth::I8));
+        let actual_rank = b.load_typed(rank_ptr, IrType::Int(IntWidth::I32));
+        let bb_done = b.create_block("derived_array_final_done");
 
-    let rank_ptr_offset = b.const_i64(16);
-    let rank_ptr = b.gep(desc, vec![rank_ptr_offset], IrType::Int(IntWidth::I8));
-    let actual_rank = b.load_typed(rank_ptr, IrType::Int(IntWidth::I32));
-    let bb_done = b.create_block("derived_array_final_done");
+        for final_proc in rank_specific {
+            let expected_rank = b.const_i32(final_proc.rank as i32);
+            let matches = b.icmp(CmpOp::Eq, actual_rank, expected_rank);
+            let bb_call = b.create_block("derived_array_final_rank_call");
+            let bb_next = b.create_block("derived_array_final_rank_next");
+            b.cond_branch(matches, bb_call, vec![], bb_next, vec![]);
 
-    for final_proc in rank_specific {
-        let expected_rank = b.const_i32(final_proc.rank as i32);
-        let matches = b.icmp(CmpOp::Eq, actual_rank, expected_rank);
-        let bb_call = b.create_block("derived_array_final_rank_call");
-        let bb_next = b.create_block("derived_array_final_rank_next");
-        b.cond_branch(matches, bb_call, vec![], bb_next, vec![]);
+            b.set_block(bb_call);
+            emit_final(b, &final_proc.name, desc);
+            b.branch(bb_done, vec![]);
+            b.set_block(bb_next);
+        }
 
-        b.set_block(bb_call);
-        emit_final(b, &final_proc.name, desc);
+        finalize_derived_array_storage_dynamic_with(b, layout, desc, emit_final);
         b.branch(bb_done, vec![]);
-        b.set_block(bb_next);
+        b.set_block(bb_done);
     }
-
-    finalize_derived_array_storage_dynamic_with(b, layout, desc, emit_final);
-    b.branch(bb_done, vec![]);
-    b.set_block(bb_done);
+    finalize_nonallocatable_components_of_array_with(b, desc, layout, registry, emit_final);
+    if let Some(parent) = layout.parent.as_deref().and_then(|name| registry.get(name)) {
+        finalize_parent_array_descriptor_with(b, desc, parent, registry, emit_final);
+    }
 }
 
 fn finalize_derived_array_descriptor_storage_direct(
     b: &mut FuncBuilder,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     let mut emit_final = |b: &mut FuncBuilder, final_proc: &str, finalized_addr: ValueId| {
         emit_direct_final_proc_call(b, final_proc, finalized_addr);
     };
-    finalize_derived_array_descriptor_storage_with(b, desc, layout, &mut emit_final);
+    finalize_derived_array_descriptor_storage_with(b, desc, layout, registry, &mut emit_final);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -26555,6 +26965,7 @@ pub(super) fn finalize_derived_array_descriptor_storage(
     closure_locals: &HashMap<String, LocalInfo>,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
     let mut emit_final = |b: &mut FuncBuilder, final_proc: &str, finalized_addr: ValueId| {
         emit_final_proc_call(
@@ -26567,19 +26978,73 @@ pub(super) fn finalize_derived_array_descriptor_storage(
             finalized_addr,
         );
     };
-    finalize_derived_array_descriptor_storage_with(b, desc, layout, &mut emit_final);
+    finalize_derived_array_descriptor_storage_with(b, desc, layout, registry, &mut emit_final);
+}
+
+pub(super) fn derived_layout_needs_finalization(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    !layout.final_procs.is_empty()
+        || layout.fields.iter().any(|field| {
+            !field.pointer
+                && !field.allocatable
+                && field_derived_type_name(field)
+                    .and_then(|name| registry.get(&name))
+                    .is_some_and(|nested| derived_layout_needs_finalization(nested, registry))
+        })
+        || layout
+            .parent
+            .as_deref()
+            .and_then(|name| registry.get(name))
+            .is_some_and(|parent| derived_layout_needs_finalization(parent, registry))
+}
+
+fn call_descriptor_vtable_thunk_with_fallback<F>(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    slot_offset: i64,
+    args: Vec<ValueId>,
+    fallback: F,
+) where
+    F: FnOnce(&mut FuncBuilder),
+{
+    let vtable = load_array_desc_vtable_ptr(b, desc);
+    let vtable_raw = b.ptr_to_int(vtable);
+    let zero = b.const_i64(0);
+    let has_vtable = b.icmp(CmpOp::Ne, vtable_raw, zero);
+    let load_bb = b.create_block("derived_desc_thunk_load");
+    let call_bb = b.create_block("derived_desc_thunk_call");
+    let fallback_bb = b.create_block("derived_desc_thunk_fallback");
+    let done_bb = b.create_block("derived_desc_thunk_done");
+    b.cond_branch(has_vtable, load_bb, vec![], fallback_bb, vec![]);
+
+    b.set_block(load_bb);
+    let offset = b.const_i64(slot_offset);
+    let slot_ptr = b.gep(vtable, vec![offset], IrType::Int(IntWidth::I8));
+    let target = b.load_typed(slot_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let target_raw = b.ptr_to_int(target);
+    let has_target = b.icmp(CmpOp::Ne, target_raw, zero);
+    b.cond_branch(has_target, call_bb, vec![], fallback_bb, vec![]);
+
+    b.set_block(call_bb);
+    b.call(FuncRef::Indirect(target), args, IrType::Void);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(fallback_bb);
+    fallback(b);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
 }
 
 fn finalize_derived_descriptor_storage_if_allocated_direct(
     b: &mut FuncBuilder,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
     enabled: ValueId,
 ) {
-    if layout.final_procs.is_empty() {
-        return;
-    }
-
     let allocated = b.call(
         FuncRef::External("afs_allocated".into()),
         vec![desc],
@@ -26594,7 +27059,13 @@ fn finalize_derived_descriptor_storage_if_allocated_direct(
     b.cond_branch(should_finalize, bb_final, vec![], bb_done, vec![]);
 
     b.set_block(bb_final);
-    finalize_derived_array_descriptor_storage_direct(b, desc, layout);
+    call_descriptor_vtable_thunk_with_fallback(
+        b,
+        desc,
+        VTABLE_FINALIZE_DESCRIPTOR_OFFSET,
+        vec![desc],
+        |b| finalize_derived_array_descriptor_storage_direct(b, desc, layout, registry),
+    );
     b.branch(bb_done, vec![]);
 
     b.set_block(bb_done);
@@ -26609,11 +27080,8 @@ pub(super) fn finalize_derived_descriptor_storage_if_allocated(
     closure_locals: &HashMap<String, LocalInfo>,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
-    if layout.final_procs.is_empty() {
-        return;
-    }
-
     let allocated = b.call(
         FuncRef::External("afs_allocated".into()),
         vec![desc],
@@ -26626,14 +27094,23 @@ pub(super) fn finalize_derived_descriptor_storage_if_allocated(
     b.cond_branch(is_allocated, bb_final, vec![], bb_done, vec![]);
 
     b.set_block(bb_final);
-    finalize_derived_array_descriptor_storage(
+    call_descriptor_vtable_thunk_with_fallback(
         b,
-        st,
-        internal_funcs,
-        contained_host_refs,
-        closure_locals,
         desc,
-        layout,
+        VTABLE_FINALIZE_DESCRIPTOR_OFFSET,
+        vec![desc],
+        |b| {
+            finalize_derived_array_descriptor_storage(
+                b,
+                st,
+                internal_funcs,
+                contained_host_refs,
+                closure_locals,
+                desc,
+                layout,
+                registry,
+            );
+        },
     );
     b.branch(bb_done, vec![]);
 
@@ -26686,7 +27163,7 @@ pub(super) fn insert_implicit_dealloc(
                     .derived_type
                     .as_ref()
                     .and_then(|tn| type_layouts.get(tn))
-                    .is_some_and(|l| !l.final_procs.is_empty())
+                    .is_some_and(|l| derived_layout_needs_finalization(l, type_layouts))
         });
     if !needs_dealloc && !needs_finalization {
         return;
@@ -26748,6 +27225,7 @@ pub(super) fn insert_implicit_dealloc(
                             closure_locals,
                             info.addr,
                             layout,
+                            type_layouts,
                         );
                     }
                     deallocate_derived_descriptor_components_with_finalization(
@@ -26771,6 +27249,22 @@ pub(super) fn insert_implicit_dealloc(
                 if let Some(layout) = type_layouts.get(type_name) {
                     let rank = local_declared_rank(info);
                     let desc = (rank > 0).then(|| materialize_array_descriptor_for_info(b, info));
+                    if let Some(desc) = desc {
+                        // This nonowning descriptor still denotes live local
+                        // storage. Mark that storage present so descriptor
+                        // walkers visit every fixed-array element; the scratch
+                        // descriptor itself is never passed to deallocation.
+                        let flags = descriptor_flags(b, desc);
+                        let allocated = b.const_i32(1);
+                        let flags = b.bit_or(flags, allocated);
+                        store_byte_aggregate_field(
+                            b,
+                            desc,
+                            ARRAY_DESC_FLAGS_OFFSET,
+                            IrType::Int(IntWidth::I32),
+                            flags,
+                        );
+                    }
 
                     // The owner's FINAL runs while its components are intact.
                     if finalize_owned_locals {
@@ -26783,6 +27277,7 @@ pub(super) fn insert_implicit_dealloc(
                                 closure_locals,
                                 desc,
                                 layout,
+                                type_layouts,
                             );
                         } else {
                             finalize_derived_storage(
@@ -26791,6 +27286,7 @@ pub(super) fn insert_implicit_dealloc(
                                 internal_funcs,
                                 contained_host_refs,
                                 closure_locals,
+                                type_layouts,
                                 layout,
                                 info.addr,
                             );
@@ -27990,13 +28486,20 @@ pub(super) fn lower_array_element_addr(
 ) -> ValueId {
     let idx64 = compute_flat_elem_offset(b, locals, info, args, st, type_layouts);
     let base = array_base_addr(b, info);
-    let elem_ty = info
+    let derived_elem_ty = info
         .derived_type
         .as_deref()
         .filter(|name| !is_opaque_c_handle_name(name))
-        .and_then(|name| type_layouts.and_then(|tl| derived_storage_ir_type(name, tl)))
-        .unwrap_or_else(|| info.ty.clone());
-    b.gep(base, vec![idx64], elem_ty)
+        .and_then(|name| type_layouts.and_then(|tl| derived_storage_ir_type(name, tl)));
+    if let Some(elem_ty) = derived_elem_ty {
+        if local_uses_array_descriptor(info) {
+            let elem_bytes = array_elem_size_value(b, info);
+            let byte_offset = b.imul(idx64, elem_bytes);
+            return b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
+        }
+        return b.gep(base, vec![idx64], elem_ty);
+    }
+    b.gep(base, vec![idx64], info.ty.clone())
 }
 
 pub(super) fn emit_bounds_check(
@@ -29360,12 +29863,12 @@ pub(super) fn lower_runtime_array_constructor_descriptor(
         contained_host_refs,
         descriptor_params,
     )?;
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -29525,12 +30028,12 @@ fn lower_runtime_char_array_constructor_descriptor(
         descriptor_params,
     )?;
 
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -30700,7 +31203,7 @@ pub(super) fn lower_array_store(
         .filter(|name| !is_opaque_c_handle_name(name))
         .is_some()
     {
-        let elem_bytes = b.const_i64(ir_scalar_byte_size(&info.ty, b.layout));
+        let elem_bytes = array_elem_size_value(b, info);
         let byte_offset = b.imul(idx64, elem_bytes);
         let dest_ptr = b.gep(base, vec![byte_offset], IrType::Int(IntWidth::I8));
         emit_derived_value_copy(
@@ -31764,12 +32267,12 @@ fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
 }
 
 fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let size384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, size384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -34871,10 +35374,7 @@ pub(super) fn load_array_desc_i64_field(
 const ARRAY_DESC_RANK_OFFSET: i64 = 16;
 const ARRAY_DESC_FLAGS_OFFSET: i64 = 20;
 const ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET: i64 = 24;
-const ARRAY_DESC_SCALAR_VTABLE_OFFSET: i64 = 32;
-const ARRAY_DESC_DIMS_OFFSET: i64 = 24;
-const ARRAY_DESC_DIM_BYTES: i64 = 24;
-const ARRAY_DESC_MAX_RANK: i32 = 15;
+const ARRAY_DESC_VTABLE_OFFSET: i64 = 384;
 const ARRAY_DESC_FLAGS_LOW_BITS_MASK: i32 = 0x0000_00ff;
 const ARRAY_DESC_TYPE_TAG_COMPACT_MASK: i64 = 0x00ff_ffff;
 const ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT: i32 = 8;
@@ -34883,18 +35383,49 @@ const CLASS_STAR_TAG_INTRINSIC_PREFIX: u64 = 0x0AF5_C1A5_5000_0000;
 pub(super) fn load_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
     let scalar_tag = load_array_desc_i64_field(b, desc, ARRAY_DESC_SCALAR_TYPE_TAG_OFFSET);
     let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
+    let zero32 = b.const_i32(0);
+    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
+    let scalar_bb = b.create_block("desc_type_tag_load_scalar");
+    let array_bb = b.create_block("desc_type_tag_load_array");
+    let array_vtable_bb = b.create_block("desc_type_tag_load_array_vtable");
+    let array_compact_bb = b.create_block("desc_type_tag_load_array_compact");
+    let done_bb = b.create_block("desc_type_tag_load_done");
+    let result = b.add_block_param(done_bb, IrType::Int(IntWidth::I64));
+    b.cond_branch(is_scalar, scalar_bb, vec![], array_bb, vec![]);
+
+    b.set_block(scalar_bb);
+    b.branch(done_bb, vec![scalar_tag]);
+
+    b.set_block(array_bb);
+    let vtable = load_array_desc_vtable_ptr(b, desc);
+    let vtable_raw = b.ptr_to_int(vtable);
+    let zero64 = b.const_i64(0);
+    let has_vtable = b.icmp(CmpOp::Ne, vtable_raw, zero64);
+    b.cond_branch(
+        has_vtable,
+        array_vtable_bb,
+        vec![],
+        array_compact_bb,
+        vec![],
+    );
+
+    b.set_block(array_vtable_bb);
+    let full_tag = b.load_typed(vtable, IrType::Int(IntWidth::I64));
+    b.branch(done_bb, vec![full_tag]);
+
+    b.set_block(array_compact_bb);
     let flags = load_array_desc_i32_field(b, desc, ARRAY_DESC_FLAGS_OFFSET);
     let shift = b.const_i32(ARRAY_DESC_TYPE_TAG_FLAGS_SHIFT);
     let compact32 = b.lshr(flags, shift);
     let compact64 = b.int_extend(compact32, IntWidth::I64, false);
-    let zero64 = b.const_i64(0);
     let has_compact_tag = b.icmp(CmpOp::Ne, compact64, zero64);
     let prefix = b.const_i64(CLASS_STAR_TAG_INTRINSIC_PREFIX as i64);
     let reconstructed = b.bit_or(prefix, compact64);
     let array_tag = b.select(has_compact_tag, reconstructed, zero64);
-    let zero32 = b.const_i32(0);
-    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
-    b.select(is_scalar, scalar_tag, array_tag)
+    b.branch(done_bb, vec![array_tag]);
+
+    b.set_block(done_bb);
+    result
 }
 
 pub(super) fn lower_parameter_derived_component_const(
@@ -34949,49 +35480,10 @@ pub(super) fn lower_parameter_derived_component_const(
 }
 
 pub(super) fn load_array_desc_vtable_ptr(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
-    // Scalars keep their full vtable pointer in dims[0].upper_bound.
-    // Arrays use the first unused DimDescriptor's lower_bound slot; active
-    // dimension fields are observable through LBOUND/UBOUND and finalizers.
     let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
-    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
-    let zero32 = b.const_i32(0);
-    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
-    let scalar_bb = b.create_block("desc_vtable_scalar");
-    let array_check_bb = b.create_block("desc_vtable_array_check");
-    let array_load_bb = b.create_block("desc_vtable_array_load");
-    let null_bb = b.create_block("desc_vtable_null");
-    let done_bb = b.create_block("desc_vtable_done");
-    let result = b.add_block_param(done_bb, ptr_ty.clone());
-    b.cond_branch(is_scalar, scalar_bb, vec![], array_check_bb, vec![]);
-
-    b.set_block(scalar_bb);
-    let off = b.const_i64(ARRAY_DESC_SCALAR_VTABLE_OFFSET);
+    let off = b.const_i64(ARRAY_DESC_VTABLE_OFFSET);
     let ptr = b.gep(desc, vec![off], IrType::Int(IntWidth::I8));
-    let vtable = b.load_typed(ptr, ptr_ty.clone());
-    b.branch(done_bb, vec![vtable]);
-
-    b.set_block(array_check_bb);
-    let max_rank = b.const_i32(ARRAY_DESC_MAX_RANK);
-    let has_sidecar_slot = b.icmp(CmpOp::Lt, rank, max_rank);
-    b.cond_branch(has_sidecar_slot, array_load_bb, vec![], null_bb, vec![]);
-
-    b.set_block(array_load_bb);
-    let rank64 = b.int_extend(rank, IntWidth::I64, false);
-    let dim_bytes = b.const_i64(ARRAY_DESC_DIM_BYTES);
-    let sidecar_delta = b.imul(rank64, dim_bytes);
-    let dims_base = b.const_i64(ARRAY_DESC_DIMS_OFFSET);
-    let sidecar_off = b.iadd(dims_base, sidecar_delta);
-    let sidecar_ptr = b.gep(desc, vec![sidecar_off], IrType::Int(IntWidth::I8));
-    let sidecar_vtable = b.load_typed(sidecar_ptr, ptr_ty);
-    b.branch(done_bb, vec![sidecar_vtable]);
-
-    b.set_block(null_bb);
-    let zero64 = b.const_i64(0);
-    let null = b.int_to_ptr(zero64, IrType::Int(IntWidth::I8));
-    b.branch(done_bb, vec![null]);
-
-    b.set_block(done_bb);
-    result
+    b.load_typed(ptr, ptr_ty)
 }
 
 pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag: ValueId) {
@@ -35028,41 +35520,13 @@ pub(super) fn store_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId, tag:
 }
 
 pub(super) fn store_array_desc_vtable_ptr(b: &mut FuncBuilder, desc: ValueId, vtable_ptr: ValueId) {
-    let rank = load_array_desc_i32_field(b, desc, ARRAY_DESC_RANK_OFFSET);
-    let zero32 = b.const_i32(0);
-    let is_scalar = b.icmp(CmpOp::Eq, rank, zero32);
-    let scalar_bb = b.create_block("desc_vtable_store_scalar");
-    let array_check_bb = b.create_block("desc_vtable_store_array_check");
-    let array_store_bb = b.create_block("desc_vtable_store_array");
-    let done_bb = b.create_block("desc_vtable_store_done");
-    b.cond_branch(is_scalar, scalar_bb, vec![], array_check_bb, vec![]);
-
-    b.set_block(scalar_bb);
     store_byte_aggregate_field(
         b,
         desc,
-        ARRAY_DESC_SCALAR_VTABLE_OFFSET,
+        ARRAY_DESC_VTABLE_OFFSET,
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         vtable_ptr,
     );
-    b.branch(done_bb, vec![]);
-
-    b.set_block(array_check_bb);
-    let max_rank = b.const_i32(ARRAY_DESC_MAX_RANK);
-    let has_sidecar_slot = b.icmp(CmpOp::Lt, rank, max_rank);
-    b.cond_branch(has_sidecar_slot, array_store_bb, vec![], done_bb, vec![]);
-
-    b.set_block(array_store_bb);
-    let rank64 = b.int_extend(rank, IntWidth::I64, false);
-    let dim_bytes = b.const_i64(ARRAY_DESC_DIM_BYTES);
-    let sidecar_delta = b.imul(rank64, dim_bytes);
-    let dims_base = b.const_i64(ARRAY_DESC_DIMS_OFFSET);
-    let sidecar_off = b.iadd(dims_base, sidecar_delta);
-    let sidecar_ptr = b.gep(desc, vec![sidecar_off], IrType::Int(IntWidth::I8));
-    b.store(vtable_ptr, sidecar_ptr);
-    b.branch(done_bb, vec![]);
-
-    b.set_block(done_bb);
 }
 
 pub(super) fn store_scalar_polymorphic_descriptor_view(
@@ -35074,10 +35538,10 @@ pub(super) fn store_scalar_polymorphic_descriptor_view(
     lookup_ptr: Option<ValueId>,
 ) {
     let zero32 = b.const_i32(0);
-    let size384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, size384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     store_byte_aggregate_field(
@@ -35547,7 +36011,7 @@ pub(super) fn lower_alloc_section_read(
 ///
 /// Audit CRITICAL-3: multi-dim slice prints used to mis-dispatch
 /// through afs_create_section on a bare stack pointer and crash
-/// at runtime reading 384 bytes of garbage as a descriptor.
+/// at runtime reading 392 bytes of garbage as a descriptor.
 // Local intermediate `dim_data` collects per-dim values to release the
 // `dims` borrow before emitting IR; a one-shot named struct here would
 // just be ceremony.
@@ -36395,7 +36859,7 @@ pub(super) fn actual_is_descriptor_backed(
     };
 
     // Only array-shaped descriptor storage is an unconditional descriptor
-    // fallback. Rank-0 allocatable/pointer components also occupy a 384-byte
+    // fallback. Rank-0 allocatable/pointer components also occupy a 392-byte
     // runtime descriptor, but an ordinary scalar dummy expects the component's
     // payload address; descriptor association for scalar allocatable dummies is
     // driven by the callee mask instead.
@@ -36548,7 +37012,7 @@ pub(super) fn lower_bounds_remap_pointer_assignment(
     };
 
     let tgt_desc = array_descriptor_addr(b, &tgt_info);
-    let size = b.const_i64(384);
+    let size = b.const_i64(392);
     b.call(
         FuncRef::External("memcpy".into()),
         vec![tgt_desc, src_desc, size],
@@ -36711,10 +37175,10 @@ pub(super) fn lower_rank_remap_pointer_assignment(
 
     let desc = array_descriptor_addr(b, &tgt_info);
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -36817,12 +37281,12 @@ pub(super) fn materialize_array_descriptor_for_info(
     b: &mut FuncBuilder,
     info: &LocalInfo,
 ) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -36914,8 +37378,8 @@ pub(super) fn lower_descriptor_actual_from_info(
             if let Some(type_name) = info.derived_type.as_ref() {
                 if let Some(layout) = type_layouts.and_then(|layouts| layouts.get(type_name)) {
                     let src_desc = array_descriptor_addr(b, info);
-                    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-                    let size = b.const_i64(384);
+                    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+                    let size = b.const_i64(392);
                     b.call(
                         FuncRef::External("memcpy".into()),
                         vec![desc, src_desc, size],
@@ -36932,7 +37396,7 @@ pub(super) fn lower_descriptor_actual_from_info(
         }
         array_descriptor_addr(b, info)
     } else if local_declared_rank(info) == 0 && info.derived_type.is_some() {
-        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
         let base = if info.is_pointer {
             if info.by_ref {
                 let caller_slot =
@@ -36994,7 +37458,7 @@ pub(super) fn materialize_scalar_element_descriptor_from_info(
         if let Some((elem_base, elem_len)) =
             char_array_element_ptr_and_len(b, locals, info, args, st, type_layouts)
         {
-            let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             let tag = intrinsic_class_star_type_tag_for_type_info(
                 &crate::sema::symtab::TypeInfo::Character {
                     len: None,
@@ -37010,7 +37474,7 @@ pub(super) fn materialize_scalar_element_descriptor_from_info(
     let elem_addr = lower_array_element_addr(b, locals, info, args, st, type_layouts);
     let elem_raw = b.ptr_to_int(elem_addr);
     let elem_base = b.int_to_ptr(elem_raw, IrType::Int(IntWidth::I8));
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let semantic_type = local_semantic_type_info(info);
     let elem_size = info
         .derived_type
@@ -37076,8 +37540,8 @@ fn descriptor_with_polymorphic_type_tag(
         return desc;
     };
 
-    let tagged = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-    let size = b.const_i64(384);
+    let tagged = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let size = b.const_i64(392);
     b.call(
         FuncRef::External("memcpy".into()),
         vec![tagged, desc, size],
@@ -37314,7 +37778,7 @@ pub(super) fn box_actual_into_class_star_descriptor(
     {
         let (base_ptr, elem_size) =
             lower_string_expr_full(b, locals, expr, st, type_layouts, None, None, None);
-        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+        let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
         let type_tag =
             intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
                 .or_else(|| {
@@ -37427,7 +37891,7 @@ pub(super) fn box_actual_into_class_star_descriptor(
         box_value_into_addr(b, raw, &ty)
     };
 
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let elem_size = b.const_i64(elem_size_bytes);
     let type_tag =
         intrinsic_class_star_type_tag_value_for_expr(b, expr, Some(locals), st, type_layouts)
@@ -39506,12 +39970,12 @@ pub(super) fn lower_reshape_array_expr_descriptor(
     if pad_arg.is_none() && order_arg.is_none() {
         if let Some(extents) = reshape_shape_extents(shape_expr, st) {
             if !extents.is_empty() {
-                let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
                 let zero32 = b.const_i32(0);
-                let sz384 = b.const_i64(384);
+                let descriptor_bytes = b.const_i64(392);
                 b.call(
                     FuncRef::External("memset".into()),
-                    vec![desc, zero32, sz384],
+                    vec![desc, zero32, descriptor_bytes],
                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 );
                 let base_ptr = b.load_typed(source_desc, IrType::Ptr(Box::new(elem_ty.clone())));
@@ -39630,12 +40094,12 @@ pub(super) fn lower_reshape_array_expr_descriptor(
         null_ptr
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     b.call(
@@ -39848,12 +40312,12 @@ pub(super) fn lower_transfer_array_expr_descriptor(
     };
 
     // Build the rank-1 descriptor.
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     store_byte_aggregate_field(
@@ -39939,12 +40403,12 @@ pub(super) fn lower_array_count_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -40011,12 +40475,12 @@ pub(super) fn lower_array_logical_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -40089,12 +40553,12 @@ pub(super) fn lower_array_norm2_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let helper = match &elem_ty {
@@ -40201,12 +40665,12 @@ pub(super) fn lower_array_sum_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -40335,12 +40799,12 @@ pub(super) fn lower_array_product_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -40450,12 +40914,12 @@ pub(super) fn lower_array_minmax_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -40482,7 +40946,7 @@ fn null_array_descriptor_ptr(b: &mut FuncBuilder) -> ValueId {
     let zero = b.const_i64(0);
     b.int_to_ptr(
         zero,
-        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384),
+        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392),
     )
 }
 
@@ -40667,12 +41131,12 @@ pub(super) fn lower_array_location_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -40824,12 +41288,12 @@ pub(super) fn lower_array_findloc_dim_descriptor(
         _ => dim_raw,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero_i32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero_i32, sz384],
+        vec![result_desc, zero_i32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     b.call(
@@ -41167,12 +41631,12 @@ pub(super) fn lower_pack_array_expr_descriptor(
     let null_desc_ptr = b.int_to_ptr(null_desc, IrType::Int(IntWidth::I8));
     let vector_desc = vector_desc.unwrap_or(null_desc_ptr);
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -41234,7 +41698,7 @@ fn lower_pack_mask_descriptor(
     b.store(value, slot);
     let base_raw = b.ptr_to_int(slot);
     let base = b.int_to_ptr(base_raw, IrType::Int(IntWidth::I8));
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let elem_size = b.const_i64(1);
     store_scalar_polymorphic_descriptor_view(b, desc, base, Some(elem_size), None, None);
     Some(desc)
@@ -41305,12 +41769,12 @@ pub(super) fn lower_unpack_array_expr_descriptor(
         descriptor_params,
     )?;
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     b.call(
@@ -41389,12 +41853,12 @@ pub(super) fn lower_scalar_spread_array_expr_descriptor(
                 vec![source_desc],
                 IrType::Int(IntWidth::I64),
             );
-            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             let zero32 = b.const_i32(0);
-            let sz384 = b.const_i64(384);
+            let descriptor_bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memset".into()),
-                vec![result_desc, zero32, sz384],
+                vec![result_desc, zero32, descriptor_bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
 
@@ -41509,12 +41973,12 @@ pub(super) fn lower_scalar_spread_array_expr_descriptor(
         return None;
     }
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -41972,12 +42436,12 @@ fn lower_complex_part_array_descriptor(
         _ => return None,
     };
 
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -42200,12 +42664,12 @@ pub(super) fn allocate_rank1_array_descriptor_with_runtime_bounds(
     upper: ValueId,
     elem_size: ValueId,
 ) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -43457,12 +43921,12 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
     let elem_size = result_char_len
         .map(|len| b.const_i64(len))
         .unwrap_or_else(|| b.const_i64(ir_scalar_byte_size(&result_elem_ty, b.layout)));
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32_for_alloc = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32_for_alloc, sz384],
+        vec![result_desc, zero32_for_alloc, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let stat_for_alloc = b.alloca(IrType::Int(IntWidth::I32));
@@ -43716,12 +44180,12 @@ pub(super) fn lower_vector_subscript_gather_descriptor(
     );
 
     // Build a fresh rank-1 descriptor sized n with elem_ty.
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let elem_bytes_v = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
@@ -43783,12 +44247,12 @@ pub(super) fn allocate_like_array_temp_descriptor(
     b: &mut FuncBuilder,
     source_desc: ValueId,
 ) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -43802,12 +44266,12 @@ pub(super) fn allocate_like_array_temp_descriptor(
 }
 
 fn zeroed_array_temp_descriptor(b: &mut FuncBuilder) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     desc
@@ -43818,12 +44282,12 @@ pub(super) fn allocate_like_array_temp_descriptor_with_elem_type(
     source_desc: ValueId,
     elem_ty: &IrType,
 ) -> ValueId {
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, sz384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -44058,7 +44522,7 @@ pub(super) fn track_call_arg_array_temp_descriptor(
         Some(IrType::Ptr(inner))
             if matches!(
                 inner.as_ref(),
-                IrType::Array(elem, 384) if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
+                IrType::Array(elem, 392) if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
             )
     );
     if actual_expr_rank(expr, locals, st, type_layouts).is_some_and(|rank| rank > 0)
@@ -44314,12 +44778,12 @@ pub(super) fn lower_rank1_array_compare_descriptor(
     // gives callees a consistent 1-based view through `mask(:,:)`
     // dummies).  Element size differs from the source (Bool=4 vs.
     // potentially Real(8) source), so we cannot reuse afs_allocate_like.
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -45509,13 +45973,13 @@ pub(super) fn lower_array_expr_descriptor(
                                 if is_complex {
                                     let result_desc = b.alloca(IrType::Array(
                                         Box::new(IrType::Int(IntWidth::I8)),
-                                        384,
+                                        392,
                                     ));
                                     let zero = b.const_i32(0);
-                                    let sz384 = b.const_i64(384);
+                                    let descriptor_bytes = b.const_i64(392);
                                     b.call(
                                         FuncRef::External("memset".into()),
-                                        vec![result_desc, zero, sz384],
+                                        vec![result_desc, zero, descriptor_bytes],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
                                     b.call(
@@ -45587,13 +46051,13 @@ pub(super) fn lower_array_expr_descriptor(
                                 if let Some(fw) = real_lane {
                                     let result_desc = b.alloca(IrType::Array(
                                         Box::new(IrType::Int(IntWidth::I8)),
-                                        384,
+                                        392,
                                     ));
                                     let zero = b.const_i32(0);
-                                    let sz384 = b.const_i64(384);
+                                    let descriptor_bytes = b.const_i64(392);
                                     b.call(
                                         FuncRef::External("memset".into()),
-                                        vec![result_desc, zero, sz384],
+                                        vec![result_desc, zero, descriptor_bytes],
                                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                     );
                                     let runtime = if name.eq_ignore_ascii_case("abs") {
@@ -45930,12 +46394,12 @@ pub(super) fn lower_array_expr_descriptor(
                         descriptor_params,
                     );
 
-                    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
                     let zero32 = b.const_i32(0);
-                    let sz384 = b.const_i64(384);
+                    let descriptor_bytes = b.const_i64(392);
                     b.call(
                         FuncRef::External("memset".into()),
-                        vec![desc, zero32, sz384],
+                        vec![desc, zero32, descriptor_bytes],
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
                     store_byte_aggregate_field(
@@ -45977,12 +46441,12 @@ pub(super) fn lower_array_expr_descriptor(
                         let zero = b.const_i64(0);
                         let table_base = b.gep(slot, vec![zero], IrType::Int(IntWidth::I8));
                         let desc =
-                            b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                            b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
                         let zero32 = b.const_i32(0);
-                        let sz384 = b.const_i64(384);
+                        let descriptor_bytes = b.const_i64(392);
                         b.call(
                             FuncRef::External("memset".into()),
-                            vec![desc, zero32, sz384],
+                            vec![desc, zero32, descriptor_bytes],
                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         );
                         store_byte_aggregate_field(
@@ -46079,12 +46543,12 @@ pub(super) fn lower_array_expr_descriptor(
                 descriptor_params,
             );
 
-            let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             let zero32 = b.const_i32(0);
-            let sz384 = b.const_i64(384);
+            let descriptor_bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memset".into()),
-                vec![desc, zero32, sz384],
+                vec![desc, zero32, descriptor_bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
             store_byte_aggregate_field(b, desc, 0, IrType::Ptr(Box::new(elem_ty.clone())), base);
@@ -48258,11 +48722,12 @@ fn try_lower_alloc_return_call_into_descriptor_view(
     true
 }
 
-fn finalize_allocatable_derived_array_assignment_lhs(
+fn prepare_allocatable_derived_array_assignment_lhs_for_replacement(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
     dest_info: &LocalInfo,
     dest_desc: ValueId,
+    stat_addr: ValueId,
 ) {
     let Some(layout) = dest_info
         .derived_type
@@ -48279,25 +48744,134 @@ fn finalize_allocatable_derived_array_assignment_lhs(
         &ctx.locals,
         dest_desc,
         layout,
+        ctx.type_layouts,
     );
+    deallocate_derived_descriptor_components(b, dest_desc, layout, ctx.type_layouts, stat_addr);
 }
 
-fn prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+fn assign_dynamic_polymorphic_allocatable_array(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
     dest_info: &LocalInfo,
     dest_desc: ValueId,
-    stat_addr: ValueId,
+    source_desc: ValueId,
+    base_type: &str,
 ) {
-    let Some(layout) = dest_info
-        .derived_type
-        .as_deref()
-        .and_then(|type_name| ctx.type_layouts.get(type_name))
-    else {
-        return;
-    };
-    finalize_allocatable_derived_array_assignment_lhs(b, ctx, dest_info, dest_desc);
-    deallocate_derived_descriptor_components(b, dest_desc, layout, ctx.type_layouts, stat_addr);
+    let (source_desc, snapshot_desc) = stabilize_dynamic_array_assignment_source(
+        b,
+        dest_desc,
+        source_desc,
+        base_type,
+        ctx.type_layouts,
+    );
+    let done_bb = b.create_block("dynamic_array_assign_done");
+    // Array sections and other descriptor views do not own their storage, so
+    // DESC_ALLOCATED is intentionally clear even though they are valid RHSes.
+    let source_base = b.load_typed(
+        source_desc,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let source_base_raw = b.ptr_to_int(source_base);
+    let zero64 = b.const_i64(0);
+    let has_source = b.icmp(CmpOp::Ne, source_base_raw, zero64);
+    let zero32 = b.const_i32(0);
+    let copy_bb = b.create_block("dynamic_array_assign_copy");
+    let clear_bb = b.create_block("dynamic_array_assign_clear");
+    b.cond_branch(has_source, copy_bb, vec![], clear_bb, vec![]);
+
+    b.set_block(clear_bb);
+    let clear_stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, clear_stat);
+    prepare_allocatable_derived_array_assignment_lhs_for_replacement(
+        b, ctx, dest_info, dest_desc, clear_stat,
+    );
+    b.store(zero32, clear_stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, clear_stat],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let copy_stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, copy_stat);
+    prepare_allocatable_derived_array_assignment_lhs_for_replacement(
+        b, ctx, dest_info, dest_desc, copy_stat,
+    );
+    b.store(zero32, copy_stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![dest_desc, copy_stat],
+        IrType::Void,
+    );
+    b.store(zero32, copy_stat);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![dest_desc, source_desc, copy_stat],
+        IrType::Void,
+    );
+    let alloc_stat = b.load_typed(copy_stat, IrType::Int(IntWidth::I32));
+    let allocated = b.icmp(CmpOp::Eq, alloc_stat, zero32);
+    let deep_copy_bb = b.create_block("dynamic_array_assign_deep_copy");
+    b.cond_branch(allocated, deep_copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(deep_copy_bb);
+    emit_dynamic_derived_array_desc_copy(
+        b,
+        dest_desc,
+        source_desc,
+        copy_stat,
+        base_type,
+        ctx.type_layouts,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+    let layout = ctx
+        .type_layouts
+        .get(base_type)
+        .expect("dynamic array assignment requires its declared type layout");
+    discard_dynamic_assignment_snapshot(b, snapshot_desc, layout, ctx.type_layouts);
+}
+
+fn deallocate_dynamic_derived_array_descriptor(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    finalize_derived_descriptor_storage_if_allocated(
+        b,
+        ctx.st,
+        ctx.internal_funcs,
+        Some(ctx.contained_host_refs),
+        &ctx.locals,
+        desc,
+        layout,
+        ctx.type_layouts,
+    );
+    deallocate_derived_descriptor_components(b, desc, layout, ctx.type_layouts, stat);
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![desc, stat],
+        IrType::Void,
+    );
+}
+
+fn deallocate_dynamic_derived_array_expr_descriptor_if_temp(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    expr: &crate::ast::expr::SpannedExpr,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    if array_expr_descriptor_may_own_temp(expr, &ctx.locals, ctx.st) {
+        deallocate_dynamic_derived_array_descriptor(b, ctx, desc, layout);
+    }
 }
 
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
@@ -48450,8 +49024,11 @@ pub(super) fn lower_array_assign(
                     Some(ctx.descriptor_params),
                 ) {
                     if !derived_array_needs_deep_copy {
-                        finalize_allocatable_derived_array_assignment_lhs(
-                            b, ctx, dest_info, dest_desc,
+                        let stat = b.alloca(IrType::Int(IntWidth::I32));
+                        let zero32 = b.const_i32(0);
+                        b.store(zero32, stat);
+                        prepare_allocatable_derived_array_assignment_lhs_for_replacement(
+                            b, ctx, dest_info, dest_desc, stat,
                         );
                         b.call(
                             FuncRef::External("afs_assign_allocatable".into()),
@@ -48474,7 +49051,7 @@ pub(super) fn lower_array_assign(
                             let stat = b.alloca(IrType::Int(IntWidth::I32));
                             let zero32 = b.const_i32(0);
                             b.store(zero32, stat);
-                            prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+                            prepare_allocatable_derived_array_assignment_lhs_for_replacement(
                                 b, ctx, dest_info, dest_desc, stat,
                             );
                             b.call(
@@ -48609,12 +49186,12 @@ pub(super) fn lower_array_assign(
                     if let (Some(sk), Some(dk)) = (src_kind_tag, dest_kind_tag) {
                         if sk != dk {
                             let tmp_desc =
-                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+                                b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
                             let zero32 = b.const_i32(0);
-                            let sz384 = b.const_i64(384);
+                            let descriptor_bytes = b.const_i64(392);
                             b.call(
                                 FuncRef::External("memset".into()),
-                                vec![tmp_desc, zero32, sz384],
+                                vec![tmp_desc, zero32, descriptor_bytes],
                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             );
                             lower_alloc_return_call_into_desc(
@@ -48644,8 +49221,24 @@ pub(super) fn lower_array_assign(
                     if call_mentions_dest || dest_info.derived_type.is_some() {
                         let tmp_desc = zeroed_array_temp_descriptor(b);
                         lower_alloc_return_call_into_desc(b, ctx, tmp_desc, callee_name, call_args);
-                        finalize_allocatable_derived_array_assignment_lhs(
-                            b, ctx, dest_info, dest_desc,
+                        if dest_info.is_class {
+                            if let Some(base_type) = dest_info.derived_type.as_deref() {
+                                if let Some(layout) = ctx.type_layouts.get(base_type).cloned() {
+                                    assign_dynamic_polymorphic_allocatable_array(
+                                        b, ctx, dest_info, dest_desc, tmp_desc, base_type,
+                                    );
+                                    deallocate_dynamic_derived_array_descriptor(
+                                        b, ctx, tmp_desc, &layout,
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        let stat = b.alloca(IrType::Int(IntWidth::I32));
+                        let zero32 = b.const_i32(0);
+                        b.store(zero32, stat);
+                        prepare_allocatable_derived_array_assignment_lhs_for_replacement(
+                            b, ctx, dest_info, dest_desc, stat,
                         );
                         b.call(
                             FuncRef::External("afs_assign_allocatable".into()),
@@ -48690,6 +49283,19 @@ pub(super) fn lower_array_assign(
             Some(ctx.contained_host_refs),
             Some(ctx.descriptor_params),
         ) {
+            if dest_info.is_class {
+                if let Some(base_type) = dest_info.derived_type.as_deref() {
+                    if let Some(layout) = ctx.type_layouts.get(base_type).cloned() {
+                        assign_dynamic_polymorphic_allocatable_array(
+                            b, ctx, dest_info, dest_desc, src_desc, base_type,
+                        );
+                        deallocate_dynamic_derived_array_expr_descriptor_if_temp(
+                            b, ctx, value, src_desc, &layout,
+                        );
+                        return;
+                    }
+                }
+            }
             if !derived_array_needs_deep_copy {
                 let mut assign_src_desc = src_desc;
                 let tmp_src_desc = if !dest_name.is_empty() && expr_mentions_name(value, dest_name)
@@ -48768,7 +49374,12 @@ pub(super) fn lower_array_assign(
                         return;
                     }
                 }
-                finalize_allocatable_derived_array_assignment_lhs(b, ctx, dest_info, dest_desc);
+                let stat = b.alloca(IrType::Int(IntWidth::I32));
+                let zero32 = b.const_i32(0);
+                b.store(zero32, stat);
+                prepare_allocatable_derived_array_assignment_lhs_for_replacement(
+                    b, ctx, dest_info, dest_desc, stat,
+                );
                 b.call(
                     FuncRef::External("afs_assign_allocatable".into()),
                     vec![dest_desc, assign_src_desc],
@@ -48816,7 +49427,7 @@ pub(super) fn lower_array_assign(
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);
-                    prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+                    prepare_allocatable_derived_array_assignment_lhs_for_replacement(
                         b, ctx, dest_info, dest_desc, stat,
                     );
                     b.call(
@@ -48911,7 +49522,7 @@ pub(super) fn lower_array_assign(
                     let stat = b.alloca(IrType::Int(IntWidth::I32));
                     let zero32 = b.const_i32(0);
                     b.store(zero32, stat);
-                    prepare_allocatable_derived_array_assignment_lhs_for_deallocation(
+                    prepare_allocatable_derived_array_assignment_lhs_for_replacement(
                         b, ctx, dest_info, dest_desc, stat,
                     );
                     b.call(
@@ -50041,11 +50652,11 @@ pub(super) fn lower_array_section_with_vector_subscripts(
     // each kept dim having lower_bound 1 and extent = result_extents[k].
     // afs_allocate_array fills in the heap base and computes column-major
     // strides (1, ext0, ext0*ext1, ...).
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
-    let sz384 = b.const_i64(384);
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero32, sz384],
+        vec![result_desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
     let dim_buf_words = (3 * result_rank) as u64;
@@ -50338,13 +50949,13 @@ pub(super) fn lower_array_section(
         }
     }
 
-    // Allocate result descriptor on stack (384 bytes).
-    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    // Allocate result descriptor on stack (392 bytes).
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero = b.const_i32(0);
-    let sz384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![result_desc, zero, sz384],
+        vec![result_desc, zero, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -50360,6 +50971,11 @@ pub(super) fn lower_array_section(
         vec![source_desc, result_desc, specs, ndims],
         IrType::Void,
     );
+
+    let type_tag = load_array_desc_type_tag(b, source_desc);
+    store_array_desc_type_tag(b, result_desc, type_tag);
+    let vtable = load_array_desc_vtable_ptr(b, source_desc);
+    store_array_desc_vtable_ptr(b, result_desc, vtable);
 
     result_desc
 }
@@ -50546,7 +51162,7 @@ pub(super) fn lower_scalar_allocated_intrinsic(
             let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
             if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32 {
                 (field_ptr, true)
-            } else if field.allocatable && field.size == 384 {
+            } else if field.allocatable && field.size == 392 {
                 (field_ptr, false)
             } else {
                 return None;
@@ -50614,7 +51230,7 @@ fn lower_allocated_component_through_descriptor_array_element(
     let field = layout_component_field_or_parent_view(layout, component, tl)?.clone();
     let is_string = if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32 {
         true
-    } else if field.allocatable && field.size == 384 {
+    } else if field.allocatable && field.size == 392 {
         false
     } else {
         return None;
@@ -50765,18 +51381,17 @@ fn projected_scalar_component_local_info(
 
     let elem_ty = field_storage_ir_type(&field, tl);
     let elem_bytes = field.size as i64;
-    let record_bytes = layout.size as i64;
-    if elem_bytes <= 0 || record_bytes <= 0 || record_bytes % elem_bytes != 0 {
+    let declared_record_bytes = layout.size as i64;
+    if elem_bytes <= 0 || declared_record_bytes <= 0 || declared_record_bytes % elem_bytes != 0 {
         return None;
     }
-    let record_stride_elems = record_bytes / elem_bytes;
-
-    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+    let record_stride_elems = declared_record_bytes / elem_bytes;
+    let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
-    let size384 = b.const_i64(384);
+    let descriptor_bytes = b.const_i64(392);
     b.call(
         FuncRef::External("memset".into()),
-        vec![desc, zero32, size384],
+        vec![desc, zero32, descriptor_bytes],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
@@ -50798,9 +51413,10 @@ fn projected_scalar_component_local_info(
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes_val);
     let rank_val = b.const_i32(rank as i32);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank_val);
+
     let flags = if record_stride_elems == 1 { 2 } else { 0 };
-    let flags_val = b.const_i32(flags);
-    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags_val);
+    let flags = b.const_i32(flags);
+    store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
 
     for dim_idx in 0..rank {
         let dim_off = 24 + (dim_idx as i64) * 24;
@@ -51658,7 +52274,7 @@ pub(super) fn lower_array_intrinsic(
     // Bail before any IR emission if `name` isn't one of the array
     // intrinsics this dispatcher handles.  The function originally fell
     // through to the unconditional `lower_array_expr_descriptor` below
-    // (which materialises a 384-byte descriptor + memset +
+    // (which materialises a 392-byte descriptor + memset +
     // afs_create_section for the first arg) and only THEN matched on
     // `name`, returning None for unknown intrinsics — at which point
     // the descriptor was already emitted.  expr.rs's FunctionCall
@@ -51772,7 +52388,7 @@ pub(super) fn lower_array_intrinsic(
     // Sprint 09: static-fold size/lbound/ubound when both the array's
     // shape is compile-time-known AND (for the dim-form) the dim
     // argument is a literal. Runs before `lower_array_expr_descriptor`
-    // so we never pay for the 384-byte descriptor materialization a
+    // so we never pay for the 392-byte descriptor materialization a
     // foldable intrinsic would otherwise trigger via the always-Some
     // `materialize_array_descriptor_for_info` branch in that helper.
     if let Some(info) = first_arg_info.as_ref() {
@@ -52582,12 +53198,12 @@ pub(super) fn lower_array_intrinsic(
                 (false, false) => None,
             };
             let is_real = complex_fw.is_none() && first_arg_is_real(args, locals);
-            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             let zero = b.const_i32(0);
-            let sz384 = b.const_i64(384);
+            let descriptor_bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memset".into()),
-                vec![result_desc, zero, sz384],
+                vec![result_desc, zero, descriptor_bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
             let (func, lhs_desc, rhs_desc) = if let Some(fw) = complex_fw {
@@ -52616,12 +53232,12 @@ pub(super) fn lower_array_intrinsic(
         "transpose" => {
             // TRANSPOSE(source) → allocate result descriptor, dispatch by type.
             let is_real = first_arg_is_real(args, locals);
-            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             let zero = b.const_i32(0);
-            let sz384 = b.const_i64(384);
+            let descriptor_bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memset".into()),
-                vec![result_desc, zero, sz384],
+                vec![result_desc, zero, descriptor_bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
             let func = if is_real {
@@ -52651,12 +53267,12 @@ pub(super) fn lower_array_intrinsic(
                     None
                 }
             });
-            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384));
+            let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
             let zero = b.const_i32(0);
-            let sz384 = b.const_i64(384);
+            let descriptor_bytes = b.const_i64(392);
             b.call(
                 FuncRef::External("memset".into()),
-                vec![result_desc, zero, sz384],
+                vec![result_desc, zero, descriptor_bytes],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
             let func = if matches!(kind, Some(8)) {
@@ -52977,7 +53593,7 @@ pub(super) fn derived_layout_needs_deep_copy(
         if field.allocatable && is_deferred_char_component_field(field) {
             return true;
         }
-        if field.allocatable && field.size == 384 {
+        if field.allocatable && field.size == 392 {
             return true;
         }
         if !field.pointer && !field.allocatable {
@@ -53100,7 +53716,7 @@ pub(super) fn clear_derived_storage_for_intent_out(
             continue;
         }
 
-        if field.allocatable && field.size == 384 {
+        if field.allocatable && field.size == 392 {
             b.call(
                 FuncRef::External("afs_deallocate_array".into()),
                 vec![field_ptr, stat_addr],
@@ -53316,6 +53932,35 @@ fn deallocate_derived_descriptor_components_guarded(
     finalize: ValueId,
     active_types: &mut HashSet<String>,
 ) {
+    let desc_ptr = ptr_i8_value(b, desc);
+    call_descriptor_vtable_thunk_with_fallback(
+        b,
+        desc,
+        VTABLE_DEALLOC_DESCRIPTOR_OFFSET,
+        vec![desc_ptr, stat_addr, finalize],
+        |b| {
+            deallocate_derived_descriptor_components_guarded_static(
+                b,
+                desc,
+                layout,
+                registry,
+                stat_addr,
+                finalize,
+                active_types,
+            );
+        },
+    );
+}
+
+fn deallocate_derived_descriptor_components_guarded_static(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+    finalize: ValueId,
+    active_types: &mut HashSet<String>,
+) {
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
@@ -53485,13 +54130,14 @@ fn emit_deallocate_derived_storage_components_inline(
             continue;
         }
 
-        if field.allocatable && field.size == 384 {
+        if field.allocatable && field.size == 392 {
             if let Some(nested_name) = field_derived_type_name(field) {
                 if let Some(nested_layout) = registry.get(&nested_name) {
                     finalize_derived_descriptor_storage_if_allocated_direct(
                         b,
                         field_ptr,
                         nested_layout,
+                        registry,
                         finalize,
                     );
                     deallocate_derived_descriptor_components_guarded(
@@ -53865,7 +54511,7 @@ pub(super) fn resolve_component_base(
                     // pointee base in the descriptor's base_addr field.
                     // Chained accesses must walk through that indirection.
                     b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
-                } else if field.size == 384 && field.allocatable {
+                } else if field.size == 392 && field.allocatable {
                     // Scalar allocatable derived components are stored in an
                     // ArrayDescriptor slot. Chained accesses must walk the
                     // pointee base, not the descriptor header itself.
@@ -54025,7 +54671,7 @@ pub(super) fn fixed_char_component_data_ptr(
     field_ptr: ValueId,
     field: &crate::sema::type_layout::FieldLayout,
 ) -> ValueId {
-    if field.pointer || (field.allocatable && field.size == 384) {
+    if field.pointer || (field.allocatable && field.size == 392) {
         b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
     } else {
         field_ptr
@@ -54234,7 +54880,7 @@ pub(super) fn field_storage_ir_type(
 }
 
 pub(super) fn field_uses_array_descriptor(field: &crate::sema::type_layout::FieldLayout) -> bool {
-    field.size == 384
+    field.size == 392
         && (field.allocatable || field.pointer)
         && (field.declared_array || !field.dims.is_empty())
 }
@@ -54250,7 +54896,7 @@ pub(super) fn scalar_allocatable_derived_component_payload_addr(
     if field_derived_type_name(&field).is_some()
         && field.dims.is_empty()
         && !field.declared_array
-        && field.size == 384
+        && field.size == 392
         && (field.allocatable || field.pointer)
         && !field.procedure_pointer
     {
@@ -54727,7 +55373,7 @@ pub(super) fn hidden_result_temp_bytes_for_callee(
 ) -> Option<u64> {
     match abi {
         HiddenResultAbi::None => None,
-        HiddenResultAbi::ArrayDescriptor => Some(384),
+        HiddenResultAbi::ArrayDescriptor => Some(392),
         HiddenResultAbi::StringDescriptor => Some(32),
         HiddenResultAbi::DerivedAggregate => {
             let type_name = first_procedure_lookup(abi_lookup_keys, |k| {
@@ -54928,7 +55574,7 @@ fn emit_derived_value_copy_inline(
             continue;
         }
 
-        if field.allocatable && field.size == 384 {
+        if field.allocatable && field.size == 392 {
             // Intrinsic assignment of derived values must deep-copy
             // allocatable components instead of aliasing their
             // descriptors. A raw memcpy here makes sibling copies of
@@ -55259,8 +55905,8 @@ pub(super) fn store_derived_field_expr(
                         b.store(ptr, field_ptr);
                         return;
                     }
-                    if src_field.pointer && src_field.size == 384 {
-                        emit_memcpy_bytes(b, field_ptr, src_field_ptr, 384);
+                    if src_field.pointer && src_field.size == 392 {
+                        emit_memcpy_bytes(b, field_ptr, src_field_ptr, 392);
                         return;
                     }
                     if src_field.pointer {
@@ -56111,9 +56757,7 @@ pub(super) fn emit_derived_array_desc_copy(
     dest_desc: ValueId,
     source_desc: ValueId,
 ) {
-    if derived_layout_needs_deep_copy(layout, type_layouts)
-        || derived_layout_needs_runtime_initialization(layout, type_layouts)
-    {
+    if derived_layout_needs_deep_copy(layout, type_layouts) {
         if !derived_memory_helper_available_xmodule(b, layout) {
             emit_derived_array_desc_copy_inline(b, type_layouts, layout, dest_desc, source_desc);
             return;
@@ -56147,8 +56791,6 @@ fn emit_derived_array_desc_copy_inline(
         vec![dest_desc],
         IrType::Int(IntWidth::I64),
     );
-    let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
-    let src_stride = load_array_desc_i64_field(b, source_desc, 24 + 16);
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let src_base = b.load_typed(
         source_desc,
@@ -56173,11 +56815,11 @@ fn emit_derived_array_desc_copy_inline(
     b.cond_branch(done, bb_exit, vec![], bb_body, vec![i]);
 
     b.set_block(bb_body);
-    let dest_index = b.imul(i_val, dest_stride);
+    let dest_index = array_descriptor_flat_element_offset(b, dest_desc, i_val);
     let dest_off = b.imul(dest_index, elem_bytes_val);
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
 
-    let src_index = b.imul(i_val, src_stride);
+    let src_index = array_descriptor_flat_element_offset(b, source_desc, i_val);
     let src_off = b.imul(src_index, elem_bytes_val);
     let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
 
@@ -56192,6 +56834,313 @@ fn emit_derived_array_desc_copy_inline(
     let lookup = load_array_desc_vtable_ptr(b, source_desc);
     store_array_desc_type_tag(b, dest_desc, tag);
     store_array_desc_vtable_ptr(b, dest_desc, lookup);
+}
+
+fn emit_dynamic_derived_scalar_copy_fallback(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    dest_base: ValueId,
+    source_base: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let candidates = concrete_type_dispatch_candidates(type_layouts, base_type);
+    if candidates.is_empty() {
+        b.call(
+            FuncRef::External("afs_assign_allocatable".into()),
+            vec![dest_desc, source_desc],
+            IrType::Void,
+        );
+        return;
+    }
+
+    let source_tag = load_array_desc_type_tag(b, source_desc);
+    let fallback_bb = b.create_block("alloc_source_copy_fallback");
+    let done_bb = b.create_block("alloc_source_copy_fallback_done");
+    let test_blocks: Vec<BlockId> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| b.create_block(&format!("alloc_source_copy_test_{}", i)))
+        .collect();
+    let case_blocks: Vec<BlockId> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| b.create_block(&format!("alloc_source_copy_case_{}", i)))
+        .collect();
+    b.branch(test_blocks[0], vec![]);
+
+    for (idx, ((type_tag, type_name), case_bb)) in
+        candidates.iter().zip(case_blocks.iter()).enumerate()
+    {
+        b.set_block(test_blocks[idx]);
+        let want_tag = b.const_i64(*type_tag as i64);
+        let is_match = b.icmp(CmpOp::Eq, source_tag, want_tag);
+        let next_bb = if idx + 1 < test_blocks.len() {
+            test_blocks[idx + 1]
+        } else {
+            fallback_bb
+        };
+        b.cond_branch(is_match, *case_bb, vec![], next_bb, vec![]);
+
+        b.set_block(*case_bb);
+        emit_derived_value_copy(b, type_layouts, type_name, dest_base, source_base);
+        b.branch(done_bb, vec![]);
+    }
+
+    b.set_block(fallback_bb);
+    b.call(
+        FuncRef::External("afs_assign_allocatable".into()),
+        vec![dest_desc, source_desc],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+fn emit_dynamic_derived_scalar_copy(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let source_base = b.load_typed(
+        source_desc,
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let dest_arg = ptr_i8_value(b, dest_base);
+    let source_arg = ptr_i8_value(b, source_base);
+    call_descriptor_vtable_thunk_with_fallback(
+        b,
+        source_desc,
+        VTABLE_COPY_VALUE_OFFSET,
+        vec![dest_arg, source_arg],
+        |b| {
+            emit_dynamic_derived_scalar_copy_fallback(
+                b,
+                dest_desc,
+                source_desc,
+                dest_base,
+                source_base,
+                base_type,
+                type_layouts,
+            )
+        },
+    );
+    let tag = load_array_desc_type_tag(b, source_desc);
+    let vtable = load_array_desc_vtable_ptr(b, source_desc);
+    store_array_desc_type_tag(b, dest_desc, tag);
+    store_array_desc_vtable_ptr(b, dest_desc, vtable);
+}
+
+pub(super) fn stabilize_dynamic_scalar_assignment_source(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> (ValueId, ValueId) {
+    let snapshot_desc = zeroed_array_temp_descriptor(b);
+    let overlaps = b.call(
+        FuncRef::External("afs_descriptors_overlap".into()),
+        vec![dest_desc, source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero32 = b.const_i32(0);
+    let aliases_dest = b.icmp(CmpOp::Ne, overlaps, zero32);
+    let snapshot_bb = b.create_block("scalar_assign_snapshot_source");
+    let direct_bb = b.create_block("scalar_assign_direct_source");
+    let done_bb = b.create_block("scalar_assign_source_done");
+    let effective_source = b.add_block_param(done_bb, ptr_i8_ty());
+    b.cond_branch(aliases_dest, snapshot_bb, vec![], direct_bb, vec![]);
+
+    b.set_block(snapshot_bb);
+    let null_stat = b.const_i64(0);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![snapshot_desc, source_desc, null_stat],
+        IrType::Void,
+    );
+    emit_dynamic_derived_scalar_copy(b, snapshot_desc, source_desc, base_type, type_layouts);
+    let snapshot_arg = ptr_i8_value(b, snapshot_desc);
+    b.branch(done_bb, vec![snapshot_arg]);
+
+    b.set_block(direct_bb);
+    let source_arg = ptr_i8_value(b, source_desc);
+    b.branch(done_bb, vec![source_arg]);
+
+    b.set_block(done_bb);
+    (effective_source, snapshot_desc)
+}
+
+pub(super) fn discard_dynamic_assignment_snapshot(
+    b: &mut FuncBuilder,
+    snapshot_desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero32 = b.const_i32(0);
+    b.store(zero32, stat);
+    let finalize = b.const_i32(0);
+    let mut active = HashSet::new();
+    deallocate_derived_descriptor_components_guarded(
+        b,
+        snapshot_desc,
+        layout,
+        type_layouts,
+        stat,
+        finalize,
+        &mut active,
+    );
+    b.store(zero32, stat);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![snapshot_desc, stat],
+        IrType::Void,
+    );
+}
+
+fn stabilize_dynamic_array_assignment_source(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> (ValueId, ValueId) {
+    let snapshot_desc = zeroed_array_temp_descriptor(b);
+    let overlaps = b.call(
+        FuncRef::External("afs_descriptors_overlap".into()),
+        vec![dest_desc, source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero32 = b.const_i32(0);
+    let needs_snapshot = b.icmp(CmpOp::Ne, overlaps, zero32);
+    let snapshot_bb = b.create_block("array_assign_snapshot_source");
+    let direct_bb = b.create_block("array_assign_direct_source");
+    let done_bb = b.create_block("array_assign_source_done");
+    let effective_source = b.add_block_param(done_bb, ptr_i8_ty());
+    b.cond_branch(needs_snapshot, snapshot_bb, vec![], direct_bb, vec![]);
+
+    b.set_block(snapshot_bb);
+    let null_stat = b.const_i64(0);
+    b.call(
+        FuncRef::External("afs_allocate_like".into()),
+        vec![snapshot_desc, source_desc, null_stat],
+        IrType::Void,
+    );
+    let copy_stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, copy_stat);
+    emit_dynamic_derived_array_desc_copy(
+        b,
+        snapshot_desc,
+        source_desc,
+        copy_stat,
+        base_type,
+        type_layouts,
+    );
+    let snapshot_arg = ptr_i8_value(b, snapshot_desc);
+    b.branch(done_bb, vec![snapshot_arg]);
+
+    b.set_block(direct_bb);
+    let source_arg = ptr_i8_value(b, source_desc);
+    b.branch(done_bb, vec![source_arg]);
+
+    b.set_block(done_bb);
+    (effective_source, snapshot_desc)
+}
+
+fn emit_dynamic_derived_array_copy_fallback(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    stat_addr: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let candidates = concrete_type_dispatch_candidates(type_layouts, base_type);
+    if candidates.is_empty() {
+        b.call(
+            FuncRef::External("afs_copy_array_data".into()),
+            vec![dest_desc, source_desc, stat_addr],
+            IrType::Void,
+        );
+        return;
+    }
+
+    let source_tag = load_array_desc_type_tag(b, source_desc);
+    let fallback_bb = b.create_block("array_assign_copy_fallback");
+    let done_bb = b.create_block("array_assign_copy_fallback_done");
+    let test_blocks: Vec<BlockId> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| b.create_block(&format!("array_assign_copy_test_{}", i)))
+        .collect();
+    let case_blocks: Vec<BlockId> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, _)| b.create_block(&format!("array_assign_copy_case_{}", i)))
+        .collect();
+    b.branch(test_blocks[0], vec![]);
+
+    for (idx, ((type_tag, type_name), case_bb)) in
+        candidates.iter().zip(case_blocks.iter()).enumerate()
+    {
+        b.set_block(test_blocks[idx]);
+        let want_tag = b.const_i64(*type_tag as i64);
+        let is_match = b.icmp(CmpOp::Eq, source_tag, want_tag);
+        let next_bb = if idx + 1 < test_blocks.len() {
+            test_blocks[idx + 1]
+        } else {
+            fallback_bb
+        };
+        b.cond_branch(is_match, *case_bb, vec![], next_bb, vec![]);
+
+        b.set_block(*case_bb);
+        if let Some(layout) = type_layouts.get(type_name) {
+            emit_derived_array_desc_copy(b, type_layouts, layout, dest_desc, source_desc);
+        }
+        b.branch(done_bb, vec![]);
+    }
+
+    b.set_block(fallback_bb);
+    b.call(
+        FuncRef::External("afs_copy_array_data".into()),
+        vec![dest_desc, source_desc, stat_addr],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+fn emit_dynamic_derived_array_desc_copy(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    stat_addr: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let dest_arg = ptr_i8_value(b, dest_desc);
+    let source_arg = ptr_i8_value(b, source_desc);
+    call_descriptor_vtable_thunk_with_fallback(
+        b,
+        source_desc,
+        VTABLE_COPY_ARRAY_DESCRIPTOR_OFFSET,
+        vec![dest_arg, source_arg],
+        |b| {
+            emit_dynamic_derived_array_copy_fallback(
+                b,
+                dest_desc,
+                source_desc,
+                stat_addr,
+                base_type,
+                type_layouts,
+            )
+        },
+    );
 }
 
 pub(super) fn emit_allocatable_source_copy_on_success(
@@ -56251,49 +57200,14 @@ pub(super) fn emit_allocatable_source_copy_on_success(
                 true
             }
             Some(ScalarAllocSourceCopyPlan::Dynamic(base_type)) => {
-                let candidates = concrete_type_dispatch_candidates(type_layouts, base_type);
-                if candidates.is_empty() {
-                    false
-                } else {
-                    let source_tag = load_array_desc_type_tag(b, source_desc);
-                    let dest_base =
-                        b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    let source_base = b.load_typed(
-                        source_desc,
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                    );
-                    let fallback = b.create_block("alloc_source_dispatch_fallback");
-                    let test_blocks: Vec<BlockId> = candidates
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| b.create_block(&format!("alloc_source_dispatch_test_{}", i)))
-                        .collect();
-                    let case_blocks: Vec<BlockId> = candidates
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| b.create_block(&format!("alloc_source_dispatch_case_{}", i)))
-                        .collect();
-                    b.branch(test_blocks[0], vec![]);
-                    for (idx, ((type_tag, type_name), case_bb)) in
-                        candidates.iter().zip(case_blocks.iter()).enumerate()
-                    {
-                        b.set_block(test_blocks[idx]);
-                        let want_tag = b.const_i64(*type_tag as i64);
-                        let is_match = b.icmp(CmpOp::Eq, source_tag, want_tag);
-                        let next_bb = if idx + 1 < test_blocks.len() {
-                            test_blocks[idx + 1]
-                        } else {
-                            fallback
-                        };
-                        b.cond_branch(is_match, *case_bb, vec![], next_bb, vec![]);
-
-                        b.set_block(*case_bb);
-                        emit_derived_value_copy(b, type_layouts, type_name, dest_base, source_base);
-                        b.branch(done_bb, vec![]);
-                    }
-                    b.set_block(fallback);
-                    false
-                }
+                emit_dynamic_derived_scalar_copy(
+                    b,
+                    dest_desc,
+                    source_desc,
+                    base_type,
+                    type_layouts,
+                );
+                true
             }
             None => false,
         };
@@ -56367,12 +57281,9 @@ pub(super) fn derived_type_tag_value(
 pub(super) fn type_layout_vtable_symbol(
     layout: &crate::sema::type_layout::TypeLayout,
 ) -> Option<String> {
-    if layout.bound_procs.is_empty() {
-        return None;
-    }
     if let Some(owner) = layout.owner_module.as_ref() {
         return Some(format!(
-            "afs_vtable_{}_{}",
+            "afs_vtable_v2_{}_{}",
             owner.to_lowercase(),
             layout.name.to_lowercase()
         ));
@@ -56384,14 +57295,26 @@ pub(super) fn type_layout_vtable_symbol(
     layout.align.hash(&mut hasher);
     layout.parent.hash(&mut hasher);
     layout.is_abstract.hash(&mut hasher);
+    for field in &layout.fields {
+        field.name.to_lowercase().hash(&mut hasher);
+        field.offset.hash(&mut hasher);
+        field.size.hash(&mut hasher);
+        field.dims.hash(&mut hasher);
+        field.allocatable.hash(&mut hasher);
+        field.pointer.hash(&mut hasher);
+    }
     for bp in &layout.bound_procs {
         bp.method_name.to_lowercase().hash(&mut hasher);
         bp.target_name.to_lowercase().hash(&mut hasher);
         bp.abi_name.to_lowercase().hash(&mut hasher);
         bp.nopass.hash(&mut hasher);
     }
+    for final_proc in &layout.final_procs {
+        final_proc.name.to_lowercase().hash(&mut hasher);
+        final_proc.rank.hash(&mut hasher);
+    }
     Some(format!(
-        "afs_vtable_local_{:016x}_{}",
+        "afs_vtable_v2_local_{:016x}_{}",
         hasher.finish(),
         layout.name.to_lowercase()
     ))
@@ -56800,7 +57723,7 @@ pub(super) fn resolve_component_base_for_method(
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(inner_addr, vec![offset], IrType::Int(IntWidth::I8));
             if let Some(nested_type) = field_derived_type_name(&field) {
-                let addr = if field.size == 384 && (field.allocatable || field.pointer) {
+                let addr = if field.size == 392 && (field.allocatable || field.pointer) {
                     b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                 } else {
                     field_ptr
@@ -57524,7 +58447,7 @@ pub(super) fn lower_arg_by_ref_full(
                     if is_deferred_char_component_field(&field) {
                         return field_ptr;
                     }
-                    if field.size == 384 && (field.allocatable || field.pointer) {
+                    if field.size == 392 && (field.allocatable || field.pointer) {
                         return field_ptr;
                     }
                     if matches!(field.type_info, crate::sema::symtab::TypeInfo::Derived(_)) {
@@ -57540,7 +58463,7 @@ pub(super) fn lower_arg_by_ref_full(
                 // Allocatable array component actual (e.g. `c%idx` where
                 // idx is `integer, allocatable :: idx(:,:)`) passed to a
                 // by-ref dummy that is assumed-size or explicit-shape:
-                // field_ptr is the address of the 384-byte descriptor,
+                // field_ptr is the address of the 392-byte descriptor,
                 // not of the array data. The callee, declared as
                 // `a(2,*)` or similar, expects an element pointer it
                 // can index column-major directly. Load base_addr from
@@ -57550,7 +58473,7 @@ pub(super) fn lower_arg_by_ref_full(
                 // `call sort_coo(COO%index, ...)` where COO%index is an
                 // allocatable rank-2 component and the callee declares
                 // `a(2, *)`.
-                if field.allocatable && field.size == 384 && !field.pointer {
+                if field.allocatable && field.size == 392 && !field.pointer {
                     let pointee_ty = type_info_to_ir_type(&field.type_info);
                     return b.load_typed(field_ptr, IrType::Ptr(Box::new(pointee_ty)));
                 }
@@ -57619,8 +58542,8 @@ pub(super) fn lower_arg_by_ref_full(
         // F2018 §15.5.2.4: assumed-size and explicit-shape dummies receive
         // a *bare element pointer*, not a descriptor.  When the actual is
         // a section, an array binop, an array-result function, or any
-        // other expression whose lowering produces a 384-byte descriptor
-        // pointer (Ptr<[i8; 384]>), extract the base_addr field before
+        // other expression whose lowering produces a 392-byte descriptor
+        // pointer (Ptr<[i8; 392]>), extract the base_addr field before
         // passing it on.  Without this, the callee reads the descriptor's
         // first 8 bytes (= base_addr) as if they were the array's first
         // element — surfaced post-db04b9d as bounds-check failures of the
@@ -57628,7 +58551,7 @@ pub(super) fn lower_arg_by_ref_full(
         // (e.g. `call gesv(n, nrhs, amat, ...)` where amat is a pointer
         // local feeding `a(lda,*)`).
         if let IrType::Ptr(inner) = &ty {
-            if let IrType::Array(elem, 384) = inner.as_ref() {
+            if let IrType::Array(elem, 392) = inner.as_ref() {
                 if matches!(elem.as_ref(), IrType::Int(IntWidth::I8)) {
                     let scalar_aggregate_actual =
                         matches!(
@@ -57682,7 +58605,7 @@ fn scalar_class_actual_object_addr_for_concrete_dummy(
                 IrType::Ptr(desc_ty)
                     if matches!(
                         desc_ty.as_ref(),
-                        IrType::Array(elem, 384)
+                        IrType::Array(elem, 392)
                             if matches!(elem.as_ref(), IrType::Int(IntWidth::I8))
                     )
             )
@@ -57691,7 +58614,7 @@ fn scalar_class_actual_object_addr_for_concrete_dummy(
         return None;
     }
 
-    let desc = b.load_typed(info.addr, descriptor_ptr_ir_type(384));
+    let desc = b.load_typed(info.addr, descriptor_ptr_ir_type(392));
     Some(b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))))
 }
 

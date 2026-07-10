@@ -181,14 +181,14 @@ mod layout_drift_tests {
         );
     }
 
-    /// The compiler-side array_descriptor() must reproduce the 384-byte
+    /// The compiler-side array_descriptor() must reproduce the 392-byte
     /// contract that runtime/src/descriptor.rs asserts independently
-    /// (`size_of::<ArrayDescriptor>() == 384`). If these disagree, the
+    /// (`size_of::<ArrayDescriptor>() == 392`). If these disagree, the
     /// accessor formula is wrong, not the runtime constant.
     #[test]
     fn descriptor_accessors_match_runtime_contract() {
         let l = TargetLayout::LP64;
-        assert_eq!(l.array_descriptor().0, 384, "see runtime/src/descriptor.rs");
+        assert_eq!(l.array_descriptor().0, 392, "see runtime/src/descriptor.rs");
         assert_eq!(
             l.string_descriptor().0,
             32,

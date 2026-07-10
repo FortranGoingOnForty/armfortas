@@ -35,8 +35,9 @@ pub const DESC_TYPE_TAG_MASK: u32 = 0xffff_ff00;
 /// 24      dims[0]        24 bytes (DimDescriptor)
 /// 48      dims[1]        24 bytes
 /// ...
-/// 384     dims[14]       24 bytes
-/// total: 384 bytes
+/// 360     dims[14]       24 bytes
+/// 384     vtable         8 bytes (pointer)
+/// total: 392 bytes
 /// ```
 #[repr(C)]
 #[derive(Clone)]
@@ -51,6 +52,8 @@ pub struct ArrayDescriptor {
     pub flags: u32,
     /// Per-dimension information (lower bound, upper bound, stride).
     pub dims: [DimDescriptor; MAX_RANK],
+    /// Dynamic-type vtable shared by scalar and array descriptors.
+    pub vtable: *mut u8,
 }
 
 /// Per-dimension descriptor.
@@ -94,6 +97,7 @@ impl ArrayDescriptor {
             rank: 0,
             flags: 0,
             dims: [DimDescriptor::default(); MAX_RANK],
+            vtable: ptr::null_mut(),
         }
     }
 
@@ -170,25 +174,21 @@ impl ArrayDescriptor {
         }
     }
 
-    pub fn scalar_tbp_lookup_ptr(&self) -> *mut u8 {
-        if self.rank == 0 {
-            self.dims[0].upper_bound as usize as *mut u8
-        } else {
-            ptr::null_mut()
-        }
+    pub fn dynamic_vtable_ptr(&self) -> *mut u8 {
+        self.vtable
     }
 
-    pub fn set_scalar_tbp_lookup_ptr(&mut self, ptr: *mut u8) {
-        if self.rank == 0 {
-            self.dims[0].upper_bound = ptr as usize as i64;
-            self.dims[0].stride = 0;
-        }
+    pub fn set_dynamic_vtable_ptr(&mut self, ptr: *mut u8) {
+        self.vtable = ptr;
     }
 
-    pub fn clear_scalar_type_tag(&mut self) {
+    pub fn clear_dynamic_type_metadata(&mut self) {
         if self.rank == 0 {
             self.dims[0] = DimDescriptor::default();
+        } else {
+            self.flags &= !DESC_TYPE_TAG_MASK;
         }
+        self.vtable = ptr::null_mut();
     }
 }
 
@@ -346,7 +346,7 @@ mod tests {
     fn descriptor_size_is_stable() {
         // ABI stability: descriptor sizes must not change.
         assert_eq!(std::mem::size_of::<DimDescriptor>(), 24);
-        assert_eq!(std::mem::size_of::<ArrayDescriptor>(), 384);
+        assert_eq!(std::mem::size_of::<ArrayDescriptor>(), 392);
         assert_eq!(std::mem::size_of::<StringDescriptor>(), 32);
     }
 }

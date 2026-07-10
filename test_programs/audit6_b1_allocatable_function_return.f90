@@ -4,7 +4,7 @@
 ! Root cause (suspected): in lower_unit's Function arm, the
 ! result variable is alloca'd with the array element type
 ! (e.g., i32) instead of the allocatable descriptor type
-! (`Ptr<[i8 x 384]>`). When the function body assigns into the
+! (`Ptr<[i8 x 392]>`). When the function body assigns into the
 ! result via `r = [1,2,3,4,5]`, the store's value type
 ! (Ptr<[i32 x 5]>) doesn't match the alloca's pointee (i32),
 ! and the IR verifier rightfully rejects the program with:

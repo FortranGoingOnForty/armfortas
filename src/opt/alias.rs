@@ -439,14 +439,14 @@ mod tests {
     #[test]
     fn mixed_width_geps_same_index_do_not_must_alias() {
         let mut f = Function::new("test".into(), vec![], IrType::Void);
-        let base_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+        let base_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
         let base = f.next_value_id();
         f.register_type(base, IrType::Ptr(Box::new(base_ty.clone())));
         f.block_mut(f.entry).insts.push(Inst {
             id: base,
             ty: IrType::Ptr(Box::new(base_ty)),
             span: span(),
-            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)),
+            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)),
         });
 
         let four = f.next_value_id();

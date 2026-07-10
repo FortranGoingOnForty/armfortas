@@ -1,6 +1,6 @@
 ! Regression: a scalar derived-type VALUE whose storage is descriptor-sized
 ! (its only component is an allocatable array) lowers to the same
-! `Ptr<[i8;384]>` IR type as an array DESCRIPTOR. When such a value was
+! `Ptr<[i8;392]>` IR type as an array DESCRIPTOR. When such a value was
 ! passed DIRECTLY as an actual argument (a function/constructor result temp,
 ! not a named variable), the by-ref arg lowering wrongly treated it as an
 ! array descriptor and loaded its first 8 bytes as a base_addr, passing

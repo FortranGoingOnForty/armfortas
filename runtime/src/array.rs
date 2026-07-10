@@ -982,7 +982,7 @@ pub extern "C" fn afs_allocate_array(
     // Copy dimensions.
     desc.rank = rank;
     desc.elem_size = elem_size;
-    desc.clear_scalar_type_tag();
+    desc.clear_dynamic_type_metadata();
     if !dims_ptr.is_null() && rank > 0 {
         let dims_slice = unsafe { std::slice::from_raw_parts(dims_ptr, rank as usize) };
         for (i, dim) in dims_slice.iter().enumerate() {
@@ -1158,7 +1158,7 @@ pub extern "C" fn afs_allocate_like(
     afs_allocate_array(dest, source.elem_size, source.rank, dims_ptr, stat);
     let dest = unsafe { &mut *dest };
     dest.set_scalar_type_tag(source.scalar_type_tag());
-    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+    dest.set_dynamic_vtable_ptr(source.dynamic_vtable_ptr());
 }
 
 /// Copy array payload from `source` into an already-allocated `dest` without
@@ -1243,7 +1243,7 @@ pub extern "C" fn afs_copy_array_data(
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
-    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+    dest.set_dynamic_vtable_ptr(source.dynamic_vtable_ptr());
 
     if !stat.is_null() {
         unsafe {
@@ -1528,7 +1528,7 @@ pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i3
     // Clear the descriptor.
     desc.base_addr = ptr::null_mut();
     desc.flags &= !DESC_ALLOCATED;
-    desc.clear_scalar_type_tag();
+    desc.clear_dynamic_type_metadata();
     // Leave rank, elem_size, dims intact (they describe the shape for future allocate).
 
     if !stat.is_null() {
@@ -1693,7 +1693,7 @@ pub extern "C" fn afs_assign_allocatable(
         }
     }
     dest.set_scalar_type_tag(source.scalar_type_tag());
-    dest.set_scalar_tbp_lookup_ptr(source.scalar_tbp_lookup_ptr());
+    dest.set_dynamic_vtable_ptr(source.dynamic_vtable_ptr());
 }
 
 fn source_base_points_into_dest_storage(dest: &ArrayDescriptor, source: &ArrayDescriptor) -> bool {
@@ -1856,7 +1856,7 @@ pub extern "C" fn afs_copy_array_data_no_realloc(
         copy_same_type_payload_between_descriptors(dest_ref, source_ref);
     }
     dest_ref.set_scalar_type_tag(source_ref.scalar_type_tag());
-    dest_ref.set_scalar_tbp_lookup_ptr(source_ref.scalar_tbp_lookup_ptr());
+    dest_ref.set_dynamic_vtable_ptr(source_ref.dynamic_vtable_ptr());
 
     if !stat.is_null() {
         unsafe {
@@ -2090,7 +2090,7 @@ pub extern "C" fn afs_move_alloc(from: *mut ArrayDescriptor, to: *mut ArrayDescr
     // Clear `from`.
     from_desc.base_addr = ptr::null_mut();
     from_desc.flags &= !DESC_ALLOCATED;
-    from_desc.clear_scalar_type_tag();
+    from_desc.clear_dynamic_type_metadata();
 }
 
 // ---- ALLOCATED INTRINSIC ----
@@ -2102,6 +2102,62 @@ pub extern "C" fn afs_allocated(desc: *const ArrayDescriptor) -> i32 {
         return 0;
     }
     unsafe { (*desc).is_allocated() as i32 }
+}
+
+fn descriptor_byte_span(desc: &ArrayDescriptor) -> Option<(i128, i128)> {
+    if desc.base_addr.is_null()
+        || desc.elem_size <= 0
+        || desc.rank < 0
+        || desc.rank as usize > MAX_RANK
+    {
+        return None;
+    }
+
+    let mut min_element_offset = 0_i128;
+    let mut max_element_offset = 0_i128;
+    for dim in desc.dims.iter().take(desc.rank as usize) {
+        let extent = dim.extent();
+        if extent <= 0 {
+            return None;
+        }
+        let last_offset = i128::from(extent - 1).saturating_mul(i128::from(dim.stride));
+        if last_offset < 0 {
+            min_element_offset = min_element_offset.saturating_add(last_offset);
+        } else {
+            max_element_offset = max_element_offset.saturating_add(last_offset);
+        }
+    }
+
+    let elem_size = i128::from(desc.elem_size);
+    let base = desc.base_addr as usize as i128;
+    let low = base.saturating_add(min_element_offset.saturating_mul(elem_size));
+    let high = base
+        .saturating_add(max_element_offset.saturating_mul(elem_size))
+        .saturating_add(elem_size);
+    Some((low.min(high), low.max(high)))
+}
+
+/// Return nonzero when two descriptors may address any common storage.
+///
+/// The comparison is deliberately conservative for strided sections: it
+/// compares the byte ranges spanning their first and last reachable elements.
+/// False positives only force an assignment snapshot; false negatives would
+/// permit a destination reallocation to invalidate its source.
+#[no_mangle]
+pub extern "C" fn afs_descriptors_overlap(
+    left: *const ArrayDescriptor,
+    right: *const ArrayDescriptor,
+) -> i32 {
+    if left.is_null() || right.is_null() {
+        return 0;
+    }
+    let (Some((left_low, left_high)), Some((right_low, right_high))) = (
+        descriptor_byte_span(unsafe { &*left }),
+        descriptor_byte_span(unsafe { &*right }),
+    ) else {
+        return 0;
+    };
+    i32::from(left_low < right_high && right_low < left_high)
 }
 
 // ---- ARRAY SECTIONS ----
@@ -2135,8 +2191,9 @@ pub extern "C" fn afs_create_section(
     let specs_slice = unsafe { std::slice::from_raw_parts(specs, n_dims as usize) };
 
     result.elem_size = source.elem_size;
-    result.flags = DESC_CONTIGUOUS; // sections may not be contiguous
-                                    // Don't set DESC_ALLOCATED — section doesn't own the data.
+    result.flags = DESC_CONTIGUOUS | (source.flags & DESC_TYPE_TAG_MASK);
+    result.vtable = source.vtable;
+    // Don't set DESC_ALLOCATED — section doesn't own the data.
 
     // Compute base address offset and new dims.
     //
@@ -2969,6 +3026,47 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_overlap_covers_scalar_and_strided_views() {
+        let mut left_data = [10_i32, 20, 30, 40];
+        let mut right_data = [50_i32, 60];
+        let left = i32_descriptor(&mut left_data, &[4]);
+        let right = i32_descriptor(&mut right_data, &[2]);
+        assert_eq!(afs_descriptors_overlap(&left, &right), 0);
+
+        let mut scalar_alias = ArrayDescriptor::zeroed();
+        scalar_alias.base_addr = left.base_addr;
+        scalar_alias.elem_size = left.elem_size;
+        assert_eq!(afs_descriptors_overlap(&left, &scalar_alias), 1);
+
+        let positive_spec = SectionSpec {
+            start: 2,
+            end: 4,
+            stride: 2,
+        };
+        let mut positive = ArrayDescriptor::zeroed();
+        afs_create_section(&left, &mut positive, &positive_spec, 1);
+        assert_eq!(afs_descriptors_overlap(&left, &positive), 1);
+
+        let negative_spec = SectionSpec {
+            start: 4,
+            end: 1,
+            stride: -1,
+        };
+        let mut negative = ArrayDescriptor::zeroed();
+        afs_create_section(&left, &mut negative, &negative_spec, 1);
+        assert_eq!(afs_descriptors_overlap(&left, &negative), 1);
+
+        let empty_spec = SectionSpec {
+            start: 3,
+            end: 2,
+            stride: 1,
+        };
+        let mut empty = ArrayDescriptor::zeroed();
+        afs_create_section(&left, &mut empty, &empty_spec, 1);
+        assert_eq!(afs_descriptors_overlap(&left, &empty), 0);
+    }
+
+    #[test]
     fn zero_size_allocation() {
         let mut desc = ArrayDescriptor::zeroed();
         afs_allocate_1d(&mut desc, 4, 0);
@@ -3452,7 +3550,7 @@ pub extern "C" fn afs_array_count_logical(desc: *const ArrayDescriptor) -> i32 {
 /// COUNT(mask, DIM=k) — reduce along dimension k, allocate `dst` with
 /// rank `mask.rank - 1` and extents = mask extents minus the reduction
 /// dim, fill with per-slice counts of true elements (i32). Caller passes
-/// a zeroed 384-byte descriptor; this helper populates it. Surfaced in
+/// a zeroed 392-byte descriptor; this helper populates it. Surfaced in
 /// stdlib_stats var_mask_2_*: `n = count(mask, dim)` where n is rank-1
 /// (and a real array — caller does the int→real conversion after).
 /// Without this helper count(mask, dim) lowered to the rank-0 helper
@@ -4364,7 +4462,7 @@ fn array_findloc_logical_dim_keywords(
 /// SUM(array, DIM=k) — reduce along dimension k, allocate `dst` with
 /// rank `src.rank - 1` and extents = src extents minus the reduction
 /// dim, then write the per-slice sums into dst. Caller passes a
-/// zeroed 384-byte descriptor; this helper populates rank/dims/flags
+/// zeroed 392-byte descriptor; this helper populates rank/dims/flags
 /// and malloc's the result buffer. Real version (real4 + real8
 /// dispatching on `src.elem_size`).
 #[no_mangle]

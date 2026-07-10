@@ -123,10 +123,31 @@ fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str,
             ctx.internal_funcs,
             Some(ctx.contained_host_refs),
             &ctx.locals,
+            ctx.type_layouts,
             layout,
             dest,
         );
     }
+}
+
+fn prepare_descriptor_assignment_lhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    stat_addr: ValueId,
+) {
+    finalize_derived_descriptor_storage_if_allocated(
+        b,
+        ctx.st,
+        ctx.internal_funcs,
+        Some(ctx.contained_host_refs),
+        &ctx.locals,
+        desc,
+        layout,
+        ctx.type_layouts,
+    );
+    deallocate_derived_descriptor_components(b, desc, layout, ctx.type_layouts, stat_addr);
 }
 
 fn stabilize_finalized_assignment_rhs(
@@ -138,7 +159,7 @@ fn stabilize_finalized_assignment_rhs(
     if ctx
         .type_layouts
         .get(type_name)
-        .is_some_and(|layout| !layout.final_procs.is_empty())
+        .is_some_and(|layout| derived_layout_needs_finalization(layout, ctx.type_layouts))
     {
         stabilize_derived_call_result(b, ctx.type_layouts, type_name, rhs)
     } else {
@@ -165,7 +186,7 @@ fn finalizable_function_result_type_name(ctx: &LowerCtx, expr: &SpannedExpr) -> 
     })?;
     ctx.type_layouts
         .get(&type_name)
-        .filter(|layout| !layout.final_procs.is_empty())
+        .filter(|layout| derived_layout_needs_finalization(layout, ctx.type_layouts))
         .map(|layout| layout.name.clone())
 }
 
@@ -1934,7 +1955,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && info.derived_type.is_some()
                                 {
                                     let desc = array_descriptor_addr(b, &info);
-                                    let rhs_scalar_desc = if info.is_class {
+                                    let mut rhs_scalar_desc = if info.is_class {
                                         match &value.node {
                                             Expr::Name { name } => ctx
                                                 .locals
@@ -1955,6 +1976,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             ScalarAllocSourceCopyPlan::Dynamic(base.clone())
                                         })
                                     });
+                                    let mut rhs_scalar_snapshot = None;
+                                    if let (
+                                        Some(source_desc),
+                                        Some(ScalarAllocSourceCopyPlan::Dynamic(base_type)),
+                                    ) = (rhs_scalar_desc, dynamic_source_copy_plan.as_ref())
+                                    {
+                                        let (stable_source, snapshot_desc) =
+                                            stabilize_dynamic_scalar_assignment_source(
+                                                b,
+                                                desc,
+                                                source_desc,
+                                                base_type,
+                                                ctx.type_layouts,
+                                            );
+                                        rhs_scalar_desc = Some(stable_source);
+                                        rhs_scalar_snapshot = Some(snapshot_desc);
+                                    }
                                     let assign_type_name =
                                         if info.is_class && rhs_scalar_desc.is_none() {
                                             expr_type_layout(
@@ -2064,14 +2102,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.set_block(dealloc_bb);
                                     if let Some(type_name) = info.derived_type.as_ref() {
                                         if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                            finalize_derived_descriptor_storage_if_allocated(
+                                            prepare_descriptor_assignment_lhs(
                                                 b,
-                                                ctx.st,
-                                                ctx.internal_funcs,
-                                                Some(ctx.contained_host_refs),
-                                                &ctx.locals,
+                                                ctx,
                                                 desc,
                                                 layout,
+                                                assign_stat,
                                             );
                                         }
                                     }
@@ -2125,14 +2161,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.set_block(finalize_existing_bb);
                                     if let Some(type_name) = info.derived_type.as_ref() {
                                         if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                            finalize_derived_descriptor_storage_if_allocated(
+                                            prepare_descriptor_assignment_lhs(
                                                 b,
-                                                ctx.st,
-                                                ctx.internal_funcs,
-                                                Some(ctx.contained_host_refs),
-                                                &ctx.locals,
+                                                ctx,
                                                 desc,
                                                 layout,
+                                                assign_stat,
                                             );
                                         }
                                     }
@@ -2151,6 +2185,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             ctx.type_layouts,
                                             None,
                                         );
+                                        if let Some(snapshot_desc) = rhs_scalar_snapshot {
+                                            if let Some(layout) = info
+                                                .derived_type
+                                                .as_deref()
+                                                .and_then(|name| ctx.type_layouts.get(name))
+                                                .cloned()
+                                            {
+                                                discard_dynamic_assignment_snapshot(
+                                                    b,
+                                                    snapshot_desc,
+                                                    &layout,
+                                                    ctx.type_layouts,
+                                                );
+                                            }
+                                        }
                                     } else {
                                         let val = rhs_scalar_value.expect(
                                             "scalar derived assignment value lowered before branch",
@@ -2169,7 +2218,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             finalize_assignment_lhs(b, ctx, temp_type, val);
                                         }
                                         // Scalar descriptor-backed TYPE allocatables keep their
-                                        // dynamic type identity in the descriptor sidecar, so
+                                        // dynamic type identity in the descriptor metadata, so
                                         // constructor/function-result assignment must restamp the
                                         // concrete metadata after copying the value bytes.
                                         if let Some(tag) = derived_type_tag_value(
@@ -2200,7 +2249,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 {
                                     // Scalar polymorphic allocatable assign:
                                     // `class(*), allocatable :: out; out = h%poly_field`
-                                    // — copy the 384-byte descriptor verbatim
+                                    // — copy the 392-byte descriptor verbatim
                                     // when the RHS is a polymorphic component
                                     // access. This must run before the general
                                     // allocatable branch below; otherwise scalar
@@ -2218,7 +2267,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                         .map(|(p, _)| p);
                                     if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(384);
+                                        let sz = b.const_i64(392);
                                         b.call(
                                             FuncRef::External("memcpy".into()),
                                             vec![dst, src, sz],
@@ -2490,7 +2539,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 // dest is a fixed-shape stack buffer (e.g.
                                                 // `real :: r(10)`) `array_descriptor_addr`
                                                 // returns the buffer itself, but the callee
-                                                // expects a 384-byte descriptor — handing it
+                                                // expects a 392-byte descriptor — handing it
                                                 // the buffer corrupts the caller frame the
                                                 // moment the callee touches dims/flags. Allocate
                                                 // a real descriptor temp, call into it, copy
@@ -2515,13 +2564,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         );
                                                     let tmp_desc = b.alloca(IrType::Array(
                                                         Box::new(IrType::Int(IntWidth::I8)),
-                                                        384,
+                                                        392,
                                                     ));
                                                     let zero32 = b.const_i32(0);
-                                                    let sz384 = b.const_i64(384);
+                                                    let descriptor_bytes = b.const_i64(392);
                                                     b.call(
                                                         FuncRef::External("memset".into()),
-                                                        vec![tmp_desc, zero32, sz384],
+                                                        vec![tmp_desc, zero32, descriptor_bytes],
                                                         IrType::Ptr(Box::new(IrType::Int(
                                                             IntWidth::I8,
                                                         ))),
@@ -2835,7 +2884,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 {
                                     // Scalar polymorphic allocatable assign:
                                     // `class(*), allocatable :: out; out = h%poly_field`
-                                    // — copy the 384-byte descriptor verbatim
+                                    // — copy the 392-byte descriptor verbatim
                                     // when the RHS is a polymorphic component
                                     // access.  Avoids the scalar-store
                                     // fallback that would truncate the source
@@ -2851,7 +2900,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         )
                                         .map(|(p, _)| p);
                                     if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(384);
+                                        let sz = b.const_i64(392);
                                         b.call(
                                             FuncRef::External("memcpy".into()),
                                             vec![dst, src, sz],
@@ -3521,7 +3570,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
                                 ) && field.allocatable
-                                    && field.size == 384
+                                    && field.size == 392
                                     && field.dims.is_empty()
                                 {
                                     let Some(type_name) = field_derived_type_name(&field) else {
@@ -3757,7 +3806,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         _ => None,
                                     };
                                     if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(384);
+                                        let sz = b.const_i64(392);
                                         b.call(
                                             FuncRef::External("memcpy".into()),
                                             vec![field_ptr, src, sz],
@@ -3772,7 +3821,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && !field.pointer
                                     && !field.declared_array
                                     && field.dims.is_empty()
-                                    && field.size == 384
+                                    && field.size == 392
                                 {
                                     let desc = field_ptr;
                                     let allocated = b.call(
@@ -6304,7 +6353,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             continue;
                         }
-                        if field.size == 384 && (field.allocatable || field.pointer) {
+                        if field.size == 392 && (field.allocatable || field.pointer) {
                             let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
                             let field_is_class_star = matches!(
                                 &field.type_info,
@@ -7214,7 +7263,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             );
                             continue;
                         }
-                        if field.size == 384 && (field.allocatable || field.pointer) {
+                        if field.size == 392 && (field.allocatable || field.pointer) {
                             if field.allocatable {
                                 if let Some(type_name) = field_derived_type_name(&field) {
                                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
@@ -7226,6 +7275,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             &ctx.locals,
                                             field_ptr,
                                             layout,
+                                            ctx.type_layouts,
                                         );
                                         deallocate_derived_descriptor_components(
                                             b,
@@ -7293,6 +7343,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         &ctx.locals,
                                         desc,
                                         layout,
+                                        ctx.type_layouts,
                                     );
                                     deallocate_derived_descriptor_components(
                                         b,
@@ -8516,7 +8567,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if !info.is_pointer {
                     continue;
                 }
-                // Array pointers use the 384-byte descriptor, scalar
+                // Array pointers use the 392-byte descriptor, scalar
                 // deferred-length character pointers use a 32-byte
                 // string descriptor, and scalar pointers use an 8-byte
                 // slot. Pointer dummies passed by reference must write
@@ -8549,7 +8600,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             //
             //   * scalar + derived-type pointer: slot holds an 8-byte
             //     pointer, `=>` stores the target's address into it.
-            //   * array pointer: slot holds a 384-byte ArrayDescriptor,
+            //   * array pointer: slot holds a 392-byte ArrayDescriptor,
             //     `=>` materialises a descriptor of the target and
             //     memcpy's it into the slot.
             //
@@ -8877,14 +8928,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             tgt_field.type_info,
                             crate::sema::symtab::TypeInfo::Derived(_)
                         )
-                        && tgt_field.size != 384
+                        && tgt_field.size != 392
                     {
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
                     } else {
                         field_storage_ir_type(&tgt_field, ctx.type_layouts)
                     },
                     dims: vec![],
-                    allocatable: tgt_field.size == 384
+                    allocatable: tgt_field.size == 392
                         && (tgt_field.allocatable || tgt_field.pointer),
                     descriptor_arg: false,
                     by_ref: false,
@@ -9022,7 +9073,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 Some(ctx.type_layouts),
                             );
                             let tgt_desc = array_descriptor_addr(b, &tgt_info);
-                            let size = b.const_i64(384);
+                            let size = b.const_i64(392);
                             b.call(
                                 FuncRef::External("memcpy".into()),
                                 vec![tgt_desc, src_desc, size],
@@ -9087,10 +9138,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 store_scalar_pointer_slot_value(b, &tgt_info, ptr);
                                 return;
                             }
-                            if field.size == 384 && (field.pointer || field.allocatable) {
+                            if field.size == 392 && (field.pointer || field.allocatable) {
                                 if local_uses_array_descriptor(&tgt_info) {
                                     let tgt_desc = array_descriptor_addr(b, &tgt_info);
-                                    let size = b.const_i64(384);
+                                    let size = b.const_i64(392);
                                     b.call(
                                         FuncRef::External("memcpy".into()),
                                         vec![tgt_desc, field_ptr, size],
@@ -9185,7 +9236,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             // Array pointer path: materialise a descriptor from the
-            // target and memcpy 384 bytes into the pointer's slot.
+            // target and memcpy 392 bytes into the pointer's slot.
             // Both explicit-shape stack arrays and descriptor-backed
             // allocatables are supported via array_data_ptr_for_call.
             let target_is_array =
@@ -9198,7 +9249,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 };
                 if local_uses_array_descriptor(&tgt_info) {
                     let tgt_desc = array_descriptor_addr(b, &tgt_info);
-                    let size = b.const_i64(384);
+                    let size = b.const_i64(392);
                     b.call(
                         FuncRef::External("memcpy".into()),
                         vec![tgt_desc, src_desc, size],

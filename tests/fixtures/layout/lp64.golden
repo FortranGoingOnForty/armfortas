@@ -54,9 +54,9 @@ padded	24	8
   a	0	1
   b	8	8
   c	16	2
-with_alloc_array	392	8
-  arr	0	384
-  tail	384	1
+with_alloc_array	400	8
+  arr	0	392
+  tail	392	1
 with_defchar	40	8
   s	0	32
   tail	32	1

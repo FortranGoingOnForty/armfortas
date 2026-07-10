@@ -256,7 +256,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                                 is_string: true,
                                 derived_type: None,
                             })
-                        } else if field.allocatable && field.size == 384 {
+                        } else if field.allocatable && field.size == 392 {
                             Some(MoveAllocTarget {
                                 desc: field_ptr,
                                 is_string: false,
@@ -352,6 +352,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                     &ctx.locals,
                     to.desc,
                     layout,
+                    ctx.type_layouts,
                 );
                 let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
                 let zero = b.const_i32(0);
@@ -812,7 +813,7 @@ pub(crate) fn lower_intrinsic_subroutine(
             //
             // Scalar pointers store the raw address directly into the
             // pointer slot. Array pointers are descriptor-backed in
-            // armfortas, so we must populate the 384-byte descriptor
+            // armfortas, so we must populate the 392-byte descriptor
             // with base_addr/elem_size/rank/bounds instead of
             // treating the second argument like a plain Ptr<T>.
             let raw_cptr = nth_arg_val(b, ctx, args, 0, 0);
@@ -835,10 +836,10 @@ pub(crate) fn lower_intrinsic_subroutine(
                 {
                     if descriptor_backed {
                         let zero32 = b.const_i32(0);
-                        let sz384 = b.const_i64(384);
+                        let descriptor_bytes = b.const_i64(392);
                         b.call(
                             FuncRef::External("memset".into()),
-                            vec![target_addr, zero32, sz384],
+                            vec![target_addr, zero32, descriptor_bytes],
                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         );
 

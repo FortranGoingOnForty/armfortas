@@ -17601,7 +17601,7 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
     // exercising the rank-1 caller path. Previously the alloc_return assignment
     // path passed the destination buffer (`integer :: r(5)` → `[i32 x 5]`)
     // straight to the callee as the sret slot. The callee, expecting a
-    // 384-byte descriptor, then either left it untouched (silent garbage)
+    // 392-byte descriptor, then either left it untouched (silent garbage)
     // or — once we taught the prologue to auto-allocate — wrote dims onto
     // the caller's stack and corrupted neighboring locals. Now the caller
     // alloca's a real descriptor temp, calls into it, memcpy's the result
@@ -18742,7 +18742,7 @@ fn defined_assignment_passes_array_actual_through_descriptor() {
     }
     // F2018 §15.5.2: when an overloaded `assignment(=)` resolves to a
     // procedure whose RHS dummy is an assumed-shape array, the actual
-    // array must be passed as a 384-byte descriptor — not as the raw
+    // array must be passed as a 392-byte descriptor — not as the raw
     // data pointer. stdlib_bitsets `set = logical_array` regressed
     // because `try_defined_assignment` passed `rhs_val` directly,
     // letting the callee read the array bytes as the descriptor
@@ -19461,7 +19461,7 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
         return;
     }
     // F2018 §15.5.2.12 + §7.3.2.3: a `class(*), intent(in), optional`
-    // dummy is passed as a 384-byte descriptor pointer.  When one
+    // dummy is passed as a 392-byte descriptor pointer.  When one
     // procedure forwards the actual to another procedure with the
     // same `class(*), optional` formal, the call site must route
     // through `lower_arg_descriptor` (so the actual is forwarded as
@@ -19831,7 +19831,7 @@ fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
     //
     // Rebase semantics: the caller's descriptor base_addr stays
     // shared (writes still propagate), only the lower/upper view is
-    // patched on a fresh local 384-byte descriptor copy.
+    // patched on a fresh local 392-byte descriptor copy.
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: a(:)\n  a = [3, 1, 2]\n  call my_sort(a)\n  print *, 'sorted=', a\ncontains\n  pure subroutine my_sort(arr)\n    integer, intent(inout) :: arr(0:)\n    integer :: i, j, t, n\n    n = size(arr)\n    do i = 0, n-2\n      do j = 0, n-2-i\n        if (arr(j) > arr(j+1)) then\n          t = arr(j); arr(j) = arr(j+1); arr(j+1) = t\n        end if\n      end do\n    end do\n  end subroutine\nend program\n",
         "f90",
@@ -20872,7 +20872,7 @@ fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     }
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
-    // the 384-byte ArrayDescriptor hidden-result ABI on both sides of a
+    // the 392-byte ArrayDescriptor hidden-result ABI on both sides of a
     // module boundary, NOT the 32-byte StringDescriptor ABI.  Pre-fix
     // callee_hidden_result_abi matched `TypeInfo::Character { .. }`
     // before checking `result_rank > 0`, so cross-unit calls allocated
@@ -23251,7 +23251,7 @@ fn descriptor_actual_passed_to_assumed_size_dummy_extracts_base_addr() {
     // F2018 §15.5.2.4: assumed-size dummies receive a bare element
     // pointer.  When the actual is an array section (`arr(:)`) — a
     // non-Name, non-all-Element shape — `lower_arg_by_ref_full`'s tail
-    // path lowers it to a 384-byte descriptor.  Without explicit base
+    // path lowers it to a 392-byte descriptor.  Without explicit base
     // extraction at the tail, the callee receives the descriptor pointer
     // and reads its first 8 bytes (= base_addr field) as if it were the
     // first element.  This surfaces in stdlib's solve / lapack chains
@@ -24994,7 +24994,7 @@ fn fixed_shape_array_function_result_auto_allocates_on_entry() {
     // F2018 §15.5.2.4: a function whose result is an explicit-shape
     // array with constant bounds (e.g. `real :: res(3)`) flows through
     // the same `HiddenResultAbi::ArrayDescriptor` ABI as runtime-shape
-    // results — the caller passes a 384-byte descriptor, the body
+    // results — the caller passes a 392-byte descriptor, the body
     // expects `afs_array_lbound` / `afs_array_ubound` to return the
     // declared bounds. Pre-fix `allocate_runtime_shape_array_result`
     // early-returned when every spec was a compile-time integer, so
@@ -38427,8 +38427,8 @@ fn dispatch_optional_logical_int8_array_through_descriptor() {
     }
     // F2018 §15.5.2: dispatch on a generic with a `logical(int8),
     // optional, dimension(:)` formal must accept a `logical(int8)`
-    // array actual carried via a 384-byte descriptor.  The IR matcher
-    // previously bailed when the actual rendered as `[i8 x 384]` and
+    // array actual carried via a 392-byte descriptor.  The IR matcher
+    // previously bailed when the actual rendered as `[i8 x 392]` and
     // the formal lowered to `Int(I8)` because the array peel only
     // fired in the elemental path.
     let src = write_program(
@@ -44226,10 +44226,10 @@ fn allocate_mold_imported_concrete_preserves_vtable() {
 }
 
 #[test]
-fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
+fn polymorphic_array_element_dispatch_uses_descriptor_vtable() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_element_dispatch_uses_array_vtable_sidecar count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_element_dispatch_uses_descriptor_vtable count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -44238,30 +44238,30 @@ fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
         "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(value_i), deferred :: value\n  end type base_t\n  abstract interface\n    integer function value_i(self) result(out)\n      import :: base_t\n      class(base_t), intent(in) :: self\n    end function value_i\n  end interface\n  type, extends(base_t) :: child_t\n  contains\n    procedure :: value => child_value\n  end type child_t\ncontains\n  integer function child_value(self) result(out)\n    class(child_t), intent(in) :: self\n    out = 17\n  end function child_value\nend module repro\nprogram p\n  use repro\n  implicit none\n  class(base_t), allocatable :: items(:)\n  allocate(child_t :: items(0:1))\n  if (lbound(items, 1) /= 0) error stop 1\n  if (ubound(items, 1) /= 1) error stop 2\n  if (items(0)%value() /= 17) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
     );
-    let out = unique_path("poly_array_vtable_sidecar", "bin");
+    let out = unique_path("poly_array_descriptor_vtable", "bin");
     let compile = Command::new(compiler("armfortas"))
         .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
-        .expect("polymorphic array vtable sidecar compile failed to spawn");
+        .expect("polymorphic array descriptor vtable compile failed to spawn");
     assert!(
         compile.status.success(),
-        "polymorphic array vtable sidecar compile failed: {}",
+        "polymorphic array descriptor vtable compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
 
     let run = Command::new(&out)
         .output()
-        .expect("polymorphic array vtable sidecar run failed");
+        .expect("polymorphic array descriptor vtable run failed");
     assert!(
         run.status.success(),
-        "polymorphic array vtable sidecar run failed: status={:?} stdout={} stderr={}",
+        "polymorphic array descriptor vtable run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
-        "unexpected polymorphic array vtable sidecar output: {}",
+        "unexpected polymorphic array descriptor vtable output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
@@ -45925,7 +45925,7 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
     // checking whether the callee even returns an array.  Each
     // probe re-lowered the argument expression — including any
     // `arr(i:)` section actuals, which materialise a fresh
-    // ArrayDescriptor (384 bytes) + DimDescriptor (24 bytes) on
+    // ArrayDescriptor (392 bytes) + DimDescriptor (24 bytes) on
     // the stack via `afs_create_section`.  When the same
     // expression is wrapped through a chain of scalar-returning
     // calls (e.g. stdlib_hash_32bit_water's
@@ -46453,7 +46453,7 @@ fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
     }
     // F2008 §7.2.1 / §15.5.2: a defined-assignment specific receiving
     // `class(T), intent(inout) :: to` expects the caller to pass the
-    // 384-byte descriptor pointer for `to`. `try_defined_assignment`
+    // 392-byte descriptor pointer for `to`. `try_defined_assignment`
     // was emitting `lhs_val = lhs_info.addr` — for a class()-typed
     // dummy that's the *slot* holding the descriptor pointer
     // (one extra indirection). The callee then re-loaded the slot as
@@ -47268,7 +47268,7 @@ fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
     // pointer it can index column-major directly. lower_arg_by_ref_full
     // for the ComponentAccess path used to return the field's storage
     // address — which for an allocatable component is the address of
-    // the 384-byte descriptor itself — so the dummy walked descriptor
+    // the 392-byte descriptor itself — so the dummy walked descriptor
     // bytes (base_addr, elem_size, rank fields) as if they were array
     // elements. Surfaced inside stdlib_sparse_conversion's
     // sort_coo_unique_dp where `a(1, ed)` returned descriptor-pointer

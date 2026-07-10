@@ -779,7 +779,7 @@ mod tests {
             InstKind::Alloca(IrType::Int(IntWidth::I64)),
             IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
         );
-        let wrapper_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+        let wrapper_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
         let wrapper = push(
             &mut f,
             InstKind::Alloca(wrapper_ty.clone()),

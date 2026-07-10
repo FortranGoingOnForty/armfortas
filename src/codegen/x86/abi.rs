@@ -673,8 +673,8 @@ mod tests {
     #[test]
     fn descriptors_by_value_would_be_memory() {
         let array_desc_fields: Vec<(u64, AbiField)> =
-            (0..48).map(|i| (i * 8, AbiField::I64)).collect();
-        let array_desc = agg(384, 8, &array_desc_fields);
+            (0..49).map(|i| (i * 8, AbiField::I64)).collect();
+        let array_desc = agg(392, 8, &array_desc_fields);
         assert_eq!(classify(&array_desc), Classified::Memory);
 
         let string_desc = agg(

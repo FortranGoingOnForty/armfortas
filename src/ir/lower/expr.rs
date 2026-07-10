@@ -2024,7 +2024,7 @@ pub(crate) fn lower_expr_full(
                 // touches the actual_vals slice — so the work spent
                 // lowering each arg into a typed null / real value is
                 // discarded.  For a section-shaped arg that lowering
-                // emits a 384-byte descriptor + memset + afs_create_section
+                // emits a 392-byte descriptor + memset + afs_create_section
                 // every time, which compounds badly inside nested
                 // intrinsic chains (stdlib_hash_32bit_water:
                 // `ieor(waterr32(key(i:)), waterp1)` lowers `key(i:)`
@@ -3728,7 +3728,7 @@ pub(crate) fn lower_expr_full(
                                 && !field.pointer
                                 && !field.declared_array
                                 && field.dims.is_empty()
-                                && field.size == 384
+                                && field.size == 392
                             {
                                 let ir_ty = type_info_to_ir_type(&field.type_info);
                                 let data_ptr =

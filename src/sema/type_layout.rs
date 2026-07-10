@@ -1688,7 +1688,7 @@ mod tests {
         );
         let field = layout.field("lines").expect("missing lines field");
 
-        assert_eq!(field.size, 384);
+        assert_eq!(field.size, 392);
         assert_eq!(field.dims, vec![(1, 0)]);
         assert!(field.allocatable);
         assert!(field.declared_array);

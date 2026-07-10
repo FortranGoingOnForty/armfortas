@@ -807,7 +807,7 @@ pub(crate) fn lower_unit(
             let visible_param_consts =
                 collect_decl_param_consts_with_scope(decls, host_param_consts, st);
 
-            // Hidden-result ABI: allocatable arrays use a 384-byte array
+            // Hidden-result ABI: allocatable arrays use a 392-byte array
             // descriptor, while scalar character results use a 32-byte
             // string descriptor. In both cases the caller provides the
             // descriptor storage as param 0 and the callee returns void.
@@ -823,7 +823,7 @@ pub(crate) fn lower_unit(
 
             let (func_params, ir_ret_ty) = if uses_hidden_result {
                 let desc_size = match hidden_result_abi {
-                    HiddenResultAbi::ArrayDescriptor => 384,
+                    HiddenResultAbi::ArrayDescriptor => 392,
                     HiddenResultAbi::StringDescriptor => 32,
                     HiddenResultAbi::DerivedAggregate => {
                         let result_name = result.as_deref().unwrap_or(name.as_str()).to_lowercase();
