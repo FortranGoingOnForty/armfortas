@@ -24825,7 +24825,8 @@ pub(super) fn lower_string_expr_full(
                 {
                     match field_char_kind(&field) {
                         CharKind::Fixed(len) => {
-                            return (field_ptr, b.const_i64(len));
+                            let data_ptr = fixed_char_component_data_ptr(b, field_ptr, &field);
+                            return (data_ptr, b.const_i64(len));
                         }
                         CharKind::Deferred if field.size == 32 => {
                             return load_string_descriptor_view(b, field_ptr);
@@ -53961,6 +53962,18 @@ pub(super) fn field_char_kind(field: &crate::sema::type_layout::FieldLayout) -> 
     }
 }
 
+pub(super) fn fixed_char_component_data_ptr(
+    b: &mut FuncBuilder,
+    field_ptr: ValueId,
+    field: &crate::sema::type_layout::FieldLayout,
+) -> ValueId {
+    if field.pointer || (field.allocatable && field.size == 384) {
+        b.load_typed(field_ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    } else {
+        field_ptr
+    }
+}
+
 fn allocatable_deferred_char_actual_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -54983,9 +54996,10 @@ pub(super) fn store_derived_field_expr(
             descriptor_params,
         );
         let dest_len = b.const_i64(flen);
+        let dest_ptr = fixed_char_component_data_ptr(b, field_ptr, field);
         b.call(
             FuncRef::External("afs_assign_char_fixed".into()),
-            vec![field_ptr, dest_len, src_ptr, src_len],
+            vec![dest_ptr, dest_len, src_ptr, src_len],
             IrType::Void,
         );
         deallocate_owned_string_expr_temp(b, locals, value, st, Some(type_layouts), src_ptr);
@@ -55847,7 +55861,7 @@ pub(super) fn resolve_errmsg_target_expr(
                     Some(RuntimeErrmsgTarget::Deferred { desc: field_ptr })
                 }
                 CharKind::Fixed(n) => Some(RuntimeErrmsgTarget::Fixed {
-                    ptr: field_ptr,
+                    ptr: fixed_char_component_data_ptr(b, field_ptr, &field),
                     len: b.const_i64(n),
                 }),
                 _ => None,
@@ -56835,8 +56849,9 @@ pub(super) fn lower_char_arg_by_ref(
             let (field_ptr, field) = resolve_component_field_access(b, locals, expr, st, tl)?;
             match field_char_kind(&field) {
                 CharKind::Fixed(_) => {
+                    let data_ptr = fixed_char_component_data_ptr(b, field_ptr, &field);
                     let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                    b.store(field_ptr, slot);
+                    b.store(data_ptr, slot);
                     Some(slot)
                 }
                 CharKind::Deferred if field.size == 32 => {
@@ -57646,7 +57661,7 @@ pub(super) fn lower_bind_c_char_arg_raw(
                 resolve_component_field_access(b, locals, expr, st, tl)
             {
                 return match field_char_kind(&field) {
-                    CharKind::Fixed(_) => field_ptr,
+                    CharKind::Fixed(_) => fixed_char_component_data_ptr(b, field_ptr, &field),
                     CharKind::Deferred if field.size == 32 => {
                         load_string_descriptor_view(b, field_ptr).0
                     }

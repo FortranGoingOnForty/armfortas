@@ -89,6 +89,32 @@ fn emit_scalar_class_star_char_source_copy_on_success(
     b.set_block(done_bb);
 }
 
+fn emit_scalar_fixed_char_source_copy_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    src_ptr: ValueId,
+    src_len: ValueId,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let copy_bb = b.create_block("alloc_fixed_char_source_copy");
+    let done_bb = b.create_block("alloc_fixed_char_source_copy_done");
+    b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_len = descriptor_elem_size(b, dest_desc);
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_base, dest_len, src_ptr, src_len],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
 fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str, dest: ValueId) {
     if let Some(layout) = ctx.type_layouts.get(type_name) {
         finalize_derived_storage(
@@ -3450,14 +3476,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // Character field: copy string data with space padding.
                                 if let CharKind::Fixed(flen) = field_char_kind(&field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
-                                    let dest_ptr = if field.pointer {
-                                        b.load_typed(
-                                            field_ptr,
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        )
-                                    } else {
-                                        field_ptr
-                                    };
+                                    let dest_ptr =
+                                        fixed_char_component_data_ptr(b, field_ptr, &field);
                                     let dest_len = b.const_i64(flen);
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
@@ -6389,12 +6409,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .unwrap_or_else(|| {
                                     descriptor_element_size_bytes(&field_info, ctx.layout)
                                 });
+                            let component_char_alloc_len = match &field.type_info {
+                                crate::sema::symtab::TypeInfo::Character {
+                                    len: Some(_), ..
+                                } => None,
+                                _ => char_alloc_len,
+                            };
                             let es = source_char_elem_size.unwrap_or_else(|| {
                                 allocated_array_elem_size(
                                     b,
                                     &field_info,
                                     elem_size_bytes,
-                                    char_alloc_len,
+                                    component_char_alloc_len,
                                 )
                             });
                             let one_i64 = b.const_i64(1);
@@ -6508,6 +6534,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 b, stat_addr, field_ptr, src_ptr, src_len,
                                             );
                                         }
+                                    } else if let Some((src_ptr, src_len)) = source_char {
+                                        emit_scalar_fixed_char_source_copy_on_success(
+                                            b, stat_addr, field_ptr, src_ptr, src_len,
+                                        );
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -6951,6 +6981,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 b, stat_addr, desc, src_ptr, src_len,
                                             );
                                         }
+                                    } else if let Some((src_ptr, src_len)) = source_char {
+                                        emit_scalar_fixed_char_source_copy_on_success(
+                                            b, stat_addr, desc, src_ptr, src_len,
+                                        );
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {

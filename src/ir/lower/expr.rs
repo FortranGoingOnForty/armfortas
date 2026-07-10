@@ -3750,7 +3750,7 @@ pub(crate) fn lower_expr_full(
                             if let crate::sema::symtab::TypeInfo::Character { .. } =
                                 &field.type_info
                             {
-                                return field_ptr;
+                                return fixed_char_component_data_ptr(b, field_ptr, &field);
                             }
 
                             // Complex fields follow the same address-valued
