@@ -45,13 +45,10 @@ const STMT_LIMIT: usize = 1_000_000;
 
 /// Unconditional statement-size cap, enforced at every `--std` level
 /// (unlike the conformance warnings). Every recursive walker in the
-/// pipeline (parser nesting, sema, IR lowering) has depth bounded by
-/// the statement's token count, which is bounded by its character
-/// count — so capping statement size makes stack overflow structurally
-/// unreachable: the compile thread's reservation covers ~1.8M frames
-/// (measured), and a capped statement admits at most ~1M. Twice the
-/// F2023 limit, so every conforming program is unaffected; past the
-/// cap the compiler errors cleanly instead of ever faulting.
+/// pipeline (parser nesting, sema, IR lowering) has depth bounded by the
+/// statement's token count, which is bounded by its character count. Twice
+/// the F2023 limit keeps pathological work finite without rejecting a
+/// conforming program; past the cap the compiler errors before parsing.
 pub const STMT_HARD_CAP: usize = 2 * STMT_LIMIT;
 
 /// Scan for a statement exceeding [`STMT_HARD_CAP`]. Both source

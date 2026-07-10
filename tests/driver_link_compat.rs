@@ -224,6 +224,66 @@ fn gnu_depfile_flags_write_make_dependency_file() {
 }
 
 #[test]
+fn depfile_tracks_transitive_preprocessor_includes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=depfile_tracks_transitive_preprocessor_includes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("transitive_depfile_includes");
+    let src = write_program_in(
+        &dir,
+        "main.F90",
+        "subroutine value()\n#include \"outer.inc\"\n  print *, answer\nend subroutine\n",
+    );
+    let outer = write_program_in(&dir, "outer.inc", "#include \"inner.inc\"\n");
+    let inner = write_program_in(&dir, "inner.inc", "  integer, parameter :: answer = 42\n");
+    let obj = dir.join("main.o");
+    let depfile = dir.join("main.d");
+
+    let result = Command::new(compiler("armfortas"))
+        .args(["-MMD", "-MP", "-MF"])
+        .arg(&depfile)
+        .arg("-c")
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        result.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let deps = std::fs::read_to_string(&depfile).expect("missing dependency file");
+    for prerequisite in [&src, &outer, &inner] {
+        assert!(
+            deps.contains(prerequisite.to_str().unwrap()),
+            "dependency file omitted {}:\n{deps}",
+            prerequisite.display()
+        );
+    }
+    assert!(
+        deps.contains(&format!("{}:\n", outer.display())),
+        "-MP omitted the outer include phony rule:\n{deps}"
+    );
+    assert!(
+        deps.contains(&format!("{}:\n", inner.display())),
+        "-MP omitted the inner include phony rule:\n{deps}"
+    );
+    assert!(
+        !deps.contains(&format!("\n{}:\n", src.display())),
+        "-MP must not emit a phony rule for the primary source:\n{deps}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

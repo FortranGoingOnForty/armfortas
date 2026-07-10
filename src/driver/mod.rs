@@ -23,6 +23,14 @@ use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Optimization level requested at the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptLevel {
@@ -131,6 +139,7 @@ enum CliInputKind {
 }
 
 /// Compilation options.
+#[derive(Clone)]
 pub struct Options {
     // ---- I/O ----
     pub input: PathBuf,
@@ -1434,6 +1443,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let pp_result =
         crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
+    let included_files = pp_result.included_files;
     let preprocessed = pp_result.text;
 
     if opts.preprocess_only {
@@ -1714,7 +1724,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
-        write_dependency_file(opts, &out)?;
+        write_dependency_file(opts, &out, &included_files)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -1750,11 +1760,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             .map_err(|e| format!("cannot determine current directory for temp output: {}", e))?
             .join(&out_path)
     };
-    let stem = out_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "afs".to_string());
     let token = {
         let bytes = temp_identity_path.as_os_str().as_encoded_bytes();
         let mut h: u64 = 0xcbf29ce484222325;
@@ -1764,13 +1769,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         h
     };
-    let asm_path = std::env::temp_dir().join(format!("armfortas_{}_{:016x}.s", stem, token));
+    let asm_path = std::env::temp_dir().join(format!("armfortas_{:016x}.s", token));
     let obj_path = if opts.emit_obj {
         out_path.clone()
     } else {
-        std::env::temp_dir().join(format!("armfortas_{}_{:016x}.o", stem, token))
+        std::env::temp_dir().join(format!("armfortas_{:016x}.o", token))
     };
 
+    let _asm_cleanup = RemoveFileOnDrop(asm_path.clone());
+    let _obj_cleanup = (!opts.emit_obj).then(|| RemoveFileOnDrop(obj_path.clone()));
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
     // x05: ELF targets assemble with the system assembler when the
@@ -1865,7 +1872,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // ELF assembly routing (x14): the in-process afs-as x86 pipeline
     // is the default. AFS_AS_PATH substitutes a subprocess assembler
     // (invoked `<as> --64 -o obj asm`); AFS_AS=0 forces the system
-    // `as`. Mach-O keeps the existing as/AFS_AS routing below.
+    // `as`. Mach-O uses the embedded ARM64 assembler when crossing
+    // host architecture or object format, and keeps native overrides below.
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
         let route = elf_assembler_override();
         let host = crate::target::TargetSpec::host();
@@ -1921,19 +1929,16 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             }
         }
         if opts.emit_obj {
-            let _ = fs::remove_file(&asm_path);
-            write_dependency_file(opts, &obj_path)?;
+            write_dependency_file(opts, &obj_path, &included_files)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
             return Ok(());
         }
-        let _ = fs::remove_file(&asm_path);
         let binary_path = opts.output_path();
         let phase = phases.start("link");
         let result = link_inputs(std::slice::from_ref(&obj_path), &binary_path, opts);
         phase.end(&mut phases);
-        let _ = fs::remove_file(&obj_path);
         result?;
         if opts.verbose {
             eprintln!(" linked: {}", binary_path.display());
@@ -1943,31 +1948,37 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     let phase = phases.start("assemble");
-    let as_result = if let Some(assembler) = env_override("AFS_AS_PATH") {
-        Command::new(assembler)
+    let host = crate::target::TargetSpec::host();
+    let cross =
+        host.arch != opts.target.arch || host.object_format() != crate::target::ObjectFormat::MachO;
+    let assembler = env_override("AFS_AS_PATH");
+    let assemble_result = if cross && assembler.is_none() {
+        afs_as::assemble::assemble_file(&asm_path, &obj_path).map_err(|e| format!("afs-as: {}", e))
+    } else {
+        let assembler = assembler.unwrap_or_else(|| "as".into());
+        let result = Command::new(assembler)
             .arg(&asm_path)
             .arg("-o")
             .arg(&obj_path)
             .output()
-            .map_err(|e| format!("cannot run assembler: {}", e))?
-    } else {
-        Command::new("as")
-            .args(["-o", obj_path.to_str().unwrap(), asm_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("cannot run assembler: {}", e))?
+            .map_err(|e| format!("cannot run assembler: {}", e))?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "assembler failed:\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            ))
+        }
     };
     phase.end(&mut phases);
-
-    if !as_result.status.success() {
-        let stderr = String::from_utf8_lossy(&as_result.stderr);
-        return Err(format!("assembler failed:\n{}", stderr));
-    }
+    assemble_result?;
     if opts.verbose {
         eprintln!(" assembled: {}", obj_path.display());
     }
 
     if opts.emit_obj {
-        write_dependency_file(opts, &obj_path)?;
+        write_dependency_file(opts, &obj_path, &included_files)?;
         phases.report();
         return Ok(());
     }
@@ -1980,10 +1991,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     if opts.verbose {
         eprintln!(" linked: {}", binary_path.display());
     }
-
-    // Cleanup.
-    let _ = fs::remove_file(&asm_path);
-    let _ = fs::remove_file(&obj_path);
 
     phases.report();
     Ok(())
@@ -2011,7 +2018,11 @@ fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
+fn write_dependency_file(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
     if !opts.emit_depfile && opts.depfile.is_none() {
         return Ok(());
     }
@@ -2047,11 +2058,17 @@ fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
     }
     body.push_str(": ");
     body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+    for include in included_files {
+        body.push(' ');
+        body.push_str(&escape_make_dep_token(&include.to_string_lossy()));
+    }
     body.push('\n');
     if opts.depfile_phony {
-        body.push('\n');
-        body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
-        body.push_str(":\n");
+        for include in included_files {
+            body.push('\n');
+            body.push_str(&escape_make_dep_token(&include.to_string_lossy()));
+            body.push_str(":\n");
+        }
     }
 
     fs::write(&depfile, body)
@@ -2421,45 +2438,21 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
             src.with_extension("o")
         } else {
             let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-            let stem = src
-                .file_stem()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or("out");
-            tmp_dir.join(format!("{}.o", stem))
+            tmp_dir.join(format!("source_{}.o", idx))
         };
 
-        // Build a single-file Options for this source by inheriting
-        // the user-facing flags and overriding only the per-file bits.
-        let mut sub_opts = Options {
-            input: src.clone(),
-            extra_inputs: vec![],
-            output: Some(obj_path.clone()),
-            emit_obj: true,
-            ..Options::default()
-        };
-        sub_opts.opt_level = opts.opt_level;
-        sub_opts.std = opts.std;
-        sub_opts.source_form_override = opts.source_form_override;
-        sub_opts.default_integer_8 = opts.default_integer_8;
-        sub_opts.default_real_8 = opts.default_real_8;
-        sub_opts.force_implicit_none = opts.force_implicit_none;
-        sub_opts.recursive_default = opts.recursive_default;
-        sub_opts.backslash_escapes = opts.backslash_escapes;
-        sub_opts.max_stack_var_size = opts.max_stack_var_size;
-        sub_opts.warn_all = opts.warn_all;
-        sub_opts.warn_extra = opts.warn_extra;
-        sub_opts.warn_pedantic = opts.warn_pedantic;
-        sub_opts.warn_deprecated = opts.warn_deprecated;
-        sub_opts.warn_as_error = opts.warn_as_error;
-        sub_opts.disabled_warnings = opts.disabled_warnings.clone();
-        sub_opts.debug_info = opts.debug_info;
-        sub_opts.verbose = opts.verbose;
-        sub_opts.time_report = opts.time_report;
-        sub_opts.diagnostics_format = opts.diagnostics_format;
-        sub_opts.check_bounds = opts.check_bounds;
-        sub_opts.check_all = opts.check_all;
-        sub_opts.module_output_dir = opts.module_output_dir.clone();
+        // Preserve every compilation-affecting option. Only orchestration
+        // fields and mutually exclusive output modes differ for a child job.
+        let mut sub_opts = opts.clone();
+        sub_opts.input = src.clone();
+        sub_opts.extra_inputs.clear();
+        sub_opts.output = Some(obj_path.clone());
+        sub_opts.emit_asm = false;
+        sub_opts.emit_obj = true;
+        sub_opts.emit_ir = false;
+        sub_opts.emit_ast = false;
+        sub_opts.emit_tokens = false;
+        sub_opts.preprocess_only = false;
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
             if let Some(tmp_dir) = tmp_dir.as_ref() {

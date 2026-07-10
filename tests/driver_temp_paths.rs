@@ -25,6 +25,121 @@ fn run_compile(compiler: &Path, dir: &Path) -> Output {
         .expect("compiler launch failed")
 }
 
+fn temporary_codegen_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("cannot inspect temporary directory")
+        .map(|entry| entry.expect("cannot read temporary entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("armfortas_") && (name.ends_with(".s") || name.ends_with(".o"))
+                })
+        })
+        .collect()
+}
+
+#[test]
+fn temporary_assembly_is_removed_after_success_and_failure() {
+    let compiler = compiler();
+    let dir = unique_dir("assembly_cleanup");
+    let temp_dir = dir.join("tmp");
+    std::fs::create_dir_all(&temp_dir).expect("cannot create temporary directory");
+    let source = dir.join("p.f90");
+    std::fs::write(&source, "program p\nend program\n").expect("cannot write source");
+
+    let success = Command::new(&compiler)
+        .env("TMPDIR", &temp_dir)
+        .args(["-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("success.o"))
+        .output()
+        .expect("successful compiler launch failed");
+    assert!(
+        success.status.success(),
+        "compile failed:\n{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert!(
+        temporary_codegen_files(&temp_dir).is_empty(),
+        "successful compile retained temporary assembly"
+    );
+
+    let failure = Command::new(&compiler)
+        .env("TMPDIR", &temp_dir)
+        .env("AFS_AS_PATH", "false")
+        .args(["-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("failure.o"))
+        .output()
+        .expect("failing compiler launch failed");
+    assert!(
+        !failure.status.success(),
+        "false assembler unexpectedly succeeded"
+    );
+    assert!(
+        temporary_codegen_files(&temp_dir).is_empty(),
+        "failed compile retained temporary codegen files: {:?}",
+        temporary_codegen_files(&temp_dir)
+    );
+
+    if armfortas::testing::native_e2e_support().is_ok() {
+        let link_failure = Command::new(&compiler)
+            .env("TMPDIR", &temp_dir)
+            .env("AFS_LD_PATH", "false")
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.join("failure"))
+            .output()
+            .expect("failing linker launch failed");
+        assert!(
+            !link_failure.status.success(),
+            "false linker unexpectedly succeeded"
+        );
+        assert!(
+            temporary_codegen_files(&temp_dir).is_empty(),
+            "failed link retained temporary codegen files: {:?}",
+            temporary_codegen_files(&temp_dir)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn valid_long_output_basename_does_not_expand_temporary_name() {
+    let compiler = compiler();
+    let dir = unique_dir("long_output_basename");
+    let temp_dir = dir.join("tmp");
+    std::fs::create_dir_all(&temp_dir).expect("cannot create temporary directory");
+    let source = dir.join("p.f90");
+    std::fs::write(&source, "program p\nend program\n").expect("cannot write source");
+    let output = dir.join(format!("{}.o", "x".repeat(230)));
+
+    let result = Command::new(&compiler)
+        .env("TMPDIR", &temp_dir)
+        .args(["-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "valid long output basename failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.is_file(), "long-named object was not written");
+    assert!(
+        temporary_codegen_files(&temp_dir).is_empty(),
+        "long output retained temporary codegen files"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn parallel_relative_outputs_with_same_basename_keep_separate_temps() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {

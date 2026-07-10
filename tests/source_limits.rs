@@ -42,6 +42,33 @@ fn compile_s(src_path: &Path, out: &Path, std_flag: &str) -> std::process::Outpu
         .expect("cannot run armfortas")
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn tiny_preprocess_fits_within_one_gibibyte_address_space() {
+    let dir = std::env::temp_dir().join(format!("afs_stack_limit_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("line.F90");
+    std::fs::write(&source, "program p\nend program\n").unwrap();
+
+    let result = Command::new("sh")
+        .args([
+            "-c",
+            "ulimit -v 1048576; exec \"$0\" -E \"$1\"",
+            compiler().to_str().unwrap(),
+            source.to_str().unwrap(),
+        ])
+        .output()
+        .expect("cannot run constrained compiler");
+    assert!(
+        result.status.success(),
+        "tiny preprocess exceeded a 1 GiB address space (status {:?}):\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn million_char_statement_compiles_and_warns_only_under_f2023() {
     let dir = std::env::temp_dir().join(format!("afs_srclim_{}", std::process::id()));
