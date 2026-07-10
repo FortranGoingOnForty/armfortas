@@ -9,6 +9,8 @@ use super::symtab::{ScopeId, TypeInfo};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+const TYPE_TAG_VALUE_MASK: u64 = i64::MAX as u64;
+
 /// Procedure-pointer components carry a code pointer followed by a small
 /// fixed closure payload for contained-procedure host references.
 pub const PROC_PTR_CLOSURE_SLOTS: usize = 8;
@@ -188,6 +190,9 @@ fn stable_type_tag(layout: &TypeLayout) -> u64 {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
+    // The vtable ABI reserves the high bit of its tag word for lifecycle
+    // metadata. Descriptor-visible type tags remain in the low 63 bits.
+    hash &= TYPE_TAG_VALUE_MASK;
     if hash == 0 {
         1
     } else {
@@ -270,6 +275,29 @@ impl TypeLayoutRegistry {
                     .and_then(|module| self.get_in_module(module, type_name))
             })
             .or_else(|| self.get(type_name))
+    }
+
+    pub fn is_same_or_extension_of(&self, actual: &TypeLayout, declared: &TypeLayout) -> bool {
+        let declared_key = self.canonical_key_for_layout(declared);
+        let mut current = actual;
+        let mut visited = HashSet::new();
+        loop {
+            let current_key = self.canonical_key_for_layout(current);
+            if current_key == declared_key {
+                return true;
+            }
+            if !visited.insert(current_key) {
+                return false;
+            }
+            let Some(parent) = current
+                .parent
+                .as_deref()
+                .and_then(|name| self.get_related(current, name))
+            else {
+                return false;
+            };
+            current = parent;
+        }
     }
 
     pub fn canonical_key_for_layout(&self, layout: &TypeLayout) -> String {
@@ -380,6 +408,156 @@ impl TypeLayoutRegistry {
         walk(self, layout, &mut HashSet::new(), &mut HashSet::new())
     }
 
+    pub fn lifecycle_has_ownerless_finalizer(&self, layout: &TypeLayout) -> bool {
+        fn walk(
+            registry: &TypeLayoutRegistry,
+            layout: &TypeLayout,
+            visited: &mut HashSet<String>,
+        ) -> bool {
+            let key = registry.canonical_key_for_layout(layout);
+            if !visited.insert(key) {
+                return false;
+            }
+            if layout.owner_module.is_none() && !layout.final_procs.is_empty() {
+                return true;
+            }
+            if layout
+                .parent
+                .as_deref()
+                .and_then(|name| registry.get_related(layout, name))
+                .is_some_and(|parent| walk(registry, parent, visited))
+            {
+                return true;
+            }
+            layout.fields.iter().any(|field| {
+                if field.pointer {
+                    return false;
+                }
+                let (TypeInfo::Derived(name) | TypeInfo::Class(name)) = &field.type_info else {
+                    return false;
+                };
+                registry
+                    .get_related(layout, name)
+                    .is_some_and(|nested| walk(registry, nested, visited))
+            })
+        }
+
+        walk(self, layout, &mut HashSet::new())
+    }
+
+    /// Whether a generated component-deallocation helper would need to invoke
+    /// a procedure-local FINAL binding. The root object's own finalizer is not
+    /// part of this walk: static callers invoke it through the host-aware path
+    /// before asking the helper to release owned components.
+    pub fn deallocation_has_ownerless_finalizer(&self, layout: &TypeLayout) -> bool {
+        fn walk(
+            registry: &TypeLayoutRegistry,
+            layout: &TypeLayout,
+            visited: &mut HashSet<String>,
+        ) -> bool {
+            let key = registry.canonical_key_for_layout(layout);
+            if !visited.insert(key) {
+                return false;
+            }
+
+            layout.fields.iter().any(|field| {
+                if field.pointer {
+                    return false;
+                }
+                let (TypeInfo::Derived(name) | TypeInfo::Class(name)) = &field.type_info else {
+                    return false;
+                };
+                let Some(nested) = registry.get_related(layout, name) else {
+                    return false;
+                };
+                if field.allocatable && registry.lifecycle_has_ownerless_finalizer(nested) {
+                    return true;
+                }
+                walk(registry, nested, visited)
+            })
+        }
+
+        walk(self, layout, &mut HashSet::new())
+    }
+
+    /// Find a visible concrete type whose lifecycle cannot be represented by
+    /// the context-free vtable ABI for a runtime-polymorphic value.
+    pub fn visible_ownerless_finalizer_for_polymorphic(
+        &self,
+        scope: ScopeId,
+        declared: &TypeInfo,
+    ) -> Option<&TypeLayout> {
+        fn scope_can_see(
+            registry: &TypeLayoutRegistry,
+            scope: ScopeId,
+            owner: Option<ScopeId>,
+        ) -> bool {
+            let Some(owner) = owner else {
+                return true;
+            };
+            let mut current = Some(scope);
+            let mut visited = HashSet::new();
+            while let Some(candidate) = current {
+                if candidate == owner {
+                    return true;
+                }
+                if !visited.insert(candidate) {
+                    break;
+                }
+                current = registry.scope_parents.get(&candidate).copied().flatten();
+            }
+            false
+        }
+
+        fn is_same_or_extension_of(
+            registry: &TypeLayoutRegistry,
+            candidate: &TypeLayout,
+            base_key: &str,
+            visited: &mut HashSet<String>,
+        ) -> bool {
+            let key = registry.canonical_key_for_layout(candidate);
+            if key == base_key {
+                return true;
+            }
+            if !visited.insert(key) {
+                return false;
+            }
+            candidate
+                .parent
+                .as_deref()
+                .and_then(|name| registry.get_related(candidate, name))
+                .is_some_and(|parent| is_same_or_extension_of(registry, parent, base_key, visited))
+        }
+
+        let base_key = match declared {
+            TypeInfo::Class(name) => self
+                .get_for_scope(scope, name)
+                .or_else(|| self.get(name))
+                .map(|layout| self.canonical_key_for_layout(layout)),
+            TypeInfo::ClassStar => None,
+            _ => return None,
+        };
+
+        let mut candidates: Vec<_> = self
+            .layouts
+            .values()
+            .filter(|candidate| {
+                if candidate.is_abstract
+                    || candidate.owner_module.is_some()
+                    || !scope_can_see(self, scope, candidate.owner_scope)
+                    || !self.lifecycle_has_ownerless_finalizer(candidate)
+                {
+                    return false;
+                }
+                base_key.as_deref().is_none_or(|base| {
+                    is_same_or_extension_of(self, candidate, base, &mut HashSet::new())
+                })
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| self.canonical_key_for_layout(candidate));
+        candidates.into_iter().next()
+    }
+
     fn resolve_name_in_scope(
         &self,
         scope: ScopeId,
@@ -444,8 +622,14 @@ impl TypeLayoutRegistry {
     pub fn insert(&mut self, mut layout: TypeLayout) {
         if layout.type_tag == 0 {
             layout.type_tag = stable_type_tag(&layout);
-        } else if layout.type_tag >= self.next_tag {
-            self.next_tag = layout.type_tag + 1;
+        } else {
+            layout.type_tag &= TYPE_TAG_VALUE_MASK;
+            if layout.type_tag == 0 {
+                layout.type_tag = 1;
+            }
+            if layout.type_tag < TYPE_TAG_VALUE_MASK && layout.type_tag >= self.next_tag {
+                self.next_tag = layout.type_tag + 1;
+            }
         }
         let name = layout.name.to_lowercase();
         let canonical = layout_identity_key(&layout);
