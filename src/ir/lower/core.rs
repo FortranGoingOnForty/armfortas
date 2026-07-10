@@ -23070,15 +23070,19 @@ pub(super) fn clear_intent_out_derived_params(
             let storage = derived_storage_addr(b, info);
             if is_array_dummy {
                 let elem_count = array_total_elems_value(b, info);
-                finalize_derived_array_storage_dynamic(
+                let desc = if local_uses_array_descriptor(info) {
+                    array_descriptor_addr(b, info)
+                } else {
+                    materialize_array_descriptor_for_info(b, info)
+                };
+                finalize_derived_array_descriptor_storage(
                     b,
                     st,
                     internal_funcs,
                     contained_host_refs,
                     closure_locals,
+                    desc,
                     layout,
-                    storage,
-                    elem_count,
                 );
                 clear_derived_array_storage_for_intent_out_dynamic(
                     b,
@@ -23109,15 +23113,19 @@ pub(super) fn clear_intent_out_derived_params(
         let storage = derived_storage_addr(b, info);
         if is_array_dummy {
             let elem_count = array_total_elems_value(b, info);
-            finalize_derived_array_storage_dynamic(
+            let desc = if local_uses_array_descriptor(info) {
+                array_descriptor_addr(b, info)
+            } else {
+                materialize_array_descriptor_for_info(b, info)
+            };
+            finalize_derived_array_descriptor_storage(
                 b,
                 st,
                 internal_funcs,
                 contained_host_refs,
                 closure_locals,
+                desc,
                 layout,
-                storage,
-                elem_count,
             );
             clear_derived_array_storage_for_intent_out_dynamic(
                 b,
@@ -26335,14 +26343,14 @@ pub(super) fn finalize_derived_storage(
     layout: &crate::sema::type_layout::TypeLayout,
     finalized_addr: ValueId,
 ) {
-    for final_proc in &layout.final_procs {
+    if let Some(final_proc) = layout.final_procs.iter().find(|proc| proc.rank == 0) {
         emit_final_proc_call(
             b,
             st,
             internal_funcs,
             contained_host_refs,
             closure_locals,
-            final_proc,
+            &final_proc.name,
             finalized_addr,
         );
     }
@@ -26356,13 +26364,14 @@ pub(super) fn finalize_derived_array_storage_dynamic(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     closure_locals: &HashMap<String, LocalInfo>,
     layout: &crate::sema::type_layout::TypeLayout,
-    base_addr: ValueId,
-    elem_count: ValueId,
+    desc: ValueId,
 ) {
-    if layout.final_procs.is_empty() {
+    let Some(final_proc) = layout.final_procs.iter().find(|proc| proc.rank == 0) else {
         return;
-    }
+    };
 
+    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
+    let base_addr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let zero = b.const_i64(0);
     let bb_check = b.create_block("derived_array_final_check");
     let idx = b.add_block_param(bb_check, IrType::Int(IntWidth::I64));
@@ -26376,16 +26385,17 @@ pub(super) fn finalize_derived_array_storage_dynamic(
     b.cond_branch(done, bb_exit, vec![], bb_body, vec![idx]);
 
     b.set_block(bb_body);
+    let byte_off = array_descriptor_flat_element_offset(b, desc, body_idx);
     let elem_bytes = b.const_i64(layout.size as i64);
-    let byte_off = b.imul(body_idx, elem_bytes);
+    let byte_off = b.imul(byte_off, elem_bytes);
     let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
-    finalize_derived_storage(
+    emit_final_proc_call(
         b,
         st,
         internal_funcs,
         contained_host_refs,
         closure_locals,
-        layout,
+        &final_proc.name,
         elem_ptr,
     );
 
@@ -26394,6 +26404,132 @@ pub(super) fn finalize_derived_array_storage_dynamic(
     b.branch(bb_check, vec![next_idx]);
 
     b.set_block(bb_exit);
+}
+
+fn array_descriptor_flat_element_offset(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    flat_index: ValueId,
+) -> ValueId {
+    let dim_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let remaining_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let offset_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, dim_addr);
+    b.store(flat_index, remaining_addr);
+    b.store(zero, offset_addr);
+
+    let rank_offset = b.const_i64(16);
+    let rank_ptr = b.gep(desc, vec![rank_offset], IrType::Int(IntWidth::I8));
+    let rank_i32 = b.load_typed(rank_ptr, IrType::Int(IntWidth::I32));
+    let rank = b.int_extend(rank_i32, IntWidth::I64, false);
+    let bb_check = b.create_block("derived_array_final_offset_check");
+    let bb_body = b.create_block("derived_array_final_offset_body");
+    let bb_done = b.create_block("derived_array_final_offset_done");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let dim = b.load(dim_addr);
+    let finished = b.icmp(CmpOp::Ge, dim, rank);
+    b.cond_branch(finished, bb_done, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let dim_bytes = b.const_i64(24);
+    let dims_offset = b.const_i64(24);
+    let dim_offset = b.imul(dim, dim_bytes);
+    let dim_offset = b.iadd(dims_offset, dim_offset);
+    let dim_ptr = b.gep(desc, vec![dim_offset], IrType::Int(IntWidth::I8));
+    let lower = b.load_typed(dim_ptr, IrType::Int(IntWidth::I64));
+    let upper_offset = b.const_i64(8);
+    let upper_ptr = b.gep(dim_ptr, vec![upper_offset], IrType::Int(IntWidth::I8));
+    let upper = b.load_typed(upper_ptr, IrType::Int(IntWidth::I64));
+    let stride_offset = b.const_i64(16);
+    let stride_ptr = b.gep(dim_ptr, vec![stride_offset], IrType::Int(IntWidth::I8));
+    let stride = b.load_typed(stride_ptr, IrType::Int(IntWidth::I64));
+    let span = b.isub(upper, lower);
+    let one = b.const_i64(1);
+    let extent = b.iadd(span, one);
+    let remaining = b.load(remaining_addr);
+    let coordinate = b.imod(remaining, extent);
+    let next_remaining = b.idiv(remaining, extent);
+    b.store(next_remaining, remaining_addr);
+    let contribution = b.imul(coordinate, stride);
+    let offset = b.load(offset_addr);
+    let next_offset = b.iadd(offset, contribution);
+    b.store(next_offset, offset_addr);
+    let next_dim = b.iadd(dim, one);
+    b.store(next_dim, dim_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_done);
+    b.load(offset_addr)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finalize_derived_array_descriptor_storage(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    let rank_specific: Vec<_> = layout
+        .final_procs
+        .iter()
+        .filter(|proc| proc.rank > 0)
+        .collect();
+    if rank_specific.is_empty() {
+        finalize_derived_array_storage_dynamic(
+            b,
+            st,
+            internal_funcs,
+            contained_host_refs,
+            closure_locals,
+            layout,
+            desc,
+        );
+        return;
+    }
+
+    let rank_ptr_offset = b.const_i64(16);
+    let rank_ptr = b.gep(desc, vec![rank_ptr_offset], IrType::Int(IntWidth::I8));
+    let actual_rank = b.load_typed(rank_ptr, IrType::Int(IntWidth::I32));
+    let bb_done = b.create_block("derived_array_final_done");
+
+    for final_proc in rank_specific {
+        let expected_rank = b.const_i32(final_proc.rank as i32);
+        let matches = b.icmp(CmpOp::Eq, actual_rank, expected_rank);
+        let bb_call = b.create_block("derived_array_final_rank_call");
+        let bb_next = b.create_block("derived_array_final_rank_next");
+        b.cond_branch(matches, bb_call, vec![], bb_next, vec![]);
+
+        b.set_block(bb_call);
+        emit_final_proc_call(
+            b,
+            st,
+            internal_funcs,
+            contained_host_refs,
+            closure_locals,
+            &final_proc.name,
+            desc,
+        );
+        b.branch(bb_done, vec![]);
+        b.set_block(bb_next);
+    }
+
+    finalize_derived_array_storage_dynamic(
+        b,
+        st,
+        internal_funcs,
+        contained_host_refs,
+        closure_locals,
+        layout,
+        desc,
+    );
+    b.branch(bb_done, vec![]);
+    b.set_block(bb_done);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -26422,17 +26558,14 @@ pub(super) fn finalize_derived_descriptor_storage_if_allocated(
     b.cond_branch(is_allocated, bb_final, vec![], bb_done, vec![]);
 
     b.set_block(bb_final);
-    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
-    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-    finalize_derived_array_storage_dynamic(
+    finalize_derived_array_descriptor_storage(
         b,
         st,
         internal_funcs,
         contained_host_refs,
         closure_locals,
+        desc,
         layout,
-        base,
-        elem_count,
     );
     b.branch(bb_done, vec![]);
 
@@ -26558,15 +26691,28 @@ pub(super) fn insert_implicit_dealloc(
         if finalize_owned_locals && !info.by_ref && !info.allocatable {
             if let Some(ref type_name) = info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
-                    finalize_derived_storage(
-                        b,
-                        st,
-                        internal_funcs,
-                        contained_host_refs,
-                        closure_locals,
-                        layout,
-                        info.addr,
-                    );
+                    if local_declared_rank(info) > 0 {
+                        let desc = materialize_array_descriptor_for_info(b, info);
+                        finalize_derived_array_descriptor_storage(
+                            b,
+                            st,
+                            internal_funcs,
+                            contained_host_refs,
+                            closure_locals,
+                            desc,
+                            layout,
+                        );
+                    } else {
+                        finalize_derived_storage(
+                            b,
+                            st,
+                            internal_funcs,
+                            contained_host_refs,
+                            closure_locals,
+                            layout,
+                            info.addr,
+                        );
+                    }
                 }
             }
         }

@@ -78,6 +78,12 @@ pub struct BoundProc {
 }
 
 /// Complete layout of a derived type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalProc {
+    pub name: String,
+    pub rank: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeLayout {
     pub name: String,
@@ -86,7 +92,7 @@ pub struct TypeLayout {
     pub align: usize,
     pub fields: Vec<FieldLayout>,
     pub bound_procs: Vec<BoundProc>,
-    pub final_procs: Vec<String>,
+    pub final_procs: Vec<FinalProc>,
     /// Unique type tag for polymorphic dispatch. Assigned sequentially.
     pub type_tag: u64,
     /// Parent type name (from EXTENDS). None for base types.
@@ -1143,10 +1149,10 @@ pub fn compute_layout_with_attrs(
         }
     }
 
-    let final_procs: Vec<String> = final_proc_names
+    let final_procs: Vec<FinalProc> = final_proc_names
         .iter()
         .map(|name| {
-            if let Some(module_name) = host_module {
+            let name = if let Some(module_name) = host_module {
                 format!(
                     "afs_modproc_{}_{}",
                     module_name.to_lowercase(),
@@ -1154,7 +1160,8 @@ pub fn compute_layout_with_attrs(
                 )
             } else {
                 name.clone()
-            }
+            };
+            FinalProc { name, rank: 0 }
         })
         .collect();
 

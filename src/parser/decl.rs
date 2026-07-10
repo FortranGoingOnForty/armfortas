@@ -995,8 +995,12 @@ impl<'a> Parser<'a> {
                     } else if proc_text == "final" {
                         self.advance();
                         self.eat(&TokenKind::ColonColon);
-                        let name = self.advance().clone().text;
-                        final_procs.push(name);
+                        loop {
+                            final_procs.push(self.advance().clone().text);
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
                     } else {
                         // Skip unknown lines in contains section.
                         while !self.at_stmt_end() {
@@ -1754,6 +1758,22 @@ mod tests {
             names,
             vec!["has_custom_location", "full_path", "path_or_empty"]
         );
+    }
+
+    #[test]
+    fn final_proc_comma_list_preserves_every_name() {
+        let tokens = Lexer::tokenize(
+            "type :: item\ncontains\nfinal :: finish_scalar, finish_vector\nend type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef { final_procs, .. } = decl.node else {
+            panic!("not a derived type definition");
+        };
+        assert_eq!(final_procs, vec!["finish_scalar", "finish_vector"]);
     }
 
     #[test]

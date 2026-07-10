@@ -1256,7 +1256,7 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             }
         }
         for fp in &layout.final_procs {
-            writeln!(out, "  @final {}", fp).unwrap();
+            writeln!(out, "  @final {} rank={}", fp.name, fp.rank).unwrap();
         }
         if let Some(owner_module) = &layout.owner_module {
             writeln!(out, "  @owner {}", owner_module).unwrap();
@@ -1789,6 +1789,30 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             });
         }
         // Skip unrecognized directives (forward compatibility).
+    }
+
+    let final_proc_prefix = format!("afs_modproc_{}_", module_name.to_lowercase());
+    for layout in &mut types {
+        for final_proc in &mut layout.final_procs {
+            if final_proc.rank != usize::MAX {
+                continue;
+            }
+            let source_name = final_proc
+                .name
+                .strip_prefix(&final_proc_prefix)
+                .unwrap_or(&final_proc.name);
+            let Some(proc) = procedures
+                .iter()
+                .find(|proc| proc.name.eq_ignore_ascii_case(source_name))
+            else {
+                return Err(format!(
+                    "{}: cannot infer rank for legacy @final {}",
+                    path.display(),
+                    final_proc.name
+                ));
+            };
+            final_proc.rank = proc.args.first().map_or(0, |arg| arg.rank as usize);
+        }
     }
 
     Ok(ModuleInterface {
@@ -2329,7 +2353,15 @@ fn parse_type(
                 nopass,
             });
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
-            final_procs.push(rest.trim().to_string());
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().unwrap_or_default().to_string();
+            let rank = match parts.find_map(|part| part.strip_prefix("rank=")) {
+                Some(rank) => rank
+                    .parse()
+                    .unwrap_or_else(|_| panic!("malformed @final rank '{}'", rank)),
+                None => usize::MAX,
+            };
+            final_procs.push(crate::sema::type_layout::FinalProc { name, rank });
         } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
             owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
@@ -2722,6 +2754,7 @@ mod tests {
   @field y : real @offset 4 @size 4
   @field mass : real @offset 8 @size 4
   @binds kinetic_energy
+  @final afs_modproc_physics_finish_particles rank=1
   @tag 1
 @end type
 "#;
@@ -2760,6 +2793,39 @@ mod tests {
         assert_eq!(pt.fields.len(), 3);
         assert_eq!(pt.bound_procs.len(), 1);
         assert_eq!(pt.bound_procs[0].method_name, "kinetic_energy");
+        assert_eq!(
+            pt.final_procs,
+            vec![crate::sema::type_layout::FinalProc {
+                name: "afs_modproc_physics_finish_particles".into(),
+                rank: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_final_proc_rank_is_inferred_from_procedure() {
+        let amod_text = r#"#!amod 2
+# module: m
+
+@subroutine finish
+  @arg values : type(item), rank=1
+@end subroutine
+
+@type item
+  @final afs_modproc_m_finish
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("legacy.amod")).unwrap();
+        assert_eq!(iface.types[0].final_procs[0].rank, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed @final rank")]
+    fn malformed_final_proc_rank_is_rejected() {
+        let mut lines = "  @final afs_modproc_m_finish rank=oops\n@end type\n"
+            .lines()
+            .peekable();
+        let _ = parse_type("@type item", &mut lines);
     }
 
     #[test]

@@ -1250,6 +1250,8 @@ fn collect_derived_type_layouts(
         target_layout,
         decls,
         host_module,
+        st,
+        scope_id,
         layouts,
         &const_params,
         &const_char_params,
@@ -1261,6 +1263,8 @@ fn collect_derived_type_layouts(
         target_layout,
         decls,
         host_module,
+        st,
+        scope_id,
         layouts,
         &const_params,
         &const_char_params,
@@ -1789,10 +1793,13 @@ fn collect_const_derived_field_inits(
     field_inits
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_local_type_layouts(
     target_layout: crate::target::TargetLayout,
     decls: &[SpannedDecl],
     host_module: Option<&str>,
+    st: &SymbolTable,
+    scope_id: ScopeId,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
     const_char_params: &HashMap<String, String>,
@@ -1813,7 +1820,7 @@ fn register_local_type_layouts(
             let is_abstract = attrs
                 .iter()
                 .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
-            let layout = crate::sema::type_layout::compute_layout_with_attrs(
+            let mut layout = crate::sema::type_layout::compute_layout_with_attrs(
                 name,
                 host_module,
                 type_bound_procs,
@@ -1827,6 +1834,9 @@ fn register_local_type_layouts(
                 const_derived_field_inits,
                 target_layout,
             );
+            for (final_proc, source_name) in layout.final_procs.iter_mut().zip(final_procs) {
+                final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
+            }
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
             let dominated = layouts
@@ -1843,6 +1853,27 @@ fn register_local_type_layouts(
             }
         }
     }
+}
+
+fn final_procedure_rank(st: &SymbolTable, owner_scope: ScopeId, name: &str) -> Option<usize> {
+    let proc_scope = st
+        .all_scopes()
+        .iter()
+        .enumerate()
+        .find(|(_, scope)| {
+            scope.parent == Some(owner_scope)
+                && matches!(
+                    &scope.kind,
+                    ScopeKind::Subroutine(scope_name) | ScopeKind::Function(scope_name)
+                        if scope_name.eq_ignore_ascii_case(name)
+                )
+        })
+        .map(|(id, _)| id)?;
+    let scope = st.scope(proc_scope);
+    let first_arg = scope.arg_order.first()?;
+    let symbol = scope.symbols.get(&first_arg.to_lowercase())?;
+    let specs = &symbol.attrs.array_spec;
+    Some(if specs.is_empty() { 0 } else { specs.len() })
 }
 
 /// Resolve procedure-pointer default-init targets stored as bare
