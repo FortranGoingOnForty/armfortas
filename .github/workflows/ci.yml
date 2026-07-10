@@ -67,6 +67,18 @@ jobs:
           components: clippy
       - run: cargo clippy --workspace --all-targets --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments
 
+  format:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   test-armfortas-lib:
     name: "Tests: armfortas library unit"
     runs-on: macos-latest
