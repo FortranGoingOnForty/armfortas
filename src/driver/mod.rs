@@ -1435,6 +1435,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let pp_result =
         crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
+    let included_files = pp_result.included_files;
     let preprocessed = pp_result.text;
 
     if opts.preprocess_only {
@@ -1715,7 +1716,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
-        write_dependency_file(opts, &out)?;
+        write_dependency_file(opts, &out, &included_files)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -1924,7 +1925,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         if opts.emit_obj {
             let _ = fs::remove_file(&asm_path);
-            write_dependency_file(opts, &obj_path)?;
+            write_dependency_file(opts, &obj_path, &included_files)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
@@ -1975,7 +1976,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     if opts.emit_obj {
-        write_dependency_file(opts, &obj_path)?;
+        write_dependency_file(opts, &obj_path, &included_files)?;
         phases.report();
         return Ok(());
     }
@@ -2019,7 +2020,11 @@ fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
+fn write_dependency_file(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
     if !opts.emit_depfile && opts.depfile.is_none() {
         return Ok(());
     }
@@ -2055,11 +2060,17 @@ fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
     }
     body.push_str(": ");
     body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+    for include in included_files {
+        body.push(' ');
+        body.push_str(&escape_make_dep_token(&include.to_string_lossy()));
+    }
     body.push('\n');
     if opts.depfile_phony {
-        body.push('\n');
-        body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
-        body.push_str(":\n");
+        for include in included_files {
+            body.push('\n');
+            body.push_str(&escape_make_dep_token(&include.to_string_lossy()));
+            body.push_str(":\n");
+        }
     }
 
     fs::write(&depfile, body)

@@ -124,6 +124,8 @@ pub struct PreprocOutput {
     pub text: String,
     /// Maps output line numbers (1-based) to original (filename, line) pairs.
     pub source_map: Vec<SourceLoc>,
+    /// Resolved include files in first-seen order, including nested includes.
+    pub included_files: Vec<PathBuf>,
 }
 
 /// A source location before preprocessing.
@@ -191,6 +193,7 @@ struct Preprocessor {
     in_c_block_comment: bool,
     /// #line overrides for source map reporting.
     line_override: Option<(u32, String)>,
+    included_files: Vec<PathBuf>,
 }
 
 impl Preprocessor {
@@ -205,6 +208,7 @@ impl Preprocessor {
             cond_stack: Vec::new(),
             skip_depth: 0,
             include_depth: 0,
+            included_files: Vec::new(),
         }
     }
 
@@ -251,6 +255,7 @@ impl Preprocessor {
         Ok(PreprocOutput {
             text: output,
             source_map,
+            included_files: self.included_files.clone(),
         })
     }
 
@@ -661,6 +666,9 @@ impl Preprocessor {
             line: line_num,
             msg: format!("reading {}: {}", resolved.display(), e),
         })?;
+        if !self.included_files.contains(&resolved) {
+            self.included_files.push(resolved.clone());
+        }
 
         // Save __FILE__ so it's restored after the include returns.
         let saved_file = self.defines.get("__FILE__").cloned();
