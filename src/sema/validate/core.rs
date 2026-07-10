@@ -137,6 +137,13 @@ pub(super) struct Ctx<'a> {
     /// working byte-copy lowering; only the Fortran-internal character
     /// VALUE path lacks copy-in.
     pub(super) in_bind_c_unit: bool,
+    /// Host scopes whose storage must not be captured by the procedure
+    /// currently being validated because it is reachable from a local
+    /// FINAL binding and may be invoked after those scopes return.
+    finalizer_capture_host_scopes: HashSet<ScopeId>,
+    /// Avoid repeating one unsupported-capture diagnostic for every use
+    /// of the same host entity in a finalizer or one of its helpers.
+    reported_finalizer_captures: HashSet<(ScopeId, ScopeId, String)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -173,6 +180,8 @@ impl<'a> Ctx<'a> {
             in_call_arg: false,
             allow_array_cond_rhs: false,
             in_bind_c_unit: false,
+            finalizer_capture_host_scopes: HashSet::new(),
+            reported_finalizer_captures: HashSet::new(),
         }
     }
 
@@ -2059,11 +2068,804 @@ fn find_scope_for_unit(
         .map(|s| s.id)
 }
 
+#[derive(Default)]
+struct ProcedureReferenceFacts {
+    references: Vec<(String, Span)>,
+    calls: HashSet<String>,
+}
+
+fn collect_reference_subscript(
+    subscript: &crate::ast::expr::SectionSubscript,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match subscript {
+        crate::ast::expr::SectionSubscript::Element(expr) => {
+            collect_reference_expr(expr, shadowed, facts);
+        }
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            for expr in [start, end, stride].into_iter().flatten() {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+        }
+    }
+}
+
+fn collect_reference_ac_value(
+    value: &crate::ast::expr::AcValue,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match value {
+        crate::ast::expr::AcValue::Expr(expr) => collect_reference_expr(expr, shadowed, facts),
+        crate::ast::expr::AcValue::ImpliedDo(loop_) => {
+            collect_reference_expr(&loop_.start, shadowed, facts);
+            collect_reference_expr(&loop_.end, shadowed, facts);
+            if let Some(step) = &loop_.step {
+                collect_reference_expr(step, shadowed, facts);
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.insert(loop_.var.to_lowercase());
+            for nested in &loop_.values {
+                collect_reference_ac_value(nested, &nested_shadowed, facts);
+            }
+        }
+    }
+}
+
+fn collect_reference_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if !shadowed.contains(&key) {
+                facts.references.push((key, expr.span));
+            }
+        }
+        Expr::UnaryOp { operand, .. } => collect_reference_expr(operand, shadowed, facts),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_reference_expr(left, shadowed, facts);
+            collect_reference_expr(right, shadowed, facts);
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            collect_reference_expr(real, shadowed, facts);
+            collect_reference_expr(imag, shadowed, facts);
+        }
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if !shadowed.contains(&key) {
+                    facts.calls.insert(key);
+                }
+            }
+            collect_reference_expr(callee, shadowed, facts);
+            for arg in args {
+                collect_reference_subscript(&arg.value, shadowed, facts);
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                collect_reference_ac_value(value, shadowed, facts);
+            }
+        }
+        Expr::ComponentAccess { base, .. } => collect_reference_expr(base, shadowed, facts),
+        Expr::ParenExpr { inner } => collect_reference_expr(inner, shadowed, facts),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_reference_expr(cond, shadowed, facts);
+            collect_reference_expr(then_val, shadowed, facts);
+            collect_reference_expr(else_val, shadowed, facts);
+        }
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::NilArgument => {}
+    }
+}
+
+fn collect_reference_array_spec(
+    spec: &crate::ast::decl::ArraySpec,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match spec {
+        crate::ast::decl::ArraySpec::Explicit { lower, upper } => {
+            if let Some(lower) = lower {
+                collect_reference_expr(lower, shadowed, facts);
+            }
+            collect_reference_expr(upper, shadowed, facts);
+        }
+        crate::ast::decl::ArraySpec::AssumedShape { lower }
+        | crate::ast::decl::ArraySpec::AssumedSize { lower } => {
+            if let Some(lower) = lower {
+                collect_reference_expr(lower, shadowed, facts);
+            }
+        }
+        crate::ast::decl::ArraySpec::Deferred | crate::ast::decl::ArraySpec::AssumedRank => {}
+    }
+}
+
+fn collect_reference_type_spec(
+    type_spec: &TypeSpec,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match type_spec {
+        TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Real(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Real(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Complex(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Complex(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Logical(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Logical(Some(crate::ast::decl::KindSelector::Star(expr))) => {
+            collect_reference_expr(expr, shadowed, facts);
+        }
+        TypeSpec::Character(Some(selector)) => {
+            if let Some(crate::ast::decl::LenSpec::Expr(expr)) = &selector.len {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+            if let Some(kind) = &selector.kind {
+                collect_reference_expr(kind, shadowed, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_reference_decl(
+    decl: &SpannedDecl,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match &decl.node {
+        Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } => {
+            collect_reference_type_spec(type_spec, shadowed, facts);
+            for attr in attrs {
+                if let Attribute::Dimension(specs) = attr {
+                    for spec in specs {
+                        collect_reference_array_spec(spec, shadowed, facts);
+                    }
+                }
+            }
+            for entity in entities {
+                if let Some(specs) = &entity.array_spec {
+                    for spec in specs {
+                        collect_reference_array_spec(spec, shadowed, facts);
+                    }
+                }
+                if let Some(crate::ast::decl::LenSpec::Expr(expr)) = &entity.char_len {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+                if let Some(init) = &entity.init {
+                    collect_reference_expr(init, shadowed, facts);
+                }
+                if let Some(init) = &entity.ptr_init {
+                    collect_reference_expr(init, shadowed, facts);
+                }
+            }
+        }
+        Decl::ParameterStmt { pairs } => {
+            for (_, expr) in pairs {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+        }
+        Decl::EquivalenceStmt { groups } => {
+            for expr in groups.iter().flatten() {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+        }
+        Decl::DataStmt { sets } => {
+            for set in sets {
+                for expr in &set.objects {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+                for value in &set.values {
+                    match value {
+                        crate::ast::decl::DataValue::Expr(expr) => {
+                            collect_reference_expr(expr, shadowed, facts);
+                        }
+                        crate::ast::decl::DataValue::Repeat { count, value } => {
+                            collect_reference_expr(count, shadowed, facts);
+                            collect_reference_expr(value, shadowed, facts);
+                        }
+                    }
+                }
+            }
+        }
+        Decl::EnumDef { enumerators, .. } => {
+            for (_, expr) in enumerators {
+                if let Some(expr) = expr {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+            }
+        }
+        Decl::DerivedTypeDef { components, .. } => {
+            for component in components {
+                collect_reference_decl(component, shadowed, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>) {
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                out.extend(entities.iter().map(|entity| entity.name.to_lowercase()));
+            }
+            Decl::ParameterStmt { pairs } => {
+                out.extend(pairs.iter().map(|(name, _)| name.to_lowercase()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_block_use_names(uses: &[SpannedDecl], out: &mut HashSet<String>) {
+    for use_stmt in uses {
+        let Decl::UseStmt { renames, only, .. } = &use_stmt.node else {
+            continue;
+        };
+        out.extend(renames.iter().map(|rename| rename.local.to_lowercase()));
+        if let Some(items) = only {
+            for item in items {
+                match item {
+                    crate::ast::decl::OnlyItem::Name(name)
+                    | crate::ast::decl::OnlyItem::Generic(name) => {
+                        out.insert(name.to_lowercase());
+                    }
+                    crate::ast::decl::OnlyItem::Rename(rename) => {
+                        out.insert(rename.local.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_reference_stmt(
+    stmt: &SpannedStmt,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match &stmt.node {
+        Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
+            collect_reference_expr(target, shadowed, facts);
+            collect_reference_expr(value, shadowed, facts);
+        }
+        Stmt::IfConstruct {
+            condition,
+            then_body,
+            else_ifs,
+            else_body,
+            ..
+        } => {
+            collect_reference_expr(condition, shadowed, facts);
+            collect_reference_stmts(then_body, shadowed, facts);
+            for (condition, body) in else_ifs {
+                collect_reference_expr(condition, shadowed, facts);
+                collect_reference_stmts(body, shadowed, facts);
+            }
+            if let Some(body) = else_body {
+                collect_reference_stmts(body, shadowed, facts);
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            collect_reference_expr(condition, shadowed, facts);
+            collect_reference_stmt(action, shadowed, facts);
+        }
+        Stmt::DoLoop {
+            var,
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(var) = var {
+                let key = var.to_lowercase();
+                if !shadowed.contains(&key) {
+                    facts.references.push((key, stmt.span));
+                }
+            }
+            for expr in [start, end, step].into_iter().flatten() {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+            collect_reference_stmts(body, shadowed, facts);
+        }
+        Stmt::DoWhile {
+            condition, body, ..
+        } => {
+            collect_reference_expr(condition, shadowed, facts);
+            collect_reference_stmts(body, shadowed, facts);
+        }
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            locality,
+            body,
+            ..
+        } => {
+            for control in controls {
+                collect_reference_expr(&control.start, shadowed, facts);
+                collect_reference_expr(&control.end, shadowed, facts);
+                if let Some(step) = &control.step {
+                    collect_reference_expr(step, shadowed, facts);
+                }
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(controls.iter().map(|control| control.var.to_lowercase()));
+            for spec in locality {
+                match spec {
+                    LocalitySpec::Local(names) => {
+                        nested_shadowed.extend(names.iter().map(|name| name.to_lowercase()));
+                    }
+                    LocalitySpec::LocalInit(names) | LocalitySpec::Reduce { vars: names, .. } => {
+                        for name in names {
+                            let key = name.to_lowercase();
+                            if !shadowed.contains(&key) {
+                                facts.references.push((key.clone(), stmt.span));
+                            }
+                            nested_shadowed.insert(key);
+                        }
+                    }
+                    LocalitySpec::Shared(names) => {
+                        for name in names {
+                            let key = name.to_lowercase();
+                            if !shadowed.contains(&key) {
+                                facts.references.push((key, stmt.span));
+                            }
+                        }
+                    }
+                    LocalitySpec::DefaultNone => {}
+                }
+            }
+            if let Some(mask) = mask {
+                collect_reference_expr(mask, &nested_shadowed, facts);
+            }
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::SelectCase {
+            selector, cases, ..
+        } => {
+            collect_reference_expr(selector, shadowed, facts);
+            for case in cases {
+                for selector in &case.selectors {
+                    match selector {
+                        CaseSelector::Value(expr) => {
+                            collect_reference_expr(expr, shadowed, facts);
+                        }
+                        CaseSelector::Range { low, high } => {
+                            for expr in [low, high].into_iter().flatten() {
+                                collect_reference_expr(expr, shadowed, facts);
+                            }
+                        }
+                        CaseSelector::Default => {}
+                    }
+                }
+                collect_reference_stmts(&case.body, shadowed, facts);
+            }
+        }
+        Stmt::SelectType {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            collect_reference_expr(selector, shadowed, facts);
+            let mut nested_shadowed = shadowed.clone();
+            if let Some(name) = assoc_name {
+                nested_shadowed.insert(name.to_lowercase());
+            }
+            for guard in guards {
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                collect_reference_stmts(body, &nested_shadowed, facts);
+            }
+        }
+        Stmt::SelectRank {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            collect_reference_expr(selector, shadowed, facts);
+            let mut nested_shadowed = shadowed.clone();
+            if let Some(name) = assoc_name {
+                nested_shadowed.insert(name.to_lowercase());
+            }
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                collect_reference_stmts(body, &nested_shadowed, facts);
+            }
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
+            collect_reference_expr(mask, shadowed, facts);
+            collect_reference_stmts(body, shadowed, facts);
+            for (mask, body) in elsewhere {
+                if let Some(mask) = mask {
+                    collect_reference_expr(mask, shadowed, facts);
+                }
+                collect_reference_stmts(body, shadowed, facts);
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            collect_reference_expr(mask, shadowed, facts);
+            collect_reference_stmt(stmt, shadowed, facts);
+        }
+        Stmt::ForallConstruct {
+            specs, mask, body, ..
+        } => {
+            for spec in specs {
+                collect_reference_expr(&spec.start, shadowed, facts);
+                collect_reference_expr(&spec.end, shadowed, facts);
+                if let Some(step) = &spec.step {
+                    collect_reference_expr(step, shadowed, facts);
+                }
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+            if let Some(mask) = mask {
+                collect_reference_expr(mask, &nested_shadowed, facts);
+            }
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for spec in specs {
+                collect_reference_expr(&spec.start, shadowed, facts);
+                collect_reference_expr(&spec.end, shadowed, facts);
+                if let Some(step) = &spec.step {
+                    collect_reference_expr(step, shadowed, facts);
+                }
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+            if let Some(mask) = mask {
+                collect_reference_expr(mask, &nested_shadowed, facts);
+            }
+            collect_reference_stmt(stmt, &nested_shadowed, facts);
+        }
+        Stmt::Block {
+            uses,
+            implicit,
+            decls,
+            body,
+            ..
+        } => {
+            let mut nested_shadowed = shadowed.clone();
+            collect_block_use_names(uses, &mut nested_shadowed);
+            collect_block_binding_names(decls, &mut nested_shadowed);
+            for decl in uses.iter().chain(implicit).chain(decls) {
+                collect_reference_decl(decl, &nested_shadowed, facts);
+            }
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, expr) in assocs {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(assocs.iter().map(|(name, _)| name.to_lowercase()));
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+            if let Some(code) = code {
+                collect_reference_expr(code, shadowed, facts);
+            }
+        }
+        Stmt::ComputedGoto { selector, .. } | Stmt::ArithmeticIf { expr: selector, .. } => {
+            collect_reference_expr(selector, shadowed, facts);
+        }
+        Stmt::Labeled { stmt, .. } => collect_reference_stmt(stmt, shadowed, facts),
+        Stmt::Write { controls, items }
+        | Stmt::Read { controls, items }
+        | Stmt::Inquire {
+            specs: controls,
+            items,
+        } => {
+            for control in controls {
+                collect_reference_expr(&control.value, shadowed, facts);
+            }
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => {
+            for spec in specs {
+                collect_reference_expr(&spec.value, shadowed, facts);
+            }
+        }
+        Stmt::Allocate {
+            type_spec,
+            items,
+            opts,
+        } => {
+            if let Some(type_spec) = type_spec {
+                collect_reference_type_spec(type_spec, shadowed, facts);
+            }
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+            for opt in opts {
+                collect_reference_expr(&opt.value, shadowed, facts);
+            }
+        }
+        Stmt::Deallocate { items, opts } => {
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+            for opt in opts {
+                collect_reference_expr(&opt.value, shadowed, facts);
+            }
+        }
+        Stmt::Nullify { items } => {
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+        }
+        Stmt::Call { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if !shadowed.contains(&key) {
+                    facts.calls.insert(key);
+                }
+            }
+            collect_reference_expr(callee, shadowed, facts);
+            for arg in args {
+                collect_reference_subscript(&arg.value, shadowed, facts);
+            }
+        }
+        Stmt::Print { format, items } => {
+            collect_reference_expr(format, shadowed, facts);
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+        }
+        Stmt::Namelist { groups } => {
+            for (_, names) in groups {
+                for name in names {
+                    let key = name.to_lowercase();
+                    if !shadowed.contains(&key) {
+                        facts.references.push((key, stmt.span));
+                    }
+                }
+            }
+        }
+        Stmt::Declaration(decl) => collect_reference_decl(decl, shadowed, facts),
+        Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Format { .. } => {}
+    }
+}
+
+fn collect_reference_stmts(
+    stmts: &[SpannedStmt],
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    for stmt in stmts {
+        collect_reference_stmt(stmt, shadowed, facts);
+    }
+}
+
+fn procedure_reference_facts(unit: &ProgramUnit) -> ProcedureReferenceFacts {
+    let (decls, body) = match unit {
+        ProgramUnit::Program { decls, body, .. }
+        | ProgramUnit::Subroutine { decls, body, .. }
+        | ProgramUnit::Function { decls, body, .. } => (decls.as_slice(), body.as_slice()),
+        _ => return ProcedureReferenceFacts::default(),
+    };
+    let shadowed = HashSet::new();
+    let mut facts = ProcedureReferenceFacts::default();
+    for decl in decls {
+        collect_reference_decl(decl, &shadowed, &mut facts);
+    }
+    collect_reference_stmts(body, &shadowed, &mut facts);
+    facts
+}
+
+fn contained_unit_name(unit: &ProgramUnit) -> Option<String> {
+    match unit {
+        ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } => {
+            Some(name.to_lowercase())
+        }
+        _ => None,
+    }
+}
+
+fn procedure_host_scopes(st: &SymbolTable, owner_scope: ScopeId) -> HashSet<ScopeId> {
+    let mut scopes = HashSet::new();
+    let mut current = Some(owner_scope);
+    while let Some(scope_id) = current {
+        let scope = st.scope(scope_id);
+        match scope.kind {
+            ScopeKind::Program(_) | ScopeKind::Subroutine(_) | ScopeKind::Function(_) => {
+                scopes.insert(scope_id);
+            }
+            ScopeKind::Global | ScopeKind::Module(_) | ScopeKind::Submodule(_) => break,
+            _ => {}
+        }
+        current = scope.parent;
+    }
+    scopes
+}
+
+fn resolved_contained_calls(
+    ctx: &Ctx<'_>,
+    unit: &ProgramUnit,
+    caller_scope: ScopeId,
+    owner_scope: ScopeId,
+    child_names: &HashSet<String>,
+) -> HashSet<String> {
+    procedure_reference_facts(unit)
+        .calls
+        .into_iter()
+        .filter(|callee| {
+            child_names.contains(callee)
+                && ctx
+                    .st
+                    .lookup_in(caller_scope, callee)
+                    .is_some_and(|symbol| {
+                        symbol.scope == owner_scope
+                            && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                    })
+        })
+        .collect()
+}
+
+fn validate_finalizer_capture_references(ctx: &mut Ctx<'_>, unit: &ProgramUnit) {
+    if ctx.finalizer_capture_host_scopes.is_empty() {
+        return;
+    }
+    let facts = procedure_reference_facts(unit);
+    for (name, span) in facts.references {
+        let Some(symbol) = ctx.st.lookup_in(ctx.scope_id, &name) else {
+            continue;
+        };
+        let Some(host_scope) = ctx
+            .finalizer_capture_host_scopes
+            .iter()
+            .copied()
+            .find(|host_scope| symbol.scope == *host_scope)
+        else {
+            continue;
+        };
+        let requires_host_storage = matches!(
+            symbol.kind,
+            SymbolKind::Variable | SymbolKind::ProcedurePointer
+        ) || (matches!(symbol.kind, SymbolKind::Parameter)
+            && !symbol.attrs.array_spec.is_empty());
+        if !requires_host_storage {
+            continue;
+        }
+        let key = (ctx.scope_id, host_scope, name.clone());
+        if ctx.reported_finalizer_captures.insert(key) {
+            ctx.error(
+                span,
+                format!(
+                    "local FINAL procedure cannot reference host entity '{}': deferred finalization cannot preserve procedure host associations; move the state to module storage",
+                    name
+                ),
+            );
+        }
+    }
+}
+
+fn validate_contained_units(ctx: &mut Ctx<'_>, host: &ProgramUnit, contains: &[SpannedUnit]) {
+    if contains.is_empty() {
+        return;
+    }
+
+    let child_names: HashSet<String> = contains
+        .iter()
+        .filter_map(|unit| contained_unit_name(&unit.node))
+        .collect();
+    let mut child_scopes: HashMap<String, HashSet<ScopeId>> = HashMap::new();
+
+    if let Some(layouts) = ctx.type_layouts {
+        for layout in layouts.iter_layouts().filter(|layout| {
+            layout.owner_module.is_none() && layout.owner_scope == Some(ctx.scope_id)
+        }) {
+            for final_proc in &layout.final_procs {
+                let name = final_proc.name.to_lowercase();
+                if child_names.contains(&name) {
+                    child_scopes
+                        .entry(name)
+                        .or_default()
+                        .extend(procedure_host_scopes(ctx.st, ctx.scope_id));
+                }
+            }
+        }
+    }
+
+    if !ctx.finalizer_capture_host_scopes.is_empty() {
+        for callee in resolved_contained_calls(ctx, host, ctx.scope_id, ctx.scope_id, &child_names)
+        {
+            child_scopes
+                .entry(callee)
+                .or_default()
+                .extend(ctx.finalizer_capture_host_scopes.iter().copied());
+        }
+    }
+
+    let call_graph: HashMap<String, HashSet<String>> = contains
+        .iter()
+        .filter_map(|unit| {
+            let name = contained_unit_name(&unit.node)?;
+            let caller_scope = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id)?;
+            let calls =
+                resolved_contained_calls(ctx, &unit.node, caller_scope, ctx.scope_id, &child_names);
+            Some((name, calls))
+        })
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for (caller, callees) in &call_graph {
+            let Some(scopes) = child_scopes.get(caller).cloned() else {
+                continue;
+            };
+            for callee in callees {
+                let target = child_scopes.entry(callee.clone()).or_default();
+                let before = target.len();
+                target.extend(scopes.iter().copied());
+                changed |= target.len() != before;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let inherited = std::mem::take(&mut ctx.finalizer_capture_host_scopes);
+    for unit in contains {
+        let name = contained_unit_name(&unit.node).unwrap_or_default();
+        ctx.finalizer_capture_host_scopes = child_scopes.remove(&name).unwrap_or_default();
+        validate_unit(ctx, unit);
+    }
+    ctx.finalizer_capture_host_scopes = inherited;
+}
+
 fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
     let saved_scope = ctx.scope_id;
     if let Some(scope_id) = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id) {
         ctx.scope_id = scope_id;
     }
+    validate_finalizer_capture_references(ctx, &unit.node);
 
     match &unit.node {
         ProgramUnit::Program {
@@ -2093,9 +2895,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
         }
         ProgramUnit::Module {
             uses,
@@ -2114,9 +2914,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 }
             }
             validate_decls(ctx, decls);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
         }
         ProgramUnit::Subroutine {
             name,
@@ -2194,9 +2992,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
@@ -2343,9 +3139,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
@@ -2381,9 +3175,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
             }
             validate_decls(ctx, decls);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
         }
         ProgramUnit::BlockData { decls, .. } => {
             warn_legacy_feature(ctx, unit.span, "BLOCK DATA");
@@ -4557,6 +5349,381 @@ end program
             !errs
                 .iter()
                 .any(|err| err.contains("infinite inline storage")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_host_automatic_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+    calls = 1
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      calls = calls + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_host_dummy_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value(calls)
+    integer, intent(inout) :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      calls = calls + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_ancestor_host_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine outer()
+    integer :: calls
+  contains
+    subroutine make_value()
+      type :: payload_t
+        integer :: marker
+      contains
+        final :: finish
+      end type
+      type(payload_t) :: value
+    contains
+      subroutine finish(item)
+        type(payload_t) :: item
+        calls = calls + item%marker
+      end subroutine
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_transitive_local_finalizer_host_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      call record(item%marker)
+    end subroutine
+    subroutine record(marker)
+      integer, intent(in) :: marker
+      calls = calls + marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_context_free_local_finalizers() {
+        let errs = errors_from(
+            "\
+module state_mod
+  implicit none
+  integer :: module_calls
+contains
+  subroutine make_value()
+    integer, parameter :: increment = 1
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      module_calls = module_calls + item%marker + increment
+    end subroutine
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_construct_name_shadowing() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: i
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: total
+      total = sum([(i, i = 1, 2)]) + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_shadowed_sibling_name() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: record(1)
+      item%marker = record(1)
+    end subroutine
+    subroutine record()
+      calls = calls + 1
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_block_use_shadowing() {
+        let errs = errors_from(
+            "\
+module state_mod
+  implicit none
+  integer :: module_calls
+end module
+
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      block
+        use state_mod, only: calls => module_calls
+        calls = calls + item%marker
+      end block
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_do_concurrent_local_shadowing() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: i
+      do concurrent (i = 1:1) local(calls)
+        calls = item%marker
+      end do
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_do_concurrent_local_init_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: i
+      do concurrent (i = 1:1) local_init(calls)
+        calls = calls + item%marker
+      end do
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_saved_host_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer, save :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      calls = calls + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
             "{:?}",
             errs
         );
