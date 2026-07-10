@@ -256,10 +256,10 @@ No ARM64 executable was run. Reproduction therefore uses emitted assembly, the c
 - **Consequence:** C interoperability with a complex `VALUE` dummy either fails compilation (double complex) or silently passes the argument in the wrong register bank (single complex). The frontend accepts both declarations, so this is not an intentional diagnostic gate.
 - **Confidence:** Certain; both the ICE and the complex(4) `mov x0,...; bl _take4` sequence were reproduced locally.
 
-### 8. O2 contracts separate multiply/add operations even though value-changing fast math is Ofast-only
+### 8. ARM FMA contraction contradicts the repository's fast-math contract
 
 - **Severity:** Medium
-- **Source:** `src/codegen/arm64/mod.rs:35-40` runs the peephole at every O2-or-higher level. `src/codegen/arm64/peephole.rs:60-71`, `153-215` unconditionally replaces `FMul` plus `FAdd` with `FMAdd`. The declared optimization policy at `src/opt/pipeline.rs:107-112` reserves value-changing floating-point transformations for `Ofast`.
+- **Source:** `src/codegen/arm64/mod.rs:35-40` runs the peephole at every O2-or-higher level. `src/codegen/arm64/peephole.rs:60-71`, `153-215` unconditionally replaces `FMul` plus `FAdd` with `FMAdd`. The optimization API at `src/opt/pipeline.rs:107-112` reserves value-changing floating-point transformations for `Ofast`, while `.docs/audits/x09-pass-audit.md:77-90` explicitly declares O2 ARM contraction to be allowed as a backend policy. These are incompatible user-visible contracts.
 - **Reproducer:**
 
   ```sh
@@ -277,9 +277,9 @@ No ARM64 executable was run. Reproduction therefore uses emitted assembly, the c
   ```
 
 - **Actual behavior:** O1 emits `fmul` followed by `fadd`; O2, O3, and Ofast all emit one `fmadd`.
-- **Intended behavior:** O2/O3 must preserve the separately rounded operations under the compiler's stated policy; contraction belongs under Ofast or an explicit FP-contract option.
-- **Consequence:** For exactly representable inputs `a=1+2^-27`, `b=1-2^-27`, `c=-1`, separate operations round the product to 1 and return +0, while `fmadd` returns exactly `-2^-54`. Exception flags and directed-rounding behavior can differ as well. This violates the documented cross-level value-equivalence invariant outside Ofast.
-- **Confidence:** Certain for the optimization-level discrepancy and the stated numerical counterexample.
+- **Intended behavior:** Choose and enforce one contract. If `OptimizationLevel::fast_math` is authoritative, gate contraction on Ofast or an explicit FP-contract option. If O2 contraction is intentional, expose that behavior in the CLI/user contract and revise the fast-math documentation and cross-target expectations accordingly.
+- **Consequence:** For exactly representable inputs `a=1+2^-27`, `b=1-2^-27`, `c=-1`, separate operations round the product to 1 and return +0, while `fmadd` returns exactly `-2^-54`. Exception flags and directed-rounding behavior can differ as well. Users and tests currently cannot infer which optimization levels promise separate rounding, and equivalent ARM/x86 builds follow different policies.
+- **Confidence:** Certain for the contradictory policy and optimization-level behavior; whether the implementation or the documentation should change is a project decision.
 
 ## Unconfirmed concerns
 
