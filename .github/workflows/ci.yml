@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       afs_as: ${{ steps.filter.outputs.afs_as }}
+      afs_ld: ${{ steps.filter.outputs.afs_ld }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -33,6 +34,12 @@ jobs:
             afs_as:
               - 'afs-as'
               - 'afs-as/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            afs_ld:
+              - 'afs-ld'
+              - 'afs-ld/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
@@ -265,6 +272,24 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p afs-as --test perf_sanity
+
+  test-afs-ld:
+    name: "Tests: afs-ld full suite (${{ matrix.os }})"
+    needs: changes
+    if: needs.changes.outputs.afs_ld == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p armfortas-rt
+      - run: cargo test -p afs-ld --all-targets -- --nocapture
 
   # ---- Sprint x01: non-macOS hosts. Compiler + lib suite run for real;
   # e2e suites skip with machine-readable counts until x06 lands the
