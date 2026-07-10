@@ -23,6 +23,14 @@ use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Optimization level requested at the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptLevel {
@@ -1773,6 +1781,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         std::env::temp_dir().join(format!("armfortas_{}_{:016x}.o", stem, token))
     };
 
+    let _asm_cleanup = RemoveFileOnDrop(asm_path.clone());
+    let _obj_cleanup = (!opts.emit_obj).then(|| RemoveFileOnDrop(obj_path.clone()));
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
     // x05: ELF targets assemble with the system assembler when the
@@ -1924,19 +1934,16 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             }
         }
         if opts.emit_obj {
-            let _ = fs::remove_file(&asm_path);
             write_dependency_file(opts, &obj_path, &included_files)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
             return Ok(());
         }
-        let _ = fs::remove_file(&asm_path);
         let binary_path = opts.output_path();
         let phase = phases.start("link");
         let result = link_inputs(std::slice::from_ref(&obj_path), &binary_path, opts);
         phase.end(&mut phases);
-        let _ = fs::remove_file(&obj_path);
         result?;
         if opts.verbose {
             eprintln!(" linked: {}", binary_path.display());
@@ -1989,10 +1996,6 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     if opts.verbose {
         eprintln!(" linked: {}", binary_path.display());
     }
-
-    // Cleanup.
-    let _ = fs::remove_file(&asm_path);
-    let _ = fs::remove_file(&obj_path);
 
     phases.report();
     Ok(())
