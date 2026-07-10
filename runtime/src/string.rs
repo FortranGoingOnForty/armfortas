@@ -9,11 +9,13 @@
 //! The register allocator only puts the descriptor *pointer* in a register.
 
 use crate::descriptor::*;
+use std::ffi::c_void;
 use std::ptr;
 
 extern "C" {
     fn malloc(size: usize) -> *mut u8;
     fn free(ptr: *mut u8);
+    fn memcmp(a: *const c_void, b: *const c_void, len: usize) -> i32;
 }
 
 // ---- Fixed-length character assignment ----
@@ -231,26 +233,115 @@ pub extern "C" fn afs_concat(result: *mut u8, a: *const u8, a_len: i64, b: *cons
 /// Returns: -1 if a < b, 0 if a == b, 1 if a > b.
 #[no_mangle]
 pub extern "C" fn afs_compare_char(a: *const u8, a_len: i64, b: *const u8, b_len: i64) -> i32 {
-    let max_len = a_len.max(b_len) as usize;
-    for i in 0..max_len {
-        let ac = if i < a_len as usize && !a.is_null() {
-            unsafe { *a.add(i) }
-        } else {
-            b' '
-        };
-        let bc = if i < b_len as usize && !b.is_null() {
-            unsafe { *b.add(i) }
-        } else {
-            b' '
-        };
-        if ac < bc {
-            return -1;
-        }
-        if ac > bc {
-            return 1;
+    let a_len = nonnegative_len(a_len);
+    let b_len = nonnegative_len(b_len);
+    let common_len = a_len.min(b_len);
+
+    if common_len > 0 {
+        let common = unsafe { compare_common_char_prefix(a, b, common_len) };
+        if common != 0 {
+            return common;
         }
     }
+
+    if a_len > common_len {
+        let tail = unsafe { compare_bytes_to_blank_padding(a, common_len, a_len) };
+        if tail != 0 {
+            return tail;
+        }
+    }
+    if b_len > common_len {
+        let tail = unsafe { compare_blank_padding_to_bytes(b, common_len, b_len) };
+        if tail != 0 {
+            return tail;
+        }
+    }
+
     0
+}
+
+#[inline]
+fn nonnegative_len(len: i64) -> usize {
+    if len <= 0 {
+        0
+    } else {
+        len as usize
+    }
+}
+
+#[inline]
+fn normalize_ordering(value: i32) -> i32 {
+    match value.cmp(&0) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+#[inline]
+unsafe fn compare_common_char_prefix(a: *const u8, b: *const u8, len: usize) -> i32 {
+    match (a.is_null(), b.is_null()) {
+        (false, false) => normalize_ordering(memcmp(a.cast::<c_void>(), b.cast::<c_void>(), len)),
+        (false, true) => compare_bytes_to_blank_padding(a, 0, len),
+        (true, false) => compare_blank_padding_to_bytes(b, 0, len),
+        (true, true) => 0,
+    }
+}
+
+#[inline]
+unsafe fn compare_bytes_to_blank_padding(ptr: *const u8, start: usize, end: usize) -> i32 {
+    if ptr.is_null() {
+        return 0;
+    }
+
+    let mut i = start;
+    while i < end {
+        let c = *ptr.add(i);
+        if c != b' ' {
+            return if c < b' ' { -1 } else { 1 };
+        }
+        i += 1;
+    }
+    0
+}
+
+#[inline]
+unsafe fn compare_blank_padding_to_bytes(ptr: *const u8, start: usize, end: usize) -> i32 {
+    if ptr.is_null() {
+        return 0;
+    }
+
+    let mut i = start;
+    while i < end {
+        let c = *ptr.add(i);
+        if c != b' ' {
+            return if b' ' < c { -1 } else { 1 };
+        }
+        i += 1;
+    }
+    0
+}
+
+#[inline]
+unsafe fn len_trim_bytes(src: *const u8, src_len: i64) -> usize {
+    if src.is_null() || src_len <= 0 {
+        return 0;
+    }
+    let mut len = src_len as usize;
+    let word_len = std::mem::size_of::<usize>();
+    let space_word = usize::from_ne_bytes([b' '; std::mem::size_of::<usize>()]);
+    while len >= word_len {
+        let start = len - word_len;
+        let word = std::ptr::read_unaligned(src.add(start) as *const usize);
+        if word != space_word {
+            break;
+        }
+        len = start;
+    }
+    while len > 0 && *src.add(len - 1) == b' ' {
+        len -= 1;
+    }
+    len
 }
 
 // ---- String intrinsics ----
@@ -259,16 +350,21 @@ pub extern "C" fn afs_compare_char(a: *const u8, a_len: i64, b: *const u8, b_len
 /// The data pointer is unchanged (TRIM returns a view, not a copy).
 #[no_mangle]
 pub extern "C" fn afs_len_trim(src: *const u8, src_len: i64) -> i64 {
-    if src.is_null() || src_len <= 0 {
-        return 0;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
-    let trimmed = slice
-        .iter()
-        .rposition(|&b| b != b' ')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-    trimmed as i64
+    unsafe { len_trim_bytes(src, src_len) as i64 }
+}
+
+/// Compare two character strings after applying TRIM to both operands.
+/// This is the hot path for `trim(a) == trim(b)` style predicates.
+#[no_mangle]
+pub extern "C" fn afs_compare_char_trimmed(
+    a: *const u8,
+    a_len: i64,
+    b: *const u8,
+    b_len: i64,
+) -> i32 {
+    // Fortran character comparison already blank-pads the shorter operand.
+    // Removing trailing blanks from either side cannot change the ordering.
+    afs_compare_char(a, a_len, b, b_len)
 }
 
 /// ADJUSTL: left-justify by removing leading spaces, padding trailing.
@@ -913,6 +1009,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compare_nonblank_tail_against_padding() {
+        assert_eq!(afs_compare_char(b"abc!".as_ptr(), 4, b"abc".as_ptr(), 3), 1);
+        assert_eq!(
+            afs_compare_char(b"abc".as_ptr(), 3, b"abc!".as_ptr(), 4),
+            -1
+        );
+    }
+
+    #[test]
+    fn compare_low_byte_tail_against_padding() {
+        assert_eq!(
+            afs_compare_char(b"abc\0".as_ptr(), 4, b"abc".as_ptr(), 3),
+            -1
+        );
+        assert_eq!(
+            afs_compare_char(b"abc".as_ptr(), 3, b"abc\0".as_ptr(), 4),
+            1
+        );
+    }
+
+    #[test]
+    fn compare_trimmed_matches_blank_padded_compare() {
+        assert_eq!(
+            afs_compare_char_trimmed(b"abc   ".as_ptr(), 6, b"abc".as_ptr(), 3),
+            0
+        );
+        assert_eq!(
+            afs_compare_char_trimmed(b"a b   ".as_ptr(), 6, b"a".as_ptr(), 1),
+            1
+        );
+        assert_eq!(
+            afs_compare_char_trimmed(b"a".as_ptr(), 1, b"a b   ".as_ptr(), 6),
+            -1
+        );
+        assert_eq!(
+            afs_compare_char_trimmed(b"ab9   ".as_ptr(), 6, b"ab1   ".as_ptr(), 6),
+            1
+        );
+    }
+
     // ---- Intrinsics ----
 
     #[test]
@@ -920,6 +1057,14 @@ mod tests {
         assert_eq!(afs_len_trim(b"hello   ".as_ptr(), 8), 5);
         assert_eq!(afs_len_trim(b"   ".as_ptr(), 3), 0);
         assert_eq!(afs_len_trim(b"hello".as_ptr(), 5), 5);
+        assert_eq!(afs_len_trim(b"hello".as_ptr(), -1), 0);
+
+        let mut padded = b"hello".to_vec();
+        padded.extend(std::iter::repeat(b' ').take(257));
+        assert_eq!(afs_len_trim(padded.as_ptr(), padded.len() as i64), 5);
+
+        let spaces = vec![b' '; 257];
+        assert_eq!(afs_len_trim(spaces.as_ptr(), spaces.len() as i64), 0);
     }
 
     #[test]

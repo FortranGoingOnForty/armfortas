@@ -26,7 +26,7 @@ program component_array_section_io
 
   ! list-directed integer component section
   print *, 'LD', a%id
-  ! CHECK: LD 10 20 30
+  ! CHECK: LD          10          20          30
 
   ! formatted integer / real / logical component sections (nonzero offsets)
   print '(A,3I4)', 'FI', a%id

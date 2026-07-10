@@ -23,6 +23,117 @@ Ladder (smallest dependency surface first):
 No divergences in state "observed but unclassified". (Empty so far —
 test-drive matched gfortran exactly.)
 
+## Audit remediation branch checkpoint
+
+Status as of 2026-07-09 on `ar-remediation`: the ordered AR sprint pass
+has been worked through `AR14.md`, which is the last sprint file in
+`.docs/sprints/`. There is no `AR15.md`, and there is no known unfixed AR
+target remaining on this branch after the current verification pass.
+
+Verification gates run during the closeout pass:
+
+- Full `test_programs_end_to_end*` at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`,
+  and `-Ofast`: all six levels passed with the two existing XFAILs.
+- AR8-AR12 direct fixture/repro matrices across all six optimization
+  levels, including project reductions for character, I/O, sema, and
+  validation findings.
+- AR13 optimizer and determinism gates: unswitch and unroll unit tests,
+  plus the 8-run O2 assembly determinism sweep for the audit-shaped
+  modules.
+- AR14 driver/toolchain gates: mixed source/object invocation,
+  concurrent same-basename output temps, truncated `.amod` rejection,
+  `.amod` integrity header check, AFS_LD ELF e2e routing without manual
+  CRT flags, afs-ld archive/link tests, and afs-as `.space`/`\a`
+  differential tests.
+
+PR #113 CI follow-up, also on 2026-07-09: local reproduction of the red
+Linux/end-to-end jobs found the remaining failures were in the current
+branch, not the preserved repro directories. The fixes landed in this
+follow-up checkpoint:
+
+- Descriptor-backed component arrays now keep their declared rank, fixing
+  contained proc-pointer component forwarding and stream unformatted
+  character-array reads.
+- Nonadvancing terminal/stdin reads now use the bounded read path and return
+  EOR for a final unterminated chunk, preserving embedded NUL bytes.
+- Parent component type resolution now recognizes inherited parent views,
+  so parent-component actuals and allocatable character fields validate.
+- `.amod` export now records hidden character-length ABI metadata without
+  adding hidden lengths to `bind(C)` character buffers.
+- Driver assertions that depended on list-directed spacing now compare
+  fields instead of exact spacing.
+- Integer min/max vectorizer assertions now compare emitted values instead
+  of list-directed column padding.
+- CI timing guardrails now keep the scaling checks meaningful while leaving
+  enough headroom for runner variance in use-chain, defined-operator, and
+  afs-as performance sanity jobs.
+- Character conditional expressions in print/write item classification now
+  route through string lowering; `conditional_2.f90` passes in the
+  gfortran-dg fixture.
+- `ar4_char_bytes.f90` remains active on ELF targets; macOS is
+  target-qualified XFAIL because Darwin rejects raw `0xe9` filename bytes
+  before runtime I/O begins.
+- The musl skip gate now classifies `driver_temp_paths` with the other
+  native-run suites that cannot execute until the musl link path lands.
+- The Ubuntu benchmark baseline now reflects the current CI-linked binary
+  sizes after the driver/runtime link path changes.
+
+Verification for the CI follow-up:
+
+- `cargo test -p armfortas --tests --release -- --nocapture`: passed.
+- `cargo test -p armfortas --test cli_driver`: 923 passed.
+- `cargo test -p armfortas-rt --lib`: 210 passed.
+- `cargo clippy --workspace --exclude bencch-core --exclude afs-tests -- -D warnings -A clippy::too_many_arguments`: passed.
+- `cargo test --release --test run_programs -- --nocapture`: 123 passed.
+- `cargo test -p armfortas --test compile_scaling_usechain -- --nocapture`: passed.
+- `cargo test -p armfortas --test compile_scaling_defop -- --nocapture`: passed.
+- `cargo test -p armfortas --release --test compile_scaling_usechain -- --nocapture`: passed.
+- `cargo test -p armfortas --release --test compile_scaling_defop -- --nocapture`: passed.
+- `cargo test -p afs-as --test perf_sanity -- --nocapture`: passed locally with the macOS-only performance checks skip-gated on Linux.
+
+The repo-root `verify-*` directories and `verify-audit-scratch/**` are
+preserved intentionally for audit traceability until the branch PR lands
+and CI confirms the committed state.
+
+## FIXED ledger ancestry rule
+
+As of 2026-07-09, a `FIXED` ledger entry must point at landed history.
+For superproject fixes, the recorded commit must satisfy:
+
+```
+git merge-base --is-ancestor <commit> trunk
+```
+
+For submodule fixes, the recorded submodule commit must be an ancestor of
+the submodule commit pinned by `trunk`; once known, the ledger entry
+should also name the superproject pin. Branch-only work is a candidate or
+branch fix, not a trunk `FIXED` entry.
+
+Ancestry audit scope: `.docs/audits/*.md` plus `noted_items.md`, checking
+entries that named a commit-like hash against local `trunk` at
+`163cf0c5`.
+
+- Superproject FIXED entries verified as ancestors of `trunk`:
+  `06e94f3c`, `c04476c2`, `531d19dd`, `ba67c10f`, `7a05e240`,
+  `567ed0ee`, `91420e2f`.
+- Submodule FIXED entries verified through the `trunk` submodule pin:
+  afs-ld `b46543a` and `44ba4af` are both ancestors of the afs-ld
+  commit `11831ef` pinned by superproject `trunk`.
+- Stale FIXED entries that name commits present only on
+  `origin/x12-campaign-x86`, not on `trunk`: `af214426`, `b3819f9a`,
+  `5610f607`, `53c78f32`, `82c947e5`, `b1f0b796`, `3f177c24`,
+  `9034c488`, `8de4188f`, `975fe776`. The mixed source/object driver
+  fix from `82c947e5` was cherry-picked onto this remediation branch as
+  `974f281f`; it is not trunk-FIXED until this branch lands.
+- Unresolved short hashes referenced by FIXED entries but absent from the
+  current superproject object database and the checked submodules:
+  `36a51ad`, `b113ba3`, `9b50a7e`, `99cdc2d`, `267c8ce`, `cd6bbe9`,
+  `3e15d80`. Resolve these to landed commits or downgrade the entries
+  before relying on them as trunk-FIXED.
+- FIXED entries that do not record a commit hash were not machine-checkable
+  by the ancestry rule; add landed commits or pin commits to those entries
+  when they are touched.
+
 ---
 
 ## test-drive (FreeBSD x86_64)

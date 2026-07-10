@@ -70,8 +70,10 @@ fn o2_partial_unrolls_runtime_trip_reduction_with_remainder() {
         .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one print line:\n{}", stdout);
+    let fields: Vec<&str> = trimmed[0].split_whitespace().collect();
     assert_eq!(
-        trimmed[0], "35 14910 1225",
+        fields,
+        vec!["35", "14910", "1225"],
         "runtime reduction partial unroll wrong: {:?}",
         trimmed[0]
     );

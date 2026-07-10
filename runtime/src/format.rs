@@ -5,6 +5,8 @@
 //! Fortran standard set including repeat counts, group repeat,
 //! unlimited repeat, scale factors, and all data/control descriptors.
 
+use std::sync::Arc;
+
 /// A parsed format descriptor.
 #[derive(Debug, Clone)]
 pub enum FormatDesc {
@@ -625,13 +627,14 @@ fn parse_real_desc(
 pub enum IoValue {
     Integer(i128),
     Real(f64),
+    Real32(f64),
     Logical(bool),
     Character(Vec<u8>),
 }
 
 /// Format engine state for applying descriptors to values.
 pub struct FormatEngine {
-    descriptors: Vec<FormatDesc>,
+    descriptors: Arc<[FormatDesc]>,
     sign_mode: SignMode,
     scale_factor: i32,
     round_mode: RoundMode,
@@ -641,6 +644,10 @@ pub struct FormatEngine {
 
 impl FormatEngine {
     pub fn new(descriptors: Vec<FormatDesc>) -> Self {
+        Self::from_shared(Arc::from(descriptors.into_boxed_slice()))
+    }
+
+    pub fn from_shared(descriptors: Arc<[FormatDesc]>) -> Self {
         Self {
             descriptors,
             sign_mode: SignMode::Default,
@@ -684,14 +691,22 @@ impl FormatEngine {
     }
 
     pub fn format_values_checked(&mut self, values: &[IoValue]) -> Result<String, FormatError> {
-        let mut output = String::new();
+        self.format_values_bytes_checked(values)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn format_values_bytes_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<Vec<u8>, FormatError> {
+        let mut output = FormatOutput::new();
         let mut val_idx = 0;
-        let descriptors = self.descriptors.clone();
-        self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
-        if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
+        let descriptors = Arc::clone(&self.descriptors);
+        self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
+        if !values.is_empty() && !format_has_data_descriptor(descriptors.as_ref()) {
             return Err(FormatError::InvalidFormat);
         }
-        Ok(output)
+        Ok(output.finish())
     }
 
     /// Format output records using Fortran format reversion. When the I/O list
@@ -701,30 +716,38 @@ impl FormatEngine {
         &mut self,
         values: &[IoValue],
     ) -> Result<String, FormatError> {
-        let mut output = String::new();
+        self.format_values_reverting_bytes_checked(values)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn format_values_reverting_bytes_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<Vec<u8>, FormatError> {
+        let mut output = FormatOutput::new();
         let mut val_idx = 0;
-        let descriptors = self.descriptors.clone();
-        if !values.is_empty() && !format_has_data_descriptor(&descriptors) {
+        let descriptors = Arc::clone(&self.descriptors);
+        if !values.is_empty() && !format_has_data_descriptor(descriptors.as_ref()) {
             return Err(FormatError::InvalidFormat);
         }
         if values.is_empty() {
-            self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
-            return Ok(output);
+            self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
+            return Ok(output.finish());
         }
 
         let mut first_record = true;
         while val_idx < values.len() {
             if !first_record {
-                output.push('\n');
+                output.new_record();
             }
             let before = val_idx;
-            self.apply_descriptors(&descriptors, values, &mut val_idx, &mut output)?;
+            self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
             if val_idx == before {
                 return Err(FormatError::InvalidFormat);
             }
             first_record = false;
         }
-        Ok(output)
+        Ok(output.finish())
     }
 
     fn apply_descriptors(
@@ -732,18 +755,16 @@ impl FormatEngine {
         descs: &[FormatDesc],
         values: &[IoValue],
         val_idx: &mut usize,
-        output: &mut String,
+        output: &mut FormatOutput,
     ) -> Result<(), FormatError> {
         for desc in descs {
             match desc {
                 // ---- Control descriptors ----
                 FormatDesc::Skip { count } => {
-                    for _ in 0..*count {
-                        output.push(' ');
-                    }
+                    output.advance(*count);
                 }
                 FormatDesc::Newline => {
-                    output.push('\n');
+                    output.new_record();
                 }
                 FormatDesc::Colon => {
                     if *val_idx >= values.len() {
@@ -768,25 +789,16 @@ impl FormatEngine {
                 }
                 FormatDesc::DerivedType { .. } => {} // requires user-defined I/O — no-op for now
                 FormatDesc::TabTo { position } => {
-                    let cur_col = output.lines().last().map(|l| l.len()).unwrap_or(0);
-                    if *position > cur_col + 1 {
-                        for _ in 0..(*position - cur_col - 1) {
-                            output.push(' ');
-                        }
-                    }
+                    output.tab_to(*position);
                 }
                 FormatDesc::TabLeft { count } => {
-                    // Truncate output by `count` characters (simplified).
-                    let new_len = output.len().saturating_sub(*count);
-                    output.truncate(new_len);
+                    output.tab_left(*count);
                 }
                 FormatDesc::TabRight { count } => {
-                    for _ in 0..*count {
-                        output.push(' ');
-                    }
+                    output.advance(*count);
                 }
                 FormatDesc::LiteralString(s) => {
-                    output.push_str(s);
+                    output.write(s.as_bytes());
                 }
 
                 // ---- Group repeat ----
@@ -811,8 +823,7 @@ impl FormatEngine {
                     }
                     let val = &values[*val_idx];
                     *val_idx += 1;
-                    let formatted = self.format_value(desc, val)?;
-                    output.push_str(&formatted);
+                    self.write_value(desc, val, output)?;
                 }
             }
         }
@@ -820,7 +831,75 @@ impl FormatEngine {
         Ok(())
     }
 
-    fn format_value(&self, desc: &FormatDesc, val: &IoValue) -> Result<String, FormatError> {
+    fn write_value(
+        &self,
+        desc: &FormatDesc,
+        val: &IoValue,
+        output: &mut FormatOutput,
+    ) -> Result<(), FormatError> {
+        match (desc, val) {
+            (FormatDesc::RealG { width, .. }, IoValue::Character(bytes)) => {
+                output.write_fitted(bytes, *width);
+                Ok(())
+            }
+            (FormatDesc::Character { width }, IoValue::Character(bytes)) => {
+                if let Some(w) = width {
+                    output.write_fitted(bytes, *w);
+                } else {
+                    output.write(bytes);
+                }
+                Ok(())
+            }
+            (FormatDesc::CharTrimmed, IoValue::Character(bytes)) => {
+                let end = bytes
+                    .iter()
+                    .rposition(|&b| b != b' ')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                output.write(&bytes[..end]);
+                Ok(())
+            }
+            _ => {
+                let formatted = self.format_value(desc, val)?;
+                output.write(&formatted);
+                Ok(())
+            }
+        }
+    }
+
+    fn format_value(&self, desc: &FormatDesc, val: &IoValue) -> Result<Vec<u8>, FormatError> {
+        match (desc, val) {
+            (FormatDesc::RealG { width, .. }, IoValue::Character(bytes)) => {
+                Ok(fit_bytes(bytes, *width))
+            }
+            (FormatDesc::Character { width }, IoValue::Character(bytes)) => {
+                if let Some(w) = width {
+                    if *w > bytes.len() {
+                        let mut out = vec![b' '; *w - bytes.len()];
+                        out.extend_from_slice(bytes);
+                        Ok(out)
+                    } else {
+                        Ok(bytes[..*w].to_vec())
+                    }
+                } else {
+                    Ok(bytes.clone())
+                }
+            }
+            (FormatDesc::CharTrimmed, IoValue::Character(bytes)) => {
+                let end = bytes
+                    .iter()
+                    .rposition(|&b| b != b' ')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                Ok(bytes[..end].to_vec())
+            }
+            _ => self
+                .format_value_text(desc, val)
+                .map(|text| text.into_bytes()),
+        }
+    }
+
+    fn format_value_text(&self, desc: &FormatDesc, val: &IoValue) -> Result<String, FormatError> {
         match (desc, val) {
             // ---- Integer ----
             (FormatDesc::IntegerI { width, min_digits }, IoValue::Integer(v)) => {
@@ -851,7 +930,7 @@ impl FormatEngine {
             }
 
             // ---- Real ----
-            (FormatDesc::RealF { width, decimals }, IoValue::Real(v)) => {
+            (FormatDesc::RealF { width, decimals }, IoValue::Real(v) | IoValue::Real32(v)) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
@@ -867,7 +946,7 @@ impl FormatEngine {
                     decimals,
                     exp_width,
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -882,7 +961,7 @@ impl FormatEngine {
                     decimals,
                     exp_width,
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -895,7 +974,7 @@ impl FormatEngine {
                 FormatDesc::RealEN {
                     width, decimals, ..
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -912,7 +991,7 @@ impl FormatEngine {
                 );
                 Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
             }
-            (FormatDesc::RealD { width, decimals }, IoValue::Real(v)) => {
+            (FormatDesc::RealD { width, decimals }, IoValue::Real(v) | IoValue::Real32(v)) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
@@ -925,25 +1004,16 @@ impl FormatEngine {
                     decimals,
                     exp_width,
                 },
+                IoValue::Real32(v),
+            ) => self.format_g_text(*v, 9, *width, *decimals, *exp_width),
+            (
+                FormatDesc::RealG {
+                    width,
+                    decimals,
+                    exp_width,
+                },
                 IoValue::Real(v),
-            ) => {
-                if let Some(s) = self.format_nonfinite(*v) {
-                    return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
-                }
-                if *width == 0 && *decimals == 0 {
-                    return Ok(self.apply_decimal_sep(&self.format_g0(*v)));
-                }
-                // G format: use F if magnitude fits, else E.
-                let abs_v = v.abs();
-                if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(*decimals as i32)) {
-                    let rounded = self.apply_explicit_rounding(*v, *decimals);
-                    let s = self.apply_leading_zero(&self.format_fixed(rounded, *decimals));
-                    Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
-                } else {
-                    let s = self.format_e_style(*v, *decimals, *exp_width, 'E');
-                    Ok(self.apply_decimal_sep(&fit_exponential_field(&s, *width)))
-                }
-            }
+            ) => self.format_g_text(*v, 17, *width, *decimals, *exp_width),
             (FormatDesc::RealG { width, .. }, IoValue::Integer(v)) => {
                 let s = if *v < 0 {
                     format!("-{}", v.unsigned_abs())
@@ -964,7 +1034,7 @@ impl FormatEngine {
                 FormatDesc::RealEX {
                     width, decimals, ..
                 },
-                IoValue::Real(v),
+                IoValue::Real(v) | IoValue::Real32(v),
             ) => {
                 if let Some(s) = self.format_nonfinite(*v) {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
@@ -1061,7 +1131,12 @@ impl FormatEngine {
     /// Format a fixed-point number (for F and G-as-F).
     fn format_fixed(&self, v: f64, decimals: usize) -> String {
         let sign = self.real_sign(v);
-        format!("{}{:.*}", sign, decimals, v.abs())
+        let digits = if decimals == 0 {
+            format!("{:.0}.", v.abs())
+        } else {
+            format!("{:.*}", decimals, v.abs())
+        };
+        format!("{sign}{digits}")
     }
 
     fn real_sign(&self, v: f64) -> &'static str {
@@ -1074,18 +1149,51 @@ impl FormatEngine {
         }
     }
 
-    fn format_g0(&self, v: f64) -> String {
+    fn format_g_text(
+        &self,
+        v: f64,
+        significant_digits: usize,
+        width: usize,
+        decimals: usize,
+        exp_width: Option<usize>,
+    ) -> Result<String, FormatError> {
+        if let Some(s) = self.format_nonfinite(v) {
+            return Ok(self.apply_decimal_sep(&fit_field(&s, width)));
+        }
+        if width == 0 && decimals == 0 {
+            return Ok(self.apply_decimal_sep(&self.format_g0(v, significant_digits)));
+        }
+        // G format: use F if magnitude fits, else E.
+        let abs_v = v.abs();
+        if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(decimals as i32)) {
+            let rounded = self.apply_explicit_rounding(v, decimals);
+            let s = self.apply_leading_zero(&self.format_fixed(rounded, decimals));
+            Ok(self.apply_decimal_sep(&fit_field(&s, width)))
+        } else {
+            let s = self.format_e_style(v, decimals, exp_width, 'E');
+            Ok(self.apply_decimal_sep(&fit_exponential_field(&s, width)))
+        }
+    }
+
+    fn format_g0(&self, v: f64, significant_digits: usize) -> String {
         if v == 0.0 {
-            return format!("{}0.00000000", self.real_sign(v));
+            let decimals = significant_digits.saturating_sub(1);
+            return self.format_fixed(v, decimals);
         }
 
         let abs_v = v.abs();
         if (0.1..1.0e6).contains(&abs_v) {
-            let digits_before_decimal = abs_v.log10().floor().max(0.0) as usize + 1;
-            let decimals = 9usize.saturating_sub(digits_before_decimal).max(1);
+            let decimals = if abs_v < 1.0 {
+                significant_digits
+            } else {
+                let digits_before_decimal = abs_v.log10().floor().max(0.0) as usize + 1;
+                significant_digits
+                    .saturating_sub(digits_before_decimal)
+                    .max(1)
+            };
             self.format_fixed(v, decimals)
         } else {
-            self.format_e_style(v, 8, Some(2), 'E')
+            self.format_e_style(v, significant_digits.saturating_sub(1), Some(2), 'E')
         }
     }
 
@@ -1111,6 +1219,16 @@ impl FormatEngine {
     /// Fortran kP with E format: the mantissa is multiplied by 10^k,
     /// and the exponent is decreased by k. With 0P (default), the mantissa
     /// is in [0.1, 1.0) — Fortran's convention, not C's.
+    fn e_fractional_digits(&self, decimals: usize) -> usize {
+        if self.scale_factor > 0 {
+            decimals
+                .saturating_add(1)
+                .saturating_sub(self.scale_factor as usize)
+        } else {
+            decimals
+        }
+    }
+
     fn format_e_style(
         &self,
         v: f64,
@@ -1126,14 +1244,19 @@ impl FormatEngine {
             return self.format_e_style_default(v, decimals, exp_width, exp_char);
         }
 
+        let fractional_digits = self.e_fractional_digits(decimals);
         if v == 0.0 {
             let ew = exp_width.unwrap_or(2);
+            let sign = self.real_sign(v);
+            let zeros_before_decimal = "0".repeat((self.scale_factor.max(1)) as usize);
+            let zeros_after_decimal = "0".repeat(fractional_digits);
             return format!(
-                "0.{:0>d$}{}{:+0ew$}",
-                "",
+                "{}{}.{}{}{:+0ew$}",
+                sign,
+                zeros_before_decimal,
+                zeros_after_decimal,
                 exp_char,
                 0,
-                d = decimals,
                 ew = ew + 1
             );
         }
@@ -1141,9 +1264,15 @@ impl FormatEngine {
         let abs_v = v.abs();
         let base_exp = abs_v.log10().floor() as i32;
         // Fortran default (0P): mantissa in [0.1, 1.0), so exponent = base_exp + 1.
-        let fort_exp = base_exp + 1 - self.scale_factor;
+        let mut fort_exp = base_exp + 1 - self.scale_factor;
         let mantissa = abs_v / 10f64.powi(base_exp + 1 - self.scale_factor);
-        let rounded = self.apply_explicit_rounding(mantissa, decimals);
+        let mut rounded = self.apply_explicit_rounding(mantissa, fractional_digits);
+        let carry_threshold =
+            10f64.powi(self.scale_factor) - 0.5 * 10f64.powi(-(fractional_digits as i32));
+        if self.scale_factor > 0 && rounded >= carry_threshold {
+            rounded /= 10.0;
+            fort_exp += 1;
+        }
 
         let ew = exp_width.unwrap_or(2);
         let sign = if v < 0.0 {
@@ -1156,7 +1285,7 @@ impl FormatEngine {
         format!(
             "{}{:.*}{}{:+0ew$}",
             sign,
-            decimals,
+            fractional_digits,
             rounded,
             exp_char,
             fort_exp,
@@ -1263,6 +1392,90 @@ impl FormatEngine {
     }
 }
 
+struct FormatOutput {
+    bytes: Vec<u8>,
+    record: Vec<u8>,
+    pos: usize,
+    high_water: usize,
+}
+
+impl FormatOutput {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            record: Vec::new(),
+            pos: 0,
+            high_water: 0,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let end = self.pos.saturating_add(bytes.len());
+        if self.record.len() < end {
+            self.record.resize(end, b' ');
+        }
+        self.record[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+        self.high_water = self.high_water.max(end);
+    }
+
+    fn write_spaces(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let end = self.pos.saturating_add(count);
+        if self.record.len() < end {
+            self.record.resize(end, b' ');
+        }
+        self.pos = end;
+        self.high_water = self.high_water.max(end);
+    }
+
+    fn write_fitted(&mut self, bytes: &[u8], width: usize) {
+        if width == 0 {
+            self.write(bytes);
+        } else if width > bytes.len() {
+            self.write_spaces(width - bytes.len());
+            self.write(bytes);
+        } else {
+            self.write(&bytes[..width]);
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.pos = self.pos.saturating_add(count);
+    }
+
+    fn tab_to(&mut self, position: usize) {
+        self.pos = position.saturating_sub(1);
+    }
+
+    fn tab_left(&mut self, count: usize) {
+        self.pos = self.pos.saturating_sub(count);
+    }
+
+    fn new_record(&mut self) {
+        self.flush_record();
+        self.bytes.push(b'\n');
+    }
+
+    fn flush_record(&mut self) {
+        self.bytes
+            .extend_from_slice(&self.record[..self.high_water]);
+        self.record.clear();
+        self.pos = 0;
+        self.high_water = 0;
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.flush_record();
+        self.bytes
+    }
+}
+
 fn format_radix_integer(
     value: i128,
     min_digits: Option<usize>,
@@ -1305,6 +1518,18 @@ fn fit_field(s: &str, width: usize) -> String {
         "*".repeat(width)
     } else {
         format!("{:>width$}", s, width = width)
+    }
+}
+
+fn fit_bytes(bytes: &[u8], width: usize) -> Vec<u8> {
+    if width == 0 {
+        bytes.to_vec()
+    } else if bytes.len() > width {
+        vec![b'*'; width]
+    } else {
+        let mut out = vec![b' '; width - bytes.len()];
+        out.extend_from_slice(bytes);
+        out
     }
 }
 
@@ -1541,6 +1766,14 @@ mod tests {
     }
 
     #[test]
+    fn format_real_f_zero_decimals_keeps_decimal_point() {
+        let descs = parse_format("(F4.0)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(1.0)]);
+        assert_eq!(out, "  1.");
+    }
+
+    #[test]
     fn format_real_sign_plus() {
         let descs = parse_format("(SP,F6.2)");
         let mut engine = FormatEngine::new(descs);
@@ -1578,6 +1811,17 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Character(b"hi".to_vec())]);
         assert_eq!(out, "   hi");
+
+        let out = FormatEngine::new(parse_format("(A5)"))
+            .format_values(&[IoValue::Character(Vec::new())]);
+        assert_eq!(out, "     ");
+    }
+
+    #[test]
+    fn format_g0_character_uses_unlimited_width() {
+        let out = FormatEngine::new(parse_format("(G0)"))
+            .format_values(&[IoValue::Character(b"txt".to_vec())]);
+        assert_eq!(out, "txt");
     }
 
     #[test]
@@ -1602,6 +1846,45 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(1), IoValue::Integer(2)]);
         assert_eq!(out, "  1     2");
+    }
+
+    #[test]
+    fn format_tab_descriptors_overlay_without_truncation() {
+        let out = FormatEngine::new(parse_format("(A,T3,A)")).format_values(&[
+            IoValue::Character(b"abcdef".to_vec()),
+            IoValue::Character(b"XY".to_vec()),
+        ]);
+        assert_eq!(out, "abXYef");
+
+        let out = FormatEngine::new(parse_format("(A,TL3,A)")).format_values(&[
+            IoValue::Character(b"abcdef".to_vec()),
+            IoValue::Character(b"XY".to_vec()),
+        ]);
+        assert_eq!(out, "abcXYf");
+
+        let out = FormatEngine::new(parse_format("(A,TR3,A)")).format_values(&[
+            IoValue::Character(b"ab".to_vec()),
+            IoValue::Character(b"Z".to_vec()),
+        ]);
+        assert_eq!(out, "ab   Z");
+    }
+
+    #[test]
+    fn format_trailing_x_only_moves_position() {
+        let out =
+            FormatEngine::new(parse_format("(I0,1X)")).format_values(&[IoValue::Integer(5)]);
+        assert_eq!(out, "5");
+
+        let out = FormatEngine::new(parse_format("(I0,1X,I0)"))
+            .format_values(&[IoValue::Integer(5), IoValue::Integer(6)]);
+        assert_eq!(out, "5 6");
+
+        let out = FormatEngine::new(parse_format("(3(I0,1X))")).format_values(&[
+            IoValue::Integer(1),
+            IoValue::Integer(2),
+            IoValue::Integer(3),
+        ]);
+        assert_eq!(out, "1 2 3");
     }
 
     #[test]
@@ -1923,6 +2206,18 @@ mod tests {
     }
 
     #[test]
+    fn format_scale_factor_e_reduces_fractional_digits() {
+        let descs = parse_format("(2P,E12.4,1X,E12.4,1X,E12.4)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[
+            IoValue::Real(12345.678),
+            IoValue::Real(0.0),
+            IoValue::Real(99999.99),
+        ]);
+        assert_eq!(out, "  12.346E+03   00.000E+00   10.000E+04");
+    }
+
+    #[test]
     fn format_g0_nonfinite_reals() {
         let descs = parse_format("(G0, 1X, G0, 1X, G0)");
         let mut engine = FormatEngine::new(descs);
@@ -1936,10 +2231,30 @@ mod tests {
 
     #[test]
     fn format_g0_finite_reals() {
-        let descs = parse_format("(G0,1X,G0)");
+        let descs = parse_format("(G0,1X,G0,1X,G0,1X,G0)");
         let mut engine = FormatEngine::new(descs);
-        let out = engine.format_values(&[IoValue::Real(100.0), IoValue::Real(1.0)]);
-        assert_eq!(out, "100.000000 1.00000000");
+        let out = engine.format_values(&[
+            IoValue::Real32(100.0),
+            IoValue::Real32(1.0),
+            IoValue::Real(100.0),
+            IoValue::Real(1.0),
+        ]);
+        assert_eq!(
+            out,
+            "100.000000 1.00000000 100.00000000000000 1.0000000000000000"
+        );
+    }
+
+    #[test]
+    fn format_g0_real_kinds_use_kind_precision() {
+        let descs = parse_format("(G0,1X,G0,1X,G0)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[
+            IoValue::Real32((1.0f32 / 3.0f32) as f64),
+            IoValue::Real(1.0f64 / 3.0f64),
+            IoValue::Real(std::f64::consts::PI),
+        ]);
+        assert_eq!(out, "0.333333343 0.33333333333333331 3.1415926535897931");
     }
 
     #[test]

@@ -7,7 +7,6 @@
 //! enough information for full ABI-correct separate compilation.
 //!
 //! Innovations over gfortran/flang/ifort:
-//!   - Explicit ABI annotations (@abi with register assignments)
 //!   - Optimization hints (@hint leaf, no_globals, cost)
 //!   - Linker symbol names (@ir) for direct FFI
 //!   - Source checksum for staleness detection
@@ -133,6 +132,7 @@ fn encode_nested_field_default_init(init: &crate::sema::type_layout::FieldDefaul
         FieldDefaultInit::Character(value) => format!("C{}", hex_encode_bytes(value.as_bytes())),
         FieldDefaultInit::Integer(value) => format!("I{}", value),
         FieldDefaultInit::Logical(value) => format!("L{}", if *value { '1' } else { '0' }),
+        FieldDefaultInit::Real(value) => format!("R{:016x}", value.to_bits()),
         FieldDefaultInit::Derived(fields) => {
             let rendered = fields
                 .iter()
@@ -192,6 +192,12 @@ fn decode_nested_field_default_init(
             _ => None,
         };
     }
+    if let Some(value) = encoded.strip_prefix('R') {
+        return u64::from_str_radix(value, 16)
+            .ok()
+            .map(f64::from_bits)
+            .map(FieldDefaultInit::Real);
+    }
     if let Some(value) = encoded.strip_prefix("D(").and_then(|s| s.strip_suffix(')')) {
         let mut fields = Vec::new();
         for entry in split_nested_default_fields(value)? {
@@ -236,7 +242,6 @@ pub fn write_amod(
     writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
     writeln!(out, "# compiler: armfortas 0.1.0").unwrap();
-    writeln!(out, "# abi: arm64-apple-darwin").unwrap();
     writeln!(out).unwrap();
 
     // ---- Dependencies ----
@@ -528,7 +533,7 @@ pub fn write_amod(
         emit_interface(&mut out, name, sym, scope);
     }
 
-    out
+    add_integrity_headers(out)
 }
 
 fn is_public(sym: &Symbol, scope: &Scope) -> bool {
@@ -963,32 +968,35 @@ fn emit_procedure(
     let is_bind_c = sym.attrs.binding_label.is_some();
     let declared_descriptor_params = descriptor_params.get(&name.to_lowercase());
     let declared_char_len_star_params = char_len_star_params.get(&name_lc);
+    let hidden_char_len_args: Vec<String> = proc_scope
+        .map(|pscope| {
+            pscope
+                .arg_order
+                .iter()
+                .enumerate()
+                .filter_map(|(arg_idx, arg_name)| {
+                    let arg_sym = pscope.symbols.get(&arg_name.to_lowercase())?;
+                    let is_assumed_len = declared_char_len_star_params
+                        .and_then(|flags| flags.get(arg_idx).copied())
+                        .unwrap_or({
+                            matches!(
+                                arg_sym.type_info,
+                                Some(TypeInfo::Character { len: None, .. })
+                            ) && !arg_sym.attrs.allocatable
+                                && !is_bind_c
+                        });
+                    is_assumed_len.then(|| arg_name.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    writeln!(
+        out,
+        "  @abi cc=aapcs64 hidden_char_lens={}",
+        hidden_char_len_args.len()
+    )
+    .unwrap();
 
-    let hidden_count = declared_char_len_star_params
-        .map(|flags| flags.iter().filter(|flag| **flag).count())
-        .unwrap_or_else(|| {
-            let mut count = 0usize;
-            if let Some(pscope) = proc_scope {
-                for arg_name in &pscope.arg_order {
-                    if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                        if matches!(
-                            arg_sym.type_info,
-                            Some(TypeInfo::Character { len: None, .. })
-                        ) && !arg_sym.attrs.allocatable
-                            && !is_bind_c
-                        {
-                            count += 1;
-                        }
-                    }
-                }
-            }
-            count
-        });
-
-    // @abi line for the procedure.
-    writeln!(out, "  @abi cc=aapcs64 hidden_char_lens={}", hidden_count).unwrap();
-
-    let mut reg_idx = 0usize;
     if let Some(pscope) = proc_scope {
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
@@ -1073,24 +1081,14 @@ fn emit_procedure(
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
                 }
                 writeln!(out).unwrap();
-                // @abi per arg — ARM64 AAPCS64: first 8 int/ptr args in x0-x7.
-                let reg = if reg_idx < 8 {
-                    format!("x{}", reg_idx)
-                } else {
-                    format!("stack+{}", (reg_idx - 8) * 8)
-                };
-                writeln!(out, "    @abi pass={} width=8", reg).unwrap();
-                reg_idx += 1;
             } else {
                 writeln!(out, "  @arg {}", arg_name).unwrap();
-                reg_idx += 1;
             }
         }
     } else {
         // Fallback: use arg_names from the symbol (no type info).
         for arg_name in &sym.arg_names {
             writeln!(out, "  @arg {}", arg_name).unwrap();
-            reg_idx += 1;
         }
     }
 
@@ -1098,30 +1096,8 @@ fn emit_procedure(
     // TypeInfo cannot distinguish `len=*` from `len=:` once sema has lowered
     // both to `len: None`; this matters for allocatable assumed-length
     // character-array dummies.
-    if let Some(pscope) = proc_scope {
-        for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
-            if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
-                let is_assumed_len = declared_char_len_star_params
-                    .and_then(|flags| flags.get(arg_idx).copied())
-                    .unwrap_or({
-                        matches!(
-                            arg_sym.type_info,
-                            Some(TypeInfo::Character { len: None, .. })
-                        ) && !arg_sym.attrs.allocatable
-                            && !is_bind_c
-                    });
-                if is_assumed_len {
-                    let reg = if reg_idx < 8 {
-                        format!("x{}", reg_idx)
-                    } else {
-                        format!("stack+{}", (reg_idx - 8) * 8)
-                    };
-                    writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
-                    writeln!(out, "    @abi pass={} width=8 hidden", reg).unwrap();
-                    reg_idx += 1;
-                }
-            }
-        }
+    for arg_name in &hidden_char_len_args {
+        writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
     }
 
     // @hint line.
@@ -1267,6 +1243,9 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
                 crate::sema::type_layout::FieldDefaultInit::Logical(value) => {
                     format!(" @init=logical:{}", if *value { "true" } else { "false" })
                 }
+                crate::sema::type_layout::FieldDefaultInit::Real(value) => {
+                    format!(" @init=realbits:{:016x}", value.to_bits())
+                }
                 crate::sema::type_layout::FieldDefaultInit::Derived(_) => {
                     let encoded = encode_nested_field_default_init(init);
                     format!(" @init=exprhex:{}", hex_encode_bytes(encoded.as_bytes()))
@@ -1383,13 +1362,33 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
 }
 
 fn fnv1a_hex(content: &str) -> String {
-    // FNV-1a 64-bit hash for source content fingerprinting.
+    fnv1a_hex_bytes(content.as_bytes())
+}
+
+fn fnv1a_hex_bytes(content: &[u8]) -> String {
+    // FNV-1a 64-bit hash for source and .amod content fingerprinting.
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in content.bytes() {
+    for &byte in content {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{:016x}", hash)
+}
+
+fn add_integrity_headers(mut content: String) -> String {
+    let body_start = content
+        .find("\n\n")
+        .map(|idx| idx + 2)
+        .unwrap_or(content.len());
+    let body = &content[body_start..];
+    let integrity = format!(
+        "# content-length: {}\n# content-checksum: fnv1a:{}\n",
+        body.len(),
+        fnv1a_hex(body)
+    );
+    let insert_at = content.find('\n').map(|idx| idx + 1).unwrap_or(0);
+    content.insert_str(insert_at, &integrity);
+    content
 }
 
 fn compile_timestamp() -> String {
@@ -1577,6 +1576,7 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
 
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    validate_amod_integrity(&content, path)?;
     let iface = parse_amod(&content, path)?;
 
     if let Some(stored) = mtime {
@@ -1587,6 +1587,78 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     }
 
     Ok(iface)
+}
+
+fn validate_amod_integrity(content: &str, path: &Path) -> Result<(), String> {
+    let magic = content
+        .lines()
+        .next()
+        .ok_or_else(|| format!("{}: empty .amod file", path.display()))?;
+    if !magic.starts_with("#!amod ") {
+        return Err(format!(
+            "{}: not an .amod file (missing #!amod magic)",
+            path.display()
+        ));
+    }
+
+    let body_start = content.find("\n\n").map(|idx| idx + 2).ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (missing header terminator); rebuild the provider module",
+            path.display()
+        )
+    })?;
+    let header = &content[..body_start];
+    let body = &content[body_start..];
+
+    let mut expected_len: Option<usize> = None;
+    let mut expected_checksum: Option<&str> = None;
+    for line in header.lines() {
+        if let Some(value) = line.strip_prefix("# content-length: ") {
+            expected_len = Some(value.trim().parse::<usize>().map_err(|_| {
+                format!(
+                    "{}: corrupt .amod file (invalid content-length); rebuild the provider module",
+                    path.display()
+                )
+            })?);
+        } else if let Some(value) = line.strip_prefix("# content-checksum: fnv1a:") {
+            expected_checksum = Some(value.trim());
+        }
+    }
+
+    let expected_len = expected_len.ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (missing content-length); rebuild the provider module",
+            path.display()
+        )
+    })?;
+    let expected_checksum = expected_checksum.ok_or_else(|| {
+        format!(
+            "{}: corrupt .amod file (missing content-checksum); rebuild the provider module",
+            path.display()
+        )
+    })?;
+
+    let actual_len = body.len();
+    if actual_len != expected_len {
+        return Err(format!(
+            "{}: corrupt .amod file (content length {}, expected {}); rebuild the provider module",
+            path.display(),
+            actual_len,
+            expected_len
+        ));
+    }
+
+    let actual_checksum = fnv1a_hex(body);
+    if actual_checksum != expected_checksum {
+        return Err(format!(
+            "{}: corrupt .amod file (content checksum {}, expected {}); rebuild the provider module",
+            path.display(),
+            actual_checksum,
+            expected_checksum
+        ));
+    }
+
+    Ok(())
 }
 
 /// Clear the per-thread amod cache. Tests use this to start fresh
@@ -2099,6 +2171,12 @@ fn parse_type(
                 "false" => Some(FieldDefaultInit::Logical(false)),
                 _ => None,
             };
+        }
+        if let Some(value) = payload.strip_prefix("realbits:") {
+            return u64::from_str_radix(value, 16)
+                .ok()
+                .map(f64::from_bits)
+                .map(FieldDefaultInit::Real);
         }
         if let Some(value) = payload.strip_prefix("charhex:") {
             let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
@@ -2780,16 +2858,16 @@ mod tests {
         clear_amod_cache();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
-        std::fs::write(
-            &path,
+        let text = add_integrity_headers(
             r#"#!amod 2
 # module: cache_test
 # source: cache_test.f90
 
 @param k : integer = 7
-"#,
-        )
-        .unwrap();
+"#
+            .to_string(),
+        );
+        std::fs::write(&path, text).unwrap();
 
         let _ = read_amod(&path).expect("first read");
         let hits_after_first = AMOD_CACHE_HITS.with(|h| *h.borrow());
@@ -2802,6 +2880,38 @@ mod tests {
         assert_eq!(
             hits_after_second, 1,
             "second read must hit the cache (no reparse)"
+        );
+    }
+
+    #[test]
+    fn read_amod_rejects_truncated_integrity_body() {
+        clear_amod_cache();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
+        let text = add_integrity_headers(
+            r#"#!amod 2
+# module: truncated_test
+# source: truncated_test.f90
+
+@param k : integer = 7
+@param answer : integer = 42
+"#
+            .to_string(),
+        )
+        .replace("@param answer : integer = 42\n", "");
+        std::fs::write(&path, text).unwrap();
+
+        let err = read_amod(&path).expect_err("truncated .amod must be rejected");
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            AMOD_CACHE_HITS.with(|h| *h.borrow()),
+            0,
+            "rejected .amod must not populate the cache"
+        );
+        assert!(
+            err.contains("corrupt .amod file") && err.contains("content length"),
+            "unexpected error: {err}"
         );
     }
 }

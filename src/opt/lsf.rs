@@ -43,7 +43,7 @@
 //! %x = iadd %42, %1
 //! ```
 
-use super::alias::{self, may_reach_through_call_arg, AliasResult};
+use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
@@ -51,6 +51,8 @@ use crate::ir::walk::{for_each_operand_mut, for_each_terminator_operand_mut};
 use std::collections::HashMap;
 
 pub struct LocalLsf;
+
+const LOCAL_LSF_AVAILABLE_LIMIT: usize = 256;
 
 impl Pass for LocalLsf {
     fn name(&self) -> &'static str {
@@ -76,69 +78,73 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
     let mut all_rewrites: HashMap<ValueId, ValueId> = HashMap::new();
     let mut changed = false;
 
-    for block in &func.blocks {
-        let mut available: Vec<AvailableStore> = Vec::new();
+    {
+        let mut alias_oracle = alias::AliasOracle::new(func, layout);
 
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::Store(val, ptr) => {
-                    let eff_ptr = resolve(&all_rewrites, *ptr);
-                    let eff_val = resolve(&all_rewrites, *val);
-                    available.retain(|entry| {
-                        matches!(
-                            alias::query(func, entry.ptr, eff_ptr, layout),
-                            AliasResult::NoAlias
-                        )
-                    });
-                    available.push(AvailableStore {
-                        ptr: eff_ptr,
-                        val: eff_val,
-                    });
-                }
+        for block in &func.blocks {
+            let mut available: Vec<AvailableStore> = Vec::new();
 
-                InstKind::Load(ptr) => {
-                    let eff_ptr = resolve(&all_rewrites, *ptr);
-                    if let Some(entry) = available.iter().rev().find(|entry| {
-                        matches!(
-                            alias::query(func, entry.ptr, eff_ptr, layout),
-                            AliasResult::MustAlias
-                        ) && func.value_type(entry.val).is_some_and(|ty| ty == inst.ty)
-                    }) {
-                        all_rewrites.insert(inst.id, entry.val);
-                        changed = true;
-                    }
-                }
-
-                InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
-                    let pointer_args: Vec<ValueId> = args
-                        .iter()
-                        .copied()
-                        .map(|arg| resolve(&all_rewrites, arg))
-                        .filter(|arg| value_is_pointer(func, *arg))
-                        .collect();
-                    if !pointer_args.is_empty() {
-                        if pointer_args
-                            .iter()
-                            .any(|arg| call_arg_may_carry_indirect_pointer(func, *arg))
-                        {
-                            available.clear();
-                            continue;
-                        }
-                        // Call boundaries use the coarser
-                        // may_reach_through_call_arg predicate: a
-                        // callee that gets a pointer can walk to
-                        // any offset within the same allocation,
-                        // so a precise "different GEP offset →
-                        // NoAlias" answer is unsound here.
+            for inst in &block.insts {
+                match &inst.kind {
+                    InstKind::Store(val, ptr) => {
+                        let eff_ptr = resolve(&all_rewrites, *ptr);
+                        let eff_val = resolve(&all_rewrites, *val);
                         available.retain(|entry| {
-                            pointer_args.iter().all(|arg| {
-                                !may_reach_through_call_arg(func, entry.ptr, *arg, layout)
-                            })
+                            matches!(alias_oracle.query(entry.ptr, eff_ptr), AliasResult::NoAlias)
+                        });
+                        if available.len() == LOCAL_LSF_AVAILABLE_LIMIT {
+                            available.remove(0);
+                        }
+                        available.push(AvailableStore {
+                            ptr: eff_ptr,
+                            val: eff_val,
                         });
                     }
-                }
 
-                _ => {} // Pure computation — doesn't affect memory availability.
+                    InstKind::Load(ptr) => {
+                        let eff_ptr = resolve(&all_rewrites, *ptr);
+                        if let Some(entry) = available.iter().rev().find(|entry| {
+                            matches!(
+                                alias_oracle.query(entry.ptr, eff_ptr),
+                                AliasResult::MustAlias
+                            ) && func.value_type(entry.val).is_some_and(|ty| ty == inst.ty)
+                        }) {
+                            all_rewrites.insert(inst.id, entry.val);
+                            changed = true;
+                        }
+                    }
+
+                    InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+                        let pointer_args: Vec<ValueId> = args
+                            .iter()
+                            .copied()
+                            .map(|arg| resolve(&all_rewrites, arg))
+                            .filter(|arg| alias_oracle.value_is_pointer(*arg))
+                            .collect();
+                        if !pointer_args.is_empty() {
+                            if pointer_args
+                                .iter()
+                                .any(|arg| call_arg_may_carry_indirect_pointer(func, *arg))
+                            {
+                                available.clear();
+                                continue;
+                            }
+                            // Call boundaries use the coarser
+                            // may_reach_through_call_arg predicate: a
+                            // callee that gets a pointer can walk to
+                            // any offset within the same allocation,
+                            // so a precise "different GEP offset →
+                            // NoAlias" answer is unsound here.
+                            available.retain(|entry| {
+                                pointer_args.iter().all(|arg| {
+                                    !alias_oracle.may_reach_through_call_arg(entry.ptr, *arg)
+                                })
+                            });
+                        }
+                    }
+
+                    _ => {} // Pure computation — doesn't affect memory availability.
+                }
             }
         }
     }
@@ -189,25 +195,6 @@ fn apply_rewrites(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
             for_each_terminator_operand_mut(term, r);
         }
     }
-}
-
-fn value_is_pointer(func: &Function, value: ValueId) -> bool {
-    if matches!(func.value_type(value), Some(IrType::Ptr(_))) {
-        return true;
-    }
-    if func
-        .params
-        .iter()
-        .any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_)))
-    {
-        return true;
-    }
-    func.blocks
-        .iter()
-        .flat_map(|block| block.insts.iter())
-        .find(|inst| inst.id == value)
-        .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
-        .unwrap_or(false)
 }
 
 fn call_arg_may_carry_indirect_pointer(func: &Function, value: ValueId) -> bool {

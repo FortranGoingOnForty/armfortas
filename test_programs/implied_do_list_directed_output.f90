@@ -14,25 +14,25 @@ program implied_do_list_directed_output
 
   ! list-directed implied-do (the audit reproducer)
   print *, (ia(i), i=1,3)
-  ! CHECK: 1 2 3
+  ! CHECK: 1           2           3
   ! unformatted WRITE implied-do with a stride
   write(*,*) (ia(i), i=1,6,2)
-  ! CHECK: 1 3 5
+  ! CHECK: 1           3           5
   ! negative stride
   print *, (ia(i), i=6,1,-2)
-  ! CHECK: 6 4 2
+  ! CHECK: 6           4           2
   ! nested implied-do
   print *, ((i*10 + j, j=1,2), i=1,2)
-  ! CHECK: 11 12 21 22
+  ! CHECK: 11          12          21          22
   ! character implied-do
   print *, (cs(i), i=1,2)
-  ! CHECK: abc def
+  ! CHECK: abcdef
   ! plain array constructor in an output list
   write(*,*) [7, 8, 9]
-  ! CHECK: 7 8 9
+  ! CHECK: 7           8           9
   ! implied-do mixed with scalar items
   print *, 'x', (ia(i), i=1,2), 'y'
-  ! CHECK: x 1 2 y
+  ! CHECK: x           1           2 y
   ! formatted implied-do still works (the path that was already correct)
   print '(3I4)', (ia(i), i=1,3)
   ! CHECK: 1   2   3

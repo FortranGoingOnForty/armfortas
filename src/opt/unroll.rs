@@ -1906,7 +1906,7 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
             }
         }
         if shape.reduction.is_some() {
-            prev_acc = clone_new_acc;
+            prev_acc = clone_new_acc.or(prev_acc);
         }
     }
     // New iadd: iv_next = iadd iv, U. Reuse the original iadd id.
@@ -2010,7 +2010,10 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
         span,
     });
     func.block_mut(latch_remain).insts = remain_insts;
-    let latch_remain_args: Vec<ValueId> = if let Some(acc) = remain_new_acc {
+    let latch_remain_args: Vec<ValueId> = if shape.reduction.is_some() {
+        let acc = remain_new_acc
+            .or(remain_acc_id)
+            .expect("runtime reduction remainder must have an accumulator param");
         vec![remain_iv_next_id, acc]
     } else {
         vec![remain_iv_next_id]

@@ -12,6 +12,7 @@ calling_convention_runtime
 claims_audit_29_11
 control_flow_runtime
 determinism_sweep
+driver_temp_paths
 fortsh_module_graph
 hidden_array_result_order
 i128_backend_data

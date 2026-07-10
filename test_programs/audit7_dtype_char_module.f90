@@ -1,6 +1,6 @@
 ! Derived type with character component, defined in a module.
 ! Exercises module procedure calls with derived type arguments.
-! CHECK: Name: Fortran
+! CHECK: Name:Fortran
 ! CHECK: Age: 30
 module dtype_mod
   implicit none

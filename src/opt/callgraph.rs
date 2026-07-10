@@ -75,12 +75,7 @@ impl CallGraph {
             }
         }
 
-        // Detect recursion via DFS from each node.
-        for i in 0..n {
-            if detect_cycle(&nodes, i as u32) {
-                nodes[i].is_recursive = true;
-            }
-        }
+        mark_recursive_nodes(&mut nodes);
 
         CallGraph { nodes }
     }
@@ -136,23 +131,94 @@ fn rpo_dfs(nodes: &[CallNode], idx: u32, visited: &mut [bool], order: &mut Vec<u
     order.push(idx);
 }
 
-/// Detect if function `start` is part of a cycle in the call graph.
-fn detect_cycle(nodes: &[CallNode], start: u32) -> bool {
-    let mut visiting = HashSet::new();
-    dfs_cycle(nodes, start, &mut visiting)
-}
+fn mark_recursive_nodes(nodes: &mut [CallNode]) {
+    let edges: Vec<Vec<usize>> = nodes
+        .iter()
+        .map(|node| {
+            node.callees
+                .iter()
+                .copied()
+                .filter_map(|callee| {
+                    let idx = callee as usize;
+                    (idx < nodes.len()).then_some(idx)
+                })
+                .collect()
+        })
+        .collect();
+    let mut state = SccState {
+        edges: &edges,
+        next_index: 0,
+        indices: vec![None; nodes.len()],
+        lowlink: vec![0; nodes.len()],
+        stack: Vec::new(),
+        on_stack: vec![false; nodes.len()],
+        recursive: vec![false; nodes.len()],
+    };
 
-fn dfs_cycle(nodes: &[CallNode], idx: u32, visiting: &mut HashSet<u32>) -> bool {
-    if !visiting.insert(idx) {
-        return true; // back-edge → cycle
-    }
-    for &callee in &nodes[idx as usize].callees {
-        if (callee as usize) < nodes.len() && dfs_cycle(nodes, callee, visiting) {
-            return true;
+    for idx in 0..nodes.len() {
+        if state.indices[idx].is_none() {
+            state.visit(idx);
         }
     }
-    visiting.remove(&idx);
-    false
+
+    for (node, recursive) in nodes.iter_mut().zip(state.recursive) {
+        node.is_recursive = recursive;
+    }
+}
+
+struct SccState<'a> {
+    edges: &'a [Vec<usize>],
+    next_index: usize,
+    indices: Vec<Option<usize>>,
+    lowlink: Vec<usize>,
+    stack: Vec<usize>,
+    on_stack: Vec<bool>,
+    recursive: Vec<bool>,
+}
+
+impl SccState<'_> {
+    fn visit(&mut self, node: usize) {
+        self.indices[node] = Some(self.next_index);
+        self.lowlink[node] = self.next_index;
+        self.next_index += 1;
+        self.stack.push(node);
+        self.on_stack[node] = true;
+
+        for &callee in &self.edges[node] {
+            if self.indices[callee].is_none() {
+                self.visit(callee);
+                self.lowlink[node] = self.lowlink[node].min(self.lowlink[callee]);
+            } else if self.on_stack[callee] {
+                let callee_index = self.indices[callee].expect("stacked node should be indexed");
+                self.lowlink[node] = self.lowlink[node].min(callee_index);
+            }
+        }
+
+        let node_index = self.indices[node].expect("visited node should be indexed");
+        if self.lowlink[node] != node_index {
+            return;
+        }
+
+        let mut component = Vec::new();
+        loop {
+            let member = self.stack.pop().expect("SCC stack should contain node");
+            self.on_stack[member] = false;
+            component.push(member);
+            if member == node {
+                break;
+            }
+        }
+
+        let recursive = component.len() > 1
+            || component
+                .first()
+                .is_some_and(|&member| self.edges[member].contains(&member));
+        if recursive {
+            for member in component {
+                self.recursive[member] = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

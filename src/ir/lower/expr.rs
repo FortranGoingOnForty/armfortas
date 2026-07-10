@@ -88,6 +88,89 @@ pub(crate) fn lower_expr_ctx_tl(
     )
 }
 
+fn trim_intrinsic_arg(expr: &SpannedExpr) -> Option<&SpannedExpr> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => trim_intrinsic_arg(inner),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("trim") || args.len() != 1 {
+                return None;
+            }
+            match &args[0].value {
+                crate::ast::expr::SectionSubscript::Element(arg) => Some(arg),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn emit_char_compare_predicate(b: &mut FuncBuilder, op: &BinaryOp, cmp: ValueId) -> ValueId {
+    let zero = b.const_i32(0);
+    match op {
+        BinaryOp::Eq => b.icmp(CmpOp::Eq, cmp, zero),
+        BinaryOp::Ne => b.icmp(CmpOp::Ne, cmp, zero),
+        BinaryOp::Lt => b.icmp(CmpOp::Lt, cmp, zero),
+        BinaryOp::Le => b.icmp(CmpOp::Le, cmp, zero),
+        BinaryOp::Gt => b.icmp(CmpOp::Gt, cmp, zero),
+        BinaryOp::Ge => b.icmp(CmpOp::Ge, cmp, zero),
+        _ => unreachable!(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_trimmed_character_compare(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    op: &BinaryOp,
+    left: &SpannedExpr,
+    right: &SpannedExpr,
+) -> Option<ValueId> {
+    let lhs_expr = trim_intrinsic_arg(left)?;
+    let rhs_expr = trim_intrinsic_arg(right)?;
+    if !expr_is_character_expr(b, locals, lhs_expr, st, type_layouts)
+        || !expr_is_character_expr(b, locals, rhs_expr, st, type_layouts)
+    {
+        return None;
+    }
+
+    let (lhs_ptr, lhs_len) = lower_string_expr_full(
+        b,
+        locals,
+        lhs_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let (rhs_ptr, rhs_len) = lower_string_expr_full(
+        b,
+        locals,
+        rhs_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let cmp = b.call(
+        FuncRef::External("afs_compare_char_trimmed".into()),
+        vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
+        IrType::Int(IntWidth::I32),
+    );
+    deallocate_owned_string_expr_temp(b, locals, lhs_expr, st, type_layouts, lhs_ptr);
+    deallocate_owned_string_expr_temp(b, locals, rhs_expr, st, type_layouts, rhs_ptr);
+    Some(emit_char_compare_predicate(b, op, cmp))
+}
+
 pub(super) fn try_lower_float_square_power(
     b: &mut FuncBuilder,
     base: ValueId,
@@ -827,6 +910,20 @@ pub(crate) fn lower_expr_full(
             ) && (expr_is_character_expr(b, locals, left, st, type_layouts)
                 || expr_is_character_expr(b, locals, right, st, type_layouts))
             {
+                if let Some(result) = lower_trimmed_character_compare(
+                    b,
+                    locals,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    op,
+                    left,
+                    right,
+                ) {
+                    return result;
+                }
                 let (lhs_ptr, lhs_len) = lower_string_expr_full(
                     b,
                     locals,
@@ -854,16 +951,7 @@ pub(crate) fn lower_expr_full(
                 );
                 deallocate_owned_string_expr_temp(b, locals, left, st, type_layouts, lhs_ptr);
                 deallocate_owned_string_expr_temp(b, locals, right, st, type_layouts, rhs_ptr);
-                let zero = b.const_i32(0);
-                return match op {
-                    BinaryOp::Eq => b.icmp(CmpOp::Eq, cmp, zero),
-                    BinaryOp::Ne => b.icmp(CmpOp::Ne, cmp, zero),
-                    BinaryOp::Lt => b.icmp(CmpOp::Lt, cmp, zero),
-                    BinaryOp::Le => b.icmp(CmpOp::Le, cmp, zero),
-                    BinaryOp::Gt => b.icmp(CmpOp::Gt, cmp, zero),
-                    BinaryOp::Ge => b.icmp(CmpOp::Ge, cmp, zero),
-                    _ => unreachable!(),
-                };
+                return emit_char_compare_predicate(b, op, cmp);
             }
             if matches!(op, BinaryOp::And | BinaryOp::Or) {
                 return lower_short_circuit_logical_expr(
@@ -1071,12 +1159,7 @@ pub(crate) fn lower_expr_full(
                 (BinaryOp::Pow, IrType::Float(_)) => {
                     try_lower_float_square_power(b, lhs, right).unwrap_or_else(|| b.fpow(lhs, rhs))
                 }
-                (BinaryOp::Pow, IrType::Int(_)) => {
-                    let fl = b.int_to_float(lhs, FloatWidth::F64);
-                    let fr = b.int_to_float(rhs, FloatWidth::F64);
-                    let result = b.fpow(fl, fr);
-                    b.float_to_int(result, IntWidth::I32)
-                }
+                (BinaryOp::Pow, IrType::Int(width)) => lower_integer_pow(b, lhs, rhs, *width),
                 (BinaryOp::Eq, IrType::Int(_)) => b.icmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Eq, IrType::Float(_)) => b.fcmp(CmpOp::Eq, lhs, rhs),
                 (BinaryOp::Ne, IrType::Int(_)) => b.icmp(CmpOp::Ne, lhs, rhs),
@@ -2449,9 +2532,11 @@ pub(crate) fn lower_expr_full(
                     .map(String::as_str)
                     .unwrap_or(callee_key.as_str());
                 if procptr_target.is_none() {
-                    if let Some(hidden_abi) = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_hidden_result_abi(st, k)
-                    }) {
+                    if let Some(hidden_abi) =
+                        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                            callee_hidden_result_abi(st, k)
+                        })
+                    {
                         if let Some(bytes) = hidden_result_temp_bytes_for_callee(
                             st,
                             type_layouts,
@@ -2509,57 +2594,70 @@ pub(crate) fn lower_expr_full(
                     }
                 }
                 let indirect_hidden_result = if procptr_target.is_some() {
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k))
-                        .and_then(|hidden_abi| {
-                            let bytes = hidden_result_temp_bytes_for_callee(
-                                st,
-                                type_layouts,
-                                &abi_lookup_keys,
-                                hidden_abi,
-                            )?;
-                            let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
-                                let fw = if bytes == 16 {
-                                    FloatWidth::F64
-                                } else {
-                                    FloatWidth::F32
-                                };
-                                IrType::Array(Box::new(IrType::Float(fw)), 2)
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_hidden_result_abi(st, k)
+                    })
+                    .and_then(|hidden_abi| {
+                        let bytes = hidden_result_temp_bytes_for_callee(
+                            st,
+                            type_layouts,
+                            &abi_lookup_keys,
+                            hidden_abi,
+                        )?;
+                        let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                            let fw = if bytes == 16 {
+                                FloatWidth::F64
                             } else {
-                                IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                                FloatWidth::F32
                             };
-                            let desc = b.alloca(alloca_ty);
-                            let zero_i32 = b.const_i32(0);
-                            let size = b.const_i64(bytes as i64);
-                            b.call(
-                                FuncRef::External("memset".into()),
-                                vec![desc, zero_i32, size],
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                            );
-                            Some(desc)
-                        })
+                            IrType::Array(Box::new(IrType::Float(fw)), 2)
+                        } else {
+                            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                        };
+                        let desc = b.alloca(alloca_ty);
+                        let zero_i32 = b.const_i32(0);
+                        let size = b.const_i64(bytes as i64);
+                        b.call(
+                            FuncRef::External("memset".into()),
+                            vec![desc, zero_i32, size],
+                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        );
+                        Some(desc)
+                    })
                 } else {
                     None
                 };
                 let callee_value_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(st, k));
-                let callee_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
-                });
-                let callee_string_descriptor_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_string_descriptor_arg_mask(st, k)
-                });
-                let callee_bind_c_char_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_bind_c_char_arg_mask(st, k)
-                });
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_value_arg_mask(st, k)
+                    });
+                let callee_descriptor_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        descriptor_params.and_then(|m| descriptor_param_mask_for_lookup(st, m, k))
+                    });
+                let callee_string_descriptor_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_string_descriptor_arg_mask(st, k)
+                    });
+                let callee_bind_c_char_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_bind_c_char_arg_mask(st, k)
+                    });
                 let callee_pointer_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
-                let callee_allocatable_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                    callee_allocatable_arg_mask(st, k)
-                });
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_pointer_arg_mask(st, k)
+                    });
+                let callee_allocatable_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_allocatable_arg_mask(st, k)
+                    });
                 let callee_class_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
-                let opt_flags =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_class_arg_mask(st, k)
+                    });
+                let opt_flags = first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                    callee_optional_arg_mask(st, k)
+                });
                 let mut ref_arg_vals: Vec<ValueId> =
                     Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
                 let mut call_arg_array_temps = Vec::new();
@@ -2773,7 +2871,9 @@ pub(crate) fn lower_expr_full(
                     }
                 }
                 let callee_char_len_star_args =
-                    first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_char_len_star_mask(st, k)
+                    });
 
                 if let Some(cls_flags) = &callee_char_len_star_args {
                     for (i, flag) in cls_flags.iter().enumerate() {
@@ -2846,8 +2946,13 @@ pub(crate) fn lower_expr_full(
                 let ret_ty = if indirect_hidden_result.is_some() {
                     IrType::Void
                 } else {
-                    first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_return_ir_type_for_caller(st, k, internal_funcs)
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_return_ir_type_for_call_site(
+                            st,
+                            b.func().name.as_str(),
+                            k,
+                            internal_funcs,
+                        )
                     })
                     .unwrap_or(IrType::Int(IntWidth::I32))
                 };
@@ -2879,9 +2984,11 @@ pub(crate) fn lower_expr_full(
                     return desc;
                 }
                 if let Some(tl) = type_layouts {
-                    if let Some(type_name) = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_return_stabilized_derived_type_name(st, k)
-                    }) {
+                    if let Some(type_name) =
+                        first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                            callee_return_stabilized_derived_type_name(st, k)
+                        })
+                    {
                         return stabilize_derived_call_result(b, tl, &type_name, call_result);
                     }
                 }

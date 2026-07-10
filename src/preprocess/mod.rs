@@ -19,6 +19,8 @@ pub struct PreprocConfig {
     pub filename: String,
     /// If true, source is fixed-form Fortran (C/* in column 1 = comment).
     pub fixed_form: bool,
+    /// If true, strip C block comments from source lines for -cpp compatibility.
+    pub cpp_compat: bool,
 }
 
 impl PreprocConfig {
@@ -70,6 +72,7 @@ impl PreprocConfig {
             include_paths: Vec::new(),
             filename: "<input>".into(),
             fixed_form: false,
+            cpp_compat: false,
         }
     }
 }
@@ -182,6 +185,8 @@ struct Preprocessor {
     include_depth: u32,
     /// Fixed-form source mode.
     fixed_form: bool,
+    /// GNU-style preprocessing compatibility mode.
+    cpp_compat: bool,
     /// Whether source stripping is currently inside a C-style block comment.
     in_c_block_comment: bool,
     /// #line overrides for source map reporting.
@@ -194,6 +199,7 @@ impl Preprocessor {
             defines: config.defines.clone(),
             include_paths: config.include_paths.clone(),
             fixed_form: config.fixed_form,
+            cpp_compat: config.cpp_compat,
             in_c_block_comment: false,
             line_override: None,
             cond_stack: Vec::new(),
@@ -331,8 +337,11 @@ impl Preprocessor {
                 MacroDef::object(&orig_line_num.to_string()),
             );
 
-            logical_line =
-                strip_c_block_comments_from_line(&logical_line, &mut self.in_c_block_comment);
+            let trimmed = logical_line.trim_start();
+            if self.cpp_compat || self.in_c_block_comment || trimmed.starts_with("/*") {
+                logical_line =
+                    strip_c_block_comments_from_line(&logical_line, &mut self.in_c_block_comment);
+            }
 
             // Fixed-form: C, c, or * in column 1 is a comment line.
             if self.fixed_form {
@@ -1478,6 +1487,11 @@ fn strip_c_block_comments_from_line(line: &str, in_block: &mut bool) -> String {
             continue;
         }
 
+        if bytes[i] == b'!' {
+            result.push_str(&line[i..]);
+            break;
+        }
+
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             result.push(' ');
             *in_block = true;
@@ -1569,6 +1583,12 @@ mod tests {
         for (k, v) in defines {
             config.defines.insert(k.to_string(), MacroDef::object(v));
         }
+        preprocess(src, &config).unwrap().text
+    }
+
+    fn pp_cpp(src: &str) -> String {
+        let mut config = PreprocConfig::default();
+        config.cpp_compat = true;
         preprocess(src, &config).unwrap().text
     }
 
@@ -2495,6 +2515,33 @@ deep
              #endif\n");
         assert!(lines(&out).contains(&"ok"));
         assert!(!out.contains("text.h"), "C block comment leaked: {:?}", out);
+    }
+
+    #[test]
+    fn fortran_bang_comment_does_not_start_c_block_comment() {
+        let out = pp("x = 1 ! /*\nx = x + 41\n! */\n");
+        assert!(
+            out.contains("x = x + 41"),
+            "Fortran source after ! /* was stripped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn source_string_preserves_c_block_markers() {
+        let out = pp("print *, 'literal /* kept */'\n");
+        assert!(
+            out.contains("literal /* kept */"),
+            "string was stripped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_compat_strips_source_c_block_comment() {
+        let out = pp_cpp("x = 1 /* c comment */ + 2\n");
+        assert!(
+            out.contains("x = 1   + 2"),
+            "C block comment leaked: {out:?}"
+        );
     }
 
     // ---- Multi-elif chain ----

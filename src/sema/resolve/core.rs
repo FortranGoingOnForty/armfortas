@@ -574,27 +574,51 @@ pub(super) fn resolve_unit(
                 outer_refs
             {
                 let span = unit.span;
-                let _ = st.define(Symbol {
-                    name: fn_name,
-                    kind,
-                    type_info: ti,
+                let symbol = Symbol {
+                    name: fn_name.clone(),
+                    kind: kind.clone(),
+                    type_info: ti.clone(),
                     attrs: SymbolAttrs {
                         external: true,
-                        binding_label,
+                        binding_label: binding_label.clone(),
                         pure,
                         elemental,
                         allocatable: result_attrs.allocatable,
                         pointer: result_attrs.pointer,
                         result_rank: result_attrs.result_rank,
-                        array_spec: result_attrs.array_spec,
+                        array_spec: result_attrs.array_spec.clone(),
                         ..Default::default()
                     },
                     defined_at: span,
                     scope: st.current_scope(),
-                    arg_names,
+                    arg_names: arg_names.clone(),
                     const_value: None,
                     const_char_value: None,
-                });
+                };
+                if st.define(symbol).is_err() {
+                    let key = fn_name.to_ascii_lowercase();
+                    let scope_id = st.current_scope();
+                    let is_dummy_arg = st.scope(scope_id).arg_order.iter().any(|arg| arg == &key);
+                    if is_dummy_arg {
+                        if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
+                            if existing.kind == SymbolKind::Variable {
+                                let mut attrs = existing.attrs.clone();
+                                attrs.external = true;
+                                attrs.binding_label = binding_label;
+                                attrs.pure = pure;
+                                attrs.elemental = elemental;
+                                attrs.allocatable = result_attrs.allocatable;
+                                attrs.pointer = result_attrs.pointer;
+                                attrs.result_rank = result_attrs.result_rank;
+                                attrs.array_spec = result_attrs.array_spec;
+                                existing.kind = kind;
+                                existing.type_info = ti;
+                                existing.attrs = attrs;
+                                existing.arg_names = arg_names;
+                            }
+                        }
+                    }
+                }
             }
 
             // Register the generic interface name in the enclosing scope.

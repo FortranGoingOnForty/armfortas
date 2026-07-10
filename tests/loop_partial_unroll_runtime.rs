@@ -70,8 +70,10 @@ fn o2_partial_unrolls_runtime_trip_loop_with_remainder() {
         .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one print line:\n{}", stdout);
+    let fields: Vec<&str> = trimmed[0].split_whitespace().collect();
     assert_eq!(
-        trimmed[0], "33 561 33",
+        fields,
+        vec!["33", "561", "33"],
         "runtime trip partial unroll wrong: {:?}",
         trimmed[0]
     );

@@ -15,6 +15,13 @@ impl Pass for DeadArgElim {
     }
 
     fn run(&self, module: &mut Module) -> bool {
+        let address_taken = address_taken_functions(module);
+        let trim_eligible: Vec<bool> = module
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(idx, func)| func.internal_only && !address_taken[idx] && !func.params.is_empty())
+            .collect();
         let mut live_masks: Vec<Vec<bool>> = module
             .functions
             .iter()
@@ -25,11 +32,17 @@ impl Pass for DeadArgElim {
         while changed {
             changed = false;
             for (func_idx, func) in module.functions.iter().enumerate() {
-                if !func.internal_only || func.params.is_empty() {
+                if !trim_eligible[func_idx] {
                     continue;
                 }
                 for (param_idx, param) in func.params.iter().enumerate() {
-                    let live = param_has_observable_use(module, func_idx, param.id, &live_masks);
+                    let live = param_has_observable_use(
+                        module,
+                        func_idx,
+                        param.id,
+                        &live_masks,
+                        &trim_eligible,
+                    );
                     if live_masks[func_idx][param_idx] != live {
                         live_masks[func_idx][param_idx] = live;
                         changed = true;
@@ -40,7 +53,7 @@ impl Pass for DeadArgElim {
 
         let mut removed_any = false;
         for (idx, func) in module.functions.iter_mut().enumerate() {
-            if !func.internal_only || func.params.is_empty() {
+            if !trim_eligible[idx] {
                 continue;
             }
             let keep = &live_masks[idx];
@@ -76,6 +89,10 @@ impl Pass for DeadArgElim {
                         .get(*callee_idx as usize)
                         .copied()
                         .unwrap_or(false)
+                        || !trim_eligible
+                            .get(*callee_idx as usize)
+                            .copied()
+                            .unwrap_or(false)
                     {
                         continue;
                     }
@@ -96,11 +113,34 @@ impl Pass for DeadArgElim {
     }
 }
 
+fn address_taken_functions(module: &Module) -> Vec<bool> {
+    let mut address_taken = vec![false; module.functions.len()];
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.insts {
+                let InstKind::GlobalAddr(name) = &inst.kind else {
+                    continue;
+                };
+                if let Some((idx, _)) = module
+                    .functions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, candidate)| candidate.name == *name)
+                {
+                    address_taken[idx] = true;
+                }
+            }
+        }
+    }
+    address_taken
+}
+
 fn param_has_observable_use(
     module: &Module,
     func_idx: usize,
     param_id: ValueId,
     live_masks: &[Vec<bool>],
+    trim_eligible: &[bool],
 ) -> bool {
     let func = &module.functions[func_idx];
     for block in &func.blocks {
@@ -114,7 +154,12 @@ fn param_has_observable_use(
                         let Some(callee) = module.functions.get(*callee_idx as usize) else {
                             return true;
                         };
-                        if !callee.internal_only {
+                        if !callee.internal_only
+                            || !trim_eligible
+                                .get(*callee_idx as usize)
+                                .copied()
+                                .unwrap_or(false)
+                        {
                             return true;
                         }
                         let Some(callee_live) = live_masks
@@ -354,6 +399,79 @@ mod tests {
 
         assert!(!DeadArgElim.run(&mut module));
         assert_eq!(module.functions[0].params.len(), 2);
+    }
+
+    #[test]
+    fn preserves_address_taken_internal_abi_and_forwarded_args() {
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let int_ty = IrType::Int(IntWidth::I32);
+
+        let helper_params = vec![Param {
+            name: "unused".into(),
+            ty: int_ty.clone(),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut helper = Function::new("helper".into(), helper_params, IrType::Void);
+        helper.internal_only = true;
+        let helper_entry = helper.entry;
+        helper.block_mut(helper_entry).terminator = Some(Terminator::Return(None));
+        module.add_function(helper);
+
+        let wrapper_params = vec![Param {
+            name: "forwarded".into(),
+            ty: int_ty.clone(),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut wrapper = Function::new("wrapper".into(), wrapper_params, IrType::Void);
+        wrapper.internal_only = true;
+        push(
+            &mut wrapper,
+            InstKind::Call(FuncRef::Internal(0), vec![ValueId(0)]),
+            IrType::Void,
+        );
+        let wrapper_entry = wrapper.entry;
+        wrapper.block_mut(wrapper_entry).terminator = Some(Terminator::Return(None));
+        module.add_function(wrapper);
+
+        let mut caller = Function::new("main".into(), vec![], IrType::Void);
+        let target = push(
+            &mut caller,
+            InstKind::GlobalAddr("helper".into()),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        let arg = push(
+            &mut caller,
+            InstKind::ConstInt(7, IntWidth::I32),
+            int_ty.clone(),
+        );
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Indirect(target), vec![arg]),
+            IrType::Void,
+        );
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(1), vec![arg]),
+            IrType::Void,
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(None));
+        module.add_function(caller);
+
+        assert!(
+            !DeadArgElim.run(&mut module),
+            "address-taken internal ABI and callers forwarding into it must be preserved"
+        );
+        assert_eq!(module.functions[0].params.len(), 1);
+        assert_eq!(module.functions[1].params.len(), 1);
+
+        let wrapper_args = match &module.functions[1].blocks[0].insts[0].kind {
+            InstKind::Call(FuncRef::Internal(0), args) => args,
+            other => panic!("expected wrapper call to helper, got {:?}", other),
+        };
+        assert_eq!(wrapper_args, &vec![ValueId(0)]);
     }
 
     #[test]

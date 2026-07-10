@@ -28,7 +28,6 @@
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::types::IrType;
 use std::collections::HashSet;
 
 /// Eliminate dead stores within a single basic block.
@@ -40,75 +39,76 @@ fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::Targe
         inst_idx: usize,
     }
 
-    let block = &func.blocks[block_idx];
     let mut pending: Vec<PendingStore> = Vec::new();
     let mut dead: HashSet<usize> = HashSet::new();
 
-    for (i, inst) in block.insts.iter().enumerate() {
-        match &inst.kind {
-            InstKind::Store(_, ptr) => {
-                let mut next_pending = Vec::with_capacity(pending.len() + 1);
-                for entry in pending {
-                    match alias::query(func, entry.ptr, *ptr, layout) {
-                        AliasResult::MustAlias => {
-                            dead.insert(entry.inst_idx);
-                        }
-                        AliasResult::MayAlias | AliasResult::NoAlias => {
-                            next_pending.push(entry);
+    {
+        let block = &func.blocks[block_idx];
+        let mut alias_oracle = alias::AliasOracle::new(func, layout);
+
+        for (i, inst) in block.insts.iter().enumerate() {
+            match &inst.kind {
+                InstKind::Store(_, ptr) => {
+                    let mut next_pending = Vec::with_capacity(pending.len() + 1);
+                    for entry in pending {
+                        match alias_oracle.query(entry.ptr, *ptr) {
+                            AliasResult::MustAlias => {
+                                dead.insert(entry.inst_idx);
+                            }
+                            AliasResult::MayAlias | AliasResult::NoAlias => {
+                                next_pending.push(entry);
+                            }
                         }
                     }
+                    next_pending.push(PendingStore {
+                        ptr: *ptr,
+                        inst_idx: i,
+                    });
+                    pending = next_pending;
                 }
-                next_pending.push(PendingStore {
-                    ptr: *ptr,
-                    inst_idx: i,
-                });
-                pending = next_pending;
-            }
 
-            InstKind::Load(ptr) => {
-                pending.retain(|entry| {
-                    matches!(
-                        alias::query(func, entry.ptr, *ptr, layout),
-                        AliasResult::NoAlias
-                    )
-                });
-            }
-
-            InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
-                // Call boundaries use the coarser predicate — same fix
-                // as LocalLsf / GlobalLsf.  A callee that receives a
-                // pointer into an allocation can walk to any offset
-                // within it, so `gep %a,[0]` passed as an arg must
-                // invalidate a pending store to `gep %a,[1]` even
-                // though their precise offsets differ.  Currently the
-                // Fortran programs we compile don't expose a
-                // triggering DSE pattern, but the code is structurally
-                // identical to the other LSF passes so we fix it
-                // defensively.
-                let pointer_args: Vec<ValueId> = args
-                    .iter()
-                    .copied()
-                    .filter(|arg| matches!(func.value_type(*arg), Some(IrType::Ptr(_))))
-                    .collect();
-                if !pointer_args.is_empty() {
+                InstKind::Load(ptr) => {
                     pending.retain(|entry| {
-                        pointer_args.iter().all(|arg| {
-                            !alias::may_reach_through_call_arg(func, entry.ptr, *arg, layout)
-                        })
+                        matches!(alias_oracle.query(entry.ptr, *ptr), AliasResult::NoAlias)
                     });
                 }
-            }
 
-            // Memset/memcpy wrappers (external calls) are handled above via Call.
-            // All other instructions are pure reads of their operands — they
-            // cannot modify memory so they don't affect pending stores.
-            _ => {}
+                InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+                    // Call boundaries use the coarser predicate — same fix
+                    // as LocalLsf / GlobalLsf.  A callee that receives a
+                    // pointer into an allocation can walk to any offset
+                    // within it, so `gep %a,[0]` passed as an arg must
+                    // invalidate a pending store to `gep %a,[1]` even
+                    // though their precise offsets differ.  Currently the
+                    // Fortran programs we compile don't expose a
+                    // triggering DSE pattern, but the code is structurally
+                    // identical to the other LSF passes so we fix it
+                    // defensively.
+                    let pointer_args: Vec<ValueId> = args
+                        .iter()
+                        .copied()
+                        .filter(|arg| alias_oracle.value_is_pointer(*arg))
+                        .collect();
+                    if !pointer_args.is_empty() {
+                        pending.retain(|entry| {
+                            pointer_args.iter().all(|arg| {
+                                !alias_oracle.may_reach_through_call_arg(entry.ptr, *arg)
+                            })
+                        });
+                    }
+                }
+
+                // Memset/memcpy wrappers (external calls) are handled above via Call.
+                // All other instructions are pure reads of their operands — they
+                // cannot modify memory so they don't affect pending stores.
+                _ => {}
+            }
         }
+        // Note: remaining entries in `pending` at block exit are stores to locals
+        // whose value has never been read in this block. We conservatively keep
+        // them — they might be read in a successor block.  A full dataflow DSE
+        // (liveness across blocks) could remove them, but is deferred.
     }
-    // Note: remaining entries in `pending` at block exit are stores to locals
-    // whose value has never been read in this block. We conservatively keep
-    // them — they might be read in a successor block.  A full dataflow DSE
-    // (liveness across blocks) could remove them, but is deferred.
 
     if dead.is_empty() {
         return false;

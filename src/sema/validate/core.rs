@@ -1473,7 +1473,10 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                 validate_const_int_ac_value(ctx, value);
             }
         }
-        Expr::ComponentAccess { base, .. } => validate_const_int_expr_tree(ctx, base),
+        Expr::ComponentAccess { base, .. } => {
+            validate_component_access(ctx, expr);
+            validate_const_int_expr_tree(ctx, base);
+        }
         Expr::ComplexLiteral { real, imag } => {
             validate_const_int_expr_tree(ctx, real);
             validate_const_int_expr_tree(ctx, imag);
@@ -1613,8 +1616,16 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
                 for expr in &set.objects {
                     validate_const_int_expr_tree(ctx, expr);
                 }
-                for expr in &set.values {
-                    validate_const_int_expr_tree(ctx, expr);
+                for value in &set.values {
+                    match value {
+                        crate::ast::decl::DataValue::Expr(expr) => {
+                            validate_const_int_expr_tree(ctx, expr);
+                        }
+                        crate::ast::decl::DataValue::Repeat { count, value } => {
+                            validate_const_int_expr_tree(ctx, count);
+                            validate_const_int_expr_tree(ctx, value);
+                        }
+                    }
                 }
             }
         }
@@ -2851,7 +2862,19 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             }
         }
         Stmt::IfStmt { action, .. } => validate_stmt(ctx, action),
-        Stmt::DoLoop { body, .. } => validate_stmts(ctx, body),
+        Stmt::DoLoop {
+            body,
+            shared_terminating_label,
+            ..
+        } => {
+            if *shared_terminating_label && (ctx.warn_pedantic || ctx.warn_deprecated) {
+                ctx.warning(
+                    stmt.span,
+                    "shared DO termination label is a deleted feature",
+                );
+            }
+            validate_stmts(ctx, body);
+        }
         Stmt::DoWhile { body, .. } => validate_stmts(ctx, body),
         Stmt::DoConcurrent { body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "DO CONCURRENT");
@@ -2914,6 +2937,15 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
                     validate_system_clock_args(ctx, args, stmt.span);
                 }
+            }
+            if let Some(name) = call_target_function_name(ctx, callee) {
+                ctx.error(
+                    callee.span,
+                    format!(
+                        "function '{}' cannot be invoked with CALL; reference it in an expression",
+                        name
+                    ),
+                );
             }
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
@@ -3070,6 +3102,89 @@ fn validate_select_case_arms(ctx: &mut Ctx<'_>, stmt_span: Span, cases: &[CaseBl
 
 // ---- Specific validation checks ----
 
+fn derived_type_name_from_type_info(info: &TypeInfo) -> Option<String> {
+    match info {
+        TypeInfo::Derived(name) | TypeInfo::Class(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn derived_type_name_for_expr(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Option<String> {
+    match &expr.node {
+        Expr::Name { name } => ctx
+            .lookup(name)
+            .and_then(|sym| sym.type_info.as_ref())
+            .and_then(derived_type_name_from_type_info),
+        Expr::ParenExpr { inner } => derived_type_name_for_expr(ctx, inner),
+        Expr::FunctionCall { callee, .. } => derived_type_name_for_expr(ctx, callee),
+        Expr::ComponentAccess { .. } => resolve_component_access_type(ctx, expr).ok().flatten(),
+        _ => None,
+    }
+}
+
+fn layout_component_type_info(
+    layout: &crate::sema::type_layout::TypeLayout,
+    component: &str,
+    layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<TypeInfo> {
+    if let Some(field) = layout.field(component) {
+        return Some(field.type_info.clone());
+    }
+
+    let mut parent = layout.parent.as_deref();
+    while let Some(parent_name) = parent {
+        let parent_layout = layouts.get(parent_name)?;
+        if parent_name.eq_ignore_ascii_case(component)
+            || parent_layout.name.eq_ignore_ascii_case(component)
+        {
+            return Some(TypeInfo::Derived(parent_layout.name.clone()));
+        }
+        parent = parent_layout.parent.as_deref();
+    }
+
+    None
+}
+
+fn resolve_component_access_type(
+    ctx: &Ctx<'_>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> Result<Option<String>, (Span, String, String)> {
+    let Expr::ComponentAccess { base, component } = &expr.node else {
+        return Ok(None);
+    };
+    let Some(base_type) = derived_type_name_for_expr(ctx, base) else {
+        return Ok(None);
+    };
+    let Some(layouts) = ctx.type_layouts else {
+        return Ok(None);
+    };
+    let Some(layout) = layouts.get(&base_type) else {
+        return Ok(None);
+    };
+    let Some(type_info) = layout_component_type_info(layout, component, layouts) else {
+        if layout.bound_proc(component).is_some() {
+            return Ok(None);
+        }
+        return Err((expr.span, component.clone(), base_type));
+    };
+    Ok(derived_type_name_from_type_info(&type_info))
+}
+
+fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    if let Err((span, component, base_type)) = resolve_component_access_type(ctx, expr) {
+        ctx.error(
+            span,
+            format!(
+                "unknown component '{}' for derived type '{}'",
+                component, base_type
+            ),
+        );
+    }
+}
+
 /// Check that an assignment target is modifiable (not intent(in), not parameter).
 /// Handles component access (x%field) and array elements (a(i)) — the base
 /// variable's intent/parameter status applies to all parts.
@@ -3209,6 +3324,17 @@ fn validate_system_clock_args(ctx: &mut Ctx, args: &[crate::ast::expr::Argument]
             "SYSTEM_CLOCK integer arguments must all have the same kind (F2023 16.9.202)",
         );
     }
+}
+
+fn call_target_function_name(
+    ctx: &Ctx<'_>,
+    callee: &crate::ast::expr::SpannedExpr,
+) -> Option<String> {
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let sym = ctx.lookup(name)?;
+    matches!(sym.kind, SymbolKind::Function).then(|| sym.name.clone())
 }
 
 /// Validate call-site argument intent constraints.
@@ -4064,11 +4190,12 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real"
         | "logical" | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim"
         | "floor" | "ceiling" | "maskl" | "maskr" | "shape" | "storage_size"
-        | "associated" | "any" | "all" | "norm2" | "f_c_string" => (1, Some(2)),
+        | "associated" | "any" | "all" | "norm2" | "f_c_string" | "iall" | "iany"
+        | "iparity" | "parity" => (1, Some(2)),
         "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval"
         | "minval" | "count" | "selected_real_kind" => (1, Some(3)),
-        "ishftc" | "pack" | "transfer" | "c_f_strpointer" => (2, Some(3)),
-        "index" | "scan" | "verify" | "reshape" => (2, Some(4)),
+        "ishftc" | "pack" | "transfer" | "c_f_strpointer" | "cshift" => (2, Some(3)),
+        "index" | "scan" | "verify" | "reshape" | "eoshift" => (2, Some(4)),
         "null" => (0, Some(1)),
         "mvbits" => (5, Some(5)),
         "max" | "min" | "max0" | "min0" | "max1" | "min1" | "amax0" | "amin0"
@@ -4114,6 +4241,10 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
     )
 }
 
+fn intrinsic_not_implemented(name: &str) -> bool {
+    matches!(name, "iall" | "iany" | "iparity" | "parity")
+}
+
 /// Reject a reference to an intrinsic with the wrong form (subroutine
 /// in function position or vice versa) or an argument count outside
 /// the standard's bounds (`atan2(1.0)` used to compile silently and
@@ -4146,6 +4277,13 @@ pub(super) fn check_intrinsic_call_arity(
                 "intrinsic '{}' is a function; reference it in an expression, not a CALL",
                 key
             ),
+        );
+        return;
+    }
+    if intrinsic_not_implemented(&key) {
+        ctx.error(
+            span,
+            format!("intrinsic '{}' is recognized but not implemented", key),
         );
         return;
     }
@@ -4188,8 +4326,9 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
         "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" |
         "size" | "shape" | "rank" | "lbound" | "ubound" | "allocated" | "associated" |
-        "present" | "same_type_as" | "merge" | "pack" | "unpack" | "spread" | "reshape" |
+        "present" | "same_type_as" | "merge" | "pack" | "unpack" | "spread" | "reshape" | "cshift" | "eoshift" |
         "sum" | "product" | "maxval" | "minval" | "maxloc" | "minloc" | "findloc" | "count" | "any" | "all" |
+        "iall" | "iany" | "iparity" | "parity" |
         "ieee_support_inf" | "ieee_support_nan" | "ieee_support_subnormal" |
         "ieee_support_divide" | "ieee_support_sqrt" | "ieee_support_io" |
         "ieee_support_rounding" | "ieee_support_flag" | "ieee_support_halting" |

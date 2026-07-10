@@ -15,11 +15,12 @@
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, predecessors, terminator_targets};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct GlobalLsf;
+
+const GLOBAL_LSF_SCAN_MEMORY_LIMIT: usize = 256;
 
 impl Pass for GlobalLsf {
     fn name(&self) -> &'static str {
@@ -43,17 +44,27 @@ fn global_lsf_function(func: &mut Function, layout: crate::target::TargetLayout)
 
     let mut replacements: HashMap<ValueId, ValueId> = HashMap::new();
 
-    for block in &func.blocks {
-        for inst in &block.insts {
-            if let InstKind::Load(ptr) = &inst.kind {
-                if let Some(forwarded_val) =
-                    find_reaching_store(layout, func, &idoms, &preds, block.id, inst.id, *ptr)
-                {
-                    if func
-                        .value_type(forwarded_val)
-                        .is_some_and(|ty| ty == inst.ty)
-                    {
-                        replacements.insert(inst.id, forwarded_val);
+    {
+        let mut alias_oracle = alias::AliasOracle::new(func, layout);
+
+        for block in &func.blocks {
+            for (inst_index, inst) in block.insts.iter().enumerate() {
+                if let InstKind::Load(ptr) = &inst.kind {
+                    if let Some(forwarded_val) = find_reaching_store(
+                        &mut alias_oracle,
+                        func,
+                        &idoms,
+                        &preds,
+                        block.id,
+                        inst_index,
+                        *ptr,
+                    ) {
+                        if func
+                            .value_type(forwarded_val)
+                            .is_some_and(|ty| ty == inst.ty)
+                        {
+                            replacements.insert(inst.id, forwarded_val);
+                        }
                     }
                 }
             }
@@ -88,15 +99,15 @@ enum MemoryState {
 
 /// Find the nearest store that safely reaches the given load.
 fn find_reaching_store(
-    layout: crate::target::TargetLayout,
+    alias_oracle: &mut alias::AliasOracle<'_>,
     func: &Function,
     idoms: &HashMap<BlockId, BlockId>,
     preds: &HashMap<BlockId, Vec<BlockId>>,
     load_block: BlockId,
-    load_inst: ValueId,
+    load_inst_index: usize,
     load_ptr: ValueId,
 ) -> Option<ValueId> {
-    match scan_block_before_load(layout, func, load_block, load_inst, load_ptr) {
+    match scan_block_before_load(alias_oracle, func, load_block, load_inst_index, load_ptr) {
         MemoryState::Forward(val) => return Some(val),
         MemoryState::Clobbered => return None,
         MemoryState::Clean => {}
@@ -109,11 +120,11 @@ fn find_reaching_store(
         } // entry
         current = idom;
 
-        if !paths_to_load_are_clean(layout, func, preds, current, load_block, load_ptr) {
+        if !paths_to_load_are_clean(alias_oracle, func, preds, current, load_block, load_ptr) {
             return None;
         }
 
-        match scan_block(layout, func, current, load_ptr) {
+        match scan_block(alias_oracle, func, current, load_ptr) {
             MemoryState::Forward(val) => return Some(val),
             MemoryState::Clobbered => return None,
             MemoryState::Clean => {}
@@ -124,88 +135,68 @@ fn find_reaching_store(
 }
 
 fn scan_block_before_load(
-    layout: crate::target::TargetLayout,
+    alias_oracle: &mut alias::AliasOracle<'_>,
     func: &Function,
     block_id: BlockId,
-    load_inst: ValueId,
+    load_inst_index: usize,
     load_ptr: ValueId,
 ) -> MemoryState {
     let block = func.block(block_id);
-    let mut last_store = None;
-    let mut clobbered = false;
-
-    for inst in &block.insts {
-        if inst.id == load_inst {
-            break;
-        }
-        update_memory_state(
-            func,
-            layout,
-            &inst.kind,
-            load_ptr,
-            &mut last_store,
-            &mut clobbered,
-        );
-    }
-
-    if let Some(val) = last_store {
-        MemoryState::Forward(val)
-    } else if clobbered {
-        MemoryState::Clobbered
-    } else {
-        MemoryState::Clean
-    }
+    scan_insts_backward(alias_oracle, &block.insts[..load_inst_index], load_ptr)
 }
 
 fn scan_block(
-    layout: crate::target::TargetLayout,
+    alias_oracle: &mut alias::AliasOracle<'_>,
     func: &Function,
     block_id: BlockId,
     load_ptr: ValueId,
 ) -> MemoryState {
     let block = func.block(block_id);
-    let mut last_store = None;
-    let mut clobbered = false;
-
-    for inst in &block.insts {
-        update_memory_state(
-            func,
-            layout,
-            &inst.kind,
-            load_ptr,
-            &mut last_store,
-            &mut clobbered,
-        );
-    }
-
-    if let Some(val) = last_store {
-        MemoryState::Forward(val)
-    } else if clobbered {
-        MemoryState::Clobbered
-    } else {
-        MemoryState::Clean
-    }
+    scan_insts_backward(alias_oracle, &block.insts, load_ptr)
 }
 
-fn update_memory_state(
-    func: &Function,
-    layout: crate::target::TargetLayout,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryEffect {
+    Ignore,
+    NoAlias,
+    Forward(ValueId),
+    Clobbered,
+}
+
+fn scan_insts_backward(
+    alias_oracle: &mut alias::AliasOracle<'_>,
+    insts: &[Inst],
+    load_ptr: ValueId,
+) -> MemoryState {
+    let mut scanned_memory_ops = 0usize;
+
+    for inst in insts.iter().rev() {
+        match memory_effect(alias_oracle, &inst.kind, load_ptr) {
+            MemoryEffect::Ignore => {}
+            MemoryEffect::Forward(val) => return MemoryState::Forward(val),
+            MemoryEffect::Clobbered => return MemoryState::Clobbered,
+            MemoryEffect::NoAlias => {
+                scanned_memory_ops += 1;
+                if scanned_memory_ops >= GLOBAL_LSF_SCAN_MEMORY_LIMIT {
+                    return MemoryState::Clobbered;
+                }
+            }
+        }
+    }
+
+    MemoryState::Clean
+}
+
+fn memory_effect(
+    alias_oracle: &mut alias::AliasOracle<'_>,
     kind: &InstKind,
     load_ptr: ValueId,
-    last_store: &mut Option<ValueId>,
-    clobbered: &mut bool,
-) {
+) -> MemoryEffect {
     match kind {
-        InstKind::Store(val, ptr) => match alias::query(func, *ptr, load_ptr, layout) {
-            AliasResult::MustAlias => {
-                *last_store = Some(*val);
-                *clobbered = false;
-            }
-            AliasResult::MayAlias => {
-                *last_store = None;
-                *clobbered = true;
-            }
-            AliasResult::NoAlias => {}
+        InstKind::Store(val, ptr) => match alias_oracle.query(*ptr, load_ptr) {
+            AliasResult::MustAlias => MemoryEffect::Forward(*val),
+            AliasResult::MayAlias => MemoryEffect::Clobbered,
+            AliasResult::NoAlias => MemoryEffect::NoAlias,
         },
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
             // Call boundaries use the coarser may_reach_through_call_arg
@@ -213,44 +204,28 @@ fn update_memory_state(
             // offset within the same allocation, so a precise
             // "different GEP offset → NoAlias" answer is unsound here.
             // Same fix as LocalLsf (commit e4016f6).
-            let pointer_args: Vec<ValueId> = args
-                .iter()
-                .copied()
-                .filter(|arg| value_is_pointer(func, *arg))
-                .collect();
-            if pointer_args
-                .iter()
-                .any(|arg| alias::may_reach_through_call_arg(func, load_ptr, *arg, layout))
-            {
-                *last_store = None;
-                *clobbered = true;
+            let mut saw_pointer_arg = false;
+            for arg in args.iter().copied() {
+                if !alias_oracle.value_is_pointer(arg) {
+                    continue;
+                }
+                saw_pointer_arg = true;
+                if alias_oracle.may_reach_through_call_arg(load_ptr, arg) {
+                    return MemoryEffect::Clobbered;
+                }
+            }
+            if saw_pointer_arg {
+                MemoryEffect::NoAlias
+            } else {
+                MemoryEffect::Ignore
             }
         }
-        _ => {}
+        _ => MemoryEffect::Ignore,
     }
-}
-
-fn value_is_pointer(func: &Function, value: ValueId) -> bool {
-    if matches!(func.value_type(value), Some(IrType::Ptr(_))) {
-        return true;
-    }
-    if func
-        .params
-        .iter()
-        .any(|param| param.id == value && matches!(param.ty, IrType::Ptr(_)))
-    {
-        return true;
-    }
-    func.blocks
-        .iter()
-        .flat_map(|block| block.insts.iter())
-        .find(|inst| inst.id == value)
-        .map(|inst| matches!(inst.ty, IrType::Ptr(_)))
-        .unwrap_or(false)
 }
 
 fn paths_to_load_are_clean(
-    layout: crate::target::TargetLayout,
+    alias_oracle: &mut alias::AliasOracle<'_>,
     func: &Function,
     preds: &HashMap<BlockId, Vec<BlockId>>,
     start_block: BlockId,
@@ -282,7 +257,7 @@ fn paths_to_load_are_clean(
         }
 
         if !matches!(
-            scan_block(layout, func, block_id, load_ptr),
+            scan_block(alias_oracle, func, block_id, load_ptr),
             MemoryState::Clean
         ) {
             return false;

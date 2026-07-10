@@ -1,6 +1,6 @@
 # armfortas
 
-A Fortran compiler for ARM64. No borrowed frontends, no LLVM, no GCC. Every stage from lexing to machine code is ours.
+A Fortran compiler for ARM64 and x86_64. No borrowed frontends, no LLVM, no GCC. Every stage from lexing to machine code is ours.
 
 ## Why
 
@@ -14,15 +14,18 @@ The solution was to write a compiler that runs on the machine we actually have, 
 
 ## Status
 
-Active development. The full pipeline — preprocessor through Mach-O object emission — is working. Real Fortran programs compile and run.
+Active development. The full pipeline — preprocessor through object emission — works on four targets:
+
+- `arm64-macos` (Mach-O, Apple AAPCS64) — the original platform
+- `x86_64-linux-gnu`, `x86_64-linux-musl`, `x86_64-freebsd` (ELF, SysV AMD64)
 
 ```
 Pipeline: Source → Preprocessor → Lexer → Parser → AST →
-          Sema → SSA IR → Optimizations → ARM64 Codegen →
-          afs-as → Mach-O .o → ld → Binary
+          Sema → SSA IR → Optimizations → ARM64 / x86_64 Codegen →
+          afs-as → .o (Mach-O / ELF) → ld → Binary
 ```
 
-The system linker (`ld`) is the only component we delegate. Everything else is ours.
+`afs-as` assembles both architectures and emits both object formats in-process; no system `as` in the default path anywhere. The system linker (`ld`) is the last delegated component, and `afs-ld` is replacing it: set `AFS_LD=1` (or `AFS_LD_PATH`) to link ELF and Mach-O binaries with our own linker. Real programs — up to and including fpm building itself to a byte-identical fixed point — compile and run.
 
 ## Build
 
@@ -41,7 +44,14 @@ target/debug/armfortas hello.f90 -o hello    # compile and link
 target/debug/armfortas -c module.f90         # compile to object
 target/debug/armfortas -S hello.f90          # emit assembly
 target/debug/armfortas --emit-ir hello.f90   # emit IR
+target/debug/armfortas --target x86_64-linux-gnu -c hello.f90   # cross-compile to object
 ```
+
+On Linux hosts the driver probes the GCC directories for the crt objects
+it needs to link (`crtbeginS.o` etc.). If your distro's GCC lives somewhere
+the probe doesn't know (it knows Debian and RedHat layouts), point
+`AFS_CRT_DIR` at the directory containing them, e.g.
+`AFS_CRT_DIR=/usr/lib/gcc/x86_64-pc-linux-gnu/16` on Arch.
 
 ## What Works
 
@@ -85,6 +95,7 @@ Value-class inquiry and construction (`ieee_is_nan/finite/normal`, `ieee_class`,
 ### I/O
 
 - `PRINT` and `WRITE` with format strings and list-directed I/O
+- List-directed integer output uses gfortran-compatible field widths by kind
 - `READ` from stdin and files
 - `OPEN`, `CLOSE`, `INQUIRE`, `REWIND`, `BACKSPACE`, `ENDFILE`, `FLUSH`
 - Unformatted (binary) I/O
@@ -112,16 +123,20 @@ Inquiry: `KIND`, `SELECTED_INT_KIND`, `SELECTED_REAL_KIND`, `HUGE`, `TINY`, `EPS
 | Level | Passes |
 |-------|--------|
 | `-O0` | None (preserve IR exactly) |
-| `-O1` | mem2reg, constant folding, local CSE, constant propagation, DCE |
-| `-O2` | `-O1` + strength reduction, LICM |
-| `-O3` | Same as `-O2` (vectorization and IPO deferred — see below) |
-| `-Ofast` | `-O3` + fast-math reassociation for float add/sub constant chains |
+| `-O1` | mem2reg, constant folding, DCE, basic CSE, copy propagation, small inlining |
+| `-O2` | `-O1` + LICM, strength reduction, DSE, GVN, SROA, loop store forwarding, jump threading, IPO (const-arg, dead-arg, return-prop) |
+| `-Os` | `-O2` but prefer code size: no unrolling, less inlining |
+| `-O3` | `-O2` + aggressive inlining, loop unrolling/interchange, vectorization (NEON on arm64, SSE2 on x86_64) |
+| `-Ofast` | `-O3` + fast-math (reassociation, no NaN/Inf assumptions, reciprocal) |
 
-Correctness invariant: every program that produces correct output at `-O0` must produce identical output at `-O1`, `-O2`, `-O3`. This is enforced by the end-to-end test suite at every level.
+The x86_64 vectorizer is capped at SSE2 — the architectural baseline. CI
+fails on any SSE3+/AVX mnemonic (and on any x87 instruction at any level).
+
+Correctness invariant: every program that produces correct output at `-O0` must produce identical output at `-O1`, `-O2`, `-Os`, `-O3`, and `-Ofast` (documented fast-math reassociation aside). This is enforced by the end-to-end test suite at every level.
 
 ### Modules
 
-`iso_c_binding` and `iso_fortran_env` are built-in and always available. Authored modules compile correctly. Multi-file module dependency resolution and `.amod` files are in progress (Sprint 30).
+`iso_c_binding` and `iso_fortran_env` are built-in and always available. Authored modules compile correctly. Multi-file module dependency resolution works: the driver scans `MODULE`/`USE`/`SUBMODULE` statements, topologically orders an unordered file list, and emits/consumes `.amod` files (`-J`/`-I` in the gfortran dialect — fpm drives armfortas as a backend compiler unmodified, and fpm built by armfortas rebuilds itself byte-identically).
 
 Submodules (F2008) work: separate module procedure bodies (both the `module procedure NAME` and `module function`/`module subroutine` prefix forms), nested submodule trees, submodule host association (a submodule sees the parent's PRIVATE entities), and SMPs as type-bound-procedure targets or behind generic interfaces. The multi-source driver topologically orders submodules after their parents, so an unordered file list compiles in one invocation; interface/implementation mismatches and unknown-parent submodules are compile-time errors. Scope note: the dependency scanner is line-based, so a `SUBMODULE` statement split across continuation lines is not recognized (same limitation as the `MODULE`/`USE` scan).
 
@@ -145,22 +160,26 @@ full optimizer pipeline are all live and CI-gated.)
 
 ```
 armfortas/
-├── afs-as/          Standalone ARM64 assembler (git submodule)
-│   └── src/         Instruction encoding, .s parser, Mach-O emission
+├── afs-as/          Standalone assembler (git submodule)
+│   └── src/         ARM64 + x86_64 encoding, .s parsers, Mach-O + ELF emission
+├── afs-ld/          Standalone linker (git submodule) — ELF + Mach-O
 ├── src/
 │   ├── preprocess/  Fortran-aware preprocessor (#ifdef, #include, #define)
 │   ├── lexer/       Tokenization — free-form + fixed-form
 │   ├── parser/      Recursive descent → AST
 │   ├── ast/         AST node definitions
-│   ├── sema/        Symbol tables, type system, validation
+│   ├── sema/        Symbol tables, type system, .amod modules, validation
 │   ├── ir/          SSA-form IR with block parameters (no phi nodes)
 │   ├── opt/         Optimization passes and pass manager
-│   ├── codegen/     ARM64 instruction selection, linear scan register allocation
-│   ├── driver/      CLI, compilation orchestration
-│   └── runtime/     libarmfortas_rt — I/O, intrinsics, memory management
+│   ├── target/      Target identity: arch, OS, libc, object format
+│   ├── codegen/
+│   │   ├── arm64/   ARM64 isel, linear-scan regalloc, peephole, emission
+│   │   └── x86/     x86_64 isel, two-address conversion, linear-scan, emission
+│   ├── driver/      CLI, compilation orchestration, linking
+│   └── runtime/     Runtime interface — I/O, intrinsics, memory management
 ├── bencch/          Compiler benchmark and test harness (git submodule)
-├── test_programs/   ~110 end-to-end test programs with CHECK annotations
-└── runtime/         Runtime library source
+├── test_programs/   ~660 end-to-end test programs with CHECK annotations
+└── runtime/         libarmfortas_rt source
 ```
 
 ### Key design decisions
@@ -169,7 +188,9 @@ armfortas/
 
 **SSA IR with block parameters.** Instead of phi nodes, blocks carry typed parameters. Cleaner to construct, easier to verify, simpler to transform. The mem2reg pass promotes stack allocas to SSA values using iterated dominance frontiers (Cytron et al.).
 
-**Apple AAPCS64 strictly.** 16-byte stack alignment always, x18 reserved, x29/x30 saved in prologue, frame pointer maintained. We've been bitten by every one of these constraints and handle them correctly.
+**The platform ABI strictly.** On ARM64, Apple AAPCS64: 16-byte stack alignment always, x18 reserved, x29/x30 saved in prologue, frame pointer maintained. On x86_64, SysV AMD64: integer/SSE register classes, red zone rules, stack-passed overflow args. We've been bitten by every one of these constraints and handle them correctly.
+
+**Host is not target.** `TargetSpec::host()` in `src/target.rs` is the only code in the workspace allowed to read `cfg!(target_*)`. Everything else takes a `TargetSpec` value, so `--target x86_64-linux-gnu -c` works from any host.
 
 **Array descriptors.** `{base_addr, elem_size, rank, flags, dims[15]}`. Our ABI — stable across releases.
 
@@ -177,7 +198,7 @@ armfortas/
 
 **Large arrays on heap.** Stack threshold at 64KB. Prevents the stack corruption gfortran exhibits with arrays over ~600KB.
 
-**afs-as** is the standalone ARM64 assembler. It knows nothing about Fortran — clean API boundary. It can be used independently to assemble ARM64 `.s` files.
+**afs-as** is the standalone assembler — ARM64 and x86_64 (AT&T subset), Mach-O and ELF. It knows nothing about Fortran — clean API boundary. It runs in-process by default and is validated byte-for-byte against the system assembler over the whole test corpus. **afs-ld** is the standalone linker on the same terms; the driver uses the system `ld` by default and switches to afs-ld under `AFS_LD=1`.
 
 ## Testing
 
@@ -231,12 +252,13 @@ All root end-to-end tests run at every optimization level (`-O0` through
 the audit finding — they count as passing until the bug is fixed, at which
 point CI catches the unexpected success.
 
-## Target
+## Targets
 
-- **Architecture**: ARM64 (AArch64), Apple Silicon (M1/M2/M3/M4)
-- **OS**: macOS (Mach-O, Apple AAPCS64)
+- `arm64-macos` — Apple Silicon (M1–M4), Mach-O, Apple AAPCS64
+- `x86_64-linux-gnu` / `x86_64-linux-musl` — ELF, SysV AMD64
+- `x86_64-freebsd` — ELF, SysV AMD64
 - **Standard**: F77 through F2018, building inward from F2018
-- **Goal**: Compile fortsh — a 57,000-line Fortran 2018 shell — correctly on Apple Silicon
+- **Goal**: compile real Fortran projects correctly on the machines we actually use — fortsh (a ~63k-line F2018 shell: builds, 3776/3776 POSIX suite), fpm (self-hosts to a byte-identical fixed point), toml-f, test-drive, and the rest of the [campaign ladder](PROJECT_CAMPAIGN.md)
 
 Compiling fortsh is a milestone, not the finish line. A complete compiler handles code fortsh never exercises.
 

@@ -37,6 +37,8 @@ PROGRAMS=(
     test_programs/allocatable.f90
 )
 OPT="-O2"
+BSS_SENTINEL="test_programs/ar6_bss_module_data.f90"
+BSS_SENTINEL_MAX_BYTES=$((32 * 1024 * 1024))
 
 if [ ! -x "$COMPILER" ]; then
     echo "Build the compiler first: cargo build --release"
@@ -99,6 +101,27 @@ compile_and_measure() {
     echo "$stem $elapsed $size"
 }
 
+check_bss_size_guard() {
+    local src="$BSS_SENTINEL"
+    if [ ! -f "$src" ]; then
+        echo "FAIL: missing BSS size sentinel fixture: $src"
+        exit 1
+    fi
+
+    local binary="$TMPDIR/bss-size-guard"
+    "$COMPILER" "$src" $OPT -o "$binary" 2>/dev/null
+
+    local size
+    size=$(stat -f%z "$binary" 2>/dev/null || stat -c%s "$binary" 2>/dev/null || echo 0)
+    echo "  bss-size-guard $size (limit $BSS_SENTINEL_MAX_BYTES)"
+
+    if [ "$size" -gt "$BSS_SENTINEL_MAX_BYTES" ]; then
+        echo ""
+        echo "FAIL: uninitialized module data bloated the linked binary"
+        exit 1
+    fi
+}
+
 echo "Benchmarking ${#PROGRAMS[@]} programs at $OPT..."
 RESULTS=""
 for prog in "${PROGRAMS[@]}"; do
@@ -110,6 +133,7 @@ for prog in "${PROGRAMS[@]}"; do
     echo "  $result"
     RESULTS="$RESULTS$result"$'\n'
 done
+check_bss_size_guard
 
 if [ "${1:-}" = "--update" ]; then
     echo "$RESULTS" > "$BASELINE"

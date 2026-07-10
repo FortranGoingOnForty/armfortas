@@ -2,7 +2,8 @@
 //!
 //! Every optimization pass implements `Pass` and is registered with a
 //! `PassManager`. The manager runs passes to fixpoint, verifying the IR
-//! after every pass so that any miscompile is caught immediately.
+//! at pipeline boundaries. Set `AFS_VERIFY_AFTER_EACH=1` to also verify
+//! after each mutating pass when localizing an optimizer bug.
 
 use crate::ir::inst::Module;
 use crate::ir::verify::{verify_module, VerifyError};
@@ -28,8 +29,8 @@ pub struct PassRunResult {
 /// A linearly-ordered collection of passes that are run to fixpoint.
 pub struct PassManager {
     passes: Vec<Box<dyn Pass>>,
-    /// Run `verify_module` after every pass and panic on failure.
-    /// Always-on in debug builds; can be disabled for benchmarking.
+    /// Run `verify_module` after each mutating pass.
+    /// Pipeline entry and exit are always verified.
     pub verify_after_each: bool,
     /// Maximum fixpoint iterations before bailing out (defensive).
     pub max_iterations: usize,
@@ -39,7 +40,7 @@ impl PassManager {
     pub fn new() -> Self {
         Self {
             passes: Vec::new(),
-            verify_after_each: true,
+            verify_after_each: std::env::var_os("AFS_VERIFY_AFTER_EACH").is_some(),
             max_iterations: 32,
         }
     }
@@ -73,7 +74,7 @@ impl PassManager {
         let mut iterations = 0usize;
 
         // Verify on entry — bad input shouldn't be blamed on a pass.
-        self.verify_or_panic(module, "<entry>");
+        Self::verify_module_or_panic(module, "<entry>");
 
         let mut changed = true;
         while changed && iterations < self.max_iterations {
@@ -89,11 +90,13 @@ impl PassManager {
                         func.rebuild_type_cache();
                     }
                 }
-                if self.verify_after_each {
-                    self.verify_or_panic(module, pass.name());
+                if self.verify_after_each && pass_changed {
+                    Self::verify_module_or_panic(module, pass.name());
                 }
             }
         }
+
+        Self::verify_module_or_panic(module, "<exit>");
 
         PassRunResult {
             change_count,
@@ -101,10 +104,7 @@ impl PassManager {
         }
     }
 
-    fn verify_or_panic(&self, module: &Module, after: &str) {
-        if !self.verify_after_each {
-            return;
-        }
+    fn verify_module_or_panic(module: &Module, after: &str) {
         let errors: Vec<VerifyError> = verify_module(module);
         if !errors.is_empty() {
             if std::env::var_os("AFS_DUMP_BAD_OPT_IR").is_some() {

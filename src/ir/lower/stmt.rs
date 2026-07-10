@@ -7,8 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use crate::ast::expr::{Expr, SpannedExpr};
+use crate::ast::expr::{Argument, Expr, SectionSubscript, SpannedExpr};
 use crate::ast::stmt::*;
+use crate::ast::Spanned;
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
@@ -16,6 +17,140 @@ use crate::ir::types::*;
 use super::core::*;
 use super::ctx::{BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
 use super::helpers::coerce_to_type;
+
+fn is_unlimited_polymorphic_local(info: &LocalInfo) -> bool {
+    info.is_class && info.derived_type.is_none()
+}
+
+fn class_star_intrinsic_source_ir_type(
+    ctx: &LowerCtx,
+    source_expr: &SpannedExpr,
+) -> Option<IrType> {
+    let ti = operator_expr_type_info(
+        source_expr,
+        Some(&ctx.locals),
+        ctx.st,
+        Some(ctx.type_layouts),
+    )?;
+    if matches!(ti, crate::sema::symtab::TypeInfo::Character { .. })
+        || intrinsic_class_star_type_tag_for_type_info(&ti).is_none()
+    {
+        return None;
+    }
+    Some(type_info_to_ir_type(&ti))
+}
+
+fn class_star_intrinsic_source_tag_value(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    source_expr: &SpannedExpr,
+) -> Option<ValueId> {
+    intrinsic_class_star_type_tag_value_for_expr(
+        b,
+        source_expr,
+        Some(&ctx.locals),
+        ctx.st,
+        Some(ctx.type_layouts),
+    )
+}
+
+fn root_object_name(expr: &SpannedExpr) -> Option<String> {
+    match &expr.node {
+        Expr::Name { name } => Some(name.clone()),
+        Expr::FunctionCall { callee, .. } => root_object_name(callee),
+        Expr::ComponentAccess { base, .. } => root_object_name(base),
+        Expr::ParenExpr { inner } => root_object_name(inner),
+        _ => None,
+    }
+}
+
+fn emit_scalar_class_star_char_source_copy_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    src_ptr: ValueId,
+    src_len: ValueId,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let copy_bb = b.create_block("alloc_class_star_char_source_copy");
+    let done_bb = b.create_block("alloc_class_star_char_source_copy_done");
+    b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![dest_base, src_ptr, src_len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+fn finalize_assignment_lhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    type_name: &str,
+    dest: ValueId,
+) {
+    if let Some(layout) = ctx.type_layouts.get(type_name) {
+        finalize_derived_storage(
+            b,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            &ctx.locals,
+            layout,
+            dest,
+        );
+    }
+}
+
+fn stabilize_finalized_assignment_rhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    type_name: &str,
+    rhs: ValueId,
+) -> ValueId {
+    if ctx
+        .type_layouts
+        .get(type_name)
+        .is_some_and(|layout| !layout.final_procs.is_empty())
+    {
+        stabilize_derived_call_result(b, ctx.type_layouts, type_name, rhs)
+    } else {
+        rhs
+    }
+}
+
+fn finalizable_function_result_type_name(
+    ctx: &LowerCtx,
+    expr: &SpannedExpr,
+) -> Option<String> {
+    let Expr::FunctionCall { callee, .. } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let abi_lookup_keys =
+        procedure_abi_lookup_keys_for_call_target(ctx.st, name.as_str(), &[&key]);
+    let hidden_abi =
+        first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(ctx.st, k))?;
+    if hidden_abi != HiddenResultAbi::DerivedAggregate {
+        return None;
+    }
+    let type_name = first_procedure_lookup(&abi_lookup_keys, |k| {
+        callee_return_stabilized_derived_type_name(ctx.st, k)
+    })?;
+    ctx.type_layouts
+        .get(&type_name)
+        .filter(|layout| !layout.final_procs.is_empty())
+        .map(|layout| layout.name.clone())
+}
 
 pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {
@@ -75,6 +210,749 @@ fn copy_array_result_to_descriptor_dest(
         vec![dest_desc, src_desc, null_stat],
         IrType::Void,
     );
+}
+
+struct WhereSectionTemp {
+    name: String,
+    desc: ValueId,
+}
+
+enum WhereMaskValue {
+    Scalar(ValueId),
+    Array {
+        desc: ValueId,
+        elem_ty: IrType,
+        rank: usize,
+    },
+}
+
+fn lower_where_mask_value(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    expr: &SpannedExpr,
+) -> WhereMaskValue {
+    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts)).unwrap_or(0);
+    if rank > 0 {
+        if let Some((source_desc, elem_ty)) = lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            expr,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        ) {
+            let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+            let stat = b.alloca(IrType::Int(IntWidth::I32));
+            let zero = b.const_i32(0);
+            b.store(zero, stat);
+            b.call(
+                FuncRef::External("afs_copy_array_data".into()),
+                vec![tmp_desc, source_desc, stat],
+                IrType::Void,
+            );
+            deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, expr, ctx.st, source_desc);
+            return WhereMaskValue::Array {
+                desc: tmp_desc,
+                elem_ty,
+                rank,
+            };
+        }
+    }
+
+    let raw = super::expr::lower_expr_ctx_tl(b, ctx, expr);
+    WhereMaskValue::Scalar(coerce_to_type(b, raw, &IrType::Bool))
+}
+
+fn where_mask_value_at(b: &mut FuncBuilder, mask: &WhereMaskValue, index: ValueId) -> ValueId {
+    match mask {
+        WhereMaskValue::Scalar(value) => *value,
+        WhereMaskValue::Array {
+            desc,
+            elem_ty,
+            rank,
+        } => {
+            let raw = load_array_desc_elem_rank(b, *desc, elem_ty, index, *rank);
+            coerce_to_type(b, raw, &IrType::Bool)
+        }
+    }
+}
+
+fn finish_where_mask_values(b: &mut FuncBuilder, masks: &[&WhereMaskValue]) {
+    for mask in masks {
+        if let WhereMaskValue::Array { desc, .. } = mask {
+            deallocate_array_temp_descriptor(b, *desc);
+        }
+    }
+}
+
+fn where_pending_mask_at(
+    b: &mut FuncBuilder,
+    index: ValueId,
+    main_mask: &WhereMaskValue,
+    elsewhere_masks: &[WhereMaskValue],
+) -> ValueId {
+    let main = where_mask_value_at(b, main_mask, index);
+    let mut pending = b.not(main);
+    for mask in elsewhere_masks {
+        let masked = where_mask_value_at(b, mask, index);
+        let not_mask = b.not(masked);
+        pending = b.and(pending, not_mask);
+    }
+    pending
+}
+
+fn lower_where_array_pass<F>(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    array_names: &[String],
+    array_bases: &HashMap<String, ValueId>,
+    n: ValueId,
+    body: &[SpannedStmt],
+    mut cond_for_index: F,
+) where
+    F: FnMut(&mut FuncBuilder, &mut LowerCtx, ValueId) -> ValueId,
+{
+    let rewritten_body: Vec<SpannedStmt> = body
+        .iter()
+        .map(|s| rewrite_scalarized_section_refs_stmt(s, array_names))
+        .collect();
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let i_zero = b.const_i64(0);
+    b.store(i_zero, i_addr);
+
+    let bb_check = b.create_block("where_check");
+    let bb_body = b.create_block("where_body");
+    let bb_then = b.create_block("where_then");
+    let bb_incr = b.create_block("where_incr");
+    let bb_exit = b.create_block("where_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+    for arr_name in array_names {
+        saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+        if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+            let base = *array_bases.get(arr_name).unwrap();
+            let elem_bytes_val = array_elem_size_value(b, &orig_info);
+            let byte_off = b.imul(i_val, elem_bytes_val);
+            let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            ctx.locals.insert(
+                arr_name.clone(),
+                LocalInfo {
+                    addr: elem_ptr,
+                    ty: orig_info.ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                    logical_kind: None,
+                    last_dim_assumed_size: false,
+                },
+            );
+        }
+    }
+
+    let cond = cond_for_index(b, ctx, i_val);
+    b.cond_branch(cond, bb_then, vec![], bb_incr, vec![]);
+
+    b.set_block(bb_then);
+    lower_stmts(b, ctx, &rewritten_body);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(bb_incr, vec![]);
+    }
+
+    b.set_block(bb_incr);
+    for (name, orig) in saved_locals {
+        if let Some(info) = orig {
+            ctx.locals.insert(name, info);
+        } else {
+            ctx.locals.remove(&name);
+        }
+    }
+
+    let i_cur = b.load(i_addr);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_cur, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn lower_where_array_if_else_pass<F>(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    array_names: &[String],
+    array_bases: &HashMap<String, ValueId>,
+    n: ValueId,
+    then_body: &[SpannedStmt],
+    else_body: &[SpannedStmt],
+    mut cond_for_index: F,
+) where
+    F: FnMut(&mut FuncBuilder, &mut LowerCtx, ValueId) -> ValueId,
+{
+    let rewritten_then: Vec<SpannedStmt> = then_body
+        .iter()
+        .map(|s| rewrite_scalarized_section_refs_stmt(s, array_names))
+        .collect();
+    let rewritten_else: Vec<SpannedStmt> = else_body
+        .iter()
+        .map(|s| rewrite_scalarized_section_refs_stmt(s, array_names))
+        .collect();
+
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let i_zero = b.const_i64(0);
+    b.store(i_zero, i_addr);
+
+    let bb_check = b.create_block("where_check");
+    let bb_body = b.create_block("where_body");
+    let bb_then = b.create_block("where_then");
+    let bb_else = b.create_block("where_else");
+    let bb_incr = b.create_block("where_incr");
+    let bb_exit = b.create_block("where_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
+    for arr_name in array_names {
+        saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
+        if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
+            let base = *array_bases.get(arr_name).unwrap();
+            let elem_bytes_val = array_elem_size_value(b, &orig_info);
+            let byte_off = b.imul(i_val, elem_bytes_val);
+            let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
+            ctx.locals.insert(
+                arr_name.clone(),
+                LocalInfo {
+                    addr: elem_ptr,
+                    ty: orig_info.ty.clone(),
+                    dims: vec![],
+                    allocatable: false,
+                    descriptor_arg: false,
+                    by_ref: false,
+                    char_kind: CharKind::None,
+                    derived_type: None,
+                    inline_const: None,
+                    is_pointer: false,
+                    runtime_dim_upper: vec![],
+                    is_class: false,
+                    logical_kind: None,
+                    last_dim_assumed_size: false,
+                },
+            );
+        }
+    }
+
+    let cond = cond_for_index(b, ctx, i_val);
+    b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
+
+    b.set_block(bb_then);
+    lower_stmts(b, ctx, &rewritten_then);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(bb_incr, vec![]);
+    }
+
+    b.set_block(bb_else);
+    lower_stmts(b, ctx, &rewritten_else);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(bb_incr, vec![]);
+    }
+
+    b.set_block(bb_incr);
+    for (name, orig) in saved_locals {
+        if let Some(info) = orig {
+            ctx.locals.insert(name, info);
+        } else {
+            ctx.locals.remove(&name);
+        }
+    }
+
+    let i_cur = b.load(i_addr);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_cur, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+}
+
+fn simple_array_element_designator(
+    expr: &SpannedExpr,
+) -> Option<(String, Vec<Argument>, crate::lexer::Span)> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if args
+        .iter()
+        .any(|arg| !matches!(arg.value, SectionSubscript::Element(_)))
+    {
+        return None;
+    }
+    Some((name.to_lowercase(), args.clone(), expr.span))
+}
+
+fn synth_array_element_expr(
+    array_name: &str,
+    args: &[Argument],
+    span: crate::lexer::Span,
+) -> SpannedExpr {
+    Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr(array_name, span)),
+            args: args.to_vec(),
+        },
+        span,
+    )
+}
+
+fn forall_temp_supported_element(info: &LocalInfo) -> bool {
+    info.char_kind == CharKind::None && info.derived_type.is_none()
+}
+
+fn insert_forall_temp_local(
+    ctx: &mut LowerCtx,
+    name: String,
+    desc: ValueId,
+    ty: IrType,
+    rank: usize,
+    logical_kind: Option<u8>,
+) {
+    ctx.locals.insert(
+        name,
+        LocalInfo {
+            addr: desc,
+            ty,
+            dims: vec![(1, 0); rank],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind,
+            last_dim_assumed_size: false,
+        },
+    );
+}
+
+fn try_lower_forall_assignment_with_temp(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[ForallSpec],
+    mask: Option<&SpannedExpr>,
+    body: &[SpannedStmt],
+) -> bool {
+    if specs.is_empty() || body.len() != 1 {
+        return false;
+    }
+
+    let Stmt::Assignment { target, value } = &body[0].node else {
+        return false;
+    };
+    let Some((target_name, target_args, target_span)) = simple_array_element_designator(target)
+    else {
+        return false;
+    };
+    let Some(target_info) = ctx.locals.get(&target_name).cloned() else {
+        return false;
+    };
+    if !local_is_array_like(&target_info) || !forall_temp_supported_element(&target_info) {
+        return false;
+    }
+    let rank = local_declared_rank(&target_info).max(target_args.len());
+    if rank == 0 || target_args.len() != rank {
+        return false;
+    }
+
+    let source_desc = if local_uses_array_descriptor(&target_info) {
+        array_descriptor_addr(b, &target_info)
+    } else {
+        materialize_array_descriptor_for_info(b, &target_info)
+    };
+    let value_desc =
+        allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &target_info.ty);
+    let value_temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_forall_value", 0);
+    insert_forall_temp_local(
+        ctx,
+        value_temp_name.clone(),
+        value_desc,
+        target_info.ty.clone(),
+        rank,
+        target_info.logical_kind,
+    );
+
+    let mut temps_to_remove = vec![value_temp_name.clone()];
+    let mut temps_to_deallocate = vec![value_desc];
+
+    let value_temp_target = synth_array_element_expr(&value_temp_name, &target_args, target_span);
+    let fill_value_stmt = Spanned::new(
+        Stmt::Assignment {
+            target: value_temp_target.clone(),
+            value: value.clone(),
+        },
+        body[0].span,
+    );
+
+    if let Some(mask_expr) = mask {
+        let mask_desc =
+            allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &IrType::Bool);
+        let mask_temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_forall_active", 1);
+        insert_forall_temp_local(
+            ctx,
+            mask_temp_name.clone(),
+            mask_desc,
+            IrType::Bool,
+            rank,
+            None,
+        );
+        temps_to_remove.push(mask_temp_name.clone());
+        temps_to_deallocate.push(mask_desc);
+
+        let mask_temp_target = synth_array_element_expr(&mask_temp_name, &target_args, target_span);
+        let save_mask_stmt = Spanned::new(
+            Stmt::Assignment {
+                target: mask_temp_target.clone(),
+                value: mask_expr.clone(),
+            },
+            mask_expr.span,
+        );
+        let fill_guard_stmt = Spanned::new(
+            Stmt::IfConstruct {
+                name: None,
+                condition: mask_expr.clone(),
+                then_body: vec![fill_value_stmt],
+                else_ifs: vec![],
+                else_body: None,
+            },
+            mask_expr.span,
+        );
+        let first_pass = vec![save_mask_stmt, fill_guard_stmt];
+        lower_forall_nested(b, ctx, specs, None, &first_pass);
+
+        let replay_value = synth_array_element_expr(&value_temp_name, &target_args, target_span);
+        let replay_assignment = Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: replay_value,
+            },
+            body[0].span,
+        );
+        let replay_guard = Spanned::new(
+            Stmt::IfConstruct {
+                name: None,
+                condition: mask_temp_target,
+                then_body: vec![replay_assignment],
+                else_ifs: vec![],
+                else_body: None,
+            },
+            mask_expr.span,
+        );
+        let second_pass = vec![replay_guard];
+        lower_forall_nested(b, ctx, specs, None, &second_pass);
+    } else {
+        let first_pass = vec![fill_value_stmt];
+        lower_forall_nested(b, ctx, specs, None, &first_pass);
+
+        let replay_value = synth_array_element_expr(&value_temp_name, &target_args, target_span);
+        let replay_assignment = Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: replay_value,
+            },
+            body[0].span,
+        );
+        let second_pass = vec![replay_assignment];
+        lower_forall_nested(b, ctx, specs, None, &second_pass);
+    }
+
+    for desc in temps_to_deallocate {
+        deallocate_array_temp_descriptor(b, desc);
+    }
+    for name in temps_to_remove {
+        ctx.locals.remove(&name);
+    }
+    true
+}
+
+fn lower_where_section_temp(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    expr: &SpannedExpr,
+    next_temp: &mut usize,
+    temps: &mut Vec<WhereSectionTemp>,
+) -> Option<SpannedExpr> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    if !args
+        .iter()
+        .any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+    {
+        return None;
+    }
+    let key = name.to_lowercase();
+    if !ctx.locals.get(&key).is_some_and(local_is_array_like) {
+        return None;
+    }
+
+    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .unwrap_or(1)
+        .max(1);
+    let (source_desc, elem_ty) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    )?;
+    let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    b.store(zero, stat);
+    b.call(
+        FuncRef::External("afs_copy_array_data".into()),
+        vec![tmp_desc, source_desc, stat],
+        IrType::Void,
+    );
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, expr, ctx.st, source_desc);
+
+    let temp_name = fresh_elemental_temp_name(&ctx.locals, "afs_where_section", *next_temp);
+    *next_temp += 1;
+    ctx.locals.insert(
+        temp_name.clone(),
+        LocalInfo {
+            addr: tmp_desc,
+            ty: elem_ty,
+            dims: vec![(1, 0); rank],
+            allocatable: false,
+            descriptor_arg: true,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+    temps.push(WhereSectionTemp {
+        name: temp_name.clone(),
+        desc: tmp_desc,
+    });
+    Some(synth_name_expr(&temp_name, expr.span))
+}
+
+fn rewrite_where_read_sections_to_temps(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    expr: &SpannedExpr,
+    next_temp: &mut usize,
+    temps: &mut Vec<WhereSectionTemp>,
+) -> SpannedExpr {
+    use crate::ast::Spanned;
+
+    if let Some(temp) = lower_where_section_temp(b, ctx, expr, next_temp, temps) {
+        return temp;
+    }
+
+    match &expr.node {
+        Expr::FunctionCall { callee, args } => {
+            let new_callee = Box::new(rewrite_where_read_sections_to_temps(
+                b, ctx, callee, next_temp, temps,
+            ));
+            let new_args = args
+                .iter()
+                .map(|a| crate::ast::expr::Argument {
+                    keyword: a.keyword.clone(),
+                    value: match &a.value {
+                        crate::ast::expr::SectionSubscript::Element(e) => {
+                            crate::ast::expr::SectionSubscript::Element(
+                                rewrite_where_read_sections_to_temps(b, ctx, e, next_temp, temps),
+                            )
+                        }
+                        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                            crate::ast::expr::SectionSubscript::Range {
+                                start: start.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                                end: end.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                                stride: stride.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                            }
+                        }
+                    },
+                })
+                .collect();
+            Spanned::new(
+                Expr::FunctionCall {
+                    callee: new_callee,
+                    args: new_args,
+                },
+                expr.span,
+            )
+        }
+        Expr::BinaryOp { op, left, right } => Spanned::new(
+            Expr::BinaryOp {
+                op: op.clone(),
+                left: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, left, next_temp, temps,
+                )),
+                right: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, right, next_temp, temps,
+                )),
+            },
+            expr.span,
+        ),
+        Expr::UnaryOp { op, operand } => Spanned::new(
+            Expr::UnaryOp {
+                op: op.clone(),
+                operand: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, operand, next_temp, temps,
+                )),
+            },
+            expr.span,
+        ),
+        Expr::ParenExpr { inner } => Spanned::new(
+            Expr::ParenExpr {
+                inner: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, inner, next_temp, temps,
+                )),
+            },
+            expr.span,
+        ),
+        Expr::ComponentAccess { base, component } => Spanned::new(
+            Expr::ComponentAccess {
+                base: Box::new(rewrite_where_read_sections_to_temps(
+                    b, ctx, base, next_temp, temps,
+                )),
+                component: component.clone(),
+            },
+            expr.span,
+        ),
+        Expr::ArrayConstructor { values, type_spec } => {
+            let new_values = values
+                .iter()
+                .map(|value| match value {
+                    crate::ast::expr::AcValue::Expr(e) => crate::ast::expr::AcValue::Expr(
+                        rewrite_where_read_sections_to_temps(b, ctx, e, next_temp, temps),
+                    ),
+                    crate::ast::expr::AcValue::ImpliedDo(ido) => {
+                        crate::ast::expr::AcValue::ImpliedDo(Box::new(
+                            crate::ast::expr::ImpliedDoLoop {
+                                values: ido
+                                    .values
+                                    .iter()
+                                    .map(|inner| match inner {
+                                        crate::ast::expr::AcValue::Expr(e) => {
+                                            crate::ast::expr::AcValue::Expr(
+                                                rewrite_where_read_sections_to_temps(
+                                                    b, ctx, e, next_temp, temps,
+                                                ),
+                                            )
+                                        }
+                                        crate::ast::expr::AcValue::ImpliedDo(nested) => {
+                                            crate::ast::expr::AcValue::ImpliedDo(nested.clone())
+                                        }
+                                    })
+                                    .collect(),
+                                var: ido.var.clone(),
+                                start: rewrite_where_read_sections_to_temps(
+                                    b, ctx, &ido.start, next_temp, temps,
+                                ),
+                                end: rewrite_where_read_sections_to_temps(
+                                    b, ctx, &ido.end, next_temp, temps,
+                                ),
+                                step: ido.step.as_ref().map(|e| {
+                                    rewrite_where_read_sections_to_temps(
+                                        b, ctx, e, next_temp, temps,
+                                    )
+                                }),
+                            },
+                        ))
+                    }
+                })
+                .collect();
+            Spanned::new(
+                Expr::ArrayConstructor {
+                    values: new_values,
+                    type_spec: type_spec.clone(),
+                },
+                expr.span,
+            )
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn rewrite_where_read_sections_to_temps_stmt(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    stmt: &SpannedStmt,
+    next_temp: &mut usize,
+    temps: &mut Vec<WhereSectionTemp>,
+) -> SpannedStmt {
+    use crate::ast::Spanned;
+    match &stmt.node {
+        Stmt::Assignment { target, value } => Spanned::new(
+            Stmt::Assignment {
+                target: target.clone(),
+                value: rewrite_where_read_sections_to_temps(b, ctx, value, next_temp, temps),
+            },
+            stmt.span,
+        ),
+        _ => stmt.clone(),
+    }
+}
+
+fn finish_where_section_temps(b: &mut FuncBuilder, ctx: &mut LowerCtx, temps: &[WhereSectionTemp]) {
+    for temp in temps {
+        deallocate_array_temp_descriptor(b, temp.desc);
+        ctx.locals.remove(&temp.name);
+    }
 }
 
 fn synth_defined_unary_array_result_call(
@@ -459,7 +1337,9 @@ fn lower_namelist_read_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_addr: ValueId,
+    end_label: Option<u64>,
     err_label: Option<u64>,
+    user_iostat: bool,
 ) -> bool {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
         return false;
@@ -486,7 +1366,7 @@ fn lower_namelist_read_stmt(
                 ],
                 IrType::Void,
             );
-            lower_read_err_branch(b, ctx, err_label, iostat_addr);
+            lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
             return true;
         }
     }
@@ -498,7 +1378,7 @@ fn lower_namelist_read_stmt(
         vec![unit, group_ptr, group_len, entries, n_entries, iostat_addr],
         IrType::Void,
     );
-    lower_read_err_branch(b, ctx, err_label, iostat_addr);
+    lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
     true
 }
 
@@ -514,6 +1394,14 @@ fn lower_namelist_write_stmt(
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
         lower_stmt_error(nml_ctrl.value.span, "NML= must name a NAMELIST group");
     };
+    if let Some(ctrl) = controls.first() {
+        if namelist_internal_io_buffer(b, ctx, ctrl).is_some() {
+            lower_stmt_error(
+                ctrl.value.span,
+                "internal NAMELIST WRITE is not implemented; write to an external unit",
+            );
+        }
+    }
     let (entries, n_entries) = lower_namelist_entries(b, ctx, &group_name, nml_ctrl.value.span);
     let group_ptr = b.const_string(group_name.as_bytes());
     let group_len = b.const_i64(group_name.len() as i64);
@@ -521,7 +1409,7 @@ fn lower_namelist_write_stmt(
     lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
     b.call(
         FuncRef::External("afs_write_namelist".into()),
-        vec![unit, group_ptr, group_len, entries, n_entries],
+        vec![unit, group_ptr, group_len, entries, n_entries, iostat_ptr],
         IrType::Void,
     );
     true
@@ -577,7 +1465,7 @@ fn lower_format_expr(
             &format!("FORMAT label {} not defined in this scoping unit", label),
         );
     }
-    lower_string_expr_with_layouts(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts))
+    lower_string_expr_ctx(b, ctx, expr)
 }
 
 fn inquire_size_storeback_type(
@@ -1032,15 +1920,40 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && info.derived_type.is_some()
                                 {
                                     let desc = array_descriptor_addr(b, &info);
-                                    let assign_type_name = if info.is_class {
+                                    let rhs_scalar_desc = if info.is_class {
+                                        match &value.node {
+                                            Expr::Name { name } => ctx
+                                                .locals
+                                                .get(&name.to_lowercase())
+                                                .filter(|src_info| {
+                                                    src_info.is_class
+                                                        && local_uses_array_descriptor(src_info)
+                                                        && local_declared_rank(src_info) == 0
+                                                })
+                                                .map(|src_info| array_descriptor_addr(b, src_info)),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let dynamic_source_copy_plan = rhs_scalar_desc.and_then(|_| {
+                                        info.derived_type
+                                            .as_ref()
+                                            .map(|base| {
+                                                ScalarAllocSourceCopyPlan::Dynamic(base.clone())
+                                            })
+                                    });
+                                    let assign_type_name = if info.is_class
+                                        && rhs_scalar_desc.is_none()
+                                    {
                                         expr_type_layout(
                                             value,
                                             Some(&ctx.locals),
                                             ctx.st,
                                             ctx.type_layouts,
                                         )
-                                        .filter(|layout| !layout.is_abstract)
-                                        .map(|layout| layout.name.clone())
+                                            .filter(|layout| !layout.is_abstract)
+                                            .map(|layout| layout.name.clone())
                                     } else {
                                         None
                                     }
@@ -1051,8 +1964,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         IrType::Int(IntWidth::I32),
                                     );
                                     let zero32 = b.const_i32(0);
+                                    let assign_stat = b.alloca(IrType::Int(IntWidth::I32));
+                                    b.store(zero32, assign_stat);
                                     let needs_alloc = b.icmp(CmpOp::Eq, allocated, zero32);
-                                    let needs_storage_alloc = if info.is_class {
+                                    let needs_storage_alloc = if let Some(source_desc) =
+                                        rhs_scalar_desc
+                                    {
+                                        let current_elem_size =
+                                            load_array_desc_i64_field(b, desc, 8);
+                                        let source_elem_size =
+                                            load_array_desc_i64_field(b, source_desc, 8);
+                                        let size_mismatch = b.icmp(
+                                            CmpOp::Ne,
+                                            current_elem_size,
+                                            source_elem_size,
+                                        );
+                                        let current_tag = load_array_desc_type_tag(b, desc);
+                                        let source_tag = load_array_desc_type_tag(b, source_desc);
+                                        let tag_mismatch =
+                                            b.icmp(CmpOp::Ne, current_tag, source_tag);
+                                        let storage_mismatch =
+                                            b.or(size_mismatch, tag_mismatch);
+                                        b.or(needs_alloc, storage_mismatch)
+                                    } else if info.is_class {
                                         if let Some(ref tn) = assign_type_name {
                                             if let Some(layout) = ctx.type_layouts.get(tn) {
                                                 let current_elem_size =
@@ -1081,14 +2015,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     } else {
                                         needs_alloc
                                     };
+                                    let rhs_result_temp_type =
+                                        finalizable_function_result_type_name(ctx, value);
+                                    let rhs_scalar_value = if rhs_scalar_desc.is_none() {
+                                        let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
+                                        Some(if let Some(ref tn) = assign_type_name {
+                                            stabilize_finalized_assignment_rhs(b, ctx, tn, raw)
+                                        } else {
+                                            raw
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     let alloc_bb = b.create_block("scalar_derived_assign_alloc");
+                                    let finalize_existing_bb =
+                                        b.create_block("scalar_derived_assign_finalize");
                                     let copy_bb = b.create_block("scalar_derived_assign_copy");
                                     let done_bb = b.create_block("scalar_derived_assign_done");
                                     b.cond_branch(
                                         needs_storage_alloc,
                                         alloc_bb,
                                         vec![],
-                                        copy_bb,
+                                        finalize_existing_bb,
                                         vec![],
                                     );
 
@@ -1107,17 +2055,36 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
 
                                     b.set_block(dealloc_bb);
-                                    let stat = b.alloca(IrType::Int(IntWidth::I32));
-                                    b.store(zero32, stat);
+                                    if let Some(type_name) = info.derived_type.as_ref() {
+                                        if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                            finalize_derived_descriptor_storage_if_allocated(
+                                                b,
+                                                ctx.st,
+                                                ctx.internal_funcs,
+                                                Some(ctx.contained_host_refs),
+                                                &ctx.locals,
+                                                desc,
+                                                layout,
+                                            );
+                                        }
+                                    }
+                                    b.store(zero32, assign_stat);
                                     b.call(
                                         FuncRef::External("afs_deallocate_array".into()),
-                                        vec![desc, stat],
+                                        vec![desc, assign_stat],
                                         IrType::Void,
                                     );
                                     b.branch(do_alloc_bb, vec![]);
 
                                     b.set_block(do_alloc_bb);
-                                    if let Some(ref tn) = assign_type_name {
+                                    if let Some(source_desc) = rhs_scalar_desc {
+                                        b.store(zero32, assign_stat);
+                                        b.call(
+                                            FuncRef::External("afs_allocate_like".into()),
+                                            vec![desc, source_desc, assign_stat],
+                                            IrType::Void,
+                                        );
+                                    } else if let Some(ref tn) = assign_type_name {
                                         if let Some(layout) = ctx.type_layouts.get(tn) {
                                             let elem_size = b.const_i64(layout.size as i64);
                                             let rank_val = b.const_i32(0);
@@ -1148,29 +2115,70 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     }
                                     b.branch(copy_bb, vec![]);
 
+                                    b.set_block(finalize_existing_bb);
+                                    if let Some(type_name) = info.derived_type.as_ref() {
+                                        if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                            finalize_derived_descriptor_storage_if_allocated(
+                                                b,
+                                                ctx.st,
+                                                ctx.internal_funcs,
+                                                Some(ctx.contained_host_refs),
+                                                &ctx.locals,
+                                                desc,
+                                                layout,
+                                            );
+                                        }
+                                    }
+                                    b.branch(copy_bb, vec![]);
+
                                     b.set_block(copy_bb);
-                                    let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                    let dest = derived_storage_addr(b, &info);
-                                    if let Some(ref tn) = assign_type_name {
-                                        emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
-                                    }
-                                    // Scalar descriptor-backed TYPE allocatables keep their
-                                    // dynamic type identity in the descriptor sidecar, so
-                                    // constructor/function-result assignment must restamp the
-                                    // concrete metadata after copying the value bytes.
-                                    if let Some(tag) = derived_type_tag_value(
-                                        b,
-                                        assign_type_name.as_deref(),
-                                        ctx.type_layouts,
-                                    ) {
-                                        store_array_desc_type_tag(b, desc, tag);
-                                    }
-                                    if let Some(lookup) = derived_type_vtable_value(
-                                        b,
-                                        assign_type_name.as_deref(),
-                                        ctx.type_layouts,
-                                    ) {
-                                        store_array_desc_vtable_ptr(b, desc, lookup);
+                                    if let Some(source_desc) = rhs_scalar_desc {
+                                        emit_allocatable_source_copy_on_success(
+                                            b,
+                                            assign_stat,
+                                            desc,
+                                            source_desc,
+                                            false,
+                                            None,
+                                            dynamic_source_copy_plan.as_ref(),
+                                            ctx.type_layouts,
+                                            None,
+                                        );
+                                    } else {
+                                        let val = rhs_scalar_value.expect(
+                                            "scalar derived assignment value lowered before branch",
+                                        );
+                                        let dest = derived_storage_addr(b, &info);
+                                        if let Some(ref tn) = assign_type_name {
+                                            emit_derived_value_copy(
+                                                b,
+                                                ctx.type_layouts,
+                                                tn,
+                                                dest,
+                                                val,
+                                            );
+                                        }
+                                        if let Some(ref temp_type) = rhs_result_temp_type {
+                                            finalize_assignment_lhs(b, ctx, temp_type, val);
+                                        }
+                                        // Scalar descriptor-backed TYPE allocatables keep their
+                                        // dynamic type identity in the descriptor sidecar, so
+                                        // constructor/function-result assignment must restamp the
+                                        // concrete metadata after copying the value bytes.
+                                        if let Some(tag) = derived_type_tag_value(
+                                            b,
+                                            assign_type_name.as_deref(),
+                                            ctx.type_layouts,
+                                        ) {
+                                            store_array_desc_type_tag(b, desc, tag);
+                                        }
+                                        if let Some(lookup) = derived_type_vtable_value(
+                                            b,
+                                            assign_type_name.as_deref(),
+                                            ctx.type_layouts,
+                                        ) {
+                                            store_array_desc_vtable_ptr(b, desc, lookup);
+                                        }
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
@@ -1326,6 +2334,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         | "shape"
                                                         | "pack"
                                                         | "spread"
+                                                        | "cshift"
+                                                        | "eoshift"
                                                         | "transfer"
                                                         // cmplx(re, im, kind) over real
                                                         // arrays: lower_array_expr_descriptor
@@ -1747,10 +2757,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         lower_array_assign(b, ctx, name, &info, value);
                                     }
                                 } else if info.derived_type.is_some() {
+                                    let result_temp_type =
+                                        finalizable_function_result_type_name(ctx, value);
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let dest = derived_storage_addr(b, &info);
                                     if let Some(ref tn) = info.derived_type {
+                                        let val =
+                                            stabilize_finalized_assignment_rhs(b, ctx, tn, val);
+                                        finalize_assignment_lhs(b, ctx, tn, dest);
                                         emit_derived_value_copy(b, ctx.type_layouts, tn, dest, val);
+                                        if let Some(ref temp_type) = result_temp_type {
+                                            finalize_assignment_lhs(b, ctx, temp_type, val);
+                                        }
                                     }
                                 } else if info.is_pointer {
                                     // Plain `=` on a POINTER dereferences:
@@ -2277,7 +3295,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ) {
                             if local_is_array_like(&info) && is_full_rank1_whole_slice(args) {
                                 let whole_view = descriptor_backed_whole_array_view(&info);
-                                lower_array_assign(b, ctx, "", &whole_view, value);
+                                let alias_name = root_object_name(callee);
+                                lower_array_assign(
+                                    b,
+                                    ctx,
+                                    alias_name.as_deref().unwrap_or(""),
+                                    &whole_view,
+                                    value,
+                                );
                                 return;
                             }
                             if local_is_array_like(&info)
@@ -2417,7 +3442,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ctx.type_layouts,
                     ) {
                         if local_is_array_like(&info) {
-                            lower_array_assign(b, ctx, "", &info, value);
+                            let alias_name = root_object_name(base);
+                            lower_array_assign(
+                                b,
+                                ctx,
+                                alias_name.as_deref().unwrap_or(""),
+                                &info,
+                                value,
+                            );
                             return;
                         }
                     }
@@ -2585,8 +3617,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && !field.allocatable
                                     && field.dims.is_empty()
                                 {
+                                    let result_temp_type =
+                                        finalizable_function_result_type_name(ctx, value);
                                     let src_ptr = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     if let Some(nested_name) = field_derived_type_name(&field) {
+                                        let src_ptr = stabilize_finalized_assignment_rhs(
+                                            b,
+                                            ctx,
+                                            &nested_name,
+                                            src_ptr,
+                                        );
+                                        finalize_assignment_lhs(b, ctx, &nested_name, field_ptr);
                                         emit_derived_value_copy(
                                             b,
                                             ctx.type_layouts,
@@ -2594,6 +3635,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             field_ptr,
                                             src_ptr,
                                         );
+                                        if let Some(ref temp_type) = result_temp_type {
+                                            finalize_assignment_lhs(b, ctx, temp_type, src_ptr);
+                                        }
                                     }
                                 } else if is_complex_ty(&type_info_to_ir_type(&field.type_info))
                                     && !field.pointer
@@ -2877,13 +3921,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if matches!(&c.value.node, Expr::StringLiteral { .. }) {
                     None
                 } else {
-                    let (p, l) = lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &c.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    );
+                    let (p, l) = lower_string_expr_ctx(b, ctx, &c.value);
                     Some(b.call(
                         FuncRef::External("afs_advance_eval".into()),
                         vec![p, l],
@@ -2928,13 +3966,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let iostat_ptr = iostat_arg_ptr.unwrap_or(null_i8_ptr);
             let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &c.value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
                 (arg_ptr, ptr, len)
             } else {
                 (null_char_slot_arg(b), null_i8_ptr, zero_i64)
@@ -3260,9 +4292,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         cached_param_mask_for_lookup(ctx.st, ctx.optional_params, k)
                             .or_else(|| callee_optional_arg_mask(ctx.st, k))
                     });
-                    let intent_in_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_intent_in_array_arg_mask(ctx.st, k)
+                    let sequence_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_sequence_array_arg_mask(ctx.st, k)
                     });
+                    let sequence_array_copy_back_mask =
+                        first_procedure_lookup(&abi_lookup_keys, |k| {
+                            callee_sequence_array_copy_back_mask(ctx.st, k)
+                        });
+                    let mut call_arg_sequence_temps = Vec::new();
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     let mut call_arg_array_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
@@ -3322,7 +4359,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let wants_intent_in_array = intent_in_array_mask
+                        let wants_sequence_array = sequence_array_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let sequence_array_copy_back = sequence_array_copy_back_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -3341,6 +4382,40 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        let actual_is_array_section =
+                                            actual_is_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
+                                        let actual_is_array = actual_expr_rank(
+                                            arg_expr,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                        .is_some_and(|rank| rank > 0)
+                                            || actual_is_array_section;
+                                        let actual_is_char_sequence =
+                                            actual_is_character_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
+                                        let sequence_array_for_arg = (wants_sequence_array
+                                            || actual_is_array)
+                                            && !matches!(
+                                                arg_expr.node,
+                                                Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                            );
+                                        let sequence_array_copy_back_for_arg =
+                                            if wants_sequence_array {
+                                                sequence_array_copy_back
+                                            } else {
+                                                true
+                                            };
                                         // Same conditional-argument treatment as
                                         // the direct-call path; wants_descriptor
                                         // is per-arm (it inspects the actual).
@@ -3431,17 +4506,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 dummy_is_class,
                                             )
                                         })
-                                    } else if wants_intent_in_array {
-                                        lower_contiguous_intent_in_array_actual(
-                                            b,
-                                            &ctx.locals,
-                                            e,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                            Some(ctx.internal_funcs),
-                                            Some(ctx.contained_host_refs),
-                                            Some(ctx.descriptor_params),
-                                        )
+                                    } else if sequence_array_for_arg {
+                                        let sequence_actual = if actual_is_char_sequence {
+                                            lower_sequence_char_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        } else {
+                                            lower_sequence_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        };
+                                        sequence_actual
                                         .unwrap_or_else(|| {
                                             lower_arg_by_ref_for_dummy_full(
                                                 b,
@@ -3581,6 +4674,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                     arg_vals.extend(closure_args);
                     b.call(FuncRef::Indirect(target), arg_vals, IrType::Void);
+                    finish_sequence_association_temps(b, &call_arg_sequence_temps);
                     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 }
             } else if let Expr::Name { name } = &callee.node {
@@ -3706,11 +4800,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         cached_param_mask_for_lookup(ctx.st, ctx.optional_params, k)
                             .or_else(|| callee_optional_arg_mask(ctx.st, k))
                     });
-                    let intent_in_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        callee_intent_in_array_arg_mask(ctx.st, k)
+                    let sequence_array_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
+                        callee_sequence_array_arg_mask(ctx.st, k)
                     });
+                    let sequence_array_copy_back_mask =
+                        first_procedure_lookup(&abi_lookup_keys, |k| {
+                            callee_sequence_array_copy_back_mask(ctx.st, k)
+                        });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     let mut call_arg_array_temps = Vec::new();
+                    let mut call_arg_sequence_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let is_value = value_mask
                             .as_ref()
@@ -3746,7 +4845,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                 .unwrap_or(false);
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
-                        let wants_intent_in_array = intent_in_array_mask
+                        let wants_sequence_array = sequence_array_mask
+                            .as_ref()
+                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                            .unwrap_or(false);
+                        let sequence_array_copy_back = sequence_array_copy_back_mask
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
@@ -3754,6 +4857,40 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                        let actual_is_array_section =
+                                            actual_is_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
+                                        let actual_is_array = actual_expr_rank(
+                                            arg_expr,
+                                            &ctx.locals,
+                                            ctx.st,
+                                            Some(ctx.type_layouts),
+                                        )
+                                        .is_some_and(|rank| rank > 0)
+                                            || actual_is_array_section;
+                                        let actual_is_char_sequence =
+                                            actual_is_character_array_section_designator(
+                                                &ctx.locals,
+                                                arg_expr,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                            );
+                                        let sequence_array_for_arg = (wants_sequence_array
+                                            || actual_is_array)
+                                            && !matches!(
+                                                arg_expr.node,
+                                                Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                            );
+                                        let sequence_array_copy_back_for_arg =
+                                            if wants_sequence_array {
+                                                sequence_array_copy_back
+                                            } else {
+                                                true
+                                            };
                                         // The materialization tree below is
                                         // reused per conditional-argument arm
                                         // (F2023): each arm builds its own
@@ -3847,17 +4984,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 dummy_is_class,
                                             )
                                         })
-                                    } else if wants_intent_in_array {
-                                        lower_contiguous_intent_in_array_actual(
-                                            b,
-                                            &ctx.locals,
-                                            e,
-                                            ctx.st,
-                                            Some(ctx.type_layouts),
-                                            Some(ctx.internal_funcs),
-                                            Some(ctx.contained_host_refs),
-                                            Some(ctx.descriptor_params),
-                                        )
+                                    } else if sequence_array_for_arg {
+                                        let sequence_actual = if actual_is_char_sequence {
+                                            lower_sequence_char_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        } else {
+                                            lower_sequence_array_actual(
+                                                b,
+                                                &ctx.locals,
+                                                e,
+                                                ctx.st,
+                                                Some(ctx.type_layouts),
+                                                Some(ctx.internal_funcs),
+                                                Some(ctx.contained_host_refs),
+                                                Some(ctx.descriptor_params),
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        };
+                                        sequence_actual
                                         .unwrap_or_else(|| {
                                             lower_arg_by_ref_for_dummy_full(
                                                 b,
@@ -4034,6 +5189,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         )
                     };
                     b.call(func_ref, arg_vals, IrType::Void);
+                    finish_sequence_association_temps(b, &call_arg_sequence_temps);
                     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 }
             }
@@ -4071,6 +5227,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             end,
             step,
             body,
+            ..
         } => {
             lower_do_loop(
                 b,
@@ -4092,7 +5249,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             controls,
             mask,
             body,
-            locality: _,
             ..
         } => {
             lower_do_concurrent(b, ctx, name, controls, mask.as_ref(), body, stmt.span);
@@ -4135,6 +5291,48 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             elsewhere,
             ..
         } => {
+            let mut where_section_temps = Vec::new();
+            let mut next_where_section_temp = 0usize;
+            let prepared_mask = rewrite_where_read_sections_to_temps(
+                b,
+                ctx,
+                mask,
+                &mut next_where_section_temp,
+                &mut where_section_temps,
+            );
+            let prepared_body: Vec<SpannedStmt> = body
+                .iter()
+                .map(|s| {
+                    rewrite_where_read_sections_to_temps_stmt(
+                        b,
+                        ctx,
+                        s,
+                        &mut next_where_section_temp,
+                        &mut where_section_temps,
+                    )
+                })
+                .collect();
+            let prepared_elsewhere: Vec<(Option<SpannedExpr>, Vec<SpannedStmt>)> = elsewhere
+                .iter()
+                .map(|(emask, ebody)| {
+                    (
+                        emask.clone(),
+                        ebody
+                            .iter()
+                            .map(|s| {
+                                rewrite_where_read_sections_to_temps_stmt(
+                                    b,
+                                    ctx,
+                                    s,
+                                    &mut next_where_section_temp,
+                                    &mut where_section_temps,
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
             // WHERE(mask) body [ELSEWHERE body] END WHERE
             // Collect ALL array names referenced in mask, body, OR
             // elsewhere body. Missing the elsewhere arm caused a
@@ -4144,11 +5342,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // the scalar path and silently produced 0.0 instead of
             // d(i).
             let mut array_names: Vec<String> = Vec::new();
-            collect_array_names(mask, &ctx.locals, &mut array_names);
-            for s in body {
+            collect_array_names(&prepared_mask, &ctx.locals, &mut array_names);
+            for s in &prepared_body {
                 collect_array_names_stmt(s, &ctx.locals, &mut array_names);
             }
-            if let Some((_emask, ebody)) = elsewhere.first() {
+            for (emask, ebody) in &prepared_elsewhere {
+                if let Some(emask) = emask {
+                    collect_array_names(emask, &ctx.locals, &mut array_names);
+                }
                 for s in ebody {
                     collect_array_names_stmt(s, &ctx.locals, &mut array_names);
                 }
@@ -4156,31 +5357,65 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             if array_names.is_empty() {
                 // No arrays — fall back to scalar IF-THEN-ELSE.
-                let cond = super::expr::lower_expr_ctx_tl(b, ctx, mask);
+                let raw_cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
+                let cond = coerce_to_type(b, raw_cond, &IrType::Bool);
+                let scalar_else_masks: Vec<Option<ValueId>> = prepared_elsewhere
+                    .iter()
+                    .map(|(emask, _)| {
+                        emask.as_ref().map(|emask| {
+                            let raw = super::expr::lower_expr_ctx_tl(b, ctx, emask);
+                            coerce_to_type(b, raw, &IrType::Bool)
+                        })
+                    })
+                    .collect();
                 let bb_then = b.create_block("where_then");
-                let bb_else = if !elsewhere.is_empty() {
-                    Some(b.create_block("where_else"))
-                } else {
+                let bb_else = if prepared_elsewhere.is_empty() {
                     None
+                } else {
+                    Some(b.create_block("where_else_check"))
                 };
                 let bb_end = b.create_block("where_end");
                 b.cond_branch(cond, bb_then, vec![], bb_else.unwrap_or(bb_end), vec![]);
 
                 b.set_block(bb_then);
-                lower_stmts(b, ctx, body);
+                lower_stmts(b, ctx, &prepared_body);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
-                if let Some(bb_e) = bb_else {
-                    b.set_block(bb_e);
-                    if let Some((_m, else_body)) = elsewhere.first() {
-                        lower_stmts(b, ctx, else_body);
-                    }
-                    if b.func().block(b.current_block()).terminator.is_none() {
-                        b.branch(bb_end, vec![]);
+
+                if let Some(mut bb_check) = bb_else {
+                    for (idx, ((_emask, else_body), scalar_mask)) in prepared_elsewhere
+                        .iter()
+                        .zip(scalar_else_masks.iter())
+                        .enumerate()
+                    {
+                        b.set_block(bb_check);
+                        if let Some(cond) = scalar_mask {
+                            let bb_arm = b.create_block("where_else");
+                            let bb_next = if idx + 1 < prepared_elsewhere.len() {
+                                b.create_block("where_else_check")
+                            } else {
+                                bb_end
+                            };
+                            b.cond_branch(*cond, bb_arm, vec![], bb_next, vec![]);
+                            b.set_block(bb_arm);
+                            lower_stmts(b, ctx, else_body);
+                            if b.func().block(b.current_block()).terminator.is_none() {
+                                b.branch(bb_end, vec![]);
+                            }
+                            bb_check = bb_next;
+                        } else {
+                            lower_stmts(b, ctx, else_body);
+                            if b.func().block(b.current_block()).terminator.is_none() {
+                                b.branch(bb_end, vec![]);
+                            }
+                            break;
+                        }
                     }
                 }
+
                 b.set_block(bb_end);
+                finish_where_section_temps(b, ctx, &where_section_temps);
                 return;
             }
 
@@ -4208,129 +5443,123 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
             }
 
-            let i_addr = b.alloca(IrType::Int(IntWidth::I64));
-            let i_zero = b.const_i64(0);
-            b.store(i_zero, i_addr);
+            if prepared_elsewhere.is_empty() {
+                lower_where_array_pass(
+                    b,
+                    ctx,
+                    &array_names,
+                    &array_bases,
+                    n,
+                    &prepared_body,
+                    |b, ctx, _i_val| {
+                        let rewritten_mask =
+                            rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+                        super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask)
+                    },
+                );
+                finish_where_section_temps(b, ctx, &where_section_temps);
+                return;
+            }
 
-            let bb_check = b.create_block("where_check");
-            let bb_body = b.create_block("where_body");
-            let bb_exit = b.create_block("where_exit");
-            b.branch(bb_check, vec![]);
+            if prepared_elsewhere.len() == 1 && prepared_elsewhere[0].0.is_none() {
+                lower_where_array_if_else_pass(
+                    b,
+                    ctx,
+                    &array_names,
+                    &array_bases,
+                    n,
+                    &prepared_body,
+                    &prepared_elsewhere[0].1,
+                    |b, ctx, _i_val| {
+                        let rewritten_mask =
+                            rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+                        super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask)
+                    },
+                );
+                finish_where_section_temps(b, ctx, &where_section_temps);
+                return;
+            }
 
-            b.set_block(bb_check);
-            let i = b.load(i_addr);
-            let done = b.icmp(CmpOp::Ge, i, n);
-            b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+            let main_mask_value = lower_where_mask_value(b, ctx, &prepared_mask);
+            lower_where_array_pass(
+                b,
+                ctx,
+                &array_names,
+                &array_bases,
+                n,
+                &prepared_body,
+                |b, _ctx, i_val| where_mask_value_at(b, &main_mask_value, i_val),
+            );
 
-            b.set_block(bb_body);
-            let i_val = b.load(i_addr);
-
-            // Substitute each array variable with a scalar local bound to element i.
-            // Save original locals for restoration.
-            let mut saved_locals: Vec<(String, Option<LocalInfo>)> = Vec::new();
-            for arr_name in &array_names {
-                saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
-                if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
-                    let base = *array_bases.get(arr_name).unwrap();
-                    // Compute element address: base + i * elem_bytes.
-                    let elem_bytes_val = match &orig_info.ty {
-                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => {
-                            b.const_i64(8)
-                        }
-                        IrType::Int(IntWidth::I16) => b.const_i64(2),
-                        IrType::Int(IntWidth::I8) => b.const_i64(1),
-                        _ => b.const_i64(4),
-                    };
-                    let byte_off = b.imul(i_val, elem_bytes_val);
-                    let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-                    // Replace the local with a scalar pointing to this element.
-                    ctx.locals.insert(
-                        arr_name.clone(),
-                        LocalInfo {
-                            addr: elem_ptr,
-                            ty: orig_info.ty.clone(),
-                            dims: vec![],
-                            allocatable: false,
-                            descriptor_arg: false,
-                            by_ref: false,
-                            char_kind: CharKind::None,
-                            derived_type: None,
-                            inline_const: None,
-                            is_pointer: false,
-                            runtime_dim_upper: vec![],
-                            is_class: false,
-                            logical_kind: None,
-                            last_dim_assumed_size: false,
+            let mut elsewhere_mask_values: Vec<WhereMaskValue> = Vec::new();
+            for (else_mask_expr, else_body) in &prepared_elsewhere {
+                if let Some(mask_expr) = else_mask_expr {
+                    let prepared_else_mask = rewrite_where_read_sections_to_temps(
+                        b,
+                        ctx,
+                        mask_expr,
+                        &mut next_where_section_temp,
+                        &mut where_section_temps,
+                    );
+                    let else_mask = lower_where_mask_value(b, ctx, &prepared_else_mask);
+                    lower_where_array_pass(
+                        b,
+                        ctx,
+                        &array_names,
+                        &array_bases,
+                        n,
+                        else_body,
+                        |b, _ctx, i_val| {
+                            let pending =
+                                where_pending_mask_at(b, i_val, &main_mask_value, &elsewhere_mask_values);
+                            let masked = where_mask_value_at(b, &else_mask, i_val);
+                            b.and(pending, masked)
                         },
                     );
-                }
-            }
-
-            // Pre-rewrite mask and body: any residual `name(section)`
-            // FunctionCall AST node referencing a scalarized array name
-            // would, after substitution, dispatch through the user-call
-            // path on a scalar local and emit an undefined `bl _name` at
-            // link time. Folding it to bare `Name` makes the substituted
-            // per-iter scalar binding pick up at the element index.
-            // Stdlib pattern: `where (lambda(1:m) > 0.0_sp) sv(1:m) =
-            // sqrt(lambda(1:m) * real(n-1, sp))` — both `lambda(1:m)`
-            // and `sv(1:m)` are scalarized to `lambda` / `sv` per iter.
-            let rewritten_mask = rewrite_scalarized_section_refs(mask, &array_names);
-            let rewritten_body: Vec<SpannedStmt> = body
-                .iter()
-                .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
-                .collect();
-            let rewritten_else: Vec<SpannedStmt> = elsewhere
-                .first()
-                .map(|(_m, els)| {
-                    els.iter()
-                        .map(|s| rewrite_scalarized_section_refs_stmt(s, &array_names))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Evaluate mask with element-level bindings.
-            let cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
-
-            let bb_then = b.create_block("where_then");
-            let bb_else = b.create_block("where_else");
-            let bb_incr = b.create_block("where_incr");
-            b.cond_branch(cond, bb_then, vec![], bb_else, vec![]);
-
-            b.set_block(bb_then);
-            lower_stmts(b, ctx, &rewritten_body);
-            if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_incr, vec![]);
-            }
-
-            b.set_block(bb_else);
-            if !rewritten_else.is_empty() {
-                lower_stmts(b, ctx, &rewritten_else);
-            }
-            if b.func().block(b.current_block()).terminator.is_none() {
-                b.branch(bb_incr, vec![]);
-            }
-
-            b.set_block(bb_incr);
-            // Restore original locals.
-            for (name, orig) in saved_locals {
-                if let Some(info) = orig {
-                    ctx.locals.insert(name, info);
+                    elsewhere_mask_values.push(else_mask);
                 } else {
-                    ctx.locals.remove(&name);
+                    lower_where_array_pass(
+                        b,
+                        ctx,
+                        &array_names,
+                        &array_bases,
+                        n,
+                        else_body,
+                        |b, _ctx, i_val| {
+                            where_pending_mask_at(b, i_val, &main_mask_value, &elsewhere_mask_values)
+                        },
+                    );
+                    break;
                 }
             }
 
-            let i_cur = b.load(i_addr);
-            let one = b.const_i64(1);
-            let next = b.iadd(i_cur, one);
-            b.store(next, i_addr);
-            b.branch(bb_check, vec![]);
-
-            b.set_block(bb_exit);
+            let mut mask_values: Vec<&WhereMaskValue> = Vec::new();
+            mask_values.push(&main_mask_value);
+            for mask in &elsewhere_mask_values {
+                mask_values.push(mask);
+            }
+            finish_where_mask_values(b, &mask_values);
+            finish_where_section_temps(b, ctx, &where_section_temps);
         }
 
         Stmt::WhereStmt { mask, stmt } => {
+            let mut where_section_temps = Vec::new();
+            let mut next_where_section_temp = 0usize;
+            let prepared_mask = rewrite_where_read_sections_to_temps(
+                b,
+                ctx,
+                mask,
+                &mut next_where_section_temp,
+                &mut where_section_temps,
+            );
+            let prepared_stmt = rewrite_where_read_sections_to_temps_stmt(
+                b,
+                ctx,
+                stmt,
+                &mut next_where_section_temp,
+                &mut where_section_temps,
+            );
+
             // Single-line WHERE: where (cond) assignment.
             // F2018 §10.2.3.2: when the mask is an array-valued logical
             // expression, the assignment runs element-wise under the
@@ -4339,20 +5568,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // mask or assignment, evaluate the scalar mask, and run the
             // assignment under it.
             let mut array_names: Vec<String> = Vec::new();
-            collect_array_names(mask, &ctx.locals, &mut array_names);
-            collect_array_names_stmt(stmt, &ctx.locals, &mut array_names);
+            collect_array_names(&prepared_mask, &ctx.locals, &mut array_names);
+            collect_array_names_stmt(&prepared_stmt, &ctx.locals, &mut array_names);
 
             if array_names.is_empty() {
-                let cond = super::expr::lower_expr_ctx_tl(b, ctx, mask);
+                let cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
                 let bb_then = b.create_block("where_stmt");
                 let bb_end = b.create_block("where_stmt_end");
                 b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
                 b.set_block(bb_then);
-                lower_stmt(b, ctx, stmt);
+                lower_stmt(b, ctx, &prepared_stmt);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(bb_end, vec![]);
                 }
                 b.set_block(bb_end);
+                finish_where_section_temps(b, ctx, &where_section_temps);
                 return;
             }
 
@@ -4394,14 +5624,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 saved_locals.push((arr_name.clone(), ctx.locals.get(arr_name).cloned()));
                 if let Some(orig_info) = ctx.locals.get(arr_name).cloned() {
                     let base = *array_bases.get(arr_name).unwrap();
-                    let elem_bytes_val = match &orig_info.ty {
-                        IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64) => {
-                            b.const_i64(8)
-                        }
-                        IrType::Int(IntWidth::I16) => b.const_i64(2),
-                        IrType::Int(IntWidth::I8) => b.const_i64(1),
-                        _ => b.const_i64(4),
-                    };
+                    let elem_bytes_val = array_elem_size_value(b, &orig_info);
                     let byte_off = b.imul(i_val, elem_bytes_val);
                     let elem_ptr = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
                     ctx.locals.insert(
@@ -4430,8 +5653,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // mask/stmt would emit undefined externals after the
             // substitution. Fold them to bare `Name` so the per-iter
             // scalar binding picks up.
-            let rewritten_mask = rewrite_scalarized_section_refs(mask, &array_names);
-            let rewritten_stmt = rewrite_scalarized_section_refs_stmt(stmt, &array_names);
+            let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
+            let rewritten_stmt = rewrite_scalarized_section_refs_stmt(&prepared_stmt, &array_names);
 
             let cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
             let bb_then = b.create_block("where_stmt_then");
@@ -4459,11 +5682,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             b.branch(bb_check, vec![]);
 
             b.set_block(bb_exit);
+            finish_where_section_temps(b, ctx, &where_section_temps);
         }
 
         Stmt::ForallConstruct {
             specs, mask, body, ..
         } => {
+            if try_lower_forall_assignment_with_temp(b, ctx, specs, mask.as_ref(), body) {
+                return;
+            }
             // FORALL: nest loops. The body goes inside the innermost loop.
             // Build the body statements including optional mask as a closure-like pattern.
             // The innermost loop gets the real body; outer loops wrap it.
@@ -4472,6 +5699,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
         Stmt::ForallStmt { specs, mask, stmt } => {
             let body_vec = vec![(**stmt).clone()];
+            if try_lower_forall_assignment_with_temp(b, ctx, specs, mask.as_ref(), &body_vec) {
+                return;
+            }
             lower_forall_nested(b, ctx, specs, mask.as_ref(), &body_vec);
         }
 
@@ -4767,6 +5997,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 ctx.internal_funcs,
                 Some(ctx.contained_host_refs),
                 skip,
+                true,
             );
             if ctx.hidden_result_abi != HiddenResultAbi::None {
                 // sret convention: result was written into the hidden first param.
@@ -4795,6 +6026,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Stop { code, .. } => {
+            enum StopCode {
+                Msg(ValueId, ValueId),
+                Int(ValueId),
+                None,
+            }
             let stop_code = if let Some(code_expr) = code {
                 let is_char = expr_is_character_expr(
                     b,
@@ -4804,48 +6040,62 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     Some(ctx.type_layouts),
                 ) || matches!(code_expr.node, Expr::StringLiteral { .. });
                 if is_char {
-                    None
+                    let (ptr, len) = lower_string_expr_ctx(b, ctx, code_expr);
+                    StopCode::Msg(ptr, len)
                 } else {
                     let val = super::expr::lower_expr_ctx(b, ctx, code_expr);
                     let val_ty = b
                         .func()
                         .value_type(val)
                         .unwrap_or(IrType::Int(IntWidth::I64));
-                    Some(match val_ty {
+                    StopCode::Int(match val_ty {
                         IrType::Int(IntWidth::I64) => val,
                         IrType::Int(_) => b.int_extend(val, IntWidth::I64, true),
                         _ => val,
                     })
                 }
             } else {
-                None
+                StopCode::None
             };
-            let skip = if matches!(
-                ctx.hidden_result_abi,
-                HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
-            ) {
-                Some(ValueId(0))
-            } else {
-                None
-            };
-            insert_implicit_dealloc(
-                b,
-                &ctx.locals,
-                &ctx.locals,
-                ctx.type_layouts,
-                ctx.st,
-                ctx.internal_funcs,
-                Some(ctx.contained_host_refs),
-                skip,
-            );
-            if let Some(widened) = stop_code {
-                b.call(
-                    FuncRef::External("afs_stop_int".into()),
-                    vec![widened],
-                    IrType::Void,
+            if !matches!(stop_code, StopCode::Msg(..)) {
+                let skip = if matches!(
+                    ctx.hidden_result_abi,
+                    HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
+                ) {
+                    Some(ValueId(0))
+                } else {
+                    None
+                };
+                insert_implicit_dealloc(
+                    b,
+                    &ctx.locals,
+                    &ctx.locals,
+                    ctx.type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    skip,
+                    true,
                 );
-            } else {
-                b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            }
+            match stop_code {
+                StopCode::Msg(ptr, len) => {
+                    b.call(
+                        FuncRef::External("afs_stop_msg".into()),
+                        vec![ptr, len],
+                        IrType::Void,
+                    );
+                }
+                StopCode::Int(widened) => {
+                    b.call(
+                        FuncRef::External("afs_stop_int".into()),
+                        vec![widened],
+                        IrType::Void,
+                    );
+                }
+                StopCode::None => {
+                    b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+                }
             }
             b.unreachable();
         }
@@ -4925,6 +6175,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ctx.internal_funcs,
                     Some(ctx.contained_host_refs),
                     skip,
+                    true,
                 );
             }
 
@@ -5047,6 +6298,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         }
                         if field.size == 384 && (field.allocatable || field.pointer) {
                             let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
+                            let field_is_class_star = matches!(
+                                &field.type_info,
+                                crate::sema::symtab::TypeInfo::ClassStar
+                            );
                             let bounds = lower_alloc_bounds_list(b, ctx, args);
                             let rank = bounds.len();
                             let field_info = LocalInfo {
@@ -5061,7 +6316,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 inline_const: None,
                                 is_pointer: field.pointer,
                                 runtime_dim_upper: vec![],
-                                is_class: false,
+                                is_class: matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::Class(_)
+                                        | crate::sema::symtab::TypeInfo::ClassStar
+                                ),
                                 logical_kind: None,
                                 last_dim_assumed_size: false,
                             };
@@ -5079,6 +6338,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
+                            let source_intrinsic_elem_ty =
+                                if field_is_class_star && source_desc.is_none() {
+                                    source_expr.and_then(|expr| {
+                                        class_star_intrinsic_source_ir_type(ctx, expr)
+                                    })
+                                } else {
+                                    None
+                                };
+                            let source_char_elem_size =
+                                if field_is_class_star && rank == 0 && source_char.is_some() {
+                                    char_alloc_len
+                                } else {
+                                    None
+                                };
                             let dynamic_layout = source_scalar_layout
                                 .or(mold_static_layout)
                                 .or(typed_layout)
@@ -5120,15 +6393,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             };
                             let elem_size_bytes = dynamic_layout
                                 .map(|layout| layout.size as i64)
+                                .or_else(|| {
+                                    source_intrinsic_elem_ty
+                                        .as_ref()
+                                        .map(|ty| ir_scalar_byte_size(ty, ctx.layout))
+                                })
                                 .unwrap_or_else(|| {
                                     descriptor_element_size_bytes(&field_info, ctx.layout)
                                 });
-                            let es = allocated_array_elem_size(
-                                b,
-                                &field_info,
-                                elem_size_bytes,
-                                char_alloc_len,
-                            );
+                            let es = source_char_elem_size.unwrap_or_else(|| {
+                                allocated_array_elem_size(
+                                    b,
+                                    &field_info,
+                                    elem_size_bytes,
+                                    char_alloc_len,
+                                )
+                            });
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
                                 b.const_i64(0)
@@ -5217,21 +6497,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.st,
                                         Some(ctx.type_layouts),
                                     ) {
+                                        let init_ty =
+                                            source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
                                         let dest_base = b.load_typed(
                                             field_ptr,
-                                            IrType::Ptr(Box::new(elem_ty.clone())),
+                                            IrType::Ptr(Box::new(init_ty.clone())),
                                         );
                                         emit_scalar_allocate_source_init_on_success(
                                             b,
                                             ctx,
                                             stat_addr,
                                             dest_base,
-                                            &elem_ty,
+                                            init_ty,
                                             source_scalar_type
                                                 .as_deref()
                                                 .or(field_derived_type_name(&field).as_deref()),
                                             source_expr,
                                         );
+                                    } else if field_is_class_star {
+                                        if let Some((src_ptr, src_len)) = source_char {
+                                            emit_scalar_class_star_char_source_copy_on_success(
+                                                b, stat_addr, field_ptr, src_ptr, src_len,
+                                            );
+                                        }
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -5242,12 +6530,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ctx.st,
                                     Some(ctx.type_layouts),
                                 ) {
+                                    let init_ty =
+                                        source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
                                     emit_array_allocate_scalar_source_init_on_success(
                                         b,
                                         ctx,
                                         stat_addr,
                                         field_ptr,
-                                        &elem_ty,
+                                        init_ty,
                                         source_scalar_type
                                             .as_deref()
                                             .or(field_derived_type_name(&field).as_deref()),
@@ -5258,7 +6548,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // Polymorphic metadata (tag + vtable) for both
                             // scalars and arrays; a polymorphic array
                             // component's elements share one dynamic type.
-                            // Derived default-init below stays scalar-only.
                             {
                                 let mold_metadata_desc = if source_desc.is_none()
                                     && source_scalar_desc.is_none()
@@ -5276,13 +6565,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     if source_desc.is_some() || mold_metadata_desc.is_some() {
                                         None
                                     } else if let Some(source_expr) = source_expr {
-                                        expr_type_tag_value(
-                                            b,
-                                            source_expr,
-                                            Some(&ctx.locals),
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
+                                        (if field_is_class_star {
+                                            class_star_intrinsic_source_tag_value(
+                                                b,
+                                                ctx,
+                                                source_expr,
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                        .or_else(|| {
+                                            expr_type_tag_value(
+                                                b,
+                                                source_expr,
+                                                Some(&ctx.locals),
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
                                         .or_else(|| {
                                             static_alloc_target_type_tag_value(
                                                 b,
@@ -5370,27 +6670,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         b, stat_addr, field_ptr, mold_desc,
                                     );
                                 }
-                                let copied_from_source = source_desc.is_some()
+                                let initialized_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some()
-                                    || mold_metadata_desc.is_some();
-                                if !copied_from_source && rank == 0 {
+                                    || source_expr.is_some();
+                                if !initialized_from_source {
                                     if let Some(layout) = dynamic_layout {
-                                        let base_ptr = b.load_typed(
+                                        emit_allocatable_default_init_on_success(
+                                            b,
+                                            stat_addr,
                                             field_ptr,
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                        if derived_layout_needs_runtime_initialization(
                                             layout,
+                                            source_copy_rank > 0,
                                             ctx.type_layouts,
-                                        ) {
-                                            initialize_derived_storage(
-                                                b,
-                                                base_ptr,
-                                                layout,
-                                                ctx.type_layouts,
-                                            );
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -5477,6 +6769,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             local_storage_size_bytes(&info, ctx.type_layouts, ctx.layout);
 
                         if info.allocatable || info.descriptor_arg {
+                            let local_is_class_star = is_unlimited_polymorphic_local(&info);
                             let bounds = lower_alloc_bounds_list(b, ctx, args);
                             let rank = bounds.len();
                             let source_scalar_layout = if source_desc.is_none() {
@@ -5493,6 +6786,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
+                            let source_intrinsic_elem_ty =
+                                if local_is_class_star && source_desc.is_none() {
+                                    source_expr.and_then(|expr| {
+                                        class_star_intrinsic_source_ir_type(ctx, expr)
+                                    })
+                                } else {
+                                    None
+                                };
                             let dynamic_layout = source_scalar_layout
                                 .or(mold_static_layout)
                                 .or(typed_layout)
@@ -5526,6 +6827,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 None
                             };
+                            let source_char_elem_size =
+                                if local_is_class_star && rank == 0 && source_char.is_some() {
+                                    char_alloc_len
+                                } else {
+                                    None
+                                };
                             // Build a stack DimDescriptor[rank] honoring
                             // each subscript's actual (lower, upper) bounds,
                             // then call afs_allocate_array. Descriptor-backed
@@ -5538,9 +6845,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 &info,
                                 dynamic_layout
                                     .map(|layout| layout.size as i64)
+                                    .or_else(|| {
+                                        source_intrinsic_elem_ty
+                                            .as_ref()
+                                            .map(|ty| ir_scalar_byte_size(ty, ctx.layout))
+                                    })
                                     .unwrap_or(elem_size_bytes),
                                 char_alloc_len,
                             );
+                            let es = source_char_elem_size.unwrap_or(es);
                             let desc = array_descriptor_addr(b, &info);
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
@@ -5630,21 +6943,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.st,
                                         Some(ctx.type_layouts),
                                     ) {
+                                        let init_ty =
+                                            source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
                                         let dest_base = b.load_typed(
                                             desc,
-                                            IrType::Ptr(Box::new(info.ty.clone())),
+                                            IrType::Ptr(Box::new(init_ty.clone())),
                                         );
                                         emit_scalar_allocate_source_init_on_success(
                                             b,
                                             ctx,
                                             stat_addr,
                                             dest_base,
-                                            &info.ty,
+                                            init_ty,
                                             source_scalar_type
                                                 .as_deref()
                                                 .or(info.derived_type.as_deref()),
                                             source_expr,
                                         );
+                                    } else if local_is_class_star {
+                                        if let Some((src_ptr, src_len)) = source_char {
+                                            emit_scalar_class_star_char_source_copy_on_success(
+                                                b, stat_addr, desc, src_ptr, src_len,
+                                            );
+                                        }
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -5655,12 +6976,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     ctx.st,
                                     Some(ctx.type_layouts),
                                 ) {
+                                    let init_ty =
+                                        source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
                                     emit_array_allocate_scalar_source_init_on_success(
                                         b,
                                         ctx,
                                         stat_addr,
                                         desc,
-                                        &info.ty,
+                                        init_ty,
                                         source_scalar_type
                                             .as_deref()
                                             .or(info.derived_type.as_deref()),
@@ -5673,9 +6996,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // arrays — a polymorphic array's elements share
                             // one dynamic type, so one tag + table pointer
                             // in the descriptor serves every element-wise
-                            // TBP dispatch. (Derived default-init below
-                            // stays scalar-only; whole-array element init is
-                            // a separate concern.)
+                            // TBP dispatch.
                             {
                                 let mold_metadata_desc = if source_desc.is_none()
                                     && source_scalar_desc.is_none()
@@ -5692,13 +7013,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     if source_desc.is_some() || mold_metadata_desc.is_some() {
                                         None
                                     } else if let Some(source_expr) = source_expr {
-                                        expr_type_tag_value(
-                                            b,
-                                            source_expr,
-                                            Some(&ctx.locals),
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
+                                        (if local_is_class_star {
+                                            class_star_intrinsic_source_tag_value(
+                                                b,
+                                                ctx,
+                                                source_expr,
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                        .or_else(|| {
+                                            expr_type_tag_value(
+                                                b,
+                                                source_expr,
+                                                Some(&ctx.locals),
+                                                ctx.st,
+                                                ctx.type_layouts,
+                                            )
+                                        })
                                         .or_else(|| {
                                             static_alloc_target_type_tag_value(
                                                 b,
@@ -5786,27 +7118,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         b, stat_addr, desc, mold_desc,
                                     );
                                 }
-                                let copied_from_source = source_desc.is_some()
+                                let initialized_from_source = source_desc.is_some()
                                     || source_scalar_desc.is_some()
-                                    || source_expr.is_some()
-                                    || mold_metadata_desc.is_some();
-                                if !copied_from_source && rank == 0 {
+                                    || source_expr.is_some();
+                                if !initialized_from_source {
                                     if let Some(layout) = dynamic_layout {
-                                        let base_ptr = b.load_typed(
+                                        emit_allocatable_default_init_on_success(
+                                            b,
+                                            stat_addr,
                                             desc,
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                        if derived_layout_needs_runtime_initialization(
                                             layout,
+                                            source_copy_rank > 0,
                                             ctx.type_layouts,
-                                        ) {
-                                            initialize_derived_storage(
-                                                b,
-                                                base_ptr,
-                                                layout,
-                                                ctx.type_layouts,
-                                            );
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -5878,6 +7202,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             if field.allocatable {
                                 if let Some(type_name) = field_derived_type_name(&field) {
                                     if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                        finalize_derived_descriptor_storage_if_allocated(
+                                            b,
+                                            ctx.st,
+                                            ctx.internal_funcs,
+                                            Some(ctx.contained_host_refs),
+                                            &ctx.locals,
+                                            field_ptr,
+                                            layout,
+                                        );
                                         deallocate_derived_descriptor_components(
                                             b,
                                             field_ptr,
@@ -5936,6 +7269,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             let desc = array_descriptor_addr(b, info);
                             if let Some(type_name) = &info.derived_type {
                                 if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                    finalize_derived_descriptor_storage_if_allocated(
+                                        b,
+                                        ctx.st,
+                                        ctx.internal_funcs,
+                                        Some(ctx.contained_host_refs),
+                                        &ctx.locals,
+                                        desc,
+                                        layout,
+                                    );
                                     deallocate_derived_descriptor_components(
                                         b,
                                         desc,
@@ -6155,6 +7497,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         ctx.internal_funcs,
                         Some(ctx.contained_host_refs),
                         None,
+                        true,
                     );
                 }
             }
@@ -6307,6 +7650,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("iostat"))
                     .unwrap_or(false)
             });
+            let iomsg_spec = specs.iter().find(|s| {
+                s.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iomsg"))
+                    .unwrap_or(false)
+            });
             let err_label = specs.iter().find_map(|s| {
                 if s.keyword
                     .as_deref()
@@ -6338,15 +7687,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("file"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -6361,15 +7702,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("status"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -6384,15 +7717,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("action"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -6407,15 +7732,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("access"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -6430,15 +7747,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         .map(|k| k.eq_ignore_ascii_case("form"))
                         .unwrap_or(false)
                 })
-                .map(|s| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &s.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                 .unwrap_or_else(|| {
                     let z = b.const_i64(0);
                     (z, z)
@@ -6457,6 +7766,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .unwrap_or_else(|| b.const_i64(0));
 
             let null = b.const_i64(0);
+            let null_i8_ptr = b.int_to_ptr(null, IrType::Int(IntWidth::I8));
             let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
             let recl_i64 = coerce_to_type(b, recl_val, &IrType::Int(IntWidth::I64));
             let open_iostat_ptr = match (iostat_spec, err_label) {
@@ -6469,6 +7779,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
                 (None, None) => null,
             };
+            let (open_iomsg_ptr, open_iomsg_len) = iomsg_spec
+                .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
+                .unwrap_or((null_i8_ptr, null));
 
             // Check if we have any extended specifiers beyond the basic 7-arg set.
             let has_access = specs.iter().any(|s| {
@@ -6502,6 +7815,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .unwrap_or(false)
             });
             let has_iostat = iostat_spec.is_some();
+            let has_iomsg = iomsg_spec.is_some();
             let has_newunit = newunit_spec.is_some();
             let has_err = err_label.is_some();
 
@@ -6511,6 +7825,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 && !has_position
                 && !has_leading_zero
                 && !has_iostat
+                && !has_iomsg
                 && !has_newunit
                 && !has_err
             {
@@ -6534,15 +7849,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|k| k.eq_ignore_ascii_case("position"))
                             .unwrap_or(false)
                     })
-                    .map(|s| {
-                        lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &s.value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        )
-                    })
+                    .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                     .unwrap_or_else(|| {
                         let z = b.const_i64(0);
                         (z, z)
@@ -6557,28 +7864,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .map(|k| k.eq_ignore_ascii_case("leading_zero"))
                             .unwrap_or(false)
                     })
-                    .map(|s| {
-                        lower_string_expr_with_layouts(
-                            b,
-                            &ctx.locals,
-                            &s.value,
-                            ctx.st,
-                            Some(ctx.type_layouts),
-                        )
-                    })
+                    .map(|s| lower_string_expr_ctx(b, ctx, &s.value))
                     .unwrap_or_else(|| {
                         let z = b.const_i64(0);
                         (z, z)
                     });
 
-                // Layout matches repr(C) OpenControlBlock (144 bytes):
+                // Layout matches repr(C) OpenControlBlock (160 bytes):
                 //   0: unit(i32) + 4 pad, 8: filename(ptr), 16: filename_len(i64),
                 //  24: status(ptr), 32: status_len(i64), 40: action(ptr), 48: action_len(i64),
                 //  56: access(ptr), 64: access_len(i64), 72: form(ptr), 80: form_len(i64),
                 //  88: recl(i64), 96: iostat(ptr), 104: newunit(ptr),
                 // 112: position(ptr), 120: position_len(i64),
-                // 128: leading_zero(ptr), 136: leading_zero_len(i64)
-                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 144);
+                // 128: leading_zero(ptr), 136: leading_zero_len(i64),
+                // 144: iomsg(ptr), 152: iomsg_len(i64)
+                let cb_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 160);
                 let cb = b.alloca(cb_ty);
 
                 let store_at = |b: &mut crate::ir::builder::FuncBuilder,
@@ -6627,6 +7927,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .func()
                     .value_type(leading_zero_ptr)
                     .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let iomsg_ptr_ty = b
+                    .func()
+                    .value_type(open_iomsg_ptr)
+                    .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 let newunit_ptr = newunit_spec
                     .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
                     .unwrap_or(null);
@@ -6657,6 +7961,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 store_at(b, cb, 120, IrType::Int(IntWidth::I64), position_len);
                 store_at(b, cb, 128, leading_zero_ptr_ty, leading_zero_ptr);
                 store_at(b, cb, 136, IrType::Int(IntWidth::I64), leading_zero_len);
+                store_at(b, cb, 144, iomsg_ptr_ty, open_iomsg_ptr);
+                store_at(b, cb, 152, IrType::Int(IntWidth::I64), open_iomsg_len);
 
                 b.call(FuncRef::External("afs_open".into()), vec![cb], IrType::Void);
             }
@@ -6696,15 +8002,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
                 .unwrap_or(null);
             let (status_ptr, status_len) = status_spec
-                .map(|spec| {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &spec.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
-                })
+                .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
                 .unwrap_or_else(|| (null, null));
             b.call(
                 FuncRef::External("afs_close_ex".into()),
@@ -6739,13 +8037,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if matches!(&c.value.node, Expr::StringLiteral { .. }) {
                     None
                 } else {
-                    let (p, l) = lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &c.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    );
+                    let (p, l) = lower_string_expr_ctx(b, ctx, &c.value);
                     Some(b.call(
                         FuncRef::External("afs_advance_eval".into()),
                         vec![p, l],
@@ -6757,6 +8049,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if c.keyword
                     .as_deref()
                     .map(|k| k.eq_ignore_ascii_case("err"))
+                    .unwrap_or(false)
+                {
+                    match &c.value.node {
+                        Expr::IntegerLiteral { text, .. } => text.parse::<u64>().ok(),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+            let end_label = controls.iter().find_map(|c| {
+                if c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("end"))
                     .unwrap_or(false)
                 {
                     match &c.value.node {
@@ -6795,16 +8101,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 })
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
 
-            let has_dtio_iostat_addr = explicit_iostat_addr.is_some() || err_label.is_some();
-            let iostat_addr = match (err_label, explicit_iostat_addr) {
-                (_, Some(addr)) => addr,
-                (Some(_), None) => {
+            let user_iostat = explicit_iostat_addr.is_some();
+            let needs_hidden_iostat = end_label.is_some() || err_label.is_some();
+            let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
+            let iostat_addr = match explicit_iostat_addr {
+                Some(addr) => addr,
+                None if needs_hidden_iostat => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     let zero = b.const_i32(0);
                     b.store(zero, tmp);
                     tmp
                 }
-                (None, None) => b.const_i64(0),
+                None => b.const_i64(0),
             };
             let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
 
@@ -6831,19 +8139,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let zero_iomsg_len = b.const_i64(0);
             let (iomsg_arg_ptr, read_iomsg_ptr, read_iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
-                let (ptr, len) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &c.value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
                 (arg_ptr, ptr, len)
             } else {
                 (null_char_slot_arg(b), null_iomsg_data, zero_iomsg_len)
             };
 
-            if lower_namelist_read_stmt(b, ctx, controls, iostat_addr, err_label) {
+            if lower_namelist_read_stmt(
+                b,
+                ctx,
+                controls,
+                iostat_addr,
+                end_label,
+                err_label,
+                user_iostat,
+            ) {
                 return;
             }
 
@@ -6876,7 +8186,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             size_addr,
                         );
                     }
-                    lower_read_err_branch(b, ctx, err_label, iostat_addr);
+                    lower_read_status_branches(
+                        b,
+                        ctx,
+                        end_label,
+                        err_label,
+                        iostat_addr,
+                        user_iostat,
+                    );
                     return;
                 }
             }
@@ -6909,7 +8226,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 iomsg_arg_ptr,
                 read_iomsg_len,
             ) {
-                lower_read_err_branch(b, ctx, err_label, iostat_addr);
+                lower_read_status_branches(
+                    b,
+                    ctx,
+                    end_label,
+                    err_label,
+                    iostat_addr,
+                    user_iostat,
+                );
                 return;
             }
             if is_list_directed {
@@ -6944,7 +8268,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     size_addr,
                 );
             }
-            lower_read_err_branch(b, ctx, err_label, iostat_addr);
+            lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
 
         Stmt::Inquire { specs, .. } => {
@@ -6984,13 +8308,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             let lower_string_spec = |b: &mut FuncBuilder, needle: &str| -> (ValueId, ValueId) {
                 if let Some(spec) = spec_by_keyword(needle) {
-                    lower_string_expr_with_layouts(
-                        b,
-                        &ctx.locals,
-                        &spec.value,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                    )
+                    lower_string_expr_ctx(b, ctx, &spec.value)
                 } else {
                     (null, zero_len)
                 }
@@ -7038,13 +8356,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if let Some(fs) = file_spec {
-                let (fptr, flen) = lower_string_expr_with_layouts(
-                    b,
-                    &ctx.locals,
-                    &fs.value,
-                    ctx.st,
-                    Some(ctx.type_layouts),
-                );
+                let (fptr, flen) = lower_string_expr_ctx(b, ctx, &fs.value);
                 b.call(
                     FuncRef::External("afs_inquire_file".into()),
                     vec![
@@ -7260,11 +8572,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         && remap_args.iter().all(|a| {
                             matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. })
                         });
-                    if is_remap_target
-                        && all_ranges
-                        && lower_rank_remap_pointer_assignment(b, ctx, &tgt_key, &remap_args, value)
-                    {
-                        return;
+                    if is_remap_target && all_ranges {
+                        if lower_bounds_remap_pointer_assignment(
+                            b,
+                            ctx,
+                            &tgt_key,
+                            &remap_args,
+                            value,
+                        ) || lower_rank_remap_pointer_assignment(
+                            b,
+                            ctx,
+                            &tgt_key,
+                            &remap_args,
+                            value,
+                        ) {
+                            return;
+                        }
+                        eprintln!(
+                            "armfortas: error: {}:{}: pointer bounds remapping shape is not implemented yet",
+                            stmt.span.start.line, stmt.span.start.col
+                        );
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(1);
                     }
                 }
             }
@@ -7653,9 +8982,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 return;
             }
 
-            // Handle section-RHS: pa => ia(lo:hi).  The RHS is a
-            // FunctionCall{Name(arr), [Range(lo,hi)]}.  Build a
-            // descriptor pointing at arr(lo) with extent hi-lo+1.
+            // Handle section-RHS: pa => ia(lo:hi:stride). Reuse the
+            // section descriptor builder so extent and memory stride stay
+            // tied to the actual section triplet.
             if let Expr::FunctionCall {
                 callee,
                 args: val_args,
@@ -7664,107 +8993,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if let Expr::Name { name: arr_name } = &callee.node {
                     let arr_key = arr_name.to_lowercase();
                     if let Some(arr_info) = ctx.locals.get(&arr_key).cloned() {
-                        if (!arr_info.dims.is_empty() || arr_info.allocatable)
-                            && val_args.len() == 1
+                        if local_uses_array_descriptor(&tgt_info)
+                            && (!arr_info.dims.is_empty()
+                                || arr_info.allocatable
+                                || arr_info.descriptor_arg)
+                            && val_args
+                                .iter()
+                                .any(|arg| {
+                                    matches!(
+                                        arg.value,
+                                        crate::ast::expr::SectionSubscript::Range { .. }
+                                    )
+                                })
                         {
-                            if let crate::ast::expr::SectionSubscript::Range {
-                                start,
-                                end,
-                                stride: _,
-                            } = &val_args[0].value
-                            {
-                                let base = array_data_ptr_for_call(b, &arr_info);
-                                let lo = if let Some(se) = start {
-                                    let v = super::expr::lower_expr_ctx(b, ctx, se);
-                                    match b.func().value_type(v) {
-                                        Some(IrType::Int(IntWidth::I64)) => v,
-                                        _ => b.int_extend(v, IntWidth::I64, true),
-                                    }
-                                } else {
-                                    b.const_i64(1)
-                                };
-                                let hi = if let Some(ee) = end {
-                                    let v = super::expr::lower_expr_ctx(b, ctx, ee);
-                                    match b.func().value_type(v) {
-                                        Some(IrType::Int(IntWidth::I64)) => v,
-                                        _ => b.int_extend(v, IntWidth::I64, true),
-                                    }
-                                } else {
-                                    array_total_elems_value(b, &arr_info)
-                                };
-                                // Build a descriptor in the pointer's slot.
-                                let desc = array_descriptor_addr(b, &tgt_info);
-                                let zero32 = b.const_i32(0);
-                                let sz384 = b.const_i64(384);
-                                b.call(
-                                    FuncRef::External("memset".into()),
-                                    vec![desc, zero32, sz384],
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                );
-                                // base_addr: base + (lo - 1) * elem_size
-                                let one = b.const_i64(1);
-                                let lo_0 = b.isub(lo, one);
-                                let elem_bytes =
-                                    b.const_i64(ir_scalar_byte_size(&arr_info.ty, ctx.layout));
-                                let byte_off = b.imul(lo_0, elem_bytes);
-                                let slice_base =
-                                    b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    0,
-                                    IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                    slice_base,
-                                );
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    8,
-                                    IrType::Int(IntWidth::I64),
-                                    elem_bytes,
-                                );
-                                let rank = b.const_i32(1);
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    16,
-                                    IrType::Int(IntWidth::I32),
-                                    rank,
-                                );
-                                let flags = b.const_i32(2);
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    20,
-                                    IrType::Int(IntWidth::I32),
-                                    flags,
-                                );
-                                // dim[0]: lower=1, upper=extent, stride=1
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    24,
-                                    IrType::Int(IntWidth::I64),
-                                    one,
-                                );
-                                let extent = b.isub(hi, lo);
-                                let extent1 = b.iadd(extent, one);
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    32,
-                                    IrType::Int(IntWidth::I64),
-                                    extent1,
-                                );
-                                store_byte_aggregate_field(
-                                    b,
-                                    desc,
-                                    40,
-                                    IrType::Int(IntWidth::I64),
-                                    one,
-                                );
-                                return;
-                            }
+                            let src_desc = lower_array_section(
+                                b,
+                                &ctx.locals,
+                                &arr_info,
+                                val_args,
+                                ctx.st,
+                                Some(ctx.type_layouts),
+                            );
+                            let tgt_desc = array_descriptor_addr(b, &tgt_info);
+                            let size = b.const_i64(384);
+                            b.call(
+                                FuncRef::External("memcpy".into()),
+                                vec![tgt_desc, src_desc, size],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+                            return;
                         }
                     }
                 }

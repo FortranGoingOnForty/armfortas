@@ -730,7 +730,7 @@ impl<'a> Parser<'a> {
         Ok(AcValue::Expr(expr))
     }
 
-    fn try_parse_implied_do(&mut self) -> Result<AcValue, ParseError> {
+    pub(super) fn try_parse_implied_do(&mut self) -> Result<AcValue, ParseError> {
         self.expect(&TokenKind::LParen)?;
 
         // Parse value list (one or more expressions separated by commas).

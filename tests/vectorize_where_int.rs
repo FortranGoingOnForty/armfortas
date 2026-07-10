@@ -60,5 +60,6 @@ fn o3_vectorizes_where_block_int() {
         .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(trimmed.len(), 1, "expected one output line:\n{}", stdout);
-    assert_eq!(trimmed[0], "1 16 1 16", "WHERE int wrong: {:?}", trimmed[0]);
+    let fields: Vec<&str> = trimmed[0].split_whitespace().collect();
+    assert_eq!(fields, ["1", "16", "1", "16"], "WHERE int wrong: {:?}", trimmed[0]);
 }

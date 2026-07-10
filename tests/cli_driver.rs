@@ -7,8 +7,9 @@
 //! in-process API call wouldn't see.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
@@ -952,6 +953,81 @@ fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
     );
 
     let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn nonadvancing_a1_read_returns_before_newline_or_eof() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nonadvancing_a1_read_returns_before_newline_or_eof count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: ios, n\n  character(len=1) :: ch\n  read(*, '(A1)', advance='no', iostat=ios, size=n) ch\n  write(*, '(a,i0)') 'IOS=', ios\n  write(*, '(a,i0)') 'N=', n\n  write(*, '(a,a)') 'CH=', ch\nend program\n",
+        "nonadvancing_a1_open_stdin.f90",
+    );
+    let out = unique_path("nonadvancing_a1_open_stdin", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nonadvancing open-stdin compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nonadvancing open-stdin compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut child = Command::new(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("nonadvancing open-stdin run failed to spawn");
+    let mut stdin = child.stdin.take().expect("child stdin must be piped");
+    stdin
+        .write_all(b"Z")
+        .expect("cannot write one byte to child stdin");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if child
+            .try_wait()
+            .expect("cannot poll nonadvancing open-stdin child")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("nonadvancing A1 read blocked waiting for newline or EOF");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    drop(stdin);
+
+    let run = child
+        .wait_with_output()
+        .expect("cannot collect nonadvancing open-stdin output");
+    assert!(
+        run.status.success(),
+        "nonadvancing open-stdin run failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("IOS=0"), "expected ios=0, got: {}", stdout);
+    assert!(stdout.contains("N=1"), "expected size=1, got: {}", stdout);
+    assert!(
+        stdout.contains("CH=Z"),
+        "expected character Z, got: {}",
+        stdout
+    );
+
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
@@ -9086,13 +9162,14 @@ fn pointer_dummy_deallocate_and_nullify_write_back_to_actual_slot() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("COUNT 1"),
+        fields.windows(2).any(|w| w == ["COUNT", "1"]),
         "pointer dummy deallocate should run exactly once: {}",
         stdout
     );
     assert!(
-        stdout.contains("CACHED -1"),
+        fields.windows(2).any(|w| w == ["CACHED", "-1"]),
         "pointer dummy deallocate/nullify should disassociate the caller slot: {}",
         stdout
     );
@@ -10854,8 +10931,9 @@ fn allocatable_two_dimensional_element_actuals_update_storage() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("11 22") || stdout.contains("11  22"),
+        fields == ["11", "22"],
         "unexpected allocatable 2d element-actual output: {}",
         stdout
     );
@@ -28604,13 +28682,14 @@ fn fixed_len_allocatable_char_array_dummy_round_trips_through_amod_import_and_ru
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("COUNT= 2") || stdout.contains("COUNT=2"),
+        fields.windows(2).any(|w| w == ["COUNT=", "2"]),
         "expected element count to survive round-trip: {}",
         stdout
     );
     assert!(
-        stdout.contains("TOK1=<echo>") && stdout.contains("TOK2=<foo[1]>"),
+        fields.contains(&"TOK1=<echo>") && fields.contains(&"TOK2=<foo[1]>"),
         "fixed-length allocatable char array dummy should preserve element text across .amod import: {}",
         stdout
     );
@@ -31635,8 +31714,9 @@ fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("1 4") || stdout.contains("1  4"),
+        fields == ["1", "4"],
         "unexpected saved derived global alignment output: {}",
         stdout
     );
@@ -32778,13 +32858,14 @@ fn sibling_extensions_keep_distinct_runtime_tags_across_tus() {
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        stdout.contains("ASSOC F"),
+        fields.windows(2).any(|w| w == ["ASSOC", "F"]),
         "sibling extensions should not share runtime tags: {}",
         stdout
     );
     assert!(
-        stdout.contains("ORIGIN 7"),
+        fields.windows(2).any(|w| w == ["ORIGIN", "7"]),
         "unexpected sibling type-tag output: {}",
         stdout
     );
@@ -47171,8 +47252,9 @@ fn array_result_local_passed_to_by_ref_dummy_uses_base_addr() {
         .output()
         .expect("array result by-ref dummy run failed");
     let stdout = String::from_utf8_lossy(&run.stdout);
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert!(
-        run.status.success() && stdout.contains("12 20"),
+        run.status.success() && fields == ["12", "20"],
         "array result by-ref dummy run failed: status={:?} stdout={} stderr={}",
         run.status,
         stdout,

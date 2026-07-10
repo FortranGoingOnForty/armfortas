@@ -173,13 +173,27 @@ fn multifile_test_flags(
     let output = run_binary(&binary);
 
     assert!(
-        output.contains(expected_substring),
+        output_contains_expected(&output, expected_substring),
         "expected '{}' in output, got:\n{}",
         expected_substring,
         output
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn output_contains_expected(output: &str, expected: &str) -> bool {
+    if output.contains(expected) {
+        return true;
+    }
+    let expected_fields: Vec<_> = expected.split_whitespace().collect();
+    if expected_fields.len() <= 1 {
+        return false;
+    }
+    let output_fields: Vec<_> = output.split_whitespace().collect();
+    output_fields
+        .windows(expected_fields.len())
+        .any(|window| window == expected_fields.as_slice())
 }
 
 // ---- Tests ----
@@ -214,6 +228,163 @@ fn module_with_allocatable_array() {
         "program p\n  use arr_mod\n  call init()\n  print *, buf(1), buf(2), buf(3)\nend program\n",
         "10 20 30",
     );
+}
+
+// Regression: gfortran/flang accept Fortran sources and prebuilt objects
+// mixed on one command line, e.g. `fc main.f90 mod.o -o prog`. fortsh's
+// unit-test rules use exactly this shape (`fc test.f90 build/foo.o -o test`).
+// armfortas used to reject it ("mixing Fortran sources with prebuilt
+// object/archive inputs is not yet supported"); now it compiles the sources
+// and links them with the artifacts in command order.
+#[test]
+fn mixed_source_and_object_in_one_invocation() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=mixed_source_and_object_in_one_invocation count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("mixmod.f90");
+    let main_f90 = dir.join("mixmain.f90");
+    let mod_o = dir.join("mixmod.o");
+    let binary = dir.join("mixbin");
+
+    std::fs::write(
+        &mod_f90,
+        "module mixmod\n  implicit none\ncontains\n  integer function answer() result(r)\n    r = 42\n  end function\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use mixmod\n  print *, answer()\nend program\n",
+    )
+    .unwrap();
+
+    // Compile the module to an object up front.
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+
+    // The fix under test: one invocation with a SOURCE and an OBJECT.
+    let result = Command::new(&compiler)
+        .arg(&main_f90)
+        .arg(&mod_o)
+        .arg("-o")
+        .arg(&binary)
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("compiler launch failed for mixed source+object");
+    assert!(
+        result.status.success(),
+        "mixed source+object invocation failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("42"),
+        "expected '42' in output, got:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncated_amod_is_rejected_loudly() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=truncated_amod_is_rejected_loudly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_f90 = dir.join("provider.f90");
+    let provider_o = dir.join("provider.o");
+    let consumer_f90 = dir.join("consumer.f90");
+    let consumer_o = dir.join("consumer.o");
+
+    std::fs::write(
+        &provider_f90,
+        "module provider\n  implicit none\n  integer, parameter :: answer = 41\nend module\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &provider_f90, &provider_o, None);
+
+    let amod_path = dir.join("provider.amod");
+    let mut amod_text = std::fs::read_to_string(&amod_path).expect("missing provider.amod");
+    let truncate_at = amod_text
+        .find("@param answer")
+        .expect("provider.amod should contain answer parameter");
+    amod_text.truncate(truncate_at);
+    std::fs::write(&amod_path, amod_text).expect("cannot corrupt provider.amod");
+
+    std::fs::write(
+        &consumer_f90,
+        "program p\n  use provider\n  implicit none\n  print *, answer\nend program\n",
+    )
+    .unwrap();
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg(&consumer_f90)
+        .arg("-c")
+        .arg("-o")
+        .arg(&consumer_o)
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("consumer compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "consumer unexpectedly accepted a corrupt .amod"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("corrupt .amod file"),
+        "expected corrupt .amod diagnostic, got:\n{}",
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn amod_omits_stale_abi_stamp() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=amod_omits_stale_abi_stamp count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let module_f90 = dir.join("target_stamp.f90");
+    let module_o = dir.join("target_stamp.o");
+
+    std::fs::write(
+        &module_f90,
+        "module target_stamp\n  implicit none\n  integer, parameter :: answer = 42\nend module\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &module_f90, &module_o, None);
+
+    let amod =
+        std::fs::read_to_string(dir.join("target_stamp.amod")).expect("missing target_stamp.amod");
+    assert!(
+        !amod.lines().any(|line| line.starts_with("# abi:")),
+        ".amod should not stamp a non-authoritative ABI line:\n{}",
+        amod
+    );
+    assert!(
+        !amod.contains("cc=aapcs64") && !amod.contains("@abi pass="),
+        ".amod should not stamp target-specific procedure ABI annotations:\n{}",
+        amod
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -262,6 +433,99 @@ fn use_only_filtering() {
         "program p\n  use big_mod, only: beta\n  print *, beta\nend program\n",
         "20",
     );
+}
+
+#[test]
+fn use_only_excludes_defined_assignment_from_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=use_only_excludes_defined_assignment_from_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let t_f90 = dir.join("t.f90");
+    let e_f90 = dir.join("e.f90");
+    let main_f90 = dir.join("main.f90");
+    let t_o = dir.join("t.o");
+    let e_o = dir.join("e.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &t_f90,
+        r#"module t
+  implicit none
+  type :: v
+    integer, allocatable :: a(:)
+  end type
+  interface assignment(=)
+    module procedure asn
+  end interface
+contains
+  function mk() result(r)
+    type(v) :: r
+    allocate(r%a(1))
+    r%a(1) = 9
+  end function
+
+  subroutine asn(lhs, rhs)
+    type(v), intent(out) :: lhs
+    type(v), intent(in) :: rhs
+    if (allocated(rhs%a)) print '(a)', 'defined assignment fired'
+  end subroutine
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &e_f90,
+        r#"module e
+  use t, only: v, mk
+  implicit none
+contains
+  function go() result(r)
+    type(v) :: r
+    r = mk()
+  end function
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use t, only: v
+  use e, only: go
+  implicit none
+  type(v) :: x
+  x = go()
+  print '(a,l1)', 'alloc=', allocated(x%a)
+  if (.not. allocated(x%a)) stop 1
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &t_f90, &t_o, None);
+    compile_file(&compiler, &e_f90, &e_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&t_o, &e_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("alloc=T"),
+        "expected intrinsic assignment to preserve allocatable component, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("defined assignment fired"),
+        "defined assignment leaked through USE ONLY:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

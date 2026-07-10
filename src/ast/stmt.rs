@@ -45,6 +45,7 @@ pub enum Stmt {
         end: Option<SpannedExpr>,
         step: Option<SpannedExpr>,
         body: Vec<SpannedStmt>,
+        shared_terminating_label: bool,
     },
     DoWhile {
         name: Option<String>,

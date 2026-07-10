@@ -12,6 +12,7 @@ pub mod elf_crt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
@@ -19,6 +20,8 @@ use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize, SourceForm};
 use crate::parser::Parser;
 use crate::sema::{resolve, validate};
+
+static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Optimization level requested at the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1300,12 +1303,17 @@ pub fn execute(opts: &Options) -> Result<(), String> {
         }
         (false, true) => {
             validate_link_only_inputs(opts)?;
-            let output = opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"));
+            let output = opts
+                .output
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("a.out"));
             link_inputs(&inputs, &output, opts)
         }
-        (true, true) => Err(
-            "mixing Fortran sources with prebuilt object/archive inputs is not yet supported; compile the sources first and then link the resulting objects".into(),
-        ),
+        // Mixed `foo.f90 bar.o libbaz.a -o prog`: gfortran/flang accept it:
+        // compile the sources, then link the resulting objects together with
+        // the prebuilt artifacts (in command order). compile_multi handles the
+        // partition.
+        (true, true) => compile_multi(opts),
         (false, false) => unreachable!("parse_cli guarantees at least one input"),
     }
 }
@@ -1410,6 +1418,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let mut pp_config = crate::preprocess::PreprocConfig {
         filename: opts.input.to_str().unwrap_or("<input>").to_string(),
         fixed_form: matches!(source_form, SourceForm::FixedForm),
+        cpp_compat: opts.cpp_compat,
         // Share `-I` paths with the preprocessor so `#include "foo.inc"`
         // can find headers (e.g. stdlib's `include/macros.inc`).  The
         // resolver searches relative-to-current-file first, then this
@@ -1719,7 +1728,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     //   (1) `ld` embeds the .o path in the linked binary's symbol
     //       table (the OSO debug stab), so two back-to-back compiles
     //       of the same source to the same output path must use the
-    //       same .o name — otherwise the embedded string varies and
+    //       same .o name; otherwise the embedded string varies and
     //       reproducible-build tests fail.  PID is unsafe here
     //       because each compile_binary call spawns a fresh
     //       subprocess with a different PID.
@@ -1727,20 +1736,27 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     //       same basename (e.g. both writing `mod.o` to different
     //       unique-dir test outputs) must NOT race on the same temp
     //       file.  Output stem alone is therefore not enough.
-    // The cheap fix that satisfies both: derive a stable hash of the
-    // full output path with FNV-1a and use it in the temp basename.
-    // Same output path → same hash → same .o (deterministic across
-    // subprocesses).  Different output paths → different hashes → no
-    // collision.  std::collections::hash_map::DefaultHasher uses a
-    // per-process random seed and would defeat (1).
+    // Hash the absolute output identity with FNV-1a and use it in the
+    // temp basename. Same output path means same hash and deterministic
+    // OSO strings; same relative `-o t` from different directories means
+    // different hashes and no cross-process temp-object collision.
+    // std::collections::hash_map::DefaultHasher uses a per-process random
+    // seed and would defeat (1).
     let out_path = opts.output_path();
+    let temp_identity_path = if out_path.is_absolute() {
+        out_path.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot determine current directory for temp output: {}", e))?
+            .join(&out_path)
+    };
     let stem = out_path
         .file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "afs".to_string());
     let token = {
-        let bytes = out_path.as_os_str().as_encoded_bytes();
+        let bytes = temp_identity_path.as_os_str().as_encoded_bytes();
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in bytes {
             h ^= b as u64;
@@ -1797,15 +1813,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                     &local_char_len_star_params,
                 );
                 let amod_path = module_artifact_dir.join(format!("{}.amod", mod_key));
-                fs::write(&amod_path, &amod_text)
-                    .map_err(|e| format!("cannot write '{}': {}", amod_path.display(), e))?;
+                write_module_file_atomic(&amod_path, &amod_text)?;
                 // `.amod` remains the ARMFORTAS module ABI file. A
                 // byte-identical `.mod` alias keeps conventional Fortran
                 // build systems such as CMake able to track module
                 // dependencies for unknown compilers.
                 let mod_path = module_artifact_dir.join(format!("{}.mod", mod_key));
-                fs::write(&mod_path, &amod_text)
-                    .map_err(|e| format!("cannot write '{}': {}", mod_path.display(), e))?;
+                write_module_file_atomic(&mod_path, &amod_text)?;
                 if opts.verbose {
                     eprintln!(" amod: {}", amod_path.display());
                 }
@@ -1975,6 +1989,28 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
+fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("module");
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), id));
+
+    fs::write(&tmp, contents)
+        .map_err(|e| format!("cannot write temporary '{}': {}", tmp.display(), e))?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "cannot replace '{}' atomically: {}",
+            path.display(),
+            e
+        ));
+    }
+    Ok(())
+}
+
 fn write_dependency_file(opts: &Options, output: &Path) -> Result<(), String> {
     if !opts.emit_depfile && opts.depfile.is_none() {
         return Ok(());
@@ -2075,7 +2111,11 @@ pub(crate) fn link_inputs_elf(
         );
     }
 
-    let pie = !opts.no_pie;
+    let linker_override = afs_ld_override();
+    // afs-ld's ELF backend currently emits ET_EXEC, not PIE. Route its
+    // links through the matching crt1/crtbegin pair instead of combining
+    // Scrt1/crtbeginS with a non-PIE output.
+    let pie = !opts.no_pie && linker_override.is_none();
     let mut override_dirs = opts.crt_search_dirs.clone();
     // Colon-separated, PATH-style: NixOS needs two crt roots (crt1/
     // crti/crtn from glibc, crtbegin/crtend from the gcc store path).
@@ -2104,10 +2144,8 @@ pub(crate) fn link_inputs_elf(
 
     // x16: honor the AFS_LD routing on ELF targets too — previously
     // this path went straight to the system linker and
-    // afs_ld_override() was consulted only for Mach-O. The substitute
-    // linker receives the same ld-compatible argument list (that flag
-    // surface IS the drop-in contract afs-ld's ELF support targets).
-    let linker = afs_ld_override().unwrap_or_else(|| "ld".into());
+    // afs_ld_override() was consulted only for Mach-O.
+    let linker = linker_override.unwrap_or_else(|| "ld".into());
     if opts.verbose {
         print_verbose_command_line(&linker, &args);
     }
@@ -2342,8 +2380,23 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         return Err("-o cannot be used with -c and multiple input files".into());
     }
 
-    // Scan dependencies.
-    let file_deps: Vec<dep_scan::FileDeps> = all_inputs
+    // Partition into Fortran sources (to compile) and prebuilt link
+    // artifacts (objects/archives to pass straight to the linker). gfortran
+    // accepts them mixed on one command line, e.g. the unit-test rule
+    // `fc test.f90 build/foo.o build/bar.o -o test`.
+    let source_inputs: Vec<PathBuf> = all_inputs
+        .iter()
+        .filter(|p| classify_cli_input(p) == CliInputKind::FortranSource)
+        .cloned()
+        .collect();
+    let artifact_inputs: Vec<PathBuf> = all_inputs
+        .iter()
+        .filter(|p| classify_cli_input(p) == CliInputKind::LinkArtifact)
+        .cloned()
+        .collect();
+
+    // Scan dependencies (sources only).
+    let file_deps: Vec<dep_scan::FileDeps> = source_inputs
         .iter()
         .map(|p| dep_scan::scan_file(p))
         .collect::<Result<Vec<_>, _>>()?;
@@ -2361,6 +2414,7 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     };
 
     let mut object_files: Vec<PathBuf> = Vec::new();
+    let mut src_to_obj: Vec<(PathBuf, PathBuf)> = Vec::new();
     for &idx in &order {
         let src = &file_deps[idx].path;
         let obj_path = if opts.emit_obj {
@@ -2415,7 +2469,8 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         };
         compile(&sub_opts)?;
         if !opts.emit_obj {
-            object_files.push(obj_path);
+            object_files.push(obj_path.clone());
+            src_to_obj.push((src.clone(), obj_path));
         }
     }
 
@@ -2423,12 +2478,34 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         return Ok(());
     }
 
+    // Assemble the link list in original command order: each source becomes
+    // its compiled object; prebuilt artifacts pass straight through. This
+    // preserves the ordering callers rely on (objects before archives).
+    let link_list: Vec<PathBuf> = if artifact_inputs.is_empty() {
+        object_files
+    } else {
+        all_inputs
+            .iter()
+            .map(|input| {
+                if classify_cli_input(input) == CliInputKind::LinkArtifact {
+                    input.clone()
+                } else {
+                    src_to_obj
+                        .iter()
+                        .find(|(src, _)| src == input)
+                        .map(|(_, obj)| obj.clone())
+                        .unwrap_or_else(|| input.clone())
+                }
+            })
+            .collect()
+    };
+
     // Link all object files.
     let output = opts
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"));
-    link_multi(&object_files, &output, opts)?;
+    link_multi(&link_list, &output, opts)?;
 
     // Cleanup.
     if let Some(tmp_dir) = tmp_dir {

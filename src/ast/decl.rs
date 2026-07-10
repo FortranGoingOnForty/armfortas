@@ -274,5 +274,15 @@ pub struct ImplicitSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataSet {
     pub objects: Vec<SpannedExpr>,
-    pub values: Vec<SpannedExpr>,
+    pub values: Vec<DataValue>,
+}
+
+/// DATA initializer item.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataValue {
+    Expr(SpannedExpr),
+    Repeat {
+        count: SpannedExpr,
+        value: SpannedExpr,
+    },
 }

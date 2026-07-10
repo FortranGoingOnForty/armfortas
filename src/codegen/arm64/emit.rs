@@ -1594,8 +1594,8 @@ mod tests {
         }]);
 
         assert!(
-            asm.contains(".p2align 3\n_history:"),
-            "byte-array globals that model descriptors/derived storage need 8-byte alignment:\n{}",
+            asm.contains(".zerofill __DATA,__bss,_history,400,4"),
+            "byte-array globals should reserve zero-fill storage with 16-byte alignment:\n{}",
             asm
         );
     }
@@ -1612,8 +1612,8 @@ mod tests {
         }]);
 
         assert!(
-            asm.contains("_command_cache:\n    .space 1056"),
-            "nested byte-array globals should reserve their full storage size:\n{}",
+            asm.contains(".zerofill __DATA,__bss,_command_cache,1056,4"),
+            "nested byte-array globals should reserve their full zero-fill size:\n{}",
             asm
         );
     }

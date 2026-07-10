@@ -232,7 +232,7 @@ pub(crate) fn alloc_decls(
                                 .as_ref()
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
-                            is_class: false,
+                            is_class: matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar),
                             logical_kind: None,
                             last_dim_assumed_size: false,
                         },
@@ -278,40 +278,38 @@ pub(crate) fn alloc_decls(
                     }
                 }
                 if is_pointer_attr
-                    && matches!(type_spec, TypeSpec::Class(_))
+                    && matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar)
                     && array_spec.is_none()
                 {
-                    if let TypeSpec::Class(_) = type_spec {
-                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
-                        let addr = b.alloca(desc_ty);
-                        let zero = b.const_i32(0);
-                        let size384 = b.const_i64(384);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![addr, zero, size384],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
-                        locals.insert(
-                            key,
-                            LocalInfo {
-                                addr,
-                                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                dims: vec![],
-                                allocatable: false,
-                                descriptor_arg: true,
-                                by_ref: false,
-                                char_kind: CharKind::None,
-                                derived_type: declared_derived_info_name.clone(),
-                                inline_const: None,
-                                is_pointer: true,
-                                runtime_dim_upper: vec![],
-                                is_class: true,
-                                logical_kind: None,
-                                last_dim_assumed_size: false,
-                            },
-                        );
-                        continue;
-                    }
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let addr = b.alloca(desc_ty);
+                    let zero = b.const_i32(0);
+                    let size384 = b.const_i64(384);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![addr, zero, size384],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    locals.insert(
+                        key,
+                        LocalInfo {
+                            addr,
+                            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: true,
+                            by_ref: false,
+                            char_kind: CharKind::None,
+                            derived_type: declared_derived_info_name.clone(),
+                            inline_const: None,
+                            is_pointer: true,
+                            runtime_dim_upper: vec![],
+                            is_class: true,
+                            logical_kind: None,
+                            last_dim_assumed_size: false,
+                        },
+                    );
+                    continue;
                 }
                 if is_deferred_char && (is_allocatable || is_pointer_attr) && array_spec.is_none() {
                     // Deferred-length allocatable/pointer scalar character:
@@ -876,7 +874,7 @@ pub(crate) fn alloc_decls(
                                 .as_ref()
                                 .map(|specs| vec![None; specs.len()])
                                 .unwrap_or_default(),
-                            is_class: matches!(type_spec, TypeSpec::Class(_)),
+                            is_class: matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar),
                             logical_kind: if let TypeSpec::Logical(sel) = type_spec {
                                 Some(extract_kind_with_context(
                                     sel,
@@ -895,6 +893,69 @@ pub(crate) fn alloc_decls(
                     let dims =
                         extract_array_dims_with_init(specs, init_expr, &param_consts, Some(st));
                     let total_size: i64 = dims.iter().map(|(_, size)| *size).product();
+                    if matches!(type_spec, TypeSpec::Character(_)) && char_len.is_none() {
+                        if let Some(len_expr) = runtime_char_len_expr {
+                            let raw_len = super::expr::lower_expr_with_optional_layouts(
+                                b,
+                                locals,
+                                len_expr,
+                                st,
+                                Some(type_layouts),
+                            );
+                            let len_val = clamp_nonnegative_i64(b, raw_len);
+                            let len_addr = b.alloca(IrType::Int(IntWidth::I64));
+                            b.store(len_val, len_addr);
+
+                            let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                            let addr = b.alloca(desc_ty);
+                            let zero = b.const_i32(0);
+                            let size384 = b.const_i64(384);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![addr, zero, size384],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+
+                            let n = b.const_i64(total_size.max(0));
+                            b.call(
+                                FuncRef::External("afs_allocate_1d".into()),
+                                vec![addr, len_val, n],
+                                IrType::Void,
+                            );
+                            rewrite_heap_promoted_declared_bounds(b, addr, &dims);
+
+                            let base = b
+                                .load_typed(addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                            let total_bytes = b.imul(len_val, n);
+                            let space = b.const_i32(b' ' as i32);
+                            b.call(
+                                FuncRef::External("memset".into()),
+                                vec![base, space, total_bytes],
+                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            );
+
+                            locals.insert(
+                                key,
+                                LocalInfo {
+                                    addr,
+                                    ty: IrType::Int(IntWidth::I8),
+                                    dims,
+                                    allocatable: true,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::FixedRuntime { len_addr },
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                    runtime_dim_upper: vec![],
+                                    is_class: false,
+                                    logical_kind: None,
+                                    last_dim_assumed_size: false,
+                                },
+                            );
+                            continue;
+                        }
+                    }
                     let (array_elem_ty, array_derived_type, array_char_kind) =
                         if matches!(type_spec, TypeSpec::Character(_)) {
                             if let Some(len) = char_len {

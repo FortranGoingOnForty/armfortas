@@ -1373,6 +1373,7 @@ impl<'a> Parser<'a> {
                     end: None,
                     step: None,
                     body,
+                    shared_terminating_label: false,
                 },
                 span,
             ));
@@ -1412,6 +1413,7 @@ impl<'a> Parser<'a> {
                 end: Some(do_end),
                 step,
                 body,
+                shared_terminating_label: false,
             },
             span,
         ))
@@ -1435,14 +1437,58 @@ impl<'a> Parser<'a> {
                     .ok()
                     .map(|current| current == label)
                     .unwrap_or(false);
+            let nested_do_shares_terminator =
+                !is_terminator && self.current_stmt_is_do_with_terminating_label(label);
 
-            let stmt = self.parse_stmt()?;
+            let mut stmt = self.parse_stmt()?;
+            if nested_do_shares_terminator {
+                Self::mark_shared_labeled_do(&mut stmt);
+            }
             body.push(stmt);
-            if is_terminator {
+            if is_terminator || nested_do_shares_terminator {
                 break;
             }
         }
         Ok(body)
+    }
+
+    fn current_stmt_is_do_with_terminating_label(&self, label: u64) -> bool {
+        let mut pos = self.pos;
+        if self.tokens.get(pos).map(|t| &t.kind) == Some(&TokenKind::IntegerLiteral) {
+            let Some(next) = self.tokens.get(pos + 1) else {
+                return false;
+            };
+            if matches!(
+                next.kind,
+                TokenKind::Identifier | TokenKind::IntegerLiteral | TokenKind::LParen
+            ) {
+                pos += 1;
+            }
+        }
+
+        let Some(tok) = self.tokens.get(pos) else {
+            return false;
+        };
+        if tok.kind != TokenKind::Identifier || !tok.text.eq_ignore_ascii_case("do") {
+            return false;
+        }
+
+        self.tokens
+            .get(pos + 1)
+            .filter(|next| next.kind == TokenKind::IntegerLiteral)
+            .and_then(|next| next.text.parse::<u64>().ok())
+            == Some(label)
+    }
+
+    fn mark_shared_labeled_do(stmt: &mut SpannedStmt) {
+        match &mut stmt.node {
+            Stmt::DoLoop {
+                shared_terminating_label,
+                ..
+            } => *shared_terminating_label = true,
+            Stmt::Labeled { stmt: inner, .. } => Self::mark_shared_labeled_do(inner),
+            _ => {}
+        }
     }
 
     // ---- I/O statements ----
@@ -1954,6 +2000,68 @@ mod tests {
         } else {
             panic!("not DoLoop");
         }
+    }
+
+    #[test]
+    fn do_shared_terminating_label() {
+        let s = parse_one("do 10 i = 1, 2\n  do 10 j = 1, 2\n10 continue\n");
+        let Stmt::DoLoop {
+            var: outer_var,
+            body: outer_body,
+            ..
+        } = &s.node
+        else {
+            panic!("not outer DoLoop");
+        };
+        assert_eq!(outer_var.as_deref(), Some("i"));
+        assert_eq!(outer_body.len(), 1);
+
+        let Stmt::DoLoop {
+            var: inner_var,
+            body: inner_body,
+            shared_terminating_label,
+            ..
+        } = &outer_body[0].node
+        else {
+            panic!("not inner DoLoop");
+        };
+        assert_eq!(inner_var.as_deref(), Some("j"));
+        assert!(*shared_terminating_label);
+        assert_eq!(inner_body.len(), 1);
+        assert!(matches!(inner_body[0].node, Stmt::Labeled { label: 10, .. }));
+    }
+
+    #[test]
+    fn do_shared_terminating_label_three_deep() {
+        let s = parse_one(
+            "do 10 i = 1, 2\n  do 10 j = 1, 2\n    do 10 k = 1, 2\n10 continue\n",
+        );
+        let Stmt::DoLoop {
+            body: outer_body, ..
+        } = &s.node
+        else {
+            panic!("not outer DoLoop");
+        };
+        let Stmt::DoLoop {
+            body: middle_body,
+            shared_terminating_label: middle_shared,
+            ..
+        } = &outer_body[0].node
+        else {
+            panic!("not middle DoLoop");
+        };
+        let Stmt::DoLoop {
+            shared_terminating_label: inner_shared,
+            body: inner_body,
+            ..
+        } = &middle_body[0].node
+        else {
+            panic!("not inner DoLoop");
+        };
+        assert!(*middle_shared);
+        assert!(*inner_shared);
+        assert_eq!(inner_body.len(), 1);
+        assert!(matches!(inner_body[0].node, Stmt::Labeled { label: 10, .. }));
     }
 
     #[test]
