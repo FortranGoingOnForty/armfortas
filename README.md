@@ -248,10 +248,11 @@ The two surfaces are meant to converge on syntax and expectations, not drift
 into separate testing dialects.
 
 All root end-to-end tests run at every optimization level (`-O0` through
-`-Ofast`). Programs with known bugs carry `! XFAIL:` annotations whose reason
-starts with a stable `XFAIL-NNN` debt ID from `.docs/audits/xfail-debt.md` or an
-`X64-O0-NNN` sweep finding. They count as passing until the bug is fixed, at
-which point CI catches the unexpected success.
+`-Ofast`). Programs and imported compatibility fixtures with known bugs carry
+`! XFAIL:` annotations whose reason starts with a stable `XFAIL-NNN` debt ID
+from `.docs/audits/xfail-debt.md` or an `X64-O0-NNN` sweep finding. They count
+as passing until the bug is fixed, at which point CI catches the unexpected
+success.
 
 ## Targets
 

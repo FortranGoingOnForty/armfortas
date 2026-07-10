@@ -3032,39 +3032,40 @@ fn xfail_annotations_reference_tracked_debt() {
         .collect();
     let tracked_ids: BTreeSet<_> = registry_ids.union(&sweep_ids).cloned().collect();
 
-    let test_dir = find_test_programs();
     let mut referenced_registry_ids = BTreeSet::new();
-    for entry in fs::read_dir(&test_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-    {
-        let path = entry.path();
-        if !is_test_program_source(&path) {
-            continue;
-        }
-        let source = fs::read_to_string(&path).unwrap_or_default();
-        for (line_index, line) in source.lines().enumerate() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with("! XFAIL:") && !trimmed.starts_with("! XFAIL(") {
+    for source_dir in [find_test_programs(), find_gfortran_dg_fixtures()] {
+        for entry in fs::read_dir(&source_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+        {
+            let path = entry.path();
+            if !is_test_program_source(&path) {
                 continue;
             }
-            let ids = xfail_reference_ids(trimmed);
-            assert!(
-                !ids.is_empty(),
-                "{}:{}: XFAIL has no durable debt reference",
-                path.display(),
-                line_index + 1,
-            );
-            for id in ids {
+            let source = fs::read_to_string(&path).unwrap_or_default();
+            for (line_index, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("! XFAIL:") && !trimmed.starts_with("! XFAIL(") {
+                    continue;
+                }
+                let ids = xfail_reference_ids(trimmed);
                 assert!(
-                    tracked_ids.contains(&id),
-                    "{}:{}: XFAIL references unknown debt ID {}",
+                    !ids.is_empty(),
+                    "{}:{}: XFAIL has no durable debt reference",
                     path.display(),
                     line_index + 1,
-                    id,
                 );
-                if registry_ids.contains(&id) {
-                    referenced_registry_ids.insert(id);
+                for id in ids {
+                    assert!(
+                        tracked_ids.contains(&id),
+                        "{}:{}: XFAIL references unknown debt ID {}",
+                        path.display(),
+                        line_index + 1,
+                        id,
+                    );
+                    if registry_ids.contains(&id) {
+                        referenced_registry_ids.insert(id);
+                    }
                 }
             }
         }

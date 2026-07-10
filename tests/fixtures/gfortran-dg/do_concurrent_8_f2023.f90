@@ -8,7 +8,7 @@
 ! accepts the file with no diagnostic, so the XFAIL fires.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: locality-spec
-! XFAIL: f2023 DO CONCURRENT REDUCE duplicate-locality diagnostic not implemented (l01); see .docs/audits/f2023-feature-matrix.md
+! XFAIL: XFAIL-005 f2023 DO CONCURRENT REDUCE duplicate-locality diagnostic not implemented (l01); see .docs/audits/f2023-feature-matrix.md
 program do_concurrent_complex
   implicit none
   integer :: i, j, k, sum, product
