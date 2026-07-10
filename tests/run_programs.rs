@@ -11,10 +11,10 @@
 //!
 //! ## XFAIL annotations
 //!
-//! A program may carry one or more `! XFAIL: <reason>` lines anywhere in
-//! the source. An XFAIL'd program is *expected* to fail at compile or
-//! runtime (or to mismatch its CHECKs) — it's tracking a known bug. The
-//! harness reports:
+//! A program may carry one or more `! XFAIL: XFAIL-NNN <reason>` lines
+//! anywhere in the source. `X64-O0-NNN` sweep findings are also accepted.
+//! An XFAIL'd program is *expected* to fail at compile or runtime (or to
+//! mismatch its CHECKs) — it's tracking a known bug. The harness reports:
 //!
 //!   * `XFAIL`  — the program failed as expected. Counted as a pass.
 //!   * `XPASS`  — the program unexpectedly succeeded. Counted as a
@@ -24,7 +24,7 @@
 //! XFAIL'd programs are how we capture audit findings as living
 //! regression tests *before* the underlying bug is fixed. Each finding
 //! gets a program in `test_programs/` whose annotation references the
-//! audit ID (`! XFAIL: audit BLOCKING-1 (implied-do negative step)`),
+//! tracked debt ID (`! XFAIL: XFAIL-001 implied-do negative step`),
 //! so a future audit can grep `test_programs/` for the finding ID and
 //! immediately see whether the bug class is covered.
 //!
@@ -193,7 +193,7 @@
 //! This keeps pipeline oracles from checking only "exists" when what we really
 //! need is "exists, stays clean, and stays deterministic".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -698,6 +698,19 @@ fn match_qualified_directive<'a>(
 /// lines. A qualified line whose selectors do not match the active
 /// target behaves as if absent (the program must pass), but its
 /// selector spelling is validated regardless.
+fn xfail_reference_ids(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .filter(|token| {
+            ["XFAIL-", "X64-O0-"].iter().any(|prefix| {
+                token.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.len() >= 3 && suffix.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 fn extract_xfail(
     source: &str,
     filename: &str,
@@ -709,6 +722,13 @@ fn extract_xfail(
         if let Some((is_active, rest)) =
             match_qualified_directive(line, "XFAIL", active, Some(opt_flag), filename, i + 1)?
         {
+            if xfail_reference_ids(rest).is_empty() {
+                return Err(format!(
+                    "{}:{}: XFAIL reason must cite a durable XFAIL-NNN or X64-O0-NNN reference",
+                    filename,
+                    i + 1,
+                ));
+            }
             if is_active && first_active.is_none() {
                 first_active = Some(rest.trim().to_string());
             }
@@ -2984,6 +3004,88 @@ fn test_programs_end_to_end_ofast() {
     }
 }
 
+fn find_audit_file(name: &str) -> PathBuf {
+    for dir in [".docs/audits", "../.docs/audits"] {
+        let path = Path::new(dir).join(name);
+        if path.is_file() {
+            return path;
+        }
+    }
+    panic!("{} not found in tracked audit documents", name);
+}
+
+#[test]
+fn xfail_annotations_reference_tracked_debt() {
+    let registry_path = find_audit_file("xfail-debt.md");
+    let registry = fs::read_to_string(&registry_path).expect("read XFAIL debt registry");
+    let registry_ids: BTreeSet<_> = xfail_reference_ids(&registry)
+        .into_iter()
+        .filter(|id| id.starts_with("XFAIL-"))
+        .collect();
+    assert!(!registry_ids.is_empty(), "XFAIL debt registry has no IDs");
+
+    let sweep_path = find_audit_file("x86_64-o0-sweep.md");
+    let sweep = fs::read_to_string(&sweep_path).expect("read x86 sweep log");
+    let sweep_ids: BTreeSet<_> = xfail_reference_ids(&sweep)
+        .into_iter()
+        .filter(|id| id.starts_with("X64-O0-"))
+        .collect();
+    let tracked_ids: BTreeSet<_> = registry_ids.union(&sweep_ids).cloned().collect();
+
+    let test_dir = find_test_programs();
+    let mut referenced_registry_ids = BTreeSet::new();
+    for entry in fs::read_dir(&test_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+    {
+        let path = entry.path();
+        if !is_test_program_source(&path) {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap_or_default();
+        for (line_index, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("! XFAIL:") && !trimmed.starts_with("! XFAIL(") {
+                continue;
+            }
+            let ids = xfail_reference_ids(trimmed);
+            assert!(
+                !ids.is_empty(),
+                "{}:{}: XFAIL has no durable debt reference",
+                path.display(),
+                line_index + 1,
+            );
+            for id in ids {
+                assert!(
+                    tracked_ids.contains(&id),
+                    "{}:{}: XFAIL references unknown debt ID {}",
+                    path.display(),
+                    line_index + 1,
+                    id,
+                );
+                if registry_ids.contains(&id) {
+                    referenced_registry_ids.insert(id);
+                }
+            }
+        }
+    }
+
+    let fixed_registry_ids: BTreeSet<_> = registry
+        .lines()
+        .filter(|line| line.contains("[FIXED"))
+        .flat_map(xfail_reference_ids)
+        .collect();
+    let orphan_registry_ids: Vec<_> = registry_ids
+        .difference(&referenced_registry_ids)
+        .filter(|id| !fixed_registry_ids.contains(*id))
+        .collect();
+    assert!(
+        orphan_registry_ids.is_empty(),
+        "active XFAIL debt IDs have no annotation: {:?}",
+        orphan_registry_ids,
+    );
+}
+
 /// x07 DoD: every `XFAIL(x86_64*): X64-O0-NNN` annotation in
 /// test_programs/ must reference a finding ID present in the sweep
 /// log, and every finding ID in the log must still have at least one
@@ -2991,18 +3093,7 @@ fn test_programs_end_to_end_ofast() {
 /// only reads text.
 #[test]
 fn xfail_findings_cross_check() {
-    use std::collections::BTreeSet;
-    let log_path = {
-        let mut found = None;
-        for dir in [".docs/audits", "../.docs/audits"] {
-            let p = Path::new(dir).join("x86_64-o0-sweep.md");
-            if p.exists() {
-                found = Some(p);
-                break;
-            }
-        }
-        found.expect("x86_64-o0-sweep.md not found (tracked via .gitignore exception)")
-    };
+    let log_path = find_audit_file("x86_64-o0-sweep.md");
     let log = fs::read_to_string(&log_path).unwrap();
     let id_re = |text: &str| -> BTreeSet<String> {
         let mut out = BTreeSet::new();
@@ -5556,18 +5647,31 @@ fn qualifier_unknown_selector_is_loud_even_when_inactive() {
 #[test]
 fn qualifier_first_active_xfail_wins() {
     let mac = TargetSpec::parse("arm64-macos").unwrap();
-    let src = "! XFAIL(x86_64-linux): linux reason\n! XFAIL: everywhere reason\nprogram t\nend\n";
+    let src = "! XFAIL(x86_64-linux): XFAIL-001 linux reason\n! XFAIL: XFAIL-002 everywhere reason\nprogram t\nend\n";
     assert_eq!(
         extract_xfail(src, "t.f90", &mac, "-O2").unwrap().as_deref(),
-        Some("everywhere reason")
+        Some("XFAIL-002 everywhere reason")
     );
     let musl = TargetSpec::parse("x86_64-linux-musl").unwrap();
     assert_eq!(
         extract_xfail(src, "t.f90", &musl, "-O2")
             .unwrap()
             .as_deref(),
-        Some("linux reason")
+        Some("XFAIL-001 linux reason")
     );
+}
+
+#[test]
+fn xfail_requires_debt_reference_even_when_selector_is_inactive() {
+    let mac = TargetSpec::parse("arm64-macos").unwrap();
+    for source in [
+        "! XFAIL: untracked reason\nprogram t\nend\n",
+        "! XFAIL(x86_64-linux-musl): inactive untracked reason\nprogram t\nend\n",
+        "! XFAIL: XFAIL-01 malformed reference\nprogram t\nend\n",
+    ] {
+        let error = extract_xfail(source, "t.f90", &mac, "-O2").expect_err("must reject");
+        assert!(error.contains("durable XFAIL-NNN or X64-O0-NNN"));
+    }
 }
 
 /// Sprint T2: opt-level XFAIL qualifiers. `O2+` fires at -O2 and above
@@ -5582,7 +5686,7 @@ fn qualifier_opt_level_matching() {
     };
 
     // Bare opt selector: level-scoped, target-agnostic.
-    let o2plus = "! XFAIL(O2+): opt bug\nprogram t\nend\n";
+    let o2plus = "! XFAIL(O2+): XFAIL-001 opt bug\nprogram t\nend\n";
     assert!(xf(o2plus, &mac, "-O0").is_none(), "O2+ inactive at -O0");
     assert!(xf(o2plus, &mac, "-O1").is_none(), "O2+ inactive at -O1");
     assert!(xf(o2plus, &mac, "-O2").is_some(), "O2+ active at -O2");
@@ -5591,13 +5695,13 @@ fn qualifier_opt_level_matching() {
     assert!(xf(o2plus, &mac, "-Os").is_some(), "O2+ includes -Os");
 
     // Exact level.
-    let o3 = "! XFAIL(O3): only O3\nprogram t\nend\n";
+    let o3 = "! XFAIL(O3): XFAIL-001 only O3\nprogram t\nend\n";
     assert!(xf(o3, &mac, "-O2").is_none());
     assert!(xf(o3, &mac, "-O3").is_some());
     assert!(xf(o3, &mac, "-Ofast").is_none(), "exact O3 excludes Ofast");
 
     // Target AND opt: arm64 AND -O2-or-above.
-    let both = "! XFAIL(arm64,O2+): arm64 opt bug\nprogram t\nend\n";
+    let both = "! XFAIL(arm64,O2+): XFAIL-001 arm64 opt bug\nprogram t\nend\n";
     assert!(xf(both, &mac, "-O2").is_some(), "arm64 + O2 fires");
     assert!(xf(both, &mac, "-O1").is_none(), "arm64 but -O1: inactive");
     assert!(xf(both, &fbsd, "-O2").is_none(), "x86 at -O2: inactive");

@@ -11,6 +11,7 @@
 !.docs/audits/x86-campaign-log.md
 # Model-drift audit: consolidated findings from the 5-agent sweep.
 !.docs/audits/model-drift-audit-2026-07.md
+!.docs/audits/xfail-debt.md
 # 2026-07-07 adversarial x86_64 audit: 54 verified findings (C13-C46,
 # R1-R13, D1-D3, L10-L11, A7-A8, T5); drives the AR remediation campaign.
 !.docs/audits/x86-adversarial-audit-2026-07.md

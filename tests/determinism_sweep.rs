@@ -74,7 +74,10 @@ fn should_skip(source_text: &str) -> bool {
         return true;
     }
     // Skip XFAIL tests (they have known failures).
-    if source_text.contains("! XFAIL:") {
+    if source_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("! XFAIL"))
+    {
         return true;
     }
     false
