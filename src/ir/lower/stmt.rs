@@ -3481,7 +3481,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if let Some((base_addr, type_name)) =
                         resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
                     {
-                        if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        if let Some(layout) =
+                            type_layout_for_current_scope(ctx.type_layouts, &type_name)
+                        {
                             if let Some(field) = layout_component_field_or_parent_view(
                                 layout,
                                 component,
@@ -3562,7 +3564,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.cond_branch(needs_alloc, alloc_bb, vec![], copy_bb, vec![]);
 
                                     b.set_block(alloc_bb);
-                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                    if let Some(layout) =
+                                        type_layout_for_current_scope(ctx.type_layouts, &type_name)
+                                    {
                                         let elem_size = b.const_i64(layout.size as i64);
                                         let rank_val = b.const_i32(0);
                                         let null_ptr = b.const_i64(0);

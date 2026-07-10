@@ -2058,7 +2058,8 @@ pub(crate) fn lower_expr_full(
                 };
 
                 let fallback_to_structure_ctor = has_named_interface
-                    && type_layouts.is_some_and(|tl| tl.get(&key).is_some())
+                    && type_layouts
+                        .is_some_and(|tl| type_layout_for_current_scope(tl, &key).is_some())
                     && resolve_generic_call_actuals(
                         st,
                         b,
@@ -3026,7 +3027,7 @@ pub(crate) fn lower_expr_full(
                     if let Some((obj_addr, type_name)) =
                         resolve_component_base_for_method(b, locals, base, st, tl)
                     {
-                        if let Some(layout) = tl.get(&type_name) {
+                        if let Some(layout) = type_layout_for_current_scope(tl, &type_name) {
                             let bp_opt = resolved_bound_proc_for_call(
                                 b,
                                 locals,
@@ -3651,7 +3652,9 @@ pub(crate) fn lower_expr_full(
                                         tl,
                                     )
                                 {
-                                    if let Some(layout) = tl.get(&type_name) {
+                                    if let Some(layout) =
+                                        type_layout_for_current_scope(tl, &type_name)
+                                    {
                                         let bp = resolved_bound_proc_for_call(
                                             b,
                                             locals,
@@ -3693,7 +3696,7 @@ pub(crate) fn lower_expr_full(
                     None
                 });
                 if let Some((base_addr, type_name)) = resolved {
-                    if let Some(layout) = tl.get(&type_name) {
+                    if let Some(layout) = type_layout_for_current_scope(tl, &type_name) {
                         if let Some(field) =
                             layout_component_field_or_parent_view(layout, component, tl)
                         {

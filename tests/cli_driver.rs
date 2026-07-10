@@ -50372,6 +50372,58 @@ fn imported_recursive_allocatable_components_use_owner_dealloc_helper() {
 }
 
 #[test]
+fn repeated_local_type_names_keep_scoped_layouts() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=repeated_local_type_names_keep_scoped_layouts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  implicit none\n  call first()\n  call second()\ncontains\n  subroutine first()\n    type :: node_t\n      integer :: value = 0\n      type(node_t), allocatable :: child\n    end type\n    type(node_t) :: source, copy\n    allocate(source%child)\n    source%child%value = 11\n    copy = source\n    print *, copy%child%value\n  end subroutine\n  subroutine second()\n    type :: node_t\n      integer :: value = 0\n      type(node_t), allocatable :: child\n    end type\n    type(node_t) :: source, copy\n    allocate(source%child)\n    source%child%value = 22\n    copy = source\n    print *, copy%child%value\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("repeated_local_type_names", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("repeated local type-name compile failed to spawn");
+    let compile_stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        compile.status.success(),
+        "repeated local type-name compile failed: {}",
+        compile_stderr
+    );
+    assert!(
+        !compile_stderr.contains("no field"),
+        "repeated local type names resolved the wrong component layout: {}",
+        compile_stderr
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("repeated local type-name run failed to spawn");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "repeated local type-name run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        stdout.split_whitespace().collect::<Vec<_>>(),
+        ["11", "22"],
+        "repeated local type names shared a layout or memory helper"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_only_generic_collects_all_bare_reexport_specifics() {
     let src = write_program(
         "module table_api\n  implicit none\n  type :: toml_table\n    integer :: n = 0\n  end type\n  type :: toml_array\n    integer :: n = 0\n  end type\n  interface get_value\n    module procedure get_child_array\n  end interface\ncontains\n  subroutine get_child_array(table, key, ptr, requested)\n    class(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer, intent(out) :: ptr\n    logical, intent(in), optional :: requested\n    nullify(ptr)\n  end subroutine\nend module\nmodule array_api\n  use table_api, only: toml_array\n  implicit none\n  interface get_value\n    module procedure get_elem_array\n  end interface\ncontains\n  subroutine get_elem_array(array, pos, ptr)\n    class(toml_array), intent(inout) :: array\n    integer, intent(in) :: pos\n    type(toml_array), pointer, intent(out) :: ptr\n    nullify(ptr)\n  end subroutine\nend module\nmodule build_api\n  use array_api\n  use table_api\n  implicit none\nend module\nmodule toml_api\n  use build_api\n  implicit none\nend module\nmodule user_m\n  use toml_api, only: toml_table, toml_array, get_value\n  implicit none\n  interface get_value\n    module procedure get_local_bool\n  end interface\ncontains\n  subroutine run(table, key)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    type(toml_array), pointer :: children\n    call get_value(table, key, children, requested=.false.)\n  end subroutine\n  subroutine get_local_bool(table, key, value)\n    type(toml_table), intent(inout) :: table\n    character(*), intent(in) :: key\n    logical, intent(out) :: value\n    value = .false.\n  end subroutine\nend module\nprogram p\n  use user_m, only: run\n  use table_api, only: toml_table\n  type(toml_table) :: table\n  call run(table, 'items')\nend program\n",

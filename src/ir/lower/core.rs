@@ -535,6 +535,7 @@ impl DerivedMemoryHelperKind {
 
 fn hash_layout_for_helper(layout: &crate::sema::type_layout::TypeLayout) -> u64 {
     let mut hasher = DefaultHasher::new();
+    layout.owner_path.hash(&mut hasher);
     layout.name.to_lowercase().hash(&mut hasher);
     layout.size.hash(&mut hasher);
     layout.align.hash(&mut hasher);
@@ -619,9 +620,10 @@ fn derived_layout_identity_key(layout: &crate::sema::type_layout::TypeLayout) ->
     format!(
         "{}::{}",
         layout
-            .owner_module
+            .owner_path
             .as_deref()
-            .unwrap_or("<local>")
+            .or(layout.owner_module.as_deref())
+            .unwrap_or("<unknown>")
             .to_lowercase(),
         layout.name.to_lowercase()
     )
@@ -20833,6 +20835,15 @@ pub(super) fn canonical_layout_type_name_for_scope(
             tl.get(&sym.name)
                 .map(|layout| tl.canonical_key_for_layout(layout))
         })
+}
+
+pub(super) fn type_layout_for_current_scope<'a>(
+    type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+    type_name: &str,
+) -> Option<&'a crate::sema::type_layout::TypeLayout> {
+    current_proc_scope()
+        .and_then(|scope_id| type_layouts.get_for_scope(scope_id, type_name))
+        .or_else(|| type_layouts.get(type_name))
 }
 
 pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
@@ -57473,7 +57484,7 @@ pub(super) fn derived_type_tag_value(
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ValueId> {
     type_name
-        .and_then(|name| type_layouts.get(name))
+        .and_then(|name| type_layout_for_current_scope(type_layouts, name))
         .map(|layout| b.const_i64(layout.type_tag as i64))
 }
 
@@ -57489,6 +57500,7 @@ pub(super) fn type_layout_vtable_symbol(
     }
 
     let mut hasher = DefaultHasher::new();
+    layout.owner_path.hash(&mut hasher);
     layout.name.to_lowercase().hash(&mut hasher);
     layout.size.hash(&mut hasher);
     layout.align.hash(&mut hasher);
@@ -57574,7 +57586,9 @@ pub(super) fn expr_type_layout<'a>(
 ) -> Option<&'a crate::sema::type_layout::TypeLayout> {
     match operator_expr_type_info(expr, locals, st, Some(type_layouts)) {
         Some(crate::sema::symtab::TypeInfo::Derived(name))
-        | Some(crate::sema::symtab::TypeInfo::Class(name)) => type_layouts.get(&name),
+        | Some(crate::sema::symtab::TypeInfo::Class(name)) => {
+            type_layout_for_current_scope(type_layouts, &name)
+        }
         _ => None,
     }
 }
@@ -57648,9 +57662,10 @@ pub(super) fn typed_allocate_type_tag_value(
 ) -> Option<ValueId> {
     match type_spec {
         Some(crate::ast::decl::TypeSpec::Type(name))
-        | Some(crate::ast::decl::TypeSpec::Class(name)) => type_layouts
-            .get(name)
-            .map(|layout| b.const_i64(layout.type_tag as i64)),
+        | Some(crate::ast::decl::TypeSpec::Class(name)) => {
+            type_layout_for_current_scope(type_layouts, name)
+                .map(|layout| b.const_i64(layout.type_tag as i64))
+        }
         _ => None,
     }
 }
@@ -57662,9 +57677,10 @@ pub(super) fn typed_allocate_vtable_value(
 ) -> Option<ValueId> {
     match type_spec {
         Some(crate::ast::decl::TypeSpec::Type(name))
-        | Some(crate::ast::decl::TypeSpec::Class(name)) => type_layouts
-            .get(name)
-            .and_then(|layout| type_layout_vtable_value(b, layout)),
+        | Some(crate::ast::decl::TypeSpec::Class(name)) => {
+            type_layout_for_current_scope(type_layouts, name)
+                .and_then(|layout| type_layout_vtable_value(b, layout))
+        }
         _ => None,
     }
 }
