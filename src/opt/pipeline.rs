@@ -486,13 +486,12 @@ mod tests {
                 lvl
             );
         }
-        for lvl in [OptLevel::O0] {
-            assert!(
-                build_i128_pipeline(lvl, Arch::Arm64).is_none(),
-                "{:?} should not yet have widened i128 optimization support",
-                lvl
-            );
-        }
+        let lvl = OptLevel::O0;
+        assert!(
+            build_i128_pipeline(lvl, Arch::Arm64).is_none(),
+            "{:?} should not yet have widened i128 optimization support",
+            lvl
+        );
     }
 
     #[test]

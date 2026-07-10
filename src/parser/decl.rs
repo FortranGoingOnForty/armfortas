@@ -1333,10 +1333,8 @@ impl<'a> Parser<'a> {
         if self.peek() == &TokenKind::LParen {
             let save_pos = self.pos;
             if let Ok(value) = self.try_parse_implied_do() {
-                let span = crate::parser::expr::span_from_to(
-                    self.tokens[save_pos].span,
-                    self.prev_span(),
-                );
+                let span =
+                    crate::parser::expr::span_from_to(self.tokens[save_pos].span, self.prev_span());
                 return Ok(Spanned::new(
                     crate::ast::expr::Expr::ArrayConstructor {
                         type_spec: None,
@@ -1576,6 +1574,34 @@ impl<'a> Parser<'a> {
             Decl::EnumerationTypeDef { name, enumerators },
             span,
         ))
+    }
+}
+
+/// If `e` is a bracketed constant vector usable as an R818 bounds
+/// array (`[2, 3]` — plain expression elements, no implied-do, no
+/// type-spec), return its elements. Constancy is enforced downstream
+/// by the usual explicit-shape validation of each desugared bound.
+fn bounds_vector_elements(
+    e: &crate::ast::expr::SpannedExpr,
+) -> Option<Vec<crate::ast::expr::SpannedExpr>> {
+    if let crate::ast::expr::Expr::ArrayConstructor {
+        type_spec: None,
+        values,
+    } = &e.node
+    {
+        let mut out = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                crate::ast::expr::AcValue::Expr(item) => out.push(item.clone()),
+                crate::ast::expr::AcValue::ImpliedDo(_) => return None,
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    } else {
+        None
     }
 }
 
@@ -2274,33 +2300,5 @@ mod tests {
         } else {
             panic!("not TypeDecl");
         }
-    }
-}
-
-/// If `e` is a bracketed constant vector usable as an R818 bounds
-/// array (`[2, 3]` — plain expression elements, no implied-do, no
-/// type-spec), return its elements. Constancy is enforced downstream
-/// by the usual explicit-shape validation of each desugared bound.
-fn bounds_vector_elements(
-    e: &crate::ast::expr::SpannedExpr,
-) -> Option<Vec<crate::ast::expr::SpannedExpr>> {
-    if let crate::ast::expr::Expr::ArrayConstructor {
-        type_spec: None,
-        values,
-    } = &e.node
-    {
-        let mut out = Vec::with_capacity(values.len());
-        for v in values {
-            match v {
-                crate::ast::expr::AcValue::Expr(item) => out.push(item.clone()),
-                crate::ast::expr::AcValue::ImpliedDo(_) => return None,
-            }
-        }
-        if out.is_empty() {
-            return None;
-        }
-        Some(out)
-    } else {
-        None
     }
 }

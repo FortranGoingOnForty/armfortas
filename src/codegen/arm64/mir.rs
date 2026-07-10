@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn const_pool() {
         let mut mf = MachineFunction::new("test".into());
-        let idx0 = mf.add_const(ConstPoolEntry::F64(3.14));
+        let idx0 = mf.add_const(ConstPoolEntry::F64(std::f64::consts::PI));
         let idx1 = mf.add_const(ConstPoolEntry::F32(2.0));
         assert_eq!(idx0, 0);
         assert_eq!(idx1, 1);

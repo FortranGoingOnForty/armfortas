@@ -51,7 +51,6 @@ impl Pass for CallResolve {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::inst::*;
     use crate::ir::types::{IntWidth, IrType};
     use crate::opt::pass::Pass;
 

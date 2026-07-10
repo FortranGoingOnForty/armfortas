@@ -151,107 +151,6 @@ pub fn clone_loop(
     (block_map, new_blocks)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::builder::FuncBuilder;
-    use crate::ir::types::{IntWidth, IrType};
-
-    #[test]
-    fn clone_loop_remaps_values_defined_in_later_blocks() {
-        let mut func = Function::new("test".into(), vec![], IrType::Void);
-        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
-
-        let preheader = b.create_block("preheader");
-        let header = b.create_block("header");
-        let use_block = b.create_block("use");
-        let def_block = b.create_block("def");
-        let latch = b.create_block("latch");
-        let exit = b.create_block("exit");
-
-        let one = b.const_i32(1);
-        let ten = b.const_i32(10);
-        b.branch(preheader, vec![]);
-
-        b.set_block(preheader);
-        b.branch(header, vec![one]);
-
-        let iv = b.add_block_param(header, IrType::Int(IntWidth::I32));
-        b.set_block(header);
-        let keep_looping = b.icmp(CmpOp::Le, iv, ten);
-        b.cond_branch(keep_looping, def_block, vec![], exit, vec![]);
-
-        b.set_block(def_block);
-        let carried = b.iadd(iv, one);
-        b.branch(use_block, vec![]);
-
-        b.set_block(use_block);
-        let observed = b.iadd(carried, one);
-        let spill = b.alloca(IrType::Int(IntWidth::I32));
-        b.store(observed, spill);
-        b.branch(latch, vec![]);
-
-        b.set_block(latch);
-        let nxt = b.iadd(iv, one);
-        b.branch(header, vec![nxt]);
-
-        b.set_block(exit);
-        b.ret_void();
-
-        let loop_body = [header, use_block, def_block, latch]
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let lp = NaturalLoop {
-            header,
-            body: loop_body,
-            latches: vec![latch],
-        };
-
-        let (block_map, _) = clone_loop(&mut func, &lp);
-        let val_map = build_value_map(&func, &lp, &block_map);
-        let cloned_use = func.block(block_map[&use_block]);
-
-        let cloned_carried = val_map[&carried];
-        let cloned_observed = val_map[&observed];
-        let use_inst = cloned_use
-            .insts
-            .iter()
-            .find(|inst| inst.id == cloned_observed)
-            .expect("cloned use-block instruction");
-
-        assert!(
-            matches!(use_inst.kind, InstKind::IAdd(lhs, _) if lhs == cloned_carried),
-            "cloned use block should reference the cloned later-block value, got {:?}",
-            use_inst.kind,
-        );
-    }
-
-    #[test]
-    fn remap_inst_kind_remaps_indirect_call_target() {
-        let old_target = ValueId(10);
-        let new_target = ValueId(110);
-        let old_arg = ValueId(20);
-        let new_arg = ValueId(120);
-        let mut map = HashMap::new();
-        map.insert(old_target, new_target);
-        map.insert(old_arg, new_arg);
-
-        let remapped = remap_inst_kind(
-            &InstKind::Call(FuncRef::Indirect(old_target), vec![old_arg]),
-            &map,
-        );
-
-        assert!(
-            matches!(
-                remapped,
-                InstKind::Call(FuncRef::Indirect(target), ref args)
-                    if target == new_target && args.as_slice() == [new_arg]
-            ),
-            "indirect call target and args should both be remapped, got {remapped:?}",
-        );
-    }
-}
-
 /// Build a value map from original loop blocks → cloned loop blocks.
 pub fn build_value_map(
     func: &Function,
@@ -405,5 +304,106 @@ pub fn remap_terminator(
             cases: cases.iter().map(|(v, d)| (*v, rb(d))).collect(),
         },
         Terminator::Unreachable => Terminator::Unreachable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::builder::FuncBuilder;
+    use crate::ir::types::{IntWidth, IrType};
+
+    #[test]
+    fn clone_loop_remaps_values_defined_in_later_blocks() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+
+        let preheader = b.create_block("preheader");
+        let header = b.create_block("header");
+        let use_block = b.create_block("use");
+        let def_block = b.create_block("def");
+        let latch = b.create_block("latch");
+        let exit = b.create_block("exit");
+
+        let one = b.const_i32(1);
+        let ten = b.const_i32(10);
+        b.branch(preheader, vec![]);
+
+        b.set_block(preheader);
+        b.branch(header, vec![one]);
+
+        let iv = b.add_block_param(header, IrType::Int(IntWidth::I32));
+        b.set_block(header);
+        let keep_looping = b.icmp(CmpOp::Le, iv, ten);
+        b.cond_branch(keep_looping, def_block, vec![], exit, vec![]);
+
+        b.set_block(def_block);
+        let carried = b.iadd(iv, one);
+        b.branch(use_block, vec![]);
+
+        b.set_block(use_block);
+        let observed = b.iadd(carried, one);
+        let spill = b.alloca(IrType::Int(IntWidth::I32));
+        b.store(observed, spill);
+        b.branch(latch, vec![]);
+
+        b.set_block(latch);
+        let nxt = b.iadd(iv, one);
+        b.branch(header, vec![nxt]);
+
+        b.set_block(exit);
+        b.ret_void();
+
+        let loop_body = [header, use_block, def_block, latch]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let lp = NaturalLoop {
+            header,
+            body: loop_body,
+            latches: vec![latch],
+        };
+
+        let (block_map, _) = clone_loop(&mut func, &lp);
+        let val_map = build_value_map(&func, &lp, &block_map);
+        let cloned_use = func.block(block_map[&use_block]);
+
+        let cloned_carried = val_map[&carried];
+        let cloned_observed = val_map[&observed];
+        let use_inst = cloned_use
+            .insts
+            .iter()
+            .find(|inst| inst.id == cloned_observed)
+            .expect("cloned use-block instruction");
+
+        assert!(
+            matches!(use_inst.kind, InstKind::IAdd(lhs, _) if lhs == cloned_carried),
+            "cloned use block should reference the cloned later-block value, got {:?}",
+            use_inst.kind,
+        );
+    }
+
+    #[test]
+    fn remap_inst_kind_remaps_indirect_call_target() {
+        let old_target = ValueId(10);
+        let new_target = ValueId(110);
+        let old_arg = ValueId(20);
+        let new_arg = ValueId(120);
+        let mut map = HashMap::new();
+        map.insert(old_target, new_target);
+        map.insert(old_arg, new_arg);
+
+        let remapped = remap_inst_kind(
+            &InstKind::Call(FuncRef::Indirect(old_target), vec![old_arg]),
+            &map,
+        );
+
+        assert!(
+            matches!(
+                remapped,
+                InstKind::Call(FuncRef::Indirect(target), ref args)
+                    if target == new_target && args.as_slice() == [new_arg]
+            ),
+            "indirect call target and args should both be remapped, got {remapped:?}",
+        );
     }
 }

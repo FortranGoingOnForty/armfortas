@@ -380,10 +380,10 @@ mod tests {
     #[test]
     fn find_crt_prefers_override_dir() {
         let root = fake_crt_root("override");
-        let crt = find_crt(&t("x86_64-freebsd"), &[root.clone()], true).unwrap();
+        let crt = find_crt(&t("x86_64-freebsd"), std::slice::from_ref(&root), true).unwrap();
         assert_eq!(crt.crt1, root.join("Scrt1.o"));
         assert_eq!(crt.crtbegin, root.join("crtbeginS.o"));
-        let crt = find_crt(&t("x86_64-freebsd"), &[root.clone()], false).unwrap();
+        let crt = find_crt(&t("x86_64-freebsd"), std::slice::from_ref(&root), false).unwrap();
         assert_eq!(crt.crt1, root.join("crt1.o"));
         assert_eq!(crt.crtend, root.join("crtend.o"));
         let _ = std::fs::remove_dir_all(&root);
@@ -398,7 +398,7 @@ mod tests {
         // multiarch layout exercises the message via override-only
         // miss when the built-ins are absent too. Assert on the
         // message text from missing() directly to stay host-neutral.
-        let msg = missing("Scrt1.o", &[empty.clone()]);
+        let msg = missing("Scrt1.o", std::slice::from_ref(&empty));
         assert!(msg.contains("-B"), "error should name -B: {}", msg);
         assert!(
             msg.contains("AFS_CRT_DIR"),
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn link_args_order_is_load_bearing() {
         let root = fake_crt_root("argv");
-        let crt = find_crt(&t("x86_64-freebsd"), &[root.clone()], true).unwrap();
+        let crt = find_crt(&t("x86_64-freebsd"), std::slice::from_ref(&root), true).unwrap();
         let args = elf_link_args(
             &t("x86_64-freebsd"),
             &crt,
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn no_pie_drops_the_flag_and_uses_crt1() {
         let root = fake_crt_root("nopie");
-        let crt = find_crt(&t("x86_64-freebsd"), &[root.clone()], false).unwrap();
+        let crt = find_crt(&t("x86_64-freebsd"), std::slice::from_ref(&root), false).unwrap();
         let args = elf_link_args(
             &t("x86_64-freebsd"),
             &crt,

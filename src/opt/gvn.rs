@@ -1550,7 +1550,7 @@ mod tests {
             InstKind::ConstInt(1, IntWidth::I32),
             IrType::Int(IntWidth::I32),
         );
-        let dec1 = push_inst(
+        let _dec1 = push_inst(
             &mut callee,
             if_else,
             InstKind::ISub(n3, one2),

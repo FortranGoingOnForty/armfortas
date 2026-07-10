@@ -2036,7 +2036,7 @@ end program hello
                     let path = entry.path();
                     if path.is_dir() {
                         collect(&path, buf);
-                    } else if path.extension().map_or(false, |e| e == "f90") {
+                    } else if path.extension().is_some_and(|e| e == "f90") {
                         if let Ok(src) = std::fs::read_to_string(&path) {
                             let filtered: String = src
                                 .lines()
@@ -2238,7 +2238,7 @@ end program hello
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "f90") {
+            if path.extension().is_some_and(|e| e == "f90") {
                 let path_str = path.to_string_lossy();
                 match try_lex_fortsh_file(&path_str) {
                     Ok(count) => {
@@ -2279,7 +2279,7 @@ end program hello
                     let path = entry.path();
                     if path.is_dir() {
                         visit_dir(&path, files_tested, total_tokens, failures);
-                    } else if path.extension().map_or(false, |e| e == "f90") {
+                    } else if path.extension().is_some_and(|e| e == "f90") {
                         let path_str = path.to_string_lossy().to_string();
                         match super::tests::try_lex_fortsh_file(&path_str) {
                             Ok(count) => {
