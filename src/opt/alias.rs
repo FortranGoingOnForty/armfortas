@@ -178,6 +178,13 @@ impl<'a> AliasOracle<'a> {
         matches!(self.func.value_type(value), Some(IrType::Ptr(_)))
     }
 
+    /// Arbitrary calls can read or write globals without receiving their
+    /// addresses as arguments. Unknown pointer provenance requires the same
+    /// conservative barrier.
+    pub fn requires_global_call_barrier(&mut self, ptr: ValueId) -> bool {
+        matches!(self.trace_base(ptr), PtrBase::Global(_) | PtrBase::Unknown)
+    }
+
     fn pointer_points_to_aggregate(&mut self, ptr: ValueId) -> bool {
         if let Some(points_to_aggregate) = self.aggregate_cache.get(&ptr) {
             return *points_to_aggregate;

@@ -27,7 +27,7 @@
 //! |---------------------|----------------------------------------------|
 //! | `store %v, %ptr`    | kill aliasing entries; record `%ptr → v`     |
 //! | `load %ptr`         | Forward if available; otherwise no-op        |
-//! | `call / rcall`      | Flush only entries aliasing pointer args     |
+//! | `call / rcall`      | Flush globals and entries aliasing pointer args |
 //! | Any other           | No-op (reads only)                           |
 //!
 //! ### Example
@@ -115,6 +115,10 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                     }
 
                     InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+                        // A callee may access module/global state without
+                        // receiving its address as an argument.
+                        available
+                            .retain(|entry| !alias_oracle.requires_global_call_barrier(entry.ptr));
                         let pointer_args: Vec<ValueId> = args
                             .iter()
                             .copied()
@@ -249,6 +253,18 @@ mod tests {
         }
     }
 
+    fn ptr_ty() -> IrType {
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))
+    }
+
+    fn alloca_ty() -> IrType {
+        IrType::Int(IntWidth::I32)
+    }
+
+    fn i32_ty() -> IrType {
+        IrType::Int(IntWidth::I32)
+    }
+
     #[test]
     fn forwards_load_after_store() {
         // store %42, %alloca
@@ -375,6 +391,30 @@ mod tests {
         // No forwarding should happen (call killed the available store).
         let changed = pass.run(&mut m);
         assert!(!changed, "LSF must not forward across a call");
+    }
+
+    #[test]
+    fn does_not_forward_global_store_across_unrelated_pointer_call() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let global = push(&mut f, InstKind::GlobalAddr("state".into()), ptr_ty());
+        let scratch = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let value = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(value, global), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("touch_global".into()), vec![scratch]),
+            IrType::Void,
+        );
+        let load = push(&mut f, InstKind::Load(global), i32_ty());
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(
+            !LocalLsf.run(&mut m),
+            "LSF must treat every call as a barrier for global memory"
+        );
     }
 
     #[test]
