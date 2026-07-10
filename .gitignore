@@ -1,6 +1,7 @@
 .docs/*
 !.docs/audits
 .docs/audits/*
+!.docs/audits/audit-*.md
 # The -O0 sweep log is tracked: its X64-O0-NNN finding IDs are
 # cross-checked against test_programs XFAIL annotations by a CI test.
 !.docs/audits/x86_64-o0-sweep.md
