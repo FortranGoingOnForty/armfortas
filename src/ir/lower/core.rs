@@ -686,12 +686,14 @@ fn emit_derived_dealloc_storage_helper(
     let params = vec![
         helper_param("base", 0, ptr_i8_ty()),
         helper_param("stat", 1, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+        helper_param("finalize", 2, IrType::Int(IntWidth::I32)),
     ];
     let mut func = Function::new(name, params, IrType::Void);
     func.internal_only = layout.owner_module.is_none();
     {
         let base = func.params[0].id;
         let stat = func.params[1].id;
+        let finalize = func.params[2].id;
         let mut b = FuncBuilder::new(&mut func, module.layout);
         let mut active = HashSet::new();
         active.insert(derived_layout_identity_key(layout));
@@ -701,6 +703,7 @@ fn emit_derived_dealloc_storage_helper(
             layout,
             type_layouts,
             stat,
+            finalize,
             &mut active,
         );
         b.ret_void();
@@ -720,12 +723,14 @@ fn emit_derived_dealloc_descriptor_helper(
     let params = vec![
         helper_param("desc", 0, ptr_i8_ty()),
         helper_param("stat", 1, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+        helper_param("finalize", 2, IrType::Int(IntWidth::I32)),
     ];
     let mut func = Function::new(name, params, IrType::Void);
     func.internal_only = layout.owner_module.is_none();
     {
         let desc = func.params[0].id;
         let stat = func.params[1].id;
+        let finalize = func.params[2].id;
         let mut b = FuncBuilder::new(&mut func, module.layout);
         let mut active = HashSet::new();
         active.insert(derived_layout_identity_key(layout));
@@ -735,6 +740,7 @@ fn emit_derived_dealloc_descriptor_helper(
             layout,
             type_layouts,
             stat,
+            finalize,
             &mut active,
         );
         b.ret_void();
@@ -26334,6 +26340,14 @@ pub(super) fn emit_final_proc_call(
     b.call(func_ref, call_args, IrType::Void);
 }
 
+fn emit_direct_final_proc_call(b: &mut FuncBuilder, final_proc: &str, finalized_addr: ValueId) {
+    b.call(
+        FuncRef::External(final_proc.to_string()),
+        vec![finalized_addr],
+        IrType::Void,
+    );
+}
+
 pub(super) fn finalize_derived_storage(
     b: &mut FuncBuilder,
     st: &SymbolTable,
@@ -26356,16 +26370,14 @@ pub(super) fn finalize_derived_storage(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn finalize_derived_array_storage_dynamic(
+fn finalize_derived_array_storage_dynamic_with<F>(
     b: &mut FuncBuilder,
-    st: &SymbolTable,
-    internal_funcs: &HashMap<String, u32>,
-    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
-    closure_locals: &HashMap<String, LocalInfo>,
     layout: &crate::sema::type_layout::TypeLayout,
     desc: ValueId,
-) {
+    emit_final: &mut F,
+) where
+    F: FnMut(&mut FuncBuilder, &str, ValueId),
+{
     let Some(final_proc) = layout.final_procs.iter().find(|proc| proc.rank == 0) else {
         return;
     };
@@ -26389,21 +26401,37 @@ pub(super) fn finalize_derived_array_storage_dynamic(
     let elem_bytes = b.const_i64(layout.size as i64);
     let byte_off = b.imul(byte_off, elem_bytes);
     let elem_ptr = b.gep(base_addr, vec![byte_off], IrType::Int(IntWidth::I8));
-    emit_final_proc_call(
-        b,
-        st,
-        internal_funcs,
-        contained_host_refs,
-        closure_locals,
-        &final_proc.name,
-        elem_ptr,
-    );
+    emit_final(b, &final_proc.name, elem_ptr);
 
     let one = b.const_i64(1);
     let next_idx = b.iadd(body_idx, one);
     b.branch(bb_check, vec![next_idx]);
 
     b.set_block(bb_exit);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finalize_derived_array_storage_dynamic(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    layout: &crate::sema::type_layout::TypeLayout,
+    desc: ValueId,
+) {
+    let mut emit_final = |b: &mut FuncBuilder, final_proc: &str, finalized_addr: ValueId| {
+        emit_final_proc_call(
+            b,
+            st,
+            internal_funcs,
+            contained_host_refs,
+            closure_locals,
+            final_proc,
+            finalized_addr,
+        );
+    };
+    finalize_derived_array_storage_dynamic_with(b, layout, desc, &mut emit_final);
 }
 
 fn array_descriptor_flat_element_offset(
@@ -26465,31 +26493,21 @@ fn array_descriptor_flat_element_offset(
     b.load(offset_addr)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn finalize_derived_array_descriptor_storage(
+fn finalize_derived_array_descriptor_storage_with<F>(
     b: &mut FuncBuilder,
-    st: &SymbolTable,
-    internal_funcs: &HashMap<String, u32>,
-    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
-    closure_locals: &HashMap<String, LocalInfo>,
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
-) {
+    emit_final: &mut F,
+) where
+    F: FnMut(&mut FuncBuilder, &str, ValueId),
+{
     let rank_specific: Vec<_> = layout
         .final_procs
         .iter()
         .filter(|proc| proc.rank > 0)
         .collect();
     if rank_specific.is_empty() {
-        finalize_derived_array_storage_dynamic(
-            b,
-            st,
-            internal_funcs,
-            contained_host_refs,
-            closure_locals,
-            layout,
-            desc,
-        );
+        finalize_derived_array_storage_dynamic_with(b, layout, desc, emit_final);
         return;
     }
 
@@ -26506,29 +26524,78 @@ pub(super) fn finalize_derived_array_descriptor_storage(
         b.cond_branch(matches, bb_call, vec![], bb_next, vec![]);
 
         b.set_block(bb_call);
+        emit_final(b, &final_proc.name, desc);
+        b.branch(bb_done, vec![]);
+        b.set_block(bb_next);
+    }
+
+    finalize_derived_array_storage_dynamic_with(b, layout, desc, emit_final);
+    b.branch(bb_done, vec![]);
+    b.set_block(bb_done);
+}
+
+fn finalize_derived_array_descriptor_storage_direct(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    let mut emit_final = |b: &mut FuncBuilder, final_proc: &str, finalized_addr: ValueId| {
+        emit_direct_final_proc_call(b, final_proc, finalized_addr);
+    };
+    finalize_derived_array_descriptor_storage_with(b, desc, layout, &mut emit_final);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finalize_derived_array_descriptor_storage(
+    b: &mut FuncBuilder,
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    closure_locals: &HashMap<String, LocalInfo>,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+) {
+    let mut emit_final = |b: &mut FuncBuilder, final_proc: &str, finalized_addr: ValueId| {
         emit_final_proc_call(
             b,
             st,
             internal_funcs,
             contained_host_refs,
             closure_locals,
-            &final_proc.name,
-            desc,
+            final_proc,
+            finalized_addr,
         );
-        b.branch(bb_done, vec![]);
-        b.set_block(bb_next);
+    };
+    finalize_derived_array_descriptor_storage_with(b, desc, layout, &mut emit_final);
+}
+
+fn finalize_derived_descriptor_storage_if_allocated_direct(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    enabled: ValueId,
+) {
+    if layout.final_procs.is_empty() {
+        return;
     }
 
-    finalize_derived_array_storage_dynamic(
-        b,
-        st,
-        internal_funcs,
-        contained_host_refs,
-        closure_locals,
-        layout,
-        desc,
+    let allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
     );
+    let zero_i32 = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero_i32);
+    let is_enabled = b.icmp(CmpOp::Ne, enabled, zero_i32);
+    let should_finalize = b.and(is_allocated, is_enabled);
+    let bb_final = b.create_block("derived_desc_final_present");
+    let bb_done = b.create_block("derived_desc_final_done");
+    b.cond_branch(should_finalize, bb_final, vec![], bb_done, vec![]);
+
+    b.set_block(bb_final);
+    finalize_derived_array_descriptor_storage_direct(b, desc, layout);
     b.branch(bb_done, vec![]);
+
     b.set_block(bb_done);
 }
 
@@ -26589,16 +26656,28 @@ pub(super) fn insert_implicit_dealloc(
     // got a zombie i32 alloca right before its ret, bloating the
     // frame and the IR — and DCE couldn't drop it because allocas
     // are classified as side-effecting.
+    let owns_derived_components = |info: &LocalInfo| {
+        !info.by_ref
+            && !info.is_pointer
+            && info
+                .derived_type
+                .as_ref()
+                .and_then(|name| type_layouts.get(name))
+                .is_some_and(|layout| {
+                    derived_layout_needs_component_deallocation(layout, type_layouts)
+                })
+    };
     let needs_dealloc = owned_locals.values().any(|info| {
         (!info.by_ref && info.allocatable)
             || matches!(
                 info.char_kind,
                 CharKind::Deferred | CharKind::FixedRuntime { .. }
             )
+            || owns_derived_components(info)
     });
     let needs_stat = owned_locals
         .values()
-        .any(|info| !info.by_ref && info.allocatable);
+        .any(|info| (!info.by_ref && info.allocatable) || owns_derived_components(info));
     let needs_finalization = finalize_owned_locals
         && owned_locals.values().any(|info| {
             !info.by_ref
@@ -26670,12 +26749,13 @@ pub(super) fn insert_implicit_dealloc(
                             layout,
                         );
                     }
-                    deallocate_derived_descriptor_components(
+                    deallocate_derived_descriptor_components_with_finalization(
                         b,
                         info.addr,
                         layout,
                         type_layouts,
                         stat_addr.unwrap(),
+                        finalize_owned_locals,
                     );
                 }
             }
@@ -26685,33 +26765,59 @@ pub(super) fn insert_implicit_dealloc(
                 IrType::Void,
             );
         }
-        // Finalization: call FINAL procedures for locally-owned derived type variables.
-        // Allocatable payloads were finalized above while their descriptor and
-        // components were still live. By-ref params remain caller-owned.
-        if finalize_owned_locals && !info.by_ref && !info.allocatable {
-            if let Some(ref type_name) = info.derived_type {
+        if !info.by_ref && !info.allocatable {
+            if let Some(type_name) = &info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
-                    if local_declared_rank(info) > 0 {
-                        let desc = materialize_array_descriptor_for_info(b, info);
-                        finalize_derived_array_descriptor_storage(
-                            b,
-                            st,
-                            internal_funcs,
-                            contained_host_refs,
-                            closure_locals,
-                            desc,
-                            layout,
-                        );
-                    } else {
-                        finalize_derived_storage(
-                            b,
-                            st,
-                            internal_funcs,
-                            contained_host_refs,
-                            closure_locals,
-                            layout,
-                            info.addr,
-                        );
+                    let rank = local_declared_rank(info);
+                    let desc = (rank > 0).then(|| materialize_array_descriptor_for_info(b, info));
+
+                    // The owner's FINAL runs while its components are intact.
+                    if finalize_owned_locals {
+                        if let Some(desc) = desc {
+                            finalize_derived_array_descriptor_storage(
+                                b,
+                                st,
+                                internal_funcs,
+                                contained_host_refs,
+                                closure_locals,
+                                desc,
+                                layout,
+                            );
+                        } else {
+                            finalize_derived_storage(
+                                b,
+                                st,
+                                internal_funcs,
+                                contained_host_refs,
+                                closure_locals,
+                                layout,
+                                info.addr,
+                            );
+                        }
+                    }
+
+                    // Nonallocatable derived locals still own their allocatable
+                    // components, which are finalized and released at scope exit.
+                    if derived_layout_needs_component_deallocation(layout, type_layouts) {
+                        if let Some(desc) = desc {
+                            deallocate_derived_descriptor_components_with_finalization(
+                                b,
+                                desc,
+                                layout,
+                                type_layouts,
+                                stat_addr.unwrap(),
+                                finalize_owned_locals,
+                            );
+                        } else {
+                            deallocate_derived_storage_components_with_finalization(
+                                b,
+                                info.addr,
+                                layout,
+                                type_layouts,
+                                stat_addr.unwrap(),
+                                finalize_owned_locals,
+                            );
+                        }
                     }
                 }
             }
@@ -53080,6 +53186,20 @@ pub(super) fn deallocate_derived_descriptor_components(
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
 ) {
+    deallocate_derived_descriptor_components_with_finalization(
+        b, desc, layout, registry, stat_addr, true,
+    );
+}
+
+fn deallocate_derived_descriptor_components_with_finalization(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+    finalize_components: bool,
+) {
+    let finalize = b.const_i32(i32::from(finalize_components));
     let mut active = HashSet::new();
     deallocate_derived_descriptor_components_guarded(
         b,
@@ -53087,6 +53207,7 @@ pub(super) fn deallocate_derived_descriptor_components(
         layout,
         registry,
         stat_addr,
+        finalize,
         &mut active,
     );
 }
@@ -53096,6 +53217,7 @@ fn call_derived_descriptor_dealloc_helper(
     desc: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
     stat_addr: ValueId,
+    finalize: ValueId,
 ) {
     let desc_ptr = ptr_i8_value(b, desc);
     b.call(
@@ -53103,7 +53225,7 @@ fn call_derived_descriptor_dealloc_helper(
             layout,
             DerivedMemoryHelperKind::DeallocDescriptor,
         )),
-        vec![desc_ptr, stat_addr],
+        vec![desc_ptr, stat_addr, finalize],
         IrType::Void,
     );
 }
@@ -53113,6 +53235,7 @@ fn call_derived_storage_dealloc_helper(
     base_addr: ValueId,
     layout: &crate::sema::type_layout::TypeLayout,
     stat_addr: ValueId,
+    finalize: ValueId,
 ) {
     let base = ptr_i8_value(b, base_addr);
     b.call(
@@ -53120,7 +53243,7 @@ fn call_derived_storage_dealloc_helper(
             layout,
             DerivedMemoryHelperKind::DeallocStorage,
         )),
-        vec![base, stat_addr],
+        vec![base, stat_addr, finalize],
         IrType::Void,
     );
 }
@@ -53131,18 +53254,19 @@ fn deallocate_derived_descriptor_components_guarded(
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
+    finalize: ValueId,
     active_types: &mut HashSet<String>,
 ) {
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
     if derived_memory_helper_available_xmodule(b, layout) {
-        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr);
+        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr, finalize);
         return;
     }
     let key = derived_layout_identity_key(layout);
     if !active_types.insert(key.clone()) {
-        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr);
+        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr, finalize);
         return;
     }
     emit_deallocate_derived_descriptor_components_inline(
@@ -53151,6 +53275,7 @@ fn deallocate_derived_descriptor_components_guarded(
         layout,
         registry,
         stat_addr,
+        finalize,
         active_types,
     );
     active_types.remove(&key);
@@ -53162,6 +53287,7 @@ fn emit_deallocate_derived_descriptor_components_inline(
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
+    finalize: ValueId,
     active_types: &mut HashSet<String>,
 ) {
     let flags = load_array_desc_i32_field(b, desc, 20);
@@ -53199,6 +53325,7 @@ fn emit_deallocate_derived_descriptor_components_inline(
         layout,
         registry,
         stat_addr,
+        finalize,
         active_types,
     );
     let one = b.const_i64(1);
@@ -53218,6 +53345,20 @@ pub(super) fn deallocate_derived_storage_components(
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
 ) {
+    deallocate_derived_storage_components_with_finalization(
+        b, base_addr, layout, registry, stat_addr, true,
+    );
+}
+
+fn deallocate_derived_storage_components_with_finalization(
+    b: &mut FuncBuilder,
+    base_addr: ValueId,
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    stat_addr: ValueId,
+    finalize_components: bool,
+) {
+    let finalize = b.const_i32(i32::from(finalize_components));
     let mut active = HashSet::new();
     deallocate_derived_storage_components_guarded(
         b,
@@ -53225,6 +53366,7 @@ pub(super) fn deallocate_derived_storage_components(
         layout,
         registry,
         stat_addr,
+        finalize,
         &mut active,
     );
 }
@@ -53235,18 +53377,19 @@ fn deallocate_derived_storage_components_guarded(
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
+    finalize: ValueId,
     active_types: &mut HashSet<String>,
 ) {
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
     if derived_memory_helper_available_xmodule(b, layout) {
-        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr);
+        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr, finalize);
         return;
     }
     let key = derived_layout_identity_key(layout);
     if !active_types.insert(key.clone()) {
-        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr);
+        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr, finalize);
         return;
     }
     emit_deallocate_derived_storage_components_inline(
@@ -53255,6 +53398,7 @@ fn deallocate_derived_storage_components_guarded(
         layout,
         registry,
         stat_addr,
+        finalize,
         active_types,
     );
     active_types.remove(&key);
@@ -53266,6 +53410,7 @@ fn emit_deallocate_derived_storage_components_inline(
     layout: &crate::sema::type_layout::TypeLayout,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
     stat_addr: ValueId,
+    finalize: ValueId,
     active_types: &mut HashSet<String>,
 ) {
     for field in &layout.fields {
@@ -53284,12 +53429,19 @@ fn emit_deallocate_derived_storage_components_inline(
         if field.allocatable && field.size == 384 {
             if let Some(nested_name) = field_derived_type_name(field) {
                 if let Some(nested_layout) = registry.get(&nested_name) {
+                    finalize_derived_descriptor_storage_if_allocated_direct(
+                        b,
+                        field_ptr,
+                        nested_layout,
+                        finalize,
+                    );
                     deallocate_derived_descriptor_components_guarded(
                         b,
                         field_ptr,
                         nested_layout,
                         registry,
                         stat_addr,
+                        finalize,
                         active_types,
                     );
                 }
@@ -53320,6 +53472,7 @@ fn emit_deallocate_derived_storage_components_inline(
                 nested_layout,
                 registry,
                 stat_addr,
+                finalize,
                 active_types,
             );
             continue;
@@ -53339,6 +53492,7 @@ fn emit_deallocate_derived_storage_components_inline(
                 nested_layout,
                 registry,
                 stat_addr,
+                finalize,
                 active_types,
             );
         }
