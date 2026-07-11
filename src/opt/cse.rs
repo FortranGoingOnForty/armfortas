@@ -243,8 +243,9 @@ impl Pass for LocalCse {
     }
 
     fn run(&self, module: &mut Module) -> bool {
+        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
         let mut changed = false;
-        for func in &mut module.functions {
+        for (func_idx, func) in module.functions.iter_mut().enumerate() {
             // Collect all (old, new) rewrites first, then apply them
             // in a *single* function walk. Audit Min-1: the previous
             // version called `substitute_uses` once per rewrite, so a
@@ -254,16 +255,12 @@ impl Pass for LocalCse {
             // In a function that changes the FP rounding mode, rounding-
             // dependent FP ops must not be CSE'd (two identical `fdiv`
             // across a mode change differ); l09.
-            let fpenv_barrier = func
-                .blocks
-                .iter()
-                .flat_map(|b| b.insts.iter())
-                .any(|inst| super::gvn::is_fpenv_rounding_barrier(&inst.kind));
+            let fpenv_barrier = rounding_effects.may_change_rounding[func_idx];
             let mut rewrite_map: HashMap<ValueId, ValueId> = HashMap::new();
             for block in &func.blocks {
                 let mut seen: HashMap<Key, ValueId> = HashMap::new();
                 for inst in &block.insts {
-                    if fpenv_barrier && super::gvn::is_rounding_dependent_fp(&inst.kind) {
+                    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(&inst.kind) {
                         continue;
                     }
                     let Some(k) = key_of(inst) else { continue };
@@ -326,7 +323,7 @@ fn substitute_uses_batch(func: &mut Function, rewrites: &HashMap<ValueId, ValueI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{FloatWidth, IntWidth, IrType};
+    use crate::ir::types::{FloatWidth, FuncSig, IntWidth, IrType};
     use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
@@ -482,6 +479,42 @@ mod tests {
             Some(Terminator::Return(Some(v))) => assert_eq!(*v, m1),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn keeps_fp_expressions_distinct_across_indirect_call() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F64));
+        let a = push(
+            &mut f,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let b = push(
+            &mut f,
+            InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let target_ty = IrType::FuncPtr(Box::new(FuncSig {
+            params: vec![],
+            ret: IrType::Void,
+        }));
+        let target = push(&mut f, InstKind::Undef(target_ty.clone()), target_ty);
+        let _down = push(&mut f, InstKind::FAdd(a, b), IrType::Float(FloatWidth::F64));
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::Indirect(target), vec![]),
+            IrType::Void,
+        );
+        let up = push(&mut f, InstKind::FAdd(a, b), IrType::Float(FloatWidth::F64));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(up)));
+        m.add_function(f);
+
+        assert!(
+            !LocalCse.run(&mut m),
+            "an indirect call may change the rounding mode between FP expressions"
+        );
     }
 
     #[test]

@@ -123,7 +123,7 @@ fn try_fold(
     consts: &HashMap<ValueId, Const>,
     fpenv_barrier: bool,
 ) -> Option<InstKind> {
-    if fpenv_barrier && super::gvn::is_rounding_dependent_fp(kind) {
+    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(kind) {
         return None;
     }
 
@@ -571,13 +571,10 @@ impl Pass for ConstFold {
     }
 
     fn run(&self, module: &mut Module) -> bool {
+        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
         let mut changed = false;
-        for func in &mut module.functions {
-            let fpenv_barrier = func
-                .blocks
-                .iter()
-                .flat_map(|block| block.insts.iter())
-                .any(|inst| super::gvn::is_fpenv_rounding_barrier(&inst.kind));
+        for (func_idx, func) in module.functions.iter_mut().enumerate() {
+            let fpenv_barrier = rounding_effects.may_run_after_change[func_idx];
 
             // Audit N-8: we walk `func.blocks` in vec order, which
             // is NOT guaranteed to be reverse-postorder. If a fold
@@ -635,7 +632,7 @@ impl Pass for ConstFold {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::IrType;
+    use crate::ir::types::{FuncSig, IrType};
 
     fn dummy_span() -> crate::lexer::Span {
         let p = crate::lexer::Position { line: 1, col: 1 };
@@ -801,6 +798,105 @@ mod tests {
             "constant FP arithmetic must remain dynamic when the function changes rounding mode"
         );
         assert!(matches!(first_block_kinds(&m)[4], InstKind::FAdd(..)));
+    }
+
+    #[test]
+    fn leaves_rounding_dependent_fold_in_called_function() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FAdd(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        let entry = caller.entry;
+        for callee in [
+            FuncRef::External("afs_ieee_set_rounding".into()),
+            FuncRef::Internal(0),
+        ] {
+            let id = caller.next_value_id();
+            caller.block_mut(entry).insts.push(Inst {
+                id,
+                kind: InstKind::Call(callee, vec![]),
+                ty: IrType::Void,
+                span: dummy_span(),
+            });
+        }
+        caller.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(caller);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "a callee can execute under the rounding mode selected by its caller"
+        );
+        assert!(matches!(
+            m.functions[0].blocks[0].insts[2].kind,
+            InstKind::FAdd(..)
+        ));
+    }
+
+    #[test]
+    fn leaves_rounding_dependent_fold_in_indirect_target() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FAdd(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        let entry = caller.entry;
+        let setter = caller.next_value_id();
+        caller.block_mut(entry).insts.push(Inst {
+            id: setter,
+            kind: InstKind::Call(FuncRef::External("afs_ieee_set_rounding".into()), vec![]),
+            ty: IrType::Void,
+            span: dummy_span(),
+        });
+        let target_ty = IrType::FuncPtr(Box::new(FuncSig {
+            params: vec![],
+            ret: IrType::Void,
+        }));
+        let target = caller.next_value_id();
+        caller.block_mut(entry).insts.push(Inst {
+            id: target,
+            kind: InstKind::Undef(target_ty.clone()),
+            ty: target_ty,
+            span: dummy_span(),
+        });
+        let call = caller.next_value_id();
+        caller.block_mut(entry).insts.push(Inst {
+            id: call,
+            kind: InstKind::Call(FuncRef::Indirect(target), vec![]),
+            ty: IrType::Void,
+            span: dummy_span(),
+        });
+        caller.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(caller);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "an indirect call can enter a function under a changed rounding mode"
+        );
+        assert!(matches!(
+            m.functions[0].blocks[0].insts[2].kind,
+            InstKind::FAdd(..)
+        ));
     }
 
     #[test]

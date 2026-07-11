@@ -27,8 +27,9 @@ impl Pass for Gvn {
             .iter()
             .map(PureCallPolicy::for_function)
             .collect();
+        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
         let mut changed = false;
-        for func in &mut module.functions {
+        for (func_idx, func) in module.functions.iter_mut().enumerate() {
             // Sprint 15 Stage 2: congruence closure via fixpoint.
             // After the first pass merges some values, downstream
             // instructions may now have equivalent operands; their
@@ -39,7 +40,11 @@ impl Pass for Gvn {
             // case (in practice 1-2 rounds covers it).
             let mut local_changed = false;
             for _ in 0..8 {
-                if gvn_function(func, &pure_calls) {
+                if gvn_function(
+                    func,
+                    &pure_calls,
+                    rounding_effects.may_change_rounding[func_idx],
+                ) {
                     local_changed = true;
                 } else {
                     break;
@@ -447,34 +452,6 @@ fn flatten_assoc(
     out
 }
 
-/// A call that changes the hardware FP rounding mode (l09). Rounding-
-/// dependent FP ops must not be value-numbered across it: two textually
-/// identical `fdiv a, b` separated by such a call can produce different
-/// results, so GVN must not treat them as the same value.
-pub(super) fn is_fpenv_rounding_barrier(kind: &InstKind) -> bool {
-    matches!(
-        kind,
-        InstKind::Call(FuncRef::External(name), _)
-            if name == "afs_ieee_set_rounding" || name == "afs_ieee_set_status"
-    )
-}
-
-/// True if an op's result depends on the current rounding mode, so it
-/// must not be GVN'd/CSE'd in a function that changes that mode.
-pub(super) fn is_rounding_dependent_fp(kind: &InstKind) -> bool {
-    matches!(
-        kind,
-        InstKind::FAdd(..)
-            | InstKind::FSub(..)
-            | InstKind::FMul(..)
-            | InstKind::FDiv(..)
-            | InstKind::FSqrt(..)
-            | InstKind::FPow(..)
-            | InstKind::IntToFloat(..)
-            | InstKind::FloatTrunc(..)
-    )
-}
-
 fn key_of(
     inst: &Inst,
     replacements: &HashMap<ValueId, ValueId>,
@@ -487,7 +464,7 @@ fn key_of(
     // ops are not value-numbered at all (conservative — the merge across
     // a mode change is the bug; FP-env code is rare so the lost CSE is
     // cheap).
-    if fpenv_barrier && is_rounding_dependent_fp(&inst.kind) {
+    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(&inst.kind) {
         return None;
     }
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
@@ -596,6 +573,12 @@ fn key_of(
         // alloca to the stored SSA value when the callee only reads the
         // pointee as a scalar input.
         InstKind::Call(FuncRef::Internal(idx), args) => {
+            // A PURE procedure can return an integer or logical derived from
+            // rounding-sensitive arithmetic, so return type alone is not a
+            // sufficient independence proof.
+            if fpenv_barrier {
+                return None;
+            }
             let policy = pure_calls.get(*idx as usize)?;
             if !policy.reusable || policy.arg_policies.len() != args.len() {
                 return None;
@@ -653,17 +636,11 @@ fn key_of(
     }
 }
 
-fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy]) -> bool {
+fn gvn_function(func: &mut Function, pure_calls: &[PureCallPolicy], fpenv_barrier: bool) -> bool {
     let idoms = compute_immediate_dominators(func);
     let children = dominator_tree_children(&idoms);
     let wrapper_values = wrapper_alloca_values(func, pure_calls);
     let defs = inst_map(func);
-    let fpenv_barrier = func
-        .blocks
-        .iter()
-        .flat_map(|b| b.insts.iter())
-        .any(|inst| is_fpenv_rounding_barrier(&inst.kind));
-
     // Scoped value number table: Key → dominating ValueId.
     let mut vn_table: HashMap<Key, ValueId> = HashMap::new();
     // Replacement map: redundant ValueId → dominating ValueId.
@@ -779,7 +756,7 @@ fn remap_terminator_operands(term: &mut Terminator, map: &HashMap<ValueId, Value
 mod tests {
     use super::*;
     use crate::ir::lower;
-    use crate::ir::types::{IntWidth, IrType};
+    use crate::ir::types::{FloatWidth, FuncSig, IntWidth, IrType};
     use crate::lexer::{tokenize, SourceForm};
     use crate::lexer::{Position, Span};
     use crate::opt::pass::Pass;
@@ -944,6 +921,200 @@ mod tests {
         m.add_function(f);
         let pass = Gvn;
         assert!(!pass.run(&mut m));
+    }
+
+    #[test]
+    fn gvn_keeps_fp_expressions_distinct_across_indirect_call() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Float(FloatWidth::F64));
+        let entry = f.entry;
+        let f64_ty = IrType::Float(FloatWidth::F64);
+        let a = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let b = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let target_ty = IrType::FuncPtr(Box::new(FuncSig {
+            params: vec![],
+            ret: IrType::Void,
+        }));
+        let target = push_inst(&mut f, entry, InstKind::Undef(target_ty.clone()), target_ty);
+        push_inst(&mut f, entry, InstKind::FAdd(a, b), f64_ty.clone());
+        push_inst(
+            &mut f,
+            entry,
+            InstKind::Call(FuncRef::Indirect(target), vec![]),
+            IrType::Void,
+        );
+        let up = push_inst(&mut f, entry, InstKind::FAdd(a, b), f64_ty);
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(up)));
+        m.add_function(f);
+
+        assert!(
+            !Gvn.run(&mut m),
+            "an indirect call may change the rounding mode between FP expressions"
+        );
+    }
+
+    #[test]
+    fn gvn_keeps_float_pure_calls_distinct_across_indirect_call() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let f64_ty = IrType::Float(FloatWidth::F64);
+
+        let mut callee = Function::new("rounded".into(), vec![], f64_ty.clone());
+        callee.is_pure = true;
+        let callee_entry = callee.entry;
+        let one = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let half_ulp = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let rounded = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::FAdd(one, half_ulp),
+            f64_ty.clone(),
+        );
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(rounded)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], f64_ty.clone());
+        let entry = caller.entry;
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            f64_ty.clone(),
+        );
+        let target_ty = IrType::FuncPtr(Box::new(FuncSig {
+            params: vec![],
+            ret: IrType::Void,
+        }));
+        let target = push_inst(
+            &mut caller,
+            entry,
+            InstKind::Undef(target_ty.clone()),
+            target_ty,
+        );
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Indirect(target), vec![]),
+            IrType::Void,
+        );
+        let second = push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            f64_ty,
+        );
+        caller.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(caller);
+
+        assert!(
+            !Gvn.run(&mut m),
+            "a float-returning PURE call may observe a new rounding mode"
+        );
+        let call_count = m.functions[1].blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.kind, InstKind::Call(FuncRef::Internal(0), _)))
+            .count();
+        assert_eq!(call_count, 2);
+    }
+
+    #[test]
+    fn gvn_keeps_nonfloat_rounding_sensitive_calls_distinct() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let f64_ty = IrType::Float(FloatWidth::F64);
+
+        let mut callee = Function::new("rounded_up".into(), vec![], IrType::Bool);
+        callee.is_pure = true;
+        let callee_entry = callee.entry;
+        let one = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let half_ulp = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let rounded = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::FAdd(one, half_ulp),
+            f64_ty,
+        );
+        let increased = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::FCmp(CmpOp::Gt, rounded, one),
+            IrType::Bool,
+        );
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(increased)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Bool);
+        let entry = caller.entry;
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Bool,
+        );
+        let target_ty = IrType::FuncPtr(Box::new(FuncSig {
+            params: vec![],
+            ret: IrType::Void,
+        }));
+        let target = push_inst(
+            &mut caller,
+            entry,
+            InstKind::Undef(target_ty.clone()),
+            target_ty,
+        );
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Indirect(target), vec![]),
+            IrType::Void,
+        );
+        let second = push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Bool,
+        );
+        caller.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(caller);
+
+        assert!(
+            !Gvn.run(&mut m),
+            "a non-float PURE result can still depend on active rounding"
+        );
+        let call_count = m.functions[1].blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.kind, InstKind::Call(FuncRef::Internal(0), _)))
+            .count();
+        assert_eq!(call_count, 2);
     }
 
     #[test]
