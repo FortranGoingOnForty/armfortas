@@ -11,8 +11,42 @@ pub struct VRegId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MBlockId(pub u32);
 
+/// How many call sites lie strictly inside a live interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallCrossing {
+    None,
+    One(u32),
+    Multiple,
+}
+
+/// Classify calls in the open interval `(start, end)` without materializing
+/// a per-interval crossing vector. `sorted_calls` must be ascending.
+pub fn classify_call_crossing(sorted_calls: &[u32], start: u32, end: u32) -> CallCrossing {
+    let first = sorted_calls.partition_point(|&position| position <= start);
+    let after_last = sorted_calls.partition_point(|&position| position < end);
+    match after_last.saturating_sub(first) {
+        0 => CallCrossing::None,
+        1 => CallCrossing::One(sorted_calls[first]),
+        _ => CallCrossing::Multiple,
+    }
+}
+
 use crate::ir::types::{FloatWidth, IrType};
 use std::fmt::Write;
+
+#[cfg(test)]
+mod call_crossing_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_open_interval_call_crossings() {
+        let calls = [2, 4, 6, 8, 10];
+        assert_eq!(classify_call_crossing(&calls, 4, 6), CallCrossing::None);
+        assert_eq!(classify_call_crossing(&calls, 3, 5), CallCrossing::One(4));
+        assert_eq!(classify_call_crossing(&calls, 1, 9), CallCrossing::Multiple);
+        assert_eq!(classify_call_crossing(&[], 0, 10), CallCrossing::None);
+    }
+}
 
 fn split_i128_words(value: i128) -> (u64, u64) {
     let bits = value as u128;

@@ -20,10 +20,6 @@ pub struct LiveInterval {
     pub class: X86RegClass,
     pub start: u32,
     pub end: u32,
-    /// True if any Call/CallReg falls strictly within (start, end).
-    pub crosses_call: bool,
-    /// Sorted positions of every call strictly inside (start, end).
-    pub call_crossings: Vec<u32>,
     /// Preferred physical register: this vreg is moved to/from this
     /// register by isel (an arg-setup `mov vreg, %rdi`, a return value,
     /// a div dividend, …). Allocating the vreg here turns the move into
@@ -35,6 +31,8 @@ pub struct LiveInterval {
 /// Result of liveness analysis.
 pub struct LivenessResult {
     pub intervals: Vec<LiveInterval>,
+    /// Sorted Call/CallReg positions, stored once for lazy interval queries.
+    pub call_positions: Vec<u32>,
     pub num_positions: u32,
 }
 
@@ -252,8 +250,8 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
         }
     }
 
-    // Call positions for crosses_call. Both direct (Call) and indirect
-    // (CallReg) clobber all caller-saved registers.
+    // Both direct and indirect calls must be visible to the allocator's
+    // lazy crossing query because they clobber all caller-saved registers.
     let mut call_positions: Vec<u32> = Vec::new();
     for (block_idx, block) in f.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
@@ -302,18 +300,11 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
         .filter_map(|(idx, start)| {
             let start = (*start)?;
             let end = ends[idx]?;
-            let call_crossings: Vec<u32> = call_positions
-                .iter()
-                .copied()
-                .filter(|&cp| cp > start && cp < end)
-                .collect();
             Some(LiveInterval {
                 vreg: VRegId(idx as u32),
                 class: classes[idx],
                 start,
                 end,
-                crosses_call: !call_crossings.is_empty(),
-                call_crossings,
                 hint: hints.get(&VRegId(idx as u32)).copied(),
             })
         })
@@ -326,6 +317,7 @@ pub fn compute_liveness(f: &X86Function) -> LivenessResult {
 
     LivenessResult {
         intervals,
+        call_positions,
         num_positions,
     }
 }
@@ -418,6 +410,88 @@ mod tests {
             addr_interval.hint, None,
             "store address must not inherit an FP move hint"
         );
+    }
+
+    #[test]
+    fn call_positions_include_direct_and_indirect_calls_once() {
+        let mut mf = X86Function::new("calls".into());
+        mf.blocks[0].insts.push(X86Inst {
+            opcode: X86Opcode::Call,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Extern("callee".into())],
+            def: None,
+        });
+        mf.blocks[0].insts.push(X86Inst {
+            opcode: X86Opcode::CallReg,
+            size: OpSize::Q,
+            operands: vec![X86Operand::Reg(X86Reg::R11)],
+            def: None,
+        });
+
+        let result = compute_liveness(&mf);
+        assert_eq!(result.call_positions, vec![0, 2]);
+    }
+
+    #[test]
+    fn call_crossing_storage_scales_with_calls_and_intervals() {
+        const COUNT: usize = 128;
+        assert!(
+            !std::mem::needs_drop::<LiveInterval>(),
+            "live intervals must not own per-interval call metadata"
+        );
+
+        let mut mf = X86Function::new("call_matrix".into());
+        let mut long_lived = Vec::with_capacity(COUNT);
+        for value in 0..COUNT {
+            let vreg = mf.new_vreg(X86RegClass::Gp64);
+            long_lived.push(vreg);
+            mf.blocks[0].insts.push(X86Inst {
+                opcode: X86Opcode::MovRI,
+                size: OpSize::Q,
+                operands: vec![X86Operand::Imm(value as i64)],
+                def: Some(X86Operand::VReg(vreg)),
+            });
+        }
+        for call in 0..COUNT {
+            let (opcode, operand) = if call % 2 == 0 {
+                (X86Opcode::Call, X86Operand::Extern("callee".into()))
+            } else {
+                (X86Opcode::CallReg, X86Operand::Reg(X86Reg::R11))
+            };
+            mf.blocks[0].insts.push(X86Inst {
+                opcode,
+                size: OpSize::Q,
+                operands: vec![operand],
+                def: None,
+            });
+        }
+        for source in &long_lived {
+            let result = mf.new_vreg(X86RegClass::Gp64);
+            mf.blocks[0].insts.push(X86Inst {
+                opcode: X86Opcode::MovRR,
+                size: OpSize::Q,
+                operands: vec![X86Operand::VReg(*source)],
+                def: Some(X86Operand::VReg(result)),
+            });
+        }
+
+        let liveness = compute_liveness(&mf);
+        assert_eq!(liveness.call_positions.len(), COUNT);
+        for vreg in long_lived {
+            let interval = liveness
+                .intervals
+                .iter()
+                .find(|interval| interval.vreg == vreg.id)
+                .expect("long-lived interval");
+            assert_eq!(
+                crate::codegen::shared::classify_call_crossing(
+                    &liveness.call_positions,
+                    interval.start,
+                    interval.end,
+                ),
+                crate::codegen::shared::CallCrossing::Multiple
+            );
+        }
     }
 
     #[test]
