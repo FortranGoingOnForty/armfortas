@@ -952,7 +952,7 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
     assert!(verify_module(&m).is_empty(), "test setup invalid");
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     // Final IR must verify.
     let errs = verify_module(&m);
@@ -1010,7 +1010,7 @@ fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
     m.add_function(f);
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     let post = verify_module(&m);
     assert!(post.is_empty(), "post-pipeline IR invalid: {:?}", post);
@@ -1058,7 +1058,7 @@ fn audit_interaction_strength_reduce_orphans_get_dced() {
     m.add_function(f);
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     // strength_reduce makes mul an identity (passes through to x), then
     // turns the original mul inst into Const(0). DCE should remove that.
@@ -2164,7 +2164,7 @@ fn audit_const_fold_non_rpo_block_order() {
     assert!(pre.is_empty(), "test setup invalid: {:?}", pre);
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     let post = verify_module(&m);
     assert!(

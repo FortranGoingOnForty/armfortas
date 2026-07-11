@@ -1693,7 +1693,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         } else {
             crate::opt::build_pipeline(ir_opt, opts.target.arch)
         };
-        pm.run(&mut ir_module);
+        pm.run(&mut ir_module)
+            .map_err(|error| format!("internal error: {error}"))?;
     }
     phase.end(&mut phases);
     if opts.verbose {

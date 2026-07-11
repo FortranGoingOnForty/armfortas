@@ -1973,7 +1973,8 @@ mod tests {
     fn gvn_matches_real_pure_recursive_fixture_after_pre_o2_passes() {
         let mut module = lower_fixture("pure_recursive_reuse.f90");
         let pm = build_pre_gvn_o2_pipeline();
-        pm.run(&mut module);
+        pm.run(&mut module)
+            .expect("pre-GVN fixture pipeline should converge");
 
         let pure_calls: Vec<PureCallPolicy> = module
             .functions
