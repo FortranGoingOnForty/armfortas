@@ -25,10 +25,11 @@ test-drive matched gfortran exactly.)
 
 ## Audit remediation branch checkpoint
 
-Status as of 2026-07-09 on `ar-remediation`: the ordered AR sprint pass
-has been worked through `AR14.md`, which is the last sprint file in
-`.docs/sprints/`. There is no `AR15.md`, and there is no known unfixed AR
-target remaining on this branch after the current verification pass.
+Status as of 2026-07-11: the original ordered pass through `AR14.md`
+landed through PR #113. Follow-up audit work added five more ordered files:
+`AR15.md` through `AR18.md` landed through PRs #115-#118, and all six
+targets in `AR19.md` are implemented on `remediate-19-optimizer-legality`
+with local gates complete. Hosted PR CI is the remaining merge gate.
 
 Verification gates run during the closeout pass:
 
@@ -45,6 +46,16 @@ Verification gates run during the closeout pass:
   `.amod` integrity header check, AFS_LD ELF e2e routing without manual
   CRT flags, afs-ld archive/link tests, and afs-as `.space`/`\a`
   differential tests.
+- AR15-AR18 completed CI truth, driver integrity, finalization/ownership,
+  and allocation-state remediation and are merged into `trunk`.
+- AR19 release workspace build, 1,398 library tests, and the complete
+  integration suite passed. The end-to-end harness passed 125 tests; each
+  optimization lane ran 763 programs with two expected failures and no
+  unexpected failures.
+- AR19 determinism and toolchain checks passed, including 1,971 x86
+  assembler object comparisons with no divergence, 1,272-compilation x87
+  and ISA-ceiling sweeps, strict Linux skip accounting, formatting,
+  all-target workspace Clippy, and the benchmark size guard.
 
 PR #113 CI follow-up, also on 2026-07-09: local reproduction of the red
 Linux/end-to-end jobs found the remaining failures were in the current
