@@ -10,29 +10,37 @@ fn compiler() -> PathBuf {
         .expect("armfortas binary should be built for integration tests")
 }
 
-fn compile_arm64_asm(source: &str, opt: &str) -> String {
+fn compile_arm64_output(source: &str, opt: &str, emit: &str, extension: &str) -> String {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let stem = format!("armfortas_arm64_remediation_{}_{}", std::process::id(), id);
     let source_path = std::env::temp_dir().join(format!("{stem}.f90"));
-    let asm_path = std::env::temp_dir().join(format!("{stem}.s"));
+    let output_path = std::env::temp_dir().join(format!("{stem}.{extension}"));
     fs::write(&source_path, source).expect("write ARM64 regression source");
 
     let output = Command::new(compiler())
-        .args(["-ffree-form", "--target", "arm64-macos", opt, "-S", "-o"])
-        .arg(&asm_path)
+        .args(["-ffree-form", "--target", "arm64-macos", opt, emit, "-o"])
+        .arg(&output_path)
         .arg(&source_path)
         .output()
-        .expect("run armfortas ARM64 assembly compile");
+        .expect("run armfortas ARM64 compile");
     let _ = fs::remove_file(&source_path);
     assert!(
         output.status.success(),
-        "ARM64 assembly compile failed: {}",
+        "ARM64 compile failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let asm = fs::read_to_string(&asm_path).expect("read ARM64 regression assembly");
-    let _ = fs::remove_file(&asm_path);
-    asm
+    let text = fs::read_to_string(&output_path).expect("read ARM64 compiler output");
+    let _ = fs::remove_file(&output_path);
+    text
+}
+
+fn compile_arm64_asm(source: &str, opt: &str) -> String {
+    compile_arm64_output(source, opt, "-S", "s")
+}
+
+fn compile_arm64_ir(source: &str, opt: &str) -> String {
+    compile_arm64_output(source, opt, "--emit-ir", "ir")
 }
 
 #[test]
@@ -165,5 +173,44 @@ end function
     assert!(
         last_flag_setter.trim_start().starts_with("cmp "),
         "CSEL consumed arithmetic flags instead of the condition:\n{asm}"
+    );
+}
+
+#[test]
+fn unsupported_arm64_where_comparisons_remain_scalar() {
+    let ir = compile_arm64_ir(
+        r#"
+program comparisons
+  use iso_fortran_env, only: int64, real32
+  implicit none
+  integer :: i, a(32), b(32)
+  integer(int64) :: c(32), d(32)
+  real(real32) :: x(32), y(32)
+  do i = 1, 32
+    a(i) = i
+    b(i) = -i
+    c(i) = int(i, int64)
+    d(i) = -int(i, int64)
+    x(i) = real(i, real32)
+    y(i) = -real(i, real32)
+  end do
+  where (a /= 0)
+    b = a
+  end where
+  where (c > 0_int64)
+    d = c
+  end where
+  where (x /= 0.0_real32)
+    y = x
+  end where
+  print *, b(1), d(1), y(1)
+end program comparisons
+"#,
+        "-O3",
+    );
+
+    assert!(
+        !ir.contains("vicmp") && !ir.contains("vfcmp"),
+        "unsupported ARM64 comparisons reached vector instruction selection:\n{ir}"
     );
 }

@@ -1612,8 +1612,11 @@ pub(crate) fn build_where_plan(
         (IrType::Float(_), true) | (IrType::Int(_), false) => {}
         _ => return None,
     }
-    // Packed i64 lane compare is per-ISA (NEON cmgt.2d; SSE2 has
-    // only the i32 forms).
+    // Reject comparison shapes that the selected backend cannot lower.
+    // Letting them reach instruction selection produces an undefined mask.
+    if cmp_op == CmpOp::Ne && !isa.cmp_ne {
+        return None;
+    }
     if !cmp_is_float && matches!(elem_ty, IrType::Int(IntWidth::I64)) && !isa.int_cmp_i64 {
         return None;
     }
