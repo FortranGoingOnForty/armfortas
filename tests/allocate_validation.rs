@@ -375,10 +375,14 @@ fn allocation_options_are_rejected_where_they_do_not_apply() {
 
 #[test]
 fn errmsg_without_stat_warns_but_compiles() {
-    let (dir, compile) = compile_source(
-        "errmsg_without_stat",
+    let dir = unique_dir("errmsg_without_stat");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
         "program p\n  integer, allocatable :: x\n  character(32) :: msg\n  allocate(x, errmsg=msg)\n  deallocate(x, errmsg=msg)\nend program\n",
     );
+    let object = dir.join("errmsg_without_stat.o");
+    let compile = compile_with_args(&["-c", src.to_str().unwrap(), "-o", object.to_str().unwrap()]);
     assert!(
         compile.status.success(),
         "ERRMSG without STAT should remain valid:\nstdout:\n{}\nstderr:\n{}",
