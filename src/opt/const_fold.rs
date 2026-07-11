@@ -117,7 +117,16 @@ fn round_for_width(v: f64, w: FloatWidth) -> f64 {
 /// constants. Returns `Some(new_kind)` if the instruction can be
 /// replaced with a `Const*`.
 #[allow(clippy::too_many_lines)]
-fn try_fold(kind: &InstKind, ty: &IrType, consts: &HashMap<ValueId, Const>) -> Option<InstKind> {
+fn try_fold(
+    kind: &InstKind,
+    ty: &IrType,
+    consts: &HashMap<ValueId, Const>,
+    fpenv_barrier: bool,
+) -> Option<InstKind> {
+    if fpenv_barrier && super::gvn::is_rounding_dependent_fp(kind) {
+        return None;
+    }
+
     let get = |id: &ValueId| consts.get(id).copied();
 
     match kind {
@@ -564,6 +573,12 @@ impl Pass for ConstFold {
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
         for func in &mut module.functions {
+            let fpenv_barrier = func
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .any(|inst| super::gvn::is_fpenv_rounding_barrier(&inst.kind));
+
             // Audit N-8: we walk `func.blocks` in vec order, which
             // is NOT guaranteed to be reverse-postorder. If a fold
             // in an early-vec block needs a constant defined by a
@@ -599,7 +614,9 @@ impl Pass for ConstFold {
                         if consts.contains_key(&inst.id) {
                             continue;
                         }
-                        if let Some(new_kind) = try_fold(&inst.kind, &inst.ty, &consts) {
+                        if let Some(new_kind) =
+                            try_fold(&inst.kind, &inst.ty, &consts, fpenv_barrier)
+                        {
                             if let Some(c) = Const::from_inst(&new_kind) {
                                 consts.insert(inst.id, c);
                             }
@@ -749,6 +766,41 @@ mod tests {
             }
             _ => panic!("expected ConstFloat"),
         }
+    }
+
+    #[test]
+    fn leaves_rounding_dependent_fold_after_fpenv_change() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstInt(2, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::Call(
+                    FuncRef::External("afs_ieee_set_rounding".into()),
+                    vec![ValueId(2)],
+                ),
+                IrType::Void,
+            ),
+            (
+                InstKind::FAdd(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "constant FP arithmetic must remain dynamic when the function changes rounding mode"
+        );
+        assert!(matches!(first_block_kinds(&m)[4], InstKind::FAdd(..)));
     }
 
     #[test]
