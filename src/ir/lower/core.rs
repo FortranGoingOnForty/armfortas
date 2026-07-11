@@ -56903,6 +56903,57 @@ pub(super) struct AllocateStatTarget {
     pub writeback_ty: Option<IrType>,
 }
 
+fn allocation_option_array_element_info(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    callee: &SpannedExpr,
+    args: &[crate::ast::expr::Argument],
+) -> Option<LocalInfo> {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|arg| !matches!(arg.value, crate::ast::expr::SectionSubscript::Element(_)))
+    {
+        return None;
+    }
+    let info = match &callee.node {
+        Expr::Name { name } => ctx.locals.get(&name.to_lowercase()).cloned(),
+        Expr::ComponentAccess { .. } => {
+            component_intrinsic_local_info(b, &ctx.locals, callee, ctx.st, ctx.type_layouts)
+        }
+        _ => None,
+    }?;
+    let rank = local_declared_rank(&info);
+    (rank > 0 && args.len() == rank).then_some(info)
+}
+
+fn allocation_status_array_element_target(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    callee: &SpannedExpr,
+    args: &[crate::ast::expr::Argument],
+) -> Option<AllocateStatTarget> {
+    let info = allocation_option_array_element_info(b, ctx, callee, args)?;
+    let IrType::Int(width) = info.ty else {
+        return None;
+    };
+    let user_addr =
+        lower_array_element_addr(b, &ctx.locals, &info, args, ctx.st, Some(ctx.type_layouts));
+    if width == IntWidth::I32 {
+        Some(AllocateStatTarget {
+            runtime_addr: user_addr,
+            writeback_user_addr: None,
+            writeback_ty: None,
+        })
+    } else {
+        Some(AllocateStatTarget {
+            runtime_addr: b.alloca(IrType::Int(IntWidth::I32)),
+            writeback_user_addr: Some(user_addr),
+            writeback_ty: Some(IrType::Int(width)),
+        })
+    }
+}
+
 pub(super) fn allocate_status_target_addr(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
@@ -57007,6 +57058,14 @@ pub(super) fn allocate_status_target(
                 ),
             }
         }
+        Expr::FunctionCall { callee, args } => {
+            allocation_status_array_element_target(b, ctx, callee, args).unwrap_or_else(|| {
+                lower_stmt_error(
+                    stat_expr.span,
+                    "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
+                )
+            })
+        }
         _ => lower_stmt_error(
             stat_expr.span,
             "ALLOCATE/DEALLOCATE STAT= must name a scalar integer variable",
@@ -57067,6 +57126,18 @@ pub(super) fn resolve_errmsg_target_expr(
                 }),
                 _ => None,
             }
+        }
+        Expr::FunctionCall { callee, args } => {
+            let info = allocation_option_array_element_info(b, ctx, callee, args)?;
+            let (ptr, len) = char_array_element_ptr_and_len(
+                b,
+                &ctx.locals,
+                &info,
+                args,
+                ctx.st,
+                Some(ctx.type_layouts),
+            )?;
+            Some(RuntimeErrmsgTarget::Fixed { ptr, len })
         }
         _ => None,
     }

@@ -643,6 +643,43 @@ fn allocate_byte_overflow_without_stat_terminates_cleanly() {
 }
 
 #[test]
+fn allocation_options_accept_scalar_array_elements() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocation_options_accept_scalar_array_elements count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_option_array_elements");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: option_box_t\n    integer :: statuses(2)\n    character(len=64) :: messages(2)\n  end type option_box_t\n  type(option_box_t) :: box\n  integer, allocatable :: values(:)\n  integer(kind=8) :: statuses(2)\n  character(len=64) :: messages(2)\n  statuses = 99_8\n  messages = 'unchanged'\n  allocate(values(2), stat=statuses(2), errmsg=messages(2))\n  if (statuses(2) /= 0_8) error stop 1\n  if (trim(messages(2)) /= 'unchanged') error stop 2\n  allocate(values(2), stat=statuses(1), errmsg=messages(1))\n  if (statuses(1) == 0_8) error stop 3\n  if (index(trim(messages(1)), 'ALLOCATE failed') == 0) error stop 4\n  box%statuses = 99\n  box%messages = 'unchanged'\n  deallocate(values, stat=box%statuses(2), errmsg=box%messages(2))\n  if (box%statuses(2) /= 0) error stop 5\n  if (trim(box%messages(2)) /= 'unchanged') error stop 6\n  deallocate(values, stat=box%statuses(1), errmsg=box%messages(1))\n  if (box%statuses(1) == 0) error stop 7\n  if (index(trim(box%messages(1)), 'DEALLOCATE failed') == 0) error stop 8\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("alloc_option_array_elements.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("allocation option array-element runtime failed");
+    assert!(
+        run.status.success(),
+        "array-element allocation options failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_source_array_infers_shape_and_copies_values() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
