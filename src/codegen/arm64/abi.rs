@@ -20,6 +20,8 @@ pub enum AbiArgLoc {
     Fp(u8),
     Fp32(u8),
     GpPair(u8),
+    FpPair(u8),
+    Fp32Pair(u8),
     /// 128-bit NEON vector via `v0-v7`. Per AAPCS64, vectors share
     /// the same physical bank as floats; the V form is the 128-bit
     /// view of the same register.
@@ -49,6 +51,10 @@ pub fn align_to(value: i64, align: i64) -> i64 {
 pub fn abi_stack_layout(ty: &IrType) -> (i64, i64) {
     match ty {
         IrType::Int(IntWidth::I128) => (16, 16),
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F64)) => {
+            (16, 8)
+        }
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)) => (8, 4),
         IrType::Int(IntWidth::I64) | IrType::Ptr(_) | IrType::FuncPtr(_) => (8, 8),
         IrType::Float(FloatWidth::F64) => (8, 8),
         // TODO: integer(c_short), value actuals still appear widened before
@@ -74,6 +80,32 @@ pub fn classify_abi_arg(ty: &IrType, state: &mut AbiArgState) -> AbiArgLoc {
                 AbiArgLoc::GpPair(reg)
             } else {
                 state.gp_idx = 8;
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F64)) => {
+            if state.fp_idx + 2 <= 8 {
+                let reg = state.fp_idx;
+                state.fp_idx += 2;
+                AbiArgLoc::FpPair(reg)
+            } else {
+                state.fp_idx = 8;
+                let (size, align) = abi_stack_layout(ty);
+                let offset = align_to(state.stack_offset, align);
+                state.stack_offset = offset + size;
+                AbiArgLoc::Stack(offset)
+            }
+        }
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)) => {
+            if state.fp_idx + 2 <= 8 {
+                let reg = state.fp_idx;
+                state.fp_idx += 2;
+                AbiArgLoc::Fp32Pair(reg)
+            } else {
+                state.fp_idx = 8;
                 let (size, align) = abi_stack_layout(ty);
                 let offset = align_to(state.stack_offset, align);
                 state.stack_offset = offset + size;
@@ -194,5 +226,58 @@ mod layout_drift_tests {
             32,
             "see runtime/src/descriptor.rs StringDescriptor"
         );
+    }
+
+    #[test]
+    fn complex_hfas_consume_two_fp_slots_and_overflow_by_value() {
+        let complex4 = IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2);
+        let complex8 = IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2);
+        let mut state = AbiArgState::default();
+
+        assert_eq!(
+            classify_abi_arg(&complex4, &mut state),
+            AbiArgLoc::Fp32Pair(0)
+        );
+        assert_eq!(
+            classify_abi_arg(&IrType::Float(FloatWidth::F64), &mut state),
+            AbiArgLoc::Fp(2)
+        );
+        for _ in 3..7 {
+            assert!(matches!(
+                classify_abi_arg(&IrType::Float(FloatWidth::F64), &mut state),
+                AbiArgLoc::Fp(_)
+            ));
+        }
+        assert_eq!(classify_abi_arg(&complex8, &mut state), AbiArgLoc::Stack(0));
+        assert_eq!(
+            classify_abi_arg(&IrType::Float(FloatWidth::F64), &mut state),
+            AbiArgLoc::Stack(16)
+        );
+        assert_eq!(
+            classify_abi_arg(&IrType::Int(IntWidth::I32), &mut state),
+            AbiArgLoc::Gp32(0)
+        );
+        assert_eq!(abi_stack_layout(&complex4), (8, 4));
+        assert_eq!(abi_stack_layout(&complex8), (16, 8));
+        assert_eq!(state.fp_idx, 8);
+        assert_eq!(state.stack_offset, 24);
+
+        let mut state = AbiArgState::default();
+        for reg in 0..7 {
+            assert_eq!(
+                classify_abi_arg(&IrType::Float(FloatWidth::F32), &mut state),
+                AbiArgLoc::Fp32(reg)
+            );
+        }
+        assert_eq!(classify_abi_arg(&complex4, &mut state), AbiArgLoc::Stack(0));
+        assert_eq!(
+            classify_abi_arg(&IrType::Float(FloatWidth::F32), &mut state),
+            AbiArgLoc::Stack(8)
+        );
+        assert_eq!(
+            classify_abi_arg(&IrType::Int(IntWidth::I32), &mut state),
+            AbiArgLoc::Gp32(0)
+        );
+        assert_eq!(state.stack_offset, 12);
     }
 }

@@ -89,6 +89,11 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
     enum IncomingParam {
         Narrow(VRegId, RegClass, AbiArgLoc, IrType),
         Wide(i32, AbiArgLoc),
+        Complex4 {
+            dest: VRegId,
+            lanes: Option<(VRegId, VRegId)>,
+            loc: AbiArgLoc,
+        },
     }
 
     // Phase 2.5: handle incoming parameters.
@@ -98,7 +103,38 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
     let mut abi_state = AbiArgState::default();
     for param in &func.params {
         let loc = classify_abi_arg(&param.ty, &mut abi_state);
+        if is_complex8_pair_ty_arm(&param.ty) {
+            let dest = mf.new_vreg(RegClass::Gp64);
+            ctx.value_map.insert(param.id, dest);
+            let lanes = match loc {
+                AbiArgLoc::Fp32Pair(_) => {
+                    Some((mf.new_vreg(RegClass::Fp32), mf.new_vreg(RegClass::Fp32)))
+                }
+                AbiArgLoc::Stack(_) => None,
+                other => panic!(
+                    "isel: unexpected ABI loc {:?} for incoming complex(4) param",
+                    other
+                ),
+            };
+            param_info.push(IncomingParam::Complex4 { dest, lanes, loc });
+            continue;
+        }
         if matches!(param.ty, IrType::Int(IntWidth::I128)) {
+            if !matches!(loc, AbiArgLoc::GpPair(_) | AbiArgLoc::Stack(_)) {
+                panic!("isel: unexpected ABI loc {:?} for incoming i128 param", loc);
+            }
+            let offset = mf.alloc_local(16);
+            ctx.wide_value_slots.insert(param.id, offset);
+            param_info.push(IncomingParam::Wide(offset, loc));
+            continue;
+        }
+        if is_complex16_pair_ty_arm(&param.ty) {
+            if !matches!(loc, AbiArgLoc::FpPair(_) | AbiArgLoc::Stack(_)) {
+                panic!(
+                    "isel: unexpected ABI loc {:?} for incoming complex(8) param",
+                    loc
+                );
+            }
             let offset = mf.alloc_local(16);
             ctx.wide_value_slots.insert(param.id, offset);
             param_info.push(IncomingParam::Wide(offset, loc));
@@ -113,29 +149,35 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
     // Phase 3: emit prologue in entry block.
     emit_prologue(&mut mf, MBlockId(0));
 
-    // Phase 3.5a: capture fixed incoming i128 pairs before allocator-selected
-    // scalar destinations can reuse either source register. The later scalar
-    // receipts are resolved as parallel copies, but these pair stores are not
-    // part of that graph and therefore must happen first.
-    for info in &param_info {
-        if let IncomingParam::Wide(offset, AbiArgLoc::GpPair(reg)) = info {
-            emit_store_phys_i128_pair(
-                &mut mf,
-                MBlockId(0),
-                MachineOperand::PhysReg(PhysReg::FP),
-                *offset as i64,
-                PhysReg::Gp(*reg),
-                PhysReg::Gp(*reg + 1),
-            );
-        }
-    }
-
-    // Phase 3.5b: move the remaining incoming arguments into their vregs or
-    // backing slots. Dispatch by register class: GP args from x0-x7, FP args
-    // from d0-d7.
+    // Phase 3.5a: capture fixed incoming wide pairs before allocator-selected
+    // scalar destinations can reuse their source registers. The later scalar
+    // receipts are resolved as parallel copies, but these stores are not part
+    // of that graph and therefore must happen first.
     for info in &param_info {
         match info {
-            IncomingParam::Wide(_, AbiArgLoc::GpPair(_)) => {}
+            IncomingParam::Wide(offset, AbiArgLoc::GpPair(reg)) => {
+                emit_store_phys_i128_pair(
+                    &mut mf,
+                    MBlockId(0),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    *offset as i64,
+                    PhysReg::Gp(*reg),
+                    PhysReg::Gp(*reg + 1),
+                );
+            }
+            IncomingParam::Wide(offset, AbiArgLoc::FpPair(reg)) => {
+                for (half, fp) in [(0i64, *reg), (8, *reg + 1)] {
+                    mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                        opcode: ArmOpcode::StrFpImm,
+                        operands: vec![
+                            MachineOperand::PhysReg(PhysReg::Fp(fp)),
+                            MachineOperand::PhysReg(PhysReg::FP),
+                            MachineOperand::Imm(*offset as i64 + half),
+                        ],
+                        def: None,
+                    });
+                }
+            }
             IncomingParam::Wide(offset, AbiArgLoc::Stack(stack_offset)) => {
                 emit_load_phys_i128_pair(
                     &mut mf,
@@ -154,6 +196,34 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
                     PhysReg::Gp(17),
                 );
             }
+            _ => {}
+        }
+    }
+
+    // Phase 3.5b: move the remaining incoming arguments into their vregs or
+    // backing slots. Dispatch by register class: GP args from x0-x7, FP args
+    // from d0-d7.
+    for info in &param_info {
+        match info {
+            IncomingParam::Wide(_, _) => {}
+            IncomingParam::Complex4 {
+                lanes: Some((real, imag)),
+                loc: AbiArgLoc::Fp32Pair(reg),
+                ..
+            } => {
+                for (lane, fp) in [(*real, *reg), (*imag, *reg + 1)] {
+                    mf.entry_arg_receipts.push(lane);
+                    mf.block_mut(MBlockId(0)).insts.push(MachineInst {
+                        opcode: ArmOpcode::FmovReg,
+                        operands: vec![
+                            MachineOperand::VReg(lane),
+                            MachineOperand::PhysReg(PhysReg::Fp32(fp)),
+                        ],
+                        def: Some(lane),
+                    });
+                }
+            }
+            IncomingParam::Complex4 { .. } => {}
             IncomingParam::Narrow(vreg, RegClass::Fp64, AbiArgLoc::Fp(reg), _) => {
                 mf.entry_arg_receipts.push(*vreg);
                 mf.block_mut(MBlockId(0)).insts.push(MachineInst {
@@ -208,18 +278,45 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
                     16 + *stack_offset,
                 );
             }
-            IncomingParam::Wide(_, other) => {
-                panic!(
-                    "isel: unexpected ABI loc {:?} for incoming i128 param",
-                    other
-                );
-            }
             IncomingParam::Narrow(_, class, other, _) => {
                 panic!(
                     "isel: unexpected ABI loc {:?} for incoming {:?} param",
                     other, class
                 );
             }
+        }
+    }
+
+    // Phase 3.5c: after every fixed register argument has been received,
+    // assemble packed complex(4) values or load their stack-overflow form.
+    // Delaying the GPR destination prevents it from overwriting an incoming
+    // scalar argument before the parallel receipt pass can consume that value.
+    for info in &param_info {
+        match info {
+            IncomingParam::Complex4 {
+                dest,
+                lanes: Some((real, imag)),
+                loc: AbiArgLoc::Fp32Pair(_),
+            } => emit_pack_complex4_lanes(&mut mf, MBlockId(0), *dest, *real, *imag),
+            IncomingParam::Complex4 {
+                dest,
+                lanes: None,
+                loc: AbiArgLoc::Stack(stack_offset),
+            } => emit_load_stack_arg_into_vreg(
+                &mut mf,
+                MBlockId(0),
+                *dest,
+                RegClass::Gp64,
+                &IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2),
+                16 + *stack_offset,
+            ),
+            IncomingParam::Complex4 { loc, .. } => {
+                panic!(
+                    "isel: inconsistent incoming complex(4) ABI location {:?}",
+                    loc
+                );
+            }
+            _ => {}
         }
     }
 
@@ -350,6 +447,65 @@ fn select_call_inst(
 
     let mut pending_reg_arg_moves: Vec<(ArmOpcode, PhysReg, VRegId)> = Vec::new();
     for (arg_val, loc, arg_ty) in arg_locs {
+        if is_complex16_pair_ty_arm(&arg_ty) {
+            let arg_slot = ctx.lookup_wide_slot(arg_val);
+            match loc {
+                AbiArgLoc::FpPair(reg) => {
+                    for (half, fp) in [(0i64, reg), (8, reg + 1)] {
+                        let lane = mf.new_vreg(RegClass::Fp64);
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::LdrFpImm,
+                            operands: vec![
+                                MachineOperand::VReg(lane),
+                                MachineOperand::PhysReg(PhysReg::FP),
+                                MachineOperand::Imm(arg_slot as i64 + half),
+                            ],
+                            def: Some(lane),
+                        });
+                        pending_reg_arg_moves.push((ArmOpcode::FmovReg, PhysReg::Fp(fp), lane));
+                    }
+                }
+                AbiArgLoc::Stack(stack_offset) => {
+                    emit_load_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        arg_slot as i64,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                    emit_store_phys_i128_pair(
+                        mf,
+                        mb,
+                        MachineOperand::PhysReg(PhysReg::Sp),
+                        stack_offset,
+                        PhysReg::Gp(16),
+                        PhysReg::Gp(17),
+                    );
+                }
+                other => panic!(
+                    "isel: unexpected ABI loc {:?} for outgoing complex(8) arg",
+                    other
+                ),
+            }
+            continue;
+        }
+        if is_complex8_pair_ty_arm(&arg_ty) {
+            match loc {
+                AbiArgLoc::Fp32Pair(reg) => {
+                    let src = ctx.lookup_vreg(arg_val);
+                    let (real, imag) = emit_unpack_complex4_lanes(mf, mb, src);
+                    pending_reg_arg_moves.push((ArmOpcode::FmovReg, PhysReg::Fp32(reg), real));
+                    pending_reg_arg_moves.push((ArmOpcode::FmovReg, PhysReg::Fp32(reg + 1), imag));
+                    continue;
+                }
+                AbiArgLoc::Stack(_) => {}
+                other => panic!(
+                    "isel: unexpected ABI loc {:?} for outgoing complex(4) arg",
+                    other
+                ),
+            }
+        }
         if matches!(arg_ty, IrType::Int(IntWidth::I128)) {
             let arg_slot = ctx.lookup_wide_slot(arg_val);
             match loc {
@@ -512,20 +668,11 @@ fn select_call_inst(
             def: None,
         });
         mf.block_mut(mb).insts.push(MachineInst {
-            opcode: ArmOpcode::Movz,
-            operands: vec![
-                MachineOperand::PhysReg(PhysReg::Gp(9)),
-                MachineOperand::Imm(32),
-                MachineOperand::Shift(0),
-            ],
-            def: None,
-        });
-        mf.block_mut(mb).insts.push(MachineInst {
             opcode: ArmOpcode::LslReg,
             operands: vec![
                 MachineOperand::PhysReg(PhysReg::Gp(17)),
                 MachineOperand::PhysReg(PhysReg::Gp(17)),
-                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::Imm(32),
             ],
             def: None,
         });
@@ -2352,26 +2499,13 @@ fn select_terminator(
                     ],
                     def: None,
                 });
-                // x16 = src >> 32; s1 ← w16. The shift amount lives
-                // in x17, NOT x9 — x9 is the allocator's vreg-load
-                // scratch and the VReg(src) substitution below would
-                // clobber it (caught by the differential: imag lane
-                // read the real lane's bits).
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::Movz,
-                    operands: vec![
-                        MachineOperand::PhysReg(PhysReg::Gp(17)),
-                        MachineOperand::Imm(32),
-                        MachineOperand::Shift(0),
-                    ],
-                    def: None,
-                });
+                // x16 = src >> 32; s1 ← w16.
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::LsrReg,
                     operands: vec![
                         MachineOperand::PhysReg(PhysReg::Gp(16)),
                         MachineOperand::VReg(src),
-                        MachineOperand::PhysReg(PhysReg::Gp(17)),
+                        MachineOperand::Imm(32),
                     ],
                     def: None,
                 });
@@ -2849,10 +2983,80 @@ fn is_wide_pair_ty_arm(ty: &IrType) -> bool {
     }
 }
 
+fn is_complex16_pair_ty_arm(ty: &IrType) -> bool {
+    matches!(ty, IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F64)))
+}
+
 /// `[f32 x 2]` — complex(4) by value: 8 raw bytes in a Gp64 vreg,
 /// crossing the AAPCS64 boundary as an HFA in s0/s1.
 fn is_complex8_pair_ty_arm(ty: &IrType) -> bool {
     matches!(ty, IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(FloatWidth::F32)))
+}
+
+fn emit_pack_complex4_lanes(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    dest: VRegId,
+    real: VRegId,
+    imag: VRegId,
+) {
+    for (lane, gp) in [(real, PhysReg::Gp(16)), (imag, PhysReg::Gp(17))] {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::MovReg,
+            operands: vec![MachineOperand::PhysReg(gp), MachineOperand::VReg(lane)],
+            def: None,
+        });
+    }
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::LslReg,
+        operands: vec![
+            MachineOperand::PhysReg(PhysReg::Gp(17)),
+            MachineOperand::PhysReg(PhysReg::Gp(17)),
+            MachineOperand::Imm(32),
+        ],
+        def: None,
+    });
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::OrrReg,
+        operands: vec![
+            MachineOperand::VReg(dest),
+            MachineOperand::PhysReg(PhysReg::Gp(16)),
+            MachineOperand::PhysReg(PhysReg::Gp(17)),
+        ],
+        def: Some(dest),
+    });
+}
+
+fn emit_unpack_complex4_lanes(
+    mf: &mut MachineFunction,
+    mb: MBlockId,
+    src: VRegId,
+) -> (VRegId, VRegId) {
+    let real = mf.new_vreg(RegClass::Fp32);
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::MovReg,
+        operands: vec![MachineOperand::VReg(real), MachineOperand::VReg(src)],
+        def: Some(real),
+    });
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::LsrReg,
+        operands: vec![
+            MachineOperand::PhysReg(PhysReg::Gp(16)),
+            MachineOperand::VReg(src),
+            MachineOperand::Imm(32),
+        ],
+        def: None,
+    });
+    let imag = mf.new_vreg(RegClass::Fp32);
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::MovReg,
+        operands: vec![
+            MachineOperand::VReg(imag),
+            MachineOperand::PhysReg(PhysReg::Gp32(16)),
+        ],
+        def: Some(imag),
+    });
+    (real, imag)
 }
 
 fn emit_const_i128_to_phys_pair(

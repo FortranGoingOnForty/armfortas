@@ -243,3 +243,316 @@ end function large
         "frame offset overwrote the materialized i128 low limb:\n{asm}"
     );
 }
+
+#[test]
+fn complex_value_call_arguments_use_hfa_register_pairs() {
+    let c4 = compile_arm64_asm(
+        r#"
+real(c_float) function call4() result(r) bind(c, name="call4")
+  use iso_c_binding
+  interface
+    function take4(value) result(out) bind(c, name="take4")
+      import :: c_float, c_float_complex
+      complex(c_float_complex), value :: value
+      real(c_float) :: out
+    end function take4
+  end interface
+  r = take4(cmplx(1.25_c_float, -2.5_c_float, kind=c_float))
+end function call4
+"#,
+        "-O0",
+    );
+    let call4 = c4
+        .find("bl _take4")
+        .unwrap_or_else(|| panic!("complex(4) call missing:\n{c4}"));
+    let setup4 = &c4[..call4];
+    assert!(
+        setup4.contains("fmov s0,") && setup4.contains("fmov s1,"),
+        "complex(4) VALUE argument must use s0:s1:\n{c4}"
+    );
+
+    let c8 = compile_arm64_asm(
+        r#"
+real(c_double) function call8() result(r) bind(c, name="call8")
+  use iso_c_binding
+  interface
+    function take8(value) result(out) bind(c, name="take8")
+      import :: c_double, c_double_complex
+      complex(c_double_complex), value :: value
+      real(c_double) :: out
+    end function take8
+  end interface
+  r = take8(cmplx(3.5_c_double, 4.25_c_double, kind=c_double))
+end function call8
+"#,
+        "-O0",
+    );
+    let call8 = c8
+        .find("bl _take8")
+        .unwrap_or_else(|| panic!("complex(8) call missing:\n{c8}"));
+    let setup8 = &c8[..call8];
+    assert!(
+        setup8
+            .lines()
+            .any(|line| line.trim_start().starts_with("fmov d0,"))
+            && setup8
+                .lines()
+                .any(|line| line.trim_start().starts_with("fmov d1,")),
+        "complex(8) VALUE argument must use d0:d1:\n{c8}"
+    );
+
+    let mixed = compile_arm64_asm(
+        r#"
+real(c_double) function call_mixed() result(r) bind(c, name="call_mixed")
+  use iso_c_binding
+  interface
+    function take_mixed(x,value,y) result(out) bind(c, name="take_mixed")
+      import :: c_float, c_float_complex
+      real(c_float), value :: x,y
+      complex(c_float_complex), value :: value
+      real(c_float) :: out
+    end function take_mixed
+  end interface
+  r = take_mixed(1.0_c_float, &
+                 cmplx(2.0_c_float, 3.0_c_float, kind=c_float), &
+                 4.0_c_float)
+end function call_mixed
+
+real(c_double) function call_mixed8() result(r) bind(c, name="call_mixed8")
+  use iso_c_binding
+  interface
+    function take_mixed8(x,value,y) result(out) bind(c, name="take_mixed8")
+      import :: c_double, c_double_complex
+      real(c_double), value :: x,y
+      complex(c_double_complex), value :: value
+      real(c_double) :: out
+    end function take_mixed8
+  end interface
+  r = take_mixed8(1.0_c_double, &
+                  cmplx(2.0_c_double, 3.0_c_double, kind=c_double), &
+                  4.0_c_double)
+end function call_mixed8
+"#,
+        "-O2",
+    );
+    let call = mixed
+        .find("bl _take_mixed")
+        .unwrap_or_else(|| panic!("mixed complex call missing:\n{mixed}"));
+    let setup = &mixed[..call];
+    for reg in ["s0", "s1", "s2", "s3"] {
+        assert!(
+            setup
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("fmov {reg},"))),
+            "scalar/complex/scalar arguments must occupy s0/s1:s2/s3:\n{mixed}"
+        );
+    }
+    let call8_start = mixed
+        .find("_call_mixed8:")
+        .unwrap_or_else(|| panic!("mixed complex(8) caller missing:\n{mixed}"));
+    let call8 = mixed[call8_start..]
+        .find("bl _take_mixed8")
+        .map(|offset| call8_start + offset)
+        .unwrap_or_else(|| panic!("mixed complex(8) call missing:\n{mixed}"));
+    let setup8 = &mixed[call8_start..call8];
+    for reg in ["d0", "d1", "d2", "d3"] {
+        assert!(
+            setup8
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("fmov {reg},"))),
+            "scalar/complex/scalar arguments must occupy d0/d1:d2/d3:\n{mixed}"
+        );
+    }
+}
+
+#[test]
+fn complex_value_parameters_are_captured_from_hfa_register_pairs() {
+    let asm = compile_arm64_asm(
+        r#"
+real(c_float) function take4(z) result(r) bind(c, name="take4")
+  use iso_c_binding
+  complex(c_float_complex), value :: z
+  r = real(z, c_float) + aimag(z)
+end function take4
+
+real(c_double) function take8(z) result(r) bind(c, name="take8")
+  use iso_c_binding
+  complex(c_double_complex), value :: z
+  r = real(z, c_double) + aimag(z)
+end function take8
+
+real(c_float) function take_mixed4(x,z,y) result(r) bind(c, name="take_mixed4")
+  use iso_c_binding
+  real(c_float), value :: x,y
+  complex(c_float_complex), value :: z
+  r = x + real(z, c_float) + aimag(z) + y
+end function take_mixed4
+
+real(c_double) function take_mixed8(x,z,y) result(r) bind(c, name="take_mixed8")
+  use iso_c_binding
+  real(c_double), value :: x,y
+  complex(c_double_complex), value :: z
+  r = x + real(z, c_double) + aimag(z) + y
+end function take_mixed8
+"#,
+        "-O2",
+    );
+
+    let take4_start = asm
+        .find("_take4:")
+        .unwrap_or_else(|| panic!("complex(4) callee missing:\n{asm}"));
+    let take8_start = asm
+        .find("_take8:")
+        .unwrap_or_else(|| panic!("complex(8) callee missing:\n{asm}"));
+    let mixed4_start = asm
+        .find("_take_mixed4:")
+        .unwrap_or_else(|| panic!("mixed complex(4) callee missing:\n{asm}"));
+    let mixed8_start = asm
+        .find("_take_mixed8:")
+        .unwrap_or_else(|| panic!("mixed complex(8) callee missing:\n{asm}"));
+    let take4 = &asm[take4_start..take8_start];
+    let take8 = &asm[take8_start..mixed4_start];
+    let mixed4 = &asm[mixed4_start..mixed8_start];
+    let mixed8 = &asm[mixed8_start..];
+    assert!(
+        take4.lines().any(|line| line.trim_end().ends_with(", s0"))
+            && take4.lines().any(|line| line.trim_end().ends_with(", s1")),
+        "complex(4) VALUE parameter must be captured from s0:s1:\n{take4}"
+    );
+    assert!(
+        (take8.contains("str d0,") && take8.contains("str d1,")) || take8.contains("stp d0, d1,"),
+        "complex(8) VALUE parameter must be captured from d0:d1:\n{take8}"
+    );
+    for reg in ["s0", "s1", "s2", "s3"] {
+        assert!(
+            mixed4
+                .lines()
+                .any(|line| line.trim_end().ends_with(&format!(", {reg}"))),
+            "optimized mixed complex(4) receipts must preserve {reg}:\n{mixed4}"
+        );
+    }
+    assert!(
+        mixed8.contains("stp d1, d2,")
+            && mixed8.lines().any(|line| line.trim_end().ends_with(", d0"))
+            && mixed8.lines().any(|line| line.trim_end().ends_with(", d3")),
+        "optimized mixed complex(8) receipts must preserve d0/d1:d2/d3:\n{mixed8}"
+    );
+}
+
+#[test]
+fn complex_hfa_overflow_preserves_stack_layout_and_following_arguments() {
+    let asm = compile_arm64_asm(
+        r#"
+real(c_float) function call_overflow4() result(r) bind(c, name="call_overflow4")
+  use iso_c_binding
+  interface
+    function take_overflow4(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) result(out) &
+        bind(c, name="take_overflow4")
+      import :: c_float, c_float_complex, c_int
+      real(c_float), value :: a1,a2,a3,a4,a5,a6,a7,tail
+      complex(c_float_complex), value :: z
+      integer(c_int), value :: marker
+      real(c_float) :: out
+    end function take_overflow4
+  end interface
+  r = take_overflow4(1.0_c_float, 1.0_c_float, 1.0_c_float, 1.0_c_float, &
+                     1.0_c_float, 1.0_c_float, 1.0_c_float, &
+                     cmplx(2.0_c_float, 3.0_c_float, kind=c_float), &
+                     4.0_c_float, 5_c_int)
+end function call_overflow4
+
+real(c_double) function call_overflow8() result(r) bind(c, name="call_overflow8")
+  use iso_c_binding
+  interface
+    function take_overflow8(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) result(out) &
+        bind(c, name="take_overflow8")
+      import :: c_double, c_double_complex, c_int
+      real(c_double), value :: a1,a2,a3,a4,a5,a6,a7,tail
+      complex(c_double_complex), value :: z
+      integer(c_int), value :: marker
+      real(c_double) :: out
+    end function take_overflow8
+  end interface
+  r = take_overflow8(1.0_c_double, 1.0_c_double, 1.0_c_double, 1.0_c_double, &
+                     1.0_c_double, 1.0_c_double, 1.0_c_double, &
+                     cmplx(2.0_c_double, 3.0_c_double, kind=c_double), &
+                     4.0_c_double, 5_c_int)
+end function call_overflow8
+
+real(c_float) function receive_overflow4(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) &
+    result(r) bind(c, name="receive_overflow4")
+  use iso_c_binding
+  real(c_float), value :: a1,a2,a3,a4,a5,a6,a7,tail
+  complex(c_float_complex), value :: z
+  integer(c_int), value :: marker
+  r = real(z, c_float) + aimag(z) + tail + marker
+end function receive_overflow4
+
+real(c_double) function receive_overflow8(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) &
+    result(r) bind(c, name="receive_overflow8")
+  use iso_c_binding
+  real(c_double), value :: a1,a2,a3,a4,a5,a6,a7,tail
+  complex(c_double_complex), value :: z
+  integer(c_int), value :: marker
+  r = real(z, c_double) + aimag(z) + tail + marker
+end function receive_overflow8
+"#,
+        "-O2",
+    );
+
+    let call4_start = asm
+        .find("_call_overflow4:")
+        .unwrap_or_else(|| panic!("complex(4) overflow caller missing:\n{asm}"));
+    let call8_start = asm
+        .find("_call_overflow8:")
+        .unwrap_or_else(|| panic!("complex(8) overflow caller missing:\n{asm}"));
+    let receive4_start = asm
+        .find("_receive_overflow4:")
+        .unwrap_or_else(|| panic!("complex(4) overflow callee missing:\n{asm}"));
+    let receive8_start = asm
+        .find("_receive_overflow8:")
+        .unwrap_or_else(|| panic!("complex(8) overflow callee missing:\n{asm}"));
+    let call4 = &asm[call4_start..call8_start];
+    let call8 = &asm[call8_start..receive4_start];
+    let receive4 = &asm[receive4_start..receive8_start];
+    let receive8 = &asm[receive8_start..];
+
+    assert!(
+        call4
+            .lines()
+            .any(|line| { line.trim_start().starts_with("str x") && line.contains("[sp, #0]") })
+            && call4.lines().any(|line| {
+                line.trim_start().starts_with("str s") && line.contains("[sp, #8]")
+            }),
+        "complex(4) overflow and following scalar need stack offsets 0 and 8:\n{call4}"
+    );
+    assert!(
+        call8.contains("stp x16, x17, [sp, #0]")
+            && call8.lines().any(|line| {
+                line.trim_start().starts_with("str d") && line.contains("[sp, #16]")
+            }),
+        "complex(8) overflow and following scalar need stack offsets 0 and 16:\n{call8}"
+    );
+    assert!(
+        receive4
+            .lines()
+            .any(|line| { line.trim_start().starts_with("ldr x") && line.contains("[x29, #16]") })
+            && receive4.lines().any(|line| {
+                line.trim_start().starts_with("ldr s") && line.contains("[x29, #24]")
+            })
+            && receive4
+                .lines()
+                .any(|line| line.trim_end().ends_with(", w0")),
+        "complex(4) callee must receive stack overflow without consuming GP x0:\n{receive4}"
+    );
+    assert!(
+        receive8.contains("ldp x16, x17, [x29, #16]")
+            && receive8.lines().any(|line| {
+                line.trim_start().starts_with("ldr d") && line.contains("[x29, #32]")
+            })
+            && receive8
+                .lines()
+                .any(|line| line.trim_end().ends_with(", w0")),
+        "complex(8) callee must receive stack overflow without consuming GP x0:\n{receive8}"
+    );
+}
