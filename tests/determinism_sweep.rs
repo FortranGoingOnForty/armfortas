@@ -121,6 +121,12 @@ fn audit_shaped_programs_deterministic_eight_runs_at_o2() {
     ] {
         assert_repeated_asm_identical(&compiler, &test_dir.join(name), "-O2", 8);
     }
+    assert_repeated_asm_identical(
+        &compiler,
+        &test_dir.join("ar20_fusion_deterministic.f90"),
+        "-O2",
+        16,
+    );
 }
 
 #[test]
