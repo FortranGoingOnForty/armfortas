@@ -57613,6 +57613,7 @@ fn emit_dynamic_derived_array_desc_copy(
 pub(super) fn emit_allocatable_source_copy_on_success(
     b: &mut FuncBuilder,
     stat_addr: ValueId,
+    runtime_stat_arg: ValueId,
     dest_desc: ValueId,
     source_desc: ValueId,
     preserve_shape: bool,
@@ -57632,7 +57633,7 @@ pub(super) fn emit_allocatable_source_copy_on_success(
     if let Some(layout) = array_copy_layout {
         b.call(
             FuncRef::External("afs_prepare_array_copy".into()),
-            vec![dest_desc, source_desc, stat_addr],
+            vec![dest_desc, source_desc, runtime_stat_arg],
             IrType::Void,
         );
         emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
@@ -57656,7 +57657,7 @@ pub(super) fn emit_allocatable_source_copy_on_success(
         if let Some(base_type) = dynamic_base_type {
             b.call(
                 FuncRef::External("afs_prepare_array_copy".into()),
-                vec![dest_desc, source_desc, stat_addr],
+                vec![dest_desc, source_desc, runtime_stat_arg],
                 IrType::Void,
             );
             emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
@@ -57671,7 +57672,7 @@ pub(super) fn emit_allocatable_source_copy_on_success(
                 b,
                 dest_desc,
                 source_desc,
-                stat_addr,
+                runtime_stat_arg,
                 base_type,
                 type_layouts,
             );
@@ -57682,7 +57683,7 @@ pub(super) fn emit_allocatable_source_copy_on_success(
             require_context_free_dynamic_lifecycle(b, source_desc);
             b.call(
                 FuncRef::External("afs_copy_array_data".into()),
-                vec![dest_desc, source_desc, stat_addr],
+                vec![dest_desc, source_desc, runtime_stat_arg],
                 IrType::Void,
             );
             emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");

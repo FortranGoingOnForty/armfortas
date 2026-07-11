@@ -2202,6 +2202,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         emit_allocatable_source_copy_on_success(
                                             b,
                                             assign_stat,
+                                            assign_stat,
                                             desc,
                                             source_desc,
                                             false,
@@ -6219,6 +6220,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         } => {
             let stat_target = super::core::allocate_status_target(b, ctx, opts);
             let stat_addr = stat_target.runtime_addr;
+            let runtime_stat_arg = if allocate_keyword_expr(opts, "stat").is_some() {
+                stat_addr
+            } else {
+                b.const_i64(0)
+            };
             // F2018 §9.7.1.3: stat-variable is 0 on success. Pre-zero so
             // any item path that doesn't update stat_addr (e.g. scalar
             // simple allocates that don't go through a runtime helper)
@@ -6481,14 +6487,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 if let Some(shape_desc) = shape_desc {
                                     b.call(
                                         FuncRef::External("afs_allocate_like".into()),
-                                        vec![field_ptr, shape_desc, stat_addr],
+                                        vec![field_ptr, shape_desc, runtime_stat_arg],
                                         IrType::Void,
                                     );
                                 } else {
                                     let rank_val = b.const_i32(0);
                                     b.call(
                                         FuncRef::External("afs_allocate_array".into()),
-                                        vec![field_ptr, es, rank_val, dim_buf, stat_addr],
+                                        vec![field_ptr, es, rank_val, dim_buf, runtime_stat_arg],
                                         IrType::Void,
                                     );
                                 }
@@ -6496,7 +6502,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let rank_val = b.const_i32(rank as i32);
                                 b.call(
                                     FuncRef::External("afs_allocate_array".into()),
-                                    vec![field_ptr, es, rank_val, dim_buf, stat_addr],
+                                    vec![field_ptr, es, rank_val, dim_buf, runtime_stat_arg],
                                     IrType::Void,
                                 );
                             }
@@ -6510,6 +6516,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 emit_allocatable_source_copy_on_success(
                                     b,
                                     stat_addr,
+                                    runtime_stat_arg,
                                     field_ptr,
                                     source_desc,
                                     source_copy_rank > 0,
@@ -6523,6 +6530,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     emit_allocatable_source_copy_on_success(
                                         b,
                                         stat_addr,
+                                        runtime_stat_arg,
                                         field_ptr,
                                         source_desc,
                                         false,
@@ -6952,14 +6960,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 if let Some(shape_desc) = shape_desc {
                                     b.call(
                                         FuncRef::External("afs_allocate_like".into()),
-                                        vec![desc, shape_desc, stat_addr],
+                                        vec![desc, shape_desc, runtime_stat_arg],
                                         IrType::Void,
                                     );
                                 } else {
                                     let rank_val = b.const_i32(0);
                                     b.call(
                                         FuncRef::External("afs_allocate_array".into()),
-                                        vec![desc, es, rank_val, dim_buf, stat_addr],
+                                        vec![desc, es, rank_val, dim_buf, runtime_stat_arg],
                                         IrType::Void,
                                     );
                                 }
@@ -6967,7 +6975,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let rank_val = b.const_i32(rank as i32);
                                 b.call(
                                     FuncRef::External("afs_allocate_array".into()),
-                                    vec![desc, es, rank_val, dim_buf, stat_addr],
+                                    vec![desc, es, rank_val, dim_buf, runtime_stat_arg],
                                     IrType::Void,
                                 );
                             }
@@ -6981,6 +6989,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 emit_allocatable_source_copy_on_success(
                                     b,
                                     stat_addr,
+                                    runtime_stat_arg,
                                     desc,
                                     source_desc,
                                     source_copy_rank > 0,
@@ -6994,6 +7003,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     emit_allocatable_source_copy_on_success(
                                         b,
                                         stat_addr,
+                                        runtime_stat_arg,
                                         desc,
                                         source_desc,
                                         false,

@@ -131,6 +131,47 @@ fn allocate_stat_errmsg_populates_deferred_character_target() {
 }
 
 #[test]
+fn allocate_failure_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_failure_without_stat_terminates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_failure_loud");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: a(:)\n  allocate(a(2))\n  allocate(a(2))\n  print *, 'survived'\nend program\n",
+    );
+    let exe = dir.join("alloc_failure_loud.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("allocation failure runtime failed");
+    assert!(
+        !run.status.success(),
+        "allocation failure without STAT= returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("ALLOCATE"),
+        "allocation failure did not report its operation:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_errmsg_requires_scalar_character_target() {
     let dir = unique_dir("alloc_bad_errmsg");
     let src = write_program_in(
