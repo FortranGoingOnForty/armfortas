@@ -31,7 +31,7 @@ enum LookupMode {
     Exported,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CachedSymbolRef {
     scope_id: ScopeId,
     key: String,
@@ -144,12 +144,9 @@ impl SymbolTable {
         scope_id: ScopeId,
         key: &str,
     ) -> Option<Option<&'a Symbol>> {
-        let cached = self
-            .lookup_cache(mode)
-            .borrow()
-            .get(&scope_id)
-            .and_then(|scope_cache| scope_cache.get(key).cloned());
-        cached.map(|loc| loc.and_then(|loc| self.symbol_at(&loc)))
+        let cache = self.lookup_cache(mode).borrow();
+        let cached = cache.get(&scope_id)?.get(key)?;
+        Some(cached.as_ref().and_then(|loc| self.symbol_at(loc)))
     }
 
     fn remember_lookup(
@@ -178,22 +175,30 @@ impl SymbolTable {
     }
 
     fn locate_symbol(&self, sym: &Symbol) -> Option<CachedSymbolRef> {
-        self.locate_symbol_in_scope(sym.scope, sym).or_else(|| {
-            self.scopes
-                .iter()
-                .filter(|scope| scope.id != sym.scope)
-                .find_map(|scope| self.locate_symbol_in_scope(scope.id, sym))
-        })
-    }
-
-    fn locate_symbol_in_scope(&self, scope_id: ScopeId, sym: &Symbol) -> Option<CachedSymbolRef> {
-        let scope = self.scopes.get(scope_id)?;
-        scope.symbols.iter().find_map(|(key, candidate)| {
-            std::ptr::eq(candidate, sym).then(|| CachedSymbolRef {
-                scope_id,
-                key: key.clone(),
+        let scope = self.scopes.get(sym.scope)?;
+        let key = ensure_ascii_lowercase(&sym.name);
+        if scope
+            .symbols
+            .get(key.as_ref())
+            .is_some_and(|candidate| std::ptr::eq(candidate, sym))
+        {
+            return Some(CachedSymbolRef {
+                scope_id: sym.scope,
+                key: key.into_owned(),
+            });
+        }
+        if !is_named_interface_like_symbol(sym) {
+            return None;
+        }
+        let side_key = same_name_generic_interface_key(key.as_ref());
+        scope
+            .symbols
+            .get(&side_key)
+            .is_some_and(|candidate| std::ptr::eq(candidate, sym))
+            .then_some(CachedSymbolRef {
+                scope_id: sym.scope,
+                key: side_key,
             })
-        })
     }
 
     /// Lookup a statement function by (scope, name). Caller passes
@@ -298,6 +303,7 @@ impl SymbolTable {
             });
         }
         let mut symbol = symbol;
+        symbol.scope = self.current;
         if let Some(access) = scope.pending_access.get(&key).copied() {
             symbol.attrs.access = access;
         }
@@ -378,6 +384,7 @@ impl SymbolTable {
             });
         }
         let mut symbol = symbol;
+        symbol.scope = scope_id;
         if let Some(access) = scope.pending_access.get(&key).copied() {
             symbol.attrs.access = access;
         }
@@ -411,11 +418,10 @@ impl SymbolTable {
         visited: &mut Vec<(ScopeId, String, LookupMode)>,
         cache: &mut HashMap<(ScopeId, String, LookupMode), Option<&'a Symbol>>,
     ) -> Option<&'a Symbol> {
-        let visit_key = (scope_id, key.to_string(), LookupMode::Normal);
         if let Some(cached) = self.cached_lookup(LookupMode::Normal, scope_id, key) {
-            cache.insert(visit_key, cached);
             return cached;
         }
+        let visit_key = (scope_id, key.to_string(), LookupMode::Normal);
         if let Some(cached) = cache.get(&visit_key) {
             return *cached;
         }
@@ -557,11 +563,10 @@ impl SymbolTable {
         visited: &mut Vec<(ScopeId, String, LookupMode)>,
         cache: &mut HashMap<(ScopeId, String, LookupMode), Option<&'a Symbol>>,
     ) -> Option<&'a Symbol> {
-        let visit_key = (scope_id, key.to_string(), LookupMode::Exported);
         if let Some(cached) = self.cached_lookup(LookupMode::Exported, scope_id, key) {
-            cache.insert(visit_key, cached);
             return cached;
         }
+        let visit_key = (scope_id, key.to_string(), LookupMode::Exported);
         if let Some(cached) = cache.get(&visit_key) {
             return *cached;
         }
@@ -1173,9 +1178,25 @@ mod tests {
     #[test]
     fn define_and_lookup() {
         let mut st = SymbolTable::new();
-        st.push_scope(ScopeKind::Program("main".into()));
+        let scope_id = st.push_scope(ScopeKind::Program("main".into()));
         st.define(make_symbol("x", SymbolKind::Variable)).unwrap();
-        assert!(st.lookup("x").is_some());
+        let first = st.lookup("x").expect("first lookup");
+        assert_eq!(first.scope, scope_id, "definition must record its owner");
+        let second = st.lookup("x").expect("cached lookup");
+        assert!(
+            std::ptr::eq(first, second),
+            "cache hits must preserve symbol identity"
+        );
+        {
+            let cache = st.normal_lookup_cache.borrow();
+            let location = cache
+                .get(&scope_id)
+                .and_then(|scope| scope.get("x"))
+                .and_then(Option::as_ref)
+                .expect("successful lookup must be cached");
+            assert_eq!(location.scope_id, scope_id);
+            assert_eq!(location.key, "x");
+        }
         assert!(st.lookup("X").is_some()); // case insensitive
         assert!(st.lookup("y").is_none());
     }
