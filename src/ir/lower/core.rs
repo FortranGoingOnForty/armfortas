@@ -18808,7 +18808,7 @@ pub(super) fn reorder_args_by_keyword_slots_for_target(
 
 pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'static [&'static str]> {
     match callee_key {
-        "move_alloc" => Some(&["from", "to"]),
+        "move_alloc" => Some(&["from", "to", "stat", "errmsg"]),
         "system_clock" => Some(&["count", "count_rate", "count_max"]),
         "cpu_time" => Some(&["time"]),
         "date_and_time" => Some(&["date", "time", "zone", "values"]),

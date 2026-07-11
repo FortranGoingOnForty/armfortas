@@ -972,3 +972,46 @@ fn allocate_source_and_mold_are_rejected_together() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn move_alloc_success_sets_status_for_all_descriptor_families() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=move_alloc_success_sets_status_for_all_descriptor_families count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("move_alloc_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: source(:), target(:)\n  character(len=:), allocatable :: text_source, text_target\n  integer(kind=8) :: status(2)\n  character(len=64) :: message\n  allocate(source(2))\n  source = [4, 9]\n  status = 77\n  message = 'unchanged'\n  call move_alloc(source, target, errmsg=message, stat=status(2))\n  if (status(2) /= 0) error stop 1\n  if (trim(message) /= 'unchanged') error stop 2\n  if (allocated(source)) error stop 3\n  if (.not. allocated(target)) error stop 4\n  if (any(target /= [4, 9])) error stop 5\n  allocate(character(len=4) :: text_source)\n  text_source = 'done'\n  call move_alloc(from=text_source, stat=status(1), to=text_target)\n  if (status(1) /= 0) error stop 6\n  if (allocated(text_source)) error stop 7\n  if (.not. allocated(text_target)) error stop 8\n  if (text_target /= 'done') error stop 9\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("move_alloc_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("MOVE_ALLOC status runtime failed");
+    assert!(
+        run.status.success(),
+        "MOVE_ALLOC status runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected MOVE_ALLOC output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
