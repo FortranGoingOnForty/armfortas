@@ -2024,7 +2024,7 @@ pub(crate) fn lower_expr_full(
                 // touches the actual_vals slice — so the work spent
                 // lowering each arg into a typed null / real value is
                 // discarded.  For a section-shaped arg that lowering
-                // emits a 384-byte descriptor + memset + afs_create_section
+                // emits a 392-byte descriptor + memset + afs_create_section
                 // every time, which compounds badly inside nested
                 // intrinsic chains (stdlib_hash_32bit_water:
                 // `ieor(waterr32(key(i:)), waterp1)` lowers `key(i:)`
@@ -2058,7 +2058,8 @@ pub(crate) fn lower_expr_full(
                 };
 
                 let fallback_to_structure_ctor = has_named_interface
-                    && type_layouts.is_some_and(|tl| tl.get(&key).is_some())
+                    && type_layouts
+                        .is_some_and(|tl| type_layout_for_current_scope(tl, &key).is_some())
                     && resolve_generic_call_actuals(
                         st,
                         b,
@@ -2687,7 +2688,6 @@ pub(crate) fn lower_expr_full(
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                    let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
                     let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                     let wants_pointer = callee_pointer_args
                         .as_ref()
@@ -2697,6 +2697,10 @@ pub(crate) fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let wants_polymorphic_descriptor = wants_descriptor
+                        && dummy_is_class
+                        && !dummy_is_allocatable
+                        && !wants_pointer;
                     let is_optional = opt_flags
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -3026,7 +3030,7 @@ pub(crate) fn lower_expr_full(
                     if let Some((obj_addr, type_name)) =
                         resolve_component_base_for_method(b, locals, base, st, tl)
                     {
-                        if let Some(layout) = tl.get(&type_name) {
+                        if let Some(layout) = type_layout_for_current_scope(tl, &type_name) {
                             let bp_opt = resolved_bound_proc_for_call(
                                 b,
                                 locals,
@@ -3651,7 +3655,9 @@ pub(crate) fn lower_expr_full(
                                         tl,
                                     )
                                 {
-                                    if let Some(layout) = tl.get(&type_name) {
+                                    if let Some(layout) =
+                                        type_layout_for_current_scope(tl, &type_name)
+                                    {
                                         let bp = resolved_bound_proc_for_call(
                                             b,
                                             locals,
@@ -3693,7 +3699,7 @@ pub(crate) fn lower_expr_full(
                     None
                 });
                 if let Some((base_addr, type_name)) = resolved {
-                    if let Some(layout) = tl.get(&type_name) {
+                    if let Some(layout) = type_layout_for_current_scope(tl, &type_name) {
                         if let Some(field) =
                             layout_component_field_or_parent_view(layout, component, tl)
                         {
@@ -3728,7 +3734,7 @@ pub(crate) fn lower_expr_full(
                                 && !field.pointer
                                 && !field.declared_array
                                 && field.dims.is_empty()
-                                && field.size == 384
+                                && field.size == 392
                             {
                                 let ir_ty = type_info_to_ir_type(&field.type_info);
                                 let data_ptr =
@@ -3750,7 +3756,7 @@ pub(crate) fn lower_expr_full(
                             if let crate::sema::symtab::TypeInfo::Character { .. } =
                                 &field.type_info
                             {
-                                return field_ptr;
+                                return fixed_char_component_data_ptr(b, field_ptr, &field);
                             }
 
                             // Complex fields follow the same address-valued

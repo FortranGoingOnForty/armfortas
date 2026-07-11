@@ -1,5 +1,5 @@
 ! CHECK: ok
-! IR_CHECK: func @afs_internal___prog_stdlib_host_large_array_section_1(%0: ptr<[i8 x 384]>)
+! IR_CHECK: func @afs_internal___prog_stdlib_host_large_array_section_1(%0: ptr<[i8 x 392]>)
 ! IR_CHECK: call @afs_create_section(
 ! REPRO_CHECK: run
 program stdlib_host_large_array_section

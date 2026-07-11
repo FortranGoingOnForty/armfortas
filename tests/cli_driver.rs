@@ -17601,7 +17601,7 @@ fn rank1_runtime_shape_array_function_result_into_fixed_dest() {
     // exercising the rank-1 caller path. Previously the alloc_return assignment
     // path passed the destination buffer (`integer :: r(5)` → `[i32 x 5]`)
     // straight to the callee as the sret slot. The callee, expecting a
-    // 384-byte descriptor, then either left it untouched (silent garbage)
+    // 392-byte descriptor, then either left it untouched (silent garbage)
     // or — once we taught the prologue to auto-allocate — wrote dims onto
     // the caller's stack and corrupted neighboring locals. Now the caller
     // alloca's a real descriptor temp, calls into it, memcpy's the result
@@ -18742,7 +18742,7 @@ fn defined_assignment_passes_array_actual_through_descriptor() {
     }
     // F2018 §15.5.2: when an overloaded `assignment(=)` resolves to a
     // procedure whose RHS dummy is an assumed-shape array, the actual
-    // array must be passed as a 384-byte descriptor — not as the raw
+    // array must be passed as a 392-byte descriptor — not as the raw
     // data pointer. stdlib_bitsets `set = logical_array` regressed
     // because `try_defined_assignment` passed `rhs_val` directly,
     // letting the callee read the array bytes as the descriptor
@@ -19461,7 +19461,7 @@ fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
         return;
     }
     // F2018 §15.5.2.12 + §7.3.2.3: a `class(*), intent(in), optional`
-    // dummy is passed as a 384-byte descriptor pointer.  When one
+    // dummy is passed as a 392-byte descriptor pointer.  When one
     // procedure forwards the actual to another procedure with the
     // same `class(*), optional` formal, the call site must route
     // through `lower_arg_descriptor` (so the actual is forwarded as
@@ -19831,7 +19831,7 @@ fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
     //
     // Rebase semantics: the caller's descriptor base_addr stays
     // shared (writes still propagate), only the lower/upper view is
-    // patched on a fresh local 384-byte descriptor copy.
+    // patched on a fresh local 392-byte descriptor copy.
     let src = write_program(
         "program p\n  implicit none\n  integer, allocatable :: a(:)\n  a = [3, 1, 2]\n  call my_sort(a)\n  print *, 'sorted=', a\ncontains\n  pure subroutine my_sort(arr)\n    integer, intent(inout) :: arr(0:)\n    integer :: i, j, t, n\n    n = size(arr)\n    do i = 0, n-2\n      do j = 0, n-2-i\n        if (arr(j) > arr(j+1)) then\n          t = arr(j); arr(j) = arr(j+1); arr(j+1) = t\n        end if\n      end do\n    end do\n  end subroutine\nend program\n",
         "f90",
@@ -20872,7 +20872,7 @@ fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     }
     // F2018 §15.5.2.13 (function results): a function with rank-1
     // character result like `character :: cstr(len(value)+1)` must use
-    // the 384-byte ArrayDescriptor hidden-result ABI on both sides of a
+    // the 392-byte ArrayDescriptor hidden-result ABI on both sides of a
     // module boundary, NOT the 32-byte StringDescriptor ABI.  Pre-fix
     // callee_hidden_result_abi matched `TypeInfo::Character { .. }`
     // before checking `result_rank > 0`, so cross-unit calls allocated
@@ -23251,7 +23251,7 @@ fn descriptor_actual_passed_to_assumed_size_dummy_extracts_base_addr() {
     // F2018 §15.5.2.4: assumed-size dummies receive a bare element
     // pointer.  When the actual is an array section (`arr(:)`) — a
     // non-Name, non-all-Element shape — `lower_arg_by_ref_full`'s tail
-    // path lowers it to a 384-byte descriptor.  Without explicit base
+    // path lowers it to a 392-byte descriptor.  Without explicit base
     // extraction at the tail, the callee receives the descriptor pointer
     // and reads its first 8 bytes (= base_addr field) as if it were the
     // first element.  This surfaces in stdlib's solve / lapack chains
@@ -24994,7 +24994,7 @@ fn fixed_shape_array_function_result_auto_allocates_on_entry() {
     // F2018 §15.5.2.4: a function whose result is an explicit-shape
     // array with constant bounds (e.g. `real :: res(3)`) flows through
     // the same `HiddenResultAbi::ArrayDescriptor` ABI as runtime-shape
-    // results — the caller passes a 384-byte descriptor, the body
+    // results — the caller passes a 392-byte descriptor, the body
     // expects `afs_array_lbound` / `afs_array_ubound` to return the
     // declared bounds. Pre-fix `allocate_runtime_shape_array_result`
     // early-returned when every spec was a compile-time integer, so
@@ -38427,8 +38427,8 @@ fn dispatch_optional_logical_int8_array_through_descriptor() {
     }
     // F2018 §15.5.2: dispatch on a generic with a `logical(int8),
     // optional, dimension(:)` formal must accept a `logical(int8)`
-    // array actual carried via a 384-byte descriptor.  The IR matcher
-    // previously bailed when the actual rendered as `[i8 x 384]` and
+    // array actual carried via a 392-byte descriptor.  The IR matcher
+    // previously bailed when the actual rendered as `[i8 x 392]` and
     // the formal lowered to `Int(I8)` because the array peel only
     // fired in the elemental path.
     let src = write_program(
@@ -44226,10 +44226,10 @@ fn allocate_mold_imported_concrete_preserves_vtable() {
 }
 
 #[test]
-fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
+fn polymorphic_array_element_dispatch_uses_descriptor_vtable() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_element_dispatch_uses_array_vtable_sidecar count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_element_dispatch_uses_descriptor_vtable count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -44238,30 +44238,30 @@ fn polymorphic_array_element_dispatch_uses_array_vtable_sidecar() {
         "module repro\n  implicit none\n  type, abstract :: base_t\n  contains\n    procedure(value_i), deferred :: value\n  end type base_t\n  abstract interface\n    integer function value_i(self) result(out)\n      import :: base_t\n      class(base_t), intent(in) :: self\n    end function value_i\n  end interface\n  type, extends(base_t) :: child_t\n  contains\n    procedure :: value => child_value\n  end type child_t\ncontains\n  integer function child_value(self) result(out)\n    class(child_t), intent(in) :: self\n    out = 17\n  end function child_value\nend module repro\nprogram p\n  use repro\n  implicit none\n  class(base_t), allocatable :: items(:)\n  allocate(child_t :: items(0:1))\n  if (lbound(items, 1) /= 0) error stop 1\n  if (ubound(items, 1) /= 1) error stop 2\n  if (items(0)%value() /= 17) error stop 3\n  print *, 'ok'\nend program p\n",
         "f90",
     );
-    let out = unique_path("poly_array_vtable_sidecar", "bin");
+    let out = unique_path("poly_array_descriptor_vtable", "bin");
     let compile = Command::new(compiler("armfortas"))
         .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
-        .expect("polymorphic array vtable sidecar compile failed to spawn");
+        .expect("polymorphic array descriptor vtable compile failed to spawn");
     assert!(
         compile.status.success(),
-        "polymorphic array vtable sidecar compile failed: {}",
+        "polymorphic array descriptor vtable compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
 
     let run = Command::new(&out)
         .output()
-        .expect("polymorphic array vtable sidecar run failed");
+        .expect("polymorphic array descriptor vtable run failed");
     assert!(
         run.status.success(),
-        "polymorphic array vtable sidecar run failed: status={:?} stdout={} stderr={}",
+        "polymorphic array descriptor vtable run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
-        "unexpected polymorphic array vtable sidecar output: {}",
+        "unexpected polymorphic array descriptor vtable output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 
@@ -45925,7 +45925,7 @@ fn nested_call_chain_with_array_section_args_keeps_frame_bounded() {
     // checking whether the callee even returns an array.  Each
     // probe re-lowered the argument expression — including any
     // `arr(i:)` section actuals, which materialise a fresh
-    // ArrayDescriptor (384 bytes) + DimDescriptor (24 bytes) on
+    // ArrayDescriptor (392 bytes) + DimDescriptor (24 bytes) on
     // the stack via `afs_create_section`.  When the same
     // expression is wrapped through a chain of scalar-returning
     // calls (e.g. stdlib_hash_32bit_water's
@@ -46453,7 +46453,7 @@ fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
     }
     // F2008 §7.2.1 / §15.5.2: a defined-assignment specific receiving
     // `class(T), intent(inout) :: to` expects the caller to pass the
-    // 384-byte descriptor pointer for `to`. `try_defined_assignment`
+    // 392-byte descriptor pointer for `to`. `try_defined_assignment`
     // was emitting `lhs_val = lhs_info.addr` — for a class()-typed
     // dummy that's the *slot* holding the descriptor pointer
     // (one extra indirection). The callee then re-loaded the slot as
@@ -47268,7 +47268,7 @@ fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
     // pointer it can index column-major directly. lower_arg_by_ref_full
     // for the ComponentAccess path used to return the field's storage
     // address — which for an allocatable component is the address of
-    // the 384-byte descriptor itself — so the dummy walked descriptor
+    // the 392-byte descriptor itself — so the dummy walked descriptor
     // bytes (base_addr, elem_size, rank fields) as if they were array
     // elements. Surfaced inside stdlib_sparse_conversion's
     // sort_coo_unique_dp where `a(1, ed)` returned descriptor-pointer
@@ -49666,6 +49666,685 @@ fn optional_allocatable_intent_out_array_assignment_reallocates() {
 }
 
 #[test]
+fn defined_assignment_can_transform_local_finalizable_source() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_can_transform_local_finalizable_source count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: payload_t\n    integer :: value = 21\n  contains\n    final :: finish\n  end type\n  interface assignment(=)\n    procedure :: assign_payload\n  end interface\n  type(payload_t) :: source\n  class(*), allocatable :: assigned\n  assigned = source\n  select type (item => assigned)\n  type is (integer)\n    if (item /= 42) error stop 1\n  class default\n    error stop 2\n  end select\n  print *, 'ok'\ncontains\n  subroutine assign_payload(lhs, rhs)\n    class(*), allocatable, intent(out) :: lhs\n    type(payload_t), intent(in) :: rhs\n    allocate(lhs, source=rhs%value * 2)\n  end subroutine\n  subroutine finish(item)\n    type(payload_t) :: item\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_assign_local_final_source", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined assignment with local finalizable source failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined assignment with local finalizable source failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("defined assignment with local finalizable source failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "defined assignment with local finalizable source run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scoped_nested_types_deep_copy_owned_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scoped_nested_types_deep_copy_owned_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  call first()\n  call second()\n  print *, 'ok'\ncontains\n  subroutine first()\n    type :: leaf_t\n      integer, allocatable :: values(:)\n    end type\n    type :: outer_t\n      type(leaf_t) :: leaf\n    end type\n    type(outer_t) :: source, copy\n    allocate(source%leaf%values(2))\n    source%leaf%values = [1, 2]\n    copy = source\n    source%leaf%values(1) = 99\n    if (copy%leaf%values(1) /= 1) error stop 11\n  end subroutine\n  subroutine second()\n    type :: leaf_t\n      integer :: marker = 7\n    end type\n    type :: outer_t\n      type(leaf_t) :: leaf\n    end type\n    type(outer_t) :: item\n    if (item%leaf%marker /= 7) error stop 12\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("scoped_nested_owned_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scoped nested owned-component compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scoped nested owned-component compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scoped nested owned-component run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scoped nested owned-component run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn scoped_component_deallocation_uses_owner_layout() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=scoped_component_deallocation_uses_owner_layout count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  integer :: calls = 0\n  type :: payload_t\n  contains\n    final :: finish_payload\n  end type\ncontains\n  subroutine finish_payload(item)\n    type(payload_t) :: item\n    calls = calls + 1\n  end subroutine\n  subroutine release_owned_component()\n    type :: leaf_t\n      type(payload_t), allocatable :: payload\n    end type\n    type :: outer_t\n      type(leaf_t), allocatable :: leaf\n    end type\n    type(outer_t) :: value\n    allocate(value%leaf)\n    allocate(value%leaf%payload)\n    deallocate(value%leaf)\n    if (allocated(value%leaf)) error stop 1\n  end subroutine\n  subroutine register_colliding_layout()\n    type :: leaf_t\n      integer :: marker = 11\n    end type\n    type :: outer_t\n      type(leaf_t), allocatable :: leaf\n    end type\n    type(outer_t) :: value\n    allocate(value%leaf)\n    if (value%leaf%marker /= 11) error stop 2\n    deallocate(value%leaf)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call register_colliding_layout()\n  call release_owned_component()\n  if (calls /= 1) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("scoped_component_deallocation", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scoped component deallocation compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scoped component deallocation compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scoped component deallocation run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scoped component deallocation run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_self_assignment_does_not_finalize_snapshot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_self_assignment_does_not_finalize_snapshot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  integer :: calls = 0\n  type :: payload_t\n    integer :: marker = 0\n  contains\n    final :: finish_payload\n  end type\n  type :: holder_t\n    type(payload_t), allocatable :: payload\n  end type\ncontains\n  subroutine finish_payload(item)\n    type(payload_t) :: item\n    calls = calls + item%marker\n  end subroutine\n  subroutine exercise()\n    type(holder_t) :: values(1)\n    allocate(values(1)%payload)\n    values(1)%payload%marker = 3\n    values = values\n    if (calls /= 3) error stop 1\n    if (.not. allocated(values(1)%payload)) error stop 2\n    if (values(1)%payload%marker /= 3) error stop 3\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  call exercise()\n  if (calls /= 6) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("derived_self_assignment_snapshot", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("derived self-assignment IR emit failed to spawn");
+    assert!(
+        emit.status.success(),
+        "derived self-assignment IR emit failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read derived self-assignment IR");
+    let snapshot = ir_text
+        .split("\n    derived_value_self_copy")
+        .nth(1)
+        .and_then(|body| body.split("\n    derived_value_direct_copy").next())
+        .expect("missing derived self-copy snapshot block");
+    let dealloc_call = snapshot
+        .lines()
+        .find(|line| line.contains("_dealloc_storage"))
+        .expect("self-copy snapshot does not release owned components");
+    let finalize_arg = dealloc_call
+        .split(',')
+        .next_back()
+        .and_then(|arg| arg.trim().strip_suffix(')'))
+        .expect("cannot parse snapshot deallocation finalization argument");
+    assert!(
+        snapshot
+            .lines()
+            .any(|line| line.contains(&format!("{} = const_int 0 : i32", finalize_arg))),
+        "compiler scratch cleanup must suppress user finalization: {}",
+        snapshot
+    );
+
+    let out = unique_path("derived_self_assignment_snapshot", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived self-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived self-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("derived self-assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "derived self-assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn ownership_bearing_polymorphic_calls_preserve_descriptor_identity() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ownership_bearing_polymorphic_calls_preserve_descriptor_identity count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  integer :: calls = 0\n  type :: payload_t\n  contains\n    final :: finish_payload\n  end type\n  abstract interface\n    subroutine clear_interface(value)\n      class(*), allocatable, intent(out) :: value\n    end subroutine\n  end interface\n  type :: controller_t\n  contains\n    procedure :: clear_bound\n  end type\ncontains\n  subroutine finish_payload(item)\n    type(payload_t) :: item\n    calls = calls + 1\n  end subroutine\n  subroutine clear_value(value)\n    class(*), allocatable, intent(out) :: value\n  end subroutine\n  integer function clear_and_return(value)\n    class(*), allocatable, intent(out) :: value\n    clear_and_return = 42\n  end function\n  subroutine clear_bound(self, value)\n    class(controller_t), intent(in) :: self\n    class(*), allocatable, intent(out) :: value\n  end subroutine\n  function make_values(value) result(values)\n    class(*), allocatable, intent(out) :: value\n    integer, allocatable :: values(:)\n    allocate(values(1))\n    values = [9]\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  procedure(clear_interface), pointer :: clear_ptr\n  type(controller_t) :: controller\n  class(*), allocatable :: via_procptr, via_function, via_bound, via_result\n  integer, allocatable :: values(:)\n  integer :: answer\n\n  allocate(payload_t :: via_procptr)\n  clear_ptr => clear_value\n  call clear_ptr(via_procptr)\n  if (allocated(via_procptr)) error stop 1\n  if (calls /= 1) error stop 2\n\n  allocate(payload_t :: via_function)\n  answer = clear_and_return(via_function)\n  if (answer /= 42) error stop 3\n  if (allocated(via_function)) error stop 4\n  if (calls /= 2) error stop 5\n\n  allocate(payload_t :: via_bound)\n  call controller%clear_bound(via_bound)\n  if (allocated(via_bound)) error stop 6\n  if (calls /= 3) error stop 7\n\n  allocate(payload_t :: via_result)\n  values = make_values(via_result)\n  if (allocated(via_result)) error stop 8\n  if (calls /= 4) error stop 9\n  if (.not. allocated(values)) error stop 10\n  if (any(values /= [9])) error stop 11\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("polymorphic_call_descriptor_identity", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic call descriptor-identity compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic call descriptor-identity compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic call descriptor-identity run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "polymorphic call descriptor-identity run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn polymorphic_pointer_calls_preserve_descriptor_identity() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_pointer_calls_preserve_descriptor_identity count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: payload_t\n    integer :: marker = 7\n  end type\n  abstract interface\n    subroutine clear_pointer_interface(value)\n      class(*), pointer, intent(inout) :: value\n    end subroutine\n  end interface\n  type :: controller_t\n  contains\n    procedure :: clear_bound_pointer\n  end type\ncontains\n  subroutine clear_pointer(value)\n    class(*), pointer, intent(inout) :: value\n    nullify(value)\n  end subroutine\n  integer function clear_pointer_and_return(value)\n    class(*), pointer, intent(inout) :: value\n    nullify(value)\n    clear_pointer_and_return = 42\n  end function\n  subroutine clear_bound_pointer(self, value)\n    class(controller_t), intent(in) :: self\n    class(*), pointer, intent(inout) :: value\n    nullify(value)\n  end subroutine\n  function make_pointer_values(value) result(values)\n    class(*), pointer, intent(inout) :: value\n    integer, allocatable :: values(:)\n    nullify(value)\n    allocate(values(1))\n    values = [9]\n  end function\nend module\nprogram p\n  use m\n  implicit none\n  procedure(clear_pointer_interface), pointer :: clear_ptr\n  type(controller_t) :: controller\n  type(payload_t), target :: target\n  class(*), pointer :: value\n  integer, allocatable :: values(:)\n  integer :: answer\n\n  value => target\n  clear_ptr => clear_pointer\n  call clear_ptr(value)\n  if (associated(value)) error stop 1\n\n  value => target\n  answer = clear_pointer_and_return(value)\n  if (answer /= 42) error stop 2\n  if (associated(value)) error stop 3\n\n  value => target\n  call controller%clear_bound_pointer(value)\n  if (associated(value)) error stop 4\n\n  value => target\n  values = make_pointer_values(value)\n  if (associated(value)) error stop 5\n  if (.not. allocated(values)) error stop 6\n  if (any(values /= [9])) error stop 7\n  if (target%marker /= 7) error stop 8\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("polymorphic_pointer_descriptor_identity", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("polymorphic pointer descriptor-identity compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "polymorphic pointer descriptor-identity compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("polymorphic pointer descriptor-identity run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "polymorphic pointer descriptor-identity run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn defined_assignment_accepts_scalar_expression_sources() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_accepts_scalar_expression_sources count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: payload_t\n    integer :: value = 0\n  contains\n    final :: finish\n  end type\n  type :: holder_t\n    type(payload_t) :: item\n  end type\n  interface assignment(=)\n    procedure :: assign_payload\n  end interface\n  type(payload_t) :: source\n  type(holder_t) :: holder\n  class(*), allocatable :: assigned\n  source%value = 4\n  holder%item%value = 5\n  assigned = payload_t(3)\n  call check_value(assigned, 6)\n  assigned = (source)\n  call check_value(assigned, 8)\n  assigned = holder%item\n  call check_value(assigned, 10)\n  assigned = make_payload(6)\n  call check_value(assigned, 12)\n  print *, 'ok'\ncontains\n  subroutine assign_payload(lhs, rhs)\n    class(*), allocatable, intent(out) :: lhs\n    type(payload_t), intent(in) :: rhs\n    allocate(lhs, source=rhs%value * 2)\n  end subroutine\n  function make_payload(value) result(item)\n    integer, intent(in) :: value\n    type(payload_t) :: item\n    item%value = value\n  end function\n  subroutine check_value(value, expected)\n    class(*), intent(in) :: value\n    integer, intent(in) :: expected\n    select type (value)\n    type is (integer)\n      if (value /= expected) error stop 21\n    class default\n      error stop 22\n    end select\n  end subroutine\n  subroutine finish(item)\n    type(payload_t) :: item\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_assign_scalar_expr_sources", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined assignment scalar-expression compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined assignment scalar-expression compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("defined assignment scalar-expression run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "defined assignment scalar-expression run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_defined_assignment_accepts_extensions_only() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_defined_assignment_accepts_extensions_only count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: base_t\n    integer :: value = 0\n  contains\n    final :: finish_base\n  end type\n  type, extends(base_t) :: child_t\n  contains\n    final :: finish_child\n  end type\n  interface assignment(=)\n    procedure :: assign_base\n  end interface\n  type(base_t) :: base\n  type(child_t) :: child\n  class(*), allocatable :: assigned\n  base%value = 3\n  child%value = 4\n  assigned = base\n  call check_value(assigned, 6)\n  assigned = child\n  call check_value(assigned, 8)\n  print *, 'ok'\ncontains\n  subroutine assign_base(lhs, rhs)\n    class(*), allocatable, intent(out) :: lhs\n    class(base_t), intent(in) :: rhs\n    allocate(lhs, source=rhs%value * 2)\n  end subroutine\n  subroutine check_value(value, expected)\n    class(*), intent(in) :: value\n    integer, intent(in) :: expected\n    select type (value)\n    type is (integer)\n      if (value /= expected) error stop 31\n    class default\n      error stop 32\n    end select\n  end subroutine\n  subroutine finish_base(item)\n    type(base_t) :: item\n  end subroutine\n  subroutine finish_child(item)\n    type(child_t) :: item\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_defined_assign_extension", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class defined-assignment extension compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class defined-assignment extension compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class defined-assignment extension run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "class defined-assignment extension run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let unrelated_src = write_program(
+        "program p\n  implicit none\n  type :: base_t\n    integer :: value = 0\n  end type\n  type :: other_t\n    integer :: value = 1\n  contains\n    final :: finish_other\n  end type\n  interface assignment(=)\n    procedure :: assign_base\n  end interface\n  type(other_t) :: source\n  class(*), allocatable :: assigned\n  assigned = source\ncontains\n  subroutine assign_base(lhs, rhs)\n    class(*), allocatable, intent(out) :: lhs\n    class(base_t), intent(in) :: rhs\n    allocate(lhs, source=rhs%value)\n  end subroutine\n  subroutine finish_other(item)\n    type(other_t) :: item\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let unrelated_out = unique_path("class_defined_assign_unrelated", "bin");
+    let unrelated_compile = Command::new(compiler("armfortas"))
+        .args([
+            unrelated_src.to_str().unwrap(),
+            "-o",
+            unrelated_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("unrelated class defined-assignment compile failed to spawn");
+    assert!(
+        !unrelated_compile.status.success()
+            && String::from_utf8_lossy(&unrelated_compile.stderr)
+                .contains("cannot preserve its local FINAL procedure"),
+        "unrelated type matched CLASS(base) assignment: status={:?} stdout={} stderr={}",
+        unrelated_compile.status,
+        String::from_utf8_lossy(&unrelated_compile.stdout),
+        String::from_utf8_lossy(&unrelated_compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&unrelated_out);
+    let _ = std::fs::remove_file(&unrelated_src);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn hidden_local_finalizer_ownership_stops_at_runtime() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=hidden_local_finalizer_ownership_stops_at_runtime count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let cases = [
+        (
+            "assignment",
+            "  type(payload_t) :: source\n  class(*), allocatable :: owned\n  call clone_value(source, owned)\n",
+            true,
+        ),
+        (
+            "mold",
+            "  type(payload_t) :: source\n  class(*), allocatable :: owned\n  call mold_value(source, owned)\n",
+            true,
+        ),
+        (
+            "move_alloc",
+            "  type(payload_t), allocatable :: source\n  class(*), allocatable :: owned\n  allocate(source)\n  call move_value(source, owned)\n",
+            true,
+        ),
+        (
+            "move_unallocated",
+            "  type(payload_t), allocatable :: source\n  class(*), allocatable :: owned\n  call move_value(source, owned)\n  print *, 'ok'\n",
+            false,
+        ),
+    ];
+
+    for (case, declarations_and_call, should_report) in cases {
+        let source = format!(
+            "module dynamic_owner_m\n  implicit none\ncontains\n  subroutine clone_value(source, target)\n    class(*), intent(in) :: source\n    class(*), allocatable, intent(out) :: target\n    target = source\n  end subroutine\n  subroutine mold_value(source, target)\n    class(*), intent(in) :: source\n    class(*), allocatable, intent(out) :: target\n    allocate(target, mold=source)\n  end subroutine\n  subroutine move_value(source, target)\n    class(*), allocatable, intent(inout) :: source\n    class(*), allocatable, intent(out) :: target\n    call move_alloc(source, target)\n  end subroutine\nend module\nprogram p\n  use dynamic_owner_m\n  implicit none\n  type :: payload_t\n    integer :: value = 1\n  contains\n    final :: finish\n  end type\n{}contains\n  subroutine finish(item)\n    type(payload_t) :: item\n  end subroutine\nend program\n",
+            declarations_and_call
+        );
+        let src = write_program(&source, "f90");
+        let out = unique_path(&format!("hidden_local_finalizer_{}", case), "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("hidden local finalizer case failed to spawn");
+        assert!(
+            compile.status.success(),
+            "hidden local finalizer {} failed to compile: {}",
+            case,
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out)
+            .output()
+            .expect("hidden local finalizer case failed to run");
+        if should_report {
+            assert!(
+                !run.status.success()
+                    && String::from_utf8_lossy(&run.stderr).contains(
+                        "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+                    ),
+                "hidden local finalizer {} was not stopped: status={:?} stdout={} stderr={}",
+                case,
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+        } else {
+            assert!(
+                run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+                "unallocated MOVE_ALLOC source should remain valid: status={:?} stdout={} stderr={}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn static_local_finalizer_uses_static_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=static_local_finalizer_uses_static_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module static_final_state_m\n  implicit none\n  integer :: calls = 0\nend module\nprogram p\n  use static_final_state_m, only: calls\n  implicit none\n  type :: payload_t\n    integer :: marker = 3\n  contains\n    final :: finish\n  end type\n  type(payload_t), allocatable :: value\n  allocate(value)\n  deallocate(value)\n  if (calls /= 3) error stop 1\n  print *, 'ok'\ncontains\n  subroutine finish(item)\n    use static_final_state_m, only: calls\n    type(payload_t) :: item\n    calls = calls + item%marker\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("static_local_finalizer", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("static local finalizer IR emit failed to spawn");
+    assert!(
+        emit.status.success(),
+        "static local finalizer IR emit failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read static local finalizer IR");
+    let vtable = ir_text
+        .lines()
+        .find(|line| line.contains("global @afs_vtable_v2_local_") && line.contains("_payload_t"))
+        .expect("missing local payload vtable");
+    assert!(
+        vtable.trim_end().ends_with(", 0, 0, 0, 0, 0]"),
+        "procedure-local finalizer must not be published through the context-free vtable: {}",
+        vtable
+    );
+
+    let out = unique_path("static_local_finalizer", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("static local finalizer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "static local finalizer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("static local finalizer run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "static local finalizer run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn context_free_local_dynamic_lifecycle_uses_vtable_helpers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=context_free_local_dynamic_lifecycle_uses_vtable_helpers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module final_counter_m\n  implicit none\n  integer :: calls = 0\n  type :: payload_t\n    integer :: marker = 1\n  contains\n    final :: finish_payload\n  end type\ncontains\n  subroutine finish_payload(item)\n    type(payload_t) :: item\n    calls = calls + item%marker\n  end subroutine\nend module\nprogram p\n  use final_counter_m, only: calls, payload_t\n  implicit none\n  type :: wrapper_t\n    type(payload_t) :: inline\n    type(payload_t), allocatable :: owned\n  end type\n  class(*), allocatable :: value\n  allocate(wrapper_t :: value)\n  select type (item => value)\n  type is (wrapper_t)\n    allocate(item%owned)\n    item%inline%marker = 2\n    item%owned%marker = 3\n  class default\n    error stop 1\n  end select\n  deallocate(value)\n  if (calls /= 5) error stop 2\n  block\n    class(*), allocatable :: implicit_value\n    allocate(wrapper_t :: implicit_value)\n    select type (item => implicit_value)\n    type is (wrapper_t)\n      allocate(item%owned)\n      item%inline%marker = 4\n      item%owned%marker = 6\n    class default\n      error stop 3\n    end select\n  end block\n  if (calls /= 15) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let ir = unique_path("context_free_local_lifecycle", "ir");
+    let emit = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("context-free local lifecycle IR emit failed to spawn");
+    assert!(
+        emit.status.success(),
+        "context-free local lifecycle IR emit failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read context-free lifecycle IR");
+    let vtable = ir_text
+        .lines()
+        .find(|line| line.contains("global @afs_vtable_v2_local_") && line.contains("_wrapper_t"))
+        .expect("missing local wrapper vtable");
+    assert!(
+        vtable.contains("_wrapper_t_finalize_desc") && vtable.contains("_wrapper_t_dealloc_desc"),
+        "context-free local lifecycle helpers must populate both vtable slots: {}",
+        vtable
+    );
+
+    let out = unique_path("context_free_local_lifecycle", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("context-free local lifecycle compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "context-free local lifecycle compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("context-free local lifecycle run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "context-free local lifecycle run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn explicit_class_star_deallocation_uses_dynamic_finalizers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_class_star_deallocation_uses_dynamic_finalizers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  integer :: calls = 0\n  type :: payload_t\n    integer :: marker = 0\n  contains\n    final :: finish\n  end type\n  type :: holder_t\n    class(*), allocatable :: payload\n  end type\ncontains\n  subroutine finish(item)\n    type(payload_t) :: item\n    calls = calls + item%marker\n  end subroutine\n  subroutine exercise()\n    class(*), allocatable :: value\n    type(holder_t) :: holder\n    allocate(payload_t :: value)\n    select type (item => value)\n    type is (payload_t)\n      item%marker = 2\n    class default\n      error stop 1\n    end select\n    allocate(payload_t :: holder%payload)\n    select type (item => holder%payload)\n    type is (payload_t)\n      item%marker = 3\n    class default\n      error stop 2\n    end select\n    deallocate(value)\n    deallocate(holder%payload)\n  end subroutine\nend module\nprogram p\n  use m, only: calls, exercise\n  implicit none\n  call exercise()\n  if (calls /= 5) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("explicit_class_star_dynamic_final", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class(*) dynamic finalization compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class(*) dynamic finalization compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class(*) dynamic finalization run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "class(*) dynamic finalization run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn derived_assignment_deep_copies_nested_class_star_allocatable_state() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=derived_assignment_deep_copies_nested_class_star_allocatable_state count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: payload_t\n    integer, allocatable :: values(:)\n  end type\n  type :: value_t\n    class(*), allocatable :: payload\n  end type\ncontains\n  subroutine copy_then_change_source(independent)\n    logical, intent(out) :: independent\n    type(value_t) :: source, copied\n    allocate(payload_t :: source%payload)\n    select type (payload => source%payload)\n    type is (payload_t)\n      payload%values = [42]\n    class default\n      error stop 1\n    end select\n    copied = source\n    select type (payload => source%payload)\n    type is (payload_t)\n      payload%values(1) = 99\n    class default\n      error stop 2\n    end select\n    independent = .false.\n    select type (payload => copied%payload)\n    type is (payload_t)\n      independent = allocated(payload%values) .and. payload%values(1) == 42\n    end select\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  logical :: independent\n  call copy_then_change_source(independent)\n  if (.not. independent) error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("derived_copy_nested_class_star_alloc", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested class(*) derived-copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested class(*) derived-copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("nested class(*) derived-copy run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "nested class(*) derived-copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn direct_class_star_assignment_deep_copies_dynamic_allocatable_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=direct_class_star_assignment_deep_copies_dynamic_allocatable_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: payload_t\n    integer, allocatable :: values(:)\n  end type\n  class(*), allocatable :: source, assigned, sourced\n\n  allocate(payload_t :: source)\n  select type (item => source)\n  type is (payload_t)\n    item%values = [10, 20]\n  class default\n    error stop 1\n  end select\n\n  assigned = source\n  allocate(sourced, source=source)\n\n  select type (item => source)\n  type is (payload_t)\n    item%values = [90, 99]\n  class default\n    error stop 2\n  end select\n\n  select type (item => assigned)\n  type is (payload_t)\n    if (.not. allocated(item%values)) error stop 3\n    if (any(item%values /= [10, 20])) error stop 4\n  class default\n    error stop 5\n  end select\n\n  select type (item => sourced)\n  type is (payload_t)\n    if (.not. allocated(item%values)) error stop 6\n    if (any(item%values /= [10, 20])) error stop 7\n  class default\n    error stop 8\n  end select\n\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("direct_class_star_alloc_component_copy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("direct class(*) allocatable-component copy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "direct class(*) allocatable-component copy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("direct class(*) allocatable-component copy run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "direct class(*) allocatable-component copy run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_class_star_allocatable_component_assignment_copies_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -49694,6 +50373,43 @@ fn scalar_class_star_allocatable_component_assignment_copies_descriptor() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "scalar class(*) allocatable component assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn class_star_assignment_boxes_concrete_scalar_expressions() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_assignment_boxes_concrete_scalar_expressions count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: holder_t\n    class(*), allocatable :: value\n  end type\n  type(holder_t) :: holder\n  class(*), allocatable :: local\n  integer :: base\n  base = 40\n  holder%value = base + 2\n  select type (item => holder%value)\n  type is (integer)\n    if (item /= 42) error stop 1\n  class default\n    error stop 2\n  end select\n  local = base + 3\n  select type (item => local)\n  type is (integer)\n    if (item /= 43) error stop 3\n  class default\n    error stop 4\n  end select\n  local = 1.25\n  select type (item => local)\n  type is (real)\n    if (abs(item - 1.25) > 1.0e-6) error stop 5\n  class default\n    error stop 6\n  end select\n  deallocate(local)\n  deallocate(holder%value)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_concrete_scalar_assign", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("concrete scalar class(*) assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "concrete scalar class(*) assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("concrete scalar class(*) assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "concrete scalar class(*) assignment run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -50221,6 +50937,58 @@ fn imported_recursive_allocatable_components_use_owner_dealloc_helper() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+#[test]
+fn repeated_local_type_names_keep_scoped_layouts() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=repeated_local_type_names_keep_scoped_layouts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  implicit none\n  call first()\n  call second()\ncontains\n  subroutine first()\n    type :: node_t\n      integer :: value = 0\n      type(node_t), allocatable :: child\n    end type\n    type(node_t) :: source, copy\n    allocate(source%child)\n    source%child%value = 11\n    copy = source\n    print *, copy%child%value\n  end subroutine\n  subroutine second()\n    type :: node_t\n      integer :: value = 0\n      type(node_t), allocatable :: child\n    end type\n    type(node_t) :: source, copy\n    allocate(source%child)\n    source%child%value = 22\n    copy = source\n    print *, copy%child%value\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("repeated_local_type_names", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("repeated local type-name compile failed to spawn");
+    let compile_stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        compile.status.success(),
+        "repeated local type-name compile failed: {}",
+        compile_stderr
+    );
+    assert!(
+        !compile_stderr.contains("no field"),
+        "repeated local type names resolved the wrong component layout: {}",
+        compile_stderr
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("repeated local type-name run failed to spawn");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "repeated local type-name run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        stdout.split_whitespace().collect::<Vec<_>>(),
+        ["11", "22"],
+        "repeated local type names shared a layout or memory helper"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

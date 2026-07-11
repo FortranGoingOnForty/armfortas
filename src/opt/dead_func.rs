@@ -73,8 +73,18 @@ impl Pass for DeadFuncElim {
                 }
             }
         }
+        for global in &module.globals {
+            let Some(GlobalInit::QuadTable(slots)) = &global.initializer else {
+                continue;
+            };
+            for slot in slots {
+                if let QuadSlot::Sym(name) = slot {
+                    addressed_names.insert(name.clone());
+                }
+            }
+        }
         // Keep functions whose names match External calls or whose
-        // addresses escaped via GlobalAddr.
+        // addresses escaped via GlobalAddr or a data relocation.
         for (i, func) in module.functions.iter().enumerate() {
             if external_names.contains(&func.name) || addressed_names.contains(&func.name) {
                 referenced.insert(i as u32);
@@ -270,6 +280,35 @@ mod tests {
         assert!(
             !changed,
             "address-taken internal helper should not be removed"
+        );
+        assert_eq!(m.functions.len(), 2);
+        assert_eq!(m.functions[1].name, "helper");
+    }
+
+    #[test]
+    fn keeps_internal_function_referenced_by_global_quad_table() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+
+        let mut prog = Function::new("__prog_entry".into(), vec![], IrType::Void);
+        prog.block_mut(prog.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(prog);
+
+        let mut helper = Function::new("helper".into(), vec![], IrType::Void);
+        helper.internal_only = true;
+        helper.block_mut(helper.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(helper);
+
+        m.add_global(Global {
+            name: "dispatch".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 1),
+            initializer: Some(GlobalInit::QuadTable(vec![QuadSlot::Sym("helper".into())])),
+        });
+
+        let pass = DeadFuncElim;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "global-relocated internal helper should not be removed"
         );
         assert_eq!(m.functions.len(), 2);
         assert_eq!(m.functions[1].name, "helper");

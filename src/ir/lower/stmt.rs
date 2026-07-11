@@ -54,6 +54,24 @@ fn class_star_intrinsic_source_tag_value(
     )
 }
 
+fn class_star_descriptor_source(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    source_expr: &SpannedExpr,
+) -> ValueId {
+    lower_arg_descriptor_full(
+        b,
+        &ctx.locals,
+        source_expr,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+        true,
+    )
+}
+
 fn root_object_name(expr: &SpannedExpr) -> Option<String> {
     match &expr.node {
         Expr::Name { name } => Some(name.clone()),
@@ -89,6 +107,32 @@ fn emit_scalar_class_star_char_source_copy_on_success(
     b.set_block(done_bb);
 }
 
+fn emit_scalar_fixed_char_source_copy_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_desc: ValueId,
+    src_ptr: ValueId,
+    src_len: ValueId,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let copy_bb = b.create_block("alloc_fixed_char_source_copy");
+    let done_bb = b.create_block("alloc_fixed_char_source_copy_done");
+    b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let dest_len = descriptor_elem_size(b, dest_desc);
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_base, dest_len, src_ptr, src_len],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
 fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str, dest: ValueId) {
     if let Some(layout) = ctx.type_layouts.get(type_name) {
         finalize_derived_storage(
@@ -97,10 +141,35 @@ fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str,
             ctx.internal_funcs,
             Some(ctx.contained_host_refs),
             &ctx.locals,
+            ctx.type_layouts,
             layout,
             dest,
         );
     }
+}
+
+fn prepare_descriptor_assignment_lhs(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    desc: ValueId,
+    is_polymorphic: bool,
+    layout: &crate::sema::type_layout::TypeLayout,
+    stat_addr: ValueId,
+) {
+    if is_polymorphic {
+        require_context_free_dynamic_lifecycle(b, desc);
+    }
+    finalize_derived_descriptor_storage_if_allocated(
+        b,
+        ctx.st,
+        ctx.internal_funcs,
+        Some(ctx.contained_host_refs),
+        &ctx.locals,
+        desc,
+        layout,
+        ctx.type_layouts,
+    );
+    deallocate_derived_descriptor_components(b, desc, layout, ctx.type_layouts, stat_addr);
 }
 
 fn stabilize_finalized_assignment_rhs(
@@ -112,7 +181,7 @@ fn stabilize_finalized_assignment_rhs(
     if ctx
         .type_layouts
         .get(type_name)
-        .is_some_and(|layout| !layout.final_procs.is_empty())
+        .is_some_and(|layout| derived_layout_needs_finalization(layout, ctx.type_layouts))
     {
         stabilize_derived_call_result(b, ctx.type_layouts, type_name, rhs)
     } else {
@@ -139,7 +208,7 @@ fn finalizable_function_result_type_name(ctx: &LowerCtx, expr: &SpannedExpr) -> 
     })?;
     ctx.type_layouts
         .get(&type_name)
-        .filter(|layout| !layout.final_procs.is_empty())
+        .filter(|layout| derived_layout_needs_finalization(layout, ctx.type_layouts))
         .map(|layout| layout.name.clone())
 }
 
@@ -1408,11 +1477,12 @@ fn static_concrete_expr_type_layout<'a>(
     expr: Option<&SpannedExpr>,
 ) -> Option<&'a crate::sema::type_layout::TypeLayout> {
     let expr = expr?;
-    let layout = expr_type_layout(expr, Some(&ctx.locals), ctx.st, ctx.type_layouts)?;
-    if layout.is_abstract {
-        return None;
+    match operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)) {
+        Some(crate::sema::symtab::TypeInfo::Derived(type_name)) => {
+            type_layout_for_current_scope(ctx.type_layouts, &type_name)
+        }
+        _ => None,
     }
-    Some(layout)
 }
 
 fn format_label_literal(expr: &SpannedExpr) -> Option<u64> {
@@ -1908,7 +1978,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     && info.derived_type.is_some()
                                 {
                                     let desc = array_descriptor_addr(b, &info);
-                                    let rhs_scalar_desc = if info.is_class {
+                                    let mut rhs_scalar_desc = if info.is_class {
                                         match &value.node {
                                             Expr::Name { name } => ctx
                                                 .locals
@@ -1929,6 +1999,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             ScalarAllocSourceCopyPlan::Dynamic(base.clone())
                                         })
                                     });
+                                    let mut rhs_scalar_snapshot = None;
+                                    if let (
+                                        Some(source_desc),
+                                        Some(ScalarAllocSourceCopyPlan::Dynamic(base_type)),
+                                    ) = (rhs_scalar_desc, dynamic_source_copy_plan.as_ref())
+                                    {
+                                        let (stable_source, snapshot_desc) =
+                                            stabilize_dynamic_scalar_assignment_source(
+                                                b,
+                                                desc,
+                                                source_desc,
+                                                base_type,
+                                                ctx.type_layouts,
+                                            );
+                                        rhs_scalar_desc = Some(stable_source);
+                                        rhs_scalar_snapshot = Some(snapshot_desc);
+                                    }
                                     let assign_type_name =
                                         if info.is_class && rhs_scalar_desc.is_none() {
                                             expr_type_layout(
@@ -2038,14 +2125,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.set_block(dealloc_bb);
                                     if let Some(type_name) = info.derived_type.as_ref() {
                                         if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                            finalize_derived_descriptor_storage_if_allocated(
+                                            prepare_descriptor_assignment_lhs(
                                                 b,
-                                                ctx.st,
-                                                ctx.internal_funcs,
-                                                Some(ctx.contained_host_refs),
-                                                &ctx.locals,
+                                                ctx,
                                                 desc,
+                                                info.is_class,
                                                 layout,
+                                                assign_stat,
                                             );
                                         }
                                     }
@@ -2099,14 +2185,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.set_block(finalize_existing_bb);
                                     if let Some(type_name) = info.derived_type.as_ref() {
                                         if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                            finalize_derived_descriptor_storage_if_allocated(
+                                            prepare_descriptor_assignment_lhs(
                                                 b,
-                                                ctx.st,
-                                                ctx.internal_funcs,
-                                                Some(ctx.contained_host_refs),
-                                                &ctx.locals,
+                                                ctx,
                                                 desc,
+                                                info.is_class,
                                                 layout,
+                                                assign_stat,
                                             );
                                         }
                                     }
@@ -2125,6 +2210,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             ctx.type_layouts,
                                             None,
                                         );
+                                        if let Some(snapshot_desc) = rhs_scalar_snapshot {
+                                            if let Some(layout) = info
+                                                .derived_type
+                                                .as_deref()
+                                                .and_then(|name| ctx.type_layouts.get(name))
+                                                .cloned()
+                                            {
+                                                discard_dynamic_assignment_snapshot(
+                                                    b,
+                                                    snapshot_desc,
+                                                    &layout,
+                                                    ctx.type_layouts,
+                                                );
+                                            }
+                                        }
                                     } else {
                                         let val = rhs_scalar_value.expect(
                                             "scalar derived assignment value lowered before branch",
@@ -2143,7 +2243,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             finalize_assignment_lhs(b, ctx, temp_type, val);
                                         }
                                         // Scalar descriptor-backed TYPE allocatables keep their
-                                        // dynamic type identity in the descriptor sidecar, so
+                                        // dynamic type identity in the descriptor metadata, so
                                         // constructor/function-result assignment must restamp the
                                         // concrete metadata after copying the value bytes.
                                         if let Some(tag) = derived_type_tag_value(
@@ -2163,47 +2263,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     }
                                     b.branch(done_bb, vec![]);
                                     b.set_block(done_bb);
-                                } else if info.is_class
+                                } else if is_unlimited_polymorphic_local(&info)
                                     && local_declared_rank(&info) == 0
                                     && ctx
                                         .st
                                         .find_symbol_any_scope(&key)
                                         .map(|s| s.attrs.allocatable)
                                         .unwrap_or(info.allocatable)
-                                    && matches!(value.node, Expr::ComponentAccess { .. })
                                 {
-                                    // Scalar polymorphic allocatable assign:
-                                    // `class(*), allocatable :: out; out = h%poly_field`
-                                    // — copy the 384-byte descriptor verbatim
-                                    // when the RHS is a polymorphic component
-                                    // access. This must run before the general
-                                    // allocatable branch below; otherwise scalar
-                                    // CLASS(*) dummies are mistaken for arrays
-                                    // and their payload is loaded through a
-                                    // bogus concrete element type.
                                     let dst = array_descriptor_addr(b, &info);
-                                    let src_desc_opt: Option<ValueId> =
-                                        resolve_component_field_access(
-                                            b,
-                                            &ctx.locals,
-                                            value,
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
-                                        .map(|(p, _)| p);
-                                    if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(384);
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![dst, src, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                        let coerced = coerce_to_type(b, val, &info.ty);
-                                        let ptr = b.load(info.addr);
-                                        b.store(coerced, ptr);
-                                    }
+                                    let src = class_star_descriptor_source(b, ctx, value);
+                                    copy_unlimited_polymorphic_allocatable_descriptor(
+                                        b,
+                                        dst,
+                                        src,
+                                        ctx.type_layouts,
+                                    );
                                 } else if !info.dims.is_empty() || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
                                     {
@@ -2464,7 +2539,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 // dest is a fixed-shape stack buffer (e.g.
                                                 // `real :: r(10)`) `array_descriptor_addr`
                                                 // returns the buffer itself, but the callee
-                                                // expects a 384-byte descriptor — handing it
+                                                // expects a 392-byte descriptor — handing it
                                                 // the buffer corrupts the caller frame the
                                                 // moment the callee touches dims/flags. Allocate
                                                 // a real descriptor temp, call into it, copy
@@ -2489,13 +2564,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         );
                                                     let tmp_desc = b.alloca(IrType::Array(
                                                         Box::new(IrType::Int(IntWidth::I8)),
-                                                        384,
+                                                        392,
                                                     ));
                                                     let zero32 = b.const_i32(0);
-                                                    let sz384 = b.const_i64(384);
+                                                    let descriptor_bytes = b.const_i64(392);
                                                     b.call(
                                                         FuncRef::External("memset".into()),
-                                                        vec![tmp_desc, zero32, sz384],
+                                                        vec![tmp_desc, zero32, descriptor_bytes],
                                                         IrType::Ptr(Box::new(IrType::Int(
                                                             IntWidth::I8,
                                                         ))),
@@ -2798,46 +2873,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                                         );
                                     }
-                                } else if info.is_class
+                                } else if is_unlimited_polymorphic_local(&info)
                                     && info.dims.is_empty()
                                     && ctx
                                         .st
                                         .find_symbol_any_scope(&key)
                                         .map(|s| s.attrs.allocatable)
                                         .unwrap_or(false)
-                                    && matches!(value.node, Expr::ComponentAccess { .. })
                                 {
-                                    // Scalar polymorphic allocatable assign:
-                                    // `class(*), allocatable :: out; out = h%poly_field`
-                                    // — copy the 384-byte descriptor verbatim
-                                    // when the RHS is a polymorphic component
-                                    // access.  Avoids the scalar-store
-                                    // fallback that would truncate the source
-                                    // descriptor's payload to a single i32.
                                     let dst = array_descriptor_addr(b, &info);
-                                    let src_desc_opt: Option<ValueId> =
-                                        resolve_component_field_access(
-                                            b,
-                                            &ctx.locals,
-                                            value,
-                                            ctx.st,
-                                            ctx.type_layouts,
-                                        )
-                                        .map(|(p, _)| p);
-                                    if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(384);
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![dst, src, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        // Fall through if we can't resolve.
-                                        let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
-                                        let coerced = coerce_to_type(b, val, &info.ty);
-                                        let ptr = b.load(info.addr);
-                                        b.store(coerced, ptr);
-                                    }
+                                    let src = class_star_descriptor_source(b, ctx, value);
+                                    copy_unlimited_polymorphic_allocatable_descriptor(
+                                        b,
+                                        dst,
+                                        src,
+                                        ctx.type_layouts,
+                                    );
                                 } else if info.by_ref {
                                     let val = super::expr::lower_expr_ctx_tl(b, ctx, value);
                                     let coerced = coerce_to_type(b, val, &info.ty);
@@ -3437,7 +3488,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if let Some((base_addr, type_name)) =
                         resolve_component_base(b, &ctx.locals, base, ctx.st, ctx.type_layouts)
                     {
-                        if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                        if let Some(layout) =
+                            type_layout_for_current_scope(ctx.type_layouts, &type_name)
+                        {
                             if let Some(field) = layout_component_field_or_parent_view(
                                 layout,
                                 component,
@@ -3450,14 +3503,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // Character field: copy string data with space padding.
                                 if let CharKind::Fixed(flen) = field_char_kind(&field) {
                                     let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
-                                    let dest_ptr = if field.pointer {
-                                        b.load_typed(
-                                            field_ptr,
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        )
-                                    } else {
-                                        field_ptr
-                                    };
+                                    let dest_ptr =
+                                        fixed_char_component_data_ptr(b, field_ptr, &field);
                                     let dest_len = b.const_i64(flen);
                                     b.call(
                                         FuncRef::External("afs_assign_char_fixed".into()),
@@ -3501,7 +3548,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     field.type_info,
                                     crate::sema::symtab::TypeInfo::Derived(_)
                                 ) && field.allocatable
-                                    && field.size == 384
+                                    && field.size == 392
                                     && field.dims.is_empty()
                                 {
                                     let Some(type_name) = field_derived_type_name(&field) else {
@@ -3524,7 +3571,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b.cond_branch(needs_alloc, alloc_bb, vec![], copy_bb, vec![]);
 
                                     b.set_block(alloc_bb);
-                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                    if let Some(layout) =
+                                        type_layout_for_current_scope(ctx.type_layouts, &type_name)
+                                    {
                                         let elem_size = b.const_i64(layout.size as i64);
                                         let rank_val = b.const_i32(0);
                                         let null_ptr = b.const_i64(0);
@@ -3712,47 +3761,18 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 ) && field.allocatable
                                     && field.dims.is_empty()
                                 {
-                                    // Polymorphic component target:
-                                    // `derived%poly_field = expr` where
-                                    // `poly_field` is class(*), allocatable.
-                                    // Memcpy the source descriptor.  RHS is
-                                    // expected to be a polymorphic local or
-                                    // another class(*) component access.
-                                    let src_desc_opt: Option<ValueId> = match &value.node {
-                                        Expr::ComponentAccess { .. } => {
-                                            resolve_component_field_access(
-                                                b,
-                                                &ctx.locals,
-                                                value,
-                                                ctx.st,
-                                                ctx.type_layouts,
-                                            )
-                                            .map(|(p, _)| p)
-                                        }
-                                        Expr::Name { name } => ctx
-                                            .locals
-                                            .get(&name.to_lowercase())
-                                            .filter(|info| info.is_class && info.dims.is_empty())
-                                            .map(|info| array_descriptor_addr(b, info)),
-                                        _ => None,
-                                    };
-                                    if let Some(src) = src_desc_opt {
-                                        let sz = b.const_i64(384);
-                                        b.call(
-                                            FuncRef::External("memcpy".into()),
-                                            vec![field_ptr, src, sz],
-                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                        );
-                                    } else {
-                                        // Last-resort: skip the assignment
-                                        // rather than emit invalid IR.
-                                        // Better than truncating to i32.
-                                    }
+                                    let src = class_star_descriptor_source(b, ctx, value);
+                                    copy_unlimited_polymorphic_allocatable_descriptor(
+                                        b,
+                                        field_ptr,
+                                        src,
+                                        ctx.type_layouts,
+                                    );
                                 } else if field.allocatable
                                     && !field.pointer
                                     && !field.declared_array
                                     && field.dims.is_empty()
-                                    && field.size == 384
+                                    && field.size == 392
                                 {
                                     let desc = field_ptr;
                                     let allocated = b.call(
@@ -4355,7 +4375,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .as_ref()
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                 .unwrap_or(false);
-                        let wants_polymorphic_descriptor = dummy_is_class;
+                        let wants_polymorphic_descriptor =
+                            dummy_is_class && !dummy_is_allocatable && !wants_pointer;
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => {
@@ -4886,8 +4907,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 Some(ctx.type_layouts),
                                             )))
                                         && !wants_bind_c_char;
-                                    let wants_polymorphic_descriptor =
-                                        wants_descriptor && dummy_is_class;
+                                    let wants_polymorphic_descriptor = wants_descriptor
+                                        && dummy_is_class
+                                        && !dummy_is_allocatable
+                                        && !wants_pointer;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
@@ -6257,13 +6280,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     _ => None,
                 };
                 if let Some((component_expr, args)) = component_alloc {
-                    if let Some((field_ptr, field)) = resolve_component_field_access(
-                        b,
-                        &ctx.locals,
-                        component_expr,
-                        ctx.st,
-                        ctx.type_layouts,
-                    ) {
+                    if let Some((field_ptr, field_owner_layout, field)) =
+                        resolve_component_field_access_with_owner(
+                            b,
+                            &ctx.locals,
+                            component_expr,
+                            ctx.st,
+                            ctx.type_layouts,
+                        )
+                    {
                         if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32
                         {
                             let Some(len_val) = char_alloc_len else {
@@ -6284,7 +6309,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             continue;
                         }
-                        if field.size == 384 && (field.allocatable || field.pointer) {
+                        if field.size == 392 && (field.allocatable || field.pointer) {
                             let elem_ty = field_storage_ir_type(&field, ctx.type_layouts);
                             let field_is_class_star = matches!(
                                 &field.type_info,
@@ -6344,10 +6369,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .or(mold_static_layout)
                                 .or(typed_layout)
                                 .or_else(|| {
-                                    field_info
-                                        .derived_type
-                                        .as_deref()
-                                        .and_then(|type_name| ctx.type_layouts.get(type_name))
+                                    field_info.derived_type.as_deref().and_then(|type_name| {
+                                        ctx.type_layouts.get_related(field_owner_layout, type_name)
+                                    })
                                 });
                             let target_rank =
                                 local_declared_rank(&field_info).max(if field.declared_array {
@@ -6356,25 +6380,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     0
                                 });
                             let source_copy_rank = rank.max(target_rank);
-                            let scalar_source_copy_plan = if source_copy_rank == 0 {
-                                source_expr.and_then(|expr| {
-                                    expr_scalar_alloc_source_copy_plan(
-                                        expr,
-                                        &ctx.locals,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
+                            let source_copy_plan = source_expr.and_then(|expr| {
+                                expr_scalar_alloc_source_copy_plan(
+                                    expr,
+                                    &ctx.locals,
+                                    ctx.st,
+                                    ctx.type_layouts,
+                                )
+                            });
                             let array_source_copy_layout = if source_desc.is_some() {
-                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
+                                if source_copy_rank == 0 && source_copy_plan.is_some() {
                                     None
                                 } else {
-                                    dynamic_layout.filter(|layout| {
-                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                    })
+                                    match source_copy_plan.as_ref() {
+                                        Some(ScalarAllocSourceCopyPlan::Static(type_name)) => {
+                                            ctx.type_layouts.get(type_name).filter(|layout| {
+                                                derived_layout_needs_deep_copy(
+                                                    layout,
+                                                    ctx.type_layouts,
+                                                )
+                                            })
+                                        }
+                                        Some(
+                                            ScalarAllocSourceCopyPlan::Dynamic(_)
+                                            | ScalarAllocSourceCopyPlan::UnlimitedPolymorphic,
+                                        ) => None,
+                                        None => dynamic_layout.filter(|layout| {
+                                            derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                        }),
+                                    }
                                 }
                             } else {
                                 None
@@ -6389,14 +6423,34 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .unwrap_or_else(|| {
                                     descriptor_element_size_bytes(&field_info, ctx.layout)
                                 });
-                            let es = source_char_elem_size.unwrap_or_else(|| {
-                                allocated_array_elem_size(
-                                    b,
-                                    &field_info,
-                                    elem_size_bytes,
-                                    char_alloc_len,
-                                )
-                            });
+                            let component_char_alloc_len = match &field.type_info {
+                                crate::sema::symtab::TypeInfo::Character {
+                                    len: Some(_), ..
+                                } => None,
+                                _ => char_alloc_len,
+                            };
+                            let dynamic_descriptor_elem_size = if field_info.is_class {
+                                source_desc
+                                    .or(mold_shape_desc)
+                                    .map(|desc| descriptor_elem_size(b, desc))
+                            } else {
+                                None
+                            };
+                            let es = source_char_elem_size
+                                .or(dynamic_descriptor_elem_size)
+                                .unwrap_or_else(|| {
+                                    allocated_array_elem_size(
+                                        b,
+                                        &field_info,
+                                        elem_size_bytes,
+                                        component_char_alloc_len,
+                                    )
+                                });
+                            if field_info.is_class {
+                                if let Some(metadata_desc) = shape_desc {
+                                    require_context_free_dynamic_lifecycle(b, metadata_desc);
+                                }
+                            }
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
                                 b.const_i64(0)
@@ -6460,7 +6514,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     source_desc,
                                     source_copy_rank > 0,
                                     array_source_copy_layout,
-                                    scalar_source_copy_plan.as_ref(),
+                                    source_copy_plan.as_ref(),
                                     ctx.type_layouts,
                                     errmsg_target.as_ref(),
                                 );
@@ -6473,7 +6527,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         source_desc,
                                         false,
                                         None,
-                                        scalar_source_copy_plan.as_ref(),
+                                        source_copy_plan.as_ref(),
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
@@ -6508,6 +6562,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 b, stat_addr, field_ptr, src_ptr, src_len,
                                             );
                                         }
+                                    } else if let Some((src_ptr, src_len)) = source_char {
+                                        emit_scalar_fixed_char_source_copy_on_success(
+                                            b, stat_addr, field_ptr, src_ptr, src_len,
+                                        );
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -6789,25 +6847,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 });
                             let target_rank = local_declared_rank(&info);
                             let source_copy_rank = rank.max(target_rank);
-                            let scalar_source_copy_plan = if source_copy_rank == 0 {
-                                source_expr.and_then(|expr| {
-                                    expr_scalar_alloc_source_copy_plan(
-                                        expr,
-                                        &ctx.locals,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
+                            let source_copy_plan = source_expr.and_then(|expr| {
+                                expr_scalar_alloc_source_copy_plan(
+                                    expr,
+                                    &ctx.locals,
+                                    ctx.st,
+                                    ctx.type_layouts,
+                                )
+                            });
                             let array_source_copy_layout = if source_desc.is_some() {
-                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
+                                if source_copy_rank == 0 && source_copy_plan.is_some() {
                                     None
                                 } else {
-                                    dynamic_layout.filter(|layout| {
-                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                    })
+                                    match source_copy_plan.as_ref() {
+                                        Some(ScalarAllocSourceCopyPlan::Static(type_name)) => {
+                                            ctx.type_layouts.get(type_name).filter(|layout| {
+                                                derived_layout_needs_deep_copy(
+                                                    layout,
+                                                    ctx.type_layouts,
+                                                )
+                                            })
+                                        }
+                                        Some(
+                                            ScalarAllocSourceCopyPlan::Dynamic(_)
+                                            | ScalarAllocSourceCopyPlan::UnlimitedPolymorphic,
+                                        ) => None,
+                                        None => dynamic_layout.filter(|layout| {
+                                            derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                        }),
+                                    }
                                 }
                             } else {
                                 None
@@ -6825,7 +6893,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // rather than the local spill slot that holds its
                             // address. Scalar allocatables lower as a rank-0
                             // descriptor allocation.
-                            let es = allocated_array_elem_size(
+                            let static_elem_size = allocated_array_elem_size(
                                 b,
                                 &info,
                                 dynamic_layout
@@ -6838,8 +6906,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     .unwrap_or(elem_size_bytes),
                                 char_alloc_len,
                             );
-                            let es = source_char_elem_size.unwrap_or(es);
+                            let dynamic_descriptor_elem_size = if info.is_class {
+                                source_desc
+                                    .or(mold_shape_desc)
+                                    .map(|desc| descriptor_elem_size(b, desc))
+                            } else {
+                                None
+                            };
+                            let es = source_char_elem_size
+                                .or(dynamic_descriptor_elem_size)
+                                .unwrap_or(static_elem_size);
                             let desc = array_descriptor_addr(b, &info);
+                            if info.is_class {
+                                if let Some(metadata_desc) = shape_desc {
+                                    require_context_free_dynamic_lifecycle(b, metadata_desc);
+                                }
+                            }
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
                                 b.const_i64(0)
@@ -6903,7 +6985,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     source_desc,
                                     source_copy_rank > 0,
                                     array_source_copy_layout,
-                                    scalar_source_copy_plan.as_ref(),
+                                    source_copy_plan.as_ref(),
                                     ctx.type_layouts,
                                     errmsg_target.as_ref(),
                                 );
@@ -6916,7 +6998,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         source_desc,
                                         false,
                                         None,
-                                        scalar_source_copy_plan.as_ref(),
+                                        source_copy_plan.as_ref(),
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
@@ -6951,6 +7033,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 b, stat_addr, desc, src_ptr, src_len,
                                             );
                                         }
+                                    } else if let Some((src_ptr, src_len)) = source_char {
+                                        emit_scalar_fixed_char_source_copy_on_success(
+                                            b, stat_addr, desc, src_ptr, src_len,
+                                        );
                                     }
                                 }
                             } else if let Some(source_expr) = source_expr {
@@ -7165,13 +7251,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             for item in items {
                 if let Expr::ComponentAccess { .. } = &item.node {
-                    if let Some((field_ptr, field)) = resolve_component_field_access(
-                        b,
-                        &ctx.locals,
-                        item,
-                        ctx.st,
-                        ctx.type_layouts,
-                    ) {
+                    if let Some((field_ptr, field_owner, field)) =
+                        resolve_component_field_access_with_owner(
+                            b,
+                            &ctx.locals,
+                            item,
+                            ctx.st,
+                            ctx.type_layouts,
+                        )
+                    {
                         if is_deferred_char_component_field(&field) {
                             b.call(
                                 FuncRef::External("afs_dealloc_string".into()),
@@ -7180,10 +7268,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             );
                             continue;
                         }
-                        if field.size == 384 && (field.allocatable || field.pointer) {
+                        if field.size == 392 && (field.allocatable || field.pointer) {
                             if field.allocatable {
+                                if matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ) {
+                                    let finalize = b.const_i32(1);
+                                    release_unlimited_polymorphic_allocatable_descriptor(
+                                        b, field_ptr, stat_addr, finalize,
+                                    );
+                                    emit_runtime_errmsg_on_failure(
+                                        b,
+                                        stat_addr,
+                                        errmsg_target.as_ref(),
+                                        "DEALLOCATE failed",
+                                    );
+                                    continue;
+                                }
+                                if matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::Class(_)
+                                ) {
+                                    require_context_free_dynamic_lifecycle(b, field_ptr);
+                                }
                                 if let Some(type_name) = field_derived_type_name(&field) {
-                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                    if let Some(layout) =
+                                        ctx.type_layouts.get_related(field_owner, &type_name)
+                                    {
                                         finalize_derived_descriptor_storage_if_allocated(
                                             b,
                                             ctx.st,
@@ -7192,6 +7305,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             &ctx.locals,
                                             field_ptr,
                                             layout,
+                                            ctx.type_layouts,
                                         );
                                         deallocate_derived_descriptor_components(
                                             b,
@@ -7249,31 +7363,42 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             );
                         } else if info.allocatable || info.descriptor_arg {
                             let desc = array_descriptor_addr(b, info);
-                            if let Some(type_name) = &info.derived_type {
-                                if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    finalize_derived_descriptor_storage_if_allocated(
-                                        b,
-                                        ctx.st,
-                                        ctx.internal_funcs,
-                                        Some(ctx.contained_host_refs),
-                                        &ctx.locals,
-                                        desc,
-                                        layout,
-                                    );
-                                    deallocate_derived_descriptor_components(
-                                        b,
-                                        desc,
-                                        layout,
-                                        ctx.type_layouts,
-                                        stat_addr,
-                                    );
+                            if is_unlimited_polymorphic_local(info) {
+                                let finalize = b.const_i32(1);
+                                release_unlimited_polymorphic_allocatable_descriptor(
+                                    b, desc, stat_addr, finalize,
+                                );
+                            } else {
+                                if info.is_class {
+                                    require_context_free_dynamic_lifecycle(b, desc);
                                 }
+                                if let Some(type_name) = &info.derived_type {
+                                    if let Some(layout) = ctx.type_layouts.get(type_name) {
+                                        finalize_derived_descriptor_storage_if_allocated(
+                                            b,
+                                            ctx.st,
+                                            ctx.internal_funcs,
+                                            Some(ctx.contained_host_refs),
+                                            &ctx.locals,
+                                            desc,
+                                            layout,
+                                            ctx.type_layouts,
+                                        );
+                                        deallocate_derived_descriptor_components(
+                                            b,
+                                            desc,
+                                            layout,
+                                            ctx.type_layouts,
+                                            stat_addr,
+                                        );
+                                    }
+                                }
+                                b.call(
+                                    FuncRef::External("afs_deallocate_array".into()),
+                                    vec![desc, stat_addr],
+                                    IrType::Void,
+                                );
                             }
-                            b.call(
-                                FuncRef::External("afs_deallocate_array".into()),
-                                vec![desc, stat_addr],
-                                IrType::Void,
-                            );
                             emit_runtime_errmsg_on_failure(
                                 b,
                                 stat_addr,
@@ -8482,7 +8607,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if !info.is_pointer {
                     continue;
                 }
-                // Array pointers use the 384-byte descriptor, scalar
+                // Array pointers use the 392-byte descriptor, scalar
                 // deferred-length character pointers use a 32-byte
                 // string descriptor, and scalar pointers use an 8-byte
                 // slot. Pointer dummies passed by reference must write
@@ -8515,7 +8640,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             //
             //   * scalar + derived-type pointer: slot holds an 8-byte
             //     pointer, `=>` stores the target's address into it.
-            //   * array pointer: slot holds a 384-byte ArrayDescriptor,
+            //   * array pointer: slot holds a 392-byte ArrayDescriptor,
             //     `=>` materialises a descriptor of the target and
             //     memcpy's it into the slot.
             //
@@ -8843,14 +8968,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             tgt_field.type_info,
                             crate::sema::symtab::TypeInfo::Derived(_)
                         )
-                        && tgt_field.size != 384
+                        && tgt_field.size != 392
                     {
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
                     } else {
                         field_storage_ir_type(&tgt_field, ctx.type_layouts)
                     },
                     dims: vec![],
-                    allocatable: tgt_field.size == 384
+                    allocatable: tgt_field.size == 392
                         && (tgt_field.allocatable || tgt_field.pointer),
                     descriptor_arg: false,
                     by_ref: false,
@@ -8988,7 +9113,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 Some(ctx.type_layouts),
                             );
                             let tgt_desc = array_descriptor_addr(b, &tgt_info);
-                            let size = b.const_i64(384);
+                            let size = b.const_i64(392);
                             b.call(
                                 FuncRef::External("memcpy".into()),
                                 vec![tgt_desc, src_desc, size],
@@ -9053,10 +9178,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 store_scalar_pointer_slot_value(b, &tgt_info, ptr);
                                 return;
                             }
-                            if field.size == 384 && (field.pointer || field.allocatable) {
+                            if field.size == 392 && (field.pointer || field.allocatable) {
                                 if local_uses_array_descriptor(&tgt_info) {
                                     let tgt_desc = array_descriptor_addr(b, &tgt_info);
-                                    let size = b.const_i64(384);
+                                    let size = b.const_i64(392);
                                     b.call(
                                         FuncRef::External("memcpy".into()),
                                         vec![tgt_desc, field_ptr, size],
@@ -9151,7 +9276,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             // Array pointer path: materialise a descriptor from the
-            // target and memcpy 384 bytes into the pointer's slot.
+            // target and memcpy 392 bytes into the pointer's slot.
             // Both explicit-shape stack arrays and descriptor-backed
             // allocatables are supported via array_data_ptr_for_call.
             let target_is_array =
@@ -9164,7 +9289,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 };
                 if local_uses_array_descriptor(&tgt_info) {
                     let tgt_desc = array_descriptor_addr(b, &tgt_info);
-                    let size = b.const_i64(384);
+                    let size = b.const_i64(392);
                     b.call(
                         FuncRef::External("memcpy".into()),
                         vec![tgt_desc, src_desc, size],

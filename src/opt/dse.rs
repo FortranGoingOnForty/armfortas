@@ -15,7 +15,8 @@
 //! * Uses alias analysis:
 //!   - later `MustAlias` store kills the earlier unread store
 //!   - `Load`/call pointer args flush any pending store that is not `NoAlias`
-//! * Calls with no pointer args leave pending stores intact.
+//! * Calls preserve only non-global stores proven unreachable through their
+//!   pointer arguments.
 //!
 //! ### Effect
 //!
@@ -74,6 +75,10 @@ fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::Targe
                 }
 
                 InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+                    // Calls can observe module/global state without receiving
+                    // its address as an argument, so those stores are never
+                    // dead across a call boundary.
+                    pending.retain(|entry| !alias_oracle.requires_global_call_barrier(entry.ptr));
                     // Call boundaries use the coarser predicate — same fix
                     // as LocalLsf / GlobalLsf.  A callee that receives a
                     // pointer into an allocation can walk to any offset
@@ -217,6 +222,39 @@ mod tests {
             .collect();
         assert_eq!(stores.len(), 1);
         assert!(matches!(stores[0].kind, InstKind::Store(v, _) if v == v2));
+    }
+
+    #[test]
+    fn does_not_remove_global_store_across_unrelated_pointer_call() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let global = push(&mut f, InstKind::GlobalAddr("state".into()), ptr_ty());
+        let scratch = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, global), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("observe_global".into()), vec![scratch]),
+            IrType::Void,
+        );
+        push(&mut f, InstKind::Store(v2, global), IrType::Void);
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(
+            !Dse.run(&mut m),
+            "DSE must preserve a global store observable by an intervening call"
+        );
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
     }
 
     /// store then load: first store is live (must not be removed).

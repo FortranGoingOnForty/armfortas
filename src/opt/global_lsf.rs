@@ -199,6 +199,11 @@ fn memory_effect(
             AliasResult::NoAlias => MemoryEffect::NoAlias,
         },
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+            // A callee may access module/global state without receiving its
+            // address as an argument.
+            if alias_oracle.requires_global_call_barrier(load_ptr) {
+                return MemoryEffect::Clobbered;
+            }
             // Call boundaries use the coarser may_reach_through_call_arg
             // predicate: a callee that gets a pointer can walk to any
             // offset within the same allocation, so a precise
@@ -406,6 +411,76 @@ mod tests {
         assert!(
             matches!(term, Terminator::Return(Some(v)) if v == value),
             "return should use the stored value after forwarding"
+        );
+    }
+
+    #[test]
+    fn does_not_forward_global_store_across_unrelated_pointer_call() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+        let load_block = f.create_block("load");
+
+        let global = f.next_value_id();
+        f.register_type(global, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: global,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span,
+            kind: InstKind::GlobalAddr("state".into()),
+        });
+        let scratch = f.next_value_id();
+        f.register_type(scratch, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: scratch,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span,
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+        });
+        let value = f.next_value_id();
+        f.register_type(value, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: value,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(42, IntWidth::I32),
+        });
+        let store = f.next_value_id();
+        f.register_type(store, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(value, global),
+        });
+        let call = f.next_value_id();
+        f.register_type(call, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: call,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Call(FuncRef::External("touch_global".into()), vec![scratch]),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(load_block, vec![]));
+
+        let load = f.next_value_id();
+        f.register_type(load, IrType::Int(IntWidth::I32));
+        f.block_mut(load_block).insts.push(Inst {
+            id: load,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::Load(global),
+        });
+        f.block_mut(load_block).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(
+            !GlobalLsf.run(&mut m),
+            "global LSF must treat every call as a barrier for global memory"
         );
     }
 

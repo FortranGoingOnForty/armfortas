@@ -164,7 +164,7 @@ pub(crate) fn alloc_decls(
                     matches!(effective_char_len, Some(crate::ast::decl::LenSpec::Colon));
 
                 if is_pointer_attr && array_spec.is_some() {
-                    // Pointer to array.  Reuses the 384-byte array
+                    // Pointer to array.  Reuses the 392-byte array
                     // descriptor layout that allocatables use: the
                     // pointer slot carries base_addr, elem_size,
                     // rank, flags, and per-dim bounds so that
@@ -184,13 +184,13 @@ pub(crate) fn alloc_decls(
                     // scope-exit deallocation to suppress the
                     // afs_deallocate_array call — a pointer does
                     // not own its target.
-                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                     let addr = b.alloca(desc_ty);
                     let zero_byte = b.const_i32(0);
-                    let size384 = b.const_i64(384);
+                    let descriptor_bytes = b.const_i64(392);
                     b.call(
                         FuncRef::External("memset".into()),
-                        vec![addr, zero_byte, size384],
+                        vec![addr, zero_byte, descriptor_bytes],
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
                     // dims is left empty for a deferred-shape pointer;
@@ -281,13 +281,13 @@ pub(crate) fn alloc_decls(
                     && matches!(type_spec, TypeSpec::Class(_) | TypeSpec::ClassStar)
                     && array_spec.is_none()
                 {
-                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                     let addr = b.alloca(desc_ty);
                     let zero = b.const_i32(0);
-                    let size384 = b.const_i64(384);
+                    let descriptor_bytes = b.const_i64(392);
                     b.call(
                         FuncRef::External("memset".into()),
-                        vec![addr, zero, size384],
+                        vec![addr, zero, descriptor_bytes],
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
                     locals.insert(
@@ -377,13 +377,13 @@ pub(crate) fn alloc_decls(
                             (elem_ty.clone(), None, CharKind::None)
                         };
 
-                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                         let addr = b.alloca(desc_ty);
                         let zero = b.const_i32(0);
-                        let size384 = b.const_i64(384);
+                        let descriptor_bytes = b.const_i64(392);
                         b.call(
                             FuncRef::External("memset".into()),
-                            vec![addr, zero, size384],
+                            vec![addr, zero, descriptor_bytes],
                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         );
 
@@ -552,13 +552,13 @@ pub(crate) fn alloc_decls(
                         const STACK_THRESHOLD: i64 = 64 * 1024;
 
                         if total_bytes >= STACK_THRESHOLD {
-                            let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                            let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                             let addr = b.alloca(desc_ty);
                             let zero = b.const_i32(0);
-                            let size384 = b.const_i64(384);
+                            let descriptor_bytes = b.const_i64(392);
                             b.call(
                                 FuncRef::External("memset".into()),
-                                vec![addr, zero, size384],
+                                vec![addr, zero, descriptor_bytes],
                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             );
                             let es = b.const_i64(elem_bytes);
@@ -831,12 +831,12 @@ pub(crate) fn alloc_decls(
                 }
 
                 if is_allocatable {
-                    // Allocatable variable: alloca a descriptor (384 bytes), zero-initialized.
-                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                    // Allocatable variable: alloca a descriptor (392 bytes), zero-initialized.
+                    let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                     let addr = b.alloca(desc_ty);
                     // Zero-initialize the descriptor so flags=0 (not allocated).
                     let zero = b.const_i32(0);
-                    let size = b.const_i64(384);
+                    let size = b.const_i64(392);
                     b.call(
                         FuncRef::External("memset".into()),
                         vec![addr, zero, size],
@@ -906,13 +906,13 @@ pub(crate) fn alloc_decls(
                             let len_addr = b.alloca(IrType::Int(IntWidth::I64));
                             b.store(len_val, len_addr);
 
-                            let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                            let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                             let addr = b.alloca(desc_ty);
                             let zero = b.const_i32(0);
-                            let size384 = b.const_i64(384);
+                            let descriptor_bytes = b.const_i64(392);
                             b.call(
                                 FuncRef::External("memset".into()),
-                                vec![addr, zero, size384],
+                                vec![addr, zero, descriptor_bytes],
                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             );
 
@@ -985,13 +985,13 @@ pub(crate) fn alloc_decls(
 
                     if total_bytes >= STACK_THRESHOLD {
                         // Large array: use descriptor + heap allocation (prevents stack overflow).
-                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+                        let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
                         let addr = b.alloca(desc_ty);
                         let zero = b.const_i32(0);
-                        let size384 = b.const_i64(384);
+                        let descriptor_bytes = b.const_i64(392);
                         b.call(
                             FuncRef::External("memset".into()),
-                            vec![addr, zero, size384],
+                            vec![addr, zero, descriptor_bytes],
                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         );
                         // Auto-allocate with the declared shape.

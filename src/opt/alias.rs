@@ -178,6 +178,13 @@ impl<'a> AliasOracle<'a> {
         matches!(self.func.value_type(value), Some(IrType::Ptr(_)))
     }
 
+    /// Arbitrary calls can read or write globals without receiving their
+    /// addresses as arguments. Unknown pointer provenance requires the same
+    /// conservative barrier.
+    pub fn requires_global_call_barrier(&mut self, ptr: ValueId) -> bool {
+        matches!(self.trace_base(ptr), PtrBase::Global(_) | PtrBase::Unknown)
+    }
+
     fn pointer_points_to_aggregate(&mut self, ptr: ValueId) -> bool {
         if let Some(points_to_aggregate) = self.aggregate_cache.get(&ptr) {
             return *points_to_aggregate;
@@ -432,14 +439,14 @@ mod tests {
     #[test]
     fn mixed_width_geps_same_index_do_not_must_alias() {
         let mut f = Function::new("test".into(), vec![], IrType::Void);
-        let base_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384);
+        let base_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
         let base = f.next_value_id();
         f.register_type(base, IrType::Ptr(Box::new(base_ty.clone())));
         f.block_mut(f.entry).insts.push(Inst {
             id: base,
             ty: IrType::Ptr(Box::new(base_ty)),
             span: span(),
-            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 384)),
+            kind: InstKind::Alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392)),
         });
 
         let four = f.next_value_id();

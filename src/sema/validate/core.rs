@@ -17,7 +17,7 @@ use super::pure_elemental::{
     validate_pure_call,
 };
 use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeAttr, TypeSpec};
-use crate::ast::expr::Expr;
+use crate::ast::expr::{Expr, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
 use crate::lexer::Span;
@@ -137,6 +137,13 @@ pub(super) struct Ctx<'a> {
     /// working byte-copy lowering; only the Fortran-internal character
     /// VALUE path lacks copy-in.
     pub(super) in_bind_c_unit: bool,
+    /// Host scopes whose storage must not be captured by the procedure
+    /// currently being validated because it is reachable from a local
+    /// FINAL binding and may be invoked after those scopes return.
+    finalizer_capture_host_scopes: HashSet<ScopeId>,
+    /// Avoid repeating one unsupported-capture diagnostic for every use
+    /// of the same host entity in a finalizer or one of its helpers.
+    reported_finalizer_captures: HashSet<(ScopeId, ScopeId, String)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -173,6 +180,8 @@ impl<'a> Ctx<'a> {
             in_call_arg: false,
             allow_array_cond_rhs: false,
             in_bind_c_unit: false,
+            finalizer_capture_host_scopes: HashSet::new(),
+            reported_finalizer_captures: HashSet::new(),
         }
     }
 
@@ -272,7 +281,14 @@ pub fn validate_file_with_warning_groups(
     warn_pedantic: bool,
     warn_deprecated: bool,
 ) -> Vec<Diagnostic> {
-    let mut ctx = Ctx::new(st, std, warn_pedantic, warn_deprecated);
+    let mut type_layouts = crate::sema::type_layout::TypeLayoutRegistry::new();
+    crate::sema::resolve::compute_all_layouts(
+        crate::target::TargetLayout::LP64,
+        units,
+        st,
+        &mut type_layouts,
+    );
+    let mut ctx = Ctx::new_with_layouts(st, std, &type_layouts, warn_pedantic, warn_deprecated);
     for unit in units {
         validate_unit(&mut ctx, unit);
     }
@@ -2052,11 +2068,804 @@ fn find_scope_for_unit(
         .map(|s| s.id)
 }
 
+#[derive(Default)]
+struct ProcedureReferenceFacts {
+    references: Vec<(String, Span)>,
+    calls: HashSet<String>,
+}
+
+fn collect_reference_subscript(
+    subscript: &crate::ast::expr::SectionSubscript,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match subscript {
+        crate::ast::expr::SectionSubscript::Element(expr) => {
+            collect_reference_expr(expr, shadowed, facts);
+        }
+        crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+            for expr in [start, end, stride].into_iter().flatten() {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+        }
+    }
+}
+
+fn collect_reference_ac_value(
+    value: &crate::ast::expr::AcValue,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match value {
+        crate::ast::expr::AcValue::Expr(expr) => collect_reference_expr(expr, shadowed, facts),
+        crate::ast::expr::AcValue::ImpliedDo(loop_) => {
+            collect_reference_expr(&loop_.start, shadowed, facts);
+            collect_reference_expr(&loop_.end, shadowed, facts);
+            if let Some(step) = &loop_.step {
+                collect_reference_expr(step, shadowed, facts);
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.insert(loop_.var.to_lowercase());
+            for nested in &loop_.values {
+                collect_reference_ac_value(nested, &nested_shadowed, facts);
+            }
+        }
+    }
+}
+
+fn collect_reference_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if !shadowed.contains(&key) {
+                facts.references.push((key, expr.span));
+            }
+        }
+        Expr::UnaryOp { operand, .. } => collect_reference_expr(operand, shadowed, facts),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_reference_expr(left, shadowed, facts);
+            collect_reference_expr(right, shadowed, facts);
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            collect_reference_expr(real, shadowed, facts);
+            collect_reference_expr(imag, shadowed, facts);
+        }
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if !shadowed.contains(&key) {
+                    facts.calls.insert(key);
+                }
+            }
+            collect_reference_expr(callee, shadowed, facts);
+            for arg in args {
+                collect_reference_subscript(&arg.value, shadowed, facts);
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                collect_reference_ac_value(value, shadowed, facts);
+            }
+        }
+        Expr::ComponentAccess { base, .. } => collect_reference_expr(base, shadowed, facts),
+        Expr::ParenExpr { inner } => collect_reference_expr(inner, shadowed, facts),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_reference_expr(cond, shadowed, facts);
+            collect_reference_expr(then_val, shadowed, facts);
+            collect_reference_expr(else_val, shadowed, facts);
+        }
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::NilArgument => {}
+    }
+}
+
+fn collect_reference_array_spec(
+    spec: &crate::ast::decl::ArraySpec,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match spec {
+        crate::ast::decl::ArraySpec::Explicit { lower, upper } => {
+            if let Some(lower) = lower {
+                collect_reference_expr(lower, shadowed, facts);
+            }
+            collect_reference_expr(upper, shadowed, facts);
+        }
+        crate::ast::decl::ArraySpec::AssumedShape { lower }
+        | crate::ast::decl::ArraySpec::AssumedSize { lower } => {
+            if let Some(lower) = lower {
+                collect_reference_expr(lower, shadowed, facts);
+            }
+        }
+        crate::ast::decl::ArraySpec::Deferred | crate::ast::decl::ArraySpec::AssumedRank => {}
+    }
+}
+
+fn collect_reference_type_spec(
+    type_spec: &TypeSpec,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match type_spec {
+        TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Integer(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Real(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Real(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Complex(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Complex(Some(crate::ast::decl::KindSelector::Star(expr)))
+        | TypeSpec::Logical(Some(crate::ast::decl::KindSelector::Expr(expr)))
+        | TypeSpec::Logical(Some(crate::ast::decl::KindSelector::Star(expr))) => {
+            collect_reference_expr(expr, shadowed, facts);
+        }
+        TypeSpec::Character(Some(selector)) => {
+            if let Some(crate::ast::decl::LenSpec::Expr(expr)) = &selector.len {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+            if let Some(kind) = &selector.kind {
+                collect_reference_expr(kind, shadowed, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_reference_decl(
+    decl: &SpannedDecl,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match &decl.node {
+        Decl::TypeDecl {
+            type_spec,
+            attrs,
+            entities,
+        } => {
+            collect_reference_type_spec(type_spec, shadowed, facts);
+            for attr in attrs {
+                if let Attribute::Dimension(specs) = attr {
+                    for spec in specs {
+                        collect_reference_array_spec(spec, shadowed, facts);
+                    }
+                }
+            }
+            for entity in entities {
+                if let Some(specs) = &entity.array_spec {
+                    for spec in specs {
+                        collect_reference_array_spec(spec, shadowed, facts);
+                    }
+                }
+                if let Some(crate::ast::decl::LenSpec::Expr(expr)) = &entity.char_len {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+                if let Some(init) = &entity.init {
+                    collect_reference_expr(init, shadowed, facts);
+                }
+                if let Some(init) = &entity.ptr_init {
+                    collect_reference_expr(init, shadowed, facts);
+                }
+            }
+        }
+        Decl::ParameterStmt { pairs } => {
+            for (_, expr) in pairs {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+        }
+        Decl::EquivalenceStmt { groups } => {
+            for expr in groups.iter().flatten() {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+        }
+        Decl::DataStmt { sets } => {
+            for set in sets {
+                for expr in &set.objects {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+                for value in &set.values {
+                    match value {
+                        crate::ast::decl::DataValue::Expr(expr) => {
+                            collect_reference_expr(expr, shadowed, facts);
+                        }
+                        crate::ast::decl::DataValue::Repeat { count, value } => {
+                            collect_reference_expr(count, shadowed, facts);
+                            collect_reference_expr(value, shadowed, facts);
+                        }
+                    }
+                }
+            }
+        }
+        Decl::EnumDef { enumerators, .. } => {
+            for (_, expr) in enumerators {
+                if let Some(expr) = expr {
+                    collect_reference_expr(expr, shadowed, facts);
+                }
+            }
+        }
+        Decl::DerivedTypeDef { components, .. } => {
+            for component in components {
+                collect_reference_decl(component, shadowed, facts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>) {
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                out.extend(entities.iter().map(|entity| entity.name.to_lowercase()));
+            }
+            Decl::ParameterStmt { pairs } => {
+                out.extend(pairs.iter().map(|(name, _)| name.to_lowercase()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_block_use_names(uses: &[SpannedDecl], out: &mut HashSet<String>) {
+    for use_stmt in uses {
+        let Decl::UseStmt { renames, only, .. } = &use_stmt.node else {
+            continue;
+        };
+        out.extend(renames.iter().map(|rename| rename.local.to_lowercase()));
+        if let Some(items) = only {
+            for item in items {
+                match item {
+                    crate::ast::decl::OnlyItem::Name(name)
+                    | crate::ast::decl::OnlyItem::Generic(name) => {
+                        out.insert(name.to_lowercase());
+                    }
+                    crate::ast::decl::OnlyItem::Rename(rename) => {
+                        out.insert(rename.local.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_reference_stmt(
+    stmt: &SpannedStmt,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    match &stmt.node {
+        Stmt::Assignment { target, value } | Stmt::PointerAssignment { target, value } => {
+            collect_reference_expr(target, shadowed, facts);
+            collect_reference_expr(value, shadowed, facts);
+        }
+        Stmt::IfConstruct {
+            condition,
+            then_body,
+            else_ifs,
+            else_body,
+            ..
+        } => {
+            collect_reference_expr(condition, shadowed, facts);
+            collect_reference_stmts(then_body, shadowed, facts);
+            for (condition, body) in else_ifs {
+                collect_reference_expr(condition, shadowed, facts);
+                collect_reference_stmts(body, shadowed, facts);
+            }
+            if let Some(body) = else_body {
+                collect_reference_stmts(body, shadowed, facts);
+            }
+        }
+        Stmt::IfStmt { condition, action } => {
+            collect_reference_expr(condition, shadowed, facts);
+            collect_reference_stmt(action, shadowed, facts);
+        }
+        Stmt::DoLoop {
+            var,
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(var) = var {
+                let key = var.to_lowercase();
+                if !shadowed.contains(&key) {
+                    facts.references.push((key, stmt.span));
+                }
+            }
+            for expr in [start, end, step].into_iter().flatten() {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+            collect_reference_stmts(body, shadowed, facts);
+        }
+        Stmt::DoWhile {
+            condition, body, ..
+        } => {
+            collect_reference_expr(condition, shadowed, facts);
+            collect_reference_stmts(body, shadowed, facts);
+        }
+        Stmt::DoConcurrent {
+            controls,
+            mask,
+            locality,
+            body,
+            ..
+        } => {
+            for control in controls {
+                collect_reference_expr(&control.start, shadowed, facts);
+                collect_reference_expr(&control.end, shadowed, facts);
+                if let Some(step) = &control.step {
+                    collect_reference_expr(step, shadowed, facts);
+                }
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(controls.iter().map(|control| control.var.to_lowercase()));
+            for spec in locality {
+                match spec {
+                    LocalitySpec::Local(names) => {
+                        nested_shadowed.extend(names.iter().map(|name| name.to_lowercase()));
+                    }
+                    LocalitySpec::LocalInit(names) | LocalitySpec::Reduce { vars: names, .. } => {
+                        for name in names {
+                            let key = name.to_lowercase();
+                            if !shadowed.contains(&key) {
+                                facts.references.push((key.clone(), stmt.span));
+                            }
+                            nested_shadowed.insert(key);
+                        }
+                    }
+                    LocalitySpec::Shared(names) => {
+                        for name in names {
+                            let key = name.to_lowercase();
+                            if !shadowed.contains(&key) {
+                                facts.references.push((key, stmt.span));
+                            }
+                        }
+                    }
+                    LocalitySpec::DefaultNone => {}
+                }
+            }
+            if let Some(mask) = mask {
+                collect_reference_expr(mask, &nested_shadowed, facts);
+            }
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::SelectCase {
+            selector, cases, ..
+        } => {
+            collect_reference_expr(selector, shadowed, facts);
+            for case in cases {
+                for selector in &case.selectors {
+                    match selector {
+                        CaseSelector::Value(expr) => {
+                            collect_reference_expr(expr, shadowed, facts);
+                        }
+                        CaseSelector::Range { low, high } => {
+                            for expr in [low, high].into_iter().flatten() {
+                                collect_reference_expr(expr, shadowed, facts);
+                            }
+                        }
+                        CaseSelector::Default => {}
+                    }
+                }
+                collect_reference_stmts(&case.body, shadowed, facts);
+            }
+        }
+        Stmt::SelectType {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            collect_reference_expr(selector, shadowed, facts);
+            let mut nested_shadowed = shadowed.clone();
+            if let Some(name) = assoc_name {
+                nested_shadowed.insert(name.to_lowercase());
+            }
+            for guard in guards {
+                let body = match guard {
+                    TypeGuard::TypeIs { body, .. }
+                    | TypeGuard::ClassIs { body, .. }
+                    | TypeGuard::ClassDefault { body } => body,
+                };
+                collect_reference_stmts(body, &nested_shadowed, facts);
+            }
+        }
+        Stmt::SelectRank {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            collect_reference_expr(selector, shadowed, facts);
+            let mut nested_shadowed = shadowed.clone();
+            if let Some(name) = assoc_name {
+                nested_shadowed.insert(name.to_lowercase());
+            }
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                collect_reference_stmts(body, &nested_shadowed, facts);
+            }
+        }
+        Stmt::WhereConstruct {
+            mask,
+            body,
+            elsewhere,
+            ..
+        } => {
+            collect_reference_expr(mask, shadowed, facts);
+            collect_reference_stmts(body, shadowed, facts);
+            for (mask, body) in elsewhere {
+                if let Some(mask) = mask {
+                    collect_reference_expr(mask, shadowed, facts);
+                }
+                collect_reference_stmts(body, shadowed, facts);
+            }
+        }
+        Stmt::WhereStmt { mask, stmt } => {
+            collect_reference_expr(mask, shadowed, facts);
+            collect_reference_stmt(stmt, shadowed, facts);
+        }
+        Stmt::ForallConstruct {
+            specs, mask, body, ..
+        } => {
+            for spec in specs {
+                collect_reference_expr(&spec.start, shadowed, facts);
+                collect_reference_expr(&spec.end, shadowed, facts);
+                if let Some(step) = &spec.step {
+                    collect_reference_expr(step, shadowed, facts);
+                }
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+            if let Some(mask) = mask {
+                collect_reference_expr(mask, &nested_shadowed, facts);
+            }
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::ForallStmt { specs, mask, stmt } => {
+            for spec in specs {
+                collect_reference_expr(&spec.start, shadowed, facts);
+                collect_reference_expr(&spec.end, shadowed, facts);
+                if let Some(step) = &spec.step {
+                    collect_reference_expr(step, shadowed, facts);
+                }
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+            if let Some(mask) = mask {
+                collect_reference_expr(mask, &nested_shadowed, facts);
+            }
+            collect_reference_stmt(stmt, &nested_shadowed, facts);
+        }
+        Stmt::Block {
+            uses,
+            implicit,
+            decls,
+            body,
+            ..
+        } => {
+            let mut nested_shadowed = shadowed.clone();
+            collect_block_use_names(uses, &mut nested_shadowed);
+            collect_block_binding_names(decls, &mut nested_shadowed);
+            for decl in uses.iter().chain(implicit).chain(decls) {
+                collect_reference_decl(decl, &nested_shadowed, facts);
+            }
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::Associate { assocs, body, .. } => {
+            for (_, expr) in assocs {
+                collect_reference_expr(expr, shadowed, facts);
+            }
+            let mut nested_shadowed = shadowed.clone();
+            nested_shadowed.extend(assocs.iter().map(|(name, _)| name.to_lowercase()));
+            collect_reference_stmts(body, &nested_shadowed, facts);
+        }
+        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+            if let Some(code) = code {
+                collect_reference_expr(code, shadowed, facts);
+            }
+        }
+        Stmt::ComputedGoto { selector, .. } | Stmt::ArithmeticIf { expr: selector, .. } => {
+            collect_reference_expr(selector, shadowed, facts);
+        }
+        Stmt::Labeled { stmt, .. } => collect_reference_stmt(stmt, shadowed, facts),
+        Stmt::Write { controls, items }
+        | Stmt::Read { controls, items }
+        | Stmt::Inquire {
+            specs: controls,
+            items,
+        } => {
+            for control in controls {
+                collect_reference_expr(&control.value, shadowed, facts);
+            }
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+        }
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => {
+            for spec in specs {
+                collect_reference_expr(&spec.value, shadowed, facts);
+            }
+        }
+        Stmt::Allocate {
+            type_spec,
+            items,
+            opts,
+        } => {
+            if let Some(type_spec) = type_spec {
+                collect_reference_type_spec(type_spec, shadowed, facts);
+            }
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+            for opt in opts {
+                collect_reference_expr(&opt.value, shadowed, facts);
+            }
+        }
+        Stmt::Deallocate { items, opts } => {
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+            for opt in opts {
+                collect_reference_expr(&opt.value, shadowed, facts);
+            }
+        }
+        Stmt::Nullify { items } => {
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+        }
+        Stmt::Call { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if !shadowed.contains(&key) {
+                    facts.calls.insert(key);
+                }
+            }
+            collect_reference_expr(callee, shadowed, facts);
+            for arg in args {
+                collect_reference_subscript(&arg.value, shadowed, facts);
+            }
+        }
+        Stmt::Print { format, items } => {
+            collect_reference_expr(format, shadowed, facts);
+            for item in items {
+                collect_reference_expr(item, shadowed, facts);
+            }
+        }
+        Stmt::Namelist { groups } => {
+            for (_, names) in groups {
+                for name in names {
+                    let key = name.to_lowercase();
+                    if !shadowed.contains(&key) {
+                        facts.references.push((key, stmt.span));
+                    }
+                }
+            }
+        }
+        Stmt::Declaration(decl) => collect_reference_decl(decl, shadowed, facts),
+        Stmt::Exit { .. }
+        | Stmt::Cycle { .. }
+        | Stmt::Goto { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Format { .. } => {}
+    }
+}
+
+fn collect_reference_stmts(
+    stmts: &[SpannedStmt],
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    for stmt in stmts {
+        collect_reference_stmt(stmt, shadowed, facts);
+    }
+}
+
+fn procedure_reference_facts(unit: &ProgramUnit) -> ProcedureReferenceFacts {
+    let (decls, body) = match unit {
+        ProgramUnit::Program { decls, body, .. }
+        | ProgramUnit::Subroutine { decls, body, .. }
+        | ProgramUnit::Function { decls, body, .. } => (decls.as_slice(), body.as_slice()),
+        _ => return ProcedureReferenceFacts::default(),
+    };
+    let shadowed = HashSet::new();
+    let mut facts = ProcedureReferenceFacts::default();
+    for decl in decls {
+        collect_reference_decl(decl, &shadowed, &mut facts);
+    }
+    collect_reference_stmts(body, &shadowed, &mut facts);
+    facts
+}
+
+fn contained_unit_name(unit: &ProgramUnit) -> Option<String> {
+    match unit {
+        ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } => {
+            Some(name.to_lowercase())
+        }
+        _ => None,
+    }
+}
+
+fn procedure_host_scopes(st: &SymbolTable, owner_scope: ScopeId) -> HashSet<ScopeId> {
+    let mut scopes = HashSet::new();
+    let mut current = Some(owner_scope);
+    while let Some(scope_id) = current {
+        let scope = st.scope(scope_id);
+        match scope.kind {
+            ScopeKind::Program(_) | ScopeKind::Subroutine(_) | ScopeKind::Function(_) => {
+                scopes.insert(scope_id);
+            }
+            ScopeKind::Global | ScopeKind::Module(_) | ScopeKind::Submodule(_) => break,
+            _ => {}
+        }
+        current = scope.parent;
+    }
+    scopes
+}
+
+fn resolved_contained_calls(
+    ctx: &Ctx<'_>,
+    unit: &ProgramUnit,
+    caller_scope: ScopeId,
+    owner_scope: ScopeId,
+    child_names: &HashSet<String>,
+) -> HashSet<String> {
+    procedure_reference_facts(unit)
+        .calls
+        .into_iter()
+        .filter(|callee| {
+            child_names.contains(callee)
+                && ctx
+                    .st
+                    .lookup_in(caller_scope, callee)
+                    .is_some_and(|symbol| {
+                        symbol.scope == owner_scope
+                            && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                    })
+        })
+        .collect()
+}
+
+fn validate_finalizer_capture_references(ctx: &mut Ctx<'_>, unit: &ProgramUnit) {
+    if ctx.finalizer_capture_host_scopes.is_empty() {
+        return;
+    }
+    let facts = procedure_reference_facts(unit);
+    for (name, span) in facts.references {
+        let Some(symbol) = ctx.st.lookup_in(ctx.scope_id, &name) else {
+            continue;
+        };
+        let Some(host_scope) = ctx
+            .finalizer_capture_host_scopes
+            .iter()
+            .copied()
+            .find(|host_scope| symbol.scope == *host_scope)
+        else {
+            continue;
+        };
+        let requires_host_storage = matches!(
+            symbol.kind,
+            SymbolKind::Variable | SymbolKind::ProcedurePointer
+        ) || (matches!(symbol.kind, SymbolKind::Parameter)
+            && !symbol.attrs.array_spec.is_empty());
+        if !requires_host_storage {
+            continue;
+        }
+        let key = (ctx.scope_id, host_scope, name.clone());
+        if ctx.reported_finalizer_captures.insert(key) {
+            ctx.error(
+                span,
+                format!(
+                    "local FINAL procedure cannot reference host entity '{}': deferred finalization cannot preserve procedure host associations; move the state to module storage",
+                    name
+                ),
+            );
+        }
+    }
+}
+
+fn validate_contained_units(ctx: &mut Ctx<'_>, host: &ProgramUnit, contains: &[SpannedUnit]) {
+    if contains.is_empty() {
+        return;
+    }
+
+    let child_names: HashSet<String> = contains
+        .iter()
+        .filter_map(|unit| contained_unit_name(&unit.node))
+        .collect();
+    let mut child_scopes: HashMap<String, HashSet<ScopeId>> = HashMap::new();
+
+    if let Some(layouts) = ctx.type_layouts {
+        for layout in layouts.iter_layouts().filter(|layout| {
+            layout.owner_module.is_none() && layout.owner_scope == Some(ctx.scope_id)
+        }) {
+            for final_proc in &layout.final_procs {
+                let name = final_proc.name.to_lowercase();
+                if child_names.contains(&name) {
+                    child_scopes
+                        .entry(name)
+                        .or_default()
+                        .extend(procedure_host_scopes(ctx.st, ctx.scope_id));
+                }
+            }
+        }
+    }
+
+    if !ctx.finalizer_capture_host_scopes.is_empty() {
+        for callee in resolved_contained_calls(ctx, host, ctx.scope_id, ctx.scope_id, &child_names)
+        {
+            child_scopes
+                .entry(callee)
+                .or_default()
+                .extend(ctx.finalizer_capture_host_scopes.iter().copied());
+        }
+    }
+
+    let call_graph: HashMap<String, HashSet<String>> = contains
+        .iter()
+        .filter_map(|unit| {
+            let name = contained_unit_name(&unit.node)?;
+            let caller_scope = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id)?;
+            let calls =
+                resolved_contained_calls(ctx, &unit.node, caller_scope, ctx.scope_id, &child_names);
+            Some((name, calls))
+        })
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for (caller, callees) in &call_graph {
+            let Some(scopes) = child_scopes.get(caller).cloned() else {
+                continue;
+            };
+            for callee in callees {
+                let target = child_scopes.entry(callee.clone()).or_default();
+                let before = target.len();
+                target.extend(scopes.iter().copied());
+                changed |= target.len() != before;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let inherited = std::mem::take(&mut ctx.finalizer_capture_host_scopes);
+    for unit in contains {
+        let name = contained_unit_name(&unit.node).unwrap_or_default();
+        ctx.finalizer_capture_host_scopes = child_scopes.remove(&name).unwrap_or_default();
+        validate_unit(ctx, unit);
+    }
+    ctx.finalizer_capture_host_scopes = inherited;
+}
+
 fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
     let saved_scope = ctx.scope_id;
     if let Some(scope_id) = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id) {
         ctx.scope_id = scope_id;
     }
+    validate_finalizer_capture_references(ctx, &unit.node);
 
     match &unit.node {
         ProgramUnit::Program {
@@ -2086,9 +2895,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
         }
         ProgramUnit::Module {
             uses,
@@ -2107,9 +2914,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 }
             }
             validate_decls(ctx, decls);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
         }
         ProgramUnit::Subroutine {
             name,
@@ -2187,9 +2992,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
@@ -2336,9 +3139,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
@@ -2374,9 +3175,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
             }
             validate_decls(ctx, decls);
-            for sub in contains {
-                validate_unit(ctx, sub);
-            }
+            validate_contained_units(ctx, &unit.node, contains);
         }
         ProgramUnit::BlockData { decls, .. } => {
             warn_legacy_feature(ctx, unit.span, "BLOCK DATA");
@@ -2728,6 +3527,40 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 components,
                 decl.span,
             );
+            let has_inline_cycle = ctx.type_layouts.is_some_and(|layouts| {
+                layouts
+                    .get_for_scope(ctx.scope_id, name)
+                    .or_else(|| layouts.get(name))
+                    .is_some_and(|layout| layouts.has_inline_storage_cycle(layout))
+            });
+            if has_inline_cycle {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "derived type '{}' has a recursive component that requires infinite inline storage; make the recursive component POINTER or ALLOCATABLE",
+                        name
+                    ),
+                );
+            } else if ctx
+                .type_layouts
+                .and_then(|layouts| {
+                    let layout = layouts
+                        .get_for_scope(ctx.scope_id, name)
+                        .or_else(|| layouts.get(name))?;
+                    layouts
+                        .deallocation_has_ownerless_finalizer(layout)
+                        .then_some(())
+                })
+                .is_some()
+            {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "locally declared derived type '{}' combines allocatable ownership with a local FINAL binding that generated cleanup cannot call; move the type declaration and its FINAL procedures to module scope",
+                        name
+                    ),
+                );
+            }
         }
     }
 }
@@ -2752,6 +3585,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             if ctx.in_pure {
                 check_pure_expr_calls(ctx, value);
             }
+            if polymorphic_allocatable_target(ctx, target)
+                && !assignment_uses_defined_assignment(ctx, target, value)
+            {
+                let unsupported_type = unsupported_polymorphic_ownership_from_expr(ctx, value);
+                if let Some(type_name) = unsupported_type {
+                    reject_context_dependent_polymorphic_ownership(ctx, value.span, &type_name);
+                }
+            }
         }
         Stmt::PointerAssignment { target, value, .. } => {
             // F2023 10.2.2.2 bounds remapping from an array constructor
@@ -2761,7 +3602,11 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
 
         // ---- Allocate / Deallocate ----
-        Stmt::Allocate { items, opts, .. } => {
+        Stmt::Allocate {
+            type_spec,
+            items,
+            opts,
+        } => {
             let has_source = opts.iter().any(|opt| {
                 opt.keyword
                     .as_deref()
@@ -2785,6 +3630,13 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 validate_allocatable_item(ctx, item, "allocate");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
+                }
+                if polymorphic_allocate_target(ctx, item) {
+                    let unsupported_type =
+                        unsupported_allocate_dynamic_type(ctx, type_spec.as_ref(), opts, item);
+                    if let Some(type_name) = unsupported_type {
+                        reject_context_dependent_polymorphic_ownership(ctx, item.span, &type_name);
+                    }
                 }
                 // F2023 R936-R937: one array constructor may supply all
                 // bounds (`allocate(x([2, 3]))`); lowered via
@@ -2936,8 +3788,13 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         // Call in pure: callee must be pure (we check if it's known impure).
         Stmt::Call { callee, args, .. } => {
             if let Expr::Name { name } = &callee.node {
-                if name.eq_ignore_ascii_case("move_alloc") {
+                let intrinsic_move_alloc = name.eq_ignore_ascii_case("move_alloc")
+                    && ctx.lookup(name).is_none_or(|symbol| {
+                        symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc)
+                    });
+                if intrinsic_move_alloc {
                     ctx.require_std(stmt.span, FortranStandard::F2003, "MOVE_ALLOC");
+                    validate_move_alloc_polymorphic_ownership(ctx, args);
                 }
                 if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
                     validate_system_clock_args(ctx, args, stmt.span);
@@ -3124,10 +3981,453 @@ fn derived_type_name_for_expr(
             .and_then(|sym| sym.type_info.as_ref())
             .and_then(derived_type_name_from_type_info),
         Expr::ParenExpr { inner } => derived_type_name_for_expr(ctx, inner),
-        Expr::FunctionCall { callee, .. } => derived_type_name_for_expr(ctx, callee),
+        Expr::FunctionCall { callee, .. } => {
+            let Expr::Name { name } = &callee.node else {
+                return derived_type_name_for_expr(ctx, callee);
+            };
+            let symbol = ctx.lookup(name)?;
+            if matches!(symbol.kind, SymbolKind::DerivedType) {
+                Some(symbol.name.clone())
+            } else {
+                symbol
+                    .type_info
+                    .as_ref()
+                    .and_then(derived_type_name_from_type_info)
+            }
+        }
         Expr::ComponentAccess { .. } => resolve_component_access_type(ctx, expr).ok().flatten(),
         _ => None,
     }
+}
+
+fn fortran_type_to_validation_type_info(
+    type_: crate::sema::types::FortranType,
+) -> Option<TypeInfo> {
+    use crate::sema::types::{CharLen, FortranType};
+    match type_ {
+        FortranType::Integer { kind } => Some(TypeInfo::Integer { kind: Some(kind) }),
+        FortranType::Real { kind } => Some(TypeInfo::Real { kind: Some(kind) }),
+        FortranType::Complex { kind } => Some(TypeInfo::Complex { kind: Some(kind) }),
+        FortranType::Logical { kind } => Some(TypeInfo::Logical { kind: Some(kind) }),
+        FortranType::Character { kind, len } => Some(TypeInfo::Character {
+            len: match len {
+                CharLen::Known(len) => Some(len),
+                CharLen::Assumed | CharLen::Deferred | CharLen::Unknown => None,
+            },
+            kind: Some(kind),
+        }),
+        FortranType::Derived { name } => Some(TypeInfo::Derived(name)),
+        FortranType::Enumeration { name } => Some(TypeInfo::Enumeration(name)),
+        FortranType::ClassOf { base } => Some(TypeInfo::Class(base)),
+        FortranType::UnlimitedPoly => Some(TypeInfo::ClassStar),
+        FortranType::AssumedType => Some(TypeInfo::TypeStar),
+        FortranType::Void | FortranType::Unknown => None,
+    }
+}
+
+fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
+    if expr_selects_component(expr) {
+        if let Some(leaf) = leaf_field_layout(ctx, expr) {
+            return Some(leaf.field.type_info.clone());
+        }
+    }
+    let resolved = match &expr.node {
+        Expr::Name { name } => ctx.lookup(name).and_then(|symbol| symbol.type_info.clone()),
+        Expr::ParenExpr { inner } => validation_expr_type_info(ctx, inner),
+        Expr::FunctionCall { callee, .. } => {
+            let Expr::Name { name } = &callee.node else {
+                return validation_expr_type_info(ctx, callee);
+            };
+            ctx.lookup(name).and_then(|symbol| {
+                if matches!(symbol.kind, SymbolKind::DerivedType) {
+                    Some(TypeInfo::Derived(symbol.name.clone()))
+                } else {
+                    symbol.type_info.clone()
+                }
+            })
+        }
+        _ => None,
+    };
+    resolved.or_else(|| fortran_type_to_validation_type_info(expr_type(expr, ctx.st)))
+}
+
+fn polymorphic_allocatable_target(ctx: &Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) -> bool {
+    if expr_selects_component(expr) {
+        return leaf_field_layout(ctx, expr).is_some_and(|leaf| {
+            leaf.field.allocatable
+                && matches!(
+                    &leaf.field.type_info,
+                    TypeInfo::Class(_) | TypeInfo::ClassStar
+                )
+        });
+    }
+    extract_base_name(expr)
+        .and_then(|name| ctx.lookup(&name))
+        .is_some_and(|symbol| {
+            symbol.attrs.allocatable
+                && matches!(
+                    symbol.type_info.as_ref(),
+                    Some(TypeInfo::Class(_) | TypeInfo::ClassStar)
+                )
+        })
+}
+
+fn polymorphic_allocate_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> bool {
+    if expr_selects_component(expr) {
+        return leaf_field_layout(ctx, expr).is_some_and(|leaf| {
+            (leaf.field.allocatable || leaf.field.pointer)
+                && matches!(
+                    &leaf.field.type_info,
+                    TypeInfo::Class(_) | TypeInfo::ClassStar
+                )
+        });
+    }
+    extract_base_name(expr)
+        .and_then(|name| ctx.lookup(&name))
+        .is_some_and(|symbol| {
+            (symbol.attrs.allocatable || symbol.attrs.pointer)
+                && matches!(
+                    symbol.type_info.as_ref(),
+                    Some(TypeInfo::Class(_) | TypeInfo::ClassStar)
+                )
+        })
+}
+
+fn ownerless_finalizer_type_name(ctx: &Ctx<'_>, type_name: &str) -> Option<String> {
+    let layouts = ctx.type_layouts?;
+    let layout = layouts
+        .get_for_scope(ctx.scope_id, type_name)
+        .or_else(|| layouts.get(type_name))?;
+    layouts
+        .lifecycle_has_ownerless_finalizer(layout)
+        .then(|| layout.name.clone())
+}
+
+fn unsupported_polymorphic_ownership_from_expr(
+    ctx: &Ctx<'_>,
+    expr: &SpannedExpr,
+) -> Option<String> {
+    if let Some(type_name) = derived_type_name_for_expr(ctx, expr) {
+        if let Some(unsupported) = ownerless_finalizer_type_name(ctx, &type_name) {
+            return Some(unsupported);
+        }
+    }
+    let type_info = validation_expr_type_info(ctx, expr)?;
+    if let Some(type_name) = derived_type_name_from_type_info(&type_info) {
+        if let Some(unsupported) = ownerless_finalizer_type_name(ctx, &type_name) {
+            return Some(unsupported);
+        }
+    }
+    ctx.type_layouts?
+        .visible_ownerless_finalizer_for_polymorphic(ctx.scope_id, &type_info)
+        .map(|layout| layout.name.clone())
+}
+
+fn assignment_type_names_match(
+    ctx: &Ctx<'_>,
+    declared_scope: ScopeId,
+    declared: &str,
+    actual: &str,
+) -> bool {
+    let Some(layouts) = ctx.type_layouts else {
+        return declared.eq_ignore_ascii_case(actual);
+    };
+    let declared_layout = layouts
+        .get_for_scope(declared_scope, declared)
+        .or_else(|| layouts.get(declared));
+    let actual_layout = layouts
+        .get_for_scope(ctx.scope_id, actual)
+        .or_else(|| layouts.get(actual));
+    match (declared_layout, actual_layout) {
+        (Some(declared), Some(actual)) => {
+            layouts.canonical_key_for_layout(declared) == layouts.canonical_key_for_layout(actual)
+        }
+        _ => declared.eq_ignore_ascii_case(actual),
+    }
+}
+
+fn assignment_type_is_same_or_extension(
+    ctx: &Ctx<'_>,
+    declared_scope: ScopeId,
+    declared: &str,
+    actual: &str,
+) -> bool {
+    let Some(layouts) = ctx.type_layouts else {
+        return declared.eq_ignore_ascii_case(actual);
+    };
+    let declared_layout = layouts
+        .get_for_scope(declared_scope, declared)
+        .or_else(|| layouts.get(declared));
+    let actual_layout = layouts
+        .get_for_scope(ctx.scope_id, actual)
+        .or_else(|| layouts.get(actual));
+    match (declared_layout, actual_layout) {
+        (Some(declared), Some(actual)) => layouts.is_same_or_extension_of(actual, declared),
+        _ => declared.eq_ignore_ascii_case(actual),
+    }
+}
+
+fn defined_assignment_type_matches(
+    ctx: &Ctx<'_>,
+    declared_scope: ScopeId,
+    declared: &TypeInfo,
+    actual: &TypeInfo,
+) -> bool {
+    fn kind_eq(a: Option<u8>, b: Option<u8>, default: u8) -> bool {
+        a.unwrap_or(default) == b.unwrap_or(default)
+    }
+
+    match (declared, actual) {
+        (TypeInfo::Derived(declared), TypeInfo::Derived(actual)) => {
+            assignment_type_names_match(ctx, declared_scope, declared, actual)
+        }
+        (TypeInfo::Class(declared), TypeInfo::Class(actual) | TypeInfo::Derived(actual)) => {
+            assignment_type_is_same_or_extension(ctx, declared_scope, declared, actual)
+        }
+        (TypeInfo::ClassStar, TypeInfo::ClassStar)
+        | (TypeInfo::TypeStar, TypeInfo::TypeStar)
+        | (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
+        (TypeInfo::Character { .. }, TypeInfo::Character { .. }) => true,
+        (TypeInfo::Integer { kind: a }, TypeInfo::Integer { kind: b }) => kind_eq(*a, *b, 4),
+        (TypeInfo::Real { kind: a }, TypeInfo::Real { kind: b }) => kind_eq(*a, *b, 4),
+        (TypeInfo::Real { kind }, TypeInfo::DoublePrecision)
+        | (TypeInfo::DoublePrecision, TypeInfo::Real { kind }) => kind_eq(*kind, Some(8), 4),
+        (TypeInfo::Complex { kind: a }, TypeInfo::Complex { kind: b }) => kind_eq(*a, *b, 4),
+        (TypeInfo::Logical { kind: a }, TypeInfo::Logical { kind: b }) => kind_eq(*a, *b, 4),
+        (TypeInfo::Enumeration(a), TypeInfo::Enumeration(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+fn assignment_candidate_scope<'a>(
+    ctx: &'a Ctx<'_>,
+    name: &str,
+    owner_scope: ScopeId,
+) -> Option<&'a Scope> {
+    ctx.st
+        .all_scopes()
+        .iter()
+        .find(|scope| {
+            matches!(
+                &scope.kind,
+                ScopeKind::Function(candidate) | ScopeKind::Subroutine(candidate)
+                    if candidate.eq_ignore_ascii_case(name)
+            ) && scope.parent == Some(owner_scope)
+        })
+        .or_else(|| {
+            ctx.st.all_scopes().iter().find(|scope| {
+                matches!(
+                    &scope.kind,
+                    ScopeKind::Function(candidate) | ScopeKind::Subroutine(candidate)
+                        if candidate.eq_ignore_ascii_case(name)
+                )
+            })
+        })
+}
+
+fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
+    use crate::ast::expr::SectionSubscript;
+
+    match &expr.node {
+        Expr::Name { name } => ctx.lookup(name).map(|symbol| symbol.attrs.array_spec.len()),
+        Expr::ParenExpr { inner } | Expr::UnaryOp { operand: inner, .. } => {
+            validation_expr_rank(ctx, inner)
+        }
+        Expr::ComponentAccess { base, .. } => {
+            let base_rank = validation_expr_rank(ctx, base)?;
+            let field_rank = leaf_field_layout(ctx, expr)?.field.dims.len();
+            Some(base_rank + field_rank)
+        }
+        Expr::BinaryOp { left, right, .. } => match (
+            validation_expr_rank(ctx, left),
+            validation_expr_rank(ctx, right),
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(rank), None) | (None, Some(rank)) => Some(rank),
+            (None, None) => None,
+        },
+        Expr::ConditionalExpr { then_val, .. } => validation_expr_rank(ctx, then_val),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let symbol = ctx.lookup(name)?;
+            if matches!(symbol.kind, SymbolKind::DerivedType) {
+                return Some(0);
+            }
+            if !symbol.attrs.array_spec.is_empty() {
+                if args.is_empty() {
+                    return Some(symbol.attrs.array_spec.len());
+                }
+                return Some(
+                    args.iter()
+                        .filter(|arg| match &arg.value {
+                            SectionSubscript::Range { .. } => true,
+                            SectionSubscript::Element(index) => {
+                                validation_expr_rank(ctx, index).is_some_and(|rank| rank > 0)
+                            }
+                        })
+                        .count(),
+                );
+            }
+            matches!(
+                symbol.kind,
+                SymbolKind::Function | SymbolKind::NamedInterface
+            )
+            .then_some(symbol.attrs.result_rank as usize)
+        }
+        Expr::ArrayConstructor { .. } => Some(1),
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. } => Some(0),
+        Expr::NilArgument => None,
+    }
+}
+
+fn assignment_uses_defined_assignment(
+    ctx: &Ctx<'_>,
+    target: &SpannedExpr,
+    value: &SpannedExpr,
+) -> bool {
+    if validation_expr_rank(ctx, target) != Some(0) || validation_expr_rank(ctx, value) != Some(0) {
+        return false;
+    }
+    let Some(lhs_type) = validation_expr_type_info(ctx, target) else {
+        return false;
+    };
+    let Some(rhs_type) = validation_expr_type_info(ctx, value) else {
+        return false;
+    };
+
+    let mut candidates: Vec<(String, ScopeId)> = Vec::new();
+    if let Some(interface) = ctx.lookup("assignment(=)") {
+        if matches!(interface.kind, SymbolKind::NamedInterface) {
+            for name in &interface.arg_names {
+                candidates.push((name.clone(), interface.scope));
+            }
+        }
+    }
+
+    candidates.into_iter().any(|(name, owner_scope)| {
+        let Some(scope) = assignment_candidate_scope(ctx, &name, owner_scope) else {
+            return false;
+        };
+        let declared_args: Vec<_> = scope
+            .arg_order
+            .iter()
+            .filter_map(|name| scope.symbols.get(name))
+            .collect();
+        if declared_args.len() != 2 {
+            return false;
+        }
+        if declared_args
+            .iter()
+            .any(|argument| !argument.attrs.array_spec.is_empty())
+        {
+            return false;
+        }
+        let Some(lhs_declared) = declared_args[0].type_info.as_ref() else {
+            return false;
+        };
+        let Some(rhs_declared) = declared_args[1].type_info.as_ref() else {
+            return false;
+        };
+        defined_assignment_type_matches(ctx, scope.id, lhs_declared, &lhs_type)
+            && defined_assignment_type_matches(ctx, scope.id, rhs_declared, &rhs_type)
+    })
+}
+
+fn allocate_option_expr<'a>(opts: &'a [IoControl], keyword: &str) -> Option<&'a SpannedExpr> {
+    opts.iter()
+        .find(|opt| {
+            opt.keyword
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(keyword))
+        })
+        .map(|opt| &opt.value)
+}
+
+fn type_spec_dynamic_type_name(ctx: &Ctx<'_>, type_spec: &TypeSpec) -> Option<String> {
+    match type_spec {
+        TypeSpec::Type(name) | TypeSpec::Class(name) => Some(name.clone()),
+        TypeSpec::TypeOf(name) | TypeSpec::ClassOf(name) => ctx
+            .lookup(name)
+            .and_then(|symbol| symbol.type_info.as_ref())
+            .and_then(derived_type_name_from_type_info),
+        _ => None,
+    }
+}
+
+fn unsupported_allocate_dynamic_type(
+    ctx: &Ctx<'_>,
+    type_spec: Option<&TypeSpec>,
+    opts: &[IoControl],
+    item: &SpannedExpr,
+) -> Option<String> {
+    if let Some(type_name) = type_spec.and_then(|spec| type_spec_dynamic_type_name(ctx, spec)) {
+        return ownerless_finalizer_type_name(ctx, &type_name);
+    }
+    if let Some(source) = allocate_option_expr(opts, "source") {
+        return unsupported_polymorphic_ownership_from_expr(ctx, source);
+    }
+    if let Some(mold) = allocate_option_expr(opts, "mold") {
+        return unsupported_polymorphic_ownership_from_expr(ctx, mold);
+    }
+    derived_type_name_for_expr(ctx, item).and_then(|name| ownerless_finalizer_type_name(ctx, &name))
+}
+
+fn call_argument_expr<'a>(
+    args: &'a [crate::ast::expr::Argument],
+    position: usize,
+    keyword: &str,
+) -> Option<&'a SpannedExpr> {
+    let argument = args
+        .iter()
+        .find(|arg| {
+            arg.keyword
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(keyword))
+        })
+        .or_else(|| {
+            args.iter()
+                .filter(|arg| arg.keyword.is_none())
+                .nth(position)
+        })?;
+    let crate::ast::expr::SectionSubscript::Element(expr) = &argument.value else {
+        return None;
+    };
+    Some(expr)
+}
+
+fn validate_move_alloc_polymorphic_ownership(
+    ctx: &mut Ctx<'_>,
+    args: &[crate::ast::expr::Argument],
+) {
+    let Some(source) = call_argument_expr(args, 0, "from") else {
+        return;
+    };
+    let Some(target) = call_argument_expr(args, 1, "to") else {
+        return;
+    };
+    if !polymorphic_allocatable_target(ctx, target) {
+        return;
+    }
+    if let Some(type_name) = unsupported_polymorphic_ownership_from_expr(ctx, source) {
+        reject_context_dependent_polymorphic_ownership(ctx, source.span, &type_name);
+    }
+}
+
+fn reject_context_dependent_polymorphic_ownership(ctx: &mut Ctx<'_>, span: Span, type_name: &str) {
+    ctx.error(
+        span,
+        format!(
+            "polymorphic ownership of locally declared finalizable type '{}' cannot preserve its local FINAL procedure; move the type and FINAL procedure to module scope",
+            type_name
+        ),
+    );
 }
 
 fn layout_component_type_info(
@@ -4496,6 +5796,850 @@ end program
 ",
         );
         assert!(!errs.iter().any(|e| e.contains("expected")), "{:?}", errs);
+    }
+
+    #[test]
+    fn rejects_recursive_inline_storage_cycles() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: node_t
+    type(node_t) :: child
+  end type
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("infinite inline storage")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_pointer_and_allocatable_recursive_components() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: node_t
+    type(node_t), pointer :: next
+    type(node_t), allocatable :: children(:)
+  end type
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("infinite inline storage")
+                    || err.contains("locally declared derived type")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_open_dynamic_components() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: node_t
+    class(*), allocatable :: child
+    class(*), pointer :: link
+  end type
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("locally declared derived type")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_polymorphic_ownership_of_local_finalizable_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type(payload_t) :: source
+  class(*), allocatable :: typed, sourced, molded, assigned
+  allocate(payload_t :: typed)
+  allocate(sourced, source=source)
+  allocate(molded, mold=source)
+  assigned = source
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("cannot preserve its local FINAL procedure"))
+                .count(),
+            4,
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_polymorphic_transfer_and_runtime_cloning_of_local_finalizers() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type(payload_t), allocatable :: concrete
+  class(*), allocatable :: moved
+  allocate(concrete)
+  call move_alloc(concrete, moved)
+  call clone(moved)
+contains
+  subroutine clone(source)
+    class(*), intent(in) :: source
+    class(*), allocatable :: sourced, molded, assigned
+    allocate(sourced, source=source)
+    allocate(molded, mold=source)
+    assigned = source
+  end subroutine
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("cannot preserve its local FINAL procedure"))
+                .count(),
+            4,
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_polymorphic_pointer_and_array_ownership_of_local_finalizers() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type(payload_t) :: source
+  class(*), pointer :: pointed
+  class(*), allocatable :: assigned(:), sourced(:)
+  allocate(payload_t :: pointed)
+  assigned = [source]
+  allocate(sourced, source=[source])
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("cannot preserve its local FINAL procedure"))
+                .count(),
+            3,
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn ignores_user_defined_move_alloc_procedures() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type(payload_t) :: source
+  class(*), allocatable :: target
+  call move_alloc(source, target)
+contains
+  subroutine move_alloc(from, to)
+    type(payload_t), intent(in) :: from
+    class(*), allocatable, intent(out) :: to
+  end subroutine
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("cannot preserve its local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_constructor_assignment_to_polymorphic_components() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type :: holder_t
+    class(*), allocatable :: value
+  end type
+  type(holder_t) :: direct
+  class(holder_t), allocatable :: polymorphic_holder
+  allocate(polymorphic_holder)
+  direct%value = payload_t()
+  polymorphic_holder%value = payload_t()
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("cannot preserve its local FINAL procedure"))
+                .count(),
+            2,
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_defined_assignment_from_local_finalizable_source() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  interface assignment(=)
+    subroutine assign_payload(lhs, rhs)
+      class(*), allocatable, intent(out) :: lhs
+      type(payload_t), intent(in) :: rhs
+    end subroutine
+  end interface
+  type(payload_t) :: source
+  class(*), allocatable :: assigned
+  assigned = source
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("cannot preserve its local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_array_defined_assignment_without_exact_lowering_match() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  interface assignment(=)
+    subroutine assign_payload(lhs, rhs)
+      class(*), allocatable, intent(out) :: lhs(:)
+      type(payload_t), intent(in) :: rhs(:)
+    end subroutine
+  end interface
+  type(payload_t) :: source(1)
+  class(*), allocatable :: assigned(:)
+  assigned = source
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("cannot preserve its local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_static_ownership_of_local_finalizable_type() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type(payload_t), allocatable :: concrete
+  allocate(concrete)
+  deallocate(concrete)
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("cannot preserve its local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_context_free_polymorphic_ownership() {
+        let errs = errors_from(
+            "\
+module final_m
+  implicit none
+  type :: module_t
+  contains
+    final :: finish_module
+  end type
+contains
+  subroutine finish_module(item)
+    type(module_t) :: item
+  end subroutine
+end module
+program p
+  use final_m, only: module_t
+  implicit none
+  type :: local_t
+    integer, allocatable :: values(:)
+  end type
+  class(*), allocatable :: local_value, module_value
+  allocate(local_t :: local_value)
+  allocate(module_t :: module_value)
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("cannot preserve its local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_recursive_ownership_with_finalizer() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: node_t
+    type(node_t), allocatable :: child
+  contains
+    final :: finish
+  end type
+contains
+  subroutine finish(item)
+    type(node_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("locally declared derived type") && err.contains("local FINAL binding")
+            }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_allocatable_component_with_local_finalizer() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+    integer :: value = 0
+  contains
+    final :: finish
+  end type
+  type :: holder_t
+    type(payload_t), allocatable :: payload
+  end type
+contains
+  subroutine finish(item)
+    type(payload_t) :: item
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("holder_t")
+                    && err.contains("allocatable ownership")
+                    && err.contains("local FINAL binding")
+            }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_module_owned_recursive_dynamic_ownership() {
+        let errs = errors_from(
+            "\
+module ownership_mod
+  implicit none
+  type :: dynamic_node_t
+    class(*), allocatable :: child
+  end type
+  type :: final_node_t
+    type(final_node_t), allocatable :: child
+  contains
+    final :: finish
+  end type
+contains
+  subroutine finish(item)
+    type(final_node_t) :: item
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("locally declared derived type")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_host_automatic_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+    calls = 1
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      calls = calls + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_host_dummy_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value(calls)
+    integer, intent(inout) :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      calls = calls + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_ancestor_host_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine outer()
+    integer :: calls
+  contains
+    subroutine make_value()
+      type :: payload_t
+        integer :: marker
+      contains
+        final :: finish
+      end type
+      type(payload_t) :: value
+    contains
+      subroutine finish(item)
+        type(payload_t) :: item
+        calls = calls + item%marker
+      end subroutine
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_transitive_local_finalizer_host_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      call record(item%marker)
+    end subroutine
+    subroutine record(marker)
+      integer, intent(in) :: marker
+      calls = calls + marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_context_free_local_finalizers() {
+        let errs = errors_from(
+            "\
+module state_mod
+  implicit none
+  integer :: module_calls
+contains
+  subroutine make_value()
+    integer, parameter :: increment = 1
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      module_calls = module_calls + item%marker + increment
+    end subroutine
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_construct_name_shadowing() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: i
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: total
+      total = sum([(i, i = 1, 2)]) + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_shadowed_sibling_name() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: record(1)
+      item%marker = record(1)
+    end subroutine
+    subroutine record()
+      calls = calls + 1
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_block_use_shadowing() {
+        let errs = errors_from(
+            "\
+module state_mod
+  implicit none
+  integer :: module_calls
+end module
+
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      block
+        use state_mod, only: calls => module_calls
+        calls = calls + item%marker
+      end block
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn accepts_local_finalizer_do_concurrent_local_shadowing() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: i
+      do concurrent (i = 1:1) local(calls)
+        calls = item%marker
+      end do
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("local FINAL procedure")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_do_concurrent_local_init_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      integer :: i
+      do concurrent (i = 1:1) local_init(calls)
+        calls = calls + item%marker
+      end do
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn rejects_local_finalizer_saved_host_capture() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+contains
+  subroutine make_value()
+    integer, save :: calls
+    type :: payload_t
+      integer :: marker
+    contains
+      final :: finish
+    end type
+    type(payload_t) :: value
+  contains
+    subroutine finish(item)
+      type(payload_t) :: item
+      calls = calls + item%marker
+    end subroutine
+  end subroutine
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| { err.contains("local FINAL procedure") && err.contains("calls") }),
+            "{:?}",
+            errs
+        );
     }
 
     #[test]

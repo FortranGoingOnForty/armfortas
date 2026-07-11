@@ -683,13 +683,65 @@ pub(super) fn resolve_unit(
     Ok(())
 }
 
+fn stable_scope_path(st: &SymbolTable, scope_id: ScopeId) -> String {
+    let scope = st.scope(scope_id);
+    let segment = match &scope.kind {
+        ScopeKind::Global => return "global".to_string(),
+        ScopeKind::Module(name) | ScopeKind::Submodule(name) => {
+            return name.to_ascii_lowercase();
+        }
+        ScopeKind::Program(name) => format!("program:{}", name.to_ascii_lowercase()),
+        ScopeKind::Subroutine(name) => format!("subroutine:{}", name.to_ascii_lowercase()),
+        ScopeKind::Function(name) => format!("function:{}", name.to_ascii_lowercase()),
+        ScopeKind::DerivedType(name) => format!("type:{}", name.to_ascii_lowercase()),
+        ScopeKind::Block => format!("block:{}", scope.id),
+        ScopeKind::Interface => format!("interface:{}", scope.id),
+        ScopeKind::Forall => format!("forall:{}", scope.id),
+        ScopeKind::Associate => format!("associate:{}", scope.id),
+        ScopeKind::Critical => format!("critical:{}", scope.id),
+    };
+    let Some(parent) = scope.parent else {
+        return segment;
+    };
+    format!("{}::{}", stable_scope_path(st, parent), segment)
+}
+
+fn register_layout_scopes(
+    st: &SymbolTable,
+    layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    for scope in st.all_scopes() {
+        let parent = if matches!(scope.kind, ScopeKind::Module(_) | ScopeKind::Submodule(_)) {
+            Some(0)
+        } else {
+            scope.parent
+        };
+        layouts.register_scope(scope.id, parent, stable_scope_path(st, scope.id));
+    }
+    for scope in st.all_scopes() {
+        for assoc in &scope.use_associations {
+            if assoc.from_bare_use && assoc.local_name.is_empty() {
+                layouts.bind_bare_use_scope(scope.id, assoc.source_scope);
+            } else {
+                layouts.bind_layout(
+                    scope.id,
+                    &assoc.local_name,
+                    assoc.source_scope,
+                    &assoc.original_name,
+                );
+            }
+        }
+    }
+}
+
 /// Walk all program units and compute layouts for derived types.
-fn compute_all_layouts(
+pub(crate) fn compute_all_layouts(
     target_layout: crate::target::TargetLayout,
     units: &[SpannedUnit],
     st: &SymbolTable,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) {
+    register_layout_scopes(st, layouts);
     let inherited_params = HashMap::new();
     let inherited_char_params = HashMap::new();
     let mut visible_param_cache: HashMap<ScopeId, HashMap<String, i64>> = HashMap::new();
@@ -712,6 +764,7 @@ fn compute_all_layouts(
             &mut exported_char_param_cache,
         );
     }
+    layouts.rebuild_alias_index();
 }
 
 fn scope_matches_unit(kind: &ScopeKind, unit: &ProgramUnit) -> bool {
@@ -1250,6 +1303,8 @@ fn collect_derived_type_layouts(
         target_layout,
         decls,
         host_module,
+        st,
+        scope_id,
         layouts,
         &const_params,
         &const_char_params,
@@ -1261,6 +1316,8 @@ fn collect_derived_type_layouts(
         target_layout,
         decls,
         host_module,
+        st,
+        scope_id,
         layouts,
         &const_params,
         &const_char_params,
@@ -1789,10 +1846,13 @@ fn collect_const_derived_field_inits(
     field_inits
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_local_type_layouts(
     target_layout: crate::target::TargetLayout,
     decls: &[SpannedDecl],
     host_module: Option<&str>,
+    st: &SymbolTable,
+    scope_id: ScopeId,
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
     const_params: &HashMap<String, i64>,
     const_char_params: &HashMap<String, String>,
@@ -1809,13 +1869,19 @@ fn register_local_type_layouts(
             ..
         } = &decl.node
         {
-            let parent = extends.as_ref().and_then(|p| layouts.get(p)).cloned();
+            let parent = extends
+                .as_ref()
+                .and_then(|p| layouts.get_for_scope(scope_id, p))
+                .cloned();
             let is_abstract = attrs
                 .iter()
                 .any(|attr| matches!(attr, crate::ast::decl::TypeAttr::Abstract));
-            let layout = crate::sema::type_layout::compute_layout_with_attrs(
+            let owner_path = layouts.scope_path(scope_id).map(str::to_string);
+            let mut layout = crate::sema::type_layout::compute_layout_with_attrs_in_scope(
                 name,
                 host_module,
+                Some(scope_id),
+                owner_path.as_deref(),
                 type_bound_procs,
                 final_procs,
                 components,
@@ -1827,10 +1893,13 @@ fn register_local_type_layouts(
                 const_derived_field_inits,
                 target_layout,
             );
+            for (final_proc, source_name) in layout.final_procs.iter_mut().zip(final_procs) {
+                final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
+            }
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
             let dominated = layouts
-                .get(&name.to_lowercase())
+                .get_for_scope(scope_id, &name.to_lowercase())
                 .map(|existing| {
                     let existing_has =
                         !existing.bound_procs.is_empty() || !existing.final_procs.is_empty();
@@ -1843,6 +1912,27 @@ fn register_local_type_layouts(
             }
         }
     }
+}
+
+fn final_procedure_rank(st: &SymbolTable, owner_scope: ScopeId, name: &str) -> Option<usize> {
+    let proc_scope = st
+        .all_scopes()
+        .iter()
+        .enumerate()
+        .find(|(_, scope)| {
+            scope.parent == Some(owner_scope)
+                && matches!(
+                    &scope.kind,
+                    ScopeKind::Subroutine(scope_name) | ScopeKind::Function(scope_name)
+                        if scope_name.eq_ignore_ascii_case(name)
+                )
+        })
+        .map(|(id, _)| id)?;
+    let scope = st.scope(proc_scope);
+    let first_arg = scope.arg_order.first()?;
+    let symbol = scope.symbols.get(&first_arg.to_lowercase())?;
+    let specs = &symbol.attrs.array_spec;
+    Some(if specs.is_empty() { 0 } else { specs.len() })
 }
 
 /// Resolve procedure-pointer default-init targets stored as bare
@@ -2764,6 +2854,53 @@ end program
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(!prog_scope.use_associations.is_empty());
+    }
+
+    #[test]
+    fn same_named_module_layouts_resolve_through_use_renames() {
+        let resolved = resolve_source_with_layouts(
+            "\
+module alpha_m
+  implicit none
+  type :: item_t
+    integer :: alpha
+  end type
+end module
+module beta_m
+  implicit none
+  type :: item_t
+    real(8) :: beta
+  end type
+end module
+program p
+  use alpha_m, only: alpha_item => item_t
+  use beta_m, only: beta_item => item_t
+  implicit none
+  type(alpha_item) :: left
+  type(beta_item) :: right
+end program
+",
+        );
+        let program_scope = resolved
+            .st
+            .all_scopes()
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap()
+            .id;
+
+        let alpha = resolved
+            .type_layouts
+            .get_for_scope(program_scope, "alpha_item")
+            .unwrap();
+        let beta = resolved
+            .type_layouts
+            .get_for_scope(program_scope, "beta_item")
+            .unwrap();
+        assert_eq!(alpha.owner_module.as_deref(), Some("alpha_m"));
+        assert_eq!(beta.owner_module.as_deref(), Some("beta_m"));
+        assert_eq!(alpha.size, 4);
+        assert_eq!(beta.size, 8);
     }
 
     #[test]

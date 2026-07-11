@@ -216,15 +216,15 @@ impl TargetLayout {
         }
     }
 
-    /// `{base_addr, elem_size, rank, flags, dims[15]}` — the stable
-    /// array-descriptor ABI. The runtime asserts 384 independently
+    /// `{base_addr, elem_size, rank, flags, dims[15], vtable}` — the stable
+    /// array-descriptor ABI. The runtime asserts 392 independently
     /// (`runtime/src/descriptor.rs`); if this formula and that assert
     /// ever disagree, the formula is wrong.
     pub fn array_descriptor(&self) -> (usize, usize) {
         // Header: base_addr (ptr) + elem_size (i64) + rank:i32/flags:u32
         // packed into one slot = 3 pointer-sized slots. Then 15 dims ×
-        // (lower, upper, stride) = 45 slots. 8 × 48 = 384.
-        (self.ptr_bytes * (3 + 45), self.ptr_align)
+        // (lower, upper, stride) = 45 slots, plus the vtable pointer.
+        (self.ptr_bytes * (3 + 45 + 1), self.ptr_align)
     }
 
     /// `{data, len, capacity, flags}` — the stable string-descriptor ABI.
@@ -352,9 +352,9 @@ mod layout_tests {
     #[test]
     fn descriptor_footprints_match_the_stable_abi() {
         let layout = TargetLayout::of(&TargetSpec::parse("arm64-macos").unwrap());
-        // 384 is asserted independently by runtime/src/descriptor.rs;
+        // 392 is asserted independently by runtime/src/descriptor.rs;
         // these are the compiler-side halves of that contract.
-        assert_eq!(layout.array_descriptor(), (384, 8));
+        assert_eq!(layout.array_descriptor(), (392, 8));
         assert_eq!(layout.string_descriptor(), (32, 8));
         assert_eq!(layout.class_descriptor(), (16, 8));
         assert_eq!(layout.proc_ptr_component(), 72);

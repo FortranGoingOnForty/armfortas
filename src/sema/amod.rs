@@ -1,4 +1,4 @@
-//! ARMFORTAS module file (.amod) v2 writer and reader.
+//! ARMFORTAS module file (.amod) writer and reader.
 //!
 //! Format spec: see `.claude/plans/composed-questing-catmull.md`.
 //!
@@ -21,6 +21,8 @@ use crate::ir::inst::{FuncRef, Function, InstKind, Module as IrModule};
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
+
+const AMOD_VERSION: u32 = 4;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
 /// is `lower:upper` or just `upper`. Returns None if any dim is not
@@ -218,7 +220,7 @@ fn decode_nested_field_default_init(
 // Writer
 // =====================================================================
 
-/// Serialize a module's public interface to `.amod` v2 text.
+/// Serialize a module's public interface to the current `.amod` text format.
 pub fn write_amod(
     module_name: &str,
     source_path: &str,
@@ -236,7 +238,7 @@ pub fn write_amod(
     let scope = st.scope(mod_scope_id);
 
     // ---- Header ----
-    writeln!(out, "#!amod 2").unwrap();
+    writeln!(out, "#!amod {}", AMOD_VERSION).unwrap();
     writeln!(out, "# module: {}", mod_key).unwrap();
     writeln!(out, "# source: {}", source_path).unwrap();
     writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex(source_content)).unwrap();
@@ -506,8 +508,12 @@ pub fn write_amod(
         }
     }
     for key in &type_exports {
-        if let Some(layout) = type_layouts.get(key) {
-            emit_type(&mut out, &layout.name, type_layouts);
+        if let Some(layout) = type_layouts
+            .get_for_scope(mod_scope_id, key)
+            .or_else(|| type_layouts.get(key))
+        {
+            let canonical = type_layouts.canonical_key_for_layout(layout);
+            emit_type(&mut out, &canonical, type_layouts);
         }
     }
 
@@ -1024,7 +1030,7 @@ fn emit_procedure(
                             crate::ir::types::IrType::Ptr(inner)
                                 if matches!(
                                     inner.as_ref(),
-                                    crate::ir::types::IrType::Array(elem, 384)
+                                    crate::ir::types::IrType::Array(elem, 392)
                                         if matches!(
                                             elem.as_ref(),
                                             crate::ir::types::IrType::Int(
@@ -1144,8 +1150,8 @@ fn touches_globals(func: &Function) -> bool {
 }
 
 fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
-    writeln!(out, "@type {}", name).unwrap();
     if let Some(layout) = type_layouts.get(&name.to_lowercase()) {
+        writeln!(out, "@type {}", layout.name).unwrap();
         writeln!(out, "  @layout size={} align={}", layout.size, layout.align).unwrap();
         if let Some(ref parent) = layout.parent {
             writeln!(out, "  @extends {}", parent).unwrap();
@@ -1256,7 +1262,7 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             }
         }
         for fp in &layout.final_procs {
-            writeln!(out, "  @final {}", fp).unwrap();
+            writeln!(out, "  @final {} rank={}", fp.name, fp.rank).unwrap();
         }
         if let Some(owner_module) = &layout.owner_module {
             writeln!(out, "  @owner {}", owner_module).unwrap();
@@ -1577,6 +1583,15 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     validate_amod_integrity(&content, path)?;
+    let version = amod_version(&content, path)?;
+    if version != AMOD_VERSION {
+        return Err(format!(
+            "{}: incompatible .amod version {} (compiler requires {}); rebuild the provider module",
+            path.display(),
+            version,
+            AMOD_VERSION
+        ));
+    }
     let iface = parse_amod(&content, path)?;
 
     if let Some(stored) = mtime {
@@ -1589,17 +1604,25 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     Ok(iface)
 }
 
-fn validate_amod_integrity(content: &str, path: &Path) -> Result<(), String> {
+fn amod_version(content: &str, path: &Path) -> Result<u32, String> {
     let magic = content
         .lines()
         .next()
         .ok_or_else(|| format!("{}: empty .amod file", path.display()))?;
-    if !magic.starts_with("#!amod ") {
-        return Err(format!(
+    let encoded = magic.strip_prefix("#!amod ").ok_or_else(|| {
+        format!(
             "{}: not an .amod file (missing #!amod magic)",
             path.display()
-        ));
-    }
+        )
+    })?;
+    encoded
+        .trim()
+        .parse()
+        .map_err(|_| format!("{}: invalid .amod version", path.display()))
+}
+
+fn validate_amod_integrity(content: &str, path: &Path) -> Result<(), String> {
+    amod_version(content, path)?;
 
     let body_start = content.find("\n\n").map(|idx| idx + 2).ok_or_else(|| {
         format!(
@@ -1672,18 +1695,9 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     let mut lines = content.lines().peekable();
 
     // Header: #!amod N
-    let magic = lines.next().ok_or("empty .amod file")?;
-    if !magic.starts_with("#!amod ") {
-        return Err(format!(
-            "{}: not an .amod file (missing #!amod magic)",
-            path.display()
-        ));
-    }
-    let version: u32 = magic[7..]
-        .trim()
-        .parse()
-        .map_err(|_| format!("{}: invalid .amod version", path.display()))?;
-    if version > 2 {
+    lines.next().ok_or("empty .amod file")?;
+    let version = amod_version(content, path)?;
+    if version > AMOD_VERSION {
         eprintln!("warning: {}: .amod version {} is newer than this compiler supports; some information may be ignored", path.display(), version);
     }
 
@@ -1789,6 +1803,30 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             });
         }
         // Skip unrecognized directives (forward compatibility).
+    }
+
+    let final_proc_prefix = format!("afs_modproc_{}_", module_name.to_lowercase());
+    for layout in &mut types {
+        for final_proc in &mut layout.final_procs {
+            if final_proc.rank != usize::MAX {
+                continue;
+            }
+            let source_name = final_proc
+                .name
+                .strip_prefix(&final_proc_prefix)
+                .unwrap_or(&final_proc.name);
+            let Some(proc) = procedures
+                .iter()
+                .find(|proc| proc.name.eq_ignore_ascii_case(source_name))
+            else {
+                return Err(format!(
+                    "{}: cannot infer rank for legacy @final {}",
+                    path.display(),
+                    final_proc.name
+                ));
+            };
+            final_proc.rank = proc.args.first().map_or(0, |arg| arg.rank as usize);
+        }
     }
 
     Ok(ModuleInterface {
@@ -2329,7 +2367,15 @@ fn parse_type(
                 nopass,
             });
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
-            final_procs.push(rest.trim().to_string());
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().unwrap_or_default().to_string();
+            let rank = match parts.find_map(|part| part.strip_prefix("rank=")) {
+                Some(rank) => rank
+                    .parse()
+                    .unwrap_or_else(|_| panic!("malformed @final rank '{}'", rank)),
+                None => usize::MAX,
+            };
+            final_procs.push(crate::sema::type_layout::FinalProc { name, rank });
         } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
             owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
@@ -2339,9 +2385,14 @@ fn parse_type(
         }
     }
 
+    let owner_path = owner_module
+        .as_ref()
+        .map(|owner| owner.to_ascii_lowercase());
     TypeLayout {
         name,
         owner_module,
+        owner_scope: None,
+        owner_path,
         size,
         align,
         fields,
@@ -2613,7 +2664,7 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
 
 /// Extract descriptor_params from a loaded ModuleInterface.
 /// For each procedure with descriptor-backed dummies, produces a
-/// Vec<bool> (per-position, true = pass the 384-byte descriptor).
+/// Vec<bool> (per-position, true = pass the 392-byte descriptor).
 pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for proc in &iface.procedures {
@@ -2722,6 +2773,7 @@ mod tests {
   @field y : real @offset 4 @size 4
   @field mass : real @offset 8 @size 4
   @binds kinetic_energy
+  @final afs_modproc_physics_finish_particles rank=1
   @tag 1
 @end type
 "#;
@@ -2760,6 +2812,39 @@ mod tests {
         assert_eq!(pt.fields.len(), 3);
         assert_eq!(pt.bound_procs.len(), 1);
         assert_eq!(pt.bound_procs[0].method_name, "kinetic_energy");
+        assert_eq!(
+            pt.final_procs,
+            vec![crate::sema::type_layout::FinalProc {
+                name: "afs_modproc_physics_finish_particles".into(),
+                rank: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_final_proc_rank_is_inferred_from_procedure() {
+        let amod_text = r#"#!amod 2
+# module: m
+
+@subroutine finish
+  @arg values : type(item), rank=1
+@end subroutine
+
+@type item
+  @final afs_modproc_m_finish
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("legacy.amod")).unwrap();
+        assert_eq!(iface.types[0].final_procs[0].rank, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed @final rank")]
+    fn malformed_final_proc_rank_is_rejected() {
+        let mut lines = "  @final afs_modproc_m_finish rank=oops\n@end type\n"
+            .lines()
+            .peekable();
+        let _ = parse_type("@type item", &mut lines);
     }
 
     #[test]
@@ -2859,7 +2944,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 2
+            r#"#!amod 4
 # module: cache_test
 # source: cache_test.f90
 
@@ -2889,7 +2974,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 2
+            r#"#!amod 4
 # module: truncated_test
 # source: truncated_test.f90
 
@@ -2911,6 +2996,34 @@ mod tests {
         );
         assert!(
             err.contains("corrupt .amod file") && err.contains("content length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_amod_rejects_stale_abi_version() {
+        clear_amod_cache();
+        let path = std::env::temp_dir().join(format!(
+            "amod_stale_version_test_{}.amod",
+            std::process::id()
+        ));
+        let text = add_integrity_headers(
+            r#"#!amod 3
+# module: stale_test
+# source: stale_test.f90
+
+@param k : integer = 7
+"#
+            .to_string(),
+        );
+        std::fs::write(&path, text).unwrap();
+
+        let err = read_amod(&path).expect_err("stale .amod must be rejected");
+
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("incompatible .amod version 3")
+                && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );
     }

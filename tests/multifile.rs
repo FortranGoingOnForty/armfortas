@@ -610,6 +610,52 @@ fn use_rename() {
     );
 }
 
+#[test]
+fn same_named_imported_types_keep_module_owned_layouts() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=same_named_imported_types_keep_module_owned_layouts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let alpha_f90 = dir.join("alpha_m.f90");
+    let beta_f90 = dir.join("beta_m.f90");
+    let main_f90 = dir.join("main.f90");
+    let alpha_o = dir.join("alpha_m.o");
+    let beta_o = dir.join("beta_m.o");
+    let main_o = dir.join("main.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &alpha_f90,
+        "module alpha_m\n  implicit none\n  type :: item_t\n    integer :: value = 0\n  end type\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &beta_f90,
+        "module beta_m\n  implicit none\n  type :: item_t\n    integer :: pad = -1\n    integer(8) :: value = 0\n  end type\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use alpha_m, only: alpha_item => item_t\n  use beta_m, only: beta_item => item_t\n  implicit none\n  type(alpha_item) :: alpha\n  type(beta_item) :: beta\n  alpha%value = 17\n  beta%pad = 23\n  beta%value = 5000000000_8\n  if (alpha%value /= 17) error stop 1\n  if (beta%pad /= 23) error stop 2\n  if (beta%value /= 5000000000_8) error stop 3\n  print *, 'ok'\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &alpha_f90, &alpha_o, None);
+    compile_file(&compiler, &beta_f90, &beta_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&alpha_o, &beta_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(output.contains("ok"), "unexpected output:\n{}", output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Generic interface resolved across .amod boundaries: the consumer
 /// reconstructs the NamedInterface from the @interface block and
 /// dispatches each specific at the call site.
@@ -1757,6 +1803,476 @@ fn cross_tu_vtable_slots_match_source_and_amod_views() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_polymorphic_copy_reports_unavailable_finalizer_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_polymorphic_copy_reports_unavailable_finalizer_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("dynamic_copy.f90");
+    let main_f90 = dir.join("local_payload.f90");
+    let mod_o = dir.join("dynamic_copy.o");
+    let main_o = dir.join("local_payload.o");
+    let binary = dir.join("dynamic_copy_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module dynamic_copy_m\n  implicit none\ncontains\n  subroutine clone_value(source, target)\n    class(*), intent(in) :: source\n    class(*), allocatable, intent(out) :: target\n    target = source\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use dynamic_copy_m\n  implicit none\n  type :: payload_t\n    integer :: value = 1\n  contains\n    final :: finish\n  end type\n  type(payload_t) :: source\n  class(*), allocatable :: target\n  call clone_value(source, target)\ncontains\n  subroutine finish(item)\n    type(payload_t) :: item\n  end subroutine\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &main_o], &binary);
+    let result = Command::new(&binary)
+        .output()
+        .expect("binary launch failed");
+    assert!(
+        !result.status.success()
+            && String::from_utf8_lossy(&result.stderr)
+                .contains("polymorphic ownership cannot preserve a procedure-local FINAL binding"),
+        "cross-TU dynamic copy did not report the unavailable FINAL context: status={:?} stdout={} stderr={}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_class_base_source_and_mold_report_unavailable_finalizer_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_class_base_source_and_mold_report_unavailable_finalizer_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("dynamic_base_copy.f90");
+    let mod_o = dir.join("dynamic_base_copy.o");
+
+    std::fs::write(
+        &mod_f90,
+        "module dynamic_base_copy_m\n  implicit none\n  type :: base_t\n    integer :: value = 1\n  end type\n  type, extends(base_t) :: module_payload_t\n    integer, allocatable :: owned(:)\n  end type\ncontains\n  subroutine clone_source(source, target)\n    class(base_t), intent(in) :: source\n    class(base_t), allocatable, intent(out) :: target\n    allocate(target, source=source)\n  end subroutine\n  subroutine clone_mold(source, target)\n    class(base_t), intent(in) :: source\n    class(base_t), allocatable, intent(out) :: target\n    allocate(target, mold=source)\n  end subroutine\n  subroutine clone_array_source(source, target)\n    class(base_t), intent(in) :: source(:)\n    class(base_t), allocatable, intent(out) :: target(:)\n    allocate(target, source=source)\n  end subroutine\n  subroutine clone_bounded_mold(source, target)\n    class(base_t), intent(in) :: source(:)\n    class(base_t), allocatable, intent(out) :: target(:)\n    allocate(target(1), mold=source)\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    let mod_ir = dir.join("dynamic_base_copy.ir");
+    let emit = Command::new(&compiler)
+        .args([
+            "--emit-ir",
+            mod_f90.to_str().unwrap(),
+            "-o",
+            mod_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("module IR emission failed to spawn");
+    assert!(
+        emit.status.success(),
+        "module IR emission failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir = std::fs::read_to_string(&mod_ir).expect("cannot read module IR");
+    let function_start = ir
+        .find("func @afs_modproc_dynamic_base_copy_m_clone_bounded_mold")
+        .expect("missing clone_bounded_mold IR");
+    let function_tail = &ir[function_start..];
+    let function_end = function_tail
+        .find("\n  func @")
+        .unwrap_or(function_tail.len());
+    let function_ir = &function_tail[..function_end];
+    let allocation = function_ir
+        .find("call @afs_allocate_array")
+        .expect("missing bounded MOLD allocation call");
+    assert!(
+        function_ir[..allocation]
+            .matches("call @afs_error_stop_msg")
+            .count()
+            >= 2,
+        "bounded polymorphic MOLD must validate both destination release and source metadata before allocation:\n{}",
+        function_ir
+    );
+
+    let cases = [
+        (
+            "source",
+            "  type(payload_t) :: source\n  class(base_t), allocatable :: target\n  allocate(source%owned(1))\n  call clone_source(source, target)\n",
+        ),
+        (
+            "mold",
+            "  type(payload_t) :: source\n  class(base_t), allocatable :: target\n  call clone_mold(source, target)\n",
+        ),
+        (
+            "array_source",
+            "  type(payload_t) :: source(1)\n  class(base_t), allocatable :: target(:)\n  allocate(source(1)%owned(1))\n  call clone_array_source(source, target)\n",
+        ),
+        (
+            "zero_sized_mold",
+            "  type(payload_t), allocatable :: source(:)\n  class(base_t), allocatable :: target(:)\n  allocate(source(0))\n  call clone_bounded_mold(source, target)\n  error stop 97\n",
+        ),
+    ];
+
+    for (case, declarations_and_call) in cases {
+        let main_f90 = dir.join(format!("local_payload_{}.f90", case));
+        let main_o = dir.join(format!("local_payload_{}.o", case));
+        let binary = dir.join(format!("dynamic_base_copy_{}_bin", case));
+        let source = format!(
+            "program p\n  use dynamic_base_copy_m\n  implicit none\n  type, extends(base_t) :: payload_t\n    integer, allocatable :: owned(:)\n  contains\n    final :: finish\n  end type\n{}contains\n  subroutine finish(item)\n    type(payload_t) :: item\n  end subroutine\nend program\n",
+            declarations_and_call
+        );
+        std::fs::write(&main_f90, source).unwrap();
+        compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+        link_files(&[&mod_o, &main_o], &binary);
+
+        let result = Command::new(&binary)
+            .output()
+            .expect("binary launch failed");
+        assert!(
+            !result.status.success()
+                && String::from_utf8_lossy(&result.stderr).contains(
+                    "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+                ),
+            "cross-TU CLASS(base) {} did not report the unavailable FINAL context: status={:?} stdout={} stderr={}",
+            case,
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    let main_f90 = dir.join("module_payload_copy.f90");
+    let main_o = dir.join("module_payload_copy.o");
+    let binary = dir.join("module_payload_copy_bin");
+    std::fs::write(
+        &main_f90,
+        "program p\n  use dynamic_base_copy_m\n  implicit none\n  type(module_payload_t) :: source(1)\n  class(base_t), allocatable :: target(:)\n  source(1)%owned = [4]\n  call clone_array_source(source, target)\n  source(1)%owned = [9]\n  select type (target)\n  type is (module_payload_t)\n    if (.not. allocated(target(1)%owned)) error stop 1\n    if (any(target(1)%owned /= [4])) error stop 2\n  class default\n    error stop 3\n  end select\n  print *, 'ok'\nend program\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "cross-TU CLASS(base) array SOURCE did not deep-copy module payload: {}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_zero_sized_class_base_assignment_reports_unavailable_finalizer_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_zero_sized_class_base_assignment_reports_unavailable_finalizer_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("dynamic_zero_assignment.f90");
+    let main_f90 = dir.join("dynamic_zero_assignment_main.f90");
+    let mod_o = dir.join("dynamic_zero_assignment.o");
+    let main_o = dir.join("dynamic_zero_assignment_main.o");
+    let binary = dir.join("dynamic_zero_assignment_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module dynamic_zero_assignment_m\n  implicit none\n  type :: base_t\n    integer :: marker = 1\n  end type\ncontains\n  subroutine copy_zero(source, target)\n    class(base_t), intent(in) :: source(:)\n    class(base_t), allocatable, intent(out) :: target(:)\n    target = source\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use dynamic_zero_assignment_m\n  implicit none\n  type, extends(base_t) :: local_t\n    integer :: payload = 7\n  contains\n    final :: finish\n  end type\n  type(local_t), allocatable :: source(:)\n  class(base_t), allocatable :: target(:)\n  allocate(source(0))\n  call copy_zero(source, target)\n  error stop 97\ncontains\n  subroutine finish(item)\n    type(local_t) :: item\n  end subroutine\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &main_o], &binary);
+    let result = Command::new(&binary)
+        .output()
+        .expect("binary launch failed");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success()
+            && stderr.contains(
+                "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+            )
+            && !stderr.contains("ERROR STOP 97"),
+        "zero-sized CLASS(base) assignment did not reject the unavailable FINAL context before ownership: status={:?} stdout={} stderr={}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_polymorphic_assignment_guards_existing_destination() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_polymorphic_assignment_guards_existing_destination count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("dynamic_replacement.f90");
+    let main_f90 = dir.join("dynamic_replacement_main.f90");
+    let mod_o = dir.join("dynamic_replacement.o");
+    let main_o = dir.join("dynamic_replacement_main.o");
+    let binary = dir.join("dynamic_replacement_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module dynamic_replacement_m\n  implicit none\n  type :: base_t\n    integer :: marker = 1\n  contains\n    final :: finish_base\n  end type\n  type, extends(base_t) :: replacement_t\n    integer :: replacement = 22\n  end type\ncontains\n  subroutine finish_base(item)\n    type(base_t) :: item\n    print *, 'DESTINATION_FINALIZED', item%marker\n  end subroutine\n  subroutine replace_value(target)\n    class(base_t), allocatable, intent(inout) :: target\n    type(replacement_t) :: source\n    target = source\n  end subroutine\n  subroutine replace_array(target)\n    class(base_t), allocatable, intent(inout) :: target(:)\n    type(replacement_t) :: source(1)\n    target = source\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use dynamic_replacement_m\n  implicit none\n  type, extends(base_t) :: local_t\n    integer :: payload = 7\n  contains\n    final :: finish\n  end type\n  type(local_t), allocatable :: target\n  allocate(target)\n  call replace_value(target)\n  error stop 97\ncontains\n  subroutine finish(item)\n    type(local_t) :: item\n  end subroutine\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &main_o], &binary);
+    let result = Command::new(&binary)
+        .output()
+        .expect("binary launch failed");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success()
+            && stderr.contains(
+                "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+            )
+            && !stderr.contains("ERROR STOP 97")
+            && !stdout.contains("DESTINATION_FINALIZED"),
+        "polymorphic assignment replaced a destination with an unavailable FINAL context: status={:?} stdout={} stderr={}",
+        result.status,
+        stdout,
+        stderr
+    );
+
+    let array_main_f90 = dir.join("dynamic_replacement_array_main.f90");
+    let array_main_o = dir.join("dynamic_replacement_array_main.o");
+    let array_binary = dir.join("dynamic_replacement_array_bin");
+    std::fs::write(
+        &array_main_f90,
+        "program p\n  use dynamic_replacement_m\n  implicit none\n  type, extends(base_t) :: local_t\n    integer :: payload = 7\n  contains\n    final :: finish\n  end type\n  type(local_t), allocatable :: target(:)\n  allocate(target(1))\n  call replace_array(target)\n  error stop 97\ncontains\n  subroutine finish(item)\n    type(local_t) :: item\n  end subroutine\nend program\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &array_main_f90, &array_main_o, Some(&dir));
+    link_files(&[&mod_o, &array_main_o], &array_binary);
+    let array_result = Command::new(&array_binary)
+        .output()
+        .expect("array binary launch failed");
+    let array_stdout = String::from_utf8_lossy(&array_result.stdout);
+    let array_stderr = String::from_utf8_lossy(&array_result.stderr);
+    assert!(
+        !array_result.status.success()
+            && array_stderr.contains(
+                "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+            )
+            && !array_stderr.contains("ERROR STOP 97")
+            && !array_stdout.contains("DESTINATION_FINALIZED"),
+        "polymorphic array assignment replaced a destination with an unavailable FINAL context: status={:?} stdout={} stderr={}",
+        array_result.status,
+        array_stdout,
+        array_stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_recursive_class_base_scope_exit_guards_dynamic_lifecycle() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_recursive_class_base_scope_exit_guards_dynamic_lifecycle count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("recursive_owner.f90");
+    let main_f90 = dir.join("recursive_scope_exit.f90");
+    let mod_o = dir.join("recursive_owner.o");
+    let main_o = dir.join("recursive_scope_exit.o");
+    let binary = dir.join("recursive_scope_exit_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module recursive_owner_m\n  implicit none\n  type :: base_t\n    integer :: marker = 1\n  end type\n  type :: node_t\n    class(base_t), allocatable :: value\n    type(node_t), allocatable :: next\n  end type\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use recursive_owner_m\n  implicit none\n  type, extends(base_t) :: local_t\n    integer :: payload = 7\n  contains\n    final :: finish\n  end type\n  block\n    type(node_t), allocatable :: root\n    allocate(root)\n    allocate(root%next)\n    allocate(local_t :: root%next%value)\n    print *, 'READY_FOR_SCOPE_EXIT'\n  end block\n  error stop 97\ncontains\n  subroutine finish(item)\n    type(local_t) :: item\n  end subroutine\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &main_o], &binary);
+    let result = Command::new(&binary)
+        .output()
+        .expect("binary launch failed");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success()
+            && stderr.contains(
+                "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+            )
+            && !stderr.contains("ERROR STOP 97")
+            && stdout.contains("READY_FOR_SCOPE_EXIT"),
+        "recursive CLASS(base) scope cleanup bypassed dynamic lifecycle validation: status={:?} stdout={} stderr={}",
+        result.status,
+        stdout,
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_explicit_bounds_preserve_dynamic_element_size() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_explicit_bounds_preserve_dynamic_element_size count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("dynamic_size.f90");
+    let main_f90 = dir.join("dynamic_size_main.f90");
+    let mod_o = dir.join("dynamic_size.o");
+    let main_o = dir.join("dynamic_size_main.o");
+    let binary = dir.join("dynamic_size_bin");
+
+    std::fs::write(
+        &mod_f90,
+        "module dynamic_size_m\n  implicit none\n  type :: base_t\n    integer :: base = 1\n  end type\n  type, extends(base_t) :: payload_t\n    integer, allocatable :: owned(:)\n  end type\n  type :: holder_t\n    class(base_t), allocatable :: value(:, :)\n  end type\ncontains\n  subroutine clone_bounded_source(source, target)\n    class(base_t), intent(in) :: source(:)\n    class(base_t), allocatable, intent(out) :: target(:)\n    allocate(target(1), source=source)\n  end subroutine\n  subroutine clone_bounded_mold(source, target)\n    class(base_t), intent(in) :: source(:)\n    class(base_t), allocatable, intent(out) :: target(:)\n    allocate(target(1), mold=source)\n  end subroutine\n  subroutine clone_component_mold(source, holder, ok)\n    class(base_t), intent(in) :: source(:, :)\n    type(holder_t), intent(out) :: holder\n    integer, intent(out) :: ok\n    allocate(holder%value(2, 2), mold=source)\n    select type (value => holder%value)\n    type is (payload_t)\n      if (allocated(value(1, 1)%owned)) error stop 7\n      allocate(value(2, 2)%owned(2))\n      value(2, 2)%owned = [8, 9]\n      ok = merge(1, -1, all(value(2, 2)%owned == [8, 9]))\n    class default\n      ok = -2\n    end select\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        "program p\n  use dynamic_size_m\n  implicit none\n  type(payload_t) :: source(1), matrix(2, 2)\n  type(holder_t) :: holder\n  class(base_t), allocatable :: copied(:), shaped(:)\n  integer :: component_ok\n  source(1)%owned = [4, 5]\n  call clone_bounded_source(source, copied)\n  source(1)%owned = [9, 10]\n  select type (copied)\n  type is (payload_t)\n    if (.not. allocated(copied(1)%owned)) error stop 1\n    if (any(copied(1)%owned /= [4, 5])) error stop 2\n  class default\n    error stop 3\n  end select\n  call clone_bounded_mold(source, shaped)\n  select type (shaped)\n  type is (payload_t)\n    if (allocated(shaped(1)%owned)) error stop 4\n    allocate(shaped(1)%owned(2))\n    shaped(1)%owned = [6, 7]\n    if (any(shaped(1)%owned /= [6, 7])) error stop 5\n  class default\n    error stop 6\n  end select\n  call clone_component_mold(matrix, holder, component_ok)\n  if (component_ok /= 1) error stop 8\n  print *, 'ok'\nend program\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&mod_o, &main_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "explicit-bound polymorphic allocation lost the dynamic element size: {}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_polymorphic_release_reports_unavailable_finalizer_context() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_polymorphic_release_reports_unavailable_finalizer_context count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("dynamic_release.f90");
+    let mod_o = dir.join("dynamic_release.o");
+
+    std::fs::write(
+        &mod_f90,
+        "module dynamic_release_m\n  implicit none\n  type :: base_t\n    integer :: value = 1\n  end type\ncontains\n  subroutine clear_star(value)\n    class(*), allocatable, intent(out) :: value\n  end subroutine\n  subroutine clear_base(value)\n    class(base_t), allocatable, intent(out) :: value\n  end subroutine\n  subroutine clear_optional_star(value)\n    class(*), allocatable, optional, intent(out) :: value\n  end subroutine\n  subroutine clear_optional_base(value)\n    class(base_t), allocatable, optional, intent(out) :: value\n  end subroutine\n  subroutine release_star(value)\n    class(*), allocatable, intent(inout) :: value\n    deallocate(value)\n  end subroutine\n  subroutine release_base(value)\n    class(base_t), allocatable, intent(inout) :: value\n    deallocate(value)\n  end subroutine\nend module\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+
+    let cases = [
+        "clear_star",
+        "clear_base",
+        "clear_optional_star",
+        "clear_optional_base",
+        "release_star",
+        "release_base",
+    ];
+    for procedure in cases {
+        let main_f90 = dir.join(format!("{}_main.f90", procedure));
+        let main_o = dir.join(format!("{}_main.o", procedure));
+        let binary = dir.join(format!("{}_bin", procedure));
+        let source = format!(
+            "program p\n  use dynamic_release_m\n  implicit none\n  type, extends(base_t) :: payload_t\n    integer :: marker = 7\n  contains\n    final :: finish\n  end type\n  type(payload_t), allocatable :: value\n  allocate(value)\n  call {}(value)\n  error stop 99\ncontains\n  subroutine finish(item)\n    type(payload_t) :: item\n    if (item%marker < 0) error stop 98\n  end subroutine\nend program\n",
+            procedure
+        );
+        std::fs::write(&main_f90, source).unwrap();
+        compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+        link_files(&[&mod_o, &main_o], &binary);
+
+        let result = Command::new(&binary)
+            .output()
+            .expect("binary launch failed");
+        assert!(
+            !result.status.success()
+                && String::from_utf8_lossy(&result.stderr).contains(
+                    "polymorphic ownership cannot preserve a procedure-local FINAL binding"
+                ),
+            "cross-TU {} did not report the unavailable FINAL context: status={:?} stdout={} stderr={}",
+            procedure,
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_class_star_intent_out_runs_dynamic_finalizers() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=cross_tu_class_star_intent_out_runs_dynamic_finalizers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    multifile_test(
+        "module dynamic_intent_out_m\n  implicit none\n  integer :: finalized = 0\n  integer :: observed_owned = 0\n  type :: payload_t\n    integer, allocatable :: owned(:)\n  contains\n    final :: finish\n  end type\ncontains\n  subroutine finish(item)\n    type(payload_t) :: item\n    finalized = finalized + 1\n    if (allocated(item%owned)) observed_owned = observed_owned + sum(item%owned)\n  end subroutine\n  subroutine clear_star(value)\n    class(*), allocatable, intent(out) :: value\n  end subroutine\n  subroutine clear_optional_star(value)\n    class(*), allocatable, optional, intent(out) :: value\n  end subroutine\nend module\n",
+        "program p\n  use dynamic_intent_out_m\n  implicit none\n  type(payload_t), allocatable :: required, optional\n  allocate(required)\n  required%owned = [2, 3]\n  allocate(optional)\n  optional%owned = [5, 7]\n  call clear_star(required)\n  call clear_optional_star(optional)\n  if (allocated(required)) error stop 1\n  if (allocated(optional)) error stop 2\n  if (finalized /= 2) error stop 3\n  if (observed_owned /= 17) error stop 4\n  print *, 'intent-out-finalized', finalized, observed_owned\nend program\n",
+        "intent-out-finalized 2 17",
+    );
 }
 
 #[test]

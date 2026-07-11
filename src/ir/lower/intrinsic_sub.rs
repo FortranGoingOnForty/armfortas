@@ -206,19 +206,39 @@ pub(crate) fn lower_intrinsic_subroutine(
     let arg_slots = reorder_args_by_keyword_slots(args, name, ctx.st);
     let args = arg_slots.as_slice();
 
+    struct MoveAllocTarget {
+        desc: ValueId,
+        is_string: bool,
+        is_polymorphic: bool,
+        is_unlimited_polymorphic: bool,
+        derived_type: Option<String>,
+    }
+
     fn move_alloc_target(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
         expr: &crate::ast::expr::SpannedExpr,
-    ) -> Option<(ValueId, bool)> {
+    ) -> Option<MoveAllocTarget> {
         match &expr.node {
             Expr::ParenExpr { inner } => move_alloc_target(b, ctx, inner),
             Expr::Name { name } => {
                 let info = ctx.locals.get(&name.to_lowercase())?;
                 if matches!(info.char_kind, CharKind::Deferred) {
-                    Some((string_descriptor_addr(b, info), true))
+                    Some(MoveAllocTarget {
+                        desc: string_descriptor_addr(b, info),
+                        is_string: true,
+                        is_polymorphic: false,
+                        is_unlimited_polymorphic: false,
+                        derived_type: None,
+                    })
                 } else if local_uses_array_descriptor(info) {
-                    Some((array_descriptor_addr(b, info), false))
+                    Some(MoveAllocTarget {
+                        desc: array_descriptor_addr(b, info),
+                        is_string: false,
+                        is_polymorphic: info.is_class,
+                        is_unlimited_polymorphic: info.is_class && info.derived_type.is_none(),
+                        derived_type: info.derived_type.clone(),
+                    })
                 } else {
                     None
                 }
@@ -227,15 +247,42 @@ pub(crate) fn lower_intrinsic_subroutine(
                 if let Some(info) =
                     component_array_local_info(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
                 {
-                    return Some((array_descriptor_addr(b, &info), false));
+                    return Some(MoveAllocTarget {
+                        desc: array_descriptor_addr(b, &info),
+                        is_string: false,
+                        is_polymorphic: info.is_class,
+                        is_unlimited_polymorphic: info.is_class && info.derived_type.is_none(),
+                        derived_type: info.derived_type,
+                    });
                 }
                 resolve_component_field_access(b, &ctx.locals, expr, ctx.st, ctx.type_layouts)
                     .and_then(|(field_ptr, field)| {
                         if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32
                         {
-                            Some((field_ptr, true))
-                        } else if field.allocatable && field.size == 384 {
-                            Some((field_ptr, false))
+                            Some(MoveAllocTarget {
+                                desc: field_ptr,
+                                is_string: true,
+                                is_polymorphic: false,
+                                is_unlimited_polymorphic: false,
+                                derived_type: None,
+                            })
+                        } else if field.allocatable && field.size == 392 {
+                            Some(MoveAllocTarget {
+                                desc: field_ptr,
+                                is_string: false,
+                                is_polymorphic: matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::Class(_)
+                                        | crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ),
+                                is_unlimited_polymorphic: matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ),
+                                derived_type: field_derived_type_name(&field),
+                            })
                         } else {
                             None
                         }
@@ -295,35 +342,72 @@ pub(crate) fn lower_intrinsic_subroutine(
                     None
                 }
             });
-            let Some((from_desc, from_is_string)) =
-                from_expr.and_then(|e| move_alloc_target(b, ctx, e))
-            else {
+            let Some(from) = from_expr.and_then(|e| move_alloc_target(b, ctx, e)) else {
                 eprintln!(
                     "armfortas: error: MOVE_ALLOC source must be a descriptor-backed allocatable variable"
                 );
                 std::process::exit(1);
             };
-            let Some((to_desc, to_is_string)) = to_expr.and_then(|e| move_alloc_target(b, ctx, e))
-            else {
+            let Some(to) = to_expr.and_then(|e| move_alloc_target(b, ctx, e)) else {
                 eprintln!(
                     "armfortas: error: MOVE_ALLOC destination must be a descriptor-backed allocatable variable"
                 );
                 std::process::exit(1);
             };
-            if from_is_string != to_is_string {
+            if from.is_string != to.is_string {
                 eprintln!(
                     "armfortas: error: MOVE_ALLOC source and destination must use matching descriptor kinds"
                 );
                 std::process::exit(1);
             }
-            let runtime = if from_is_string {
+            if to.is_polymorphic {
+                require_context_free_dynamic_lifecycle(b, from.desc);
+            }
+            if to.is_unlimited_polymorphic {
+                let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, stat_addr);
+                let finalize = b.const_i32(1);
+                release_unlimited_polymorphic_allocatable_descriptor(
+                    b, to.desc, stat_addr, finalize,
+                );
+            } else if let Some(layout) = to
+                .derived_type
+                .as_deref()
+                .and_then(|type_name| ctx.type_layouts.get(type_name))
+            {
+                if to.is_polymorphic {
+                    require_context_free_dynamic_lifecycle(b, to.desc);
+                }
+                finalize_derived_descriptor_storage_if_allocated(
+                    b,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    &ctx.locals,
+                    to.desc,
+                    layout,
+                    ctx.type_layouts,
+                );
+                let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, stat_addr);
+                deallocate_derived_descriptor_components(
+                    b,
+                    to.desc,
+                    layout,
+                    ctx.type_layouts,
+                    stat_addr,
+                );
+            }
+            let runtime = if from.is_string {
                 "afs_move_alloc_string"
             } else {
                 "afs_move_alloc"
             };
             b.call(
                 FuncRef::External(runtime.into()),
-                vec![from_desc, to_desc],
+                vec![from.desc, to.desc],
                 IrType::Void,
             );
             true
@@ -764,7 +848,7 @@ pub(crate) fn lower_intrinsic_subroutine(
             //
             // Scalar pointers store the raw address directly into the
             // pointer slot. Array pointers are descriptor-backed in
-            // armfortas, so we must populate the 384-byte descriptor
+            // armfortas, so we must populate the 392-byte descriptor
             // with base_addr/elem_size/rank/bounds instead of
             // treating the second argument like a plain Ptr<T>.
             let raw_cptr = nth_arg_val(b, ctx, args, 0, 0);
@@ -787,10 +871,10 @@ pub(crate) fn lower_intrinsic_subroutine(
                 {
                     if descriptor_backed {
                         let zero32 = b.const_i32(0);
-                        let sz384 = b.const_i64(384);
+                        let descriptor_bytes = b.const_i64(392);
                         b.call(
                             FuncRef::External("memset".into()),
-                            vec![target_addr, zero32, sz384],
+                            vec![target_addr, zero32, descriptor_bytes],
                             IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                         );
 

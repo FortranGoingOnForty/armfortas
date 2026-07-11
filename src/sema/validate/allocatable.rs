@@ -122,16 +122,18 @@ pub(super) fn leaf_field_layout<'a>(
     }
     let sym = ctx.lookup(base_name)?;
     let base_type = match sym.type_info.as_ref()? {
-        crate::sema::symtab::TypeInfo::Derived(name) => name.clone(),
+        crate::sema::symtab::TypeInfo::Derived(name)
+        | crate::sema::symtab::TypeInfo::Class(name) => name.clone(),
         _ => return None,
     };
     let mut ancestor_is_target = sym.attrs.target;
     let mut ancestor_is_allocatable = sym.attrs.allocatable;
-    let mut current_type = base_type;
+    let mut current_layout = layouts
+        .get_for_scope(ctx.scope_id, &base_type)
+        .or_else(|| layouts.get(&base_type))?;
     let mut leaf: Option<&crate::sema::type_layout::FieldLayout> = None;
     for (i, comp) in chain.iter().enumerate() {
-        let layout = layouts.get(&current_type)?;
-        let field = layout.field(comp)?;
+        let field = current_layout.field(comp)?;
         let is_terminal = i + 1 == chain.len();
         if !is_terminal {
             if field.target {
@@ -142,8 +144,13 @@ pub(super) fn leaf_field_layout<'a>(
             }
         }
         leaf = Some(field);
-        if let crate::sema::symtab::TypeInfo::Derived(name) = &field.type_info {
-            current_type = name.clone();
+        if !is_terminal {
+            let (crate::sema::symtab::TypeInfo::Derived(name)
+            | crate::sema::symtab::TypeInfo::Class(name)) = &field.type_info
+            else {
+                return None;
+            };
+            current_layout = layouts.get_related(current_layout, name)?;
         }
     }
     leaf.map(|field| LeafComponent {
