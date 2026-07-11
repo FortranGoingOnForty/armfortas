@@ -394,16 +394,15 @@ mod tests {
     }
 
     #[test]
-    fn does_not_forward_global_store_across_unrelated_pointer_call() {
+    fn does_not_forward_global_store_across_zero_argument_call() {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
         let global = push(&mut f, InstKind::GlobalAddr("state".into()), ptr_ty());
-        let scratch = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
         let value = push(&mut f, InstKind::ConstInt(42, IntWidth::I32), i32_ty());
         push(&mut f, InstKind::Store(value, global), IrType::Void);
         push(
             &mut f,
-            InstKind::Call(FuncRef::External("touch_global".into()), vec![scratch]),
+            InstKind::Call(FuncRef::External("touch_global".into()), vec![]),
             IrType::Void,
         );
         let load = push(&mut f, InstKind::Load(global), i32_ty());

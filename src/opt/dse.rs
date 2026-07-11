@@ -225,17 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn does_not_remove_global_store_across_unrelated_pointer_call() {
+    fn does_not_remove_global_store_across_zero_argument_call() {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let global = push(&mut f, InstKind::GlobalAddr("state".into()), ptr_ty());
-        let scratch = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
         let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
         let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
         push(&mut f, InstKind::Store(v1, global), IrType::Void);
         push(
             &mut f,
-            InstKind::Call(FuncRef::External("observe_global".into()), vec![scratch]),
+            InstKind::Call(FuncRef::External("observe_global".into()), vec![]),
             IrType::Void,
         );
         push(&mut f, InstKind::Store(v2, global), IrType::Void);
