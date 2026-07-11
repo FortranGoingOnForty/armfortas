@@ -13,7 +13,7 @@
 //! element accesses. This pass removes the checks when the index is
 //! provably safe.
 
-use super::loop_utils::{find_preheader, resolve_const_int};
+use super::loop_utils::find_preheader;
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::{find_natural_loops, predecessors};
@@ -79,7 +79,7 @@ fn is_provably_safe(
     lower: ValueId,
     upper: ValueId,
 ) -> bool {
-    let index = strip_int_casts(func, index);
+    let index = strip_value_preserving_int_extends(func, index);
 
     // Case 1: constant index, constant bounds.
     if let (Some(idx), Some(lo), Some(hi)) = (
@@ -166,7 +166,7 @@ fn loop_index_range(
 ///  * `imul lhs, const` / `imul const, rhs` → multiplies both scale
 ///    and offset, capturing `(2*i) + 3 = 2*i + 3` and `2*(i+1) = 2*i + 2`.
 fn loop_index_base_and_offset(func: &Function, value: ValueId) -> Option<(ValueId, i64, i64)> {
-    let value = strip_int_casts(func, value);
+    let value = strip_value_preserving_int_extends(func, value);
     let Some(kind) = find_inst_kind(func, value) else {
         return Some((value, 1, 0));
     };
@@ -311,7 +311,7 @@ fn edge_arg_value(term: &Terminator, target: BlockId, param_idx: usize) -> Optio
 }
 
 fn update_step_const(func: &Function, index: ValueId, next: ValueId) -> Option<i64> {
-    let next = strip_int_casts(func, next);
+    let next = strip_value_preserving_int_extends(func, next);
     if next == index {
         return Some(0);
     }
@@ -335,23 +335,59 @@ fn update_step_const(func: &Function, index: ValueId, next: ValueId) -> Option<i
 }
 
 fn resolve_int_scalar(func: &Function, value: ValueId) -> Option<i64> {
+    i64::try_from(resolve_int_scalar_i128(func, value)?).ok()
+}
+
+fn resolve_int_scalar_i128(func: &Function, value: ValueId) -> Option<i128> {
     let kind = find_inst_kind(func, value)?;
     match kind {
-        InstKind::ConstInt(v, _) => i64::try_from(*v).ok(),
-        InstKind::IntExtend(src, _, _) | InstKind::IntTrunc(src, _) => {
-            resolve_int_scalar(func, *src)
+        InstKind::ConstInt(v, width) => Some(normalize_signed_int(*v, *width)),
+        InstKind::IntExtend(src, _, true) => resolve_int_scalar_i128(func, *src),
+        InstKind::IntExtend(src, _, false) => {
+            let source_width = func.value_type(*src)?.int_width()?;
+            resolve_int_scalar_i128(func, *src)
+                .map(|source| mask_int_to_width(source, source_width))
         }
-        _ => resolve_const_int(func, value),
+        InstKind::IntTrunc(src, width) => {
+            resolve_int_scalar_i128(func, *src).map(|source| normalize_signed_int(source, *width))
+        }
+        _ => None,
     }
 }
 
-fn strip_int_casts(func: &Function, mut value: ValueId) -> ValueId {
+fn normalize_signed_int(value: i128, width: crate::ir::types::IntWidth) -> i128 {
+    let bits = width.bits();
+    if bits == 128 {
+        value
+    } else {
+        let shift = 128 - bits;
+        (value << shift) >> shift
+    }
+}
+
+fn mask_int_to_width(value: i128, width: crate::ir::types::IntWidth) -> i128 {
+    let bits = width.bits();
+    if bits == 128 {
+        value
+    } else {
+        value & ((1_i128 << bits) - 1)
+    }
+}
+
+fn strip_value_preserving_int_extends(func: &Function, mut value: ValueId) -> ValueId {
     loop {
         let Some(kind) = find_inst_kind(func, value) else {
             return value;
         };
         match kind {
-            InstKind::IntExtend(src, _, _) | InstKind::IntTrunc(src, _) => value = *src,
+            InstKind::IntExtend(src, target_width, true)
+                if func
+                    .value_type(*src)
+                    .and_then(|ty| ty.int_width())
+                    .is_some_and(|source_width| source_width.bits() < target_width.bits()) =>
+            {
+                value = *src;
+            }
             _ => return value,
         }
     }
@@ -440,6 +476,79 @@ mod tests {
             .iter()
             .any(|i| matches!(i.kind, InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)));
         assert!(!has_check, "CheckBounds should be removed");
+    }
+
+    #[test]
+    fn bce_keeps_narrowed_constant_out_of_bounds() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let wide = f.next_value_id();
+        f.register_type(wide, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: wide,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(129, IntWidth::I32),
+        });
+        let narrow = f.next_value_id();
+        f.register_type(narrow, IrType::Int(IntWidth::I8));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: narrow,
+            ty: IrType::Int(IntWidth::I8),
+            span,
+            kind: InstKind::IntTrunc(wide, IntWidth::I8),
+        });
+        let index = f.next_value_id();
+        f.register_type(index, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: index,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::IntExtend(narrow, IntWidth::I64, true),
+        });
+        let lo = f.next_value_id();
+        f.register_type(lo, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: lo,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let hi = f.next_value_id();
+        f.register_type(hi, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: hi,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(200, IntWidth::I64),
+        });
+        let check = f.next_value_id();
+        f.register_type(check, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: check,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::RuntimeCall(RuntimeFunc::CheckBounds, vec![index, lo, hi]),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        assert_eq!(
+            resolve_int_scalar(&f, narrow),
+            Some(-127),
+            "constant truncation must use the destination width"
+        );
+        m.add_function(f);
+
+        let pass = Bce;
+        assert!(
+            !pass.run(&mut m),
+            "narrowing 129 to i8 produces -127, so the bounds check must remain"
+        );
     }
 
     #[test]
