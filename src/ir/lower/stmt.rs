@@ -6787,30 +6787,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             };
                             let elem_size_bytes =
                                 local_storage_size_bytes(&field_info, ctx.type_layouts, ctx.layout);
-                            let size_val = b.const_i32(elem_size_bytes as i32);
-                            let ptr = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![size_val],
-                                IrType::Ptr(Box::new(field_info.ty.clone())),
+                            let size_val = b.const_i64(elem_size_bytes);
+                            b.call(
+                                FuncRef::External("afs_allocate_scalar".into()),
+                                vec![field_ptr, size_val, runtime_stat_arg],
+                                IrType::Void,
                             );
-                            b.store(ptr, field_ptr);
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
+                            );
                             if let Some(type_name) = &field_info.derived_type {
                                 if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    let base_ptr = b.load_typed(
+                                    emit_allocatable_default_init_on_success(
+                                        b,
+                                        stat_addr,
                                         field_ptr,
-                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                    );
-                                    if derived_layout_needs_runtime_initialization(
                                         layout,
+                                        false,
                                         ctx.type_layouts,
-                                    ) {
-                                        initialize_derived_storage(
-                                            b,
-                                            base_ptr,
-                                            layout,
-                                            ctx.type_layouts,
-                                        );
-                                    }
+                                    );
                                 }
                             }
                             continue;
@@ -7262,13 +7260,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 }
                             }
                         } else {
-                            // Non-allocatable array: old path (shouldn't happen for ALLOCATE).
-                            let size_val = b.const_i32(elem_size_bytes as i32);
-                            let ptr = b.runtime_call(
-                                RuntimeFunc::Allocate,
-                                vec![size_val],
-                                IrType::Ptr(Box::new(info.ty.clone())),
-                            );
+                            // Scalar pointers use raw pointer slots rather than descriptors.
                             let slot = if info.is_pointer && info.by_ref {
                                 b.load_typed(
                                     info.addr,
@@ -7277,24 +7269,38 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 info.addr
                             };
-                            b.store(ptr, slot);
+                            if info.is_pointer {
+                                let size_val = b.const_i64(elem_size_bytes);
+                                b.call(
+                                    FuncRef::External("afs_allocate_scalar".into()),
+                                    vec![slot, size_val, runtime_stat_arg],
+                                    IrType::Void,
+                                );
+                                emit_runtime_errmsg_on_failure(
+                                    b,
+                                    stat_addr,
+                                    errmsg_target.as_ref(),
+                                    "ALLOCATE failed",
+                                );
+                            } else {
+                                let size_val = b.const_i32(elem_size_bytes as i32);
+                                let ptr = b.runtime_call(
+                                    RuntimeFunc::Allocate,
+                                    vec![size_val],
+                                    IrType::Ptr(Box::new(info.ty.clone())),
+                                );
+                                b.store(ptr, slot);
+                            }
                             if let Some(type_name) = &info.derived_type {
                                 if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    let base_ptr = b.load_typed(
+                                    emit_allocatable_default_init_on_success(
+                                        b,
+                                        stat_addr,
                                         slot,
-                                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                                    );
-                                    if derived_layout_needs_runtime_initialization(
                                         layout,
+                                        false,
                                         ctx.type_layouts,
-                                    ) {
-                                        initialize_derived_storage(
-                                            b,
-                                            base_ptr,
-                                            layout,
-                                            ctx.type_layouts,
-                                        );
-                                    }
+                                    );
                                 }
                             }
                         }
@@ -7316,8 +7322,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i64(0)
             };
+            let zero_i32 = b.const_i32(0);
+            b.store(zero_i32, stat_addr);
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
-            for item in items {
+            let deallocate_done_bb = b.create_block("deallocate_done");
+            for (item_idx, item) in items.iter().enumerate() {
+                if item_idx > 0 {
+                    let item_stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+                    let zero_i32 = b.const_i32(0);
+                    let item_ok = b.icmp(CmpOp::Eq, item_stat, zero_i32);
+                    let deallocate_item_bb = b.create_block("deallocate_item");
+                    b.cond_branch(
+                        item_ok,
+                        deallocate_item_bb,
+                        vec![],
+                        deallocate_done_bb,
+                        vec![],
+                    );
+                    b.set_block(deallocate_item_bb);
+                }
                 if let Expr::ComponentAccess { .. } = &item.node {
                     if let Some((field_ptr, field_owner, field)) =
                         resolve_component_field_access_with_owner(
@@ -7350,8 +7373,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         | crate::sema::symtab::TypeInfo::TypeStar
                                 ) {
                                     let finalize = b.const_i32(1);
-                                    release_unlimited_polymorphic_allocatable_descriptor(
-                                        b, field_ptr, stat_addr, finalize,
+                                    release_unlimited_polymorphic_allocatable_descriptor_checked(
+                                        b,
+                                        field_ptr,
+                                        stat_addr,
+                                        runtime_stat_arg,
+                                        finalize,
                                     );
                                     emit_runtime_errmsg_on_failure(
                                         b,
@@ -7440,8 +7467,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             let desc = array_descriptor_addr(b, info);
                             if is_unlimited_polymorphic_local(info) {
                                 let finalize = b.const_i32(1);
-                                release_unlimited_polymorphic_allocatable_descriptor(
-                                    b, desc, stat_addr, finalize,
+                                release_unlimited_polymorphic_allocatable_descriptor_checked(
+                                    b,
+                                    desc,
+                                    stat_addr,
+                                    runtime_stat_arg,
+                                    finalize,
                                 );
                             } else {
                                 if info.is_class {
@@ -7507,6 +7538,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
             }
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(deallocate_done_bb, vec![]);
+            }
+            b.set_block(deallocate_done_bb);
             super::core::emit_allocate_status_writeback(b, &dealloc_stat_target);
         }
 

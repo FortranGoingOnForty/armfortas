@@ -1015,3 +1015,213 @@ fn move_alloc_success_sets_status_for_all_descriptor_families() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn repeated_scalar_pointer_allocation_reports_status_and_preserves_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_pointer_allocation_reports_status_and_preserves_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("scalar_pointer_repeat");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: value\n  end type box_t\n  type(box_t) :: box\n  integer, pointer :: scalar\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  scalar = 17\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (.not. associated(scalar)) error stop 4\n  if (scalar /= 17) error stop 5\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 6\n  ios = 99\n  msg = 'unchanged'\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 7\n  if (trim(msg) /= 'unchanged') error stop 8\n  box%value = 23\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 9\n  if (.not. associated(box%value)) error stop 10\n  if (box%value /= 23) error stop 11\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 12\n  deallocate(scalar)\n  deallocate(box%value)\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("scalar_pointer_repeat.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("scalar pointer allocation runtime failed");
+    assert!(
+        run.status.success(),
+        "scalar pointer status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeated_scalar_pointer_allocation_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_pointer_allocation_without_stat_terminates count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let cases = [
+        (
+            "local",
+            "program p\n  integer, pointer :: value\n  allocate(value)\n  allocate(value)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component",
+            "program p\n  type :: box_t\n    integer, pointer :: value\n  end type box_t\n  type(box_t) :: box\n  allocate(box%value)\n  allocate(box%value)\n  print *, 'survived'\nend program\n",
+        ),
+    ];
+
+    for (name, source) in cases {
+        let dir = unique_dir(&format!("scalar_pointer_repeat_loud_{name}"));
+        let src = write_program_in(&dir, "main.f90", source);
+        let exe = dir.join("main.bin");
+        let compile = compile_program(&src, &exe);
+        assert!(
+            compile.status.success(),
+            "{name} compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&exe)
+            .output()
+            .expect("repeated scalar pointer allocation runtime failed");
+        assert!(
+            !run.status.success(),
+            "{name} repeated pointer ALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("ALLOCATE"),
+            "{name} failure did not identify ALLOCATE: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn multi_object_deallocate_preserves_first_failure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=multi_object_deallocate_preserves_first_failure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("deallocate_first_failure");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: missing(:), values(:)\n  character(len=:), allocatable :: missing_text, text\n  integer, pointer :: missing_ptr, value_ptr\n  integer :: ios\n  character(len=64) :: msg\n  allocate(values(1))\n  msg = 'unchanged'\n  deallocate(missing, values, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 1\n  if (.not. allocated(values)) error stop 2\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 3\n  allocate(character(len=3) :: text)\n  msg = 'unchanged'\n  deallocate(missing_text, text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 4\n  if (.not. allocated(text)) error stop 5\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 6\n  allocate(value_ptr)\n  msg = 'unchanged'\n  deallocate(missing_ptr, value_ptr, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 7\n  if (.not. associated(value_ptr)) error stop 8\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 9\n  deallocate(values)\n  deallocate(text)\n  deallocate(value_ptr)\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("deallocate_first_failure.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("multi-object DEALLOCATE runtime failed");
+    assert!(
+        run.status.success(),
+        "multi-object DEALLOCATE lost its first failure: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unallocated_unlimited_polymorphic_deallocate_reports_failure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=unallocated_unlimited_polymorphic_deallocate_reports_failure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("class_star_deallocate_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    class(*), allocatable :: value\n  end type box_t\n  type(box_t) :: box\n  class(*), allocatable :: value\n  integer :: ios\n  character(len=64) :: msg\n  ios = 0\n  msg = 'unchanged'\n  deallocate(value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 1\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 2\n  ios = 0\n  msg = 'unchanged'\n  deallocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 4\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("class_star_deallocate_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("unallocated class-star DEALLOCATE runtime failed");
+    assert!(
+        run.status.success(),
+        "class-star DEALLOCATE status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unallocated_unlimited_polymorphic_deallocate_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=unallocated_unlimited_polymorphic_deallocate_without_stat_terminates count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let cases = [
+        (
+            "local",
+            "program p\n  class(*), allocatable :: value\n  deallocate(value)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component",
+            "program p\n  type :: box_t\n    class(*), allocatable :: value\n  end type box_t\n  type(box_t) :: box\n  deallocate(box%value)\n  print *, 'survived'\nend program\n",
+        ),
+    ];
+
+    for (name, source) in cases {
+        let dir = unique_dir(&format!("class_star_deallocate_loud_{name}"));
+        let src = write_program_in(&dir, "main.f90", source);
+        let exe = dir.join("main.bin");
+        let compile = compile_program(&src, &exe);
+        assert!(
+            compile.status.success(),
+            "{name} compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&exe)
+            .output()
+            .expect("unallocated class-star DEALLOCATE runtime failed");
+        assert!(
+            !run.status.success(),
+            "{name} unallocated class-star DEALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
+            "{name} failure did not identify DEALLOCATE: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

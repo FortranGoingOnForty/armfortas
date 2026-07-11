@@ -29,6 +29,54 @@ pub extern "C" fn afs_allocate(size: i64) -> *mut u8 {
     ptr
 }
 
+/// Allocate storage for an explicit scalar allocatable or pointer.
+///
+/// The destination slot is published only on success. An existing allocation
+/// or association is reported through STAT when present and terminates
+/// execution otherwise.
+#[no_mangle]
+pub extern "C" fn afs_allocate_scalar(slot: *mut *mut u8, size: i64, stat: *mut i32) {
+    let fail = |code, message: &str| {
+        if !stat.is_null() {
+            unsafe {
+                *stat = code;
+            }
+            return;
+        }
+        eprintln!("ALLOCATE: {message}");
+        std::process::exit(1);
+    };
+
+    if slot.is_null() {
+        fail(1, "null scalar allocation slot");
+        return;
+    }
+    if !unsafe { *slot }.is_null() {
+        fail(2, "scalar is already allocated or associated");
+        return;
+    }
+    let Ok(size) = usize::try_from(size) else {
+        fail(4, "allocation byte count is invalid");
+        return;
+    };
+    if size == 0 {
+        fail(4, "allocation byte count is invalid");
+        return;
+    }
+
+    let allocation = unsafe { malloc(size) };
+    if allocation.is_null() {
+        fail(3, "out of memory");
+        return;
+    }
+    unsafe {
+        *slot = allocation;
+        if !stat.is_null() {
+            *stat = 0;
+        }
+    }
+}
+
 /// Deallocate memory previously allocated by afs_allocate.
 #[no_mangle]
 pub extern "C" fn afs_deallocate(ptr: *mut u8) {
@@ -125,4 +173,39 @@ pub extern "C" fn afs_string_compare(a: *const u8, alen: i64, b: *const u8, blen
         &[]
     };
     sa.cmp(sb) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_allocation_preserves_an_existing_target_on_failure() {
+        let mut slot = ptr::null_mut();
+        let mut stat = 99;
+
+        afs_allocate_scalar(&mut slot, 8, &mut stat);
+        assert_eq!(stat, 0);
+        assert!(!slot.is_null());
+        let original = slot;
+
+        afs_allocate_scalar(&mut slot, 8, &mut stat);
+        assert_eq!(stat, 2);
+        assert_eq!(slot, original);
+
+        afs_deallocate_pointer(&mut slot, &mut stat);
+        assert_eq!(stat, 0);
+        assert!(slot.is_null());
+    }
+
+    #[test]
+    fn scalar_allocation_rejects_invalid_sizes_without_publishing_a_target() {
+        let mut slot = ptr::null_mut();
+        let mut stat = 99;
+
+        afs_allocate_scalar(&mut slot, 0, &mut stat);
+
+        assert_eq!(stat, 4);
+        assert!(slot.is_null());
+    }
 }

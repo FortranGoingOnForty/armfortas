@@ -56052,6 +56052,40 @@ pub(super) fn release_unlimited_polymorphic_allocatable_descriptor(
     b.set_block(done_bb);
 }
 
+pub(super) fn release_unlimited_polymorphic_allocatable_descriptor_checked(
+    b: &mut FuncBuilder,
+    desc: ValueId,
+    stat_addr: ValueId,
+    runtime_stat_arg: ValueId,
+    finalize: ValueId,
+) {
+    let allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero_i32 = b.const_i32(0);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero_i32);
+    let present_bb = b.create_block("class_star_checked_release_present");
+    let missing_bb = b.create_block("class_star_checked_release_missing");
+    let done_bb = b.create_block("class_star_checked_release_done");
+    b.cond_branch(is_allocated, present_bb, vec![], missing_bb, vec![]);
+
+    b.set_block(present_bb);
+    release_unlimited_polymorphic_allocatable_descriptor(b, desc, stat_addr, finalize);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(missing_bb);
+    b.call(
+        FuncRef::External("afs_deallocate_array".into()),
+        vec![desc, runtime_stat_arg],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
+}
+
 pub(super) fn copy_unlimited_polymorphic_allocatable_descriptor(
     b: &mut FuncBuilder,
     dest_desc: ValueId,
