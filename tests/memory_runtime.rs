@@ -34,6 +34,35 @@ fn compile_program(source: &std::path::Path, output: &std::path::Path) -> std::p
         .expect("failed to spawn armfortas compile")
 }
 
+fn assert_program_terminates(stem: &str, source: &str, operation: &str) {
+    let dir = unique_dir(stem);
+    let src = write_program_in(&dir, "main.f90", source);
+    let exe = dir.join("main.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "{stem} compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .unwrap_or_else(|error| panic!("{stem} runtime failed to launch: {error}"));
+    assert!(
+        !run.status.success(),
+        "{stem} unexpectedly returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains(operation),
+        "{stem} failure did not identify {operation}: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn allocate_stat_errmsg_populates_fixed_character_target() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
@@ -134,41 +163,25 @@ fn allocate_stat_errmsg_populates_deferred_character_target() {
 fn allocate_failure_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=allocate_failure_without_stat_terminates count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_failure_without_stat_terminates count=2 reason=\"{}\"",
             reason
         );
         return;
     }
-    let dir = unique_dir("alloc_failure_loud");
-    let src = write_program_in(
-        &dir,
-        "main.f90",
-        "program p\n  implicit none\n  integer, allocatable :: a(:)\n  allocate(a(2))\n  allocate(a(2))\n  print *, 'survived'\nend program\n",
-    );
-    let exe = dir.join("alloc_failure_loud.bin");
-    let compile = compile_program(&src, &exe);
-    assert!(
-        compile.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
+    let cases = [
+        (
+            "local",
+            "program p\n  implicit none\n  integer, allocatable :: a(:)\n  allocate(a(2))\n  allocate(a(2))\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component",
+            "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: values(:)\n  end type box_t\n  type(box_t) :: box\n  allocate(box%values(2))\n  allocate(box%values(2))\n  print *, 'survived'\nend program\n",
+        ),
+    ];
 
-    let run = Command::new(&exe)
-        .output()
-        .expect("allocation failure runtime failed");
-    assert!(
-        !run.status.success(),
-        "allocation failure without STAT= returned success:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&run.stderr).contains("ALLOCATE"),
-        "allocation failure did not report its operation:\n{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
+    for (name, source) in cases {
+        assert_program_terminates(&format!("alloc_failure_loud_{name}"), source, "ALLOCATE");
+    }
 }
 
 #[test]
@@ -283,44 +296,70 @@ fn deallocate_stat_errmsg_reports_unallocated_array() {
 }
 
 #[test]
-fn deallocate_unallocated_without_stat_terminates() {
+fn descriptor_component_allocation_and_deallocation_report_status() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unallocated_without_stat_terminates count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=descriptor_component_allocation_and_deallocation_report_status count=1 reason=\"{}\"",
             reason
         );
         return;
     }
-    let dir = unique_dir("dealloc_unallocated_loud");
+    let dir = unique_dir("descriptor_component_status");
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  integer, allocatable :: a(:)\n  allocate(a(2))\n  deallocate(a)\n  deallocate(a)\n  print *, 'survived'\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: values(:)\n  end type box_t\n  type(box_t) :: box\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(box%values(2), stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (.not. allocated(box%values)) error stop 2\n  if (trim(msg) /= 'unchanged') error stop 3\n  box%values = [11, 12]\n  allocate(box%values(3), stat=ios, errmsg=msg)\n  if (ios == 0) error stop 4\n  if (size(box%values) /= 2) error stop 5\n  if (any(box%values /= [11, 12])) error stop 6\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 7\n  ios = 99\n  msg = 'unchanged'\n  deallocate(box%values, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 8\n  if (allocated(box%values)) error stop 9\n  if (trim(msg) /= 'unchanged') error stop 10\n  deallocate(box%values, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 11\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 12\n  print *, 'ok'\nend program\n",
     );
-    let exe = dir.join("dealloc_unallocated_loud.bin");
+    let exe = dir.join("descriptor_component_status.bin");
     let compile = compile_program(&src, &exe);
     assert!(
         compile.status.success(),
-        "compile failed: {}",
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
         String::from_utf8_lossy(&compile.stderr)
     );
 
     let run = Command::new(&exe)
         .output()
-        .expect("unallocated deallocation runtime failed");
+        .expect("descriptor component status runtime failed");
     assert!(
-        !run.status.success(),
-        "unallocated DEALLOCATE without STAT= returned success:\nstdout:\n{}\nstderr:\n{}",
+        run.status.success(),
+        "descriptor component status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
         String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
-        "unallocated deallocation did not report its operation:\n{}",
         String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deallocate_unallocated_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unallocated_without_stat_terminates count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let cases = [
+        (
+            "local",
+            "program p\n  implicit none\n  integer, allocatable :: a(:)\n  allocate(a(2))\n  deallocate(a)\n  deallocate(a)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component",
+            "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: values(:)\n  end type box_t\n  type(box_t) :: box\n  allocate(box%values(2))\n  deallocate(box%values)\n  deallocate(box%values)\n  print *, 'survived'\nend program\n",
+        ),
+    ];
+
+    for (name, source) in cases {
+        assert_program_terminates(
+            &format!("dealloc_unallocated_loud_{name}"),
+            source,
+            "DEALLOCATE",
+        );
+    }
 }
 
 #[test]
@@ -401,82 +440,74 @@ fn deallocate_stat_errmsg_handles_pointer_paths() {
 fn deallocate_unallocated_deferred_character_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unallocated_deferred_character_without_stat_terminates count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unallocated_deferred_character_without_stat_terminates count=4 reason=\"{}\"",
             reason
         );
         return;
     }
-    let dir = unique_dir("dealloc_deferred_char_loud");
-    let src = write_program_in(
-        &dir,
-        "main.f90",
-        "program p\n  implicit none\n  character(len=:), allocatable :: text\n  allocate(character(len=3) :: text)\n  deallocate(text)\n  deallocate(text)\n  print *, 'survived'\nend program\n",
-    );
-    let exe = dir.join("dealloc_deferred_char_loud.bin");
-    let compile = compile_program(&src, &exe);
-    assert!(
-        compile.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
+    let cases = [
+        (
+            "local_allocatable",
+            "program p\n  implicit none\n  character(len=:), allocatable :: text\n  allocate(character(len=3) :: text)\n  deallocate(text)\n  deallocate(text)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_allocatable",
+            "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: text\n  end type box_t\n  type(box_t) :: box\n  allocate(character(len=3) :: box%text)\n  deallocate(box%text)\n  deallocate(box%text)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "local_pointer",
+            "program p\n  implicit none\n  character(len=:), pointer :: text\n  allocate(character(len=3) :: text)\n  deallocate(text)\n  deallocate(text)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_pointer",
+            "program p\n  implicit none\n  type :: box_t\n    character(len=:), pointer :: text\n  end type box_t\n  type(box_t) :: box\n  allocate(character(len=3) :: box%text)\n  deallocate(box%text)\n  deallocate(box%text)\n  print *, 'survived'\nend program\n",
+        ),
+    ];
 
-    let run = Command::new(&exe)
-        .output()
-        .expect("deferred character failure runtime failed");
-    assert!(
-        !run.status.success(),
-        "unallocated deferred character DEALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
-        "deferred character failure did not report its operation:\n{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
+    for (name, source) in cases {
+        assert_program_terminates(
+            &format!("dealloc_deferred_char_loud_{name}"),
+            source,
+            "DEALLOCATE",
+        );
+    }
 }
 
 #[test]
 fn deallocate_unassociated_pointer_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unassociated_pointer_without_stat_terminates count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unassociated_pointer_without_stat_terminates count=4 reason=\"{}\"",
             reason
         );
         return;
     }
-    let dir = unique_dir("dealloc_pointer_loud");
-    let src = write_program_in(
-        &dir,
-        "main.f90",
-        "program p\n  implicit none\n  integer, pointer :: value\n  allocate(value)\n  deallocate(value)\n  deallocate(value)\n  print *, 'survived'\nend program\n",
-    );
-    let exe = dir.join("dealloc_pointer_loud.bin");
-    let compile = compile_program(&src, &exe);
-    assert!(
-        compile.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
+    let cases = [
+        (
+            "local_scalar",
+            "program p\n  implicit none\n  integer, pointer :: value\n  allocate(value)\n  deallocate(value)\n  deallocate(value)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_scalar",
+            "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: value\n  end type box_t\n  type(box_t) :: box\n  allocate(box%value)\n  deallocate(box%value)\n  deallocate(box%value)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "local_array",
+            "program p\n  implicit none\n  integer, pointer :: values(:)\n  allocate(values(2))\n  deallocate(values)\n  deallocate(values)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_array",
+            "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: values(:)\n  end type box_t\n  type(box_t) :: box\n  allocate(box%values(2))\n  deallocate(box%values)\n  deallocate(box%values)\n  print *, 'survived'\nend program\n",
+        ),
+    ];
 
-    let run = Command::new(&exe)
-        .output()
-        .expect("pointer failure runtime failed");
-    assert!(
-        !run.status.success(),
-        "unassociated pointer DEALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
-        "pointer failure did not report its operation:\n{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
+    for (name, source) in cases {
+        assert_program_terminates(
+            &format!("dealloc_pointer_loud_{name}"),
+            source,
+            "DEALLOCATE",
+        );
+    }
 }
 
 #[test]
@@ -520,41 +551,37 @@ fn allocate_allocated_deferred_character_reports_status() {
 fn allocate_allocated_deferred_character_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=allocate_allocated_deferred_character_without_stat_terminates count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_allocated_deferred_character_without_stat_terminates count=4 reason=\"{}\"",
             reason
         );
         return;
     }
-    let dir = unique_dir("alloc_deferred_char_repeat_loud");
-    let src = write_program_in(
-        &dir,
-        "main.f90",
-        "program p\n  implicit none\n  character(len=:), allocatable :: text\n  allocate(character(len=3) :: text)\n  allocate(character(len=5) :: text)\n  print *, 'survived'\nend program\n",
-    );
-    let exe = dir.join("alloc_deferred_char_repeat_loud.bin");
-    let compile = compile_program(&src, &exe);
-    assert!(
-        compile.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
+    let cases = [
+        (
+            "local_allocatable",
+            "program p\n  implicit none\n  character(len=:), allocatable :: text\n  allocate(character(len=3) :: text)\n  allocate(character(len=5) :: text)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_allocatable",
+            "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: text\n  end type box_t\n  type(box_t) :: box\n  allocate(character(len=3) :: box%text)\n  allocate(character(len=5) :: box%text)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "local_pointer",
+            "program p\n  implicit none\n  character(len=:), pointer :: text\n  allocate(character(len=3) :: text)\n  allocate(character(len=5) :: text)\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_pointer",
+            "program p\n  implicit none\n  type :: box_t\n    character(len=:), pointer :: text\n  end type box_t\n  type(box_t) :: box\n  allocate(character(len=3) :: box%text)\n  allocate(character(len=5) :: box%text)\n  print *, 'survived'\nend program\n",
+        ),
+    ];
 
-    let run = Command::new(&exe)
-        .output()
-        .expect("deferred character repeat allocation runtime failed");
-    assert!(
-        !run.status.success(),
-        "repeated deferred character ALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&run.stderr).contains("ALLOCATE"),
-        "deferred character allocation failure did not report its operation:\n{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
+    for (name, source) in cases {
+        assert_program_terminates(
+            &format!("alloc_deferred_char_repeat_loud_{name}"),
+            source,
+            "ALLOCATE",
+        );
+    }
 }
 
 #[test]
@@ -1075,30 +1102,11 @@ fn repeated_scalar_pointer_allocation_without_stat_terminates() {
     ];
 
     for (name, source) in cases {
-        let dir = unique_dir(&format!("scalar_pointer_repeat_loud_{name}"));
-        let src = write_program_in(&dir, "main.f90", source);
-        let exe = dir.join("main.bin");
-        let compile = compile_program(&src, &exe);
-        assert!(
-            compile.status.success(),
-            "{name} compile failed: {}",
-            String::from_utf8_lossy(&compile.stderr)
+        assert_program_terminates(
+            &format!("scalar_pointer_repeat_loud_{name}"),
+            source,
+            "ALLOCATE",
         );
-        let run = Command::new(&exe)
-            .output()
-            .expect("repeated scalar pointer allocation runtime failed");
-        assert!(
-            !run.status.success(),
-            "{name} repeated pointer ALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&run.stderr).contains("ALLOCATE"),
-            "{name} failure did not identify ALLOCATE: {}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -1199,29 +1207,10 @@ fn unallocated_unlimited_polymorphic_deallocate_without_stat_terminates() {
     ];
 
     for (name, source) in cases {
-        let dir = unique_dir(&format!("class_star_deallocate_loud_{name}"));
-        let src = write_program_in(&dir, "main.f90", source);
-        let exe = dir.join("main.bin");
-        let compile = compile_program(&src, &exe);
-        assert!(
-            compile.status.success(),
-            "{name} compile failed: {}",
-            String::from_utf8_lossy(&compile.stderr)
+        assert_program_terminates(
+            &format!("class_star_deallocate_loud_{name}"),
+            source,
+            "DEALLOCATE",
         );
-        let run = Command::new(&exe)
-            .output()
-            .expect("unallocated class-star DEALLOCATE runtime failed");
-        assert!(
-            !run.status.success(),
-            "{name} unallocated class-star DEALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
-            "{name} failure did not identify DEALLOCATE: {}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
