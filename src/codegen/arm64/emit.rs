@@ -165,6 +165,26 @@ fn fmt_addr_with_offset(dest: &str, base: &str, offset: i64, scratch: &str) -> S
     format!("{}\n    {} {}, {}, {}", imm, op, dest, base, scratch)
 }
 
+fn gp_reg_index(reg: &str) -> Option<&str> {
+    let index = reg.strip_prefix('x').or_else(|| reg.strip_prefix('w'))?;
+    index.chars().all(|c| c.is_ascii_digit()).then_some(index)
+}
+
+fn gp_regs_alias(lhs: &str, rhs: &str) -> bool {
+    matches!((gp_reg_index(lhs), gp_reg_index(rhs)), (Some(a), Some(b)) if a == b)
+}
+
+/// Select one of the registers kept out of linear-scan allocation for
+/// late spill/address expansion. The access operands may themselves use
+/// these registers, so exclude every register whose value must survive
+/// address synthesis.
+fn address_scratch(avoid: &[&str]) -> &'static str {
+    ["x8", "x9", "x10", "x11"]
+        .into_iter()
+        .find(|candidate| !avoid.iter().any(|reg| gp_regs_alias(candidate, reg)))
+        .expect("memory access cannot occupy every reserved GP scratch")
+}
+
 /// Emit a single machine instruction as assembly text. Public so the
 /// branch-relaxation pass can count emit-time instruction bytes
 /// directly rather than re-deriving each opcode's expansion rules.
@@ -639,12 +659,13 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if (-256..=255).contains(&offset_val) {
                 format!("{} {}, [{}, #{}]", mnemonic, dest, base, offset_val)
             } else {
-                // Large offset: compute address in x8, then load.
+                let addr = address_scratch(&[&dest, &base]);
                 format!(
-                    "{}\n    {} {}, [x8]",
-                    fmt_addr_with_offset("x8", &base, offset_val, "x16"),
+                    "{}\n    {} {}, [{}]",
+                    fmt_addr_with_offset(addr, &base, offset_val, addr),
                     mnemonic,
-                    dest
+                    dest,
+                    addr
                 )
             }
         }
@@ -664,12 +685,13 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if (-256..=255).contains(&offset_val) {
                 format!("{} {}, [{}, #{}]", mnemonic, src, base, offset_val)
             } else {
-                // Large offset: compute address in x8, then store.
+                let addr = address_scratch(&[&src, &base]);
                 format!(
-                    "{}\n    {} {}, [x8]",
-                    fmt_addr_with_offset("x8", &base, offset_val, "x16"),
+                    "{}\n    {} {}, [{}]",
+                    fmt_addr_with_offset(addr, &base, offset_val, addr),
                     mnemonic,
-                    src
+                    src,
+                    addr
                 )
             }
         }
@@ -771,11 +793,14 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if (-512..=504).contains(&off) {
                 format!("stp {}, {}, [{}, #{}]", r1, r2, base, off)
             } else {
+                let addr = address_scratch(&[&r1, &r2, &base]);
                 format!(
-                    "{}\n    str {}, [x9]\n    str {}, [x9, #8]",
-                    fmt_addr_with_offset("x9", &base, off, "x16"),
+                    "{}\n    str {}, [{}]\n    str {}, [{}, #8]",
+                    fmt_addr_with_offset(addr, &base, off, addr),
                     r1,
-                    r2
+                    addr,
+                    r2,
+                    addr
                 )
             }
         }
@@ -793,11 +818,14 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             if (-512..=504).contains(&off) {
                 format!("ldp {}, {}, [{}, #{}]", r1, r2, base, off)
             } else {
+                let addr = address_scratch(&[&r1, &r2, &base]);
                 format!(
-                    "{}\n    ldr {}, [x9]\n    ldr {}, [x9, #8]",
-                    fmt_addr_with_offset("x9", &base, off, "x16"),
+                    "{}\n    ldr {}, [{}]\n    ldr {}, [{}, #8]",
+                    fmt_addr_with_offset(addr, &base, off, addr),
                     r1,
-                    r2
+                    addr,
+                    r2,
+                    addr
                 )
             }
         }
@@ -1663,10 +1691,10 @@ mod tests {
         let stp = MachineInst {
             opcode: ArmOpcode::StpOffset,
             operands: vec![
-                MachineOperand::PhysReg(PhysReg::Gp(0)),
-                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::Gp(16)),
+                MachineOperand::PhysReg(PhysReg::Gp(17)),
                 MachineOperand::PhysReg(PhysReg::FP),
-                MachineOperand::Imm(-544),
+                MachineOperand::Imm(-4848),
             ],
             def: None,
         };
@@ -1684,17 +1712,27 @@ mod tests {
         let stp_asm = emit_inst(&stp, &mf);
         let ldp_asm = emit_inst(&ldp, &mf);
         assert!(
-            stp_asm.contains("sub x9, x29, #544"),
+            stp_asm.contains("str x16, [x8]") && stp_asm.contains("str x17, [x8, #8]"),
+            "large negative stp offset should preserve both value limbs: {}",
+            stp_asm
+        );
+        assert!(
+            !stp_asm.contains("movz x16, #4848"),
+            "large negative stp offset must not overwrite its low limb: {}",
+            stp_asm
+        );
+        assert!(
+            stp_asm.contains("movz x8, #4848") && stp_asm.contains("sub x8, x29, x8"),
             "large negative stp offset should synthesize address: {}",
             stp_asm
         );
         assert!(
-            ldp_asm.contains("sub x9, x29, #544"),
+            ldp_asm.contains("sub x8, x29, #544"),
             "large negative ldp offset should synthesize address: {}",
             ldp_asm
         );
         assert!(
-            !stp_asm.contains("[x29, #-544]"),
+            !stp_asm.contains("[x29, #-4848]"),
             "stp should not emit out-of-range raw offset: {}",
             stp_asm
         );
@@ -1703,6 +1741,11 @@ mod tests {
             "ldp should not emit out-of-range raw offset: {}",
             ldp_asm
         );
+    }
+
+    #[test]
+    fn address_scratch_avoids_live_gp_aliases() {
+        assert_eq!(address_scratch(&["w8", "x9", "w10"]), "x11");
     }
 
     #[test]

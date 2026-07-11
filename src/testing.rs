@@ -657,11 +657,11 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         }
 
         let mut allocated = machine_funcs.clone();
-        // Backend peephole at O2+ (must run BEFORE regalloc — it
-        // operates on vregs).
+        // Backend peephole at O2+ (must run BEFORE regalloc because it
+        // operates on vregs); floating-point contraction is Ofast-only.
         if request.opt_level >= OptLevel::O2 {
             for mf in &mut allocated {
-                crate::codegen::peephole::run_peephole(mf);
+                crate::codegen::peephole::run_peephole(mf, request.opt_level.fp_contract());
             }
         }
         for mf in &mut allocated {
@@ -669,7 +669,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 crate::codegen::regalloc::regalloc_naive(mf);
             } else {
                 let liveness = crate::codegen::liveness::compute_liveness(mf);
-                let result = linearscan::linear_scan(mf);
+                let result = linearscan::linear_scan(mf, &liveness);
                 linearscan::apply_allocation(mf, &result, &liveness);
                 // Post-allocation passes — must mirror the driver pipeline so
                 // captured asm matches the binary the user actually ships.

@@ -61,10 +61,10 @@ fn o0_scalar_fma_fixture_runs_correctly() {
 }
 
 #[test]
-fn o3_vectorizes_elementwise_fma() {
+fn vectorized_fma_contracts_only_at_ofast() {
     if let Err(reason) = armfortas::testing::native_vectorizer_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=vectorize_fma test=o3_vectorizes_elementwise_fma count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=vectorize_fma test=vectorized_fma_contracts_only_at_ofast count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -79,14 +79,40 @@ fn o3_vectorizes_elementwise_fma() {
         },
         Stage::OptIr,
     );
-    // Three FMA loops: 3-load f32, 3-load f64, 1-load + 2 invariant
-    // scalar broadcasts (f32). Each fuses to one vfma.
     assert_eq!(
         o3_ir.matches("vfma").count(),
-        3,
-        "expected three vfma:\n{}",
+        0,
+        "O3 must keep separate vector multiply-add rounding:\n{}",
         o3_ir
     );
+    assert!(
+        o3_ir.matches("vmul").count() >= 3 && o3_ir.matches("vadd").count() >= 3,
+        "O3 should still vectorize with separate vmul/vadd operations:\n{}",
+        o3_ir
+    );
+
+    let ofast_ir = capture_text(
+        CaptureRequest {
+            input: source.clone(),
+            requested: BTreeSet::from([Stage::OptIr]),
+            opt_level: OptLevel::Ofast,
+        },
+        Stage::OptIr,
+    );
+    let expected_fma = if cfg!(target_arch = "aarch64") { 3 } else { 0 };
+    assert_eq!(
+        ofast_ir.matches("vfma").count(),
+        expected_fma,
+        "Ofast contraction must follow native ISA capability:\n{}",
+        ofast_ir
+    );
+    if expected_fma == 0 {
+        assert!(
+            ofast_ir.matches("vmul").count() >= 3 && ofast_ir.matches("vadd").count() >= 3,
+            "baseline x86_64 should keep separate vector operations:\n{}",
+            ofast_ir
+        );
+    }
 
     let stdout = capture_run_stdout(CaptureRequest {
         input: source,

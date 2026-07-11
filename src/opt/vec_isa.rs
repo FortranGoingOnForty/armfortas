@@ -29,9 +29,11 @@ pub struct VectorIsa {
     pub reduce_min_max_i32: bool,
     pub reduce_min_max_f32: bool,
     pub reduce_min_max_f64: bool,
+    /// Packed not-equal comparison. SSE2 exposes this directly or via
+    /// inversion; the current NEON selector has no lowering for it.
+    pub cmp_ne: bool,
     /// Packed i64 lane compare (WHERE masks over 64-bit integer
-    /// arrays). NEON has `cmgt.2d`; SSE2 has only the i32 forms
-    /// (`pcmpgtq` is SSE4.2).
+    /// arrays). Neither baseline selector implements this yet.
     pub int_cmp_i64: bool,
 }
 
@@ -42,7 +44,8 @@ pub const NEON: VectorIsa = VectorIsa {
     reduce_min_max_i32: true,
     reduce_min_max_f32: true,
     reduce_min_max_f64: true,
-    int_cmp_i64: true,
+    cmp_ne: false,
+    int_cmp_i64: false,
 };
 
 pub const SSE2_BASELINE: VectorIsa = VectorIsa {
@@ -55,6 +58,7 @@ pub const SSE2_BASELINE: VectorIsa = VectorIsa {
     reduce_min_max_i32: true,
     reduce_min_max_f32: true,
     reduce_min_max_f64: true,
+    cmp_ne: true,
     int_cmp_i64: false,
 };
 

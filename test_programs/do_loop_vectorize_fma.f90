@@ -1,9 +1,8 @@
-! Element-wise FMA fusion: `c(i) = a(i)*b(i) + d(i)` lifts the
-! FMul + FAdd pair into a single VFma. The matcher accepts either
-! orientation (`(a*b) + c` or `c + (a*b)`) and any of the three
-! operands may be an invariant scalar (broadcast in preheader).
-! NEON FMLA is float-only — i32 falls through to the regular sum
-! path.
+! Element-wise multiply-add vectorization. Strict levels widen to
+! separate VMul + VAdd operations; Ofast may contract them to VFma
+! when the target has a fused instruction. The matcher accepts either
+! orientation (`(a*b) + c` or `c + (a*b)`) and any operand may be an
+! invariant scalar (broadcast in the preheader).
 !
 ! c32(i) = i*2+1 -> c32(1)=3, c32(16)=33, c32(32)=65
 ! c64(i) = i*2+1 -> same values

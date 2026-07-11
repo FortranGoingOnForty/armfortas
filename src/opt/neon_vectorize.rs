@@ -27,7 +27,15 @@ use super::vec_analysis::{
     WherePlan,
 };
 
-pub struct NeonVectorize;
+pub struct NeonVectorize {
+    contract_fma: bool,
+}
+
+impl NeonVectorize {
+    pub const fn new(contract_fma: bool) -> Self {
+        Self { contract_fma }
+    }
+}
 
 impl Pass for NeonVectorize {
     fn name(&self) -> &'static str {
@@ -35,7 +43,7 @@ impl Pass for NeonVectorize {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        run_loop_vectorizer(module, &super::vec_isa::NEON)
+        run_loop_vectorizer(module, &super::vec_isa::NEON, self.contract_fma)
     }
 }
 
@@ -49,14 +57,18 @@ impl Pass for SseVectorize {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        run_loop_vectorizer(module, &super::vec_isa::SSE2_BASELINE)
+        run_loop_vectorizer(module, &super::vec_isa::SSE2_BASELINE, false)
     }
 }
 
-fn run_loop_vectorizer(module: &mut Module, isa: &super::vec_isa::VectorIsa) -> bool {
+fn run_loop_vectorizer(
+    module: &mut Module,
+    isa: &super::vec_isa::VectorIsa,
+    contract_fma: bool,
+) -> bool {
     let mut changed = false;
     for func in &mut module.functions {
-        while vectorize_one_loop(func, isa) {
+        while vectorize_one_loop(func, isa, contract_fma) {
             changed = true;
         }
     }
@@ -68,7 +80,11 @@ fn run_loop_vectorizer(module: &mut Module, isa: &super::vec_isa::VectorIsa) -> 
     changed
 }
 
-fn vectorize_one_loop(func: &mut Function, isa: &super::vec_isa::VectorIsa) -> bool {
+fn vectorize_one_loop(
+    func: &mut Function,
+    isa: &super::vec_isa::VectorIsa,
+    contract_fma: bool,
+) -> bool {
     let loops = find_natural_loops(func);
     if loops.is_empty() {
         return false;
@@ -81,7 +97,7 @@ fn vectorize_one_loop(func: &mut Function, isa: &super::vec_isa::VectorIsa) -> b
             let loop_defs = loop_defined_values(func, lp);
             if !loop_values_escape(func, lp, &loop_defs) {
                 if let Some(plan) = build_vector_plan(func, &shape, &loop_defs, isa) {
-                    apply_vector_plan(func, &shape, plan);
+                    apply_vector_plan(func, &shape, plan, contract_fma);
                     return true;
                 }
             }
@@ -95,7 +111,7 @@ fn vectorize_one_loop(func: &mut Function, isa: &super::vec_isa::VectorIsa) -> b
         }
         // Fall back: reduction loop (one escaping accumulator).
         if let Some(plan) = detect_reduction_plan(func, lp, &preds, isa) {
-            apply_reduction_plan(func, lp, plan);
+            apply_reduction_plan(func, lp, plan, contract_fma);
             return true;
         }
     }
@@ -124,6 +140,7 @@ fn widen_statement(
     v_ty: &IrType,
     span: crate::lexer::Span,
     stmt: &Statement,
+    contract_fma: bool,
 ) {
     for op in op_operands(&stmt.op) {
         rewrite_array_load(func, body, op, v_ty);
@@ -224,9 +241,8 @@ fn widen_statement(
     {
         let (a_subst, b_subst, c_subst) = fma_subst.unwrap();
         let body_block = func.block_mut(body);
-        // Rewrite fmul to VMul (becomes dead — DCE will clean up;
-        // we still rewrite to avoid leaving a scalar fmul whose
-        // operands have been retyped to vectors).
+        // Rewrite fmul to VMul. It stays live for strict vectorization
+        // and becomes dead after Ofast contraction.
         if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fmul_id) {
             if let InstKind::FMul(l, r) = inst.kind {
                 inst.kind = InstKind::VMul(a_subst.unwrap_or(l), b_subst.unwrap_or(r));
@@ -234,24 +250,37 @@ fn widen_statement(
             }
         }
         func.register_type(*fmul_id, v_ty.clone());
-        // Rewrite fadd to VFma(a, b, c). Lookup fmul to recover
-        // its (possibly subst'd) operands so VFma reads the
-        // original / broadcast values rather than the dead VMul.
-        let (a_v, b_v) = {
-            let body_ro = func.block(body);
-            let fmul_inst = body_ro.insts.iter().find(|i| i.id == *fmul_id).unwrap();
-            if let InstKind::VMul(l, r) = fmul_inst.kind {
-                (l, r)
-            } else {
-                unreachable!()
+        let fused_operands = contract_fma.then(|| {
+            let fmul_inst = func
+                .block(body)
+                .insts
+                .iter()
+                .find(|inst| inst.id == *fmul_id)
+                .expect("vectorized fmul should remain in its body");
+            match fmul_inst.kind {
+                InstKind::VMul(l, r) => (l, r),
+                _ => unreachable!(),
             }
-        };
+        });
         let body_block = func.block_mut(body);
         if let Some(inst) = body_block.insts.iter_mut().find(|i| i.id == *fadd_id) {
             if let InstKind::FAdd(l, r) = inst.kind {
-                let c = if l == *fmul_id { r } else { l };
-                let c_final = c_subst.unwrap_or(c);
-                inst.kind = InstKind::VFma(a_v, b_v, c_final);
+                inst.kind = if let Some((a_v, b_v)) = fused_operands {
+                    let c = if l == *fmul_id { r } else { l };
+                    InstKind::VFma(a_v, b_v, c_subst.unwrap_or(c))
+                } else {
+                    let l = if l == *fmul_id {
+                        l
+                    } else {
+                        c_subst.unwrap_or(l)
+                    };
+                    let r = if r == *fmul_id {
+                        r
+                    } else {
+                        c_subst.unwrap_or(r)
+                    };
+                    InstKind::VAdd(l, r)
+                };
                 inst.ty = v_ty.clone();
             }
         }
@@ -266,7 +295,12 @@ fn widen_statement(
     }
 }
 
-fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan) {
+fn apply_vector_plan(
+    func: &mut Function,
+    shape: &CountedLoop,
+    plan: VectorPlan,
+    contract_fma: bool,
+) {
     let v_ty = vector_ty(&plan.elem_ty, plan.lanes);
 
     // 0. If we'll be peeling scalar tail iterations, snapshot the body's
@@ -326,7 +360,15 @@ fn apply_vector_plan(func: &mut Function, shape: &CountedLoop, plan: VectorPlan)
     //    emit any required preheader VBroadcasts, rewrite the binop
     //    into a v-op, and finally rewrite the store into a VStore.
     for stmt in plan.statements.clone() {
-        widen_statement(func, shape.body, shape.preheader, &v_ty, plan.span, &stmt);
+        widen_statement(
+            func,
+            shape.body,
+            shape.preheader,
+            &v_ty,
+            plan.span,
+            &stmt,
+            contract_fma,
+        );
     }
 
     // 3. Scalar tail. If `tail_count` remainder iterations live at the
@@ -890,7 +932,12 @@ fn broadcast_if_invariant(
     Some(new_id)
 }
 
-fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPlan) {
+fn apply_reduction_plan(
+    func: &mut Function,
+    lp: &NaturalLoop,
+    plan: ReductionPlan,
+    contract_fma: bool,
+) {
     let v_ty = vector_ty(&plan.elem_ty, plan.lanes);
 
     // 0. Snapshot the body before any in-place mutation. Used by the
@@ -1106,7 +1153,15 @@ fn apply_reduction_plan(func: &mut Function, lp: &NaturalLoop, plan: ReductionPl
     //     so any peeled iterations still run these stores scalar-ly at
     //     the correct index.
     for stmt in plan.elementwise_stores.clone() {
-        widen_statement(func, plan.body, plan.preheader, &v_ty, plan.span, &stmt);
+        widen_statement(
+            func,
+            plan.body,
+            plan.preheader,
+            &v_ty,
+            plan.span,
+            &stmt,
+            contract_fma,
+        );
     }
 
     // 6. Insert `acc_scalar = vreduce_*(acc_param)` at the top of
@@ -1516,7 +1571,7 @@ mod tests {
     #[test]
     fn rewrites_array_add_loop_to_vload_vadd_vstore() {
         let (mut module, body) = build_array_add_loop();
-        let changed = NeonVectorize.run(&mut module);
+        let changed = NeonVectorize::new(false).run(&mut module);
         assert!(
             changed,
             "neon_vectorize should fire on a clean array-add loop"
@@ -1694,7 +1749,7 @@ mod tests {
     #[test]
     fn broadcasts_invariant_scalar_into_preheader() {
         let (mut module, preheader, body) = build_array_add_scalar_loop();
-        let changed = NeonVectorize.run(&mut module);
+        let changed = NeonVectorize::new(false).run(&mut module);
         assert!(
             changed,
             "neon_vectorize should fire on a(i) + invariant scalar"
@@ -1848,7 +1903,7 @@ mod tests {
     #[test]
     fn rewrites_pure_array_copy_to_vload_vstore() {
         let (mut module, body) = build_array_copy_loop();
-        let changed = NeonVectorize.run(&mut module);
+        let changed = NeonVectorize::new(false).run(&mut module);
         assert!(changed, "neon_vectorize should fire on a pure copy loop");
 
         let func = &module.functions[0];
@@ -2015,7 +2070,7 @@ mod tests {
         func.block_mut(exit).terminator = Some(Terminator::Return(None));
         module.add_function(func);
 
-        let changed = NeonVectorize.run(&mut module);
+        let changed = NeonVectorize::new(false).run(&mut module);
         assert!(changed, "scalar tail should let the head vectorize");
 
         let func = &module.functions[0];

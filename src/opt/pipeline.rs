@@ -49,7 +49,7 @@ pub enum OptLevel {
     O1,
     /// `-O2` — `-O1` plus LICM, small inlining, strength reduction,
     /// bounds-check elimination, GVN, SROA, dead store elim, small loop
-    /// unrolling, FMA fusion.
+    /// unrolling.
     O2,
     /// `-O3` — `-O2` plus aggressive inlining, NEON vectorization,
     /// loop interchange/fusion/fission, IPO, devirtualization,
@@ -57,7 +57,8 @@ pub enum OptLevel {
     O3,
     /// `-Os` — like `-O2` but prefer code size (no unrolling, less inlining).
     Os,
-    /// `-Ofast` — `-O3` plus fast-math (reassociation, no NaN/Inf, recip).
+    /// `-Ofast` — `-O3` plus fast-math (reassociation, contraction,
+    /// no NaN/Inf, recip).
     Ofast,
 }
 
@@ -108,6 +109,11 @@ impl OptLevel {
     /// (`-Ofast`-only — relaxes IEEE 754 strictness for FAdd/FMul
     /// reordering, signed-zero collapse, etc.)?
     pub fn fast_math(self) -> bool {
+        matches!(self, Self::Ofast)
+    }
+
+    /// Does this level permit multiply-add contraction?
+    pub fn fp_contract(self) -> bool {
         matches!(self, Self::Ofast)
     }
 }
@@ -249,7 +255,7 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(LoopFusion));
             match arch {
                 crate::target::Arch::Arm64 => {
-                    pm.add(Box::new(NeonVectorize));
+                    pm.add(Box::new(NeonVectorize::new(level.fp_contract())));
                     pm.add(Box::new(Vectorize));
                 }
                 crate::target::Arch::X86_64 => {
@@ -292,7 +298,7 @@ pub fn build_pipeline(level: OptLevel, arch: crate::target::Arch) -> PassManager
             pm.add(Box::new(LoopFusion));
             match arch {
                 crate::target::Arch::Arm64 => {
-                    pm.add(Box::new(NeonVectorize));
+                    pm.add(Box::new(NeonVectorize::new(level.fp_contract())));
                     pm.add(Box::new(Vectorize));
                 }
                 crate::target::Arch::X86_64 => {
@@ -346,6 +352,8 @@ mod tests {
         assert!(!OptLevel::O2.vectorize());
         assert!(OptLevel::Ofast.fast_math());
         assert!(!OptLevel::O3.fast_math());
+        assert!(OptLevel::Ofast.fp_contract());
+        assert!(!OptLevel::O3.fp_contract());
     }
 
     #[test]

@@ -45,7 +45,7 @@ fn require_clang() -> PathBuf {
     // whole suite with a count, exactly like run_programs.
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
-            "\nHARNESS_SKIP suite=c_interop_differential test=all count=7 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=c_interop_differential test=all count=9 reason=\"{}\"",
             reason
         );
         std::process::exit(0);
@@ -59,7 +59,7 @@ fn require_clang() -> PathBuf {
             }
             // Non-ELF host without clang: counted skip (x01 convention).
             eprintln!(
-                "\nHARNESS_SKIP suite=c_interop_differential test=all count=4 reason=\"clang not found on this host\""
+                "\nHARNESS_SKIP suite=c_interop_differential test=all count=9 reason=\"clang not found on this host\""
             );
             std::process::exit(0);
         }
@@ -83,12 +83,16 @@ impl Workbench {
     }
 
     fn fortran_obj(&self, name: &str, src: &str) -> PathBuf {
+        self.fortran_obj_at(name, src, "-O0")
+    }
+
+    fn fortran_obj_at(&self, name: &str, src: &str, opt: &str) -> PathBuf {
         let f90 = self.dir.join(format!("{}.f90", name));
         let obj = self.dir.join(format!("{}.o", name));
         std::fs::write(&f90, src).unwrap();
         let r = Command::new(compiler())
             .current_dir(&self.dir)
-            .args(["-c", "-O0"])
+            .args(["-c", opt])
             .arg(&f90)
             .arg("-o")
             .arg(&obj)
@@ -349,6 +353,228 @@ end program f2c
         "Fortran→C ABI divergence; raw output:\n{}",
         out
     );
+}
+
+#[test]
+fn floating_point_contraction_matches_public_policy() {
+    let wb = Workbench::new("fp_contract");
+    let strict = wb.fortran_obj_at(
+        "strict",
+        r#"
+function strict_muladd(a, b, c) result(r) bind(c, name="strict_muladd")
+  use iso_c_binding
+  real(c_double), value :: a, b, c
+  real(c_double) :: r
+  r = a * b + c
+end function strict_muladd
+"#,
+        "-O2",
+    );
+    let fast = wb.fortran_obj_at(
+        "fast",
+        r#"
+function fast_muladd(a, b, c) result(r) bind(c, name="fast_muladd")
+  use iso_c_binding
+  real(c_double), value :: a, b, c
+  real(c_double) :: r
+  r = a * b + c
+end function fast_muladd
+"#,
+        "-Ofast",
+    );
+    let c = wb.c_obj(
+        "main",
+        r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+double strict_muladd(double, double, double);
+double fast_muladd(double, double, double);
+
+static uint64_t bits(double value) {
+  uint64_t result;
+  memcpy(&result, &value, sizeof(result));
+  return result;
+}
+
+int main(void) {
+  const double a = 0x1.0000002p0;
+  const double b = 0x1.ffffffcp-1;
+  const double c = -1.0;
+  const uint64_t strict_bits = bits(strict_muladd(a, b, c));
+  const uint64_t fast_bits = bits(fast_muladd(a, b, c));
+#if defined(__aarch64__)
+  const uint64_t expected_fast = UINT64_C(0xbc90000000000000);
+#else
+  const uint64_t expected_fast = UINT64_C(0);
+#endif
+
+  if (strict_bits != UINT64_C(0) || fast_bits != expected_fast) {
+    fprintf(stderr, "strict=%016llx fast=%016llx expected=%016llx\n",
+            (unsigned long long)strict_bits,
+            (unsigned long long)fast_bits,
+            (unsigned long long)expected_fast);
+    return 1;
+  }
+  puts("ok");
+  return 0;
+}
+"#,
+    );
+
+    assert_eq!(
+        wb.link_and_run("fp_contract_bin", &[&c, &strict, &fast]),
+        "ok"
+    );
+}
+
+#[test]
+fn arm64_complex_value_arguments_match_clang_in_both_directions() {
+    let host = armfortas::target::TargetSpec::host();
+    if host.arch != armfortas::target::Arch::Arm64
+        || host.object_format() != armfortas::target::ObjectFormat::MachO
+    {
+        eprintln!(
+            "\nHARNESS_SKIP suite=c_interop_differential test=arm64_complex_value_arguments_match_clang_in_both_directions count=2 reason=\"Apple ARM64 ABI check\""
+        );
+        return;
+    }
+
+    let wb = Workbench::new("arm64_complex_args");
+    let c = wb.c_obj(
+        "helpers",
+        r#"
+#include <complex.h>
+
+extern float f_take_c4(float complex);
+extern double f_take_c8(double complex);
+extern float f_take_c4_overflow(float, float, float, float, float, float, float,
+                                float complex, float, int);
+extern double f_take_c8_overflow(double, double, double, double, double, double,
+                                 double, double complex, double, int);
+
+float c_take_c4(float complex z) {
+  return crealf(z) + 10.0f * cimagf(z);
+}
+
+double c_take_c8(double complex z) {
+  return creal(z) + 100.0 * cimag(z);
+}
+
+float c_take_c4_overflow(float a1, float a2, float a3, float a4, float a5,
+                         float a6, float a7, float complex z, float tail,
+                         int marker) {
+  return crealf(z) + 10.0f * cimagf(z) + 100.0f * tail + marker;
+}
+
+double c_take_c8_overflow(double a1, double a2, double a3, double a4, double a5,
+                          double a6, double a7, double complex z, double tail,
+                          int marker) {
+  return creal(z) + 100.0 * cimag(z) + 1000.0 * tail + marker;
+}
+
+int c_call_fortran(void) {
+  float r4 = f_take_c4(-1.0f + 2.0f * I);
+  double r8 = f_take_c8(2.0 - 3.0 * I);
+  float o4 = f_take_c4_overflow(1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                2.0f + 3.0f * I, 4.0f, 5);
+  double o8 = f_take_c8_overflow(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                                 2.0 + 3.0 * I, 4.0, 5);
+  return r4 == 19.0f && r8 == -298.0 && o4 == 437.0f && o8 == 4307.0;
+}
+"#,
+    );
+    let f = wb.fortran_obj_at(
+        "main",
+        r#"
+function f_take_c4(z) result(r) bind(c, name="f_take_c4")
+  use iso_c_binding
+  complex(c_float_complex), value :: z
+  real(c_float) :: r
+  r = real(z, c_float) + 10.0_c_float * aimag(z)
+end function f_take_c4
+
+function f_take_c8(z) result(r) bind(c, name="f_take_c8")
+  use iso_c_binding
+  complex(c_double_complex), value :: z
+  real(c_double) :: r
+  r = real(z, c_double) + 100.0_c_double * aimag(z)
+end function f_take_c8
+
+function f_take_c4_overflow(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) result(r) &
+    bind(c, name="f_take_c4_overflow")
+  use iso_c_binding
+  real(c_float), value :: a1,a2,a3,a4,a5,a6,a7,tail
+  complex(c_float_complex), value :: z
+  integer(c_int), value :: marker
+  real(c_float) :: r
+  r = real(z, c_float) + 10.0_c_float * aimag(z) + 100.0_c_float * tail + marker
+end function f_take_c4_overflow
+
+function f_take_c8_overflow(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) result(r) &
+    bind(c, name="f_take_c8_overflow")
+  use iso_c_binding
+  real(c_double), value :: a1,a2,a3,a4,a5,a6,a7,tail
+  complex(c_double_complex), value :: z
+  integer(c_int), value :: marker
+  real(c_double) :: r
+  r = real(z, c_double) + 100.0_c_double * aimag(z) + 1000.0_c_double * tail + marker
+end function f_take_c8_overflow
+
+program p
+  use iso_c_binding
+  implicit none
+  interface
+    function c_take_c4(z) result(r) bind(c, name="c_take_c4")
+      import :: c_float, c_float_complex
+      complex(c_float_complex), value :: z
+      real(c_float) :: r
+    end function c_take_c4
+    function c_take_c8(z) result(r) bind(c, name="c_take_c8")
+      import :: c_double, c_double_complex
+      complex(c_double_complex), value :: z
+      real(c_double) :: r
+    end function c_take_c8
+    function c_take_c4_overflow(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) result(r) &
+        bind(c, name="c_take_c4_overflow")
+      import :: c_float, c_float_complex, c_int
+      real(c_float), value :: a1,a2,a3,a4,a5,a6,a7,tail
+      complex(c_float_complex), value :: z
+      integer(c_int), value :: marker
+      real(c_float) :: r
+    end function c_take_c4_overflow
+    function c_take_c8_overflow(a1,a2,a3,a4,a5,a6,a7,z,tail,marker) result(r) &
+        bind(c, name="c_take_c8_overflow")
+      import :: c_double, c_double_complex, c_int
+      real(c_double), value :: a1,a2,a3,a4,a5,a6,a7,tail
+      complex(c_double_complex), value :: z
+      integer(c_int), value :: marker
+      real(c_double) :: r
+    end function c_take_c8_overflow
+    function c_call_fortran() result(ok) bind(c, name="c_call_fortran")
+      import :: c_int
+      integer(c_int) :: ok
+    end function c_call_fortran
+  end interface
+  if (c_take_c4(cmplx(1.25_c_float, -2.5_c_float, kind=c_float)) /= -23.75_c_float) error stop 1
+  if (c_take_c8(cmplx(3.5_c_double, 4.25_c_double, kind=c_double)) /= 428.5_c_double) error stop 2
+  if (c_take_c4_overflow(1.0_c_float, 1.0_c_float, 1.0_c_float, 1.0_c_float, &
+                         1.0_c_float, 1.0_c_float, 1.0_c_float, &
+                         cmplx(2.0_c_float, 3.0_c_float, kind=c_float), &
+                         4.0_c_float, 5_c_int) /= 437.0_c_float) error stop 3
+  if (c_take_c8_overflow(1.0_c_double, 1.0_c_double, 1.0_c_double, 1.0_c_double, &
+                         1.0_c_double, 1.0_c_double, 1.0_c_double, &
+                         cmplx(2.0_c_double, 3.0_c_double, kind=c_double), &
+                         4.0_c_double, 5_c_int) /= 4307.0_c_double) error stop 4
+  if (c_call_fortran() /= 1_c_int) error stop 5
+  print *, 'ok'
+end program p
+"#,
+        "-O2",
+    );
+
+    assert_eq!(wb.link_and_run("arm64_complex_args_bin", &[&c, &f]), "ok");
 }
 
 /// BIND(C) character(len=*) passes ONLY the data pointer — the

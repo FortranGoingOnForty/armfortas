@@ -511,6 +511,10 @@ pub struct MachineFunction {
     pub const_pool: Vec<ConstPoolEntry>,
     pub internal_only: bool,
     pub entry_arg_receipts: Vec<VRegId>,
+    /// Exact physical-register/frame-slot pairs inserted for callee saves.
+    /// Tail-call recognition uses this metadata instead of guessing from load
+    /// opcodes, which are also used for ordinary post-call computation.
+    pub callee_save_slots: Vec<(PhysReg, i32)>,
     next_vreg: u32,
     next_block: u32,
 }
@@ -526,6 +530,7 @@ impl MachineFunction {
             const_pool: Vec::new(),
             internal_only: false,
             entry_arg_receipts: Vec::new(),
+            callee_save_slots: Vec::new(),
             next_vreg: 0,
             next_block: 1,
         }

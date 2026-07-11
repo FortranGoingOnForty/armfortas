@@ -76,6 +76,11 @@ impl OptLevel {
             Self::Ofast => "Ofast",
         }
     }
+
+    /// Whether multiply-add contraction may change floating-point rounding.
+    pub fn fp_contract(self) -> bool {
+        matches!(self, Self::Ofast)
+    }
 }
 
 /// Source-form override requested on the command line.  None means
@@ -1064,7 +1069,8 @@ LANGUAGE:
 OPTIMIZATION:
   -O0, -O1, -O2, -O3          Optimization level (default -O0)
   -Os                         Optimize for size
-  -Ofast                      Aggressive optimization
+  -Ofast                      Aggressive optimization; permits floating-point
+                              reassociation and multiply-add contraction
 
 WARNINGS:
   -Wall                       All standard warnings
@@ -2665,6 +2671,20 @@ mod tests {
         assert_eq!(OptLevel::parse_flag("os"), Some(OptLevel::Os));
         assert_eq!(OptLevel::Os.as_flag(), "-Os");
         assert_eq!(OptLevel::Os.as_str(), "Os");
+    }
+
+    #[test]
+    fn floating_point_contraction_is_ofast_only() {
+        assert!(OptLevel::Ofast.fp_contract());
+        for level in [
+            OptLevel::O0,
+            OptLevel::O1,
+            OptLevel::O2,
+            OptLevel::O3,
+            OptLevel::Os,
+        ] {
+            assert!(!level.fp_contract(), "{} must stay strict", level.as_flag());
+        }
     }
 
     #[test]

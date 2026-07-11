@@ -1,9 +1,9 @@
-! Test FMADD/FMSUB/FNMSUB peephole fusion (O2+).
-! Results must match at all optimization levels — correctness invariant.
+! Test FMADD/FMSUB/FNMSUB peephole fusion (-Ofast only).
+! These exactly representable cases produce the same output at every level.
 !
 ! The arithmetic uses subroutine arguments so constant folding cannot
 ! eliminate the fmul+fadd/fsub pairs. This forces the peephole to
-! actually fire at O2+.
+! actually fire at -Ofast while strict levels keep separate operations.
 program fma_peephole
   implicit none
   call test_fma_f32(2.0, 3.0, 4.0)

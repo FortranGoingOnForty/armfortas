@@ -2,7 +2,6 @@
 # until the x11 musl story lands. Everything the x09 gate opening
 # enabled on glibc/FreeBSD still skips here.
 elf_link_e2e
-c_interop_differential
 multifile
 allocate_constructor_runtime
 allocate_validation
