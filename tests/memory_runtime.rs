@@ -163,7 +163,7 @@ fn allocate_stat_errmsg_populates_deferred_character_target() {
 fn allocate_failure_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=allocate_failure_without_stat_terminates count=2 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_failure_without_stat_terminates count=4 reason=\"{}\"",
             reason
         );
         return;
@@ -176,6 +176,14 @@ fn allocate_failure_without_stat_terminates() {
         (
             "component",
             "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: values(:)\n  end type box_t\n  type(box_t) :: box\n  allocate(box%values(2))\n  allocate(box%values(2))\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "local_array_pointer",
+            "program p\n  implicit none\n  integer, pointer :: values(:)\n  allocate(values(2))\n  allocate(values(2))\n  print *, 'survived'\nend program\n",
+        ),
+        (
+            "component_array_pointer",
+            "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: values(:)\n  end type box_t\n  type(box_t) :: box\n  allocate(box%values(2))\n  allocate(box%values(2))\n  print *, 'survived'\nend program\n",
         ),
     ];
 
@@ -334,6 +342,44 @@ fn descriptor_component_allocation_and_deallocation_report_status() {
 }
 
 #[test]
+fn array_pointer_allocation_reports_status_and_preserves_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=array_pointer_allocation_reports_status_and_preserves_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("array_pointer_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: values(:)\n  end type box_t\n  type(box_t) :: box\n  integer, pointer :: values(:)\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(values(2), stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  values = [3, 4]\n  allocate(values(3), stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (.not. associated(values)) error stop 4\n  if (size(values) /= 2 .or. any(values /= [3, 4])) error stop 5\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 6\n  ios = 99\n  msg = 'unchanged'\n  allocate(box%values(2), stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 7\n  if (trim(msg) /= 'unchanged') error stop 8\n  box%values = [5, 6]\n  allocate(box%values(3), stat=ios, errmsg=msg)\n  if (ios == 0) error stop 9\n  if (.not. associated(box%values)) error stop 10\n  if (size(box%values) /= 2 .or. any(box%values /= [5, 6])) error stop 11\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 12\n  deallocate(values)\n  deallocate(box%values)\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("array_pointer_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("array pointer allocation runtime failed");
+    assert!(
+        run.status.success(),
+        "array pointer status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn deallocate_unallocated_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -391,6 +437,44 @@ fn deallocate_stat_errmsg_handles_deferred_character_paths() {
     assert!(
         run.status.success(),
         "deferred character status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deallocate_stat_errmsg_handles_deferred_character_pointer_paths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_stat_errmsg_handles_deferred_character_pointer_paths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("dealloc_deferred_char_pointer_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    character(len=:), pointer :: text\n  end type box_t\n  type(box_t) :: box\n  character(len=:), pointer :: text\n  integer :: ios\n  character(len=64) :: msg\n  allocate(character(len=3) :: text)\n  ios = 99\n  msg = 'unchanged'\n  deallocate(text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (associated(text)) error stop 2\n  if (trim(msg) /= 'unchanged') error stop 3\n  deallocate(text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 4\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 5\n  allocate(character(len=4) :: box%text)\n  ios = 99\n  msg = 'unchanged'\n  deallocate(box%text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 6\n  if (associated(box%text)) error stop 7\n  if (trim(msg) /= 'unchanged') error stop 8\n  deallocate(box%text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 9\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 10\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("dealloc_deferred_char_pointer_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("deferred character pointer deallocation runtime failed");
+    assert!(
+        run.status.success(),
+        "deferred character pointer status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -523,7 +607,7 @@ fn allocate_allocated_deferred_character_reports_status() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: text\n  end type box_t\n  type(box_t) :: box\n  character(len=:), allocatable :: text\n  character(len=:), pointer :: ptr\n  character(len=64) :: msg\n  integer :: ios\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=3) :: text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  text = 'old'\n  ios = 0\n  allocate(character(len=5) :: text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (len(text) /= 3 .or. text /= 'old') error stop 4\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 5\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=4) :: box%text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 6\n  box%text = 'keep'\n  ios = 0\n  allocate(character(len=6) :: box%text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 7\n  if (len(box%text) /= 4 .or. box%text /= 'keep') error stop 8\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 9\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=3) :: ptr, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 10\n  ptr = 'ptr'\n  ios = 0\n  allocate(character(len=5) :: ptr, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 11\n  if (.not. associated(ptr)) error stop 12\n  if (len(ptr) /= 3 .or. ptr /= 'ptr') error stop 13\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 14\n  print *, 'ok'\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: text\n    character(len=:), pointer :: ptr\n  end type box_t\n  type(box_t) :: box\n  character(len=:), allocatable :: text\n  character(len=:), pointer :: ptr\n  character(len=64) :: msg\n  integer :: ios\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=3) :: text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  text = 'old'\n  ios = 0\n  allocate(character(len=5) :: text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (len(text) /= 3 .or. text /= 'old') error stop 4\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 5\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=4) :: box%text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 6\n  box%text = 'keep'\n  ios = 0\n  allocate(character(len=6) :: box%text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 7\n  if (len(box%text) /= 4 .or. box%text /= 'keep') error stop 8\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 9\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=3) :: ptr, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 10\n  ptr = 'ptr'\n  ios = 0\n  allocate(character(len=5) :: ptr, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 11\n  if (.not. associated(ptr)) error stop 12\n  if (len(ptr) /= 3 .or. ptr /= 'ptr') error stop 13\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 14\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=4) :: box%ptr, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 15\n  if (trim(msg) /= 'unchanged') error stop 16\n  box%ptr = 'link'\n  allocate(character(len=6) :: box%ptr, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 17\n  if (.not. associated(box%ptr)) error stop 18\n  if (len(box%ptr) /= 4 .or. box%ptr /= 'link') error stop 19\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 20\n  print *, 'ok'\nend program\n",
     );
     let exe = dir.join("alloc_deferred_char_repeat.bin");
     let compile = compile_program(&src, &exe);
@@ -1187,10 +1271,10 @@ fn multi_object_deallocate_preserves_first_failure() {
 }
 
 #[test]
-fn unallocated_unlimited_polymorphic_deallocate_reports_failure() {
+fn unlimited_polymorphic_deallocate_reports_status() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=unallocated_unlimited_polymorphic_deallocate_reports_failure count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=unlimited_polymorphic_deallocate_reports_status count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -1199,7 +1283,7 @@ fn unallocated_unlimited_polymorphic_deallocate_reports_failure() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  type :: box_t\n    class(*), allocatable :: value\n  end type box_t\n  type(box_t) :: box\n  class(*), allocatable :: value\n  integer :: ios\n  character(len=64) :: msg\n  ios = 0\n  msg = 'unchanged'\n  deallocate(value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 1\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 2\n  ios = 0\n  msg = 'unchanged'\n  deallocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 4\n  print *, 'ok'\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    class(*), allocatable :: value\n  end type box_t\n  type(box_t) :: box\n  class(*), allocatable :: value\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(integer :: value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (.not. allocated(value)) error stop 2\n  if (trim(msg) /= 'unchanged') error stop 3\n  deallocate(value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 4\n  if (allocated(value)) error stop 5\n  if (trim(msg) /= 'unchanged') error stop 6\n  deallocate(value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 7\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 8\n  ios = 99\n  msg = 'unchanged'\n  allocate(integer :: box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 9\n  if (.not. allocated(box%value)) error stop 10\n  if (trim(msg) /= 'unchanged') error stop 11\n  deallocate(box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 12\n  if (allocated(box%value)) error stop 13\n  if (trim(msg) /= 'unchanged') error stop 14\n  deallocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 15\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 16\n  print *, 'ok'\nend program\n",
     );
     let exe = dir.join("class_star_deallocate_status.bin");
     let compile = compile_program(&src, &exe);
