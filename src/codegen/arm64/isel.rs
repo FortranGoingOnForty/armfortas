@@ -442,9 +442,17 @@ fn select_call_inst(
             def: None,
         });
     } else {
+        let mut operands = vec![MachineOperand::Extern(label)];
+        if abi_state.stack_offset > 0 {
+            // Tail-call optimization runs after frame teardown has been
+            // materialized. Preserve the per-call outgoing stack size so it
+            // can reject calls whose overflow arguments still live in this
+            // function's frame.
+            operands.push(MachineOperand::Imm(abi_state.stack_offset));
+        }
         mf.block_mut(mb).insts.push(MachineInst {
             opcode: ArmOpcode::Bl,
-            operands: vec![MachineOperand::Extern(label)],
+            operands,
             def: None,
         });
     }

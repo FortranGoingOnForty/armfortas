@@ -26,6 +26,8 @@
 //!   they hold the correct values when the tail branch executes.
 //! * Callee-saved restores (x19–x28, d8–d15) are disjoint from the
 //!   argument registers; restoring them cannot clobber the args.
+//! * Calls with stack-passed arguments are rejected. Their stores are relative
+//!   to this function's allocated SP and would not survive frame teardown.
 //! * LdpPost restores x29 (our FP) and x30 (our LR).  After it fires, LR
 //!   holds our *caller's* return address.  When _callee executes its own
 //!   RET, it returns to *our* caller directly — exactly what TCO requires.
@@ -84,6 +86,9 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
         if block.insts[bl_candidate].opcode != ArmOpcode::Bl {
             continue;
         }
+        if call_uses_outgoing_stack(&block.insts[bl_candidate]) {
+            continue;
+        }
 
         // SAFETY: reject TCO when any argument register (x0–x7) holds a value
         // derived from our frame pointer (e.g. a pointer to a stack-allocated
@@ -118,6 +123,10 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
             def: None,
         });
     }
+}
+
+fn call_uses_outgoing_stack(inst: &MachineInst) -> bool {
+    matches!(inst.operands.get(1), Some(MachineOperand::Imm(bytes)) if *bytes > 0)
 }
 
 fn is_callee_save_restore(inst: &MachineInst, slots: &[(PhysReg, i32)]) -> bool {
@@ -387,6 +396,17 @@ mod tests {
         }
     }
 
+    fn bl_with_stack_args(label: &str, bytes: i64) -> MachineInst {
+        MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![
+                MachineOperand::Extern(label.into()),
+                MachineOperand::Imm(bytes),
+            ],
+            def: None,
+        }
+    }
+
     fn ldp_post() -> MachineInst {
         MachineInst {
             opcode: ArmOpcode::LdpPost,
@@ -489,6 +509,35 @@ mod tests {
         assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Bl));
         assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Ret));
         assert!(!insts.iter().any(|inst| inst.opcode == ArmOpcode::B));
+    }
+
+    #[test]
+    fn no_tco_when_call_uses_outgoing_stack_arguments() {
+        let mut mf = build_mf(vec![vec![
+            bl_with_stack_args("_sink", 8),
+            ldp_post(),
+            ret(),
+        ]]);
+
+        tail_call_opt(&mut mf);
+
+        let insts = &mf.blocks[0].insts;
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Bl));
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Ret));
+        assert!(!insts.iter().any(|inst| inst.opcode == ArmOpcode::B));
+    }
+
+    #[test]
+    fn register_only_tail_call_survives_unrelated_outgoing_frame_space() {
+        let mut mf = build_mf(vec![vec![bl("_sink"), ldp_post(), ret()]]);
+        mf.reserve_outgoing_args(16);
+
+        tail_call_opt(&mut mf);
+
+        let insts = &mf.blocks[0].insts;
+        assert!(!insts.iter().any(|inst| inst.opcode == ArmOpcode::Bl));
+        assert!(!insts.iter().any(|inst| inst.opcode == ArmOpcode::Ret));
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::B));
     }
 
     #[test]

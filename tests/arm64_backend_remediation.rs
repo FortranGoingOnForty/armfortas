@@ -66,3 +66,35 @@ end function
         "call became an unsafe tail branch:\n{asm}"
     );
 }
+
+#[test]
+fn overflow_arguments_block_tail_call_frame_teardown() {
+    let asm = compile_arm64_asm(
+        r#"
+subroutine wrap() bind(c, name="wrap")
+  use iso_c_binding
+  interface
+    subroutine sink(a1,a2,a3,a4,a5,a6,a7,a8,a9) bind(c, name="sink")
+      import :: c_int
+      integer(c_int), value :: a1,a2,a3,a4,a5,a6,a7,a8,a9
+    end subroutine
+  end interface
+  call sink(11,22,33,44,55,66,77,88,99)
+end subroutine
+"#,
+        "-O1",
+    );
+
+    assert!(
+        asm.contains("bl _sink"),
+        "overflow call must remain normal:\n{asm}"
+    );
+    assert!(
+        asm.contains("[sp"),
+        "ninth argument must use outgoing stack space:\n{asm}"
+    );
+    assert!(
+        !asm.contains("\n    b _sink"),
+        "frame teardown invalidates overflow arguments:\n{asm}"
+    );
+}
