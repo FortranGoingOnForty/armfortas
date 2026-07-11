@@ -93,8 +93,8 @@ pub(crate) fn lower_intrinsic_subroutine(
 
     /// Helper: store an i32 runtime result into an out-arg pointer,
     /// coercing to the destination's pointee type (e.g. i32 tag into a
-    /// default-logical or default-integer slot). No-op on a null ptr.
-    fn ieee_store_to_ref(b: &mut FuncBuilder, value: ValueId, dest: ValueId) {
+    /// default-logical or default-integer slot).
+    fn store_i32_to_ref(b: &mut FuncBuilder, value: ValueId, dest: ValueId) {
         let pointee = match b.func().value_type(dest) {
             Some(IrType::Ptr(inner)) => (*inner).clone(),
             _ => IrType::Int(IntWidth::I32),
@@ -360,6 +360,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                 );
                 std::process::exit(1);
             }
+            let stat_ptr = nth_arg_expr(args, 2).map(|expr| lower_arg_by_ref_ctx(b, ctx, expr));
             if to.is_polymorphic {
                 require_context_free_dynamic_lifecycle(b, from.desc);
             }
@@ -410,6 +411,10 @@ pub(crate) fn lower_intrinsic_subroutine(
                 vec![from.desc, to.desc],
                 IrType::Void,
             );
+            if let Some(stat_ptr) = stat_ptr {
+                let success = b.const_i32(0);
+                store_i32_to_ref(b, success, stat_ptr);
+            }
             true
         }
         "system_clock" => {
@@ -783,7 +788,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                 vec![],
                 IrType::Int(IntWidth::I32),
             );
-            ieee_store_to_ref(b, r, dest);
+            store_i32_to_ref(b, r, dest);
             true
         }
         "ieee_set_flag" => {
@@ -807,7 +812,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                 vec![flag],
                 IrType::Int(IntWidth::I32),
             );
-            ieee_store_to_ref(b, r, dest);
+            store_i32_to_ref(b, r, dest);
             true
         }
         "ieee_get_status" => {
@@ -833,7 +838,7 @@ pub(crate) fn lower_intrinsic_subroutine(
             // report it disabled rather than lie.
             let dest = nth_arg_ref(b, ctx, args, 1);
             let zero = b.const_i32(0);
-            ieee_store_to_ref(b, zero, dest);
+            store_i32_to_ref(b, zero, dest);
             true
         }
         "ieee_set_halting_mode" => {

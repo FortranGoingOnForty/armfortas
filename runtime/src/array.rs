@@ -940,6 +940,75 @@ pub extern "C" fn afs_array_mul_scalar_f64(dest: *mut f64, src: *const f64, scal
 
 // ---- ALLOCATE ----
 
+fn report_allocation_failure(stat: *mut i32, code: i32, message: &str) {
+    if !stat.is_null() {
+        unsafe {
+            *stat = code;
+        }
+        return;
+    }
+    eprintln!("ALLOCATE: {}", message);
+    std::process::exit(1);
+}
+
+fn checked_dim_extent(dim: DimDescriptor) -> Option<i64> {
+    if dim.upper_bound < dim.lower_bound {
+        Some(0)
+    } else {
+        dim.upper_bound.checked_sub(dim.lower_bound)?.checked_add(1)
+    }
+}
+
+struct CheckedAllocationLayout {
+    dims: [DimDescriptor; MAX_RANK],
+    bytes: usize,
+}
+
+fn checked_allocation_layout(
+    elem_size: i64,
+    rank: i32,
+    dims_ptr: *const DimDescriptor,
+) -> Result<CheckedAllocationLayout, &'static str> {
+    if rank < 0 || rank as usize > MAX_RANK {
+        return Err("rank is outside the supported range");
+    }
+    if elem_size < 0 {
+        return Err("element size is negative");
+    }
+
+    let rank = rank as usize;
+    if rank > 0 && dims_ptr.is_null() {
+        return Err("dimension descriptor is missing");
+    }
+    let input_dims = if rank == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(dims_ptr, rank) }
+    };
+
+    let mut dims = [DimDescriptor::default(); MAX_RANK];
+    let mut total = 1i64;
+    let mut running_stride = 1i64;
+    for (i, input) in input_dims.iter().copied().enumerate() {
+        let extent = checked_dim_extent(input).ok_or("dimension extent overflows")?;
+        dims[i] = DimDescriptor {
+            lower_bound: input.lower_bound,
+            upper_bound: input.upper_bound,
+            stride: running_stride,
+        };
+        total = total.checked_mul(extent).ok_or("element count overflows")?;
+        running_stride = running_stride
+            .checked_mul(extent.max(1))
+            .ok_or("contiguous stride overflows")?;
+    }
+
+    let bytes = total
+        .checked_mul(elem_size)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("allocation byte count overflows")?;
+    Ok(CheckedAllocationLayout { dims, bytes })
+}
+
 /// Allocate an array described by the given dimensions.
 /// Populates the descriptor with base_addr, elem_size, rank, dims, and flags.
 ///
@@ -957,90 +1026,48 @@ pub extern "C" fn afs_allocate_array(
     stat: *mut i32,
 ) {
     if desc.is_null() {
-        if !stat.is_null() {
-            unsafe {
-                *stat = 1;
-            }
-        }
+        report_allocation_failure(stat, 1, "null array descriptor");
         return;
     }
-
-    let desc = unsafe { &mut *desc };
 
     // Check if already allocated.
-    if desc.is_allocated() {
-        if !stat.is_null() {
-            unsafe {
-                *stat = 2;
-            } // already allocated
-            return;
-        }
-        eprintln!("ALLOCATE: array is already allocated");
-        std::process::exit(1);
-    }
-
-    // Copy dimensions.
-    desc.rank = rank;
-    desc.elem_size = elem_size;
-    desc.clear_dynamic_type_metadata();
-    if !dims_ptr.is_null() && rank > 0 {
-        let dims_slice = unsafe { std::slice::from_raw_parts(dims_ptr, rank as usize) };
-        for (i, dim) in dims_slice.iter().enumerate() {
-            desc.dims[i] = *dim;
-        }
-    }
-
-    // ALLOCATE always produces a single contiguous block, so the
-    // descriptor's per-dim memory stride must be the column-major
-    // canonical step (1 for dim 0, then product of preceding extents).
-    // Compiler-generated dim_buf entries pass stride=1 across the
-    // board (the rank-1 case happens to be correct, multi-dim wasn't),
-    // so fix it up here. Without this, allocatable rank-N section
-    // assignments fed afs_create_section a stride=1 source and the
-    // produced section descriptor stepped through memory contiguously,
-    // collapsing column-major rows into a single linear walk and
-    // corrupting both the LHS write and any subsequent RHS read.
-    let mut running_stride: i64 = 1;
-    for i in 0..rank as usize {
-        desc.dims[i].stride = running_stride;
-        running_stride = running_stride.saturating_mul(desc.dims[i].extent().max(1));
-    }
-
-    // Compute total bytes.
-    let total = desc.total_elements();
-    let bytes = total * elem_size;
-
-    if bytes <= 0 {
-        // Zero-size allocation: valid but produces a null/empty array.
-        desc.base_addr = ptr::null_mut();
-        desc.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
-        if !stat.is_null() {
-            unsafe {
-                *stat = 0;
-            }
-        }
+    if unsafe { &*desc }.is_allocated() {
+        report_allocation_failure(stat, 2, "array is already allocated");
         return;
     }
 
-    // Allocate.
-    let ptr = unsafe { libc_malloc(bytes as usize) };
-    if ptr.is_null() {
-        if !stat.is_null() {
-            unsafe {
-                *stat = 3;
-            } // allocation failed
+    let layout = match checked_allocation_layout(elem_size, rank, dims_ptr) {
+        Ok(layout) => layout,
+        Err(message) => {
+            report_allocation_failure(stat, 4, message);
             return;
         }
-        eprintln!("ALLOCATE: out of memory ({} bytes)", bytes);
-        std::process::exit(1);
-    }
+    };
 
-    // Zero-initialize (Fortran doesn't require this, but it's safer).
-    unsafe {
-        ptr::write_bytes(ptr, 0, bytes as usize);
-    }
+    let data = if layout.bytes == 0 {
+        ptr::null_mut()
+    } else {
+        let data = unsafe { libc_malloc(layout.bytes) };
+        if data.is_null() {
+            report_allocation_failure(stat, 3, "out of memory");
+            return;
+        }
+        unsafe {
+            ptr::write_bytes(data, 0, layout.bytes);
+        }
+        data
+    };
 
-    desc.base_addr = ptr;
+    // Publish descriptor state only after every validation and allocation step
+    // has succeeded, so STAT recovery never exposes a partial allocation.
+    let desc = unsafe { &mut *desc };
+    desc.rank = rank;
+    desc.elem_size = elem_size;
+    for (i, dim) in layout.dims.iter().copied().enumerate().take(rank as usize) {
+        desc.dims[i] = dim;
+    }
+    desc.clear_dynamic_type_metadata();
+    desc.base_addr = data;
     desc.flags = DESC_ALLOCATED | DESC_CONTIGUOUS;
 
     if !stat.is_null() {
@@ -1084,33 +1111,26 @@ pub extern "C" fn afs_allocate_like_with_elem_size(
     stat: *mut i32,
 ) {
     if dest.is_null() || source.is_null() {
-        if !stat.is_null() {
-            unsafe {
-                *stat = 1;
-            }
-        }
+        report_allocation_failure(stat, 1, "null array descriptor");
         return;
     }
 
     let source = unsafe { &*source };
+    if source.rank < 0 || source.rank as usize > MAX_RANK {
+        report_allocation_failure(stat, 4, "source rank is outside the supported range");
+        return;
+    }
     let mut dims = [DimDescriptor::default(); MAX_RANK];
-    // Column-major running strides: dim[0]=1, dim[k]=Π_{j<k} extent_j.
-    // The previous flat-1 stride caused per-dim consumers
-    // (`for_each_reduce_along_dim`, `for_each_reduce_along_dim_with_mask`,
-    // `lower_multi_d_section_assign`) to compute colliding byte offsets,
-    // so for `m = (y > 3.)` over `real :: y(2,3)` only 4 of the 6 mask
-    // bytes were read by the masked sum-along-dim helper — the
-    // remaining two ran over the same byte twice and dropped the
-    // column-2 hit entirely.
-    let mut running: i64 = 1;
     for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
-        let extent = source.dims[i].extent();
+        let Some(extent) = checked_dim_extent(source.dims[i]) else {
+            report_allocation_failure(stat, 4, "source dimension extent overflows");
+            return;
+        };
         *dim = DimDescriptor {
             lower_bound: 1,
             upper_bound: extent,
-            stride: running,
+            stride: 1,
         };
-        running = running.saturating_mul(extent.max(1));
     }
 
     let dims_ptr = if source.rank > 0 {
@@ -1132,33 +1152,23 @@ pub extern "C" fn afs_allocate_like(
     stat: *mut i32,
 ) {
     if dest.is_null() || source.is_null() {
-        if !stat.is_null() {
-            unsafe {
-                *stat = 1;
-            }
-        }
+        report_allocation_failure(stat, 1, "null array descriptor");
         return;
     }
 
     let source = unsafe { &*source };
-    let mut dims = [DimDescriptor::default(); MAX_RANK];
-    for (i, dim) in dims.iter_mut().enumerate().take(source.rank as usize) {
-        *dim = DimDescriptor {
-            lower_bound: source.dims[i].lower_bound,
-            upper_bound: source.dims[i].upper_bound,
-            stride: 1,
-        };
+    let elem_size = source.elem_size;
+    let rank = source.rank;
+    let scalar_type_tag = source.scalar_type_tag();
+    let dynamic_vtable = source.dynamic_vtable_ptr();
+    let dims_ptr = source.dims.as_ptr();
+    afs_allocate_array(dest, elem_size, rank, dims_ptr, stat);
+    if !stat.is_null() && unsafe { *stat } != 0 {
+        return;
     }
-
-    let dims_ptr = if source.rank > 0 {
-        dims.as_ptr()
-    } else {
-        ptr::null()
-    };
-    afs_allocate_array(dest, source.elem_size, source.rank, dims_ptr, stat);
     let dest = unsafe { &mut *dest };
-    dest.set_scalar_type_tag(source.scalar_type_tag());
-    dest.set_dynamic_vtable_ptr(source.dynamic_vtable_ptr());
+    dest.set_scalar_type_tag(scalar_type_tag);
+    dest.set_dynamic_vtable_ptr(dynamic_vtable);
 }
 
 /// Copy array payload from `source` into an already-allocated `dest` without
@@ -1491,7 +1501,7 @@ pub extern "C" fn afs_prepare_array_copy(
 
 /// Deallocate an array, freeing its memory and clearing the descriptor.
 ///
-/// Safe to call on an already-deallocated descriptor (no-op with stat=0).
+/// Reports an error when the descriptor is not allocated.
 #[no_mangle]
 pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i32) {
     if desc.is_null() {
@@ -1506,10 +1516,9 @@ pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i3
     let desc = unsafe { &mut *desc };
 
     if !desc.is_allocated() {
-        // Not allocated — not an error with STAT, abort without STAT.
         if !stat.is_null() {
             unsafe {
-                *stat = 0;
+                *stat = 2;
             }
             return;
         }
@@ -2473,6 +2482,92 @@ mod tests {
         afs_allocate_array(&mut desc, 4, 1, &dim, &mut stat);
         assert_eq!(stat, 2); // already allocated
         afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
+    fn allocation_overflow_preserves_descriptor() {
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.elem_size = 17;
+        desc.dims[0] = DimDescriptor {
+            lower_bound: 7,
+            upper_bound: 9,
+            stride: 3,
+        };
+        let dims = [DimDescriptor {
+            lower_bound: 1,
+            upper_bound: i64::MAX / 4 + 1,
+            stride: 1,
+        }];
+        let mut stat = -1;
+
+        afs_allocate_array(&mut desc, 4, 1, dims.as_ptr(), &mut stat);
+
+        assert_ne!(stat, 0);
+        assert!(!desc.is_allocated());
+        assert!(desc.base_addr.is_null());
+        assert_eq!(desc.elem_size, 17);
+        assert_eq!(desc.rank, 0);
+        assert_eq!(desc.dims[0].lower_bound, 7);
+        assert_eq!(desc.dims[0].upper_bound, 9);
+        assert_eq!(desc.dims[0].stride, 3);
+    }
+
+    #[test]
+    fn allocation_rejects_extent_stride_and_rank_overflow() {
+        let cases = [
+            (
+                1,
+                vec![DimDescriptor {
+                    lower_bound: i64::MIN,
+                    upper_bound: i64::MAX,
+                    stride: 1,
+                }],
+            ),
+            (
+                2,
+                vec![
+                    DimDescriptor {
+                        lower_bound: 1,
+                        upper_bound: i64::MAX,
+                        stride: 1,
+                    },
+                    DimDescriptor {
+                        lower_bound: 1,
+                        upper_bound: 2,
+                        stride: 1,
+                    },
+                ],
+            ),
+            (16, vec![DimDescriptor::default(); 16]),
+            (-1, vec![]),
+        ];
+
+        for (rank, dims) in cases {
+            let mut desc = ArrayDescriptor::zeroed();
+            let mut stat = -1;
+            let dims_ptr = if dims.is_empty() {
+                ptr::null()
+            } else {
+                dims.as_ptr()
+            };
+
+            afs_allocate_array(&mut desc, 4, rank, dims_ptr, &mut stat);
+
+            assert_ne!(stat, 0, "rank {rank} unexpectedly succeeded");
+            assert!(!desc.is_allocated(), "rank {rank} marked allocated");
+            assert!(desc.base_addr.is_null(), "rank {rank} published storage");
+            assert_eq!(desc.rank, 0, "rank {rank} mutated the descriptor");
+        }
+    }
+
+    #[test]
+    fn deallocate_unallocated_sets_stat() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+        afs_deallocate_array(&mut desc, &mut stat);
+        assert_ne!(stat, 0);
+        assert!(!desc.is_allocated());
+        assert!(desc.base_addr.is_null());
     }
 
     #[test]
