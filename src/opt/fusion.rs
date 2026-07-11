@@ -26,8 +26,9 @@ impl Pass for LoopFusion {
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
+        let layout = module.layout;
         for func in &mut module.functions {
-            if fusion_in_function(func) {
+            if fusion_in_function(func, layout) {
                 changed = true;
             }
         }
@@ -35,7 +36,7 @@ impl Pass for LoopFusion {
     }
 }
 
-fn fusion_in_function(func: &mut Function) -> bool {
+fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
     let loops = find_natural_loops(func);
     if loops.len() < 2 {
         return false;
@@ -132,7 +133,7 @@ fn fusion_in_function(func: &mut Function) -> bool {
             }
 
             // Dep analysis: fusion legal?
-            if !dep_analysis::fusion_legal(func, &lp_a.body, &lp_b.body, iv_a, iv_b) {
+            if !dep_analysis::fusion_legal(func, &lp_a.body, &lp_b.body, iv_a, iv_b, layout) {
                 continue;
             }
 

@@ -22,6 +22,7 @@ pub mod dep_analysis;
 pub mod dse;
 pub mod fast_math;
 pub mod fission;
+pub(crate) mod fpenv;
 pub mod fusion;
 pub mod global_lsf;
 pub mod gvn;

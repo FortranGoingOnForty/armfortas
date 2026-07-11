@@ -6,12 +6,14 @@
 //!
 //! ## Fortran-specific simplifications
 //!
-//! - Distinct array base pointers → always independent (Fortran standard
-//!   prohibits aliasing between distinct named arrays absent EQUIVALENCE).
+//! - Distinct ordinary array bases are independent only when alias analysis
+//!   proves they cannot be POINTER/TARGET aliases.
 //! - Column-major strides are compile-time constants for fixed-shape arrays.
 //! - INTENT(IN) arguments cannot alias INTENT(OUT) arguments.
 
+use super::alias::{AliasOracle, AliasResult};
 use crate::ir::inst::*;
+use crate::target::TargetLayout;
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
@@ -307,6 +309,7 @@ pub fn fusion_legal(
     body_b: &HashSet<BlockId>,
     iv_a: ValueId,
     iv_b: ValueId,
+    layout: TargetLayout,
 ) -> bool {
     let mut ivs_a = HashSet::new();
     ivs_a.insert(iv_a);
@@ -328,13 +331,14 @@ pub fn fusion_legal(
             r
         })
         .collect();
+    let mut alias_oracle = AliasOracle::new(func, layout);
 
     for ra in &refs_a {
         for rb in &refs_b {
             if !ra.is_write && !rb.is_write {
                 continue;
             }
-            if ra.base != rb.base {
+            if matches!(alias_oracle.query(ra.base, rb.base), AliasResult::NoAlias) {
                 continue;
             }
 
@@ -401,6 +405,29 @@ pub fn interchange_legal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::types::{IntWidth, IrType};
+    use crate::lexer::{Position, Span};
+
+    fn dummy_span() -> Span {
+        let pos = Position { line: 0, col: 0 };
+        Span {
+            file_id: 0,
+            start: pos,
+            end: pos,
+        }
+    }
+
+    fn push_inst(func: &mut Function, block: BlockId, kind: InstKind, ty: IrType) -> ValueId {
+        let id = func.next_value_id();
+        func.register_type(id, ty.clone());
+        func.block_mut(block).insts.push(Inst {
+            id,
+            kind,
+            ty,
+            span: dummy_span(),
+        });
+        id
+    }
 
     #[test]
     fn gcd_basic() {
@@ -553,6 +580,113 @@ mod tests {
         assert!(
             !dep.dependent,
             "distinct bases should be independent (Fortran no-alias)"
+        );
+    }
+
+    #[test]
+    fn fusion_rejects_cross_iteration_pointer_alias() {
+        let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let params = vec![
+            Param {
+                name: "first".into(),
+                ty: ptr_ty.clone(),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "second".into(),
+                ty: ptr_ty.clone(),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut func = Function::new("pointer_loops".into(), params, IrType::Void);
+        let entry = func.entry;
+        let body_a = func.create_block("body_a");
+        let body_b = func.create_block("body_b");
+
+        let iv_a = func.next_value_id();
+        func.register_type(iv_a, IrType::Int(IntWidth::I64));
+        func.block_mut(body_a).params.push(BlockParam {
+            id: iv_a,
+            ty: IrType::Int(IntWidth::I64),
+        });
+        let iv_b = func.next_value_id();
+        func.register_type(iv_b, IrType::Int(IntWidth::I64));
+        func.block_mut(body_b).params.push(BlockParam {
+            id: iv_b,
+            ty: IrType::Int(IntWidth::I64),
+        });
+
+        let one = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let value = push_inst(
+            &mut func,
+            entry,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let first_element = push_inst(
+            &mut func,
+            body_a,
+            InstKind::GetElementPtr(ValueId(0), vec![iv_a]),
+            ptr_ty.clone(),
+        );
+        push_inst(
+            &mut func,
+            body_a,
+            InstKind::Store(value, first_element),
+            IrType::Void,
+        );
+
+        let next = push_inst(
+            &mut func,
+            body_b,
+            InstKind::IAdd(iv_b, one),
+            IrType::Int(IntWidth::I64),
+        );
+        let second_element = push_inst(
+            &mut func,
+            body_b,
+            InstKind::GetElementPtr(ValueId(1), vec![next]),
+            ptr_ty,
+        );
+        push_inst(
+            &mut func,
+            body_b,
+            InstKind::Load(second_element),
+            IrType::Int(IntWidth::I32),
+        );
+
+        assert!(
+            !fusion_legal(
+                &func,
+                &HashSet::from([body_a]),
+                &HashSet::from([body_b]),
+                iv_a,
+                iv_b,
+                TargetLayout::LP64,
+            ),
+            "distinct pointer descriptors may alias the same target"
+        );
+
+        for param in &mut func.params {
+            param.fortran_noalias = true;
+        }
+        assert!(
+            fusion_legal(
+                &func,
+                &HashSet::from([body_a]),
+                &HashSet::from([body_b]),
+                iv_a,
+                iv_b,
+                TargetLayout::LP64,
+            ),
+            "distinct ordinary array arguments should remain independent"
         );
     }
 }

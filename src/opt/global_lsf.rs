@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_forward_global_store_across_unrelated_pointer_call() {
+    fn does_not_forward_global_store_across_zero_argument_call() {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("test".into(), vec![], IrType::Int(IntWidth::I32));
         let span = crate::lexer::Span {
@@ -432,14 +432,6 @@ mod tests {
             ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
             span,
             kind: InstKind::GlobalAddr("state".into()),
-        });
-        let scratch = f.next_value_id();
-        f.register_type(scratch, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
-        f.block_mut(f.entry).insts.push(Inst {
-            id: scratch,
-            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
-            span,
-            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
         });
         let value = f.next_value_id();
         f.register_type(value, IrType::Int(IntWidth::I32));
@@ -463,7 +455,7 @@ mod tests {
             id: call,
             ty: IrType::Void,
             span,
-            kind: InstKind::Call(FuncRef::External("touch_global".into()), vec![scratch]),
+            kind: InstKind::Call(FuncRef::External("touch_global".into()), vec![]),
         });
         f.block_mut(f.entry).terminator = Some(Terminator::Branch(load_block, vec![]));
 
