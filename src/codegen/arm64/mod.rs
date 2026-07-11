@@ -49,7 +49,7 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
             regalloc::regalloc_naive(mf);
         } else {
             let liveness = liveness::compute_liveness(mf);
-            let result = linearscan::linear_scan(mf);
+            let result = linearscan::linear_scan(mf, &liveness);
             linearscan::apply_allocation(mf, &result, &liveness);
             linearscan::parallelize_entry_arg_moves(mf);
             linearscan::parallelize_call_arg_moves(mf);

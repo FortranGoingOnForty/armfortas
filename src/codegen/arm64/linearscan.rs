@@ -8,7 +8,7 @@
 //! Callee-saved registers (x19-x28, d8-d15) are tracked — if used, the function
 //! prologue/epilogue must save/restore them.
 
-use super::liveness::compute_liveness;
+use super::liveness::LivenessResult;
 use super::mir::*;
 use crate::codegen::shared::{classify_call_crossing, CallCrossing};
 use std::collections::{HashMap, HashSet};
@@ -116,10 +116,8 @@ pub struct AllocResult {
     pub split_records: Vec<SplitRecord>,
 }
 
-/// Run linear scan register allocation on a machine function.
-pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
-    let liveness = compute_liveness(mf);
-
+/// Run linear scan register allocation using precomputed liveness.
+pub fn linear_scan(mf: &mut MachineFunction, liveness: &LivenessResult) -> AllocResult {
     let mut assignments: HashMap<VRegId, PhysReg> = HashMap::new();
     let mut spills: HashMap<VRegId, i32> = HashMap::new();
     // Active intervals: (reg_num, interval_end, current_vreg). The
@@ -570,6 +568,172 @@ enum LogicalAssignment {
     Slot(i32),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RegisterOccupancy {
+    gp: u32,
+    fp: u32,
+}
+
+impl RegisterOccupancy {
+    const fn new(gp: u32, fp: u32) -> Self {
+        Self { gp, fp }
+    }
+
+    fn contains_gp(self, reg: u8) -> bool {
+        self.gp & (1u32 << reg) != 0
+    }
+
+    fn contains_fp(self, reg: u8) -> bool {
+        self.fp & (1u32 << reg) != 0
+    }
+}
+
+struct AllocationPlan {
+    split_indices: HashMap<VRegId, usize>,
+    gp_candidates: Vec<u8>,
+    fp_candidates: Vec<u8>,
+    occupancy: Vec<RegisterOccupancy>,
+}
+
+fn register_occupancy(phys: PhysReg) -> Option<RegisterOccupancy> {
+    match phys {
+        PhysReg::Gp(reg) | PhysReg::Gp32(reg) => Some(RegisterOccupancy::new(1u32 << reg, 0)),
+        PhysReg::Fp(reg) | PhysReg::Fp32(reg) => Some(RegisterOccupancy::new(0, 1u32 << reg)),
+        _ => None,
+    }
+}
+
+fn push_candidate(
+    phys: PhysReg,
+    gp_candidates: &mut Vec<u8>,
+    fp_candidates: &mut Vec<u8>,
+    seen: &mut RegisterOccupancy,
+) {
+    match phys {
+        PhysReg::Gp(reg) | PhysReg::Gp32(reg) if !seen.contains_gp(reg) => {
+            seen.gp |= 1u32 << reg;
+            gp_candidates.push(reg);
+        }
+        PhysReg::Fp(reg) | PhysReg::Fp32(reg) if !seen.contains_fp(reg) => {
+            seen.fp |= 1u32 << reg;
+            fp_candidates.push(reg);
+        }
+        _ => {}
+    }
+}
+
+fn toggle_occupancy_range(
+    occupancy: &mut [RegisterOccupancy],
+    phys: PhysReg,
+    start: u32,
+    end: u32,
+) {
+    let instruction_count = occupancy.len().saturating_sub(1);
+    if start > end || instruction_count == 0 {
+        return;
+    }
+    let Some(mask) = register_occupancy(phys) else {
+        return;
+    };
+    let first = start.div_ceil(2) as usize;
+    if first >= instruction_count {
+        return;
+    }
+    let last = (end as usize / 2).min(instruction_count - 1);
+    if first > last {
+        return;
+    }
+    occupancy[first].gp ^= mask.gp;
+    occupancy[first].fp ^= mask.fp;
+    occupancy[last + 1].gp ^= mask.gp;
+    occupancy[last + 1].fp ^= mask.fp;
+}
+
+fn precompute_allocation_plan(result: &AllocResult, liveness: &LivenessResult) -> AllocationPlan {
+    let mut split_indices = HashMap::new();
+    for (index, record) in result.split_records.iter().enumerate() {
+        split_indices.entry(record.vreg).or_insert(index);
+    }
+
+    let mut sorted_assignments: Vec<(VRegId, PhysReg)> = result
+        .assignments
+        .iter()
+        .map(|(&vreg, &phys)| (vreg, phys))
+        .collect();
+    sorted_assignments.sort_by_key(|(vreg, _)| vreg.0);
+
+    let mut gp_candidates = Vec::new();
+    let mut fp_candidates = Vec::new();
+    let mut seen = RegisterOccupancy::default();
+    for &(_, phys) in &sorted_assignments {
+        push_candidate(phys, &mut gp_candidates, &mut fp_candidates, &mut seen);
+    }
+    for record in &result.split_records {
+        if let PostHalf::Allocated(phys) = record.post {
+            push_candidate(phys, &mut gp_candidates, &mut fp_candidates, &mut seen);
+        }
+    }
+    for reg in GP_SPILL_SCRATCH {
+        push_candidate(
+            PhysReg::Gp(reg),
+            &mut gp_candidates,
+            &mut fp_candidates,
+            &mut seen,
+        );
+    }
+    for reg in FP_SPILL_SCRATCH {
+        push_candidate(
+            PhysReg::Fp(reg),
+            &mut gp_candidates,
+            &mut fp_candidates,
+            &mut seen,
+        );
+    }
+
+    let instruction_count = liveness.num_positions.div_ceil(2) as usize;
+    // Allocated intervals sharing a physical register never overlap, so
+    // toggling at each range boundary produces the exact occupancy mask.
+    let mut occupancy = vec![RegisterOccupancy::default(); instruction_count + 1];
+    for interval in &liveness.intervals {
+        let Some(&phys) = result.assignments.get(&interval.vreg) else {
+            continue;
+        };
+        if let Some(&split_index) = split_indices.get(&interval.vreg) {
+            let record = &result.split_records[split_index];
+            toggle_occupancy_range(
+                &mut occupancy,
+                record.pre_phys,
+                interval.start,
+                interval.end.min(record.call_position),
+            );
+            if let PostHalf::Allocated(post_phys) = record.post {
+                toggle_occupancy_range(
+                    &mut occupancy,
+                    post_phys,
+                    interval.start.max(record.call_position.saturating_add(1)),
+                    interval.end,
+                );
+            }
+        } else {
+            toggle_occupancy_range(&mut occupancy, phys, interval.start, interval.end);
+        }
+    }
+    let mut current = RegisterOccupancy::default();
+    for entry in occupancy.iter_mut().take(instruction_count) {
+        current.gp ^= entry.gp;
+        current.fp ^= entry.fp;
+        *entry = current;
+    }
+    occupancy.truncate(instruction_count);
+
+    AllocationPlan {
+        split_indices,
+        gp_candidates,
+        fp_candidates,
+        occupancy,
+    }
+}
+
 /// Apply allocation result: rewrite VReg operands to PhysReg, insert spill code.
 /// For spilled operands, borrows a temporarily-free register from the allocation
 /// pool rather than using dedicated scratch registers. This avoids wasting
@@ -581,33 +745,15 @@ pub fn apply_allocation(
 ) {
     let vreg_classes: HashMap<VRegId, RegClass> =
         mf.vregs.iter().map(|v| (v.id, v.class)).collect();
-
-    // Build interval lookup: for each vreg, its live range.
-    let intervals: HashMap<VRegId, (u32, u32)> = liveness
-        .intervals
-        .iter()
-        .map(|i| (i.vreg, (i.start, i.end)))
-        .collect();
-
-    // Compute instruction positions for each block/instruction.
-    let mut inst_pos: HashMap<(usize, usize), u32> = HashMap::new();
-    let mut pos: u32 = 0;
-    for (bi, block) in mf.blocks.iter().enumerate() {
-        for (ii, _) in block.insts.iter().enumerate() {
-            inst_pos.insert((bi, ii), pos);
-            pos += 2;
-        }
-    }
+    let plan = precompute_allocation_plan(result, liveness);
 
     // Position-aware lookup: returns the logical assignment of
     // `vid` at `cur_pos`, consulting split_records first so that
     // post-call uses pick up the post-half's location instead of
     // the pre-half's (now-clobbered) caller-saved register.
     let logical_assignment = |vid: VRegId, cur_pos: u32| -> Option<LogicalAssignment> {
-        for r in &result.split_records {
-            if r.vreg != vid {
-                continue;
-            }
+        if let Some(&split_index) = plan.split_indices.get(&vid) {
+            let r = &result.split_records[split_index];
             if cur_pos > r.call_position {
                 return Some(match r.post {
                     PostHalf::Allocated(p) => LogicalAssignment::Reg(p),
@@ -627,120 +773,34 @@ pub fn apply_allocation(
         }
     };
 
+    let mut gp_temps = Vec::with_capacity(plan.gp_candidates.len());
+    let mut fp_temps = Vec::with_capacity(plan.fp_candidates.len());
+    let mut instruction_ordinal = 0usize;
     for block_idx in 0..mf.blocks.len() {
         let mut new_insts = Vec::new();
         let insts = std::mem::take(&mut mf.blocks[block_idx].insts);
 
-        for (inst_idx, inst) in insts.iter().enumerate() {
+        for inst in &insts {
             let mut rewritten = inst.clone();
-            let cur_pos = inst_pos.get(&(block_idx, inst_idx)).copied().unwrap_or(0);
+            let cur_pos = (instruction_ordinal as u32) * 2;
+            let occupied = plan.occupancy[instruction_ordinal];
             let preserved_entry_arg_def =
                 inst.def.filter(|def| mf.entry_arg_receipts.contains(def));
 
-            // Find GP registers NOT in use at this position. A
-            // vreg's register is in use during its full live range
-            // unless the vreg was split — in which case the
-            // pre-half occupies pre_phys during [start,
-            // call_position] and the post-half occupies post_phys
-            // during (call_position, end].
-            //
-            // Iterate `result.assignments` in **deterministic vreg
-            // order**, not raw HashMap iteration order — the latter
-            // varies between runs and produces different temp-reg
-            // assignments and therefore non-reproducible builds. The
-            // resulting `gp_temps`/`fp_temps` lists are consumed by
-            // index, so their order is load-bearing.
-            let mut gp_temps: Vec<u8> = Vec::new();
-            let mut fp_temps: Vec<u8> = Vec::new();
-            let mut sorted_assignments: Vec<(VRegId, PhysReg)> =
-                result.assignments.iter().map(|(&v, &p)| (v, p)).collect();
-            sorted_assignments.sort_by_key(|(v, _)| v.0);
-            // Build the set of phys regs in use at cur_pos. For
-            // split vregs, pre_phys is in use up to call_position,
-            // post_phys (if Allocated) takes over after.
-            let mut used_gp: HashSet<u8> = HashSet::new();
-            let mut used_fp: HashSet<u8> = HashSet::new();
-            let mark_used = |phys: PhysReg, gp: &mut HashSet<u8>, fp: &mut HashSet<u8>| match phys {
-                PhysReg::Gp(n) | PhysReg::Gp32(n) => {
-                    gp.insert(n);
-                }
-                PhysReg::Fp(n) | PhysReg::Fp32(n) => {
-                    fp.insert(n);
-                }
-                _ => {}
-            };
-            for (vreg, phys) in &sorted_assignments {
-                if let Some(&(start, end)) = intervals.get(vreg) {
-                    if cur_pos < start || cur_pos > end {
-                        continue;
-                    }
-                    // Split vregs: pre_phys covers [start,
-                    // call_position]; post_phys covers
-                    // (call_position, end]. assignments[vreg] is
-                    // the pre_phys (we removed the synthetic).
-                    let split = result.split_records.iter().find(|r| r.vreg == *vreg);
-                    if let Some(rec) = split {
-                        if cur_pos <= rec.call_position {
-                            mark_used(rec.pre_phys, &mut used_gp, &mut used_fp);
-                        }
-                        if let PostHalf::Allocated(p) = rec.post {
-                            if cur_pos > rec.call_position {
-                                mark_used(p, &mut used_gp, &mut used_fp);
-                            }
-                        }
-                    } else {
-                        mark_used(*phys, &mut used_gp, &mut used_fp);
-                    }
-                }
-            }
-            for (_, phys) in &sorted_assignments {
-                match phys {
-                    PhysReg::Gp(n) | PhysReg::Gp32(n)
-                        if !used_gp.contains(n) && !gp_temps.contains(n) =>
-                    {
-                        gp_temps.push(*n);
-                    }
-                    PhysReg::Fp(n) | PhysReg::Fp32(n)
-                        if !used_fp.contains(n) && !fp_temps.contains(n) =>
-                    {
-                        fp_temps.push(*n);
-                    }
-                    _ => {}
-                }
-            }
-            // post_phys registers from split records are also
-            // candidates for temp use when *they're* not in use.
-            for r in &result.split_records {
-                if let PostHalf::Allocated(p) = r.post {
-                    let in_use = match p {
-                        PhysReg::Gp(n) | PhysReg::Gp32(n) => used_gp.contains(&n),
-                        PhysReg::Fp(n) | PhysReg::Fp32(n) => used_fp.contains(&n),
-                        _ => true,
-                    };
-                    if !in_use {
-                        match p {
-                            PhysReg::Gp(n) | PhysReg::Gp32(n) if !gp_temps.contains(&n) => {
-                                gp_temps.push(n);
-                            }
-                            PhysReg::Fp(n) | PhysReg::Fp32(n) if !fp_temps.contains(&n) => {
-                                fp_temps.push(n);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            // Also include the dedicated fallback scratches in case no free regs found.
-            for &s in &GP_SPILL_SCRATCH {
-                if !gp_temps.contains(&s) {
-                    gp_temps.push(s);
-                }
-            }
-            for &s in &FP_SPILL_SCRATCH {
-                if !fp_temps.contains(&s) {
-                    fp_temps.push(s);
-                }
-            }
+            gp_temps.clear();
+            gp_temps.extend(
+                plan.gp_candidates
+                    .iter()
+                    .copied()
+                    .filter(|&reg| !occupied.contains_gp(reg)),
+            );
+            fp_temps.clear();
+            fp_temps.extend(
+                plan.fp_candidates
+                    .iter()
+                    .copied()
+                    .filter(|&reg| !occupied.contains_fp(reg)),
+            );
 
             // For spilled (or post-spilled-after-split) vreg uses:
             // borrow a temp register and load from the slot.
@@ -898,10 +958,12 @@ pub fn apply_allocation(
                 };
                 emit_spill_access(&mut new_insts, store_op, scratch, offset as i64);
             }
+            instruction_ordinal += 1;
         }
 
         mf.blocks[block_idx].insts = new_insts;
     }
+    debug_assert_eq!(instruction_ordinal, plan.occupancy.len());
 }
 
 /// Emit a spill load or store, materializing the FP-relative
@@ -1566,9 +1628,59 @@ fn spill_scratch(class: RegClass, idx: usize) -> (PhysReg, ArmOpcode) {
 mod tests {
     use super::*;
     use crate::codegen::isel::select_function;
+    use crate::codegen::liveness::{compute_liveness, LiveInterval, LivenessResult};
     use crate::ir::builder::FuncBuilder;
     use crate::ir::inst::*;
     use crate::ir::types::*;
+
+    #[test]
+    fn allocation_plan_tracks_split_occupancy_and_stable_temp_order() {
+        let pre = VRegId(0);
+        let fp = VRegId(1);
+        let result = AllocResult {
+            assignments: HashMap::from([(fp, PhysReg::Fp(2)), (pre, PhysReg::Gp(1))]),
+            spills: HashMap::new(),
+            callee_saved_used: Vec::new(),
+            split_records: vec![SplitRecord {
+                vreg: pre,
+                call_position: 2,
+                call_index: 0,
+                pre_phys: PhysReg::Gp(1),
+                post: PostHalf::Allocated(PhysReg::Gp(3)),
+                bridge_slot: -8,
+            }],
+        };
+        let liveness = LivenessResult {
+            intervals: vec![
+                LiveInterval {
+                    vreg: pre,
+                    class: RegClass::Gp64,
+                    start: 0,
+                    end: 6,
+                    hint: None,
+                },
+                LiveInterval {
+                    vreg: fp,
+                    class: RegClass::Fp64,
+                    start: 2,
+                    end: 4,
+                    hint: None,
+                },
+            ],
+            call_positions: vec![2],
+            num_positions: 8,
+        };
+
+        let plan = precompute_allocation_plan(&result, &liveness);
+
+        assert_eq!(plan.gp_candidates, vec![1, 3, 9, 10, 11]);
+        assert_eq!(plan.fp_candidates, vec![2, 29, 30, 31]);
+        assert_eq!(plan.occupancy.len(), 4);
+        assert_eq!(plan.occupancy[0], RegisterOccupancy::new(1 << 1, 0));
+        assert_eq!(plan.occupancy[1], RegisterOccupancy::new(1 << 1, 1 << 2));
+        assert_eq!(plan.occupancy[2], RegisterOccupancy::new(1 << 3, 1 << 2));
+        assert_eq!(plan.occupancy[3], RegisterOccupancy::new(1 << 3, 0));
+    }
 
     #[test]
     fn linear_scan_assigns_registers() {
@@ -1581,7 +1693,8 @@ mod tests {
             b.ret_void();
         }
         let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
-        let result = linear_scan(&mut mf);
+        let liveness = compute_liveness(&mf);
+        let result = linear_scan(&mut mf, &liveness);
         // Should have assignments for the vregs.
         assert!(
             !result.assignments.is_empty(),
@@ -1612,7 +1725,8 @@ mod tests {
             b.ret_void();
         }
         let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
-        let result = linear_scan(&mut mf);
+        let liveness = compute_liveness(&mf);
+        let result = linear_scan(&mut mf, &liveness);
         // x18 must never be assigned.
         for phys in result.assignments.values() {
             match phys {
@@ -1801,7 +1915,8 @@ mod tests {
             b.ret_void();
         }
         let mut mf = select_function(&func, crate::target::TargetLayout::LP64);
-        let result = linear_scan(&mut mf);
+        let liveness = compute_liveness(&mf);
+        let result = linear_scan(&mut mf, &liveness);
         assert!(
             result.callee_saved_used.is_empty(),
             "no callee-saved expected for call-free function, got {:?}",
@@ -2228,7 +2343,8 @@ mod tests {
             def: None,
         });
 
-        let result = linear_scan(&mut mf);
+        let liveness = compute_liveness(&mf);
+        let result = linear_scan(&mut mf, &liveness);
         assert!(
             result.split_records.iter().all(|r| r.vreg != carried),
             "branch-carried cross-block vreg must not be split: {:#?}",
@@ -2273,7 +2389,8 @@ mod tests {
             operands: vec![],
             def: None,
         });
-        let result = linear_scan(&mut mf);
+        let liveness = compute_liveness(&mf);
+        let result = linear_scan(&mut mf, &liveness);
         assert!(
             !result.split_records.is_empty(),
             "expected splits when 12 call-crossing vregs collide with the 10-deep callee-saved pool"

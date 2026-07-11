@@ -669,7 +669,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 crate::codegen::regalloc::regalloc_naive(mf);
             } else {
                 let liveness = crate::codegen::liveness::compute_liveness(mf);
-                let result = linearscan::linear_scan(mf);
+                let result = linearscan::linear_scan(mf, &liveness);
                 linearscan::apply_allocation(mf, &result, &liveness);
                 // Post-allocation passes — must mirror the driver pipeline so
                 // captured asm matches the binary the user actually ships.
