@@ -10,8 +10,8 @@
 //!
 //! This avoids SSA domination bugs from selective instruction removal.
 
-use super::dep_analysis::{collect_mem_refs, test_dependence};
-use super::loop_utils::{clone_loop, find_preheader};
+use super::alias::{AliasOracle, AliasResult};
+use super::loop_utils::{clone_loop, find_preheader, loop_defined_values};
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::{find_natural_loops, predecessors};
@@ -28,8 +28,9 @@ impl Pass for LoopFission {
 
     fn run(&self, module: &mut Module) -> bool {
         let mut changed = false;
+        let layout = module.layout;
         for func in &mut module.functions {
-            if fission_in_function(func) {
+            if fission_in_function(func, layout) {
                 changed = true;
             }
         }
@@ -37,7 +38,7 @@ impl Pass for LoopFission {
     }
 }
 
-fn fission_in_function(func: &mut Function) -> bool {
+fn fission_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
     let loops = find_natural_loops(func);
     let preds = predecessors(func);
 
@@ -54,7 +55,6 @@ fn fission_in_function(func: &mut Function) -> bool {
         if hdr.params.len() != 1 {
             continue;
         }
-        let iv = hdr.params[0].id;
 
         // Find the single computation body block.
         let body_block = find_computation_block(func, lp, latch_id);
@@ -77,38 +77,23 @@ fn fission_in_function(func: &mut Function) -> bool {
             continue;
         }
 
-        // Check independence via dep analysis.
-        let mut ivs = HashSet::new();
-        ivs.insert(iv);
-        let mem_refs = collect_mem_refs(func, &lp.body, &ivs);
-        let writes: Vec<_> = mem_refs.iter().filter(|r| r.is_write).collect();
-        if writes.len() != 2 {
-            continue;
-        }
-        if writes[0].base == writes[1].base {
+        // Calls and vector stores would be cloned into both loops, so this
+        // store-only partitioner cannot preserve their effects.
+        if lp.body.iter().any(|&bid| {
+            func.block(bid).insts.iter().any(|inst| {
+                matches!(
+                    inst.kind,
+                    InstKind::Call(..) | InstKind::RuntimeCall(..) | InstKind::VStore(..)
+                )
+            })
+        }) {
             continue;
         }
 
-        let mut has_cross_dep = false;
-        for i in 0..mem_refs.len() {
-            for j in (i + 1)..mem_refs.len() {
-                if !mem_refs[i].is_write && !mem_refs[j].is_write {
-                    continue;
-                }
-                if mem_refs[i].base == mem_refs[j].base {
-                    continue;
-                }
-                let dep = test_dependence(&mem_refs[i], &mem_refs[j]);
-                if dep.dependent {
-                    has_cross_dep = true;
-                    break;
-                }
-            }
-            if has_cross_dep {
-                break;
-            }
-        }
-        if has_cross_dep {
+        let loop_defs = loop_defined_values(func, lp);
+        let slice_a = backward_slice(func, stores[0].1, &loop_defs);
+        let slice_b = backward_slice(func, stores[1].1, &loop_defs);
+        if !partitions_are_memory_independent(func, &slice_a, &slice_b, layout) {
             continue;
         }
 
@@ -161,6 +146,53 @@ fn fission_in_function(func: &mut Function) -> bool {
         return true;
     }
     false
+}
+
+/// Fission changes `A(i); B(i)` into all A iterations followed by all B
+/// iterations. That schedule is legal only when every cross-partition pair
+/// involving a write is proven disjoint. Distinct SSA base values are not a
+/// proof: the opposite partition may read an array written by this one, and
+/// Fortran pointers may expose the same target through separate descriptors.
+fn partitions_are_memory_independent(
+    func: &Function,
+    slice_a: &HashSet<ValueId>,
+    slice_b: &HashSet<ValueId>,
+    layout: crate::target::TargetLayout,
+) -> bool {
+    let accesses_a = partition_memory_accesses(func, slice_a);
+    let accesses_b = partition_memory_accesses(func, slice_b);
+    let mut alias_oracle = AliasOracle::new(func, layout);
+
+    for &(ptr_a, write_a) in &accesses_a {
+        for &(ptr_b, write_b) in &accesses_b {
+            if !write_a && !write_b {
+                continue;
+            }
+            if !matches!(alias_oracle.query(ptr_a, ptr_b), AliasResult::NoAlias) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn partition_memory_accesses(func: &Function, slice: &HashSet<ValueId>) -> Vec<(ValueId, bool)> {
+    let mut accesses = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if !slice.contains(&inst.id) {
+                continue;
+            }
+            match inst.kind {
+                InstKind::Load(ptr) | InstKind::VLoad(ptr) => accesses.push((ptr, false)),
+                InstKind::Store(_, ptr) | InstKind::VStore(_, ptr) => {
+                    accesses.push((ptr, true));
+                }
+                _ => {}
+            }
+        }
+    }
+    accesses
 }
 
 /// Replace a store instruction's value operand with Undef, effectively
@@ -264,6 +296,18 @@ mod tests {
         }
     }
 
+    fn push_inst(func: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
+        let id = func.next_value_id();
+        func.register_type(id, ty.clone());
+        func.block_mut(func.entry).insts.push(Inst {
+            id,
+            ty,
+            span: span(),
+            kind,
+        });
+        id
+    }
+
     #[test]
     fn fission_no_op_on_empty() {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
@@ -273,6 +317,63 @@ mod tests {
         let pass = LoopFission;
         let changed = pass.run(&mut m);
         assert!(!changed, "no loops → no fission");
+    }
+
+    #[test]
+    fn fission_requires_cross_partition_memory_independence() {
+        let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let params = ["a", "b", "c", "d"]
+            .into_iter()
+            .enumerate()
+            .map(|(id, name)| Param {
+                name: name.into(),
+                ty: ptr_ty.clone(),
+                id: ValueId(id as u32),
+                fortran_noalias: true,
+            })
+            .collect();
+        let mut func = Function::new("partition".into(), params, IrType::Void);
+
+        let read_b = push_inst(
+            &mut func,
+            InstKind::Load(ValueId(1)),
+            IrType::Int(IntWidth::I32),
+        );
+        let write_a = push_inst(&mut func, InstKind::Store(read_b, ValueId(0)), IrType::Void);
+        let read_a = push_inst(
+            &mut func,
+            InstKind::Load(ValueId(0)),
+            IrType::Int(IntWidth::I32),
+        );
+        let write_b = push_inst(&mut func, InstKind::Store(read_a, ValueId(1)), IrType::Void);
+        let read_d = push_inst(
+            &mut func,
+            InstKind::Load(ValueId(3)),
+            IrType::Int(IntWidth::I32),
+        );
+        let write_c = push_inst(&mut func, InstKind::Store(read_d, ValueId(2)), IrType::Void);
+
+        let partition_a = HashSet::from([read_b, write_a]);
+        let dependent_partition = HashSet::from([read_a, write_b]);
+        let independent_partition = HashSet::from([read_d, write_c]);
+        assert!(
+            !partitions_are_memory_independent(
+                &func,
+                &partition_a,
+                &dependent_partition,
+                crate::target::TargetLayout::LP64,
+            ),
+            "a cross-array producer/consumer cycle must block fission"
+        );
+        assert!(
+            partitions_are_memory_independent(
+                &func,
+                &partition_a,
+                &independent_partition,
+                crate::target::TargetLayout::LP64,
+            ),
+            "disjoint statement groups should remain fission candidates"
+        );
     }
 
     #[test]
