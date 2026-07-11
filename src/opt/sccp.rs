@@ -309,7 +309,7 @@ impl<'a> Sccp<'a> {
     /// Called when the block becomes reachable or when its
     /// terminator-condition lattice changes.
     fn process_terminator(&mut self, b: BlockId) {
-        let Some(block) = self.func.blocks.iter().find(|bb| bb.id == b) else {
+        let Some(block) = self.func.try_block(b) else {
             return;
         };
         let Some(term) = &block.terminator else {
@@ -453,9 +453,7 @@ impl<'a> Sccp<'a> {
                 // reachable edge may add a new input.
                 let params: Vec<ValueId> = self
                     .func
-                    .blocks
-                    .iter()
-                    .find(|b| b.id == to)
+                    .try_block(to)
                     .map(|b| b.params.iter().map(|p| p.id).collect())
                     .unwrap_or_default();
                 for pid in params {
@@ -532,7 +530,7 @@ fn apply(func: &mut Function, analysis: &SccpResult) -> bool {
             // Allocate a new value for the constant.
             let new_id = func.next_value_id();
             // Insert at the front of the target block.
-            if let Some(block) = func.blocks.iter_mut().find(|b| b.id == block_id) {
+            if let Some(block) = func.try_block_mut(block_id) {
                 let span = block
                     .insts
                     .first()

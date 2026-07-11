@@ -295,7 +295,7 @@ fn join_params_used_outside_block(func: &Function, join: &BasicBlock) -> bool {
 }
 
 fn apply_thread(func: &mut Function, action: &ThreadAction) {
-    let Some(pred_block) = func.blocks.iter_mut().find(|b| b.id == action.pred) else {
+    let Some(pred_block) = func.try_block_mut(action.pred) else {
         return;
     };
     let Some(term) = pred_block.terminator.as_mut() else {

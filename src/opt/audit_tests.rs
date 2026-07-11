@@ -2157,7 +2157,7 @@ fn audit_const_fold_non_rpo_block_order() {
     f.block_mut(b_block).terminator = Some(Terminator::Return(Some(sum_id)));
 
     // Swap A and B in the vec order (positions 1 and 2; entry is 0).
-    f.blocks.swap(1, 2);
+    f.swap_blocks(1, 2);
     m.add_function(f);
 
     let pre = verify_module(&m);
@@ -2299,7 +2299,7 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
     // func.blocks is [entry, a, b, c, d] after create_block calls.
     let a_idx = f.blocks.iter().position(|blk| blk.id == a_block).unwrap();
     let b_idx = f.blocks.iter().position(|blk| blk.id == b_block).unwrap();
-    f.blocks.swap(a_idx, b_idx);
+    f.swap_blocks(a_idx, b_idx);
 
     m.add_function(f);
 
