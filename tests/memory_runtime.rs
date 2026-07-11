@@ -1082,6 +1082,44 @@ fn repeated_scalar_pointer_allocation_reports_status_and_preserves_target() {
 }
 
 #[test]
+fn zero_storage_derived_pointer_allocation_establishes_association() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=zero_storage_derived_pointer_allocation_establishes_association count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("zero_storage_pointer");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: empty_t\n  end type empty_t\n  type :: box_t\n    type(empty_t), pointer :: value\n  end type box_t\n  type(empty_t), pointer :: local\n  type(box_t) :: box\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(local, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (.not. associated(local)) error stop 2\n  if (trim(msg) /= 'unchanged') error stop 3\n  deallocate(local, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 4\n  if (associated(local)) error stop 5\n  allocate(box%value)\n  if (.not. associated(box%value)) error stop 6\n  deallocate(box%value)\n  if (associated(box%value)) error stop 7\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("zero_storage_pointer.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("zero-storage pointer runtime failed");
+    assert!(
+        run.status.success(),
+        "zero-storage pointer allocation failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn repeated_scalar_pointer_allocation_without_stat_terminates() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

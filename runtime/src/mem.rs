@@ -59,12 +59,11 @@ pub extern "C" fn afs_allocate_scalar(slot: *mut *mut u8, size: i64, stat: *mut 
         fail(4, "allocation byte count is invalid");
         return;
     };
-    if size == 0 {
-        fail(4, "allocation byte count is invalid");
-        return;
-    }
+    // Empty derived types still need a distinct non-null target so ASSOCIATED
+    // can represent successful pointer allocation.
+    let allocation_size = size.max(1);
 
-    let allocation = unsafe { malloc(size) };
+    let allocation = unsafe { malloc(allocation_size) };
     if allocation.is_null() {
         fail(3, "out of memory");
         return;
@@ -199,13 +198,16 @@ mod tests {
     }
 
     #[test]
-    fn scalar_allocation_rejects_invalid_sizes_without_publishing_a_target() {
+    fn scalar_allocation_represents_zero_storage_objects_with_a_nonnull_target() {
         let mut slot = ptr::null_mut();
         let mut stat = 99;
 
         afs_allocate_scalar(&mut slot, 0, &mut stat);
 
-        assert_eq!(stat, 4);
+        assert_eq!(stat, 0);
+        assert!(!slot.is_null());
+        afs_deallocate_pointer(&mut slot, &mut stat);
+        assert_eq!(stat, 0);
         assert!(slot.is_null());
     }
 }
