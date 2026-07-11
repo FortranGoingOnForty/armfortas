@@ -259,7 +259,12 @@ pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: IrType,
+    /// Blocks in emission order. Use the structural mutation helpers on
+    /// `Function`, or call `rebuild_block_positions` after bulk mutation.
     pub blocks: Vec<BasicBlock>,
+    /// Dense `BlockId` to `blocks` position index. Removed block IDs retain an
+    /// empty slot so normal lookup stays O(1) after pruning.
+    block_positions: Vec<Option<usize>>,
     pub entry: BlockId,
     next_value: u32,
     next_block: u32,
@@ -289,6 +294,7 @@ impl Function {
             params,
             return_type,
             blocks: vec![entry_block],
+            block_positions: vec![Some(0)],
             entry,
             next_value,
             next_block: 1,
@@ -312,25 +318,39 @@ impl Function {
         let id = BlockId(self.next_block);
         self.next_block += 1;
         let unique_name = format!("{}_{}", name, id.0);
+        let position = self.blocks.len();
         self.blocks.push(BasicBlock::new(id, unique_name));
+        let id_index = id.0 as usize;
+        if self.block_positions.len() <= id_index {
+            self.block_positions.resize(id_index + 1, None);
+        }
+        assert!(
+            self.block_positions[id_index].replace(position).is_none(),
+            "duplicate block id"
+        );
         id
+    }
+
+    #[inline]
+    fn block_position(&self, id: BlockId) -> Option<usize> {
+        let position = self.block_positions.get(id.0 as usize).copied().flatten()?;
+        self.blocks
+            .get(position)
+            .is_some_and(|block| block.id == id)
+            .then_some(position)
     }
 
     /// Get a block by ID. Panics if the ID is not present — use
     /// `try_block` for graceful degradation.
     pub fn block(&self, id: BlockId) -> &BasicBlock {
-        self.blocks
-            .iter()
-            .find(|b| b.id == id)
-            .expect("block not found")
+        let position = self.block_position(id).expect("block not found");
+        &self.blocks[position]
     }
 
     /// Get a mutable block by ID. Panics if the ID is not present.
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
-        self.blocks
-            .iter_mut()
-            .find(|b| b.id == id)
-            .expect("block not found")
+        let position = self.block_position(id).expect("block not found");
+        &mut self.blocks[position]
     }
 
     /// Get a block by ID, returning `None` if the ID is not
@@ -341,7 +361,43 @@ impl Function {
     /// run before block pruning (or that mutate the CFG) can use
     /// this to degrade gracefully instead of panicking.
     pub fn try_block(&self, id: BlockId) -> Option<&BasicBlock> {
-        self.blocks.iter().find(|b| b.id == id)
+        self.block_position(id)
+            .map(|position| &self.blocks[position])
+    }
+
+    /// Mutable counterpart to `try_block`.
+    pub fn try_block_mut(&mut self, id: BlockId) -> Option<&mut BasicBlock> {
+        let position = self.block_position(id)?;
+        Some(&mut self.blocks[position])
+    }
+
+    /// Rebuild the derived block index after bulk structural mutation.
+    pub fn rebuild_block_positions(&mut self) {
+        let required = self
+            .blocks
+            .iter()
+            .map(|block| block.id.0 as usize + 1)
+            .max()
+            .unwrap_or(0)
+            .max(self.next_block as usize);
+        let mut positions = vec![None; required];
+        for (position, block) in self.blocks.iter().enumerate() {
+            assert!(
+                positions[block.id.0 as usize].replace(position).is_none(),
+                "duplicate block id"
+            );
+        }
+        self.next_block = self.next_block.max(required as u32);
+        self.block_positions = positions;
+    }
+
+    /// Reorder two blocks while preserving the ID index.
+    pub fn swap_blocks(&mut self, left: usize, right: usize) {
+        self.blocks.swap(left, right);
+        for position in [left, right] {
+            let id_index = self.blocks[position].id.0 as usize;
+            self.block_positions[id_index] = Some(position);
+        }
     }
 
     /// Register a value's type in the O(1) lookup cache.
@@ -823,6 +879,34 @@ fn terminator_i128_backend_o0_supported(
 mod tests {
     use super::*;
     use crate::ir::builder::FuncBuilder;
+
+    #[test]
+    fn block_index_tracks_creation_reordering_and_cloning() {
+        let mut func = Function::new("indexed".into(), vec![], IrType::Void);
+        let ids: Vec<_> = (0..4096)
+            .map(|index| func.create_block(&format!("block_{index}")))
+            .collect();
+
+        assert_eq!(func.block_positions.len(), ids.len() + 1);
+        assert_eq!(func.block_positions[func.entry.0 as usize], Some(0));
+        for (position, &id) in ids.iter().enumerate() {
+            assert_eq!(func.block_positions[id.0 as usize], Some(position + 1));
+            assert_eq!(func.block(id).id, id);
+        }
+
+        let last = *ids.last().unwrap();
+        func.try_block_mut(last).unwrap().name = "renamed".into();
+        assert_eq!(func.block(last).name, "renamed");
+
+        let last_position = func.blocks.len() - 1;
+        func.swap_blocks(0, last_position);
+        assert_eq!(func.block(last).name, "renamed");
+        assert_eq!(func.block(func.entry).id, func.entry);
+
+        let cloned = func.clone();
+        assert_eq!(cloned.block(last).name, "renamed");
+        assert_eq!(cloned.block(cloned.entry).id, cloned.entry);
+    }
 
     #[test]
     fn pointer_to_i128_pointee_is_not_an_i128_codegen_surface() {

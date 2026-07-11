@@ -41,12 +41,15 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
     if loops.len() < 2 {
         return false;
     }
+    let ordered_bodies: Vec<Vec<BlockId>> = loops.iter().map(ordered_loop_body).collect();
     let preds = predecessors(func);
 
     for i in 0..loops.len() {
         for j in (i + 1)..loops.len() {
             let lp_a = &loops[i];
             let lp_b = &loops[j];
+            let blocks_a = &ordered_bodies[i];
+            let blocks_b = &ordered_bodies[j];
 
             // Both need preheaders and single latches.
             let Some(_ph_a) = find_preheader(func, lp_a, &preds) else {
@@ -94,10 +97,10 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
             // Skip loops produced by fission in the same pipeline
             // iteration — they have clone/bridge blocks that fusion
             // can't handle safely.
-            let has_clone_a = lp_a.body.iter().any(|&b| {
+            let has_clone_a = blocks_a.iter().any(|&b| {
                 func.block(b).name.contains("clone") || func.block(b).name.contains("fission")
             });
-            let has_clone_b = lp_b.body.iter().any(|&b| {
+            let has_clone_b = blocks_b.iter().any(|&b| {
                 func.block(b).name.contains("clone") || func.block(b).name.contains("fission")
             });
             if has_clone_a || has_clone_b {
@@ -105,7 +108,7 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
             }
 
             // Loop A's exit must be (or flow to) loop B's preheader.
-            let exit_a = find_loop_exit(func, lp_a);
+            let exit_a = find_loop_exit(func, lp_a, blocks_a);
             let Some(exit_a) = exit_a else { continue };
             if exit_a != ph_b && !flows_to(func, exit_a, ph_b) {
                 continue;
@@ -122,10 +125,10 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
                 continue;
             }
 
-            let Some(bound_a) = find_bound_const(func, lp_a, iv_a) else {
+            let Some(bound_a) = find_bound_const(func, blocks_a, iv_a) else {
                 continue;
             };
-            let Some(bound_b) = find_bound_const(func, lp_b, iv_b) else {
+            let Some(bound_b) = find_bound_const(func, blocks_b, iv_b) else {
                 continue;
             };
             if bound_a != bound_b {
@@ -137,18 +140,18 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
                 continue;
             }
 
-            let body_a = find_body_block(func, lp_a, latch_a);
+            let body_a = find_body_block(func, lp_a, blocks_a, latch_a);
             let Some(body_a_id) = body_a else { continue };
 
             // Find B's body block (the one with stores/computation).
-            let body_b = find_body_block(func, lp_b, latch_b);
+            let body_b = find_body_block(func, lp_b, blocks_b, latch_b);
             let Some(body_b_id) = body_b else { continue };
 
-            let cmp_a = find_cmp_block(func, lp_a);
+            let cmp_a = find_cmp_block(func, blocks_a);
             let Some(cmp_a_id) = cmp_a else { continue };
 
             // Find B's cmp block (the one with ICmp).
-            let cmp_b = find_cmp_block(func, lp_b);
+            let cmp_b = find_cmp_block(func, blocks_b);
             let Some(cmp_b_id) = cmp_b else { continue };
 
             if !has_simple_fusion_shape(func, lp_a, latch_a, body_a_id, cmp_a_id) {
@@ -159,12 +162,13 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
             }
 
             // Find B's exit block.
-            let exit_b = find_loop_exit(func, lp_b);
+            let exit_b = find_loop_exit(func, lp_b, blocks_b);
             let Some(exit_b) = exit_b else { continue };
 
             // ---- Perform fusion via latch redirect ----
             do_fusion_latch_redirect(
-                func, lp_a, lp_b, latch_a, latch_b, iv_a, iv_b, body_b_id, cmp_b_id, exit_a, exit_b,
+                func, lp_b, blocks_a, blocks_b, latch_a, latch_b, iv_a, iv_b, body_b_id, cmp_b_id,
+                exit_a, exit_b,
             );
             return true;
         }
@@ -178,8 +182,9 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
 ///   Remap iv_b → iv_a throughout B's body
 fn do_fusion_latch_redirect(
     func: &mut Function,
-    lp_a: &crate::ir::walk::NaturalLoop,
     lp_b: &crate::ir::walk::NaturalLoop,
+    blocks_a: &[BlockId],
+    blocks_b: &[BlockId],
     latch_a: BlockId,
     latch_b: BlockId,
     iv_a: ValueId,
@@ -193,7 +198,7 @@ fn do_fusion_latch_redirect(
     // We rebuild each instruction with the IV substitution.
     let mut sub_map = std::collections::HashMap::new();
     sub_map.insert(iv_b, iv_a);
-    for &bid in &lp_b.body {
+    for &bid in blocks_b {
         let old_insts: Vec<Inst> = func.block(bid).insts.clone();
         let new_insts: Vec<Inst> = old_insts
             .into_iter()
@@ -252,7 +257,7 @@ fn do_fusion_latch_redirect(
     // instead. Then B's latch branches to A's latch (not B's header).
 
     // Find the block that branches to latch_a (A's body exit).
-    let a_body_exit = find_branch_to(func, lp_a, latch_a);
+    let a_body_exit = find_branch_to(func, blocks_a, latch_a);
     let Some(a_body_exit_id) = a_body_exit else {
         return;
     };
@@ -278,7 +283,7 @@ fn do_fusion_latch_redirect(
     // Step 4: Mark B's header, cmp, and preheader blocks as unreachable.
     func.block_mut(lp_b.header).terminator = Some(Terminator::Unreachable);
     // Mark B's cmp blocks too.
-    for &bid in &lp_b.body {
+    for &bid in blocks_b {
         if bid == body_b_id || bid == latch_b {
             continue;
         }
@@ -288,12 +293,8 @@ fn do_fusion_latch_redirect(
     crate::ir::walk::prune_unreachable(func);
 }
 
-fn find_branch_to(
-    func: &Function,
-    lp: &crate::ir::walk::NaturalLoop,
-    target: BlockId,
-) -> Option<BlockId> {
-    for &bid in &lp.body {
+fn find_branch_to(func: &Function, blocks: &[BlockId], target: BlockId) -> Option<BlockId> {
+    for &bid in blocks {
         if bid == target {
             continue;
         }
@@ -316,8 +317,12 @@ fn redirect_branch(func: &mut Function, from: BlockId, old_target: BlockId, new_
     }
 }
 
-fn find_loop_exit(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<BlockId> {
-    for &bid in &lp.body {
+fn find_loop_exit(
+    func: &Function,
+    lp: &crate::ir::walk::NaturalLoop,
+    blocks: &[BlockId],
+) -> Option<BlockId> {
+    for &bid in blocks {
         let block = func.block(bid);
         if let Some(Terminator::CondBranch { false_dest, .. }) = &block.terminator {
             if !lp.body.contains(false_dest) {
@@ -358,12 +363,8 @@ fn get_init_const(
     resolve_const_int(func, init_val)
 }
 
-fn find_bound_const(
-    func: &Function,
-    lp: &crate::ir::walk::NaturalLoop,
-    iv: ValueId,
-) -> Option<i64> {
-    for &bid in &lp.body {
+fn find_bound_const(func: &Function, blocks: &[BlockId], iv: ValueId) -> Option<i64> {
+    for &bid in blocks {
         let block = func.block(bid);
         for inst in &block.insts {
             if let InstKind::ICmp(_, a, b) = &inst.kind {
@@ -384,9 +385,10 @@ fn find_bound_const(
 fn find_body_block(
     func: &Function,
     lp: &crate::ir::walk::NaturalLoop,
+    blocks: &[BlockId],
     latch_id: BlockId,
 ) -> Option<BlockId> {
-    for &bid in &lp.body {
+    for &bid in blocks {
         if bid == lp.header || bid == latch_id {
             continue;
         }
@@ -402,8 +404,8 @@ fn find_body_block(
     None
 }
 
-fn find_cmp_block(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<BlockId> {
-    for &bid in &lp.body {
+fn find_cmp_block(func: &Function, blocks: &[BlockId]) -> Option<BlockId> {
+    for &bid in blocks {
         let block = func.block(bid);
         if block
             .insts
@@ -414,6 +416,12 @@ fn find_cmp_block(func: &Function, lp: &crate::ir::walk::NaturalLoop) -> Option<
         }
     }
     None
+}
+
+fn ordered_loop_body(lp: &crate::ir::walk::NaturalLoop) -> Vec<BlockId> {
+    let mut blocks: Vec<BlockId> = lp.body.iter().copied().collect();
+    blocks.sort_unstable_by_key(|bid| bid.0);
+    blocks
 }
 
 fn has_simple_fusion_shape(
@@ -439,6 +447,7 @@ fn has_simple_fusion_shape(
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
+    use crate::ir::walk::NaturalLoop;
     use crate::opt::pass::Pass;
 
     #[test]
@@ -450,5 +459,23 @@ mod tests {
         let pass = LoopFusion;
         let changed = pass.run(&mut m);
         assert!(!changed);
+    }
+
+    #[test]
+    fn loop_body_queries_use_block_id_order() {
+        let forward = NaturalLoop {
+            header: BlockId(2),
+            body: [BlockId(9), BlockId(2), BlockId(5)].into_iter().collect(),
+            latches: vec![BlockId(9)],
+        };
+        let reverse = NaturalLoop {
+            header: BlockId(2),
+            body: [BlockId(5), BlockId(2), BlockId(9)].into_iter().collect(),
+            latches: vec![BlockId(9)],
+        };
+
+        let expected = vec![BlockId(2), BlockId(5), BlockId(9)];
+        assert_eq!(ordered_loop_body(&forward), expected);
+        assert_eq!(ordered_loop_body(&reverse), expected);
     }
 }

@@ -10,6 +10,7 @@
 
 use super::liveness::compute_liveness;
 use super::mir::*;
+use crate::codegen::shared::{classify_call_crossing, CallCrossing};
 use std::collections::{HashMap, HashSet};
 
 /// GP registers available for allocation (excludes x18, x29, x30, x31/sp).
@@ -276,6 +277,13 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     let mut idx = 0;
     while idx < worklist.len() {
         let interval = worklist[idx].clone();
+        let crossing =
+            classify_call_crossing(&liveness.call_positions, interval.start, interval.end);
+        let crosses_call = !matches!(crossing, CallCrossing::None);
+        let single_call = match crossing {
+            CallCrossing::One(position) => Some(position),
+            CallCrossing::None | CallCrossing::Multiple => None,
+        };
         // V128 lives in the same physical V/Q register file as
         // Fp32/Fp64; the regalloc must draw from the FP pool for
         // any of these classes or the vector vreg ends up in a Gp
@@ -309,7 +317,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             (&mut active_gp, &mut free_gp_caller, &mut free_gp_callee)
         };
 
-        let reg_opt = if interval.crosses_call {
+        let reg_opt = if crosses_call {
             // Must use callee-saved (caller-saved would be clobbered
             // by the call).
             free_callee.pop()
@@ -350,9 +358,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             // one physreg or one spill slot.
             false
         } else if let Some(&(real_start, real_end)) = vreg_actual_range.get(&interval.vreg) {
-            interval.call_crossings.len() == 1
-                && interval.call_crossings[0] > real_start
-                && interval.call_crossings[0] < real_end
+            single_call.is_some_and(|position| position > real_start && position < real_end)
         } else {
             false
         };
@@ -362,8 +368,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
         // P — by the time the bridge str fires (right above the
         // arg-setup block), P would no longer hold the pre-half's
         // value and the bridge would capture garbage.
-        let safe_pre_phys = if !free_caller.is_empty() && interval.call_crossings.len() == 1 {
-            let cp = interval.call_crossings[0];
+        let safe_pre_phys = if let Some(cp) = single_call.filter(|_| !free_caller.is_empty()) {
             let pre_end = cp.saturating_sub(1);
             free_caller
                 .iter()
@@ -372,9 +377,9 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             None
         };
         if let (None, true, true, Some(safe_idx)) =
-            (reg_opt, interval.crosses_call, real_crosses, safe_pre_phys)
+            (reg_opt, crosses_call, real_crosses, safe_pre_phys)
         {
-            let call_pos = interval.call_crossings[0];
+            let call_pos = single_call.expect("single-call split must have a call position");
             let bridge_slot = mf.alloc_local(spill_slot_size(interval.class));
             let synthetic = mf.new_vreg(interval.class);
             splits_in_progress.insert(synthetic, (interval.vreg, call_pos, bridge_slot));
@@ -410,8 +415,6 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
                 class: interval.class,
                 start: call_pos.saturating_add(1),
                 end: interval.end,
-                crosses_call: false,
-                call_crossings: Vec::new(),
                 hint: None,
             };
             // Insert post-half at its sorted position.
@@ -513,25 +516,6 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
     // case) or was spilled (the fall-back). Either way we have a
     // bridge slot that links the two halves across the call.
     //
-    // Build a position→call-index map from the BL/BLR walk so
-    // we can attach a stable ordinal to each split. `liveness`
-    // already enumerated calls in walk order, so its
-    // `call_positions` would do — but liveness exposes only
-    // intervals.  Re-derive locally; the call positions are
-    // small.
-    let call_positions_walk: Vec<u32> = {
-        let mut p: u32 = 0;
-        let mut cps = Vec::new();
-        for block in &mf.blocks {
-            for inst in &block.insts {
-                if matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr) {
-                    cps.push(p);
-                }
-                p += 2;
-            }
-        }
-        cps
-    };
     let mut split_records: Vec<SplitRecord> = splits_in_progress
         .into_iter()
         .filter_map(|(synthetic, (orig, call_pos, bridge_slot))| {
@@ -547,7 +531,7 @@ pub fn linear_scan(mf: &mut MachineFunction) -> AllocResult {
             };
             assignments.remove(&synthetic);
             spills.remove(&synthetic);
-            let call_index = call_positions_walk.binary_search(&call_pos).ok()? as u32;
+            let call_index = liveness.call_positions.binary_search(&call_pos).ok()? as u32;
             Some(SplitRecord {
                 vreg: orig,
                 call_position: call_pos,
@@ -1931,8 +1915,6 @@ mod tests {
                     class: RegClass::Gp64,
                     start: 4,
                     end: 4,
-                    crosses_call: false,
-                    call_crossings: Vec::new(),
                     hint: None,
                 },
                 crate::codegen::liveness::LiveInterval {
@@ -1940,11 +1922,10 @@ mod tests {
                     class: RegClass::Gp64,
                     start: 6,
                     end: 6,
-                    crosses_call: false,
-                    call_crossings: Vec::new(),
                     hint: None,
                 },
             ],
+            call_positions: Vec::new(),
             num_positions: 8,
         };
 

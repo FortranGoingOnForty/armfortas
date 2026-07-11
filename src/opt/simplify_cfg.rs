@@ -16,9 +16,11 @@
 //!
 //! This eliminates the empty block chains left by inlining.
 
+use super::loop_utils::find_preheader;
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::walk::predecessors;
+use crate::ir::walk::{find_natural_loops, predecessors};
+use std::collections::HashSet;
 
 pub struct SimplifyCfg;
 
@@ -41,6 +43,18 @@ impl Pass for SimplifyCfg {
 fn simplify_function(func: &mut Function) -> bool {
     let mut changed = false;
 
+    // Preheader insertion deliberately creates dedicated edge blocks before
+    // loop headers. A zero-parameter preheader is otherwise indistinguishable
+    // from an empty forwarding block, so deleting it here makes the two passes
+    // remove and recreate the same block forever.
+    let loop_preheaders: HashSet<BlockId> = {
+        let preds = predecessors(func);
+        find_natural_loops(func)
+            .iter()
+            .filter_map(|lp| find_preheader(func, lp, &preds))
+            .collect()
+    };
+
     // Phase 1: Thread jumps through empty blocks.
     // If block B has no instructions, no block params, and terminates
     // with Branch(C, []), replace all branches to B with branches to C.
@@ -49,6 +63,9 @@ fn simplify_function(func: &mut Function) -> bool {
 
         for block in &func.blocks {
             if block.id == func.entry {
+                continue;
+            }
+            if loop_preheaders.contains(&block.id) {
                 continue;
             }
             if !block.insts.is_empty() {
@@ -172,7 +189,68 @@ fn redirect_terminator(term: &mut Terminator, old: BlockId, new: BlockId) {
 mod tests {
     use super::*;
     use crate::ir::types::{IntWidth, IrType};
-    use crate::opt::pass::Pass;
+    use crate::opt::pass::{Pass, PassManager};
+    use crate::opt::preheader::PreheaderInsert;
+
+    fn bool_const(func: &mut Function, value: bool) -> ValueId {
+        let id = func.next_value_id();
+        func.register_type(id, IrType::Bool);
+        func.block_mut(func.entry).insts.push(Inst {
+            id,
+            ty: IrType::Bool,
+            span: crate::lexer::Span {
+                file_id: 0,
+                start: crate::lexer::Position { line: 0, col: 0 },
+                end: crate::lexer::Position { line: 0, col: 0 },
+            },
+            kind: InstKind::ConstBool(value),
+        });
+        id
+    }
+
+    #[test]
+    fn preserves_empty_preheader_across_fixpoint_iterations() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let preheader = func.create_block("preheader");
+        let header = func.create_block("header");
+        let body = func.create_block("body");
+        let exit = func.create_block("exit");
+        let cond = bool_const(&mut func, true);
+
+        func.block_mut(func.entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: preheader,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+        func.block_mut(preheader).terminator = Some(Terminator::Branch(header, vec![]));
+        func.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+        func.block_mut(body).terminator = Some(Terminator::Branch(header, vec![]));
+        func.block_mut(exit).terminator = Some(Terminator::Return(None));
+        module.add_function(func);
+
+        let mut manager = PassManager::new();
+        manager.max_iterations = 4;
+        manager.add(Box::new(SimplifyCfg));
+        manager.add(Box::new(PreheaderInsert));
+        manager
+            .run(&mut module)
+            .expect("CFG simplification and preheader insertion must converge");
+
+        let func = &module.functions[0];
+        let preds = predecessors(func);
+        let loops = find_natural_loops(func);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(find_preheader(func, &loops[0], &preds), Some(preheader));
+    }
 
     #[test]
     fn merges_empty_chain() {

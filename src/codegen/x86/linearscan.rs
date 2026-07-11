@@ -34,7 +34,7 @@ use super::mir::{
     OpSize, X86Function, X86Inst, X86Opcode, X86Operand, X86Reg, X86RegClass, X86VReg,
 };
 use super::regalloc::{addr_operand_position, load, store, xmm_width_override};
-use crate::codegen::shared::VRegId;
+use crate::codegen::shared::{classify_call_crossing, CallCrossing, VRegId};
 use std::collections::{HashMap, HashSet};
 
 /// GP / FP spill-reload scratch — the naive allocator's set, kept out
@@ -366,6 +366,11 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
     let mut idx = 0;
     while idx < worklist.len() {
         let interval = worklist[idx].clone();
+        let single_call =
+            match classify_call_crossing(&liveness.call_positions, interval.start, interval.end) {
+                CallCrossing::One(position) => Some(position),
+                CallCrossing::None | CallCrossing::Multiple => None,
+            };
         let is_fp = is_fp_class(interval.class);
         let (active, free) = if is_fp {
             (&mut active_fp, &mut free_fp)
@@ -426,17 +431,14 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
         let single_block = vreg_ref_blocks
             .get(&interval.vreg)
             .is_some_and(|b| b.len() == 1);
-        let split_ok = interval.call_crossings.len() == 1
+        let split_ok = single_call.is_some()
             && !multi_def.contains(&interval.vreg)
             && single_block
             && vreg_actual_range
                 .get(&interval.vreg)
-                .is_some_and(|&(rs, re)| {
-                    let cp = interval.call_crossings[0];
-                    cp > rs && cp < re
-                });
+                .is_some_and(|&(rs, re)| single_call.is_some_and(|cp| cp > rs && cp < re));
         if split_ok {
-            let cp = interval.call_crossings[0];
+            let cp = single_call.expect("single-call split must have a call position");
             let pre_end = cp.saturating_sub(1);
             // Pre-half register: a caller-saved free reg clear of fixed
             // references over [start, call-1] (occ already records the
@@ -466,8 +468,6 @@ pub fn linear_scan(f: &mut X86Function) -> AllocResult {
                     class: interval.class,
                     start: cp.saturating_add(1),
                     end: interval.end,
-                    crosses_call: false,
-                    call_crossings: Vec::new(),
                     hint: None,
                 };
                 let key = (post_half.start, post_half.vreg.0);

@@ -11,15 +11,8 @@ use std::collections::HashMap;
 pub struct LiveInterval {
     pub vreg: VRegId,
     pub class: RegClass,
-    pub start: u32,         // first instruction position (definition)
-    pub end: u32,           // last instruction position (final use)
-    pub crosses_call: bool, // true if a BL/BLR falls within [start, end]
-    /// Sorted positions of every BL/BLR strictly inside (start, end).
-    /// Empty when `crosses_call` is false. Populated as the
-    /// foundation for live-range splitting: knowing exactly where
-    /// an interval crosses calls lets the allocator split it at
-    /// those boundaries rather than spilling the whole range.
-    pub call_crossings: Vec<u32>,
+    pub start: u32, // first instruction position (definition)
+    pub end: u32,   // last instruction position (final use)
     /// Preferred physical register (hint). If set, the allocator tries this register first.
     /// Used to avoid unnecessary moves (e.g., arg values prefer xN, return values prefer x0).
     pub hint: Option<u8>,
@@ -28,6 +21,8 @@ pub struct LiveInterval {
 /// Result of liveness analysis.
 pub struct LivenessResult {
     pub intervals: Vec<LiveInterval>,
+    /// Sorted BL/BLR positions, stored once for lazy interval queries.
+    pub call_positions: Vec<u32>,
     /// Total number of instruction positions.
     pub num_positions: u32,
 }
@@ -286,8 +281,7 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
 
     // Collect positions of all call instructions. Both direct
     // (`Bl`) and indirect (`Blr`) calls clobber every caller-saved
-    // register and must contribute to `crosses_call` so the
-    // allocator pins those intervals to callee-saved.
+    // register and must be visible to the allocator's lazy crossing query.
     let mut call_positions: Vec<u32> = Vec::new();
     for (block_idx, block) in mf.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
@@ -296,7 +290,7 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
             }
         }
     }
-    call_positions.sort();
+    call_positions.sort_unstable();
 
     // Build intervals.
     let mut vreg_classes = vec![RegClass::Gp64; num_vregs];
@@ -312,24 +306,11 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
             let end = ends[idx]?;
             let vreg = VRegId(idx as u32);
             let class = vreg_classes[idx];
-            // Collect every call within (start, end). These are
-            // candidate split points for the live-range splitter
-            // when callee-saved is exhausted; for today's allocator
-            // the boolean flag is what's consumed, but the
-            // splitter (sprint 18) needs the per-position list.
-            let call_crossings: Vec<u32> = call_positions
-                .iter()
-                .copied()
-                .filter(|&cp| cp > start && cp < end)
-                .collect();
-            let crosses_call = !call_crossings.is_empty();
             Some(LiveInterval {
                 vreg,
                 class,
                 start,
                 end,
-                crosses_call,
-                call_crossings,
                 hint: None,
             })
         })
@@ -348,6 +329,7 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
 
     LivenessResult {
         intervals,
+        call_positions,
         num_positions,
     }
 }
@@ -399,8 +381,8 @@ mod tests {
     fn intervals_crossing_blr_are_marked_call_crossing() {
         // Construct: def vreg %0 → BLR %0 → use %0. Since %0 is
         // both the BLR target and a value live across the call,
-        // its interval must be marked crosses_call so the
-        // allocator pins it to a callee-saved register (or
+        // its interval must report the crossing so the allocator
+        // pins it to a callee-saved register (or
         // accepts the spill rather than burying the value in a
         // caller-saved that the BLR will clobber).
         let mut mf = MachineFunction::new("test".into());
@@ -436,16 +418,95 @@ mod tests {
             .iter()
             .find(|i| i.vreg == v0)
             .expect("vreg 0 must have an interval");
-        assert!(
-            interval.crosses_call,
-            "interval crossing BLR must be marked crosses_call"
-        );
         assert_eq!(
-            interval.call_crossings.len(),
-            1,
-            "interval should record exactly one BLR crossing, got {:?}",
-            interval.call_crossings
+            crate::codegen::shared::classify_call_crossing(
+                &result.call_positions,
+                interval.start,
+                interval.end,
+            ),
+            crate::codegen::shared::CallCrossing::One(2),
+            "interval should lazily resolve its single BLR crossing"
         );
+    }
+
+    #[test]
+    fn call_positions_include_direct_and_indirect_calls_once() {
+        let mut mf = MachineFunction::new("calls".into());
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::Extern("callee".into())],
+            def: None,
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![MachineOperand::PhysReg(PhysReg::Gp(9))],
+            def: None,
+        });
+
+        let result = compute_liveness(&mf);
+        assert_eq!(result.call_positions, vec![0, 2]);
+    }
+
+    #[test]
+    fn call_crossing_storage_scales_with_calls_and_intervals() {
+        const COUNT: usize = 128;
+        assert!(
+            !std::mem::needs_drop::<LiveInterval>(),
+            "live intervals must not own per-interval call metadata"
+        );
+
+        let mut mf = MachineFunction::new("call_matrix".into());
+        let mut long_lived = Vec::with_capacity(COUNT);
+        for value in 0..COUNT {
+            let vreg = mf.new_vreg(RegClass::Gp64);
+            long_lived.push(vreg);
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::Movz,
+                operands: vec![
+                    MachineOperand::VReg(vreg),
+                    MachineOperand::Imm(value as i64),
+                ],
+                def: Some(vreg),
+            });
+        }
+        for call in 0..COUNT {
+            let (opcode, operand) = if call % 2 == 0 {
+                (ArmOpcode::Bl, MachineOperand::Extern("callee".into()))
+            } else {
+                (ArmOpcode::Blr, MachineOperand::PhysReg(PhysReg::Gp(9)))
+            };
+            mf.blocks[0].insts.push(MachineInst {
+                opcode,
+                operands: vec![operand],
+                def: None,
+            });
+        }
+        for &source in &long_lived {
+            let result = mf.new_vreg(RegClass::Gp64);
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![MachineOperand::VReg(result), MachineOperand::VReg(source)],
+                def: Some(result),
+            });
+        }
+
+        let liveness = compute_liveness(&mf);
+        assert_eq!(liveness.call_positions.len(), COUNT);
+        for vreg in long_lived {
+            let interval = liveness
+                .intervals
+                .iter()
+                .find(|interval| interval.vreg == vreg)
+                .expect("long-lived interval");
+            assert_eq!(
+                crate::codegen::shared::classify_call_crossing(
+                    &liveness.call_positions,
+                    interval.start,
+                    interval.end,
+                ),
+                crate::codegen::shared::CallCrossing::Multiple
+            );
+        }
     }
 
     #[test]

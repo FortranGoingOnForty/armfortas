@@ -666,7 +666,11 @@ pub fn prune_unreachable(func: &mut Function) -> bool {
     }
     let before = func.blocks.len();
     func.blocks.retain(|b| reachable.contains(&b.id));
-    func.blocks.len() != before
+    let changed = func.blocks.len() != before;
+    if changed {
+        func.rebuild_block_positions();
+    }
+    changed
 }
 
 // =====================================================================
@@ -900,6 +904,28 @@ mod walk_tests {
         f.block_mut(merge).terminator = Some(Terminator::Return(None));
 
         (f, a, b, merge)
+    }
+
+    #[test]
+    fn prune_unreachable_rebuilds_block_lookup_index() {
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let kept = f.create_block("kept");
+        let removed = f.create_block("removed");
+        let exit = f.create_block("exit");
+
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(kept, vec![]));
+        f.block_mut(kept).terminator = Some(Terminator::Branch(exit, vec![]));
+        f.block_mut(removed).terminator = Some(Terminator::Return(None));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+
+        assert!(prune_unreachable(&mut f));
+        assert!(f.try_block(removed).is_none());
+        assert_eq!(f.block(kept).id, kept);
+        assert_eq!(f.block(exit).id, exit);
+
+        let created_after_prune = f.create_block("after_prune");
+        assert!(created_after_prune.0 > removed.0);
+        assert_eq!(f.block(created_after_prune).id, created_after_prune);
     }
 
     #[test]

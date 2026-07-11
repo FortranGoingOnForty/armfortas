@@ -7,6 +7,7 @@
 
 use crate::ir::inst::Module;
 use crate::ir::verify::{verify_module, VerifyError};
+use std::fmt;
 
 /// A single optimization pass.
 pub trait Pass {
@@ -25,6 +26,34 @@ pub struct PassRunResult {
     /// Number of fixpoint iterations performed.
     pub iterations: usize,
 }
+
+/// The optimizer exhausted its defensive iteration limit while passes were
+/// still changing the IR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassRunError {
+    pub max_iterations: usize,
+    pub changing_passes: Vec<&'static str>,
+}
+
+impl fmt::Display for PassRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.changing_passes.is_empty() {
+            return write!(
+                f,
+                "optimizer could not establish a fixpoint within {} iterations",
+                self.max_iterations
+            );
+        }
+        write!(
+            f,
+            "optimizer did not converge after {} iterations; passes still changing: {}",
+            self.max_iterations,
+            self.changing_passes.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for PassRunError {}
 
 /// A linearly-ordered collection of passes that are run to fixpoint.
 pub struct PassManager {
@@ -69,9 +98,10 @@ impl PassManager {
     /// Each iteration runs every pass once. We keep iterating as long as
     /// at least one pass reported a change in the previous round, up to
     /// `max_iterations`.
-    pub fn run(&self, module: &mut Module) -> PassRunResult {
+    pub fn run(&self, module: &mut Module) -> Result<PassRunResult, PassRunError> {
         let mut change_count = 0usize;
         let mut iterations = 0usize;
+        let mut changing_passes = Vec::new();
 
         // Verify on entry — bad input shouldn't be blamed on a pass.
         Self::verify_module_or_panic(module, "<entry>");
@@ -79,12 +109,14 @@ impl PassManager {
         let mut changed = true;
         while changed && iterations < self.max_iterations {
             changed = false;
+            changing_passes.clear();
             iterations += 1;
             for pass in &self.passes {
                 let pass_changed = pass.run(module);
                 if pass_changed {
                     change_count += 1;
                     changed = true;
+                    changing_passes.push(pass.name());
                     // Rebuild O(1) type caches after IR mutations.
                     for func in &mut module.functions {
                         func.rebuild_type_cache();
@@ -98,10 +130,17 @@ impl PassManager {
 
         Self::verify_module_or_panic(module, "<exit>");
 
-        PassRunResult {
+        if changed {
+            return Err(PassRunError {
+                max_iterations: self.max_iterations,
+                changing_passes,
+            });
+        }
+
+        Ok(PassRunResult {
             change_count,
             iterations,
-        }
+        })
     }
 
     fn verify_module_or_panic(module: &Module, after: &str) {
@@ -179,7 +218,7 @@ mod tests {
     fn empty_pipeline_runs_one_iteration() {
         let pm = PassManager::new();
         let mut m = empty_module();
-        let r = pm.run(&mut m);
+        let r = pm.run(&mut m).expect("empty pipeline should converge");
         assert_eq!(r.change_count, 0);
         // One iteration to discover nothing changed.
         assert_eq!(r.iterations, 1);
@@ -190,7 +229,7 @@ mod tests {
         let mut pm = PassManager::new();
         pm.add(Box::new(NoopPass));
         let mut m = empty_module();
-        let r = pm.run(&mut m);
+        let r = pm.run(&mut m).expect("noop pipeline should converge");
         assert_eq!(r.change_count, 0);
         // First iteration runs every pass; since none change, we're done.
         assert_eq!(r.iterations, 1);
@@ -203,9 +242,40 @@ mod tests {
             fired: std::cell::Cell::new(false),
         }));
         let mut m = empty_module();
-        let r = pm.run(&mut m);
+        let r = pm.run(&mut m).expect("one-shot pipeline should converge");
         assert_eq!(r.change_count, 1);
         // Iter 1 changed → iter 2 stable.
         assert_eq!(r.iterations, 2);
+    }
+
+    #[test]
+    fn iteration_limit_reports_nonconvergence() {
+        let mut pm = PassManager::new();
+        pm.max_iterations = 3;
+        pm.add(Box::new(OneShotPass {
+            fired: std::cell::Cell::new(false),
+        }));
+        struct AlwaysChanging;
+        impl Pass for AlwaysChanging {
+            fn name(&self) -> &'static str {
+                "always-changing"
+            }
+
+            fn run(&self, _module: &mut Module) -> bool {
+                true
+            }
+        }
+        pm.add(Box::new(AlwaysChanging));
+
+        let mut m = empty_module();
+        let error = pm
+            .run(&mut m)
+            .expect_err("the pipeline must not silently truncate");
+        assert_eq!(error.max_iterations, 3);
+        assert_eq!(error.changing_passes, vec!["always-changing"]);
+        assert_eq!(
+            error.to_string(),
+            "optimizer did not converge after 3 iterations; passes still changing: always-changing"
+        );
     }
 }

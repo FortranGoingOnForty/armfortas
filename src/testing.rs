@@ -567,7 +567,13 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         } else {
             build_pipeline(ir_opt, host_arch)
         };
-        pm.run(&mut optimized);
+        pm.run(&mut optimized).map_err(|error| CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Ir,
+            detail: error.to_string(),
+            stages: stages.clone(),
+        })?;
         Some(optimized)
     } else {
         None

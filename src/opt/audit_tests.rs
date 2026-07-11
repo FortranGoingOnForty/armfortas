@@ -952,7 +952,7 @@ fn audit_pipeline_o2_e2e_loop_through_passmanager() {
     assert!(verify_module(&m).is_empty(), "test setup invalid");
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     // Final IR must verify.
     let errs = verify_module(&m);
@@ -1010,7 +1010,7 @@ fn audit_interaction_const_prop_then_dce_removes_orphan_const() {
     m.add_function(f);
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     let post = verify_module(&m);
     assert!(post.is_empty(), "post-pipeline IR invalid: {:?}", post);
@@ -1058,7 +1058,7 @@ fn audit_interaction_strength_reduce_orphans_get_dced() {
     m.add_function(f);
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     // strength_reduce makes mul an identity (passes through to x), then
     // turns the original mul inst into Const(0). DCE should remove that.
@@ -2157,14 +2157,14 @@ fn audit_const_fold_non_rpo_block_order() {
     f.block_mut(b_block).terminator = Some(Terminator::Return(Some(sum_id)));
 
     // Swap A and B in the vec order (positions 1 and 2; entry is 0).
-    f.blocks.swap(1, 2);
+    f.swap_blocks(1, 2);
     m.add_function(f);
 
     let pre = verify_module(&m);
     assert!(pre.is_empty(), "test setup invalid: {:?}", pre);
 
     let pm = build_pipeline(OptLevel::O2, crate::target::Arch::Arm64);
-    pm.run(&mut m);
+    pm.run(&mut m).expect("O2 audit pipeline should converge");
 
     let post = verify_module(&m);
     assert!(
@@ -2299,7 +2299,7 @@ fn audit_const_fold_inner_fixpoint_across_vec_order() {
     // func.blocks is [entry, a, b, c, d] after create_block calls.
     let a_idx = f.blocks.iter().position(|blk| blk.id == a_block).unwrap();
     let b_idx = f.blocks.iter().position(|blk| blk.id == b_block).unwrap();
-    f.blocks.swap(a_idx, b_idx);
+    f.swap_blocks(a_idx, b_idx);
 
     m.add_function(f);
 

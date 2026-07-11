@@ -73,7 +73,7 @@ fn inline_calls_in_function(
     threshold: usize,
 ) -> bool {
     // Find call sites eligible for inlining.
-    let call_sites: Vec<(BlockId, usize, u32, Vec<ValueId>)> = {
+    let mut call_sites: Vec<(BlockId, usize, u32, Vec<ValueId>)> = {
         let caller = &module.functions[caller_idx as usize];
         let mut sites = Vec::new();
         for block in &caller.blocks {
@@ -131,12 +131,22 @@ fn inline_calls_in_function(
         return false;
     }
 
-    // Inline one call site, then return true to let the pass manager
-    // re-run us. Processing multiple sites in one invocation is unsafe:
-    // splitting a block invalidates indices for other call sites in the
-    // same block. The pass manager's fixpoint loop handles re-invocation.
-    let (call_block_id, call_inst_idx, callee_idx, caller_args) = call_sites[0].clone();
-    {
+    // Split later calls first so earlier instruction indices in the same
+    // original block remain valid. This processes only the finite snapshot
+    // above; calls introduced by cloning are left for the next global round.
+    call_sites.sort_unstable_by_key(|(block, inst, _, _)| (block.0, std::cmp::Reverse(*inst)));
+    for (call_block_id, call_inst_idx, callee_idx, caller_args) in call_sites {
+        if inline_straight_line_call(
+            module,
+            caller_idx,
+            call_block_id,
+            call_inst_idx,
+            callee_idx,
+            &caller_args,
+        ) {
+            continue;
+        }
+
         // Clone the callee's body into the caller.
         let callee = &module.functions[callee_idx as usize];
         let callee_entry = callee.entry;
@@ -282,10 +292,77 @@ fn inline_calls_in_function(
         if let Some(param_id) = result_param_id {
             substitute_uses(caller, call_result_id, param_id);
         }
-    } // end single inline
+    }
 
     let caller = &mut module.functions[caller_idx as usize];
     prune_unreachable(caller);
+    true
+}
+
+fn inline_straight_line_call(
+    module: &mut Module,
+    caller_idx: u32,
+    call_block_id: BlockId,
+    call_inst_idx: usize,
+    callee_idx: u32,
+    caller_args: &[ValueId],
+) -> bool {
+    let (callee_params, callee_insts, return_value) = {
+        let callee = &module.functions[callee_idx as usize];
+        if callee.blocks.len() != 1 || !callee.blocks[0].params.is_empty() {
+            return false;
+        }
+        let return_value = match (&callee.return_type, &callee.blocks[0].terminator) {
+            (IrType::Void, Some(Terminator::Return(None))) => None,
+            (_, Some(Terminator::Return(Some(value)))) => Some(*value),
+            _ => return false,
+        };
+        (
+            callee.params.clone(),
+            callee.blocks[0].insts.clone(),
+            return_value,
+        )
+    };
+
+    let caller = &mut module.functions[caller_idx as usize];
+    let call_result = match caller.block(call_block_id).insts.get(call_inst_idx) {
+        Some(Inst {
+            id,
+            kind: InstKind::Call(FuncRef::Internal(actual_callee), _),
+            ..
+        }) if *actual_callee == callee_idx => *id,
+        _ => return false,
+    };
+
+    let mut value_map: HashMap<ValueId, ValueId> = callee_params
+        .iter()
+        .zip(caller_args.iter().copied())
+        .map(|(param, arg)| (param.id, arg))
+        .collect();
+    for inst in &callee_insts {
+        let new_id = caller.next_value_id();
+        caller.register_type(new_id, inst.ty.clone());
+        value_map.insert(inst.id, new_id);
+    }
+
+    let cloned_insts: Vec<Inst> = callee_insts
+        .into_iter()
+        .map(|inst| Inst {
+            id: value_map[&inst.id],
+            kind: remap_inst_kind(&inst.kind, &value_map),
+            ty: inst.ty,
+            span: inst.span,
+        })
+        .collect();
+    caller
+        .block_mut(call_block_id)
+        .insts
+        .splice(call_inst_idx..=call_inst_idx, cloned_insts);
+
+    if let Some(return_value) = return_value {
+        let replacement = *value_map.get(&return_value).unwrap_or(&return_value);
+        substitute_uses(caller, call_result, replacement);
+    }
     true
 }
 
@@ -542,6 +619,55 @@ mod tests {
             post.is_empty(),
             "capped chain inlining should leave valid IR: {:?}",
             post
+        );
+    }
+
+    #[test]
+    fn inline_batches_more_than_thirty_two_calls() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new("inc".into(), vec![], IrType::Int(IntWidth::I32));
+        let one = push(
+            &mut callee,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(one)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Int(IntWidth::I32));
+        let mut last = None;
+        for _ in 0..40 {
+            last = Some(push(
+                &mut caller,
+                InstKind::Call(FuncRef::Internal(0), vec![]),
+                IrType::Int(IntWidth::I32),
+            ));
+        }
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(last));
+        m.add_function(caller);
+
+        let pass = Inline::for_level(OptLevel::O1);
+        assert!(pass.run(&mut m), "expected the call snapshot to inline");
+
+        let residual_calls = m.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter(|inst| matches!(inst.kind, InstKind::Call(FuncRef::Internal(0), _)))
+            .count();
+        assert_eq!(residual_calls, 0, "one pass should consume all 40 sites");
+        assert_eq!(
+            m.functions[1].blocks.len(),
+            1,
+            "straight-line callees should not create an artificial CFG chain"
+        );
+        let errors = verify_module(&m);
+        assert!(
+            errors.is_empty(),
+            "batched inlining left invalid IR: {errors:?}"
         );
     }
 }
