@@ -126,3 +126,44 @@ end function
         "scalar receipt clobbered x4:x5 before i128 capture:\n{asm}"
     );
 }
+
+#[test]
+fn i128_arithmetic_invalidates_fused_select_flags() {
+    let asm = compile_arm64_asm(
+        r#"
+integer(16) function f(x,y,a,b) result(r) bind(c, name="f")
+  use iso_c_binding
+  integer(c_int64_t), value :: x,y
+  integer(16), value :: a,b
+  logical :: cond
+  integer(16) :: t,u
+  cond = x < y
+  t = a + b
+  u = a - b
+  r = merge(t,u,cond)
+end function
+"#,
+        "-O1",
+    );
+
+    let lines: Vec<_> = asm.lines().collect();
+    let first_csel = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("csel "))
+        .unwrap_or_else(|| panic!("wide select must lower to CSEL:\n{asm}"));
+    let last_flag_setter = lines[..first_csel]
+        .iter()
+        .rev()
+        .find(|line| {
+            let line = line.trim_start();
+            line.starts_with("cmp ")
+                || line.starts_with("fcmp ")
+                || line.starts_with("adds ")
+                || line.starts_with("subs ")
+        })
+        .unwrap_or_else(|| panic!("CSEL must have a preceding flag producer:\n{asm}"));
+    assert!(
+        last_flag_setter.trim_start().starts_with("cmp "),
+        "CSEL consumed arithmetic flags instead of the condition:\n{asm}"
+    );
+}

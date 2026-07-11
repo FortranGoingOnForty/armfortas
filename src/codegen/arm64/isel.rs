@@ -3518,7 +3518,7 @@ fn float_width_class(w: &FloatWidth) -> RegClass {
 /// 1. Its result is used exactly once in the entire function.
 /// 2. That single use is a `Select` instruction in the same block.
 /// 3. No intervening instruction between the ICmp and the Select in
-///    that block clobbers NZCV flags (another ICmp/FCmp or a Call).
+///    that block clobbers NZCV flags.
 ///
 /// For candidates, we suppress CSET during ICmp lowering and store
 /// the ARM condition in `ctx.fused_arm_cond` so the Select can pick
@@ -3601,6 +3601,9 @@ fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
                 InstKind::Call(_, _) | InstKind::RuntimeCall(_, _) => {
                     pending = None;
                 }
+                _ if csel_intervening_inst_clobbers_nzcv(inst) => {
+                    pending = None;
+                }
                 _ => {}
             }
         }
@@ -3617,6 +3620,20 @@ fn compute_csel_fusion(func: &Function, ctx: &mut ISelCtx) {
     // Remove arm_cond entries for non-fused ICmps.
     ctx.fused_arm_cond
         .retain(|vid, _| ctx.select_fused.contains(vid));
+}
+
+fn csel_intervening_inst_clobbers_nzcv(inst: &Inst) -> bool {
+    match &inst.kind {
+        // Wide integer arithmetic lowers to ADDS/SUBS carry chains.
+        InstKind::IAdd(_, _) | InstKind::ISub(_, _) | InstKind::INeg(_)
+            if matches!(&inst.ty, IrType::Int(IntWidth::I128)) =>
+        {
+            true
+        }
+        // Logical NOT lowers through CMP/CSET, and FPow emits a call.
+        InstKind::Not(_) | InstKind::FPow(_, _) => true,
+        _ => false,
+    }
 }
 
 fn cmp_to_arm_cond(op: CmpOp) -> ArmCond {
@@ -3909,6 +3926,33 @@ mod tests {
         assert!(
             insts.iter().any(|i| i.opcode == ArmOpcode::Cset),
             "CSET should remain when ICmp has multiple uses"
+        );
+    }
+
+    #[test]
+    fn csel_no_fusion_across_i128_flag_setting_arithmetic() {
+        let mf = select_simple(|b| {
+            let x = b.const_i64(0);
+            let y = b.const_i64(1);
+            let cond = b.icmp(CmpOp::Lt, x, y);
+            let a = b.const_i128(5);
+            let rhs = b.const_i128(3);
+            let sum = b.iadd(a, rhs);
+            let difference = b.isub(a, rhs);
+            let _selected = b.select(cond, sum, difference);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::AddsReg));
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::SubsReg));
+        assert!(
+            insts.iter().any(|inst| inst.opcode == ArmOpcode::Cset),
+            "comparison result must be materialized before NZCV-clobbering arithmetic"
+        );
+        assert!(
+            insts.iter().any(|inst| inst.opcode == ArmOpcode::CmpImm),
+            "wide select must re-compare the materialized condition"
         );
     }
 
