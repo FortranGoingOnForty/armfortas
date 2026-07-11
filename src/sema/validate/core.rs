@@ -3573,6 +3573,90 @@ fn validate_stmts(ctx: &mut Ctx, stmts: &[SpannedStmt]) {
     }
 }
 
+#[derive(Default)]
+struct AllocationOptionPresence {
+    stat: bool,
+    errmsg: bool,
+    source: bool,
+    mold: bool,
+}
+
+fn validate_allocation_options(
+    ctx: &mut Ctx<'_>,
+    stmt_span: Span,
+    statement: &str,
+    opts: &[IoControl],
+    type_spec_present: bool,
+) -> AllocationOptionPresence {
+    let mut presence = AllocationOptionPresence::default();
+
+    for opt in opts {
+        let Some(keyword) = opt.keyword.as_deref() else {
+            ctx.error(
+                opt.value.span,
+                format!("{statement} options require keyword syntax"),
+            );
+            continue;
+        };
+        let keyword = keyword.to_ascii_lowercase();
+        let seen = match keyword.as_str() {
+            "stat" => &mut presence.stat,
+            "errmsg" => &mut presence.errmsg,
+            "source" => &mut presence.source,
+            "mold" => &mut presence.mold,
+            _ => {
+                ctx.error(
+                    opt.value.span,
+                    format!(
+                        "{statement} does not permit {}=",
+                        keyword.to_ascii_uppercase()
+                    ),
+                );
+                continue;
+            }
+        };
+        let duplicate = *seen;
+        *seen = true;
+        if duplicate {
+            ctx.error(
+                opt.value.span,
+                format!(
+                    "{statement} cannot specify {}= more than once",
+                    keyword.to_ascii_uppercase()
+                ),
+            );
+            continue;
+        }
+        if statement == "DEALLOCATE" && matches!(keyword.as_str(), "source" | "mold") {
+            ctx.error(
+                opt.value.span,
+                format!(
+                    "DEALLOCATE does not permit {}=",
+                    keyword.to_ascii_uppercase()
+                ),
+            );
+        }
+    }
+
+    if presence.errmsg && !presence.stat {
+        ctx.warning(stmt_span, "ERRMSG= has no effect without STAT=");
+    }
+    if type_spec_present && presence.source {
+        ctx.error(
+            stmt_span,
+            "ALLOCATE type-spec cannot be combined with SOURCE=",
+        );
+    }
+    if type_spec_present && presence.mold {
+        ctx.error(
+            stmt_span,
+            "ALLOCATE type-spec cannot be combined with MOLD=",
+        );
+    }
+
+    presence
+}
+
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
     validate_stmt_enum_usage(ctx, stmt);
@@ -3607,16 +3691,10 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             items,
             opts,
         } => {
-            let has_source = opts.iter().any(|opt| {
-                opt.keyword
-                    .as_deref()
-                    .is_some_and(|kw| kw.eq_ignore_ascii_case("source"))
-            });
-            let has_mold = opts.iter().any(|opt| {
-                opt.keyword
-                    .as_deref()
-                    .is_some_and(|kw| kw.eq_ignore_ascii_case("mold"))
-            });
+            let option_presence =
+                validate_allocation_options(ctx, stmt.span, "ALLOCATE", opts, type_spec.is_some());
+            let has_source = option_presence.source;
+            let has_mold = option_presence.mold;
             if has_source {
                 ctx.require_std(stmt.span, FortranStandard::F2003, "ALLOCATE with SOURCE=");
             }
@@ -3643,7 +3721,8 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 // lower_alloc_bounds_list.
             }
         }
-        Stmt::Deallocate { items, .. } => {
+        Stmt::Deallocate { items, opts } => {
+            validate_allocation_options(ctx, stmt.span, "DEALLOCATE", opts, false);
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
             }

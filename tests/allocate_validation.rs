@@ -44,6 +44,14 @@ fn compile_with_args(args: &[&str]) -> std::process::Output {
         .expect("failed to spawn armfortas compile")
 }
 
+fn compile_source(stem: &str, source: &str) -> (PathBuf, std::process::Output) {
+    let dir = unique_dir(stem);
+    let src = write_program_in(&dir, "main.f90", source);
+    let exe = dir.join(format!("{stem}.bin"));
+    let compile = compile_program(&src, &exe);
+    (dir, compile)
+}
+
 #[test]
 fn bare_allocate_array_requires_shape_or_source_or_mold() {
     let dir = unique_dir("bare_array");
@@ -269,4 +277,121 @@ fn imported_allocatable_component_scalar_still_works() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicate_allocation_options_are_rejected() {
+    let cases = [
+        (
+            "duplicate_allocate_stat",
+            "program p\n  integer, allocatable :: a(:)\n  integer :: s1, s2\n  allocate(a(1), stat=s1, stat=s2)\nend program\n",
+            "ALLOCATE cannot specify STAT= more than once",
+        ),
+        (
+            "duplicate_allocate_errmsg",
+            "program p\n  integer, allocatable :: a(:)\n  integer :: stat\n  character(32) :: m1, m2\n  allocate(a(1), stat=stat, errmsg=m1, errmsg=m2)\nend program\n",
+            "ALLOCATE cannot specify ERRMSG= more than once",
+        ),
+        (
+            "duplicate_allocate_source",
+            "program p\n  integer, allocatable :: a(:)\n  integer :: source(1)\n  allocate(a, source=source, source=source)\nend program\n",
+            "ALLOCATE cannot specify SOURCE= more than once",
+        ),
+        (
+            "duplicate_allocate_mold",
+            "program p\n  integer, allocatable :: a(:)\n  integer :: mold(1)\n  allocate(a, mold=mold, mold=mold)\nend program\n",
+            "ALLOCATE cannot specify MOLD= more than once",
+        ),
+        (
+            "duplicate_deallocate_stat",
+            "program p\n  integer, allocatable :: a(:)\n  integer :: s1, s2\n  allocate(a(1))\n  deallocate(a, stat=s1, stat=s2)\nend program\n",
+            "DEALLOCATE cannot specify STAT= more than once",
+        ),
+        (
+            "duplicate_deallocate_errmsg",
+            "program p\n  integer, allocatable :: a(:)\n  integer :: stat\n  character(32) :: m1, m2\n  allocate(a(1))\n  deallocate(a, stat=stat, errmsg=m1, errmsg=m2)\nend program\n",
+            "DEALLOCATE cannot specify ERRMSG= more than once",
+        ),
+    ];
+
+    for (stem, source, expected) in cases {
+        let (dir, compile) = compile_source(stem, source);
+        assert!(
+            !compile.status.success(),
+            "{stem} unexpectedly compiled:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{stem} produced the wrong diagnostic: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn allocation_options_are_rejected_where_they_do_not_apply() {
+    let cases = [
+        (
+            "deallocate_source",
+            "program p\n  integer, allocatable :: a(:)\n  allocate(a(1))\n  deallocate(a, source=a)\nend program\n",
+            "DEALLOCATE does not permit SOURCE=",
+        ),
+        (
+            "deallocate_mold",
+            "program p\n  integer, allocatable :: a(:)\n  allocate(a(1))\n  deallocate(a, mold=a)\nend program\n",
+            "DEALLOCATE does not permit MOLD=",
+        ),
+        (
+            "typed_allocate_source",
+            "program p\n  integer, allocatable :: x\n  allocate(integer :: x, source=1)\nend program\n",
+            "ALLOCATE type-spec cannot be combined with SOURCE=",
+        ),
+        (
+            "typed_allocate_mold",
+            "program p\n  integer, allocatable :: x\n  allocate(integer :: x, mold=1)\nend program\n",
+            "ALLOCATE type-spec cannot be combined with MOLD=",
+        ),
+    ];
+
+    for (stem, source, expected) in cases {
+        let (dir, compile) = compile_source(stem, source);
+        assert!(
+            !compile.status.success(),
+            "{stem} unexpectedly compiled:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{stem} produced the wrong diagnostic: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn errmsg_without_stat_warns_but_compiles() {
+    let (dir, compile) = compile_source(
+        "errmsg_without_stat",
+        "program p\n  integer, allocatable :: x\n  character(32) :: msg\n  allocate(x, errmsg=msg)\n  deallocate(x, errmsg=msg)\nend program\n",
+    );
+    assert!(
+        compile.status.success(),
+        "ERRMSG without STAT should remain valid:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert_eq!(
+        stderr
+            .matches("ERRMSG= has no effect without STAT=")
+            .count(),
+        2,
+        "expected one warning for each statement: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
