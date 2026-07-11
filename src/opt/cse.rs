@@ -285,6 +285,12 @@ impl Pass for LocalCse {
             // chains, the chase logic will need to come back —
             // strict-decrease in ValueId guarantees termination.
             substitute_uses_batch(func, &rewrite_map);
+            for block in &mut func.blocks {
+                block
+                    .insts
+                    .retain(|inst| !rewrite_map.contains_key(&inst.id));
+            }
+            func.rebuild_type_cache();
             changed = true;
         }
         changed
@@ -378,6 +384,14 @@ mod tests {
             Some(Terminator::Return(Some(v))) => assert_eq!(*v, c1),
             _ => panic!(),
         }
+        assert!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .all(|inst| inst.id != c2),
+            "the rewritten duplicate must be removed"
+        );
+        assert!(!LocalCse.run(&mut m), "a second run must be a no-op");
     }
 
     #[test]
