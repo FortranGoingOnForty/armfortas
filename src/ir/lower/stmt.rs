@@ -6270,8 +6270,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 mold_desc
             };
             let shape_desc = source_desc.or(mold_shape_desc).or(source_scalar_desc);
+            let allocate_done_bb = b.create_block("allocate_done");
 
-            for item in items {
+            for (item_idx, item) in items.iter().enumerate() {
+                if item_idx > 0 {
+                    let item_stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+                    let zero_i32 = b.const_i32(0);
+                    let item_ok = b.icmp(CmpOp::Eq, item_stat, zero_i32);
+                    let allocate_item_bb = b.create_block("allocate_item");
+                    b.cond_branch(item_ok, allocate_item_bb, vec![], allocate_done_bb, vec![]);
+                    b.set_block(allocate_item_bb);
+                }
                 let source_char = allocate_char_source_value(b, ctx, opts);
                 let char_alloc_len = typed_char_len
                     .or_else(|| source_char.as_ref().map(|(_, len)| *len))
@@ -7252,6 +7261,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 }
             }
+            if b.func().block(b.current_block()).terminator.is_none() {
+                b.branch(allocate_done_bb, vec![]);
+            }
+            b.set_block(allocate_done_bb);
             super::core::emit_allocate_status_writeback(b, &stat_target);
         }
 

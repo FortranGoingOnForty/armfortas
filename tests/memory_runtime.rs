@@ -172,6 +172,48 @@ fn allocate_failure_without_stat_terminates() {
 }
 
 #[test]
+fn multi_object_allocate_preserves_first_failure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=multi_object_allocate_preserves_first_failure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_first_failure");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer :: ios\n  integer, allocatable :: a(:), b(:), c(:)\n  character(len=64) :: msg\n  allocate(b(1))\n  msg = 'unchanged'\n  allocate(a(1), b(1), c(1), stat=ios, errmsg=msg)\n  if (ios == 0) error stop 1\n  if (.not. allocated(a)) error stop 2\n  if (.not. allocated(b)) error stop 3\n  if (allocated(c)) error stop 4\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 5\n  print *, ios\n  print *, trim(msg)\nend program\n",
+    );
+    let exe = dir.join("alloc_first_failure.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("multi-object allocation runtime failed");
+    assert!(
+        run.status.success(),
+        "multi-object allocation lost its first failure: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ALLOCATE failed"),
+        "multi-object allocation did not retain ERRMSG=:\n{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_errmsg_requires_scalar_character_target() {
     let dir = unique_dir("alloc_bad_errmsg");
     let src = write_program_in(
