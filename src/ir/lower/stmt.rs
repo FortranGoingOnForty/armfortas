@@ -152,9 +152,13 @@ fn prepare_descriptor_assignment_lhs(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
     desc: ValueId,
+    is_polymorphic: bool,
     layout: &crate::sema::type_layout::TypeLayout,
     stat_addr: ValueId,
 ) {
+    if is_polymorphic {
+        require_context_free_dynamic_lifecycle(b, desc);
+    }
     finalize_derived_descriptor_storage_if_allocated(
         b,
         ctx.st,
@@ -1473,11 +1477,12 @@ fn static_concrete_expr_type_layout<'a>(
     expr: Option<&SpannedExpr>,
 ) -> Option<&'a crate::sema::type_layout::TypeLayout> {
     let expr = expr?;
-    let layout = expr_type_layout(expr, Some(&ctx.locals), ctx.st, ctx.type_layouts)?;
-    if layout.is_abstract {
-        return None;
+    match operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)) {
+        Some(crate::sema::symtab::TypeInfo::Derived(type_name)) => {
+            type_layout_for_current_scope(ctx.type_layouts, &type_name)
+        }
+        _ => None,
     }
-    Some(layout)
 }
 
 fn format_label_literal(expr: &SpannedExpr) -> Option<u64> {
@@ -2124,6 +2129,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 b,
                                                 ctx,
                                                 desc,
+                                                info.is_class,
                                                 layout,
                                                 assign_stat,
                                             );
@@ -2183,6 +2189,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 b,
                                                 ctx,
                                                 desc,
+                                                info.is_class,
                                                 layout,
                                                 assign_stat,
                                             );
@@ -4368,7 +4375,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .as_ref()
                                 .map(|mask| mask.get(i).copied().unwrap_or(false))
                                 .unwrap_or(false);
-                        let wants_polymorphic_descriptor = dummy_is_class;
+                        let wants_polymorphic_descriptor =
+                            dummy_is_class && !dummy_is_allocatable && !wants_pointer;
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                         let value = match slot {
                             Some(arg) => {
@@ -4899,8 +4907,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 Some(ctx.type_layouts),
                                             )))
                                         && !wants_bind_c_char;
-                                    let wants_polymorphic_descriptor =
-                                        wants_descriptor && dummy_is_class;
+                                    let wants_polymorphic_descriptor = wants_descriptor
+                                        && dummy_is_class
+                                        && !dummy_is_allocatable
+                                        && !wants_pointer;
                                     let value = if is_value && wants_bind_c_char {
                                         lower_bind_c_char_value_arg(
                                             b,
@@ -6270,13 +6280,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     _ => None,
                 };
                 if let Some((component_expr, args)) = component_alloc {
-                    if let Some((field_ptr, field)) = resolve_component_field_access(
-                        b,
-                        &ctx.locals,
-                        component_expr,
-                        ctx.st,
-                        ctx.type_layouts,
-                    ) {
+                    if let Some((field_ptr, field_owner_layout, field)) =
+                        resolve_component_field_access_with_owner(
+                            b,
+                            &ctx.locals,
+                            component_expr,
+                            ctx.st,
+                            ctx.type_layouts,
+                        )
+                    {
                         if matches!(field_char_kind(&field), CharKind::Deferred) && field.size == 32
                         {
                             let Some(len_val) = char_alloc_len else {
@@ -6357,10 +6369,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 .or(mold_static_layout)
                                 .or(typed_layout)
                                 .or_else(|| {
-                                    field_info
-                                        .derived_type
-                                        .as_deref()
-                                        .and_then(|type_name| ctx.type_layouts.get(type_name))
+                                    field_info.derived_type.as_deref().and_then(|type_name| {
+                                        ctx.type_layouts.get_related(field_owner_layout, type_name)
+                                    })
                                 });
                             let target_rank =
                                 local_declared_rank(&field_info).max(if field.declared_array {
@@ -6369,25 +6380,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     0
                                 });
                             let source_copy_rank = rank.max(target_rank);
-                            let scalar_source_copy_plan = if source_copy_rank == 0 {
-                                source_expr.and_then(|expr| {
-                                    expr_scalar_alloc_source_copy_plan(
-                                        expr,
-                                        &ctx.locals,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
+                            let source_copy_plan = source_expr.and_then(|expr| {
+                                expr_scalar_alloc_source_copy_plan(
+                                    expr,
+                                    &ctx.locals,
+                                    ctx.st,
+                                    ctx.type_layouts,
+                                )
+                            });
                             let array_source_copy_layout = if source_desc.is_some() {
-                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
+                                if source_copy_rank == 0 && source_copy_plan.is_some() {
                                     None
                                 } else {
-                                    dynamic_layout.filter(|layout| {
-                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                    })
+                                    match source_copy_plan.as_ref() {
+                                        Some(ScalarAllocSourceCopyPlan::Static(type_name)) => {
+                                            ctx.type_layouts.get(type_name).filter(|layout| {
+                                                derived_layout_needs_deep_copy(
+                                                    layout,
+                                                    ctx.type_layouts,
+                                                )
+                                            })
+                                        }
+                                        Some(
+                                            ScalarAllocSourceCopyPlan::Dynamic(_)
+                                            | ScalarAllocSourceCopyPlan::UnlimitedPolymorphic,
+                                        ) => None,
+                                        None => dynamic_layout.filter(|layout| {
+                                            derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                        }),
+                                    }
                                 }
                             } else {
                                 None
@@ -6408,14 +6429,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 } => None,
                                 _ => char_alloc_len,
                             };
-                            let es = source_char_elem_size.unwrap_or_else(|| {
-                                allocated_array_elem_size(
-                                    b,
-                                    &field_info,
-                                    elem_size_bytes,
-                                    component_char_alloc_len,
-                                )
-                            });
+                            let dynamic_descriptor_elem_size = if field_info.is_class {
+                                source_desc
+                                    .or(mold_shape_desc)
+                                    .map(|desc| descriptor_elem_size(b, desc))
+                            } else {
+                                None
+                            };
+                            let es = source_char_elem_size
+                                .or(dynamic_descriptor_elem_size)
+                                .unwrap_or_else(|| {
+                                    allocated_array_elem_size(
+                                        b,
+                                        &field_info,
+                                        elem_size_bytes,
+                                        component_char_alloc_len,
+                                    )
+                                });
+                            if field_info.is_class {
+                                if let Some(metadata_desc) = shape_desc {
+                                    require_context_free_dynamic_lifecycle(b, metadata_desc);
+                                }
+                            }
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
                                 b.const_i64(0)
@@ -6479,7 +6514,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     source_desc,
                                     source_copy_rank > 0,
                                     array_source_copy_layout,
-                                    scalar_source_copy_plan.as_ref(),
+                                    source_copy_plan.as_ref(),
                                     ctx.type_layouts,
                                     errmsg_target.as_ref(),
                                 );
@@ -6492,7 +6527,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         source_desc,
                                         false,
                                         None,
-                                        scalar_source_copy_plan.as_ref(),
+                                        source_copy_plan.as_ref(),
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
@@ -6812,25 +6847,35 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 });
                             let target_rank = local_declared_rank(&info);
                             let source_copy_rank = rank.max(target_rank);
-                            let scalar_source_copy_plan = if source_copy_rank == 0 {
-                                source_expr.and_then(|expr| {
-                                    expr_scalar_alloc_source_copy_plan(
-                                        expr,
-                                        &ctx.locals,
-                                        ctx.st,
-                                        ctx.type_layouts,
-                                    )
-                                })
-                            } else {
-                                None
-                            };
+                            let source_copy_plan = source_expr.and_then(|expr| {
+                                expr_scalar_alloc_source_copy_plan(
+                                    expr,
+                                    &ctx.locals,
+                                    ctx.st,
+                                    ctx.type_layouts,
+                                )
+                            });
                             let array_source_copy_layout = if source_desc.is_some() {
-                                if source_copy_rank == 0 && scalar_source_copy_plan.is_some() {
+                                if source_copy_rank == 0 && source_copy_plan.is_some() {
                                     None
                                 } else {
-                                    dynamic_layout.filter(|layout| {
-                                        derived_layout_needs_deep_copy(layout, ctx.type_layouts)
-                                    })
+                                    match source_copy_plan.as_ref() {
+                                        Some(ScalarAllocSourceCopyPlan::Static(type_name)) => {
+                                            ctx.type_layouts.get(type_name).filter(|layout| {
+                                                derived_layout_needs_deep_copy(
+                                                    layout,
+                                                    ctx.type_layouts,
+                                                )
+                                            })
+                                        }
+                                        Some(
+                                            ScalarAllocSourceCopyPlan::Dynamic(_)
+                                            | ScalarAllocSourceCopyPlan::UnlimitedPolymorphic,
+                                        ) => None,
+                                        None => dynamic_layout.filter(|layout| {
+                                            derived_layout_needs_deep_copy(layout, ctx.type_layouts)
+                                        }),
+                                    }
                                 }
                             } else {
                                 None
@@ -6848,7 +6893,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             // rather than the local spill slot that holds its
                             // address. Scalar allocatables lower as a rank-0
                             // descriptor allocation.
-                            let es = allocated_array_elem_size(
+                            let static_elem_size = allocated_array_elem_size(
                                 b,
                                 &info,
                                 dynamic_layout
@@ -6861,8 +6906,22 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     .unwrap_or(elem_size_bytes),
                                 char_alloc_len,
                             );
-                            let es = source_char_elem_size.unwrap_or(es);
+                            let dynamic_descriptor_elem_size = if info.is_class {
+                                source_desc
+                                    .or(mold_shape_desc)
+                                    .map(|desc| descriptor_elem_size(b, desc))
+                            } else {
+                                None
+                            };
+                            let es = source_char_elem_size
+                                .or(dynamic_descriptor_elem_size)
+                                .unwrap_or(static_elem_size);
                             let desc = array_descriptor_addr(b, &info);
+                            if info.is_class {
+                                if let Some(metadata_desc) = shape_desc {
+                                    require_context_free_dynamic_lifecycle(b, metadata_desc);
+                                }
+                            }
                             let one_i64 = b.const_i64(1);
                             let dim_buf = if rank == 0 {
                                 b.const_i64(0)
@@ -6926,7 +6985,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     source_desc,
                                     source_copy_rank > 0,
                                     array_source_copy_layout,
-                                    scalar_source_copy_plan.as_ref(),
+                                    source_copy_plan.as_ref(),
                                     ctx.type_layouts,
                                     errmsg_target.as_ref(),
                                 );
@@ -6939,7 +6998,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         source_desc,
                                         false,
                                         None,
-                                        scalar_source_copy_plan.as_ref(),
+                                        source_copy_plan.as_ref(),
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
@@ -7192,13 +7251,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             for item in items {
                 if let Expr::ComponentAccess { .. } = &item.node {
-                    if let Some((field_ptr, field)) = resolve_component_field_access(
-                        b,
-                        &ctx.locals,
-                        item,
-                        ctx.st,
-                        ctx.type_layouts,
-                    ) {
+                    if let Some((field_ptr, field_owner, field)) =
+                        resolve_component_field_access_with_owner(
+                            b,
+                            &ctx.locals,
+                            item,
+                            ctx.st,
+                            ctx.type_layouts,
+                        )
+                    {
                         if is_deferred_char_component_field(&field) {
                             b.call(
                                 FuncRef::External("afs_dealloc_string".into()),
@@ -7226,8 +7287,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     );
                                     continue;
                                 }
+                                if matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::Class(_)
+                                ) {
+                                    require_context_free_dynamic_lifecycle(b, field_ptr);
+                                }
                                 if let Some(type_name) = field_derived_type_name(&field) {
-                                    if let Some(layout) = ctx.type_layouts.get(&type_name) {
+                                    if let Some(layout) =
+                                        ctx.type_layouts.get_related(field_owner, &type_name)
+                                    {
                                         finalize_derived_descriptor_storage_if_allocated(
                                             b,
                                             ctx.st,
@@ -7300,6 +7369,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     b, desc, stat_addr, finalize,
                                 );
                             } else {
+                                if info.is_class {
+                                    require_context_free_dynamic_lifecycle(b, desc);
+                                }
                                 if let Some(type_name) = &info.derived_type {
                                     if let Some(layout) = ctx.type_layouts.get(type_name) {
                                         finalize_derived_descriptor_storage_if_allocated(

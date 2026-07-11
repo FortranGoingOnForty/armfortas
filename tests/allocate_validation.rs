@@ -240,6 +240,7 @@ fn imported_allocatable_component_scalar_still_works() {
         main_src.to_str().unwrap(),
         "-I",
         dir.to_str().unwrap(),
+        mod_obj.to_str().unwrap(),
         "-o",
         exe.to_str().unwrap(),
     ]);

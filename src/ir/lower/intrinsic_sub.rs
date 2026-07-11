@@ -209,6 +209,8 @@ pub(crate) fn lower_intrinsic_subroutine(
     struct MoveAllocTarget {
         desc: ValueId,
         is_string: bool,
+        is_polymorphic: bool,
+        is_unlimited_polymorphic: bool,
         derived_type: Option<String>,
     }
 
@@ -225,12 +227,16 @@ pub(crate) fn lower_intrinsic_subroutine(
                     Some(MoveAllocTarget {
                         desc: string_descriptor_addr(b, info),
                         is_string: true,
+                        is_polymorphic: false,
+                        is_unlimited_polymorphic: false,
                         derived_type: None,
                     })
                 } else if local_uses_array_descriptor(info) {
                     Some(MoveAllocTarget {
                         desc: array_descriptor_addr(b, info),
                         is_string: false,
+                        is_polymorphic: info.is_class,
+                        is_unlimited_polymorphic: info.is_class && info.derived_type.is_none(),
                         derived_type: info.derived_type.clone(),
                     })
                 } else {
@@ -244,6 +250,8 @@ pub(crate) fn lower_intrinsic_subroutine(
                     return Some(MoveAllocTarget {
                         desc: array_descriptor_addr(b, &info),
                         is_string: false,
+                        is_polymorphic: info.is_class,
+                        is_unlimited_polymorphic: info.is_class && info.derived_type.is_none(),
                         derived_type: info.derived_type,
                     });
                 }
@@ -254,12 +262,25 @@ pub(crate) fn lower_intrinsic_subroutine(
                             Some(MoveAllocTarget {
                                 desc: field_ptr,
                                 is_string: true,
+                                is_polymorphic: false,
+                                is_unlimited_polymorphic: false,
                                 derived_type: None,
                             })
                         } else if field.allocatable && field.size == 392 {
                             Some(MoveAllocTarget {
                                 desc: field_ptr,
                                 is_string: false,
+                                is_polymorphic: matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::Class(_)
+                                        | crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ),
+                                is_unlimited_polymorphic: matches!(
+                                    &field.type_info,
+                                    crate::sema::symtab::TypeInfo::ClassStar
+                                        | crate::sema::symtab::TypeInfo::TypeStar
+                                ),
                                 derived_type: field_derived_type_name(&field),
                             })
                         } else {
@@ -339,11 +360,25 @@ pub(crate) fn lower_intrinsic_subroutine(
                 );
                 std::process::exit(1);
             }
-            if let Some(layout) = to
+            if to.is_polymorphic {
+                require_context_free_dynamic_lifecycle(b, from.desc);
+            }
+            if to.is_unlimited_polymorphic {
+                let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, stat_addr);
+                let finalize = b.const_i32(1);
+                release_unlimited_polymorphic_allocatable_descriptor(
+                    b, to.desc, stat_addr, finalize,
+                );
+            } else if let Some(layout) = to
                 .derived_type
                 .as_deref()
                 .and_then(|type_name| ctx.type_layouts.get(type_name))
             {
+                if to.is_polymorphic {
+                    require_context_free_dynamic_lifecycle(b, to.desc);
+                }
                 finalize_derived_descriptor_storage_if_allocated(
                     b,
                     ctx.st,

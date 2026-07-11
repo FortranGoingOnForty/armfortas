@@ -2688,7 +2688,6 @@ pub(crate) fn lower_expr_full(
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                    let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
                     let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
                     let wants_pointer = callee_pointer_args
                         .as_ref()
@@ -2698,6 +2697,10 @@ pub(crate) fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let wants_polymorphic_descriptor = wants_descriptor
+                        && dummy_is_class
+                        && !dummy_is_allocatable
+                        && !wants_pointer;
                     let is_optional = opt_flags
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))

@@ -429,13 +429,17 @@ pub(super) fn emit_type_bound_vtables(
         }
         let mut slots: Vec<QuadSlot> = Vec::with_capacity(layout.bound_procs.len() + 6);
         // Header: type tag, parent metadata, finalization thunk, component
-        // cleanup thunk, scalar copy thunk, array copy thunk. Ownerless
-        // procedure-local types cannot use an out-of-line lifecycle thunk
-        // because their FINAL procedures may require host-closure arguments;
-        // those slots remain null and callers use the closure-aware static
-        // fallback. Copy helpers do not invoke user procedures, so their
-        // vtable slots are valid for ownerless extension types as well.
-        slots.push(QuadSlot::Int(layout.type_tag as i64));
+        // cleanup thunk, scalar copy thunk, array copy thunk. Ownerless types
+        // can use lifecycle helpers when every reachable finalizer is
+        // module-owned. A local FINAL binding still requires the closure-aware
+        // static path and therefore cannot be published through a vtable.
+        let has_context_free_lifecycle = !type_layouts.lifecycle_has_ownerless_finalizer(layout);
+        let vtable_tag = if has_context_free_lifecycle {
+            layout.type_tag
+        } else {
+            layout.type_tag | VTABLE_CONTEXT_DEPENDENT_LIFECYCLE_BIT
+        };
+        slots.push(QuadSlot::Int(vtable_tag as i64));
         let parent_vtable = layout
             .parent
             .as_ref()
@@ -445,10 +449,8 @@ pub(super) fn emit_type_bound_vtables(
             Some(sym) => QuadSlot::Sym(sym),
             None => QuadSlot::Int(0),
         });
-        let has_external_lifecycle_helpers = layout.owner_module.is_some();
         slots.push(
-            if has_external_lifecycle_helpers
-                && derived_layout_needs_finalization(layout, type_layouts)
+            if has_context_free_lifecycle && derived_layout_needs_finalization(layout, type_layouts)
             {
                 QuadSlot::Sym(derived_memory_helper_symbol(
                     layout,
@@ -459,7 +461,7 @@ pub(super) fn emit_type_bound_vtables(
             },
         );
         slots.push(
-            if has_external_lifecycle_helpers
+            if has_context_free_lifecycle
                 && derived_layout_needs_component_deallocation(layout, type_layouts)
             {
                 QuadSlot::Sym(derived_memory_helper_symbol(
@@ -686,10 +688,10 @@ fn emit_derived_memory_helpers(
         if needs_init {
             emit_derived_init_helper(module, layout, type_layouts);
         }
-        if needs_finalization && layout.owner_module.is_some() {
+        if needs_finalization && !type_layouts.lifecycle_has_ownerless_finalizer(layout) {
             emit_derived_finalize_descriptor_helper(module, layout, type_layouts);
         }
-        if needs_dealloc {
+        if needs_dealloc && !type_layouts.deallocation_has_ownerless_finalizer(layout) {
             emit_derived_dealloc_storage_helper(module, layout, type_layouts);
             emit_derived_dealloc_descriptor_helper(module, layout, type_layouts);
         }
@@ -741,7 +743,7 @@ fn emit_derived_finalize_descriptor_helper(
     }
     let params = vec![helper_param("desc", 0, ptr_i8_ty())];
     let mut func = Function::new(name, params, IrType::Void);
-    func.internal_only = false;
+    func.internal_only = layout.owner_module.is_none();
     {
         let desc = func.params[0].id;
         let mut b = FuncBuilder::new(&mut func, module.layout);
@@ -879,6 +881,8 @@ pub(super) const VTABLE_FINALIZE_DESCRIPTOR_OFFSET: i64 = 16;
 pub(super) const VTABLE_DEALLOC_DESCRIPTOR_OFFSET: i64 = 24;
 pub(super) const VTABLE_COPY_VALUE_OFFSET: i64 = 32;
 pub(super) const VTABLE_COPY_ARRAY_DESCRIPTOR_OFFSET: i64 = 40;
+const VTABLE_CONTEXT_DEPENDENT_LIFECYCLE_BIT: u64 = 1 << 63;
+const VTABLE_TYPE_TAG_MASK: i64 = i64::MAX;
 
 /// Byte offset of slot 0 within a vtable (past the metadata header).
 /// Slot `i` lives at `VTABLE_HEADER_BYTES + i * 8`.
@@ -6879,7 +6883,7 @@ pub(super) fn apply_derived_const_default_bytes(
 
         if !field.pointer && !field.allocatable {
             if let Some(nested_name) = field_derived_type_name(field) {
-                if let Some(nested_layout) = registry.get(&nested_name) {
+                if let Some(nested_layout) = registry.get_related(layout, &nested_name) {
                     if derived_layout_has_runtime_field_defaults(nested_layout, registry) {
                         let elem_count: usize = if field.dims.is_empty() {
                             1
@@ -6911,6 +6915,7 @@ pub(super) fn apply_derived_const_default_bytes(
         wrote_defaults |= apply_field_default_init_const_bytes(
             bytes,
             field_offset,
+            layout,
             field,
             default_init,
             registry,
@@ -6923,6 +6928,7 @@ pub(super) fn apply_derived_const_default_bytes(
 pub(super) fn apply_field_default_init_const_bytes(
     bytes: &mut [u8],
     field_offset: usize,
+    owner_layout: &crate::sema::type_layout::TypeLayout,
     field: &crate::sema::type_layout::FieldLayout,
     default_init: &crate::sema::type_layout::FieldDefaultInit,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
@@ -6989,7 +6995,7 @@ pub(super) fn apply_field_default_init_const_bytes(
             let Some(nested_name) = field_derived_type_name(field) else {
                 return false;
             };
-            let Some(nested_layout) = registry.get(&nested_name) else {
+            let Some(nested_layout) = registry.get_related(owner_layout, &nested_name) else {
                 return false;
             };
             let mut wrote = false;
@@ -7000,6 +7006,7 @@ pub(super) fn apply_field_default_init_const_bytes(
                 wrote |= apply_field_default_init_const_bytes(
                     bytes,
                     field_offset + nested_field.offset,
+                    nested_layout,
                     nested_field,
                     nested_init,
                     registry,
@@ -15317,10 +15324,39 @@ pub(super) fn same_type_info(
 }
 
 pub(super) fn defined_assignment_arg_semantic_match(
+    st: &SymbolTable,
+    declared_scope: crate::sema::symtab::ScopeId,
+    actual_scope: Option<crate::sema::symtab::ScopeId>,
     declared: &crate::sema::symtab::TypeInfo,
     actual: Option<&crate::sema::symtab::TypeInfo>,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> bool {
     use crate::sema::symtab::TypeInfo;
+
+    let type_names_match = |declared_name: &str, actual_name: &str| {
+        let declared_name = canonical_type_name_for_generic_match(
+            st,
+            Some(declared_scope),
+            declared_name,
+            type_layouts,
+        );
+        let actual_name =
+            canonical_type_name_for_generic_match(st, actual_scope, actual_name, type_layouts);
+        actual_name.eq_ignore_ascii_case(&declared_name)
+    };
+    let type_is_same_or_extension = |declared_name: &str, actual_name: &str| {
+        let declared_name = canonical_type_name_for_generic_match(
+            st,
+            Some(declared_scope),
+            declared_name,
+            type_layouts,
+        );
+        let actual_name =
+            canonical_type_name_for_generic_match(st, actual_scope, actual_name, type_layouts);
+        actual_name.eq_ignore_ascii_case(&declared_name)
+            || type_layouts
+                .is_some_and(|layouts| is_type_or_extends(&actual_name, &declared_name, layouts))
+    };
 
     // F2018 §10.2.1.4: a defined assignment specific is selected by
     // the declared types AND kinds of its dummies.  The previous
@@ -15352,12 +15388,12 @@ pub(super) fn defined_assignment_arg_semantic_match(
         TypeInfo::Derived(decl_name) => matches!(
             actual,
             Some(TypeInfo::Derived(actual_name))
-                if actual_name.eq_ignore_ascii_case(decl_name)
+                if type_names_match(decl_name, actual_name)
         ),
         TypeInfo::Class(decl_name) => matches!(
             actual,
             Some(TypeInfo::Class(actual_name)) | Some(TypeInfo::Derived(actual_name))
-                if actual_name.eq_ignore_ascii_case(decl_name)
+                if type_is_same_or_extension(decl_name, actual_name)
         ),
         TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. }) | None),
         TypeInfo::Integer { kind: dk } => match actual {
@@ -15660,7 +15696,11 @@ pub(super) fn local_semantic_type_info(info: &LocalInfo) -> Option<crate::sema::
     use crate::sema::symtab::TypeInfo;
 
     if let Some(type_name) = &info.derived_type {
-        return Some(TypeInfo::Derived(type_name.clone()));
+        return Some(if info.is_class {
+            TypeInfo::Class(type_name.clone())
+        } else {
+            TypeInfo::Derived(type_name.clone())
+        });
     }
     if info.char_kind != CharKind::None
         || descriptor_backed_runtime_char_array(info)
@@ -17371,6 +17411,7 @@ fn defined_assignment_specific_has_scalar_formals(
 
 fn defined_assignment_semantic_candidates(
     st: &SymbolTable,
+    actual_scope: Option<crate::sema::symtab::ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     lhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
     rhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
@@ -17402,12 +17443,26 @@ fn defined_assignment_semantic_candidates(
             }
 
             if let Some(ti) = declared_args.first().and_then(|sym| sym.type_info.as_ref()) {
-                if !defined_assignment_arg_semantic_match(ti, lhs_semantic_ti) {
+                if !defined_assignment_arg_semantic_match(
+                    st,
+                    scope.id,
+                    actual_scope,
+                    ti,
+                    lhs_semantic_ti,
+                    type_layouts,
+                ) {
                     return false;
                 }
             }
             if let Some(ti) = declared_args.get(1).and_then(|sym| sym.type_info.as_ref()) {
-                if !defined_assignment_arg_semantic_match(ti, rhs_semantic_ti) {
+                if !defined_assignment_arg_semantic_match(
+                    st,
+                    scope.id,
+                    actual_scope,
+                    ti,
+                    rhs_semantic_ti,
+                    type_layouts,
+                ) {
                     return false;
                 }
             }
@@ -17448,6 +17503,7 @@ pub(super) fn try_defined_assignment_for_array_element(
 
     let semantic_candidates = defined_assignment_semantic_candidates(
         ctx.st,
+        ctx.proc_scope_id,
         Some(ctx.type_layouts),
         lhs_semantic_ti.as_ref(),
         rhs_semantic_ti.as_ref(),
@@ -17673,6 +17729,7 @@ pub(super) fn try_defined_assignment(
 
     let semantic_candidates = defined_assignment_semantic_candidates(
         ctx.st,
+        ctx.proc_scope_id,
         Some(ctx.type_layouts),
         lhs_semantic_ti.as_ref(),
         rhs_semantic_ti.as_ref(),
@@ -19842,7 +19899,8 @@ pub(super) fn emit_named_function_call(
                     || (callee_descriptor_args.is_none()
                         && actual_is_descriptor_backed(locals, e, st, type_layouts)))
                     && !wants_bind_c_char;
-                let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
+                let wants_polymorphic_descriptor =
+                    wants_descriptor && dummy_is_class && !dummy_is_allocatable && !wants_pointer;
                 let value = if is_value && wants_bind_c_char {
                     lower_bind_c_char_value_arg(
                         b,
@@ -20382,8 +20440,10 @@ pub(super) fn emit_resolved_bound_proc_call(
                         // the caller (the memcpy-and-stamp polymorphic
                         // view would otherwise hide callee writes
                         // behind a copy).
-                        let force_box =
-                            wants_polymorphic_descriptor && !matches!(e.node, Expr::Name { .. });
+                        let force_box = wants_polymorphic_descriptor
+                            && !dummy_is_allocatable
+                            && !wants_pointer
+                            && !matches!(e.node, Expr::Name { .. });
                         let desc = lower_arg_descriptor_full(
                             b,
                             locals,
@@ -20902,7 +20962,12 @@ pub(super) fn resolve_polymorphic_component_method_base_for_dispatch(
             if field.size != 392 {
                 return None;
             }
-            let base_type = abstract_layout_base_type(tl, &field.type_info)?;
+            let raw_base_type = abstract_layout_base_type(tl, &field.type_info)?;
+            let proc_scope_id =
+                callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+            let base_type =
+                canonical_layout_type_name_for_scope(st, proc_scope_id, &raw_base_type, tl)
+                    .unwrap_or(raw_base_type);
             let obj_addr =
                 b.load_typed(desc_addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
             Some((desc_addr, obj_addr, base_type))
@@ -21136,11 +21201,6 @@ pub(super) fn lower_alloc_return_call_into_desc(
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
         let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-        let wants_polymorphic_descriptor = wants_descriptor
-            && callee_class_args
-                .as_ref()
-                .map(|mask| i < mask.len() && mask[i])
-                .unwrap_or(false);
         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
         let wants_pointer = callee_pointer_args
             .as_ref()
@@ -21150,6 +21210,13 @@ pub(super) fn lower_alloc_return_call_into_desc(
             .as_ref()
             .map(|mask| i < mask.len() && mask[i])
             .unwrap_or(false);
+        let wants_polymorphic_descriptor = wants_descriptor
+            && callee_class_args
+                .as_ref()
+                .map(|mask| i < mask.len() && mask[i])
+                .unwrap_or(false)
+            && !dummy_is_allocatable
+            && !wants_pointer;
         let is_optional = opt_flags
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
@@ -23311,6 +23378,16 @@ pub(super) fn clear_intent_out_allocatable_array_params(
 
             b.set_block(bb_clear);
             let desc = array_descriptor_addr(b, info);
+            if info.is_class && info.derived_type.is_none() {
+                let finalize = b.const_i32(1);
+                release_unlimited_polymorphic_allocatable_descriptor(b, desc, stat, finalize);
+                b.branch(bb_skip, vec![]);
+                b.set_block(bb_skip);
+                continue;
+            }
+            if info.is_class {
+                require_context_free_dynamic_lifecycle(b, desc);
+            }
             if let Some(type_name) = info.derived_type.as_ref() {
                 if let Some(layout) = type_layouts.get(type_name) {
                     finalize_derived_descriptor_storage_if_allocated(
@@ -23338,6 +23415,14 @@ pub(super) fn clear_intent_out_allocatable_array_params(
         }
 
         let desc = array_descriptor_addr(b, info);
+        if info.is_class && info.derived_type.is_none() {
+            let finalize = b.const_i32(1);
+            release_unlimited_polymorphic_allocatable_descriptor(b, desc, stat, finalize);
+            continue;
+        }
+        if info.is_class {
+            require_context_free_dynamic_lifecycle(b, desc);
+        }
         if let Some(type_name) = info.derived_type.as_ref() {
             if let Some(layout) = type_layouts.get(type_name) {
                 finalize_derived_descriptor_storage_if_allocated(
@@ -26506,7 +26591,11 @@ fn finalize_derived_storage_with<F>(
         finalized_addr,
         emit_final,
     );
-    if let Some(parent) = layout.parent.as_deref().and_then(|name| registry.get(name)) {
+    if let Some(parent) = layout
+        .parent
+        .as_deref()
+        .and_then(|name| registry.get_related(layout, name))
+    {
         finalize_derived_storage_with(b, registry, parent, finalized_addr, emit_final);
     }
 }
@@ -26518,7 +26607,7 @@ fn layout_own_fields<'a>(
     let inherited = layout
         .parent
         .as_deref()
-        .and_then(|name| registry.get(name))
+        .and_then(|name| registry.get_related(layout, name))
         .map_or(0, |parent| parent.fields.len());
     &layout.fields[inherited.min(layout.fields.len())..]
 }
@@ -26582,7 +26671,7 @@ fn finalize_nonallocatable_components_of_storage_with<F>(
         let Some(nested_name) = field_derived_type_name(field) else {
             continue;
         };
-        let Some(nested_layout) = registry.get(&nested_name) else {
+        let Some(nested_layout) = registry.get_related(layout, &nested_name) else {
             continue;
         };
         if !derived_layout_needs_finalization(nested_layout, registry) {
@@ -26663,7 +26752,7 @@ fn finalize_nonallocatable_components_of_array_with<F>(
         !field.pointer
             && !field.allocatable
             && field_derived_type_name(field)
-                .and_then(|name| registry.get(&name))
+                .and_then(|name| registry.get_related(layout, &name))
                 .is_some_and(|nested| derived_layout_needs_finalization(nested, registry))
     });
     if !has_finalizable_component {
@@ -26960,7 +27049,11 @@ fn finalize_derived_array_descriptor_storage_with<F>(
         b.set_block(bb_done);
     }
     finalize_nonallocatable_components_of_array_with(b, desc, layout, registry, emit_final);
-    if let Some(parent) = layout.parent.as_deref().and_then(|name| registry.get(name)) {
+    if let Some(parent) = layout
+        .parent
+        .as_deref()
+        .and_then(|name| registry.get_related(layout, name))
+    {
         finalize_parent_array_descriptor_with(b, desc, parent, registry, emit_final);
     }
 }
@@ -27011,13 +27104,13 @@ pub(super) fn derived_layout_needs_finalization(
             !field.pointer
                 && !field.allocatable
                 && field_derived_type_name(field)
-                    .and_then(|name| registry.get(&name))
+                    .and_then(|name| registry.get_related(layout, &name))
                     .is_some_and(|nested| derived_layout_needs_finalization(nested, registry))
         })
         || layout
             .parent
             .as_deref()
-            .and_then(|name| registry.get(name))
+            .and_then(|name| registry.get_related(layout, name))
             .is_some_and(|parent| derived_layout_needs_finalization(parent, registry))
 }
 
@@ -27055,6 +27148,52 @@ fn call_descriptor_vtable_thunk_with_fallback<F>(
     b.set_block(fallback_bb);
     fallback(b);
     b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
+}
+
+/// Stop before a runtime-polymorphic value with a procedure-local FINAL
+/// binding crosses into owned storage. Static lowering can invoke such a
+/// binding with its host context, but a context-free vtable call cannot.
+pub(super) fn require_context_free_dynamic_lifecycle(b: &mut FuncBuilder, desc: ValueId) {
+    let vtable = load_array_desc_vtable_ptr(b, desc);
+    let vtable_raw = b.ptr_to_int(vtable);
+    let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    let base_raw = b.ptr_to_int(base);
+    let allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let zero = b.const_i64(0);
+    let zero_i32 = b.const_i32(0);
+    let has_vtable = b.icmp(CmpOp::Ne, vtable_raw, zero);
+    let has_base = b.icmp(CmpOp::Ne, base_raw, zero);
+    let is_allocated = b.icmp(CmpOp::Ne, allocated, zero_i32);
+    let has_value = b.or(has_base, is_allocated);
+    let should_check = b.and(has_vtable, has_value);
+    let check_bb = b.create_block("dynamic_lifecycle_check");
+    let fail_bb = b.create_block("dynamic_lifecycle_unsupported");
+    let done_bb = b.create_block("dynamic_lifecycle_supported");
+    b.cond_branch(should_check, check_bb, vec![], done_bb, vec![]);
+
+    b.set_block(check_bb);
+    let metadata = b.load_typed(vtable, IrType::Int(IntWidth::I64));
+    let marker = b.const_i64(VTABLE_CONTEXT_DEPENDENT_LIFECYCLE_BIT as i64);
+    let lifecycle_bits = b.bit_and(metadata, marker);
+    let context_dependent = b.icmp(CmpOp::Ne, lifecycle_bits, zero);
+    b.cond_branch(context_dependent, fail_bb, vec![], done_bb, vec![]);
+
+    b.set_block(fail_bb);
+    const MESSAGE: &str = "polymorphic ownership cannot preserve a procedure-local FINAL binding; move the dynamic type and FINAL procedure to module scope";
+    let message = b.const_string(MESSAGE.as_bytes());
+    let message_len = b.const_i64(MESSAGE.len() as i64);
+    b.call(
+        FuncRef::External("afs_error_stop_msg".into()),
+        vec![message, message_len],
+        IrType::Void,
+    );
+    b.unreachable();
 
     b.set_block(done_bb);
 }
@@ -27234,6 +27373,19 @@ pub(super) fn insert_implicit_dealloc(
         } else if info.allocatable {
             if info.by_ref {
                 continue;
+            }
+            if info.is_class && info.derived_type.is_none() {
+                let stat_addr = stat_addr.unwrap();
+                let zero = b.const_i32(0);
+                b.store(zero, stat_addr);
+                let finalize = b.const_i32(i32::from(finalize_owned_locals));
+                release_unlimited_polymorphic_allocatable_descriptor(
+                    b, info.addr, stat_addr, finalize,
+                );
+                continue;
+            }
+            if info.is_class {
+                require_context_free_dynamic_lifecycle(b, info.addr);
             }
             if let Some(type_name) = &info.derived_type {
                 if let Some(layout) = type_layouts.get(type_name) {
@@ -35431,7 +35583,9 @@ pub(super) fn load_array_desc_type_tag(b: &mut FuncBuilder, desc: ValueId) -> Va
     );
 
     b.set_block(array_vtable_bb);
-    let full_tag = b.load_typed(vtable, IrType::Int(IntWidth::I64));
+    let encoded_tag = b.load_typed(vtable, IrType::Int(IntWidth::I64));
+    let tag_mask = b.const_i64(VTABLE_TYPE_TAG_MASK);
+    let full_tag = b.bit_and(encoded_tag, tag_mask);
     b.branch(done_bb, vec![full_tag]);
 
     b.set_block(array_compact_bb);
@@ -37557,9 +37711,13 @@ fn descriptor_with_polymorphic_type_tag(
             .or_else(|| {
                 type_layouts.and_then(|tl| expr_type_tag_value(b, expr, Some(locals), st, tl))
             });
-    let Some(type_tag) = type_tag else {
+    let vtable = type_layouts.and_then(|tl| {
+        expr_type_layout(expr, Some(locals), st, tl)
+            .and_then(|layout| type_layout_vtable_value(b, layout))
+    });
+    if type_tag.is_none() && vtable.is_none() {
         return desc;
-    };
+    }
 
     let tagged = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let size = b.const_i64(392);
@@ -37568,7 +37726,24 @@ fn descriptor_with_polymorphic_type_tag(
         vec![tagged, desc, size],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
-    store_array_desc_type_tag(b, tagged, type_tag);
+    let existing_vtable = load_array_desc_vtable_ptr(b, tagged);
+    let existing_vtable_raw = b.ptr_to_int(existing_vtable);
+    let zero = b.const_i64(0);
+    let has_dynamic_metadata = b.icmp(CmpOp::Ne, existing_vtable_raw, zero);
+    let install_bb = b.create_block("descriptor_install_static_type");
+    let done_bb = b.create_block("descriptor_type_ready");
+    b.cond_branch(has_dynamic_metadata, done_bb, vec![], install_bb, vec![]);
+
+    b.set_block(install_bb);
+    if let Some(type_tag) = type_tag {
+        store_array_desc_type_tag(b, tagged, type_tag);
+    }
+    if let Some(vtable) = vtable {
+        store_array_desc_vtable_ptr(b, tagged, vtable);
+    }
+    b.branch(done_bb, vec![]);
+
+    b.set_block(done_bb);
     tagged
 }
 
@@ -48819,6 +48994,9 @@ fn prepare_allocatable_derived_array_assignment_lhs_for_replacement(
     dest_desc: ValueId,
     stat_addr: ValueId,
 ) {
+    if dest_info.is_class {
+        require_context_free_dynamic_lifecycle(b, dest_desc);
+    }
     let Some(layout) = dest_info
         .derived_type
         .as_deref()
@@ -48863,8 +49041,15 @@ fn assign_dynamic_polymorphic_allocatable_array(
     );
     let source_base_raw = b.ptr_to_int(source_base);
     let zero64 = b.const_i64(0);
-    let has_source = b.icmp(CmpOp::Ne, source_base_raw, zero64);
     let zero32 = b.const_i32(0);
+    let source_allocated = b.call(
+        FuncRef::External("afs_allocated".into()),
+        vec![source_desc],
+        IrType::Int(IntWidth::I32),
+    );
+    let has_base = b.icmp(CmpOp::Ne, source_base_raw, zero64);
+    let is_allocated = b.icmp(CmpOp::Ne, source_allocated, zero32);
+    let has_source = b.or(has_base, is_allocated);
     let copy_bb = b.create_block("dynamic_array_assign_copy");
     let clear_bb = b.create_block("dynamic_array_assign_clear");
     b.cond_branch(has_source, copy_bb, vec![], clear_bb, vec![]);
@@ -48884,6 +49069,7 @@ fn assign_dynamic_polymorphic_allocatable_array(
     b.branch(done_bb, vec![]);
 
     b.set_block(copy_bb);
+    require_context_free_dynamic_lifecycle(b, source_desc);
     let copy_stat = b.alloca(IrType::Int(IntWidth::I32));
     b.store(zero32, copy_stat);
     prepare_allocatable_derived_array_assignment_lhs_for_replacement(
@@ -53378,6 +53564,9 @@ pub(super) fn is_type_or_extends(
     if actual_type.eq_ignore_ascii_case(target_type) {
         return true;
     }
+    if let (Some(actual), Some(target)) = (tl.get(actual_type), tl.get(target_type)) {
+        return tl.is_same_or_extension_of(actual, target);
+    }
     // Walk the parent chain.
     let mut current = actual_type.to_lowercase();
     loop {
@@ -53614,7 +53803,7 @@ pub(super) fn derived_layout_needs_runtime_zero_init(
                 &field.type_info,
                 crate::sema::symtab::TypeInfo::Derived(type_name)
                     if registry
-                        .get(type_name)
+                        .get_related(layout, type_name)
                         .is_some_and(|nested| derived_layout_needs_runtime_zero_init(nested, registry))
             )
     })
@@ -53632,7 +53821,7 @@ pub(super) fn derived_layout_has_runtime_field_defaults(
                     &field.type_info,
                     crate::sema::symtab::TypeInfo::Derived(type_name)
                         if registry
-                            .get(type_name)
+                            .get_related(layout, type_name)
                             .is_some_and(|nested| derived_layout_has_runtime_field_defaults(nested, registry))
                 ))
     })
@@ -53673,7 +53862,7 @@ pub(super) fn derived_layout_needs_deep_copy(
         if !field.pointer && !field.allocatable {
             if let Some(nested_name) = field_derived_type_name(field) {
                 return registry
-                    .get(&nested_name)
+                    .get_related(layout, &nested_name)
                     .is_some_and(|nested| derived_layout_needs_deep_copy(nested, registry));
             }
         }
@@ -53806,7 +53995,7 @@ pub(super) fn clear_derived_storage_for_intent_out(
         let Some(nested_name) = field_derived_type_name(field) else {
             continue;
         };
-        let Some(nested_layout) = registry.get(&nested_name) else {
+        let Some(nested_layout) = registry.get_related(layout, &nested_name) else {
             continue;
         };
 
@@ -53879,7 +54068,7 @@ pub(super) fn derived_layout_needs_component_deallocation(
             return false;
         };
         registry
-            .get(&nested_name)
+            .get_related(layout, &nested_name)
             .is_some_and(|nested| derived_layout_needs_component_deallocation(nested, registry))
     })
 }
@@ -54038,13 +54227,18 @@ fn deallocate_derived_descriptor_components_guarded_static(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if derived_memory_helper_available_xmodule(b, layout) {
+    let helper_is_context_free = !registry.deallocation_has_ownerless_finalizer(layout);
+    let helper_available =
+        helper_is_context_free && derived_memory_helper_available_xmodule(b, layout);
+    if helper_available {
         call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr, finalize);
         return;
     }
     let key = derived_layout_identity_key(layout);
     if !active_types.insert(key.clone()) {
-        call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr, finalize);
+        if helper_is_context_free {
+            call_derived_descriptor_dealloc_helper(b, desc, layout, stat_addr, finalize);
+        }
         return;
     }
     emit_deallocate_derived_descriptor_components_inline(
@@ -54161,13 +54355,18 @@ fn deallocate_derived_storage_components_guarded(
     if !derived_layout_needs_component_deallocation(layout, registry) {
         return;
     }
-    if derived_memory_helper_available_xmodule(b, layout) {
+    let helper_is_context_free = !registry.deallocation_has_ownerless_finalizer(layout);
+    let helper_available =
+        helper_is_context_free && derived_memory_helper_available_xmodule(b, layout);
+    if helper_available {
         call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr, finalize);
         return;
     }
     let key = derived_layout_identity_key(layout);
     if !active_types.insert(key.clone()) {
-        call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr, finalize);
+        if helper_is_context_free {
+            call_derived_storage_dealloc_helper(b, base_addr, layout, stat_addr, finalize);
+        }
         return;
     }
     emit_deallocate_derived_storage_components_inline(
@@ -54214,8 +54413,11 @@ fn emit_deallocate_derived_storage_components_inline(
                 );
                 continue;
             }
+            if matches!(field.type_info, crate::sema::symtab::TypeInfo::Class(_)) {
+                require_context_free_dynamic_lifecycle(b, field_ptr);
+            }
             if let Some(nested_name) = field_derived_type_name(field) {
-                if let Some(nested_layout) = registry.get(&nested_name) {
+                if let Some(nested_layout) = registry.get_related(layout, &nested_name) {
                     finalize_derived_descriptor_storage_if_allocated_direct(
                         b,
                         field_ptr,
@@ -54249,7 +54451,7 @@ fn emit_deallocate_derived_storage_components_inline(
         let Some(nested_name) = field_derived_type_name(field) else {
             continue;
         };
-        let Some(nested_layout) = registry.get(&nested_name) else {
+        let Some(nested_layout) = registry.get_related(layout, &nested_name) else {
             continue;
         };
 
@@ -54299,7 +54501,7 @@ pub(super) fn apply_derived_field_default_inits(
 
         if !field.pointer && !field.allocatable {
             if let Some(nested_name) = field_derived_type_name(field) {
-                if let Some(nested_layout) = registry.get(&nested_name) {
+                if let Some(nested_layout) = registry.get_related(layout, &nested_name) {
                     if derived_layout_needs_runtime_initialization(nested_layout, registry) {
                         if field.dims.is_empty() {
                             initialize_derived_storage(b, field_ptr, nested_layout, registry);
@@ -54322,13 +54524,14 @@ pub(super) fn apply_derived_field_default_inits(
         let Some(default_init) = &field.default_init else {
             continue;
         };
-        apply_field_default_init_runtime(b, field_ptr, field, default_init, registry);
+        apply_field_default_init_runtime(b, field_ptr, layout, field, default_init, registry);
     }
 }
 
 pub(super) fn apply_field_default_init_runtime(
     b: &mut FuncBuilder,
     field_ptr: ValueId,
+    owner_layout: &crate::sema::type_layout::TypeLayout,
     field: &crate::sema::type_layout::FieldLayout,
     default_init: &crate::sema::type_layout::FieldDefaultInit,
     registry: &crate::sema::type_layout::TypeLayoutRegistry,
@@ -54375,7 +54578,7 @@ pub(super) fn apply_field_default_init_runtime(
             let Some(nested_name) = field_derived_type_name(field) else {
                 return;
             };
-            let Some(nested_layout) = registry.get(&nested_name) else {
+            let Some(nested_layout) = registry.get_related(owner_layout, &nested_name) else {
                 return;
             };
             for (nested_field_name, nested_init) in overrides {
@@ -54387,6 +54590,7 @@ pub(super) fn apply_field_default_init_runtime(
                 apply_field_default_init_runtime(
                     b,
                     nested_ptr,
+                    nested_layout,
                     nested_field,
                     nested_init,
                     registry,
@@ -54659,6 +54863,21 @@ pub(super) fn resolve_component_field_access(
     st: &SymbolTable,
     tl: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<(ValueId, crate::sema::type_layout::FieldLayout)> {
+    let (field_ptr, _, field) = resolve_component_field_access_with_owner(b, locals, expr, st, tl)?;
+    Some((field_ptr, field))
+}
+
+pub(super) fn resolve_component_field_access_with_owner<'a>(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    tl: &'a crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<(
+    ValueId,
+    &'a crate::sema::type_layout::TypeLayout,
+    crate::sema::type_layout::FieldLayout,
+)> {
     let Expr::ComponentAccess { base, component } = &expr.node else {
         return None;
     };
@@ -54671,7 +54890,7 @@ pub(super) fn resolve_component_field_access(
     let field = layout_component_field_or_parent_view(layout, component, tl)?;
     let offset = b.const_i64(field.offset as i64);
     let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
-    Some((field_ptr, field))
+    Some((field_ptr, layout, field))
 }
 
 pub(super) fn is_deferred_char_component_field(
@@ -55545,6 +55764,11 @@ fn emit_derived_value_copy_guarded(
     dest_ptr: ValueId,
     src_ptr: ValueId,
 ) {
+    if !derived_layout_needs_deep_copy(layout, type_layouts) {
+        emit_memcpy_bytes(b, dest_ptr, src_ptr, layout.size as i64);
+        return;
+    }
+
     let dest_addr = b.ptr_to_int(dest_ptr);
     let src_addr = b.ptr_to_int(src_ptr);
     let same_addr = b.icmp(CmpOp::Eq, dest_addr, src_addr);
@@ -55585,7 +55809,14 @@ fn emit_derived_value_copy_snapshot(
     let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     let zero_i32 = b.const_i32(0);
     b.store(zero_i32, stat_addr);
-    deallocate_derived_storage_components(b, scratch, layout, type_layouts, stat_addr);
+    deallocate_derived_storage_components_with_finalization(
+        b,
+        scratch,
+        layout,
+        type_layouts,
+        stat_addr,
+        false,
+    );
 }
 
 fn emit_derived_value_copy_unaliased(
@@ -55675,7 +55906,7 @@ fn emit_derived_value_copy_inline(
             // descriptors. A raw memcpy here makes sibling copies of
             // a derived object share the same array storage.
             if let Some(nested_name) = field_derived_type_name(field) {
-                if let Some(nested_layout) = type_layouts.get(&nested_name) {
+                if let Some(nested_layout) = type_layouts.get_related(layout, &nested_name) {
                     if derived_layout_needs_deep_copy(nested_layout, type_layouts) {
                         emit_allocatable_derived_array_component_copy(
                             b,
@@ -55704,14 +55935,24 @@ fn emit_derived_value_copy_inline(
                 emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
                 continue;
             };
-            if field.dims.is_empty() {
-                emit_derived_value_copy(b, type_layouts, &nested_name, dest_field, src_field);
-                continue;
-            }
-            let Some(nested_layout) = type_layouts.get(&nested_name) else {
+            let Some(nested_layout) = type_layouts.get_related(layout, &nested_name) else {
                 emit_memcpy_bytes(b, dest_field, src_field, field.size as i64);
                 continue;
             };
+            if field.dims.is_empty() {
+                if derived_layout_needs_deep_copy(nested_layout, type_layouts) {
+                    emit_derived_value_copy_guarded(
+                        b,
+                        type_layouts,
+                        nested_layout,
+                        dest_field,
+                        src_field,
+                    );
+                } else {
+                    emit_memcpy_bytes(b, dest_field, src_field, nested_layout.size as i64);
+                }
+                continue;
+            }
             let elem_count: i64 = field.dims.iter().map(|(_, extent)| *extent).product();
             if elem_count <= 0 {
                 continue;
@@ -55734,7 +55975,17 @@ fn emit_derived_value_copy_inline(
             let elem_offset = b.imul(body_idx, elem_bytes);
             let dest_elem = b.gep(dest_field, vec![elem_offset], IrType::Int(IntWidth::I8));
             let src_elem = b.gep(src_field, vec![elem_offset], IrType::Int(IntWidth::I8));
-            emit_derived_value_copy(b, type_layouts, &nested_name, dest_elem, src_elem);
+            if derived_layout_needs_deep_copy(nested_layout, type_layouts) {
+                emit_derived_value_copy_guarded(
+                    b,
+                    type_layouts,
+                    nested_layout,
+                    dest_elem,
+                    src_elem,
+                );
+            } else {
+                emit_memcpy_bytes(b, dest_elem, src_elem, nested_layout.size as i64);
+            }
             let one = b.const_i64(1);
             let next_idx = b.iadd(body_idx, one);
             b.branch(check_bb, vec![next_idx]);
@@ -55765,6 +56016,7 @@ pub(super) fn release_unlimited_polymorphic_allocatable_descriptor(
     b.cond_branch(is_allocated, release_bb, vec![], done_bb, vec![]);
 
     b.set_block(release_bb);
+    require_context_free_dynamic_lifecycle(b, desc);
     let should_finalize = b.icmp(CmpOp::Ne, finalize, zero_i32);
     let finalize_bb = b.create_block("class_star_release_finalize");
     let dealloc_bb = b.create_block("class_star_release_dealloc");
@@ -55920,6 +56172,7 @@ pub(super) fn store_derived_field_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     field_ptr: ValueId,
+    owner_layout: &crate::sema::type_layout::TypeLayout,
     field: &crate::sema::type_layout::FieldLayout,
     value: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
@@ -56174,7 +56427,9 @@ pub(super) fn store_derived_field_expr(
             descriptor_params,
         );
         if let Some(nested_name) = field_derived_type_name(field) {
-            emit_derived_value_copy(b, type_layouts, &nested_name, field_ptr, src_ptr);
+            if let Some(nested_layout) = type_layouts.get_related(owner_layout, &nested_name) {
+                emit_derived_value_copy_guarded(b, type_layouts, nested_layout, field_ptr, src_ptr);
+            }
         }
         return;
     }
@@ -56597,7 +56852,9 @@ pub(super) fn typed_allocate_layout<'a>(
 ) -> Option<&'a crate::sema::type_layout::TypeLayout> {
     match type_spec {
         Some(crate::ast::decl::TypeSpec::Type(name))
-        | Some(crate::ast::decl::TypeSpec::Class(name)) => type_layouts.get(name),
+        | Some(crate::ast::decl::TypeSpec::Class(name)) => {
+            type_layout_for_current_scope(type_layouts, name)
+        }
         _ => None,
     }
 }
@@ -57029,7 +57286,7 @@ fn emit_derived_array_desc_copy_inline(
     let src_off = b.imul(src_index, elem_bytes_val);
     let src_ptr = b.gep(src_base, vec![src_off], IrType::Int(IntWidth::I8));
 
-    emit_derived_value_copy(b, type_layouts, &layout.name, dest_ptr, src_ptr);
+    emit_derived_value_copy_guarded(b, type_layouts, layout, dest_ptr, src_ptr);
 
     let one = b.const_i64(1);
     let next_i = b.iadd(i_val, one);
@@ -57111,6 +57368,7 @@ fn emit_dynamic_derived_scalar_copy(
     base_type: &str,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
+    require_context_free_dynamic_lifecycle(b, source_desc);
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let source_base = b.load_typed(
         source_desc,
@@ -57148,6 +57406,7 @@ pub(super) fn stabilize_dynamic_scalar_assignment_source(
     base_type: &str,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> (ValueId, ValueId) {
+    require_context_free_dynamic_lifecycle(b, source_desc);
     let snapshot_desc = zeroed_array_temp_descriptor(b);
     let overlaps = b.call(
         FuncRef::External("afs_descriptors_overlap".into()),
@@ -57216,6 +57475,7 @@ fn stabilize_dynamic_array_assignment_source(
     base_type: &str,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> (ValueId, ValueId) {
+    require_context_free_dynamic_lifecycle(b, source_desc);
     let snapshot_desc = zeroed_array_temp_descriptor(b);
     let overlaps = b.call(
         FuncRef::External("afs_descriptors_overlap".into()),
@@ -57329,6 +57589,7 @@ fn emit_dynamic_derived_array_desc_copy(
     base_type: &str,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
+    require_context_free_dynamic_lifecycle(b, source_desc);
     let dest_arg = ptr_i8_value(b, dest_desc);
     let source_arg = ptr_i8_value(b, source_desc);
     call_descriptor_vtable_thunk_with_fallback(
@@ -57387,12 +57648,45 @@ pub(super) fn emit_allocatable_source_copy_on_success(
 
         b.set_block(deep_done_bb);
     } else if preserve_shape {
-        b.call(
-            FuncRef::External("afs_copy_array_data".into()),
-            vec![dest_desc, source_desc, stat_addr],
-            IrType::Void,
-        );
-        emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
+        let dynamic_base_type = match scalar_copy_plan {
+            Some(ScalarAllocSourceCopyPlan::Dynamic(base_type)) => Some(base_type.as_str()),
+            Some(ScalarAllocSourceCopyPlan::UnlimitedPolymorphic) => Some(""),
+            _ => None,
+        };
+        if let Some(base_type) = dynamic_base_type {
+            b.call(
+                FuncRef::External("afs_prepare_array_copy".into()),
+                vec![dest_desc, source_desc, stat_addr],
+                IrType::Void,
+            );
+            emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
+            let prep_stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+            let prep_ok = b.icmp(CmpOp::Eq, prep_stat, zero);
+            let deep_bb = b.create_block("alloc_source_dynamic_array_deep_copy");
+            let deep_done_bb = b.create_block("alloc_source_dynamic_array_deep_copy_done");
+            b.cond_branch(prep_ok, deep_bb, vec![], deep_done_bb, vec![]);
+
+            b.set_block(deep_bb);
+            emit_dynamic_derived_array_desc_copy(
+                b,
+                dest_desc,
+                source_desc,
+                stat_addr,
+                base_type,
+                type_layouts,
+            );
+            b.branch(deep_done_bb, vec![]);
+
+            b.set_block(deep_done_bb);
+        } else {
+            require_context_free_dynamic_lifecycle(b, source_desc);
+            b.call(
+                FuncRef::External("afs_copy_array_data".into()),
+                vec![dest_desc, source_desc, stat_addr],
+                IrType::Void,
+            );
+            emit_runtime_errmsg_on_failure(b, stat_addr, errmsg_target, "ALLOCATE failed");
+        }
     } else {
         let deep_copied = match scalar_copy_plan {
             Some(ScalarAllocSourceCopyPlan::Static(type_name)) => {
@@ -57606,22 +57900,25 @@ pub(super) fn expr_scalar_alloc_source_copy_plan(
     st: &SymbolTable,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Option<ScalarAllocSourceCopyPlan> {
-    if let Some(layout) = expr_type_layout(expr, Some(locals), st, type_layouts) {
-        if !layout.is_abstract {
-            return Some(ScalarAllocSourceCopyPlan::Static(layout.name.clone()));
-        }
-    }
     let type_info = operator_expr_type_info(expr, Some(locals), st, Some(type_layouts));
-    if matches!(
-        type_info,
-        Some(crate::sema::symtab::TypeInfo::ClassStar)
-            | Some(crate::sema::symtab::TypeInfo::TypeStar)
-    ) {
-        return Some(ScalarAllocSourceCopyPlan::UnlimitedPolymorphic);
+    match type_info {
+        Some(crate::sema::symtab::TypeInfo::Derived(type_name)) => {
+            let type_name = type_layout_for_current_scope(type_layouts, &type_name)
+                .map(|layout| type_layouts.canonical_key_for_layout(layout))
+                .unwrap_or(type_name);
+            Some(ScalarAllocSourceCopyPlan::Static(type_name))
+        }
+        Some(crate::sema::symtab::TypeInfo::Class(base_type)) => {
+            let base_type = type_layout_for_current_scope(type_layouts, &base_type)
+                .map(|layout| type_layouts.canonical_key_for_layout(layout))
+                .unwrap_or(base_type);
+            Some(ScalarAllocSourceCopyPlan::Dynamic(base_type))
+        }
+        Some(
+            crate::sema::symtab::TypeInfo::ClassStar | crate::sema::symtab::TypeInfo::TypeStar,
+        ) => Some(ScalarAllocSourceCopyPlan::UnlimitedPolymorphic),
+        _ => None,
     }
-    type_info
-        .and_then(|ti| abstract_layout_base_type(type_layouts, &ti))
-        .map(ScalarAllocSourceCopyPlan::Dynamic)
 }
 
 pub(super) fn expr_type_tag_value(
@@ -59843,6 +60140,7 @@ pub(super) fn lower_structure_constructor_expr(
                 b,
                 locals,
                 field_ptr,
+                layout,
                 field,
                 e,
                 st,
