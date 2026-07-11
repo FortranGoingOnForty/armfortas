@@ -558,6 +558,91 @@ fn allocate_allocated_deferred_character_without_stat_terminates() {
 }
 
 #[test]
+fn allocate_byte_overflow_reports_status_without_allocating() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_byte_overflow_reports_status_without_allocating count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_byte_overflow_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: values(:)\n  integer :: ios\n  character(len=64) :: msg\n  ios = 0\n  msg = 'unchanged'\n  allocate(values(2305843009213693952_8), stat=ios, errmsg=msg)\n  if (ios == 0) error stop 1\n  if (allocated(values)) error stop 2\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 3\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("alloc_byte_overflow_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("overflow allocation runtime failed");
+    assert!(
+        run.status.success(),
+        "overflow allocation did not recover through STAT=: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocate_byte_overflow_without_stat_terminates_cleanly() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_byte_overflow_without_stat_terminates_cleanly count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_byte_overflow_loud");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: values(:)\n  allocate(values(2305843009213693952_8))\n  print *, 'survived'\nend program\n",
+    );
+    let exe = dir.join("alloc_byte_overflow_loud.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("overflow allocation termination failed");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success(),
+        "overflow ALLOCATE without STAT= returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("ALLOCATE"),
+        "overflow allocation did not report its operation:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("panicked at")
+            && !stderr.contains("panic in a function that cannot unwind"),
+        "overflow escaped through a Rust panic:\n{}",
+        stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_source_array_infers_shape_and_copies_values() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
