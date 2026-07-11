@@ -45,7 +45,7 @@ fn require_clang() -> PathBuf {
     // whole suite with a count, exactly like run_programs.
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
-            "\nHARNESS_SKIP suite=c_interop_differential test=all count=8 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=c_interop_differential test=all count=9 reason=\"{}\"",
             reason
         );
         std::process::exit(0);
@@ -59,7 +59,7 @@ fn require_clang() -> PathBuf {
             }
             // Non-ELF host without clang: counted skip (x01 convention).
             eprintln!(
-                "\nHARNESS_SKIP suite=c_interop_differential test=all count=8 reason=\"clang not found on this host\""
+                "\nHARNESS_SKIP suite=c_interop_differential test=all count=9 reason=\"clang not found on this host\""
             );
             std::process::exit(0);
         }
@@ -352,6 +352,80 @@ end program f2c
         ],
         "Fortran→C ABI divergence; raw output:\n{}",
         out
+    );
+}
+
+#[test]
+fn floating_point_contraction_matches_public_policy() {
+    let wb = Workbench::new("fp_contract");
+    let strict = wb.fortran_obj_at(
+        "strict",
+        r#"
+function strict_muladd(a, b, c) result(r) bind(c, name="strict_muladd")
+  use iso_c_binding
+  real(c_double), value :: a, b, c
+  real(c_double) :: r
+  r = a * b + c
+end function strict_muladd
+"#,
+        "-O2",
+    );
+    let fast = wb.fortran_obj_at(
+        "fast",
+        r#"
+function fast_muladd(a, b, c) result(r) bind(c, name="fast_muladd")
+  use iso_c_binding
+  real(c_double), value :: a, b, c
+  real(c_double) :: r
+  r = a * b + c
+end function fast_muladd
+"#,
+        "-Ofast",
+    );
+    let c = wb.c_obj(
+        "main",
+        r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+double strict_muladd(double, double, double);
+double fast_muladd(double, double, double);
+
+static uint64_t bits(double value) {
+  uint64_t result;
+  memcpy(&result, &value, sizeof(result));
+  return result;
+}
+
+int main(void) {
+  const double a = 0x1.0000002p0;
+  const double b = 0x1.ffffffcp-1;
+  const double c = -1.0;
+  const uint64_t strict_bits = bits(strict_muladd(a, b, c));
+  const uint64_t fast_bits = bits(fast_muladd(a, b, c));
+#if defined(__aarch64__)
+  const uint64_t expected_fast = UINT64_C(0xbc90000000000000);
+#else
+  const uint64_t expected_fast = UINT64_C(0);
+#endif
+
+  if (strict_bits != UINT64_C(0) || fast_bits != expected_fast) {
+    fprintf(stderr, "strict=%016llx fast=%016llx expected=%016llx\n",
+            (unsigned long long)strict_bits,
+            (unsigned long long)fast_bits,
+            (unsigned long long)expected_fast);
+    return 1;
+  }
+  puts("ok");
+  return 0;
+}
+"#,
+    );
+
+    assert_eq!(
+        wb.link_and_run("fp_contract_bin", &[&c, &strict, &fast]),
+        "ok"
     );
 }
 

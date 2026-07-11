@@ -127,12 +127,19 @@ Inquiry: `KIND`, `SELECTED_INT_KIND`, `SELECTED_REAL_KIND`, `HUGE`, `TINY`, `EPS
 | `-O2` | `-O1` + LICM, strength reduction, DSE, GVN, SROA, loop store forwarding, jump threading, IPO (const-arg, dead-arg, return-prop) |
 | `-Os` | `-O2` but prefer code size: no unrolling, less inlining |
 | `-O3` | `-O2` + aggressive inlining, loop unrolling/interchange, vectorization (NEON on arm64, SSE2 on x86_64) |
-| `-Ofast` | `-O3` + fast-math (reassociation, no NaN/Inf assumptions, reciprocal) |
+| `-Ofast` | `-O3` + fast-math (reassociation, multiply-add contraction, no NaN/Inf assumptions, reciprocal) |
 
 The x86_64 vectorizer is capped at SSE2 — the architectural baseline. CI
 fails on any SSE3+/AVX mnemonic (and on any x87 instruction at any level).
 
-Correctness invariant: every program that produces correct output at `-O0` must produce identical output at `-O1`, `-O2`, `-Os`, `-O3`, and `-Ofast` (documented fast-math reassociation aside). This is enforced by the end-to-end test suite at every level.
+Floating-point multiply-add contraction is disabled at `-O0`, `-O1`, `-O2`,
+`-Os`, and `-O3`. `-Ofast` may emit fused instructions on targets that provide
+them; baseline x86_64 remains SSE2 and therefore keeps separate operations.
+
+Correctness invariant: every program that produces correct output at `-O0`
+must produce identical output at `-O1`, `-O2`, `-Os`, and `-O3`. `-Ofast` may
+differ only where its documented fast-math policy applies. This is enforced by
+the end-to-end test suite at every level.
 
 ### Modules
 

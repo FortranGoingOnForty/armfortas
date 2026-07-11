@@ -32,11 +32,11 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
     // Instruction selection.
     let machine_funcs = isel::select_module(ir_module);
 
-    // Backend peephole (O2+): FMA fusion, etc.
+    // Backend peephole (O2+); floating-point contraction remains Ofast-only.
     let mut allocated: Vec<_> = machine_funcs;
     if opts.opt_level >= OptLevel::O2 {
         for mf in &mut allocated {
-            peephole::run_peephole(mf);
+            peephole::run_peephole(mf, opts.opt_level.fp_contract());
         }
     }
 

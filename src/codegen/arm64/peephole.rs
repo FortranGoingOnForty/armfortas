@@ -7,6 +7,8 @@
 //!
 //! ARM64 has fused multiply-add instructions that are both faster and
 //! more accurate (single rounding) than a separate fmul + fadd pair.
+//! The driver enables these rewrites only when the selected optimization
+//! level permits floating-point contraction.
 //!
 //! Matched patterns and their replacement:
 //!
@@ -57,7 +59,7 @@ use std::collections::HashMap;
 /// is bounded by instruction count and an 8-round ceiling is plenty in
 /// practice while still surfacing pathological non-convergence as an
 /// internal-error rather than a hang.
-pub fn run_peephole(mf: &mut MachineFunction) {
+pub fn run_peephole(mf: &mut MachineFunction, contract_fma: bool) {
     const MAX_ROUNDS: u32 = 8;
     for _ in 0..MAX_ROUNDS {
         let before = total_inst_count(mf);
@@ -66,7 +68,9 @@ pub fn run_peephole(mf: &mut MachineFunction) {
         // into a Madd. A single load-with-shift beats a fused madd
         // followed by a plain ldr.
         scaled_addressing_fusion(mf);
-        fma_fusion(mf);
+        if contract_fma {
+            fma_fusion(mf);
+        }
         madd_fusion(mf);
         ldp_stp_fusion(mf);
         if total_inst_count(mf) == before {

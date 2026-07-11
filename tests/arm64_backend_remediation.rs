@@ -44,6 +44,59 @@ fn compile_arm64_ir(source: &str, opt: &str) -> String {
 }
 
 #[test]
+fn floating_point_contraction_is_ofast_only() {
+    let source = r#"
+real(8) function muladd(a,b,c) result(r) bind(c, name="muladd")
+  use iso_c_binding
+  real(c_double), value :: a,b,c
+  r = a*b+c
+end function
+"#;
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os"] {
+        let asm = compile_arm64_asm(source, opt);
+        assert!(
+            asm.contains("\n    fmul ") && asm.contains("\n    fadd "),
+            "{opt} must preserve separate floating-point rounding:\n{asm}"
+        );
+        assert!(
+            !asm.contains("\n    fmadd "),
+            "{opt} must not contract floating-point operations:\n{asm}"
+        );
+    }
+
+    let fast_asm = compile_arm64_asm(source, "-Ofast");
+    assert!(
+        fast_asm.contains("\n    fmadd "),
+        "Ofast should contract multiply-add on ARM64:\n{fast_asm}"
+    );
+}
+
+#[test]
+fn vector_contraction_is_ofast_only_on_arm64() {
+    let source = include_str!("../test_programs/do_loop_vectorize_fma.f90");
+    let o3_asm = compile_arm64_asm(source, "-O3");
+    assert!(
+        o3_asm.contains("fmul.4s")
+            && o3_asm.contains("fadd.4s")
+            && o3_asm.contains("fmul.2d")
+            && o3_asm.contains("fadd.2d"),
+        "O3 should vectorize with separate multiply-add operations:\n{o3_asm}"
+    );
+    assert!(
+        !o3_asm.contains("fmla."),
+        "O3 must not contract vector operations:\n{o3_asm}"
+    );
+
+    let fast_asm = compile_arm64_asm(source, "-Ofast");
+    assert_eq!(
+        fast_asm.matches("fmla.").count(),
+        3,
+        "Ofast should contract all three vector loops:\n{fast_asm}"
+    );
+}
+
+#[test]
 fn post_call_i128_result_load_blocks_tail_call() {
     let asm = compile_arm64_asm(
         r#"
