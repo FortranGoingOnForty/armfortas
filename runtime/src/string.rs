@@ -208,10 +208,10 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
 
 /// Deallocate a deferred-length character for an explicit DEALLOCATE statement.
 ///
-/// Unlike `afs_dealloc_string`, this entry point reports an unallocated entity
-/// through STAT and terminates execution when STAT is absent. The unchecked
-/// entry point remains available for implicit cleanup, where an unallocated
-/// descriptor is intentionally a no-op.
+/// Unlike `afs_dealloc_string`, this entry point reports an entity that is
+/// neither allocated nor associated through STAT and terminates execution when
+/// STAT is absent. The unchecked entry point remains available for implicit
+/// cleanup, where an unallocated descriptor is intentionally a no-op.
 #[no_mangle]
 pub extern "C" fn afs_dealloc_string_checked(desc: *mut StringDescriptor, stat: *mut i32) {
     if desc.is_null() {
@@ -225,14 +225,16 @@ pub extern "C" fn afs_dealloc_string_checked(desc: *mut StringDescriptor, stat: 
         std::process::exit(1);
     }
 
-    if !unsafe { &*desc }.is_allocated() {
+    let desc_ref = unsafe { &*desc };
+    let associated_pointer = desc_ref.flags & STR_POINTER != 0 && !desc_ref.data.is_null();
+    if !desc_ref.is_allocated() && !associated_pointer {
         if !stat.is_null() {
             unsafe {
                 *stat = 2;
             }
             return;
         }
-        eprintln!("DEALLOCATE: deferred-length character is not allocated");
+        eprintln!("DEALLOCATE: deferred-length character is not allocated or associated");
         std::process::exit(1);
     }
 
@@ -834,6 +836,36 @@ mod tests {
         afs_dealloc_string(&mut d); // would segfault/corrupt if it free()d buf
         assert!(d.data.is_null());
         assert_eq!(d.len, 0);
+    }
+
+    #[test]
+    fn checked_dealloc_string_disassociates_aliased_pointer() {
+        let buf = b"data\0";
+        let mut d = StringDescriptor::zeroed();
+        let mut stat = -1;
+        afs_c_f_strpointer(buf.as_ptr(), buf.len() as i64, &mut d);
+
+        afs_dealloc_string_checked(&mut d, &mut stat);
+
+        assert_eq!(stat, 0);
+        assert!(d.data.is_null());
+        assert_eq!(d.len, 0);
+        assert_eq!(d.capacity, 0);
+        assert_eq!(d.flags, STR_DEFERRED);
+        assert_eq!(buf, b"data\0");
+    }
+
+    #[test]
+    fn checked_dealloc_string_rejects_unassociated_pointer() {
+        let mut d = StringDescriptor::zeroed();
+        d.flags = STR_DEFERRED | STR_POINTER;
+        let mut stat = -1;
+
+        afs_dealloc_string_checked(&mut d, &mut stat);
+
+        assert_ne!(stat, 0);
+        assert!(d.data.is_null());
+        assert_eq!(d.flags, STR_DEFERRED | STR_POINTER);
     }
 
     // ---- SPLIT ----
