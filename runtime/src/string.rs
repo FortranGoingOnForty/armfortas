@@ -140,6 +140,44 @@ pub extern "C" fn afs_dealloc_string(desc: *mut StringDescriptor) {
     desc.flags &= STR_DEFERRED; // keep deferred, clear everything else
 }
 
+/// Deallocate a deferred-length character for an explicit DEALLOCATE statement.
+///
+/// Unlike `afs_dealloc_string`, this entry point reports an unallocated entity
+/// through STAT and terminates execution when STAT is absent. The unchecked
+/// entry point remains available for implicit cleanup, where an unallocated
+/// descriptor is intentionally a no-op.
+#[no_mangle]
+pub extern "C" fn afs_dealloc_string_checked(desc: *mut StringDescriptor, stat: *mut i32) {
+    if desc.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+            return;
+        }
+        eprintln!("DEALLOCATE: null deferred-character descriptor");
+        std::process::exit(1);
+    }
+
+    if !unsafe { &*desc }.is_allocated() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 2;
+            }
+            return;
+        }
+        eprintln!("DEALLOCATE: deferred-length character is not allocated");
+        std::process::exit(1);
+    }
+
+    afs_dealloc_string(desc);
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
+}
+
 /// Associate a deferred-length character pointer with a C string (F2023
 /// C_F_STRPOINTER, 18.2.3.5). `data` points at the C bytes; `max_len` is
 /// the scan bound — NCHARS if given, else the size of the source array.

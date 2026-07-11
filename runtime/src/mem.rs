@@ -38,6 +38,44 @@ pub extern "C" fn afs_deallocate(ptr: *mut u8) {
     unsafe { free(ptr) };
 }
 
+/// Deallocate the target of an explicit scalar pointer DEALLOCATE statement.
+///
+/// The slot is cleared on success. An unassociated pointer is reported through
+/// STAT when present and terminates execution otherwise.
+#[no_mangle]
+pub extern "C" fn afs_deallocate_pointer(slot: *mut *mut u8, stat: *mut i32) {
+    if slot.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+            return;
+        }
+        eprintln!("DEALLOCATE: null pointer slot");
+        std::process::exit(1);
+    }
+
+    let target = unsafe { *slot };
+    if target.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 2;
+            }
+            return;
+        }
+        eprintln!("DEALLOCATE: pointer is not associated");
+        std::process::exit(1);
+    }
+
+    unsafe {
+        free(target);
+        *slot = ptr::null_mut();
+        if !stat.is_null() {
+            *stat = 0;
+        }
+    }
+}
+
 /// Concatenate two strings. Returns a newly allocated string.
 /// Caller is responsible for freeing the result.
 #[no_mangle]

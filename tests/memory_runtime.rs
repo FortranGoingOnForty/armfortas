@@ -324,6 +324,162 @@ fn deallocate_unallocated_without_stat_terminates() {
 }
 
 #[test]
+fn deallocate_stat_errmsg_handles_deferred_character_paths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_stat_errmsg_handles_deferred_character_paths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("dealloc_deferred_char_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: text\n  end type box_t\n  type(box_t) :: box\n  integer :: ios\n  character(len=:), allocatable :: text\n  character(len=64) :: msg\n  allocate(character(len=3) :: text)\n  ios = 99\n  msg = 'unchanged'\n  deallocate(text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (allocated(text)) error stop 2\n  if (trim(msg) /= 'unchanged') error stop 3\n  ios = 0\n  deallocate(text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 4\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 5\n  allocate(character(len=4) :: box%text)\n  ios = 99\n  msg = 'unchanged'\n  deallocate(box%text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 6\n  if (allocated(box%text)) error stop 7\n  if (trim(msg) /= 'unchanged') error stop 8\n  ios = 0\n  deallocate(box%text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 9\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 10\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("dealloc_deferred_char_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("deferred character deallocation runtime failed");
+    assert!(
+        run.status.success(),
+        "deferred character status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deallocate_stat_errmsg_handles_pointer_paths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_stat_errmsg_handles_pointer_paths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("dealloc_pointer_status");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: value\n  end type box_t\n  type(box_t) :: box\n  integer, pointer :: scalar\n  integer, pointer :: vector(:)\n  integer :: ios\n  character(len=64) :: msg\n  allocate(scalar)\n  ios = 99\n  msg = 'unchanged'\n  deallocate(scalar, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (associated(scalar)) error stop 2\n  if (trim(msg) /= 'unchanged') error stop 3\n  ios = 0\n  deallocate(scalar, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 4\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 5\n  allocate(box%value)\n  ios = 99\n  msg = 'unchanged'\n  deallocate(box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 6\n  if (associated(box%value)) error stop 7\n  if (trim(msg) /= 'unchanged') error stop 8\n  ios = 0\n  deallocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 9\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 10\n  allocate(vector(2))\n  ios = 99\n  msg = 'unchanged'\n  deallocate(vector, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 11\n  if (associated(vector)) error stop 12\n  if (trim(msg) /= 'unchanged') error stop 13\n  ios = 0\n  deallocate(vector, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 14\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 15\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("dealloc_pointer_status.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("pointer deallocation runtime failed");
+    assert!(
+        run.status.success(),
+        "pointer status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deallocate_unallocated_deferred_character_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unallocated_deferred_character_without_stat_terminates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("dealloc_deferred_char_loud");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  character(len=:), allocatable :: text\n  allocate(character(len=3) :: text)\n  deallocate(text)\n  deallocate(text)\n  print *, 'survived'\nend program\n",
+    );
+    let exe = dir.join("dealloc_deferred_char_loud.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("deferred character failure runtime failed");
+    assert!(
+        !run.status.success(),
+        "unallocated deferred character DEALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
+        "deferred character failure did not report its operation:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deallocate_unassociated_pointer_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unassociated_pointer_without_stat_terminates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("dealloc_pointer_loud");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, pointer :: value\n  allocate(value)\n  deallocate(value)\n  deallocate(value)\n  print *, 'survived'\nend program\n",
+    );
+    let exe = dir.join("dealloc_pointer_loud.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("pointer failure runtime failed");
+    assert!(
+        !run.status.success(),
+        "unassociated pointer DEALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
+        "pointer failure did not report its operation:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_source_array_infers_shape_and_copies_values() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

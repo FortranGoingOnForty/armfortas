@@ -7290,9 +7290,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     {
                         if is_deferred_char_component_field(&field) {
                             b.call(
-                                FuncRef::External("afs_dealloc_string".into()),
-                                vec![field_ptr],
+                                FuncRef::External("afs_dealloc_string_checked".into()),
+                                vec![field_ptr, runtime_stat_arg],
                                 IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "DEALLOCATE failed",
                             );
                             continue;
                         }
@@ -7359,22 +7365,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             continue;
                         }
                         if field.pointer {
-                            let ptr = b.load_typed(
-                                field_ptr,
-                                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                            b.call(
+                                FuncRef::External("afs_deallocate_pointer".into()),
+                                vec![field_ptr, runtime_stat_arg],
+                                IrType::Void,
                             );
-                            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
-                            // F2018 §9.7.3.2: deallocating a pointer
-                            // disassociates it.  Null the slot so a
-                            // subsequent `associated()` returns false
-                            // and `=> null()`-style sentinels work.
-                            // Without this, free_map_entry_pool's
-                            // `if (.not. associated(pool)) return`
-                            // never fires for re-deallocated pools
-                            // and recurses until stack overflow.
-                            let null_v = b.const_i64(0);
-                            let null_p = b.int_to_ptr(null_v, IrType::Int(IntWidth::I8));
-                            b.store(null_p, field_ptr);
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "DEALLOCATE failed",
+                            );
                             continue;
                         }
                     }
@@ -7385,9 +7386,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         if matches!(info.char_kind, CharKind::Deferred) {
                             let desc = string_descriptor_addr(b, info);
                             b.call(
-                                FuncRef::External("afs_dealloc_string".into()),
-                                vec![desc],
+                                FuncRef::External("afs_dealloc_string_checked".into()),
+                                vec![desc, runtime_stat_arg],
                                 IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "DEALLOCATE failed",
                             );
                         } else if info.allocatable || info.descriptor_arg {
                             let desc = array_descriptor_addr(b, info);
@@ -7439,13 +7446,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 info.addr
                             };
-                            let ptr = b
-                                .load_typed(slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                            b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
-                            // Null the pointer slot per F2018 §9.7.3.2.
-                            let null_v = b.const_i64(0);
-                            let null_p = b.int_to_ptr(null_v, IrType::Int(IntWidth::I8));
-                            b.store(null_p, slot);
+                            b.call(
+                                FuncRef::External("afs_deallocate_pointer".into()),
+                                vec![slot, runtime_stat_arg],
+                                IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "DEALLOCATE failed",
+                            );
                         } else {
                             let ptr = b.load_typed(
                                 info.addr,
