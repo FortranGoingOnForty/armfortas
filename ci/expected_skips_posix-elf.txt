@@ -10,6 +10,7 @@
 # (glibc and musl included).
 abi_differential
 artifact_audit_29_10
+c_interop_differential
 cli_driver
 driver_link_compat
 elf_static_link
