@@ -6,7 +6,7 @@
 //! ```text
 //!   ; arg setup (MOV xi, …)
 //!   Bl _callee
-//!   ; callee-save restores (LdpOffset / LdrImm / LdrFpImm) — zero or more
+//!   ; callee-save restores recorded by callee-save insertion — zero or more
 //!   LdpPost x29, x30, [sp], #16          ; epilogue frame restore
 //!   Ret
 //! ```
@@ -30,10 +30,9 @@
 //!   holds our *caller's* return address.  When _callee executes its own
 //!   RET, it returns to *our* caller directly — exactly what TCO requires.
 //! * We only recognize this pattern when there are **no instructions between
-//!   Bl and the callee-restore cluster**.  In particular, non-void calls
-//!   whose return-value register survives coalesce_moves are handled because
-//!   `coalesce_moves` already eliminated any `MOV x0, x0` self-moves, leaving
-//!   the Bl immediately adjacent to the callee restores / LdpPost.
+//!   Bl and the exact callee-restore cluster recorded on the machine
+//!   function**. Generic loads are not assumed to be restores because result
+//!   marshalling and spill reloads use the same opcodes.
 //! * Gate: we don't fire on non-void calls where a non-trivial result-capture
 //!   sequence remains (e.g., `MOV x1, x0`) — those are left alone.
 
@@ -45,6 +44,7 @@ use std::collections::{HashMap, HashSet};
 /// Safe to call at any optimization level; the transformation never changes
 /// visible behavior and is always a code-size win (removes one instruction).
 pub fn tail_call_opt(mf: &mut MachineFunction) {
+    let callee_save_slots = mf.callee_save_slots.clone();
     for block in &mut mf.blocks {
         let n = block.insts.len();
         if n < 2 {
@@ -61,26 +61,20 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
 
         let ldp_idx = n - 2;
 
-        // Walk backwards from just before LdpPost, skipping callee-save
-        // restore instructions (LdpOffset, LdrImm, LdrFpImm).  Stop when
-        // we find something that isn't a callee restore.
+        // Walk backwards from just before LdpPost, skipping only the exact
+        // restores emitted for this function's callee-save slots.
         let mut bl_candidate = ldp_idx;
         while bl_candidate > 0 {
             bl_candidate -= 1;
-            match block.insts[bl_candidate].opcode {
-                ArmOpcode::LdpOffset | ArmOpcode::LdrImm | ArmOpcode::LdrFpImm => {
-                    // Callee-save restore — keep scanning backwards.
-                }
-                ArmOpcode::Bl => {
-                    // Found the BL — stop here.
-                    break;
-                }
-                _ => {
-                    // Non-callee-restore, non-BL — pattern doesn't match.
-                    bl_candidate = usize::MAX; // sentinel
-                    break;
-                }
+            let inst = &block.insts[bl_candidate];
+            if is_callee_save_restore(inst, &callee_save_slots) {
+                continue;
             }
+            if inst.opcode == ArmOpcode::Bl {
+                break;
+            }
+            bl_candidate = usize::MAX;
+            break;
         }
 
         // Sentinel or scanned to index 0 without finding Bl.
@@ -123,6 +117,40 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
             operands: vec![MachineOperand::Extern(label)],
             def: None,
         });
+    }
+}
+
+fn is_callee_save_restore(inst: &MachineInst, slots: &[(PhysReg, i32)]) -> bool {
+    let phys = |index| match inst.operands.get(index) {
+        Some(MachineOperand::PhysReg(reg)) => Some(*reg),
+        _ => None,
+    };
+    let imm = |index| match inst.operands.get(index) {
+        Some(MachineOperand::Imm(value)) => i32::try_from(*value).ok(),
+        _ => None,
+    };
+    let has_slot = |reg, offset| slots.contains(&(reg, offset));
+
+    match inst.opcode {
+        ArmOpcode::LdrImm | ArmOpcode::LdrFpImm => {
+            phys(1) == Some(PhysReg::FP)
+                && phys(0)
+                    .zip(imm(2))
+                    .is_some_and(|(reg, offset)| has_slot(reg, offset))
+        }
+        ArmOpcode::LdpOffset => {
+            phys(2) == Some(PhysReg::FP)
+                && phys(0)
+                    .zip(phys(1))
+                    .zip(imm(3))
+                    .is_some_and(|((low, high), offset)| {
+                        has_slot(low, offset)
+                            && offset
+                                .checked_add(8)
+                                .is_some_and(|high_offset| has_slot(high, high_offset))
+                    })
+        }
+        _ => false,
     }
 }
 
@@ -391,6 +419,19 @@ mod tests {
         }
     }
 
+    fn ldp_i128_result() -> MachineInst {
+        MachineInst {
+            opcode: ArmOpcode::LdpOffset,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(-16),
+            ],
+            def: None,
+        }
+    }
+
     fn build_mf(blocks: Vec<Vec<MachineInst>>) -> MachineFunction {
         let mut mf = MachineFunction::new("test".into());
         // MachineFunction starts with one empty block; overwrite it.
@@ -424,12 +465,30 @@ mod tests {
             ldp_post(),
             ret(),
         ]]);
+        mf.callee_save_slots.push((PhysReg::Gp(19), -8));
         tail_call_opt(&mut mf);
         let insts = &mf.blocks[0].insts;
         assert_eq!(insts.len(), 3);
         assert_eq!(insts[0].opcode, ArmOpcode::LdrImm);
         assert_eq!(insts[1].opcode, ArmOpcode::LdpPost);
         assert_eq!(insts[2].opcode, ArmOpcode::B);
+    }
+
+    #[test]
+    fn no_tco_when_i128_result_is_loaded_after_call() {
+        let mut mf = build_mf(vec![vec![
+            bl("_side"),
+            ldp_i128_result(),
+            ldp_post(),
+            ret(),
+        ]]);
+
+        tail_call_opt(&mut mf);
+
+        let insts = &mf.blocks[0].insts;
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Bl));
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Ret));
+        assert!(!insts.iter().any(|inst| inst.opcode == ArmOpcode::B));
     }
 
     #[test]

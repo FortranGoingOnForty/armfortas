@@ -959,6 +959,7 @@ fn emit_spill_access(insts: &mut Vec<MachineInst>, op: ArmOpcode, rt: PhysReg, o
 /// Insert callee-saved register saves in prologue and restores in epilogue.
 /// Must be called after apply_allocation so we know which callee-saved regs were used.
 pub fn insert_callee_saves(mf: &mut MachineFunction, callee_saved: &[PhysReg]) {
+    mf.callee_save_slots.clear();
     if callee_saved.is_empty() {
         return;
     }
@@ -969,6 +970,7 @@ pub fn insert_callee_saves(mf: &mut MachineFunction, callee_saved: &[PhysReg]) {
         let offset = mf.frame.alloc_local(8);
         save_slots.push((reg, offset));
     }
+    mf.callee_save_slots.clone_from(&save_slots);
 
     // Insert saves at the start of the entry block (after prologue setup).
     // Find the insertion point: after the STP + ADD (prologue) instructions.
