@@ -480,6 +480,84 @@ fn deallocate_unassociated_pointer_without_stat_terminates() {
 }
 
 #[test]
+fn allocate_allocated_deferred_character_reports_status() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_allocated_deferred_character_reports_status count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_deferred_char_repeat");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    character(len=:), allocatable :: text\n  end type box_t\n  type(box_t) :: box\n  character(len=:), allocatable :: text\n  character(len=:), pointer :: ptr\n  character(len=64) :: msg\n  integer :: ios\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=3) :: text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  text = 'old'\n  ios = 0\n  allocate(character(len=5) :: text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (len(text) /= 3 .or. text /= 'old') error stop 4\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 5\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=4) :: box%text, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 6\n  box%text = 'keep'\n  ios = 0\n  allocate(character(len=6) :: box%text, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 7\n  if (len(box%text) /= 4 .or. box%text /= 'keep') error stop 8\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 9\n  ios = 99\n  msg = 'unchanged'\n  allocate(character(len=3) :: ptr, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 10\n  ptr = 'ptr'\n  ios = 0\n  allocate(character(len=5) :: ptr, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 11\n  if (.not. associated(ptr)) error stop 12\n  if (len(ptr) /= 3 .or. ptr /= 'ptr') error stop 13\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 14\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("alloc_deferred_char_repeat.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("deferred character allocation runtime failed");
+    assert!(
+        run.status.success(),
+        "deferred character repeat allocation handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allocate_allocated_deferred_character_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=allocate_allocated_deferred_character_without_stat_terminates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("alloc_deferred_char_repeat_loud");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  character(len=:), allocatable :: text\n  allocate(character(len=3) :: text)\n  allocate(character(len=5) :: text)\n  print *, 'survived'\nend program\n",
+    );
+    let exe = dir.join("alloc_deferred_char_repeat_loud.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("deferred character repeat allocation runtime failed");
+    assert!(
+        !run.status.success(),
+        "repeated deferred character ALLOCATE returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("ALLOCATE"),
+        "deferred character allocation failure did not report its operation:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn allocate_source_array_infers_shape_and_copies_values() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

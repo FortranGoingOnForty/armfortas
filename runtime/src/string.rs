@@ -48,7 +48,73 @@ pub extern "C" fn afs_assign_char_fixed(
     }
 }
 
-// ---- Deferred-length character assignment (THE CRITICAL PATH) ----
+// ---- Deferred-length character allocation and assignment ----
+
+/// Allocate storage for an explicit deferred-length character ALLOCATE.
+///
+/// The descriptor is left unchanged on failure. An existing allocation or
+/// pointer association is reported through STAT when present and terminates
+/// execution otherwise.
+#[no_mangle]
+pub extern "C" fn afs_allocate_string(
+    desc: *mut StringDescriptor,
+    requested_len: i64,
+    stat: *mut i32,
+) {
+    if desc.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 1;
+            }
+            return;
+        }
+        eprintln!("ALLOCATE: null deferred-character descriptor");
+        std::process::exit(1);
+    }
+
+    let desc = unsafe { &mut *desc };
+    if desc.is_allocated() || desc.flags & STR_POINTER != 0 || !desc.data.is_null() {
+        if !stat.is_null() {
+            unsafe {
+                *stat = 2;
+            }
+            return;
+        }
+        eprintln!("ALLOCATE: deferred-length character is already allocated or associated");
+        std::process::exit(1);
+    }
+
+    let len = requested_len.max(0);
+    let data = if len == 0 {
+        ptr::null_mut()
+    } else {
+        let data = unsafe { malloc(len as usize) };
+        if data.is_null() {
+            if !stat.is_null() {
+                unsafe {
+                    *stat = 3;
+                }
+                return;
+            }
+            eprintln!("ALLOCATE: out of memory ({} bytes)", len);
+            std::process::exit(1);
+        }
+        unsafe {
+            ptr::write_bytes(data, b' ', len as usize);
+        }
+        data
+    };
+
+    desc.data = data;
+    desc.len = len;
+    desc.capacity = len;
+    desc.flags = STR_ALLOCATED | STR_DEFERRED;
+    if !stat.is_null() {
+        unsafe {
+            *stat = 0;
+        }
+    }
+}
 
 /// Assign to a deferred-length character variable.
 /// **Key safety property**: allocates new memory BEFORE freeing old.

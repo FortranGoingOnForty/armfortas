@@ -6314,13 +6314,33 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 let _ = std::io::stderr().flush();
                                 std::process::exit(1);
                             };
-                            init_allocated_string_descriptor(b, field_ptr, len_val);
+                            b.call(
+                                FuncRef::External("afs_allocate_string".into()),
+                                vec![field_ptr, len_val, runtime_stat_arg],
+                                IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
+                            );
                             if let Some((src_ptr, src_len)) = source_char {
+                                let alloc_stat =
+                                    b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+                                let zero_i32 = b.const_i32(0);
+                                let alloc_ok = b.icmp(CmpOp::Eq, alloc_stat, zero_i32);
+                                let copy_bb = b.create_block("allocate_char_source_copy");
+                                let done_bb = b.create_block("allocate_char_source_done");
+                                b.cond_branch(alloc_ok, copy_bb, vec![], done_bb, vec![]);
+                                b.set_block(copy_bb);
                                 b.call(
                                     FuncRef::External("afs_assign_char_deferred".into()),
                                     vec![field_ptr, src_ptr, src_len],
                                     IrType::Void,
                                 );
+                                b.branch(done_bb, vec![]);
+                                b.set_block(done_bb);
                             }
                             continue;
                         }
@@ -6815,13 +6835,33 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 std::process::exit(1);
                             };
                             let desc = string_descriptor_addr(b, &info);
-                            init_allocated_string_descriptor(b, desc, len_val);
+                            b.call(
+                                FuncRef::External("afs_allocate_string".into()),
+                                vec![desc, len_val, runtime_stat_arg],
+                                IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
+                            );
                             if let Some((src_ptr, src_len)) = source_char {
+                                let alloc_stat =
+                                    b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+                                let zero_i32 = b.const_i32(0);
+                                let alloc_ok = b.icmp(CmpOp::Eq, alloc_stat, zero_i32);
+                                let copy_bb = b.create_block("allocate_char_source_copy");
+                                let done_bb = b.create_block("allocate_char_source_done");
+                                b.cond_branch(alloc_ok, copy_bb, vec![], done_bb, vec![]);
+                                b.set_block(copy_bb);
                                 b.call(
                                     FuncRef::External("afs_assign_char_deferred".into()),
                                     vec![desc, src_ptr, src_len],
                                     IrType::Void,
                                 );
+                                b.branch(done_bb, vec![]);
+                                b.set_block(done_bb);
                             }
                             continue;
                         }
