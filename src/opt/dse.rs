@@ -26,100 +26,108 @@
 //! initialization sequences where a variable is zeroed and then
 //! immediately written with the real value.
 
-use super::alias::{self, AliasResult};
+use super::alias::{self, AliasResult, ProvenLocation};
 use super::pass::Pass;
 use crate::ir::inst::*;
-use std::collections::HashSet;
+use crate::ir::types::IrType;
+use std::collections::{HashMap, HashSet};
 
-/// Eliminate dead stores within a single basic block.
-/// Returns true if any instructions were removed.
-fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::TargetLayout) -> bool {
-    #[derive(Clone, Copy)]
-    struct PendingStore {
-        ptr: ValueId,
-        inst_idx: usize,
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingStoreKey {
+    location: ProvenLocation,
+    value_type: Option<IrType>,
+}
 
-    let mut pending: Vec<PendingStore> = Vec::new();
+#[derive(Clone, Copy)]
+struct PendingStore {
+    ptr: ValueId,
+    inst_idx: usize,
+}
+
+/// Find dead stores within one block. Store-to-store replacement uses an exact
+/// location index; memory-observing barriers retain the conservative alias scan.
+fn find_dead_stores(
+    block: &BasicBlock,
+    alias_oracle: &mut alias::AliasOracle<'_>,
+) -> HashSet<usize> {
+    let mut pending: HashMap<PendingStoreKey, PendingStore> = HashMap::new();
     let mut dead: HashSet<usize> = HashSet::new();
 
-    {
-        let block = &func.blocks[block_idx];
-        let mut alias_oracle = alias::AliasOracle::new(func, layout);
-
-        for (i, inst) in block.insts.iter().enumerate() {
-            match &inst.kind {
-                InstKind::Store(_, ptr) => {
-                    let mut next_pending = Vec::with_capacity(pending.len() + 1);
-                    for entry in pending {
-                        match alias_oracle.query(entry.ptr, *ptr) {
-                            AliasResult::MustAlias => {
-                                dead.insert(entry.inst_idx);
-                            }
-                            AliasResult::MayAlias | AliasResult::NoAlias => {
-                                next_pending.push(entry);
-                            }
-                        }
-                    }
-                    next_pending.push(PendingStore {
+    for (i, inst) in block.insts.iter().enumerate() {
+        match &inst.kind {
+            InstKind::Store(value, ptr) => {
+                let key = PendingStoreKey {
+                    location: alias_oracle.proven_location(*ptr),
+                    value_type: alias_oracle.value_type(*value).cloned(),
+                };
+                if let Some(overwritten) = pending.insert(
+                    key,
+                    PendingStore {
                         ptr: *ptr,
                         inst_idx: i,
-                    });
-                    pending = next_pending;
+                    },
+                ) {
+                    dead.insert(overwritten.inst_idx);
                 }
-
-                InstKind::Load(ptr) => {
-                    pending.retain(|entry| {
-                        matches!(alias_oracle.query(entry.ptr, *ptr), AliasResult::NoAlias)
-                    });
-                }
-
-                InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
-                    // Calls can observe module/global state without receiving
-                    // its address as an argument, so those stores are never
-                    // dead across a call boundary.
-                    pending.retain(|entry| !alias_oracle.requires_global_call_barrier(entry.ptr));
-                    // Call boundaries use the coarser predicate — same fix
-                    // as LocalLsf / GlobalLsf.  A callee that receives a
-                    // pointer into an allocation can walk to any offset
-                    // within it, so `gep %a,[0]` passed as an arg must
-                    // invalidate a pending store to `gep %a,[1]` even
-                    // though their precise offsets differ.  Currently the
-                    // Fortran programs we compile don't expose a
-                    // triggering DSE pattern, but the code is structurally
-                    // identical to the other LSF passes so we fix it
-                    // defensively.
-                    let pointer_args: Vec<ValueId> = args
-                        .iter()
-                        .copied()
-                        .filter(|arg| alias_oracle.value_is_pointer(*arg))
-                        .collect();
-                    if !pointer_args.is_empty() {
-                        pending.retain(|entry| {
-                            pointer_args.iter().all(|arg| {
-                                !alias_oracle.may_reach_through_call_arg(entry.ptr, *arg)
-                            })
-                        });
-                    }
-                }
-
-                // Memset/memcpy wrappers (external calls) are handled above via Call.
-                // All other instructions are pure reads of their operands — they
-                // cannot modify memory so they don't affect pending stores.
-                _ => {}
             }
-        }
-        // Note: remaining entries in `pending` at block exit are stores to locals
-        // whose value has never been read in this block. We conservatively keep
-        // them — they might be read in a successor block.  A full dataflow DSE
-        // (liveness across blocks) could remove them, but is deferred.
-    }
 
+            InstKind::Load(ptr) => {
+                pending.retain(|_, entry| {
+                    matches!(alias_oracle.query(entry.ptr, *ptr), AliasResult::NoAlias)
+                });
+            }
+
+            // The alias oracle compares point addresses, while vector memory
+            // operations cover a 16-byte range. Until range aliasing exists,
+            // no pending scalar store is proven disjoint from that access.
+            InstKind::VLoad(_) | InstKind::VStore(..) => pending.clear(),
+
+            InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+                // Calls can observe module/global state without receiving
+                // its address as an argument, so those stores are never
+                // dead across a call boundary.
+                pending.retain(|_, entry| !alias_oracle.requires_global_call_barrier(entry.ptr));
+                // Call boundaries use the coarser predicate — same fix
+                // as LocalLsf / GlobalLsf.  A callee that receives a
+                // pointer into an allocation can walk to any offset
+                // within it, so `gep %a,[0]` passed as an arg must
+                // invalidate a pending store to `gep %a,[1]` even
+                // though their precise offsets differ.  Currently the
+                // Fortran programs we compile don't expose a
+                // triggering DSE pattern, but the code is structurally
+                // identical to the other LSF passes so we fix it
+                // defensively.
+                let pointer_args: Vec<ValueId> = args
+                    .iter()
+                    .copied()
+                    .filter(|arg| alias_oracle.value_is_pointer(*arg))
+                    .collect();
+                if !pointer_args.is_empty() {
+                    pending.retain(|_, entry| {
+                        pointer_args
+                            .iter()
+                            .all(|arg| !alias_oracle.may_reach_through_call_arg(entry.ptr, *arg))
+                    });
+                }
+            }
+
+            // Memset/memcpy wrappers (external calls) are handled above via Call.
+            // All other instructions are pure reads of their operands — they
+            // cannot modify memory so they don't affect pending stores.
+            _ => {}
+        }
+    }
+    // Remaining entries at block exit might be read in a successor block, so
+    // they stay live. Cross-block DSE requires a separate dataflow analysis.
+
+    dead
+}
+
+fn remove_dead_stores(block: &mut BasicBlock, dead: &HashSet<usize>) -> bool {
     if dead.is_empty() {
         return false;
     }
 
-    let block = &mut func.blocks[block_idx];
     let mut idx = 0usize;
     block.insts.retain(|_| {
         let keep = !dead.contains(&idx);
@@ -130,9 +138,19 @@ fn dse_block(func: &mut Function, block_idx: usize, layout: crate::target::Targe
 }
 
 fn dse_function(func: &mut Function, layout: crate::target::TargetLayout) -> bool {
+    let dead_by_block = {
+        let func_ref: &Function = func;
+        let mut alias_oracle = alias::AliasOracle::new(func_ref, layout);
+        func_ref
+            .blocks
+            .iter()
+            .map(|block| find_dead_stores(block, &mut alias_oracle))
+            .collect::<Vec<_>>()
+    };
+
     let mut changed = false;
-    for block_idx in 0..func.blocks.len() {
-        if dse_block(func, block_idx, layout) {
+    for (block, dead) in func.blocks.iter_mut().zip(&dead_by_block) {
+        if remove_dead_stores(block, dead) {
             changed = true;
         }
     }
@@ -343,5 +361,170 @@ mod tests {
         // Two dead stores removed, one survives.
         assert_eq!(stores.len(), 1);
         assert!(matches!(stores[0].kind, InstKind::Store(v, _) if v == v3));
+    }
+
+    #[test]
+    fn vector_load_observes_pending_scalar_store() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let array = IrType::Array(Box::new(i32_ty()), 4);
+        let base = push(
+            &mut f,
+            InstKind::Alloca(array.clone()),
+            IrType::Ptr(Box::new(array)),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let one = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let vector_ptr = push(&mut f, InstKind::GetElementPtr(base, vec![zero]), ptr_ty());
+        let scalar_ptr = push(&mut f, InstKind::GetElementPtr(base, vec![one]), ptr_ty());
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, scalar_ptr), IrType::Void);
+        push(
+            &mut f,
+            InstKind::VLoad(vector_ptr),
+            IrType::Vector {
+                lanes: 4,
+                elem: Box::new(i32_ty()),
+            },
+        );
+        push(&mut f, InstKind::Store(v2, scalar_ptr), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dse.run(&mut m));
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn vector_store_is_a_conservative_pending_store_barrier() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        let vector = push(
+            &mut f,
+            InstKind::VBroadcast(v1),
+            IrType::Vector {
+                lanes: 4,
+                elem: Box::new(i32_ty()),
+            },
+        );
+        push(&mut f, InstKind::Store(v1, ptr), IrType::Void);
+        push(&mut f, InstKind::VStore(vector, ptr), IrType::Void);
+        push(&mut f, InstKind::Store(v2, ptr), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dse.run(&mut m));
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn mixed_width_overwrite_does_not_kill_wider_store() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let byte_array = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 16);
+        let base = push(
+            &mut f,
+            InstKind::Alloca(byte_array.clone()),
+            IrType::Ptr(Box::new(byte_array)),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let ptr_i64 = push(
+            &mut f,
+            InstKind::GetElementPtr(base, vec![zero]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I64))),
+        );
+        let ptr_i32 = push(
+            &mut f,
+            InstKind::GetElementPtr(base, vec![zero]),
+            IrType::Ptr(Box::new(i32_ty())),
+        );
+        let wide = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let narrow = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(wide, ptr_i64), IrType::Void);
+        push(&mut f, InstKind::Store(narrow, ptr_i32), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dse.run(&mut m));
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn independent_stores_do_not_issue_pairwise_alias_queries() {
+        const COUNT: u64 = 2048;
+
+        let mut f = Function::new("store_scaling".into(), vec![], IrType::Void);
+        let array = IrType::Array(Box::new(i32_ty()), COUNT);
+        let base = push(
+            &mut f,
+            InstKind::Alloca(array.clone()),
+            IrType::Ptr(Box::new(array)),
+        );
+        let value = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        for index in 0..COUNT {
+            let offset = push(
+                &mut f,
+                InstKind::ConstInt(index as i128, IntWidth::I64),
+                IrType::Int(IntWidth::I64),
+            );
+            let ptr = push(
+                &mut f,
+                InstKind::GetElementPtr(base, vec![offset]),
+                ptr_ty(),
+            );
+            push(&mut f, InstKind::Store(value, ptr), IrType::Void);
+        }
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+
+        let mut oracle = alias::AliasOracle::new(&f, crate::target::TargetLayout::LP64);
+        let dead = find_dead_stores(&f.blocks[0], &mut oracle);
+        assert!(dead.is_empty());
+        assert_eq!(
+            oracle.query_count(),
+            0,
+            "independent stores must use the location index, not pairwise alias queries"
+        );
     }
 }

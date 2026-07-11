@@ -13,7 +13,6 @@
 //! Used by GVN (to determine if a store kills a prior load's value)
 //! cross-block load-store forwarding, and LICM load hoisting.
 
-use super::loop_utils::resolve_const_int;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::target::TargetLayout;
@@ -28,6 +27,20 @@ pub enum AliasResult {
     MayAlias,
     /// The pointers definitely refer to different locations.
     NoAlias,
+}
+
+/// Hashable identity for a pointer location that is proven exact.
+///
+/// Equal keys imply `MustAlias`; unequal keys make no aliasing claim. Unknown
+/// provenance is keyed by the original SSA value, preserving same-value
+/// overwrites without conflating distinct dynamic pointers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProvenLocation(ProvenLocationKind);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProvenLocationKind {
+    Exact(PtrBase, i64),
+    Opaque(ValueId),
 }
 
 /// True if `entry_ptr` may be reachable through `call_arg` when
@@ -60,12 +73,15 @@ pub struct AliasOracle<'a> {
     func: &'a Function,
     layout: TargetLayout,
     insts: HashMap<ValueId, &'a Inst>,
+    value_types: HashMap<ValueId, &'a IrType>,
     params: HashMap<ValueId, bool>,
     base_cache: HashMap<ValueId, PtrBase>,
     offset_cache: HashMap<ValueId, Option<i64>>,
     aggregate_cache: HashMap<ValueId, bool>,
     wrapper_cache: HashMap<ValueId, Option<ValueId>>,
     slot_param_cache: HashMap<ValueId, Option<ValueId>>,
+    #[cfg(test)]
+    query_count: usize,
 }
 
 impl<'a> AliasOracle<'a> {
@@ -81,16 +97,34 @@ impl<'a> AliasOracle<'a> {
             .iter()
             .map(|param| (param.id, param.fortran_noalias))
             .collect();
+        let value_types = func
+            .params
+            .iter()
+            .map(|param| (param.id, &param.ty))
+            .chain(
+                func.blocks
+                    .iter()
+                    .flat_map(|block| block.params.iter().map(|param| (param.id, &param.ty))),
+            )
+            .chain(
+                func.blocks
+                    .iter()
+                    .flat_map(|block| block.insts.iter().map(|inst| (inst.id, &inst.ty))),
+            )
+            .collect();
         Self {
             func,
             layout,
             insts,
+            value_types,
             params,
             base_cache: HashMap::new(),
             offset_cache: HashMap::new(),
             aggregate_cache: HashMap::new(),
             wrapper_cache: HashMap::new(),
             slot_param_cache: HashMap::new(),
+            #[cfg(test)]
+            query_count: 0,
         }
     }
 
@@ -99,6 +133,11 @@ impl<'a> AliasOracle<'a> {
     /// Both `a` and `b` should be pointer-typed values (results of Alloca,
     /// GlobalAddr, GetElementPtr, or function parameters).
     pub fn query(&mut self, a: ValueId, b: ValueId) -> AliasResult {
+        #[cfg(test)]
+        {
+            self.query_count += 1;
+        }
+
         // Same value → must alias.
         if a == b {
             return AliasResult::MustAlias;
@@ -133,7 +172,7 @@ impl<'a> AliasOracle<'a> {
         }
 
         // Same base, different constant offsets → no alias.
-        if base_a.base_id() == base_b.base_id() {
+        if base_a == base_b {
             let off_a = self.trace_offset(a);
             let off_b = self.trace_offset(b);
             if let (Some(oa), Some(ob)) = (off_a, off_b) {
@@ -149,6 +188,22 @@ impl<'a> AliasOracle<'a> {
         }
 
         AliasResult::MayAlias
+    }
+
+    /// Return a key suitable for indexing exact-location optimizations.
+    pub(crate) fn proven_location(&mut self, ptr: ValueId) -> ProvenLocation {
+        let base = self.trace_base(ptr);
+        match (&base, self.trace_offset(ptr)) {
+            (PtrBase::Alloca(_) | PtrBase::Global(_) | PtrBase::Param(_), Some(offset)) => {
+                ProvenLocation(ProvenLocationKind::Exact(base, offset))
+            }
+            _ => ProvenLocation(ProvenLocationKind::Opaque(ptr)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_count(&self) -> usize {
+        self.query_count
     }
 
     /// True if `entry_ptr` may be reachable through `call_arg` when
@@ -175,7 +230,11 @@ impl<'a> AliasOracle<'a> {
     }
 
     pub fn value_is_pointer(&self, value: ValueId) -> bool {
-        matches!(self.func.value_type(value), Some(IrType::Ptr(_)))
+        matches!(self.value_type(value), Some(IrType::Ptr(_)))
+    }
+
+    pub(crate) fn value_type(&self, value: ValueId) -> Option<&'a IrType> {
+        self.value_types.get(&value).copied()
     }
 
     /// Arbitrary calls can read or write globals without receiving their
@@ -191,7 +250,7 @@ impl<'a> AliasOracle<'a> {
         }
 
         let points_to_aggregate = matches!(
-            self.func.value_type(ptr),
+            self.value_type(ptr),
             Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Array(..) | IrType::Struct(_))
         );
         self.aggregate_cache.insert(ptr, points_to_aggregate);
@@ -258,13 +317,20 @@ impl<'a> AliasOracle<'a> {
                 if indices.len() != 1 {
                     return None;
                 }
-                let idx = resolve_const_int(self.func, indices[0])?;
+                let idx = self.resolve_const_int(indices[0])?;
                 let step = match &ty {
-                    IrType::Ptr(inner) => inner.size_bytes(&self.layout) as i64,
+                    IrType::Ptr(inner) => i64::try_from(inner.size_bytes(&self.layout)).ok()?,
                     _ => return None,
                 };
-                Some(base_offset + idx * step)
+                base_offset.checked_add(idx.checked_mul(step)?)
             }
+            _ => None,
+        }
+    }
+
+    fn resolve_const_int(&self, value: ValueId) -> Option<i64> {
+        match self.find_inst(value)?.kind {
+            InstKind::ConstInt(constant, _) => i64::try_from(constant).ok(),
             _ => None,
         }
     }
@@ -345,21 +411,12 @@ pub fn query(func: &Function, a: ValueId, b: ValueId, layout: TargetLayout) -> A
 }
 
 /// Traced pointer base — the root allocation or global.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PtrBase {
     Alloca(ValueId),
     Global(String),
     Param(ValueId),
     Unknown,
-}
-
-impl PtrBase {
-    fn base_id(&self) -> Option<ValueId> {
-        match self {
-            PtrBase::Alloca(id) | PtrBase::Param(id) => Some(*id),
-            _ => None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
