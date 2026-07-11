@@ -1491,7 +1491,7 @@ pub extern "C" fn afs_prepare_array_copy(
 
 /// Deallocate an array, freeing its memory and clearing the descriptor.
 ///
-/// Safe to call on an already-deallocated descriptor (no-op with stat=0).
+/// Reports an error when the descriptor is not allocated.
 #[no_mangle]
 pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i32) {
     if desc.is_null() {
@@ -1506,10 +1506,9 @@ pub extern "C" fn afs_deallocate_array(desc: *mut ArrayDescriptor, stat: *mut i3
     let desc = unsafe { &mut *desc };
 
     if !desc.is_allocated() {
-        // Not allocated — not an error with STAT, abort without STAT.
         if !stat.is_null() {
             unsafe {
-                *stat = 0;
+                *stat = 2;
             }
             return;
         }
@@ -2473,6 +2472,16 @@ mod tests {
         afs_allocate_array(&mut desc, 4, 1, &dim, &mut stat);
         assert_eq!(stat, 2); // already allocated
         afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
+    fn deallocate_unallocated_sets_stat() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+        afs_deallocate_array(&mut desc, &mut stat);
+        assert_ne!(stat, 0);
+        assert!(!desc.is_allocated());
+        assert!(desc.base_addr.is_null());
     }
 
     #[test]

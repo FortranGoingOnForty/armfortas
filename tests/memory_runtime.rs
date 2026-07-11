@@ -198,10 +198,10 @@ fn allocate_errmsg_requires_scalar_character_target() {
 }
 
 #[test]
-fn deallocate_stat_errmsg_leaves_message_unchanged_on_success() {
+fn deallocate_stat_errmsg_reports_unallocated_array() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_stat_errmsg_leaves_message_unchanged_on_success count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_stat_errmsg_reports_unallocated_array count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -210,7 +210,7 @@ fn deallocate_stat_errmsg_leaves_message_unchanged_on_success() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  integer :: ios\n  integer, allocatable :: a(:)\n  character(len=64) :: msg\n  allocate(a(2))\n  msg = 'unchanged'\n  deallocate(a, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  deallocate(a, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 3\n  if (trim(msg) /= 'unchanged') error stop 4\n  print *, ios\n  print *, trim(msg)\nend program\n",
+        "program p\n  implicit none\n  integer :: ios\n  integer, allocatable :: a(:)\n  character(len=64) :: msg\n  allocate(a(2))\n  msg = 'unchanged'\n  deallocate(a, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  deallocate(a, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (index(trim(msg), 'DEALLOCATE failed') == 0) error stop 4\n  print *, ios\n  print *, trim(msg)\nend program\n",
     );
     let exe = dir.join("dealloc_fixed_errmsg.bin");
     let compile = compile_program(&src, &exe);
@@ -232,14 +232,50 @@ fn deallocate_stat_errmsg_leaves_message_unchanged_on_success() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("0"),
-        "expected zero STAT in fixed deallocate errmsg output: {}",
+        stdout.contains("DEALLOCATE failed"),
+        "expected unallocated deallocate failure in output: {}",
         stdout
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deallocate_unallocated_without_stat_terminates() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=deallocate_unallocated_without_stat_terminates count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("dealloc_unallocated_loud");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: a(:)\n  allocate(a(2))\n  deallocate(a)\n  deallocate(a)\n  print *, 'survived'\nend program\n",
+    );
+    let exe = dir.join("dealloc_unallocated_loud.bin");
+    let compile = compile_program(&src, &exe);
     assert!(
-        stdout.contains("unchanged"),
-        "expected unchanged errmsg text in output: {}",
-        stdout
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("unallocated deallocation runtime failed");
+    assert!(
+        !run.status.success(),
+        "unallocated DEALLOCATE without STAT= returned success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("DEALLOCATE"),
+        "unallocated deallocation did not report its operation:\n{}",
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&dir);

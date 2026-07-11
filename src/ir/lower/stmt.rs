@@ -7258,6 +7258,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         Stmt::Deallocate { items, opts } => {
             let dealloc_stat_target = super::core::allocate_status_target(b, ctx, opts);
             let stat_addr = dealloc_stat_target.runtime_addr;
+            let runtime_stat_arg = if allocate_keyword_expr(opts, "stat").is_some() {
+                stat_addr
+            } else {
+                b.const_i64(0)
+            };
             let errmsg_target = allocate_errmsg_target(b, ctx, opts);
             for item in items {
                 if let Expr::ComponentAccess { .. } = &item.node {
@@ -7329,7 +7334,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             b.call(
                                 FuncRef::External("afs_deallocate_array".into()),
-                                vec![field_ptr, stat_addr],
+                                vec![field_ptr, runtime_stat_arg],
                                 IrType::Void,
                             );
                             emit_runtime_errmsg_on_failure(
@@ -7405,7 +7410,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 }
                                 b.call(
                                     FuncRef::External("afs_deallocate_array".into()),
-                                    vec![desc, stat_addr],
+                                    vec![desc, runtime_stat_arg],
                                     IrType::Void,
                                 );
                             }
