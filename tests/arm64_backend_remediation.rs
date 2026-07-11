@@ -214,3 +214,32 @@ end program comparisons
         "unsupported ARM64 comparisons reached vector instruction selection:\n{ir}"
     );
 }
+
+#[test]
+fn large_frame_i128_store_preserves_low_limb() {
+    let asm = compile_arm64_asm(
+        r#"
+function large() result(r) bind(c, name="large")
+  use iso_c_binding
+  integer(c_int64_t) :: pad(600)
+  integer(16) :: r
+  pad(1) = 7
+  r = 123456789012345678901_16
+end function large
+"#,
+        "-O0",
+    );
+
+    let value_start = asm
+        .find("movz x16, #27701")
+        .unwrap_or_else(|| panic!("i128 low limb was not materialized:\n{asm}"));
+    let store = asm[value_start..]
+        .find("str x16,")
+        .map(|offset| value_start + offset)
+        .unwrap_or_else(|| panic!("i128 low limb was not stored:\n{asm}"));
+    assert_eq!(
+        asm[value_start..store].matches("movz x16,").count(),
+        1,
+        "frame offset overwrote the materialized i128 low limb:\n{asm}"
+    );
+}
