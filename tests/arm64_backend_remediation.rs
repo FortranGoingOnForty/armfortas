@@ -98,3 +98,31 @@ end subroutine
         "frame teardown invalidates overflow arguments:\n{asm}"
     );
 }
+
+#[test]
+fn incoming_i128_pair_is_captured_before_overlapping_scalar_moves() {
+    let asm = compile_arm64_asm(
+        r#"
+function probe(a,b,c,d,w) result(r) bind(c,name="probe")
+  use iso_c_binding
+  integer(c_int), value :: a,b,c,d
+  integer(16), value :: w
+  integer(16) :: r
+  r = w
+end function
+"#,
+        "-O1",
+    );
+
+    let capture = asm
+        .find("stp x4, x5")
+        .unwrap_or_else(|| panic!("incoming i128 pair must be captured:\n{asm}"));
+    let before_capture = &asm[..capture];
+    assert!(
+        !before_capture
+            .lines()
+            .any(|line| line.trim_start().starts_with("mov w4,")
+                || line.trim_start().starts_with("mov w5,")),
+        "scalar receipt clobbered x4:x5 before i128 capture:\n{asm}"
+    );
+}

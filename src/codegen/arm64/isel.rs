@@ -113,20 +113,29 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
     // Phase 3: emit prologue in entry block.
     emit_prologue(&mut mf, MBlockId(0));
 
-    // Phase 3.5: move incoming argument registers into param vregs.
-    // Dispatch by register class: GP args from x0-x7, FP args from d0-d7.
+    // Phase 3.5a: capture fixed incoming i128 pairs before allocator-selected
+    // scalar destinations can reuse either source register. The later scalar
+    // receipts are resolved as parallel copies, but these pair stores are not
+    // part of that graph and therefore must happen first.
+    for info in &param_info {
+        if let IncomingParam::Wide(offset, AbiArgLoc::GpPair(reg)) = info {
+            emit_store_phys_i128_pair(
+                &mut mf,
+                MBlockId(0),
+                MachineOperand::PhysReg(PhysReg::FP),
+                *offset as i64,
+                PhysReg::Gp(*reg),
+                PhysReg::Gp(*reg + 1),
+            );
+        }
+    }
+
+    // Phase 3.5b: move the remaining incoming arguments into their vregs or
+    // backing slots. Dispatch by register class: GP args from x0-x7, FP args
+    // from d0-d7.
     for info in &param_info {
         match info {
-            IncomingParam::Wide(offset, AbiArgLoc::GpPair(reg)) => {
-                emit_store_phys_i128_pair(
-                    &mut mf,
-                    MBlockId(0),
-                    MachineOperand::PhysReg(PhysReg::FP),
-                    *offset as i64,
-                    PhysReg::Gp(*reg),
-                    PhysReg::Gp(*reg + 1),
-                );
-            }
+            IncomingParam::Wide(_, AbiArgLoc::GpPair(_)) => {}
             IncomingParam::Wide(offset, AbiArgLoc::Stack(stack_offset)) => {
                 emit_load_phys_i128_pair(
                     &mut mf,
