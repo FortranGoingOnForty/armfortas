@@ -107,14 +107,25 @@ pub fn select_function(
             }
             X86AbiArgLoc::Xmm(r) => {
                 mf.add_entry_live_in(*r);
-                push(
-                    &mut mf,
-                    MBlockId(0),
-                    fp_move(ty),
-                    fp_size(ty),
-                    vec![X86Operand::Reg(*r)],
-                    Some(X86Operand::VReg(*vreg)),
-                );
+                if matches!(abi_ty_of(ty), AbiTy::ComplexF32) {
+                    push(
+                        &mut mf,
+                        MBlockId(0),
+                        X86Opcode::MovqXmmToGp,
+                        OpSize::Q,
+                        vec![X86Operand::Reg(*r)],
+                        Some(X86Operand::VReg(*vreg)),
+                    );
+                } else {
+                    push(
+                        &mut mf,
+                        MBlockId(0),
+                        fp_move(ty),
+                        fp_size(ty),
+                        vec![X86Operand::Reg(*r)],
+                        Some(X86Operand::VReg(*vreg)),
+                    );
+                }
             }
             X86AbiArgLoc::Stack { offset, .. } => {
                 // After the (future) `push rbp; mov rsp, rbp` prologue:
@@ -3635,6 +3646,43 @@ mod tests {
 
     fn all_insts(mf: &X86Function) -> Vec<&X86Inst> {
         mf.blocks.iter().flat_map(|b| b.insts.iter()).collect()
+    }
+
+    #[test]
+    fn packed_complex_f32_parameter_receives_raw_xmm_bits() {
+        let complex_f32 = IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2);
+        let mut func = Function::new(
+            "take_c4".into(),
+            vec![Param {
+                name: "z".into(),
+                ty: complex_f32,
+                id: ValueId(0),
+                fortran_noalias: false,
+            }],
+            IrType::Void,
+        );
+        {
+            let mut builder = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            builder.ret_void();
+        }
+
+        let mf = select_function(
+            &func,
+            &["take_c4".to_string()],
+            crate::target::TargetLayout::LP64,
+        );
+        assert_eq!(mf.entry_live_ins, vec![X86Reg::Xmm0]);
+
+        let receipt = all_insts(&mf)
+            .into_iter()
+            .find(|inst| inst.opcode == X86Opcode::MovqXmmToGp)
+            .expect("packed complex-float parameter receipt emitted");
+        assert_eq!(receipt.size, OpSize::Q);
+        assert_eq!(receipt.operands, vec![X86Operand::Reg(X86Reg::Xmm0)]);
+        let Some(X86Operand::VReg(dest)) = receipt.def else {
+            panic!("packed complex-float receipt must define a vreg");
+        };
+        assert_eq!(dest.class, X86RegClass::Gp64);
     }
 
     #[test]

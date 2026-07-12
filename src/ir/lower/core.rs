@@ -18897,6 +18897,10 @@ pub(super) fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueI
         IrType::Bool => b.const_bool(false),
         IrType::Ptr(_) => b.const_i64(0),
         IrType::FuncPtr(_) => b.const_i64(0),
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(_)) => {
+            let zero = b.const_i32(0);
+            coerce_to_type(b, zero, ty)
+        }
         IrType::Array(_, _) | IrType::Struct(_) => b.const_i64(0),
         IrType::Void => b.const_i32(0),
         IrType::Vector { .. } => b.const_i64(0),
