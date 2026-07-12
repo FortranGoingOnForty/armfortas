@@ -535,6 +535,10 @@ pub struct X86Function {
     /// Total prologue rsp subtraction (locals + outgoing, 16-aligned).
     /// Set by frame layout in regalloc (x05); 0 until then.
     pub frame_bytes: i64,
+    /// Physical ABI argument registers whose incoming values are live at
+    /// function entry. Linear scan keeps each unavailable until its first
+    /// explicit capture in the entry block.
+    pub entry_live_ins: Vec<X86Reg>,
     next_vreg: u32,
     next_block: u32,
 }
@@ -552,8 +556,15 @@ impl X86Function {
             frame_slots: Vec::new(),
             outgoing_arg_bytes: 0,
             frame_bytes: 0,
+            entry_live_ins: Vec::new(),
             next_vreg: 0,
             next_block: 1,
+        }
+    }
+
+    pub fn add_entry_live_in(&mut self, reg: X86Reg) {
+        if !self.entry_live_ins.contains(&reg) {
+            self.entry_live_ins.push(reg);
         }
     }
 

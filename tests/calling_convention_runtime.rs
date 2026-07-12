@@ -64,6 +64,23 @@ fn compile_fortran_object(source: &std::path::Path, output: &std::path::Path) {
     );
 }
 
+fn compile_fortran_object_at(source: &std::path::Path, output: &std::path::Path, opt_level: &str) {
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", opt_level])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .expect("failed to spawn armfortas object compile");
+    assert!(
+        result.status.success(),
+        "armfortas failed for {} at {}: {}",
+        source.display(),
+        opt_level,
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 fn compile_fortran_program(source: &std::path::Path, output: &std::path::Path) {
     let result = Command::new(compiler("armfortas"))
         .args([source.to_str().unwrap(), "-o", output.to_str().unwrap()])
@@ -91,6 +108,126 @@ fn link_program(objects: &[&std::path::Path], output: &std::path::Path) {
         "link failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+#[test]
+fn bind_c_dead_leading_register_arguments_survive_entry_copies() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_dead_leading_register_arguments_survive_entry_copies count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("entry_liveins");
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        r#"#include <complex.h>
+#include <stdint.h>
+
+int32_t pick_gp4(int32_t, int32_t, int32_t, int32_t);
+double pick_fp4(double, double, double, double);
+__int128 echo_gp_pair(int32_t, __int128);
+double consume_xmm_pair(double, double complex);
+int32_t pick_gp_after_pair_revert(int32_t, int32_t, int32_t, int32_t, int32_t,
+                                  __int128, int32_t);
+double pick_xmm_after_pair_revert(double, double, double, double, double, double,
+                                  double, double complex, double);
+
+int main(void) {
+    const __int128 wide = ((__int128)0x123456789abcdefULL << 64) |
+                          (__int128)0xfedcba9876543210ULL;
+    if (pick_gp4(11, 22, 33, 44) != 44) return 1;
+    if (pick_fp4(1.25, 2.5, 3.75, 4.5) != 4.5) return 2;
+    if (echo_gp_pair(9, wide) != wide) return 3;
+    if (consume_xmm_pair(9.0, 2.0 + 3.0 * I) != 302.0) return 4;
+    if (pick_gp_after_pair_revert(1, 2, 3, 4, 5, wide, 77) != 77) return 5;
+    if (pick_xmm_after_pair_revert(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                                   8.0 + 9.0 * I, 10.5) != 10.5) return 6;
+    return 0;
+}
+"#,
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "callees.f90",
+        r#"function pick_gp4(a, b, c, d) result(r) bind(c, name="pick_gp4")
+  use iso_c_binding
+  integer(c_int), value :: a, b, c, d
+  integer(c_int) :: r
+  r = d
+end function pick_gp4
+
+function pick_fp4(a, b, c, d) result(r) bind(c, name="pick_fp4")
+  use iso_c_binding
+  real(c_double), value :: a, b, c, d
+  real(c_double) :: r
+  r = d
+end function pick_fp4
+
+function echo_gp_pair(dead, wide) result(r) bind(c, name="echo_gp_pair")
+  use iso_c_binding
+  integer(c_int), value :: dead
+  integer(16), value :: wide
+  integer(16) :: r
+  r = wide
+end function echo_gp_pair
+
+function consume_xmm_pair(dead, z) result(r) bind(c, name="consume_xmm_pair")
+  use iso_c_binding
+  real(c_double), value :: dead
+  complex(c_double_complex), value :: z
+  real(c_double) :: r
+  r = real(z, c_double) + 100.0_c_double * aimag(z)
+end function consume_xmm_pair
+
+function pick_gp_after_pair_revert(a1, a2, a3, a4, a5, wide, tail) result(r) &
+    bind(c, name="pick_gp_after_pair_revert")
+  use iso_c_binding
+  integer(c_int), value :: a1, a2, a3, a4, a5, tail
+  integer(16), value :: wide
+  integer(c_int) :: r
+  r = tail
+end function pick_gp_after_pair_revert
+
+function pick_xmm_after_pair_revert(a1, a2, a3, a4, a5, a6, a7, z, tail) &
+    result(r) bind(c, name="pick_xmm_after_pair_revert")
+  use iso_c_binding
+  real(c_double), value :: a1, a2, a3, a4, a5, a6, a7, tail
+  complex(c_double_complex), value :: z
+  real(c_double) :: r
+  r = tail
+end function pick_xmm_after_pair_revert
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("callees_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("entry_liveins_{tag}.bin"));
+        link_program(&[&c_obj, &f_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} entry-livein probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "entry-livein ABI mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 }
 
 #[test]

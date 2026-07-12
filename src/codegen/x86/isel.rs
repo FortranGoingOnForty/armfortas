@@ -94,6 +94,7 @@ pub fn select_function(
     for (vreg, loc, ty) in &param_info {
         match loc {
             X86AbiArgLoc::Gp(r) => {
+                mf.add_entry_live_in(*r);
                 let size = gp_move_size(vreg.class);
                 push(
                     &mut mf,
@@ -105,6 +106,7 @@ pub fn select_function(
                 );
             }
             X86AbiArgLoc::Xmm(r) => {
+                mf.add_entry_live_in(*r);
                 push(
                     &mut mf,
                     MBlockId(0),
@@ -140,9 +142,13 @@ pub fn select_function(
     for (slots, loc) in &wide_param_info {
         match loc {
             X86AbiArgLoc::GpPair(lo, hi) => {
+                mf.add_entry_live_in(*lo);
+                mf.add_entry_live_in(*hi);
                 emit_store_pair_to_slot(&mut mf, MBlockId(0), *slots, *lo, *hi);
             }
             X86AbiArgLoc::XmmPair(a, b) => {
+                mf.add_entry_live_in(*a);
+                mf.add_entry_live_in(*b);
                 // complex(8) param: xmm pair into the wide slots.
                 for (slot, xmm) in [(slots.0, *a), (slots.1, *b)] {
                     push(
