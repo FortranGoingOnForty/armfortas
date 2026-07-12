@@ -8116,6 +8116,26 @@ fn resolve_visible_global_key(
     globals.contains_key(&source_key).then_some(source_key)
 }
 
+fn global_keys_resolve_to_same_symbol(
+    st: &SymbolTable,
+    left: &(String, String),
+    right: &(String, String),
+) -> bool {
+    let Some(left_scope) = st.find_module_scope(&left.0) else {
+        return false;
+    };
+    let Some(right_scope) = st.find_module_scope(&right.0) else {
+        return false;
+    };
+    let Some(left_symbol) = st.lookup_in(left_scope, &left.1) else {
+        return false;
+    };
+    let Some(right_symbol) = st.lookup_in(right_scope, &right.1) else {
+        return false;
+    };
+    std::ptr::eq(left_symbol, right_symbol)
+}
+
 /// Install module globals imported by this function's USE
 /// statements as `LocalInfo` entries. Honors:
 ///   * USE ONLY filtering — only names in the only-list are installed
@@ -8123,8 +8143,8 @@ fn resolve_visible_global_key(
 ///     `use m, x => y` (non-only rename)
 ///   * Cross-module collision detection — if two modules bring in
 ///     the same local key through their use list, the emitted IR
-///     would resolve ambiguously; we skip the second one and note
-///     the collision in an eprintln (sema doesn't yet diagnose).
+///     would resolve ambiguously; validation diagnoses referenced
+///     collisions before this recovery path runs.
 ///
 /// Audit C2/C3/C4: previously this function installed every
 /// global regardless of any USE statement, ignored ONLY filtering,
@@ -8164,7 +8184,7 @@ pub(super) fn install_globals_as_locals_in(
     host_module: Option<&str>,
     extra_host: Option<&str>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &AmbiguousUseWarnings,
+    _ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
     use crate::ast::decl::OnlyItem;
 
@@ -8372,7 +8392,7 @@ pub(super) fn install_globals_as_locals_in(
 
     pending.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut installed_from: HashMap<String, String> = HashMap::new();
+    let mut installed_from: HashMap<String, (String, String)> = HashMap::new();
     for (local_key, (mod_key, var_key)) in pending {
         if let Some(required) = required_names {
             if !required.contains(&local_key) {
@@ -8384,20 +8404,21 @@ pub(super) fn install_globals_as_locals_in(
         if let Some(info) = globals.get(&resolved_global_key) {
             // Collision check: two modules exporting the same local key.
             let resolved_mod = resolved_global_key.0.clone();
-            if let Some(prev_mod) = installed_from.get(&local_key) {
-                if *prev_mod != resolved_mod {
-                    let warning_key = (local_key.clone(), prev_mod.clone(), resolved_mod.clone());
-                    if ambiguous_use_warnings.borrow_mut().insert(warning_key) {
-                        eprintln!(
-                            "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
-                             keeping the first",
-                            local_key, prev_mod, resolved_mod,
-                        );
-                    }
+            if let Some(previous_key) = installed_from.get(&local_key) {
+                if previous_key == &resolved_global_key
+                    || global_keys_resolve_to_same_symbol(st, previous_key, &resolved_global_key)
+                {
+                    continue;
+                }
+                if previous_key.0 != resolved_mod {
+                    // Referenced ambiguities are rejected during validation.
+                    // Collisions that remain here are unreferenced or hidden
+                    // by a more local association, so lowering keeps its
+                    // deterministic first entry without a user diagnostic.
                     continue;
                 }
             }
-            installed_from.insert(local_key.clone(), resolved_mod);
+            installed_from.insert(local_key.clone(), resolved_global_key.clone());
             if !install_global_inline_const(b, locals, local_key.clone(), info) {
                 // Recover the declared rank from the module symbol — a
                 // deferred-shape allocatable/pointer array has no bounds in
@@ -8484,7 +8505,7 @@ pub(super) fn install_globals_as_locals_in(
                                     },
                                 );
                             }
-                            installed_from.insert(local_key, mod_key);
+                            installed_from.insert(local_key, resolved_global_key);
                         }
                     }
                 }

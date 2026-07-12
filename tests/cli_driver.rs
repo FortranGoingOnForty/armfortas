@@ -715,10 +715,10 @@ end program p
 }
 
 #[test]
-fn ambiguous_use_warning_is_deduped_across_contained_procedures() {
+fn ambiguous_use_reference_is_rejected_once_across_contained_procedures() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=ambiguous_use_warning_is_deduped_across_contained_procedures count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=ambiguous_use_reference_is_rejected_once_across_contained_procedures count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -758,20 +758,511 @@ end program
         .output()
         .expect("compile failed to spawn");
     assert!(
-        result.status.success(),
-        "compile failed: {}",
+        !result.status.success(),
+        "ambiguous reference should be rejected: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     let count = stderr
-        .matches(
-            "warning: ambiguous USE import 'x' from both 'mod_a' and 'mod_b'; keeping the first",
-        )
+        .matches("error: ambiguous USE-associated reference 'x' from modules 'mod_a' and 'mod_b'")
         .count();
     assert_eq!(
         count, 1,
-        "expected one deduped ambiguous-USE warning, got {}:\n{}",
+        "expected one deduped ambiguous-USE error, got {}:\n{}",
         count, stderr
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unreferenced_use_name_collision_is_accepted_without_diagnostic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: x = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: x = 2
+end module
+
+program demo
+  use mod_a
+  use mod_b
+  implicit none
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("unused_ambig_use", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "unreferenced collision should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("ambiguous USE"),
+        "unreferenced collision should not be diagnosed: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn same_use_entity_through_two_facades_is_not_ambiguous() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_use_entity_through_two_facades_is_not_ambiguous count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module source
+  implicit none
+  integer, parameter :: shared_value = 23
+end module
+
+module left_facade
+  use source
+  implicit none
+end module
+
+module right_facade
+  use source
+  implicit none
+end module
+
+program demo
+  use left_facade
+  use right_facade
+  implicit none
+  if (shared_value /= 23) error stop 1
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("same_use_entity", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "same underlying entity should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("ambiguous USE"),
+        "same underlying entity should not be diagnosed: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_ambiguous_use_reference_is_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_ambiguous_use_reference_is_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: x = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: x = 2
+end module
+
+program demo
+  implicit none
+  block
+    use mod_a
+    use mod_b
+    print *, x
+  end block
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("block_ambig_use", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "ambiguous block-local reference should be rejected: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "error: ambiguous USE-associated reference 'x' from modules 'mod_a' and 'mod_b'"
+        ),
+        "missing block-local ambiguity diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_only_ambiguity_is_rejected_once() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_only_ambiguity_is_rejected_once count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: x = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: x = 2
+end module
+
+program demo
+  implicit none
+  block
+    use mod_a, only: x
+    use mod_b, only: x
+    print *, x, x
+  end block
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("block_only_ambig_use", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "ambiguous block-local ONLY reference should be rejected: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let diagnostic =
+        "error: ambiguous USE-associated reference 'x' from modules 'mod_a' and 'mod_b'";
+    assert_eq!(
+        stderr.matches(diagnostic).count(),
+        1,
+        "expected one block-local ambiguity diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_use_shadows_ambiguous_host_association() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_use_shadows_ambiguous_host_association count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: x = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: x = 2
+end module
+
+module mod_c
+  implicit none
+  integer :: x = 3
+end module
+
+program demo
+  use mod_a
+  use mod_b
+  implicit none
+  block
+    use mod_c, only: x
+    print *, x
+  end block
+  block
+    use mod_c
+    print *, x
+  end block
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("block_use_shadows_host", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "block-local USE should shadow host ambiguity: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("ambiguous USE"),
+        "block-local shadowing should not be diagnosed: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn enclosing_lexical_bindings_shadow_ambiguous_host_association() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=enclosing_lexical_bindings_shadow_ambiguous_host_association count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer :: x = 1
+end module
+
+module mod_b
+  implicit none
+  integer :: x = 2
+end module
+
+program demo
+  use mod_a
+  use mod_b
+  implicit none
+  integer :: local_value
+
+  block
+    integer :: x
+    x = 3
+    block
+      print *, x
+    end block
+  end block
+
+  local_value = 4
+  associate (x => local_value)
+    block
+      print *, x
+    end block
+  end associate
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("lexical_binding_shadows_host", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "enclosing lexical bindings should shadow host ambiguity: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("ambiguous USE"),
+        "shadowed host collision should not be diagnosed: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn ambiguous_use_in_declaration_spec_is_rejected_once() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ambiguous_use_in_declaration_spec_is_rejected_once count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  integer, parameter :: k = 2
+end module
+
+module mod_b
+  implicit none
+  integer, parameter :: k = 3
+end module
+
+program demo
+  use mod_a
+  use mod_b
+  implicit none
+  integer(kind=k), dimension(k) :: values
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("decl_spec_ambig_use", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "ambiguous declaration specification should be rejected: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let diagnostic =
+        "error: ambiguous USE-associated reference 'k' from modules 'mod_a' and 'mod_b'";
+    assert_eq!(
+        stderr.matches(diagnostic).count(),
+        1,
+        "expected one declaration-specification ambiguity diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn ambiguous_use_in_derived_type_spec_is_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ambiguous_use_in_derived_type_spec_is_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module mod_a
+  implicit none
+  type :: box
+    integer :: value
+  end type
+end module
+
+module mod_b
+  implicit none
+  type :: box
+    real :: value
+  end type
+end module
+
+program demo
+  use mod_a
+  use mod_b
+  implicit none
+  type(box) :: value
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("derived_type_ambig_use", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "ambiguous derived type should be rejected: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "error: ambiguous USE-associated reference 'box' from modules 'mod_a' and 'mod_b'"
+        ),
+        "missing derived-type ambiguity diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn bare_use_rename_does_not_create_false_ambiguity() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bare_use_rename_does_not_create_false_ambiguity count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module renamed
+  implicit none
+  integer :: x = 1
+end module
+
+module direct
+  implicit none
+  integer :: x = 2
+end module
+
+program demo
+  use renamed, y => x
+  use direct
+  implicit none
+  print *, x, y
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rename_no_false_ambiguity", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "bare USE rename should leave one unambiguous remote binding: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("ambiguous USE"),
+        "bare USE rename should not create an ambiguity diagnostic: {stderr}"
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);

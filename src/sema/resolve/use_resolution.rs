@@ -113,7 +113,7 @@ pub(super) fn process_uses(
                             original_name: rename.remote.clone(),
                             source_scope: mod_scope,
                             is_submodule_access: false,
-                            from_bare_use: false,
+                            from_bare_use: true,
                         });
                     }
                 }
@@ -622,6 +622,7 @@ pub(super) fn load_external_module(
         // Also add a DerivedType symbol.
         let attrs = SymbolAttrs {
             access: Access::Public,
+            type_owner_module: layout.owner_module.as_deref().map(str::to_ascii_lowercase),
             ..Default::default()
         };
         let _ = st.define(Symbol {
