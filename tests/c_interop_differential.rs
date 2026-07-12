@@ -577,15 +577,13 @@ end program p
     assert_eq!(wb.link_and_run("arm64_complex_args_bin", &[&c, &f]), "ok");
 }
 
-/// BIND(C) character(len=*) passes ONLY the data pointer — the
-/// trailing hidden-length convention is armfortas-internal and does
-/// not exist at the C boundary (verified against the lowering: the
-/// call site loads two pointers and nothing else). Interop code
-/// passes lengths explicitly; with six leading ints those explicit
-/// lengths spill to the stack, which is the marshaling case this
-/// pins.
+/// BIND(C) assumed-size character arrays are raw C buffers. Interop
+/// code passes lengths explicitly; with six leading ints those
+/// explicit lengths spill to the stack, which is the marshaling case
+/// this pins. Scalar character(len=*) is intentionally excluded: that
+/// form requires a C descriptor.
 #[test]
-fn fortran_calls_c_char_pointers_with_explicit_lengths() {
+fn fortran_calls_c_assumed_size_char_buffers_with_explicit_lengths() {
     let wb = Workbench::new("charlen");
     let c = wb.c_obj(
         "helpers",
@@ -611,7 +609,7 @@ program charlen
     function count_chars(a, b, c, d, e, f, s1, s2, l1, l2) result(n) bind(c, name="count_chars")
       import :: c_int, c_int64_t, c_char
       integer(c_int), value :: a, b, c, d, e, f
-      character(kind=c_char, len=*), intent(in) :: s1, s2
+      character(kind=c_char), intent(in) :: s1(*), s2(*)
       integer(c_int64_t), value :: l1, l2
       integer(c_int64_t) :: n
     end function count_chars

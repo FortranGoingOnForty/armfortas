@@ -155,7 +155,8 @@ NEON/SSE vectorizers, inlining, multi-file `.amod` builds, and the
 full optimizer pipeline are all live and CI-gated.)
 
 - Coarray Fortran
-- C descriptor (`CFI_cdesc_t` / ISO_Fortran_binding.h) interop
+- C descriptor (`CFI_cdesc_t` / ISO_Fortran_binding.h) interop; declarations
+  that require descriptors, including `BIND(C) CHARACTER(len=*)`, are rejected
 - UCS-4 (`ISO_10646`) character data — `SELECTED_CHAR_KIND` answers 4,
   but kind-4 character storage and I/O are not implemented
 - Internal READ whose unit is a whole character array — rejected
