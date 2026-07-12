@@ -147,6 +147,9 @@ pub(super) struct Ctx<'a> {
     /// One ambiguity in a host scope can be referenced by several contained
     /// procedures. Report it once at the first source reference.
     reported_use_ambiguities: HashSet<(ScopeId, String)>,
+    /// A restricted IMPORT policy can make the same host entity appear in
+    /// several declaration expressions. Diagnose the first reference only.
+    reported_inaccessible_host_entities: HashSet<(ScopeId, String)>,
     /// BLOCK constructs do not have symbol-table scope IDs, so their
     /// ambiguity diagnostics are keyed by the construct's source position.
     reported_block_use_ambiguities: HashSet<(u32, u32, u32, String)>,
@@ -204,6 +207,7 @@ impl<'a> Ctx<'a> {
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
+            reported_inaccessible_host_entities: HashSet::new(),
             reported_block_use_ambiguities: HashSet::new(),
             ambiguity_lexical_frames: Vec::new(),
         }
@@ -2798,7 +2802,63 @@ fn procedure_reference_facts(unit: &ProgramUnit, unit_span: Span) -> ProcedureRe
     facts
 }
 
+fn procedure_specification_reference_facts(
+    unit: &ProgramUnit,
+    unit_span: Span,
+) -> ProcedureReferenceFacts {
+    let shadowed = HashSet::new();
+    let mut facts = ProcedureReferenceFacts::default();
+    let decls = match unit {
+        ProgramUnit::Program { decls, .. } | ProgramUnit::Subroutine { decls, .. } => {
+            decls.as_slice()
+        }
+        ProgramUnit::Function {
+            return_type, decls, ..
+        } => {
+            if let Some(return_type) = return_type {
+                collect_reference_type_spec(return_type, unit_span, &shadowed, &mut facts);
+            }
+            decls.as_slice()
+        }
+        ProgramUnit::Module { decls, .. }
+        | ProgramUnit::Submodule { decls, .. }
+        | ProgramUnit::BlockData { decls, .. } => decls.as_slice(),
+        ProgramUnit::InterfaceBlock { .. } => return facts,
+    };
+    for decl in decls {
+        collect_reference_decl(decl, &shadowed, &mut facts);
+    }
+    facts
+}
+
 fn validate_use_ambiguities(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
+    for reference in procedure_specification_reference_facts(&unit.node, unit.span).references {
+        if reference.role == ReferenceRole::Callable && is_intrinsic_name(&reference.name) {
+            continue;
+        }
+        if ctx
+            .st
+            .inaccessible_host_symbol(
+                ctx.scope_id,
+                &reference.name,
+                reference.role == ReferenceRole::Callable,
+            )
+            .is_none()
+        {
+            continue;
+        }
+        let report_key = (ctx.scope_id, reference.name.clone());
+        if ctx.reported_inaccessible_host_entities.insert(report_key) {
+            ctx.error(
+                reference.span,
+                format!(
+                    "host entity '{}' is not accessible under this IMPORT policy",
+                    reference.name
+                ),
+            );
+        }
+    }
+
     let facts = procedure_reference_facts(&unit.node, unit.span);
     for reference in facts.references {
         let allow_generic_merge = reference.role == ReferenceRole::Callable;

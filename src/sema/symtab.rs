@@ -9,7 +9,7 @@ use crate::ast::expr::SpannedExpr;
 use crate::lexer::Span;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Sprint 07: borrow when the input is already canonical lowercase,
 /// allocate only when at least one ASCII uppercase byte needs folding.
@@ -132,6 +132,7 @@ impl SymbolTable {
             implicit_rules: ImplicitRules::default_fortran(),
             has_explicit_implicit_stmt: false,
             use_associations: Vec::new(),
+            host_association: HostAssociationControl::all(),
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
@@ -274,6 +275,7 @@ impl SymbolTable {
             implicit_rules: parent_implicit, // inherit from parent, may be overridden
             has_explicit_implicit_stmt: false,
             use_associations: Vec::new(),
+            host_association: HostAssociationControl::all(),
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
@@ -314,10 +316,153 @@ impl SymbolTable {
         &mut self.scopes[id]
     }
 
+    pub(crate) fn set_host_association_control(
+        &mut self,
+        scope_id: ScopeId,
+        control: HostAssociationControl,
+    ) {
+        self.clear_lookup_caches();
+        self.scopes[scope_id].host_association = control;
+    }
+
+    fn import_host_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
+        let parent = self.scopes[scope_id].parent?;
+        if self.scopes[parent].kind == ScopeKind::Interface {
+            self.scopes[parent].parent
+        } else {
+            Some(parent)
+        }
+    }
+
+    fn host_symbol_precedes_cutoff(&self, scope_id: ScopeId, symbol: &Symbol) -> bool {
+        let control = &self.scopes[scope_id].host_association;
+        let Some(cutoff) = control.host_declaration_cutoff else {
+            return true;
+        };
+        let Some(host_scope) = self.import_host_scope(scope_id) else {
+            return true;
+        };
+        symbol.scope != host_scope
+            || symbol.defined_at.file_id != cutoff.file_id
+            || (symbol.defined_at.start.line, symbol.defined_at.start.col)
+                < (cutoff.start.line, cutoff.start.col)
+    }
+
+    fn host_association_allows_symbol(
+        &self,
+        scope_id: ScopeId,
+        key: &str,
+        symbol: &Symbol,
+    ) -> bool {
+        self.scopes[scope_id].host_association.allows(key)
+            && self.host_symbol_precedes_cutoff(scope_id, symbol)
+    }
+
+    fn host_association_allows_generic_facet(&self, scope_id: ScopeId, key: &str) -> bool {
+        if !self.scopes[scope_id].host_association.allows(key) {
+            return false;
+        }
+        let Some(host_scope) = self.import_host_scope(scope_id) else {
+            return true;
+        };
+        let generic_symbol = self.named_interface_facet_symbol_in_scope(host_scope, key);
+        generic_symbol.is_none_or(|symbol| {
+            self.host_symbol_precedes_cutoff(scope_id, symbol)
+                || self.scope_has_use_associated_generic_facet(host_scope, key)
+        })
+    }
+
+    fn scope_has_use_associated_generic_facet(&self, scope_id: ScopeId, key: &str) -> bool {
+        let scope = &self.scopes[scope_id];
+        let mut visited = vec![(scope_id, key.to_string(), LookupMode::Normal)];
+        for association in &scope.use_associations {
+            if association.local_name != key {
+                continue;
+            }
+            if association.from_bare_use
+                && association.local_name == association.original_name
+                && self.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+            {
+                continue;
+            }
+            let source_mode = if association.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
+            if self.scope_has_generic_facet_guarded(
+                association.source_scope,
+                &association.original_name,
+                source_mode,
+                &mut visited,
+            ) {
+                return true;
+            }
+        }
+
+        let mut seen_use_scopes = Vec::new();
+        for association in &scope.use_associations {
+            if !association.from_bare_use
+                || association.local_name != association.original_name
+                || seen_use_scopes.contains(&association.source_scope)
+                || self.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+            {
+                continue;
+            }
+            seen_use_scopes.push(association.source_scope);
+            if self.scope_has_generic_facet_guarded(
+                association.source_scope,
+                key,
+                LookupMode::Exported,
+                &mut visited,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn inaccessible_host_symbol(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+        allow_generic_facet: bool,
+    ) -> Option<&Symbol> {
+        let key = ensure_ascii_lowercase(name);
+        if self.lookup_in(scope_id, key.as_ref()).is_some() {
+            return None;
+        }
+        if allow_generic_facet
+            && self.scope_has_generic_facet(scope_id, key.as_ref(), LookupMode::Normal)
+        {
+            return None;
+        }
+        let host_scope = self.import_host_scope(scope_id)?;
+        let host_symbol = self.lookup_in(host_scope, key.as_ref())?;
+        (!self.host_association_allows_symbol(scope_id, key.as_ref(), host_symbol))
+            .then_some(host_symbol)
+    }
+
     /// Define a symbol in the current scope.
     pub fn define(&mut self, symbol: Symbol) -> Result<(), SemaError> {
         self.clear_lookup_caches();
         let key = symbol.name.to_lowercase();
+        let imported_host_symbol = self
+            .import_host_scope(self.current)
+            .and_then(|host_scope| self.lookup_in(host_scope, &key));
+        let conflicts_with_import = self.scopes[self.current].host_association.protects(&key)
+            && imported_host_symbol.is_some_and(|host_symbol| {
+                self.host_association_allows_symbol(self.current, &key, host_symbol)
+            });
+        if conflicts_with_import {
+            return Err(SemaError {
+                span: symbol.defined_at,
+                msg: format!(
+                    "local declaration '{}' conflicts with an explicitly imported host entity",
+                    symbol.name
+                ),
+            });
+        }
         let local_type_owner = if symbol.kind == SymbolKind::DerivedType {
             match &self.scopes[self.current].kind {
                 ScopeKind::Module(name) | ScopeKind::Submodule(name) => {
@@ -382,6 +527,20 @@ impl SymbolTable {
             .get(&side_key)
             .filter(|sym| is_named_interface_like_symbol(sym))
             .filter(|sym| sym.name.eq_ignore_ascii_case(key.as_ref()))
+    }
+
+    pub(crate) fn named_interface_facet_symbol_in_scope(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Option<&Symbol> {
+        let key = ensure_ascii_lowercase(name);
+        let side_key = same_name_generic_interface_key(key.as_ref());
+        self.scopes[scope_id]
+            .symbols
+            .get(&side_key)
+            .filter(|symbol| is_named_interface_like_symbol(symbol))
+            .or_else(|| self.named_interface_symbol_in_scope(scope_id, key.as_ref()))
     }
 
     pub fn may_have_named_interface_name(&self, name: &str) -> bool {
@@ -643,7 +802,7 @@ impl SymbolTable {
             return Some(ambiguity);
         }
 
-        if !has_use_candidate && mode == LookupMode::Normal {
+        if !has_use_candidate && mode == LookupMode::Normal && scope.host_association.allows(key) {
             if let Some(parent) = scope.parent {
                 if self.scopes[parent].kind != ScopeKind::Global {
                     return self.use_ambiguity_in_guarded(
@@ -854,7 +1013,10 @@ impl SymbolTable {
             }
         }
 
-        let result = if !saw_binding && mode == LookupMode::Normal {
+        let result = if !saw_binding
+            && mode == LookupMode::Normal
+            && self.host_association_allows_generic_facet(scope_id, key)
+        {
             scope
                 .parent
                 .filter(|parent| self.scopes[*parent].kind != ScopeKind::Global)
@@ -903,6 +1065,12 @@ impl SymbolTable {
             // original_name is followed, so unrelated names cannot leak.
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
+                    if assoc.from_bare_use
+                        && assoc.local_name == assoc.original_name
+                        && self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
+                    {
+                        continue;
+                    }
                     if assoc.is_submodule_access {
                         if let Some(sym) = self.scopes[assoc.source_scope]
                             .symbols
@@ -944,6 +1112,9 @@ impl SymbolTable {
                 if assoc.local_name != assoc.original_name {
                     continue;
                 }
+                if self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key) {
+                    continue;
+                }
                 if seen_use_scopes.contains(&assoc.source_scope) {
                     continue;
                 }
@@ -956,9 +1127,15 @@ impl SymbolTable {
             }
 
             // 3. Host association — look in parent scope.
-            if let Some(parent) = scope.parent {
-                if self.scopes[parent].kind != ScopeKind::Global {
-                    return self.lookup_in_guarded(parent, key, visited, cache);
+            if scope.host_association.allows(key) {
+                if let Some(parent) = scope.parent {
+                    if self.scopes[parent].kind != ScopeKind::Global {
+                        if let Some(symbol) = self.lookup_in_guarded(parent, key, visited, cache) {
+                            if self.host_association_allows_symbol(scope_id, key, symbol) {
+                                return Some(symbol);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1099,20 +1276,11 @@ impl SymbolTable {
         result
     }
 
-    /// Sprint 08: scope-correct lookup with all-scope fallback.
-    ///
     /// Tries `lookup_in(proc_scope_id, name)` first — that walks
     /// local → USE associations → transitive USE → host scope per
-    /// Fortran's normal name resolution order, returning the symbol
-    /// the source actually refers to. If `proc_scope_id` is `None`
-    /// (or the scoped lookup misses), falls back to
-    /// `find_symbol_any_scope`, which scans every scope without
-    /// regard to visibility.
-    ///
-    /// The fallback preserves prior behavior — this helper is a
-    /// stepping stone, not a behavior change. Call sites in
-    /// `src/ir/lower/**` should migrate to this helper as part of
-    /// killing `find_symbol_any_scope` (see `feedback_lookup_discipline.md`).
+    /// Fortran's normal name resolution order. Unrestricted scopes retain
+    /// the legacy all-scope fallback used by lowering. Restricted IMPORT
+    /// scopes must not bypass their host-association policy on a miss.
     pub fn lookup_local_then_any(
         &self,
         proc_scope_id: Option<ScopeId>,
@@ -1122,8 +1290,17 @@ impl SymbolTable {
             if let Some(sym) = self.lookup_in(scope_id, name) {
                 return Some(sym);
             }
+            if self.host_association_is_restricted(scope_id) {
+                return None;
+            }
         }
         self.find_symbol_any_scope(name)
+    }
+
+    pub(crate) fn host_association_is_restricted(&self, scope_id: ScopeId) -> bool {
+        let control = &self.scopes[scope_id].host_association;
+        control.host_declaration_cutoff.is_some()
+            || !matches!(control.policy, HostAssociationPolicy::All)
     }
 
     /// Search ALL scopes for a symbol by name.
@@ -1327,6 +1504,65 @@ impl SymbolTable {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostAssociationPolicy {
+    All,
+    None,
+    Only(HashSet<String>),
+}
+
+impl HostAssociationPolicy {
+    fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Only(names) => names.contains(name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostImportProtection {
+    None,
+    All,
+    Names(HashSet<String>),
+}
+
+impl HostImportProtection {
+    fn protects(&self, name: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Names(names) => names.contains(name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostAssociationControl {
+    pub policy: HostAssociationPolicy,
+    pub protection: HostImportProtection,
+    pub host_declaration_cutoff: Option<Span>,
+}
+
+impl HostAssociationControl {
+    pub(crate) fn all() -> Self {
+        Self {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::None,
+            host_declaration_cutoff: None,
+        }
+    }
+
+    fn allows(&self, name: &str) -> bool {
+        self.policy.allows(name)
+    }
+
+    fn protects(&self, name: &str) -> bool {
+        self.protection.protects(name)
+    }
+}
+
 /// A scope in the symbol table.
 #[derive(Debug)]
 pub struct Scope {
@@ -1337,6 +1573,7 @@ pub struct Scope {
     pub implicit_rules: ImplicitRules,
     pub has_explicit_implicit_stmt: bool,
     pub use_associations: Vec<UseAssociation>,
+    pub(crate) host_association: HostAssociationControl,
     pub default_access: Access,
     pub pending_access: HashMap<String, Access>,
     /// Ordered dummy argument names (for function/subroutine scopes).
@@ -1632,6 +1869,14 @@ mod tests {
         }
     }
 
+    fn span_at(line: u32) -> Span {
+        Span {
+            file_id: 0,
+            start: Position { line, col: 1 },
+            end: Position { line, col: 1 },
+        }
+    }
+
     // ---- Basic scope operations ----
 
     #[test]
@@ -1690,6 +1935,102 @@ mod tests {
         st.push_scope(ScopeKind::Subroutine("inner".into()));
         // Inner sees outer's x via host association.
         assert!(st.lookup("x").is_some());
+    }
+
+    #[test]
+    fn host_association_policy_filters_parent_and_invalidates_cache() {
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Subroutine("outer".into()));
+        st.define(make_symbol("x", SymbolKind::Variable)).unwrap();
+        st.define(make_symbol("y", SymbolKind::Variable)).unwrap();
+        let inner = st.push_scope(ScopeKind::Subroutine("inner".into()));
+
+        assert!(
+            st.lookup("x").is_some(),
+            "initial lookup populates the cache"
+        );
+        st.set_host_association_control(
+            inner,
+            HostAssociationControl {
+                policy: HostAssociationPolicy::None,
+                protection: HostImportProtection::None,
+                host_declaration_cutoff: None,
+            },
+        );
+        assert!(st.lookup("x").is_none());
+        assert!(st.lookup_local_then_any(Some(inner), "x").is_none());
+
+        st.set_host_association_control(
+            inner,
+            HostAssociationControl {
+                policy: HostAssociationPolicy::Only(HashSet::from(["x".into()])),
+                protection: HostImportProtection::None,
+                host_declaration_cutoff: None,
+            },
+        );
+        assert!(st.lookup("X").is_some());
+        assert!(st.lookup("y").is_none());
+    }
+
+    #[test]
+    fn host_declaration_cutoff_filters_direct_and_generic_facets_independently() {
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Subroutine("outer".into()));
+
+        let mut early_direct = make_symbol("early_direct", SymbolKind::Function);
+        early_direct.defined_at = span_at(1);
+        st.define(early_direct).unwrap();
+        let mut late_generic = make_symbol("early_direct", SymbolKind::NamedInterface);
+        late_generic.defined_at = span_at(10);
+        st.define_same_name_generic_interface(late_generic);
+
+        let mut early_generic = make_symbol("early_generic", SymbolKind::NamedInterface);
+        early_generic.defined_at = span_at(1);
+        st.define_same_name_generic_interface(early_generic);
+        let mut late_direct = make_symbol("early_generic", SymbolKind::Function);
+        late_direct.defined_at = span_at(10);
+        st.define(late_direct).unwrap();
+
+        let inner = st.push_scope(ScopeKind::Subroutine("inner".into()));
+        st.set_host_association_control(
+            inner,
+            HostAssociationControl {
+                policy: HostAssociationPolicy::All,
+                protection: HostImportProtection::None,
+                host_declaration_cutoff: Some(span_at(5)),
+            },
+        );
+
+        assert!(st.lookup_in(inner, "early_direct").is_some());
+        assert!(!st.scope_has_generic_facet(inner, "early_direct", LookupMode::Normal));
+        assert!(st.lookup_in(inner, "early_generic").is_none());
+        assert!(st.scope_has_generic_facet(inner, "early_generic", LookupMode::Normal));
+    }
+
+    #[test]
+    fn explicit_host_imports_prevent_local_shadowing() {
+        for protection in [
+            HostImportProtection::All,
+            HostImportProtection::Names(HashSet::from(["x".into()])),
+        ] {
+            let mut st = SymbolTable::new();
+            st.push_scope(ScopeKind::Subroutine("outer".into()));
+            st.define(make_symbol("x", SymbolKind::Variable)).unwrap();
+            let inner = st.push_scope(ScopeKind::Subroutine("inner".into()));
+            st.set_host_association_control(
+                inner,
+                HostAssociationControl {
+                    policy: HostAssociationPolicy::All,
+                    protection,
+                    host_declaration_cutoff: None,
+                },
+            );
+
+            let err = st
+                .define(make_symbol("x", SymbolKind::Variable))
+                .expect_err("an explicit host import must prevent local shadowing");
+            assert!(err.msg.contains("explicitly imported host entity"));
+        }
     }
 
     #[test]

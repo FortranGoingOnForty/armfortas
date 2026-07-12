@@ -187,6 +187,149 @@ type InterfaceOuterRef = (
     SymbolAttrs,
 );
 
+fn reject_imports_in_disallowed_scope(
+    imports: &[ImportStmt],
+    scope_name: &str,
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    if imports.is_empty() {
+        return Ok(());
+    }
+    Err(SemaError {
+        span,
+        msg: format!("IMPORT is not permitted in {scope_name}"),
+    })
+}
+
+fn process_imports(
+    st: &mut SymbolTable,
+    scope_id: ScopeId,
+    imports: &[ImportStmt],
+    default_policy: HostAssociationPolicy,
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    let has_only = imports
+        .iter()
+        .any(|import| matches!(import, ImportStmt::Only(_)));
+    if has_only
+        && imports
+            .iter()
+            .any(|import| !matches!(import, ImportStmt::Only(_)))
+    {
+        return Err(SemaError {
+            span,
+            msg: "IMPORT, ONLY cannot be combined with another IMPORT form".into(),
+        });
+    }
+    if imports.len() > 1
+        && imports
+            .iter()
+            .any(|import| matches!(import, ImportStmt::All | ImportStmt::None))
+    {
+        return Err(SemaError {
+            span,
+            msg: "IMPORT, ALL and IMPORT, NONE must be the only IMPORT statement in a scope".into(),
+        });
+    }
+
+    let parent = st
+        .scope(scope_id)
+        .parent
+        .expect("subprogram scope has a parent");
+    let is_interface_body = st.scope(parent).kind == ScopeKind::Interface;
+    let host_scope = if is_interface_body {
+        st.scope(parent).parent.expect("interface scope has a host")
+    } else {
+        parent
+    };
+    let mut imported_names = HashSet::new();
+    for name in imports.iter().flat_map(|import| match import {
+        ImportStmt::Default(names) | ImportStmt::Only(names) => names.as_slice(),
+        ImportStmt::All | ImportStmt::None => &[],
+    }) {
+        let key = name.to_ascii_lowercase();
+        let direct_symbol = st.lookup_in(host_scope, &key);
+        let generic_symbol = st.named_interface_facet_symbol_in_scope(host_scope, &key);
+        if direct_symbol.is_none() && generic_symbol.is_none() {
+            return Err(SemaError {
+                span,
+                msg: format!("IMPORT name '{}' does not identify a host entity", name),
+            });
+        }
+        let precedes_interface_body = |symbol: &crate::sema::symtab::Symbol| {
+            !is_interface_body
+                || symbol.scope != host_scope
+                || symbol.defined_at.file_id != span.file_id
+                || (symbol.defined_at.start.line, symbol.defined_at.start.col)
+                    < (span.start.line, span.start.col)
+        };
+        if !direct_symbol.is_some_and(precedes_interface_body)
+            && !generic_symbol.is_some_and(precedes_interface_body)
+        {
+            return Err(SemaError {
+                span,
+                msg: format!(
+                    "IMPORT name '{}' must be declared before the interface body",
+                    name
+                ),
+            });
+        }
+        imported_names.insert(key);
+    }
+
+    let control = match imports {
+        [] => HostAssociationControl {
+            policy: default_policy,
+            protection: HostImportProtection::None,
+            host_declaration_cutoff: is_interface_body.then_some(span),
+        },
+        [ImportStmt::All] => HostAssociationControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::All,
+            host_declaration_cutoff: is_interface_body.then_some(span),
+        },
+        [ImportStmt::None] => HostAssociationControl {
+            policy: HostAssociationPolicy::None,
+            protection: HostImportProtection::None,
+            host_declaration_cutoff: is_interface_body.then_some(span),
+        },
+        imports
+            if imports
+                .iter()
+                .any(|import| matches!(import, ImportStmt::Default(names) if names.is_empty())) =>
+        {
+            HostAssociationControl {
+                policy: HostAssociationPolicy::All,
+                protection: HostImportProtection::Names(imported_names),
+                host_declaration_cutoff: is_interface_body.then_some(span),
+            }
+        }
+        imports
+            if imports
+                .iter()
+                .all(|import| matches!(import, ImportStmt::Only(_))) =>
+        {
+            HostAssociationControl {
+                policy: HostAssociationPolicy::Only(imported_names.clone()),
+                protection: HostImportProtection::Names(imported_names),
+                host_declaration_cutoff: is_interface_body.then_some(span),
+            }
+        }
+        _ => HostAssociationControl {
+            policy: match default_policy {
+                HostAssociationPolicy::All => HostAssociationPolicy::All,
+                HostAssociationPolicy::None | HostAssociationPolicy::Only(_) => {
+                    HostAssociationPolicy::Only(imported_names.clone())
+                }
+            },
+            protection: HostImportProtection::Names(imported_names),
+            host_declaration_cutoff: is_interface_body.then_some(span),
+        },
+    };
+    st.set_host_association_control(scope_id, control);
+    Ok(())
+}
+
 pub(super) fn resolve_unit(
     st: &mut SymbolTable,
     unit: &SpannedUnit,
@@ -197,12 +340,13 @@ pub(super) fn resolve_unit(
         ProgramUnit::Program {
             name,
             uses,
-            imports: _,
+            imports,
             implicit,
             decls,
             body,
             contains,
         } => {
+            reject_imports_in_disallowed_scope(imports, "a main program", unit.span)?;
             let scope_name = name.clone().unwrap_or_else(|| "main".into());
             st.push_scope(ScopeKind::Program(scope_name));
             let scope_id = st.current_scope();
@@ -219,11 +363,12 @@ pub(super) fn resolve_unit(
         ProgramUnit::Module {
             name,
             uses,
-            imports: _,
+            imports,
             implicit,
             decls,
             contains,
         } => {
+            reject_imports_in_disallowed_scope(imports, "a module", unit.span)?;
             // Find the pre-created module scope and enter it.
             if let Some(mod_id) = st.find_module_scope(name) {
                 let saved = st.enter_scope(mod_id);
@@ -243,13 +388,25 @@ pub(super) fn resolve_unit(
             prefix,
             bind: _,
             uses,
-            imports: _,
+            imports,
             implicit,
             decls,
             body,
             contains,
         } => {
+            let host_scope = st.current_scope();
+            if st.scope(host_scope).kind == ScopeKind::Global {
+                reject_imports_in_disallowed_scope(imports, "an external subprogram", unit.span)?;
+            }
+            let default_host_policy = if st.scope(host_scope).kind == ScopeKind::Interface
+                && !prefix.iter().any(|item| matches!(item, Prefix::Module))
+            {
+                HostAssociationPolicy::None
+            } else {
+                HostAssociationPolicy::All
+            };
             let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
+            process_imports(st, scope_id, imports, default_host_policy, unit.span)?;
 
             // F2008 §12.6.2.5: separate module procedure body — args
             // are inherited from the parent module's interface block.
@@ -310,16 +467,27 @@ pub(super) fn resolve_unit(
             result,
             return_type,
             bind: _,
-            prefix: _,
+            prefix,
             uses,
-            imports: _,
+            imports,
             implicit,
             decls,
             body,
             contains,
         } => {
             let host_scope = st.current_scope();
+            if st.scope(host_scope).kind == ScopeKind::Global {
+                reject_imports_in_disallowed_scope(imports, "an external subprogram", unit.span)?;
+            }
+            let default_host_policy = if st.scope(host_scope).kind == ScopeKind::Interface
+                && !prefix.iter().any(|item| matches!(item, Prefix::Module))
+            {
+                HostAssociationPolicy::None
+            } else {
+                HostAssociationPolicy::All
+            };
             let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
+            process_imports(st, scope_id, imports, default_host_policy, unit.span)?;
             st.scope_mut(scope_id).arg_order = args
                 .iter()
                 .filter_map(|a| {

@@ -986,7 +986,9 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                 {
                     if let Some(nested_refs) = out.get(&nested_name.to_lowercase()) {
                         for r in nested_refs {
-                            if ancestor_names.contains(r) {
+                            if ancestor_names.contains(r)
+                                && host_name_allowed_by_imports(&sub.node, r)
+                            {
                                 refs_set.insert(r.clone());
                             }
                         }
@@ -1057,7 +1059,10 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                     continue;
                 };
                 for r in callee_refs {
-                    if ancestor_names.contains(&r) && refs.insert(r) {
+                    if ancestor_names.contains(&r)
+                        && host_name_allowed_by_imports(&sub.node, &r)
+                        && refs.insert(r)
+                    {
                         changed = true;
                     }
                 }
@@ -1069,6 +1074,32 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             }
         }
     }
+}
+
+fn host_name_allowed_by_imports(unit: &ProgramUnit, name: &str) -> bool {
+    let imports = match unit {
+        ProgramUnit::Subroutine { imports, .. } | ProgramUnit::Function { imports, .. } => imports,
+        _ => return true,
+    };
+    if imports
+        .iter()
+        .any(|import| matches!(import, ImportStmt::None))
+    {
+        return false;
+    }
+    let mut saw_only = false;
+    for import in imports {
+        if let ImportStmt::Only(names) = import {
+            saw_only = true;
+            if names
+                .iter()
+                .any(|imported| imported.eq_ignore_ascii_case(name))
+            {
+                return true;
+            }
+        }
+    }
+    !saw_only
 }
 
 fn collect_called_contained_names(unit: &ProgramUnit, out: &mut std::collections::HashSet<String>) {
@@ -3250,6 +3281,7 @@ pub(super) fn collect_host_references(
             }
         }
     }
+    host_names.retain(|name| host_name_allowed_by_imports(sub, name));
     // Collect names declared locally in the subprogram.
     // Also seed with the function name and any RESULT(r) clause name —
     // those are implicit local names that don't appear in the
@@ -3731,7 +3763,11 @@ pub(super) fn collect_implicit_locals(
         if ctx.internal_funcs.contains_key(&key) {
             continue;
         }
-        if ctx.globals.keys().any(|(_m, v)| v == &key) {
+        if ctx.globals.keys().any(|(_m, v)| v == &key)
+            && !ctx
+                .proc_scope_id
+                .is_some_and(|scope_id| ctx.st.host_association_is_restricted(scope_id))
+        {
             continue;
         }
         // Names that resolve to symbols already known to the sema
@@ -7336,9 +7372,16 @@ pub(super) fn install_host_param_consts(
     // stdlib_math_arg_complex_elemental.f90.
     let mut names: Vec<&String> = host_param_consts.keys().collect();
     names.sort();
+    let proc_scope = current_proc_scope();
     for name in names {
         let value = &host_param_consts[name];
         if locals.contains_key(name) {
+            continue;
+        }
+        let visible_symbol = proc_scope.and_then(|scope_id| st.lookup_in(scope_id, name));
+        if proc_scope.is_some_and(|scope_id| {
+            st.host_association_is_restricted(scope_id) && visible_symbol.is_none()
+        }) {
             continue;
         }
         // Prefer the declared type (e.g. `integer(int32), parameter`) over
@@ -7346,8 +7389,11 @@ pub(super) fn install_host_param_consts(
         // declared kind=4 lands here as I64 because const_scalar_ir_type
         // sees the unsigned bit pattern doesn't fit i32; later `kind()`
         // and generic dispatch then both report the wrong width.
-        let declared_ty = st
-            .find_symbol_any_scope(name)
+        let declared_symbol = match proc_scope {
+            Some(_) => visible_symbol,
+            None => st.find_symbol_any_scope(name),
+        };
+        let declared_ty = declared_symbol
             .and_then(|sym| sym.type_info.clone())
             .and_then(|ti| match ti {
                 crate::sema::symtab::TypeInfo::Integer { kind: Some(k) } => match k {
@@ -8396,6 +8442,13 @@ pub(super) fn install_globals_as_locals_in(
     for (local_key, (mod_key, var_key)) in pending {
         if let Some(required) = required_names {
             if !required.contains(&local_key) {
+                continue;
+            }
+        }
+        if let Some(scope_id) = current_proc_scope() {
+            if st.host_association_is_restricted(scope_id)
+                && st.lookup_in(scope_id, &local_key).is_none()
+            {
                 continue;
             }
         }
@@ -19489,7 +19542,18 @@ pub(super) fn same_unit_func_ref(
     // resolve to the lexically last definition (bitset_large_decrease
     // in the sort submodule), so `int32_increase_sort`'s introsort
     // would silently call into bitset_large_decrease's helpers.
-    let caller_scope = current_proc_scope();
+    let Some(caller_scope) = current_proc_scope() else {
+        return FuncRef::External(fallback_call_name);
+    };
+    let caller_sees_internal = st.lookup_in(caller_scope, matched_key).is_some_and(|sym| {
+        matches!(
+            sym.kind,
+            crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine
+        ) && scope_is_host_associated_or_self(st, caller_scope, sym.scope)
+    });
+    if !caller_sees_internal {
+        return FuncRef::External(fallback_call_name);
+    }
     // Host-association ONLY: the rebind exists to redirect calls to
     // contained procedures the caller can actually reach (F2018 §11.2.1).
     // The old path fell back to a global last-match scan when the
@@ -19501,7 +19565,8 @@ pub(super) fn same_unit_func_ref(
     // resize — toml_key strides over a toml_node array, scribbling text
     // pointers into polymorphic val slots. When the walk finds nothing,
     // the already-resolved fallback name is the right answer.
-    let Some(scope_id) = find_procedure_scope_id_for_caller_strict(st, matched_key, caller_scope)
+    let Some(scope_id) =
+        find_procedure_scope_id_for_caller_strict(st, matched_key, Some(caller_scope))
     else {
         return FuncRef::External(fallback_call_name);
     };
@@ -19740,6 +19805,9 @@ fn resolved_symbol_call_target_from_scope(
     if let Some(scope_id) = scope_id {
         if let Some(sym) = find_linkable_symbol_from_scope(st, key, scope_id) {
             return (symbol_link_name(st, sym), key.to_string());
+        }
+        if st.host_association_is_restricted(scope_id) {
+            return (fallback_name.to_string(), key.to_string());
         }
     }
     resolved_symbol_call_target(st, key, fallback_name)

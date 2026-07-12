@@ -6976,6 +6976,465 @@ fn component_array_intrinsics_survive_logical_condition_lowering() {
 }
 
 #[test]
+fn external_interface_host_access_requires_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=external_interface_host_access_requires_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for (label, import_stmt) in [("default", ""), ("none", "import, none")] {
+        let src = write_program(
+            &format!(
+                r#"
+module import_host
+  implicit none
+  integer, parameter :: host_kind = 8
+  interface
+    function external_value(x) result(r)
+      {import_stmt}
+      integer(host_kind), intent(in) :: x
+      integer(host_kind) :: r
+    end function
+  end interface
+end module
+"#
+            ),
+            "f90",
+        );
+        let out = unique_path(&format!("interface_import_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "host access without an enabling IMPORT should fail: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("host entity 'host_kind' is not accessible under this IMPORT policy"),
+            "missing restricted-host diagnostic: {stderr}"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn interface_named_and_all_imports_enable_host_access() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=interface_named_and_all_imports_enable_host_access count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module import_host
+  implicit none
+  integer, parameter :: host_kind = 8
+  type :: box_t
+    integer :: value
+  end type
+  interface
+    subroutine named_import(x)
+      import :: host_kind
+      integer(host_kind), intent(in) :: x
+    end subroutine
+    subroutine bare_import(value)
+      import
+      type(box_t), intent(in) :: value
+    end subroutine
+    subroutine all_import(value)
+      import, all
+      type(box_t), intent(in) :: value
+    end subroutine
+    subroutine repeated_bare_import(value)
+      import
+      import
+      type(box_t), intent(in) :: value
+    end subroutine
+  end interface
+end module
+"#,
+        "f90",
+    );
+    let out = unique_path("interface_import_access", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "named and ALL imports should enable host access: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn interface_import_cutoff_preserves_early_same_name_generic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=interface_import_cutoff_preserves_early_same_name_generic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    for (label, import_stmt) in [("named", "import :: value"), ("all", "import, all")] {
+        let src = write_program(
+            &format!(
+                r#"
+module import_host
+  implicit none
+  interface value
+    module procedure value
+  end interface
+  interface
+    subroutine external_value(x)
+      {import_stmt}
+      integer, intent(in) :: x(value(1))
+    end subroutine
+  end interface
+contains
+  pure integer function value(x)
+    integer, intent(in) :: x
+    value = x
+  end function
+end module
+"#
+            ),
+            "f90",
+        );
+        let out = unique_path(&format!("interface_import_early_generic_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "an early generic facet must remain visible through {label} IMPORT when its same-name specific is later: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    for (label, import_stmt) in [("named", "import :: value"), ("all", "import, all")] {
+        let src = write_program(
+            &format!(
+                r#"
+module import_provider
+  implicit none
+  interface value
+    module procedure provider_value
+  end interface
+contains
+  pure integer function provider_value(x)
+    integer, intent(in) :: x
+    provider_value = x
+  end function
+end module
+
+module import_consumer
+  use import_provider, only: value
+  implicit none
+  interface
+    subroutine external_value(x)
+      {import_stmt}
+      integer, intent(in) :: x(value(1))
+    end subroutine
+  end interface
+  interface value
+    module procedure local_value
+  end interface
+contains
+  pure integer function local_value(x)
+    character(*), intent(in) :: x
+    local_value = len(x)
+  end function
+end module
+"#
+            ),
+            "f90",
+        );
+        let out = unique_path(&format!("interface_import_early_used_generic_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "an early use-associated generic must remain visible through {label} IMPORT when a local extension is later: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn interface_import_only_hides_unlisted_host_entities() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=interface_import_only_hides_unlisted_host_entities count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module import_host
+  implicit none
+  integer, parameter :: visible_kind = 8
+  integer, parameter :: hidden_kind = 4
+  interface
+    function external_value(x) result(r)
+      import, only: visible_kind
+      integer(visible_kind), intent(in) :: x
+      integer(hidden_kind) :: r
+    end function
+  end interface
+end module
+"#,
+        "f90",
+    );
+    let out = unique_path("interface_import_only", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "unlisted host access should fail: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("host entity 'hidden_kind' is not accessible under this IMPORT policy"),
+        "missing ONLY diagnostic: {stderr}"
+    );
+    assert!(
+        !stderr.contains("host entity 'visible_kind'"),
+        "listed host entity should remain accessible: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn invalid_import_constraints_are_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=invalid_import_constraints_are_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let cases = [
+        (
+            "missing",
+            "module m\ninteger, parameter :: k = 4\ninterface\nsubroutine s()\nimport :: missing\nend subroutine\nend interface\nend module\n",
+            "IMPORT name 'missing' does not identify a host entity",
+        ),
+        (
+            "mixed_only",
+            "module m\ninteger, parameter :: k = 4\ninterface\nsubroutine s()\nimport, only: k\nimport :: k\nend subroutine\nend interface\nend module\n",
+            "IMPORT, ONLY cannot be combined with another IMPORT form",
+        ),
+        (
+            "mixed_all",
+            "module m\ninteger, parameter :: k = 4\ninterface\nsubroutine s()\nimport, all\nimport :: k\nend subroutine\nend interface\nend module\n",
+            "IMPORT, ALL and IMPORT, NONE must be the only IMPORT statement in a scope",
+        ),
+        (
+            "declared_late",
+            "module m\ninterface\nsubroutine s()\nimport :: k\nend subroutine\nend interface\ninteger, parameter :: k = 4\nend module\n",
+            "IMPORT name 'k' must be declared before the interface body",
+        ),
+        (
+            "fully_renamed_then_declared_late",
+            "module dep\ninterface value\nmodule procedure provider_value\nend interface\ncontains\ninteger function provider_value(x)\ninteger :: x\nprovider_value = x\nend function\nend module\nmodule m\nuse dep, alias => value\ninterface\nsubroutine s()\nimport :: value\nend subroutine\nend interface\ninterface value\nmodule procedure local_value\nend interface\ncontains\ninteger function local_value(x)\ncharacter(*) :: x\nlocal_value = len(x)\nend function\nend module\n",
+            "IMPORT name 'value' does not identify a host entity",
+        ),
+        (
+            "bare_late_reference",
+            "module m\ninterface\nsubroutine s(x)\nimport\ntype(t), intent(in) :: x\nend subroutine\nend interface\ntype :: t\nend type\nend module\n",
+            "host entity 't' is not accessible under this IMPORT policy",
+        ),
+        (
+            "all_late_reference",
+            "module m\ninterface\nsubroutine s(x)\nimport, all\ntype(t), intent(in) :: x\nend subroutine\nend interface\ntype :: t\nend type\nend module\n",
+            "host entity 't' is not accessible under this IMPORT policy",
+        ),
+        (
+            "main",
+            "program p\nimport, none\nend program\n",
+            "IMPORT is not permitted in a main program",
+        ),
+        (
+            "external",
+            "subroutine s()\nimport, all\nend subroutine\n",
+            "IMPORT is not permitted in an external subprogram",
+        ),
+    ];
+
+    for (label, source, expected) in cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(&format!("invalid_import_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "invalid IMPORT case {label} should fail"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "missing IMPORT constraint diagnostic for {label}: {stderr}"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
+fn internal_import_controls_host_access_without_narrowing_named_form() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=internal_import_controls_host_access_without_narrowing_named_form count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let accepted = write_program(
+        r#"
+module import_host
+  implicit none
+  integer, parameter :: first_kind = 4
+  integer, parameter :: second_kind = 8
+contains
+  subroutine outer()
+  contains
+    subroutine inner(x, y)
+      import :: first_kind
+      integer(first_kind), intent(in) :: x
+      integer(second_kind), intent(in) :: y
+    end subroutine
+  end subroutine
+end module
+"#,
+        "f90",
+    );
+    let accepted_out = unique_path("internal_named_import", "o");
+    let accepted_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            accepted.to_str().unwrap(),
+            "-o",
+            accepted_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        accepted_result.status.success(),
+        "named IMPORT must not narrow ordinary internal host association: {}",
+        String::from_utf8_lossy(&accepted_result.stderr)
+    );
+
+    let rejected = write_program(
+        r#"
+module import_host
+  implicit none
+  integer, parameter :: host_kind = 8
+contains
+  subroutine outer()
+  contains
+    subroutine inner(x)
+      import, none
+      integer(host_kind), intent(in) :: x
+    end subroutine
+  end subroutine
+end module
+"#,
+        "f90",
+    );
+    let rejected_out = unique_path("internal_import_none", "o");
+    let rejected_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            rejected.to_str().unwrap(),
+            "-o",
+            rejected_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !rejected_result.status.success(),
+        "IMPORT, NONE should hide internal host entities"
+    );
+    let stderr = String::from_utf8_lossy(&rejected_result.stderr);
+    assert!(
+        stderr.contains("host entity 'host_kind' is not accessible under this IMPORT policy"),
+        "missing internal IMPORT diagnostic: {stderr}"
+    );
+
+    for path in [accepted_out, accepted, rejected_out, rejected] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn import_all_prevents_local_shadowing() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=import_all_prevents_local_shadowing count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module import_host
+  implicit none
+  integer :: x
+  interface
+    subroutine external_value(x)
+      import, all
+      integer, intent(in) :: x
+    end subroutine
+  end interface
+end module
+"#,
+        "f90",
+    );
+    let out = unique_path("import_all_shadow", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "IMPORT, ALL should reject local shadowing"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("local declaration 'x' conflicts with an explicitly imported host entity"),
+        "missing imported-host conflict diagnostic: {stderr}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_array_element_component_intrinsics_do_not_escape() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -7062,6 +7521,167 @@ fn allocated_component_of_unallocated_allocatable_array_element_is_false() {
         String::from_utf8_lossy(&run.stderr)
     );
 
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn hidden_host_names_do_not_override_intrinsic_calls() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=hidden_host_names_do_not_override_intrinsic_calls count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module import_host
+  integer :: kind, selected_int_kind
+  interface
+    subroutine external_value(x, y)
+      integer(kind(0)), intent(in) :: x
+      integer(selected_int_kind(9)), intent(in) :: y
+    end subroutine
+  end interface
+end module
+"#,
+        "f90",
+    );
+    let out = unique_path("import_intrinsic_collision", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "intrinsic calls must remain available when a hidden host entity has the same name: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn restricted_imports_materialize_hidden_names_as_implicit_locals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=restricted_imports_materialize_hidden_names_as_implicit_locals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+module import_host
+  integer, parameter :: visible = 11
+  integer :: hidden_none = 99
+  integer :: hidden_only = 88
+contains
+  subroutine run_none()
+    import, none
+    hidden_none = 7
+    if (hidden_none /= 7) error stop 1
+  end subroutine
+
+  subroutine run_only()
+    import, only: visible
+    hidden_only = 9
+    if (visible /= 11 .or. hidden_only /= 9) error stop 2
+  end subroutine
+end module
+
+program p
+  use import_host, only: run_none, run_only, hidden_none, hidden_only
+  call run_none()
+  call run_only()
+  if (hidden_none /= 99 .or. hidden_only /= 88) error stop 3
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("import_implicit_local", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "restricted IMPORT compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("restricted IMPORT run failed to spawn");
+    assert!(
+        run.status.success(),
+        "restricted IMPORT run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn restricted_imports_do_not_rebind_hidden_internal_procedures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=restricted_imports_do_not_rebind_hidden_internal_procedures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+subroutine hidden_target()
+end subroutine
+
+program p
+  call outer()
+contains
+  subroutine outer()
+    integer, parameter :: permitted = 1
+    call caller_none()
+    call caller_only()
+  contains
+    subroutine hidden_target()
+      error stop 1
+    end subroutine
+
+    subroutine caller_none()
+      import, none
+      external hidden_target
+      call hidden_target()
+    end subroutine
+
+    subroutine caller_only()
+      import, only: permitted
+      external hidden_target
+      call hidden_target()
+    end subroutine
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("import_hidden_internal_call", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "restricted IMPORT compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("restricted IMPORT run failed to spawn");
+    assert!(
+        run.status.success(),
+        "hidden internal procedure captured the call: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
@@ -31792,20 +32412,6 @@ fn type_bound_generic_prefers_int8_array_wrapper_over_derived_specific() {
     integer(int8), allocatable :: value(:)
   end type key_type
 
-  abstract interface
-    function hasher_fun(key) result(hash_code)
-      import :: int32, key_type
-      type(key_type), intent(in) :: key
-      integer(int32) :: hash_code
-    end function hasher_fun
-
-    subroutine key_map_entry_ifc(map, key)
-      import :: hashmap_type, key_type
-      class(hashmap_type), intent(inout) :: map
-      type(key_type), intent(in) :: key
-    end subroutine key_map_entry_ifc
-  end interface
-
   type, abstract :: hashmap_type
     integer :: seen = 0
     procedure(hasher_fun), pointer, nopass :: hasher => sum_key
@@ -31819,6 +32425,20 @@ fn type_bound_generic_prefers_int8_array_wrapper_over_derived_specific() {
   contains
     procedure :: key_map_entry => map_chain_entry
   end type chaining_hashmap_type
+
+  abstract interface
+    function hasher_fun(key) result(hash_code)
+      import :: int32, key_type
+      type(key_type), intent(in) :: key
+      integer(int32) :: hash_code
+    end function hasher_fun
+
+    subroutine key_map_entry_ifc(map, key)
+      import :: hashmap_type, key_type
+      class(hashmap_type), intent(inout) :: map
+      type(key_type), intent(in) :: key
+    end subroutine key_map_entry_ifc
+  end interface
 contains
   subroutine set_int8(key, value)
     type(key_type), intent(out) :: key
