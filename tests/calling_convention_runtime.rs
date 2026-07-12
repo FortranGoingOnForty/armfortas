@@ -231,6 +231,98 @@ end function pick_xmm_after_pair_revert
 }
 
 #[test]
+fn bind_c_narrow_returns_ignore_dirty_upper_register_bits() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_narrow_returns_ignore_dirty_upper_register_bits count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("narrow_returns");
+    let c_src = write_program_in(
+        &dir,
+        "dirty_returns.c",
+        r#"#include <stdbool.h>
+#include <stdint.h>
+
+#if defined(__x86_64__)
+__attribute__((naked)) int8_t dirty_i8(void) {
+    __asm__ volatile("movl $0x12345680, %eax\n\tret");
+}
+
+__attribute__((naked)) int16_t dirty_i16(void) {
+    __asm__ volatile("movl $0x12348000, %eax\n\tret");
+}
+
+__attribute__((naked)) bool dirty_bool(void) {
+    __asm__ volatile("movl $0x12345600, %eax\n\tret");
+}
+#else
+int8_t dirty_i8(void) { return INT8_MIN; }
+int16_t dirty_i16(void) { return INT16_MIN; }
+bool dirty_bool(void) { return false; }
+#endif
+"#,
+    );
+    let c_obj = dir.join("dirty_returns.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use iso_c_binding
+  implicit none
+  interface
+    function dirty_i8() result(v) bind(c, name="dirty_i8")
+      import :: c_signed_char
+      integer(c_signed_char) :: v
+    end function dirty_i8
+    function dirty_i16() result(v) bind(c, name="dirty_i16")
+      import :: c_short
+      integer(c_short) :: v
+    end function dirty_i16
+    function dirty_bool() result(v) bind(c, name="dirty_bool")
+      import :: c_bool
+      logical(c_bool) :: v
+    end function dirty_bool
+  end interface
+
+  if (dirty_i8() >= 0_c_signed_char) error stop 1
+  if (dirty_i16() >= 0_c_short) error stop 2
+  if (dirty_bool()) error stop 3
+  print *, "ok"
+end program p
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("main_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("narrow_returns_{tag}.bin"));
+        link_program(&[&f_obj, &c_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} narrow-return probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "narrow return ABI mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
 fn bind_c_mixed_gp_fp_value_args_match_c_peer() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

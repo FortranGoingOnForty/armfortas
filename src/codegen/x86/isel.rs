@@ -2750,9 +2750,14 @@ fn select_call_inst(
 }
 
 fn emit_phys_to_vreg(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, reg: X86Reg, ty: &IrType) {
-    let (opcode, size) = match dest.class {
-        X86RegClass::Xmm => (fp_move(ty), fp_size(ty)),
-        class => (X86Opcode::MovRR, gp_move_size(class)),
+    let (opcode, size) = match ty {
+        IrType::Bool => (X86Opcode::Movzx { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I8) => (X86Opcode::Movsx { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I16) => (X86Opcode::Movsx { src: OpSize::W }, OpSize::L),
+        _ => match dest.class {
+            X86RegClass::Xmm => (fp_move(ty), fp_size(ty)),
+            class => (X86Opcode::MovRR, gp_move_size(class)),
+        },
     };
     push(
         mf,
@@ -3623,6 +3628,30 @@ mod tests {
 
     fn all_insts(mf: &X86Function) -> Vec<&X86Inst> {
         mf.blocks.iter().flat_map(|b| b.insts.iter()).collect()
+    }
+
+    #[test]
+    fn narrow_call_returns_extend_from_their_declared_width() {
+        let mut mf = X86Function::new("narrow_returns".into());
+        for (ty, expected) in [
+            (IrType::Bool, X86Opcode::Movzx { src: OpSize::B }),
+            (
+                IrType::Int(IntWidth::I8),
+                X86Opcode::Movsx { src: OpSize::B },
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                X86Opcode::Movsx { src: OpSize::W },
+            ),
+        ] {
+            let dest = mf.new_vreg(type_to_class(&ty));
+            emit_phys_to_vreg(&mut mf, MBlockId(0), dest, X86Reg::Rax, &ty);
+            let inst = mf.blocks[0].insts.last().expect("return capture emitted");
+            assert_eq!(inst.opcode, expected);
+            assert_eq!(inst.size, OpSize::L);
+            assert_eq!(inst.operands, vec![X86Operand::Reg(X86Reg::Rax)]);
+            assert_eq!(inst.def, Some(X86Operand::VReg(dest)));
+        }
     }
 
     // ---- The FP condition table, row by row (sprint deliverable 4).
