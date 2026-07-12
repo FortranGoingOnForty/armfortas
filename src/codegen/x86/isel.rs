@@ -94,6 +94,7 @@ pub fn select_function(
     for (vreg, loc, ty) in &param_info {
         match loc {
             X86AbiArgLoc::Gp(r) => {
+                mf.add_entry_live_in(*r);
                 let size = gp_move_size(vreg.class);
                 push(
                     &mut mf,
@@ -105,14 +106,26 @@ pub fn select_function(
                 );
             }
             X86AbiArgLoc::Xmm(r) => {
-                push(
-                    &mut mf,
-                    MBlockId(0),
-                    fp_move(ty),
-                    fp_size(ty),
-                    vec![X86Operand::Reg(*r)],
-                    Some(X86Operand::VReg(*vreg)),
-                );
+                mf.add_entry_live_in(*r);
+                if matches!(abi_ty_of(ty), AbiTy::ComplexF32) {
+                    push(
+                        &mut mf,
+                        MBlockId(0),
+                        X86Opcode::MovqXmmToGp,
+                        OpSize::Q,
+                        vec![X86Operand::Reg(*r)],
+                        Some(X86Operand::VReg(*vreg)),
+                    );
+                } else {
+                    push(
+                        &mut mf,
+                        MBlockId(0),
+                        fp_move(ty),
+                        fp_size(ty),
+                        vec![X86Operand::Reg(*r)],
+                        Some(X86Operand::VReg(*vreg)),
+                    );
+                }
             }
             X86AbiArgLoc::Stack { offset, .. } => {
                 // After the (future) `push rbp; mov rsp, rbp` prologue:
@@ -140,9 +153,13 @@ pub fn select_function(
     for (slots, loc) in &wide_param_info {
         match loc {
             X86AbiArgLoc::GpPair(lo, hi) => {
+                mf.add_entry_live_in(*lo);
+                mf.add_entry_live_in(*hi);
                 emit_store_pair_to_slot(&mut mf, MBlockId(0), *slots, *lo, *hi);
             }
             X86AbiArgLoc::XmmPair(a, b) => {
+                mf.add_entry_live_in(*a);
+                mf.add_entry_live_in(*b);
                 // complex(8) param: xmm pair into the wide slots.
                 for (slot, xmm) in [(slots.0, *a), (slots.1, *b)] {
                     push(
@@ -2602,12 +2619,15 @@ fn select_call_inst(
         }
         let v = ctx.lookup_vreg(*arg);
         match loc {
-            X86AbiArgLoc::Gp(r) => pending.push(X86Inst {
-                opcode: X86Opcode::MovRR,
-                size: gp_move_size(v.class),
-                operands: vec![X86Operand::VReg(v)],
-                def: Some(X86Operand::Reg(*r)),
-            }),
+            X86AbiArgLoc::Gp(r) => {
+                let (opcode, size) = gp_abi_value_move(ty, v.class);
+                pending.push(X86Inst {
+                    opcode,
+                    size,
+                    operands: vec![X86Operand::VReg(v)],
+                    def: Some(X86Operand::Reg(*r)),
+                });
+            }
             X86AbiArgLoc::Xmm(r) => pending.push(X86Inst {
                 opcode: fp_move(ty),
                 size: fp_size(ty),
@@ -2743,10 +2763,19 @@ fn select_call_inst(
     }
 }
 
+fn gp_abi_value_move(ty: &IrType, class: X86RegClass) -> (X86Opcode, OpSize) {
+    match ty {
+        IrType::Bool => (X86Opcode::Movzx { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I8) => (X86Opcode::Movsx { src: OpSize::B }, OpSize::L),
+        IrType::Int(IntWidth::I16) => (X86Opcode::Movsx { src: OpSize::W }, OpSize::L),
+        _ => (X86Opcode::MovRR, gp_move_size(class)),
+    }
+}
+
 fn emit_phys_to_vreg(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, reg: X86Reg, ty: &IrType) {
     let (opcode, size) = match dest.class {
         X86RegClass::Xmm => (fp_move(ty), fp_size(ty)),
-        class => (X86Opcode::MovRR, gp_move_size(class)),
+        class => gp_abi_value_move(ty, class),
     };
     push(
         mf,
@@ -3617,6 +3646,98 @@ mod tests {
 
     fn all_insts(mf: &X86Function) -> Vec<&X86Inst> {
         mf.blocks.iter().flat_map(|b| b.insts.iter()).collect()
+    }
+
+    #[test]
+    fn packed_complex_f32_parameter_receives_raw_xmm_bits() {
+        let complex_f32 = IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2);
+        let mut func = Function::new(
+            "take_c4".into(),
+            vec![Param {
+                name: "z".into(),
+                ty: complex_f32,
+                id: ValueId(0),
+                fortran_noalias: false,
+            }],
+            IrType::Void,
+        );
+        {
+            let mut builder = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            builder.ret_void();
+        }
+
+        let mf = select_function(
+            &func,
+            &["take_c4".to_string()],
+            crate::target::TargetLayout::LP64,
+        );
+        assert_eq!(mf.entry_live_ins, vec![X86Reg::Xmm0]);
+
+        let receipt = all_insts(&mf)
+            .into_iter()
+            .find(|inst| inst.opcode == X86Opcode::MovqXmmToGp)
+            .expect("packed complex-float parameter receipt emitted");
+        assert_eq!(receipt.size, OpSize::Q);
+        assert_eq!(receipt.operands, vec![X86Operand::Reg(X86Reg::Xmm0)]);
+        let Some(X86Operand::VReg(dest)) = receipt.def else {
+            panic!("packed complex-float receipt must define a vreg");
+        };
+        assert_eq!(dest.class, X86RegClass::Gp64);
+    }
+
+    #[test]
+    fn narrow_call_returns_extend_from_their_declared_width() {
+        let mut mf = X86Function::new("narrow_returns".into());
+        for (ty, expected) in [
+            (IrType::Bool, X86Opcode::Movzx { src: OpSize::B }),
+            (
+                IrType::Int(IntWidth::I8),
+                X86Opcode::Movsx { src: OpSize::B },
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                X86Opcode::Movsx { src: OpSize::W },
+            ),
+        ] {
+            let dest = mf.new_vreg(type_to_class(&ty));
+            emit_phys_to_vreg(&mut mf, MBlockId(0), dest, X86Reg::Rax, &ty);
+            let inst = mf.blocks[0].insts.last().expect("return capture emitted");
+            assert_eq!(inst.opcode, expected);
+            assert_eq!(inst.size, OpSize::L);
+            assert_eq!(inst.operands, vec![X86Operand::Reg(X86Reg::Rax)]);
+            assert_eq!(inst.def, Some(X86Operand::VReg(dest)));
+        }
+    }
+
+    #[test]
+    fn narrow_register_call_arguments_extend_from_their_declared_width() {
+        for (ty, expected) in [
+            (IrType::Bool, X86Opcode::Movzx { src: OpSize::B }),
+            (
+                IrType::Int(IntWidth::I8),
+                X86Opcode::Movsx { src: OpSize::B },
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                X86Opcode::Movsx { src: OpSize::W },
+            ),
+        ] {
+            let mf = select_simple(|b| {
+                let arg = match ty {
+                    IrType::Bool => b.const_bool(true),
+                    IrType::Int(width) => b.const_int(1, width),
+                    _ => unreachable!(),
+                };
+                b.call(FuncRef::External("consume".into()), vec![arg], IrType::Void);
+                b.ret_void();
+            });
+            let arg_move = all_insts(&mf)
+                .into_iter()
+                .find(|inst| inst.def == Some(X86Operand::Reg(X86Reg::Rdi)))
+                .expect("register argument move emitted");
+            assert_eq!(arg_move.opcode, expected);
+            assert_eq!(arg_move.size, OpSize::L);
+        }
     }
 
     // ---- The FP condition table, row by row (sprint deliverable 4).

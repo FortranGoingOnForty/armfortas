@@ -1592,9 +1592,14 @@ fn conform_condarg_to_slot(b: &mut FuncBuilder, val: ValueId, slot_ty: &IrType) 
 /// block (via `materialize`, the caller's full ABI decision tree) and
 /// the merge block carries the chosen one as a block parameter. A
 /// `.NIL.` arm produces the same absent representation an omitted
-/// OPTIONAL gets (`missing_optional_call_arg`) — one null convention,
-/// so PRESENT() in the callee just works. Never a value temporary:
-/// INTENT(OUT)/INOUT writes land in the selected actual.
+/// OPTIONAL gets (`missing_optional_call_arg`). Never a value temporary:
+/// INTENT(OUT)/INOUT writes land in the selected actual. OPTIONAL, VALUE
+/// presence is returned separately from the payload.
+pub(super) struct LoweredCallArg {
+    pub(super) value: ValueId,
+    pub(super) present: ValueId,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_call_arg_maybe_conditional(
     b: &mut FuncBuilder,
@@ -1609,10 +1614,13 @@ pub(super) fn lower_call_arg_maybe_conditional(
     arg_index: usize,
     is_value: bool,
     materialize: &mut dyn FnMut(&mut FuncBuilder, &crate::ast::expr::SpannedExpr) -> ValueId,
-) -> ValueId {
+) -> LoweredCallArg {
     use crate::ast::expr::Expr;
     match &e.node {
-        Expr::NilArgument => missing_optional_call_arg(b, st, callee_key, arg_index, is_value),
+        Expr::NilArgument => LoweredCallArg {
+            value: missing_optional_call_arg(b, st, callee_key, arg_index, is_value),
+            present: b.const_bool(false),
+        },
         Expr::ConditionalExpr {
             cond,
             then_val,
@@ -1656,7 +1664,7 @@ pub(super) fn lower_call_arg_maybe_conditional(
             // the then-arm first, take the WIDER commitment: if then
             // is the .NIL. arm, the else-arm decides the slot type and
             // then conforms (and vice versa).
-            let t_raw = lower_call_arg_maybe_conditional(
+            let t_arg = lower_call_arg_maybe_conditional(
                 b,
                 locals,
                 st,
@@ -1676,15 +1684,16 @@ pub(super) fn lower_call_arg_maybe_conditional(
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
             } else {
                 b.func()
-                    .value_type(t_raw)
+                    .value_type(t_arg.value)
                     .unwrap_or(IrType::Int(IntWidth::I64))
             };
-            let merged = b.add_block_param(bb_merge, slot_ty.clone());
-            let t_val = conform_condarg_to_slot(b, t_raw, &slot_ty);
-            b.branch(bb_merge, vec![t_val]);
+            let merged_value = b.add_block_param(bb_merge, slot_ty.clone());
+            let merged_presence = b.add_block_param(bb_merge, IrType::Bool);
+            let t_val = conform_condarg_to_slot(b, t_arg.value, &slot_ty);
+            b.branch(bb_merge, vec![t_val, t_arg.present]);
 
             b.set_block(bb_else);
-            let e_val = lower_call_arg_maybe_conditional(
+            let e_arg = lower_call_arg_maybe_conditional(
                 b,
                 locals,
                 st,
@@ -1698,13 +1707,55 @@ pub(super) fn lower_call_arg_maybe_conditional(
                 is_value,
                 materialize,
             );
-            let e_val = conform_condarg_to_slot(b, e_val, &slot_ty);
-            b.branch(bb_merge, vec![e_val]);
+            let e_val = conform_condarg_to_slot(b, e_arg.value, &slot_ty);
+            b.branch(bb_merge, vec![e_val, e_arg.present]);
 
             b.set_block(bb_merge);
-            merged
+            LoweredCallArg {
+                value: merged_value,
+                present: merged_presence,
+            }
         }
-        _ => materialize(b, e),
+        _ => {
+            let present = call_actual_presence(b, locals, e);
+            let must_guard_payload = is_value
+                && matches!(
+                    &e.node,
+                    Expr::Name { name }
+                        if locals.contains_key(&optional_value_presence_local_name(name))
+                );
+            if !must_guard_payload {
+                return LoweredCallArg {
+                    value: materialize(b, e),
+                    present,
+                };
+            }
+
+            let bb_present = b.create_block("optional_value_present");
+            let bb_absent = b.create_block("optional_value_absent");
+            let bb_merge = b.create_block("optional_value_merge");
+            b.cond_branch(present, bb_present, vec![], bb_absent, vec![]);
+
+            b.set_block(bb_present);
+            let present_value = materialize(b, e);
+            let slot_ty = b
+                .func()
+                .value_type(present_value)
+                .unwrap_or(IrType::Int(IntWidth::I64));
+            let merged_value = b.add_block_param(bb_merge, slot_ty.clone());
+            b.branch(bb_merge, vec![present_value]);
+
+            b.set_block(bb_absent);
+            let absent_value = missing_optional_call_arg(b, st, callee_key, arg_index, is_value);
+            let absent_value = conform_condarg_to_slot(b, absent_value, &slot_ty);
+            b.branch(bb_merge, vec![absent_value]);
+
+            b.set_block(bb_merge);
+            LoweredCallArg {
+                value: merged_value,
+                present,
+            }
+        }
     }
 }
 
@@ -4301,6 +4352,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         });
                     let mut call_arg_sequence_temps = Vec::new();
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                    let mut arg_presence: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     let mut call_arg_array_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
                         let mask_wants_descriptor = desc_mask
@@ -4341,6 +4393,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     dummy_is_class,
                                 )
                             });
+                            arg_presence.push(b.const_bool(true));
                             continue;
                         }
                         let is_value = value_mask
@@ -4379,7 +4432,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         let wants_polymorphic_descriptor =
                             dummy_is_class && !dummy_is_allocatable && !wants_pointer;
                         let wants_string_descriptor = wants_string_descriptor && !wants_bind_c_char;
-                        let value = match slot {
+                        let lowered = match slot {
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
@@ -4583,7 +4636,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         value,
                                     )
                                     };
-                                        let value = lower_call_arg_maybe_conditional(
+                                        let lowered = lower_call_arg_maybe_conditional(
                                             b,
                                             &ctx.locals,
                                             ctx.st,
@@ -4619,21 +4672,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 arg_expr,
                                                 ctx.st,
                                                 Some(ctx.type_layouts),
-                                                value,
+                                                lowered.value,
                                             );
                                         }
-                                        value
+                                        lowered
                                     }
-                                    _ => b.const_i32(0),
+                                    _ => LoweredCallArg {
+                                        value: b.const_i32(0),
+                                        present: b.const_bool(true),
+                                    },
                                 }
                             }
-                            None => {
-                                missing_optional_call_arg(b, ctx.st, abi_primary_key, i, is_value)
-                            }
+                            None => LoweredCallArg {
+                                value: missing_optional_call_arg(
+                                    b,
+                                    ctx.st,
+                                    abi_primary_key,
+                                    i,
+                                    is_value,
+                                ),
+                                present: b.const_bool(false),
+                            },
                         };
-                        arg_vals.push(value);
+                        arg_vals.push(lowered.value);
+                        arg_presence.push(lowered.present);
                     }
-                    if let Some(opt_flags) = opt_flags {
+                    if let Some(opt_flags) = &opt_flags {
                         let missing_slots = arg_slots.len().saturating_sub(arg_vals.len());
                         for flag in opt_flags.iter().skip(arg_vals.len()).take(missing_slots) {
                             if *flag {
@@ -4641,6 +4705,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                         }
                     }
+                    append_optional_value_presence_args(
+                        b,
+                        opt_flags.as_deref(),
+                        value_mask.as_deref(),
+                        &arg_presence,
+                        &mut arg_vals,
+                    );
                     if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
                         cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
                             .or_else(|| callee_char_len_star_mask(ctx.st, k))
@@ -4809,6 +4880,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             callee_sequence_array_copy_back_mask(ctx.st, k)
                         });
                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
+                    let mut arg_presence: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                     let mut call_arg_array_temps = Vec::new();
                     let mut call_arg_sequence_temps = Vec::new();
                     for (i, slot) in arg_slots.iter().enumerate() {
@@ -4854,7 +4926,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             .as_ref()
                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                             .unwrap_or(false);
-                        let value = match slot {
+                        let lowered = match slot {
                             Some(arg) => {
                                 match &arg.value {
                                     crate::ast::expr::SectionSubscript::Element(arg_expr) => {
@@ -5063,7 +5135,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         value,
                                     )
                                     };
-                                        let value = lower_call_arg_maybe_conditional(
+                                        let lowered = lower_call_arg_maybe_conditional(
                                             b,
                                             &ctx.locals,
                                             ctx.st,
@@ -5099,21 +5171,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                 arg_expr,
                                                 ctx.st,
                                                 Some(ctx.type_layouts),
-                                                value,
+                                                lowered.value,
                                             );
                                         }
-                                        value
+                                        lowered
                                     }
-                                    _ => b.const_i32(0),
+                                    _ => LoweredCallArg {
+                                        value: b.const_i32(0),
+                                        present: b.const_bool(true),
+                                    },
                                 }
                             }
-                            None => {
-                                missing_optional_call_arg(b, ctx.st, abi_primary_key, i, is_value)
-                            }
+                            None => LoweredCallArg {
+                                value: missing_optional_call_arg(
+                                    b,
+                                    ctx.st,
+                                    abi_primary_key,
+                                    i,
+                                    is_value,
+                                ),
+                                present: b.const_bool(false),
+                            },
                         };
-                        arg_vals.push(value);
+                        arg_vals.push(lowered.value);
+                        arg_presence.push(lowered.present);
                     }
-                    if let Some(opt_flags) = opt_flags {
+                    if let Some(opt_flags) = &opt_flags {
                         let missing_slots = arg_slots.len().saturating_sub(arg_vals.len());
                         for flag in opt_flags.iter().skip(arg_vals.len()).take(missing_slots) {
                             if *flag {
@@ -5121,6 +5204,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                         }
                     }
+                    append_optional_value_presence_args(
+                        b,
+                        opt_flags.as_deref(),
+                        value_mask.as_deref(),
+                        &arg_presence,
+                        &mut arg_vals,
+                    );
                     // Hidden character-length ABI: for each callee
                     // param that is character(len=*), append the
                     // actual argument's string length as an i64.

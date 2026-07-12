@@ -79,3 +79,4 @@ vectorize_where_int
 vectorize_where_invariant
 vectorize_where_unary
 vectorize_where_unary_on_b
+x86_complex_value_runtime

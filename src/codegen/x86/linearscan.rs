@@ -148,15 +148,28 @@ fn implicit_phys_effects(opcode: X86Opcode) -> (&'static [X86Reg], &'static [X86
 
 /// Build, per physical register, the sorted positions where isel
 /// references it (explicit `Reg` in any operand or def, plus implicit
-/// effects). A vreg interval [s,e] may NOT use register P if any of
-/// P's occupied positions lies in [s,e] — that is the fixed-interval
-/// constraint. Position numbering matches `compute_liveness` (step 2
-/// per instruction, blocks in order).
+/// effects). Incoming ABI registers are also occupied from function
+/// entry through their first explicit capture, so an earlier receipt
+/// cannot overwrite a later argument. A vreg interval [s,e] may NOT use
+/// register P if any of P's occupied positions lies in [s,e] — that is
+/// the fixed-interval constraint. Position numbering matches
+/// `compute_liveness` (step 2 per instruction, blocks in order).
 fn build_phys_occupancy(f: &X86Function) -> HashMap<X86Reg, Vec<u32>> {
     let mut occ: HashMap<X86Reg, Vec<u32>> = HashMap::new();
+    let entry_live_ins: HashSet<X86Reg> = f.entry_live_ins.iter().copied().collect();
+    let mut entry_captures: HashMap<X86Reg, u32> = HashMap::new();
     let mut pos: u32 = 0;
-    for block in &f.blocks {
+    for (block_idx, block) in f.blocks.iter().enumerate() {
         for inst in &block.insts {
+            if block_idx == 0 {
+                for op in &inst.operands {
+                    if let X86Operand::Reg(reg) = op {
+                        if entry_live_ins.contains(reg) {
+                            entry_captures.entry(*reg).or_insert(pos);
+                        }
+                    }
+                }
+            }
             let mut mark = |reg: X86Reg| occ.entry(reg).or_default().push(pos);
             for op in inst.operands.iter().chain(inst.def.iter()) {
                 match op {
@@ -179,6 +192,17 @@ fn build_phys_occupancy(f: &X86Function) -> HashMap<X86Reg, Vec<u32>> {
             pos += 2;
         }
     }
+
+    for &reg in &f.entry_live_ins {
+        let capture_pos = entry_captures
+            .get(&reg)
+            .copied()
+            .unwrap_or_else(|| panic!("entry live-in {reg:?} has no explicit entry capture"));
+        occ.entry(reg)
+            .or_default()
+            .extend((0..=capture_pos).step_by(2));
+    }
+
     for positions in occ.values_mut() {
         positions.sort_unstable();
         positions.dedup();
@@ -1049,5 +1073,28 @@ mod tests {
         assert!(!phys_free_over(&occ, X86Reg::Rax, 4, 4));
         // A register with no occupancy is always free.
         assert!(phys_free_over(&occ, X86Reg::Rbx, 0, 1000));
+    }
+
+    #[test]
+    fn incoming_registers_stay_occupied_until_their_capture() {
+        let mut f = X86Function::new("entry_liveins".into());
+        let sources = [X86Reg::Rdi, X86Reg::Rsi, X86Reg::Rdx, X86Reg::Rcx];
+
+        for source in sources {
+            f.add_entry_live_in(source);
+            let dest = f.new_vreg(X86RegClass::Gp32);
+            f.blocks[0].insts.push(X86Inst {
+                opcode: X86Opcode::MovRR,
+                size: OpSize::L,
+                operands: vec![X86Operand::Reg(source)],
+                def: Some(X86Operand::VReg(dest)),
+            });
+        }
+
+        let occ = build_phys_occupancy(&f);
+        assert_eq!(occ[&X86Reg::Rdi], vec![0]);
+        assert_eq!(occ[&X86Reg::Rsi], vec![0, 2]);
+        assert_eq!(occ[&X86Reg::Rdx], vec![0, 2, 4]);
+        assert_eq!(occ[&X86Reg::Rcx], vec![0, 2, 4, 6]);
     }
 }

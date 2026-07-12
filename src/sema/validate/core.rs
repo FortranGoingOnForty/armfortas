@@ -3270,6 +3270,32 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 }
             }
 
+            // An interoperable assumed-length CHARACTER dummy is passed as a
+            // C descriptor, not by armfortas's internal pointer-plus-hidden-
+            // length convention. Reject it before lowering or .amod emission
+            // until CFI_cdesc_t support is available.
+            if ctx.in_bind_c_unit {
+                if let TypeSpec::Character(selector) = type_spec {
+                    let declared_len = selector.as_ref().and_then(|sel| sel.len.as_ref());
+                    for entity in entities {
+                        let is_dummy = ctx.current_args.contains(&entity.name.to_lowercase());
+                        let effective_len = entity.char_len.as_ref().or(declared_len);
+                        if is_dummy
+                            && matches!(effective_len, Some(crate::ast::decl::LenSpec::Star))
+                        {
+                            ctx.error(
+                                decl.span,
+                                format!(
+                                    "BIND(C) assumed-length CHARACTER dummy '{}' is not supported yet \
+                                     (C descriptors are not implemented)",
+                                    entity.name
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+
             // Character VALUE dummies are not lowered with copy-in
             // semantics yet: the callee receives the caller's storage
             // pointer, so mutation corrupts the caller (or SEGVs on a
@@ -6989,6 +7015,78 @@ end program
             !errs
                 .iter()
                 .any(|e| e.contains("VALUE attribute on CHARACTER")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn bind_c_assumed_length_character_dummy_requires_c_descriptor() {
+        let errs = errors_from(
+            "\
+subroutine inspect_text(text) bind(c, name='inspect_text')
+  use iso_c_binding
+  character(kind=c_char, len=*), intent(in) :: text
+end subroutine inspect_text
+",
+        );
+        assert!(
+            errs.iter().any(|e| {
+                e.contains("BIND(C) assumed-length CHARACTER dummy 'text'")
+                    && e.contains("C descriptors are not implemented")
+            }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn bind_c_assumed_length_character_interface_requires_c_descriptor() {
+        let errs = errors_from(
+            "\
+program p
+  use iso_c_binding
+  interface
+    function text_len(text) result(n) bind(c, name='text_len')
+      import :: c_char, c_int
+      character(kind=c_char) :: text*(*)
+      integer(c_int) :: n
+    end function text_len
+  end interface
+end program p
+",
+        );
+        assert!(
+            errs.iter().any(|e| {
+                e.contains("BIND(C) assumed-length CHARACTER dummy 'text'")
+                    && e.contains("C descriptors are not implemented")
+            }),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn c_character_forms_without_descriptors_remain_supported() {
+        let errs = errors_from(
+            "\
+subroutine inspect_byte(byte) bind(c, name='inspect_byte')
+  use iso_c_binding
+  character(kind=c_char, len=1), intent(in) :: byte
+end subroutine inspect_byte
+
+subroutine inspect_buffer(buffer) bind(c, name='inspect_buffer')
+  use iso_c_binding
+  character(kind=c_char), intent(in) :: buffer(*)
+end subroutine inspect_buffer
+
+subroutine inspect_fortran_text(text)
+  character(len=*), intent(in) :: text
+end subroutine inspect_fortran_text
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("C descriptors")),
             "{:?}",
             errs
         );

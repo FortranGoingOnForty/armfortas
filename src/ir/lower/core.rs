@@ -18423,6 +18423,7 @@ pub(super) fn emit_resolved_operator_call(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_pointer_arg_mask(st, k));
     let callee_class_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_class_arg_mask(st, k));
+    let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(st, k));
     let callee_char_len_star_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_char_len_star_mask(st, k));
     let hidden_result = hidden_abi.and_then(|abi| {
@@ -18568,6 +18569,18 @@ pub(super) fn emit_resolved_operator_call(
         };
         call_args.push(lowered);
     }
+
+    let actual_presence = [
+        call_actual_presence(b, locals, left_expr),
+        call_actual_presence(b, locals, right_expr),
+    ];
+    append_optional_value_presence_args(
+        b,
+        opt_flags.as_deref(),
+        callee_value_args.as_deref(),
+        &actual_presence,
+        &mut call_args,
+    );
 
     if let Some(cls_flags) = &callee_char_len_star_args {
         for (i, flag) in cls_flags.iter().enumerate().take(2) {
@@ -18884,6 +18897,10 @@ pub(super) fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueI
         IrType::Bool => b.const_bool(false),
         IrType::Ptr(_) => b.const_i64(0),
         IrType::FuncPtr(_) => b.const_i64(0),
+        IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(_)) => {
+            let zero = b.const_i32(0);
+            coerce_to_type(b, zero, ty)
+        }
         IrType::Array(_, _) | IrType::Struct(_) => b.const_i64(0),
         IrType::Void => b.const_i32(0),
         IrType::Vector { .. } => b.const_i64(0),
@@ -18903,6 +18920,151 @@ pub(super) fn missing_optional_call_arg(
     callee_arg_ir_type(st, callee_name, idx)
         .map(|ty| zero_value_for_ir_type(b, &ty))
         .unwrap_or_else(|| b.const_i32(0))
+}
+
+pub(super) fn optional_value_presence_local_name(arg_name: &str) -> String {
+    format!("__present_{}", arg_name.to_lowercase())
+}
+
+pub(super) fn abi_argument_presence(b: &mut FuncBuilder, incoming: ValueId) -> ValueId {
+    let present_raw = match b.func().value_type(incoming) {
+        Some(IrType::Ptr(_)) => b.ptr_to_int(incoming),
+        Some(IrType::Int(IntWidth::I64)) => incoming,
+        Some(IrType::Int(_)) => coerce_to_type(b, incoming, &IrType::Int(IntWidth::I64)),
+        _ => return b.const_bool(true),
+    };
+    let zero = b.const_i64(0);
+    b.icmp(CmpOp::Ne, present_raw, zero)
+}
+
+pub(super) fn call_actual_presence(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> ValueId {
+    match &expr.node {
+        Expr::NilArgument => b.const_bool(false),
+        Expr::LogicalLiteral { .. } => b.const_bool(true),
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            if let Expr::LogicalLiteral { value, .. } = &cond.node {
+                let selected = if *value { then_val } else { else_val };
+                return call_actual_presence(b, locals, selected);
+            }
+            // Dynamic conditional arguments are split into control-flow arms by
+            // `lower_call_arg_maybe_conditional`; this helper is then called on
+            // the selected arm rather than on the conditional itself.
+            b.const_bool(true)
+        }
+        Expr::Name { name } => {
+            if let Some(presence) = locals.get(&optional_value_presence_local_name(name)) {
+                return b.load(presence.addr);
+            }
+            let Some(info) = locals.get(&name.to_lowercase()) else {
+                return b.const_bool(true);
+            };
+            if !info.by_ref {
+                return b.const_bool(true);
+            }
+
+            let incoming = b.load(info.addr);
+            abi_argument_presence(b, incoming)
+        }
+        _ => b.const_bool(true),
+    }
+}
+
+pub(super) fn lower_value_call_slot_with_presence(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+    actual: Option<&crate::ast::expr::Argument>,
+    callee_key: &str,
+    arg_index: usize,
+    wants_bind_c_char: bool,
+) -> super::stmt::LoweredCallArg {
+    let Some(actual) = actual else {
+        return super::stmt::LoweredCallArg {
+            value: missing_optional_call_arg(b, st, callee_key, arg_index, true),
+            present: b.const_bool(false),
+        };
+    };
+    let crate::ast::expr::SectionSubscript::Element(expr) = &actual.value else {
+        return super::stmt::LoweredCallArg {
+            value: b.const_i32(0),
+            present: b.const_bool(true),
+        };
+    };
+    let mut materialize = |b: &mut FuncBuilder, value_expr: &crate::ast::expr::SpannedExpr| {
+        if wants_bind_c_char {
+            lower_bind_c_char_value_arg(
+                b,
+                locals,
+                value_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            )
+        } else {
+            let raw = super::expr::lower_expr_full(
+                b,
+                locals,
+                value_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            coerce_value_call_arg(b, st, callee_key, arg_index, raw)
+        }
+    };
+    super::stmt::lower_call_arg_maybe_conditional(
+        b,
+        locals,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+        expr,
+        callee_key,
+        arg_index,
+        true,
+        &mut materialize,
+    )
+}
+
+pub(super) fn append_optional_value_presence_args(
+    b: &mut FuncBuilder,
+    optional_mask: Option<&[bool]>,
+    value_mask: Option<&[bool]>,
+    actual_presence: &[ValueId],
+    args: &mut Vec<ValueId>,
+) {
+    let (Some(optional_mask), Some(value_mask)) = (optional_mask, value_mask) else {
+        return;
+    };
+    for (idx, (&is_optional, &is_value)) in optional_mask.iter().zip(value_mask.iter()).enumerate()
+    {
+        if is_optional && is_value {
+            args.push(
+                actual_presence
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(|| b.const_bool(false)),
+            );
+        }
+    }
 }
 
 /// Generic SUBROUTINE call-site resolver. Mirror of the generic
@@ -19804,6 +19966,7 @@ pub(super) fn emit_named_function_call(
         });
 
     let mut call_args = Vec::new();
+    let mut arg_presence = Vec::with_capacity(arg_slots.len());
     let mut call_arg_array_temps = Vec::new();
     let mut call_arg_sequence_temps = Vec::new();
     if let Some(desc) = hidden_result {
@@ -19852,6 +20015,33 @@ pub(super) fn emit_named_function_call(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        if is_value {
+            let lowered = lower_value_call_slot_with_presence(
+                b,
+                locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+                slot.as_ref(),
+                abi_primary_key,
+                i,
+                wants_bind_c_char,
+            );
+            call_args.push(lowered.value);
+            arg_presence.push(lowered.present);
+            continue;
+        }
+        arg_presence.push(match slot {
+            Some(arg) => match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    call_actual_presence(b, locals, e)
+                }
+                _ => b.const_bool(true),
+            },
+            None => b.const_bool(false),
+        });
         let arg = match slot {
             Some(arg) => arg,
             None => {
@@ -20091,6 +20281,14 @@ pub(super) fn emit_named_function_call(
         }
     }
 
+    append_optional_value_presence_args(
+        b,
+        opt_flags.as_deref(),
+        callee_value_args.as_deref(),
+        &arg_presence,
+        &mut call_args,
+    );
+
     if let Some(cls_flags) =
         first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| callee_char_len_star_mask(st, k))
     {
@@ -20307,6 +20505,7 @@ pub(super) fn emit_resolved_bound_proc_call(
 
     let mut call_args =
         Vec::with_capacity(arg_slots.len() + hidden_result.is_some() as usize + (!nopass) as usize);
+    let mut arg_presence = Vec::with_capacity(arg_slots.len());
     let mut call_arg_array_temps = Vec::new();
     let mut call_arg_sequence_temps = Vec::new();
     if let Some(result) = hidden_result {
@@ -20331,6 +20530,7 @@ pub(super) fn emit_resolved_bound_proc_call(
         } else {
             obj_addr
         });
+        arg_presence.push(b.const_bool(true));
     }
 
     for (i, slot) in arg_slots
@@ -20387,6 +20587,33 @@ pub(super) fn emit_resolved_bound_proc_call(
         // it, the TBP path passed NULL for class(*) literal actuals,
         // producing SIGSEGV inside the callee on first use.
         let wants_polymorphic_descriptor = wants_descriptor && dummy_is_class;
+        if is_value {
+            let lowered = lower_value_call_slot_with_presence(
+                b,
+                locals,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+                slot.as_ref(),
+                abi_primary_key,
+                i,
+                wants_bind_c_char,
+            );
+            call_args.push(lowered.value);
+            arg_presence.push(lowered.present);
+            continue;
+        }
+        arg_presence.push(match slot {
+            Some(arg) => match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    call_actual_presence(b, locals, e)
+                }
+                _ => b.const_bool(true),
+            },
+            None => b.const_bool(false),
+        });
         let value = match slot {
             Some(arg) => match &arg.value {
                 crate::ast::expr::SectionSubscript::Element(e) => {
@@ -20584,7 +20811,7 @@ pub(super) fn emit_resolved_bound_proc_call(
         call_args.push(value);
     }
 
-    if let Some(opt_flags) = opt_flags {
+    if let Some(opt_flags) = &opt_flags {
         for (i, flag) in opt_flags.iter().enumerate().skip(arg_slots.len()) {
             if *flag {
                 let is_value = callee_value_args
@@ -20601,6 +20828,14 @@ pub(super) fn emit_resolved_bound_proc_call(
             }
         }
     }
+
+    append_optional_value_presence_args(
+        b,
+        opt_flags.as_deref(),
+        callee_value_args.as_deref(),
+        &arg_presence,
+        &mut call_args,
+    );
 
     if let Some(cls_flags) = &callee_char_len_star_args {
         for (i, flag) in cls_flags.iter().enumerate() {
@@ -21183,6 +21418,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
         first_procedure_lookup(&abi_lookup_keys, |k| callee_optional_arg_mask(ctx.st, k));
 
     let mut call_args = vec![desc_addr];
+    let mut arg_presence = Vec::with_capacity(arg_slots.len());
     for (i, slot) in arg_slots.iter().enumerate() {
         let is_value = callee_value_args
             .as_ref()
@@ -21221,6 +21457,33 @@ pub(super) fn lower_alloc_return_call_into_desc(
             .as_ref()
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
+        if is_value {
+            let lowered = lower_value_call_slot_with_presence(
+                b,
+                &ctx.locals,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+                slot.as_ref(),
+                abi_primary_key,
+                i,
+                wants_bind_c_char,
+            );
+            call_args.push(lowered.value);
+            arg_presence.push(lowered.present);
+            continue;
+        }
+        arg_presence.push(match slot {
+            Some(arg) => match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(e) => {
+                    call_actual_presence(b, &ctx.locals, e)
+                }
+                _ => b.const_bool(true),
+            },
+            None => b.const_bool(false),
+        });
         let arg = match slot {
             Some(arg) => arg,
             None => {
@@ -21329,6 +21592,14 @@ pub(super) fn lower_alloc_return_call_into_desc(
         };
         call_args.push(value);
     }
+
+    append_optional_value_presence_args(
+        b,
+        opt_flags.as_deref(),
+        callee_value_args.as_deref(),
+        &arg_presence,
+        &mut call_args,
+    );
 
     if let Some(cls_flags) = first_procedure_lookup(&abi_lookup_keys, |k| {
         cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)

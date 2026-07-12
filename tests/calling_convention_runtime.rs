@@ -64,6 +64,44 @@ fn compile_fortran_object(source: &std::path::Path, output: &std::path::Path) {
     );
 }
 
+fn compile_fortran_object_at(source: &std::path::Path, output: &std::path::Path, opt_level: &str) {
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", opt_level])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .expect("failed to spawn armfortas object compile");
+    assert!(
+        result.status.success(),
+        "armfortas failed for {} at {}: {}",
+        source.display(),
+        opt_level,
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn compile_fortran_object_at_f2023(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    opt_level: &str,
+) {
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", opt_level, "--std=f2023"])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .expect("failed to spawn armfortas F2023 object compile");
+    assert!(
+        result.status.success(),
+        "armfortas failed for {} at {}: {}",
+        source.display(),
+        opt_level,
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 fn compile_fortran_program(source: &std::path::Path, output: &std::path::Path) {
     let result = Command::new(compiler("armfortas"))
         .args([source.to_str().unwrap(), "-o", output.to_str().unwrap()])
@@ -91,6 +129,947 @@ fn link_program(objects: &[&std::path::Path], output: &std::path::Path) {
         "link failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+#[test]
+fn bind_c_dead_leading_register_arguments_survive_entry_copies() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_dead_leading_register_arguments_survive_entry_copies count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("entry_liveins");
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        r#"#include <complex.h>
+#include <stdint.h>
+
+int32_t pick_gp4(int32_t, int32_t, int32_t, int32_t);
+double pick_fp4(double, double, double, double);
+__int128 echo_gp_pair(int32_t, __int128);
+double consume_xmm_pair(double, double complex);
+int32_t pick_gp_after_pair_revert(int32_t, int32_t, int32_t, int32_t, int32_t,
+                                  __int128, int32_t);
+double pick_xmm_after_pair_revert(double, double, double, double, double, double,
+                                  double, double complex, double);
+int32_t call_pick_gp_after_pair_revert(void);
+double call_pick_xmm_after_pair_revert(void);
+
+#if defined(__x86_64__) && defined(__ELF__)
+/* C frontends disagree on reopening a register file after a two-register
+   argument reverts to the stack. Drive the SysV layout directly so this
+   probe isolates armfortas entry copies. */
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl call_pick_gp_after_pair_revert\n"
+    ".type call_pick_gp_after_pair_revert,@function\n"
+    "call_pick_gp_after_pair_revert:\n"
+    "subq $24, %rsp\n"
+    "movabsq $0xfedcba9876543210, %rax\n"
+    "movq %rax, 0(%rsp)\n"
+    "movabsq $0x0123456789abcdef, %rax\n"
+    "movq %rax, 8(%rsp)\n"
+    "movl $1, %edi\n"
+    "movl $2, %esi\n"
+    "movl $3, %edx\n"
+    "movl $4, %ecx\n"
+    "movl $5, %r8d\n"
+    "movl $77, %r9d\n"
+    "call pick_gp_after_pair_revert\n"
+    "addq $24, %rsp\n"
+    "ret\n"
+    ".size call_pick_gp_after_pair_revert, .-call_pick_gp_after_pair_revert\n"
+    ".p2align 4\n"
+    ".globl call_pick_xmm_after_pair_revert\n"
+    ".type call_pick_xmm_after_pair_revert,@function\n"
+    "call_pick_xmm_after_pair_revert:\n"
+    "subq $24, %rsp\n"
+    "movabsq $0x4020000000000000, %rax\n"
+    "movq %rax, 0(%rsp)\n"
+    "movabsq $0x4022000000000000, %rax\n"
+    "movq %rax, 8(%rsp)\n"
+    "movabsq $0x3ff0000000000000, %rax\n"
+    "movq %rax, %xmm0\n"
+    "movabsq $0x4000000000000000, %rax\n"
+    "movq %rax, %xmm1\n"
+    "movabsq $0x4008000000000000, %rax\n"
+    "movq %rax, %xmm2\n"
+    "movabsq $0x4010000000000000, %rax\n"
+    "movq %rax, %xmm3\n"
+    "movabsq $0x4014000000000000, %rax\n"
+    "movq %rax, %xmm4\n"
+    "movabsq $0x4018000000000000, %rax\n"
+    "movq %rax, %xmm5\n"
+    "movabsq $0x401c000000000000, %rax\n"
+    "movq %rax, %xmm6\n"
+    "movabsq $0x4025000000000000, %rax\n"
+    "movq %rax, %xmm7\n"
+    "call pick_xmm_after_pair_revert\n"
+    "addq $24, %rsp\n"
+    "ret\n"
+    ".size call_pick_xmm_after_pair_revert, .-call_pick_xmm_after_pair_revert\n"
+);
+#else
+int32_t call_pick_gp_after_pair_revert(void) {
+    const __int128 wide = ((__int128)0x123456789abcdefULL << 64) |
+                          (__int128)0xfedcba9876543210ULL;
+    return pick_gp_after_pair_revert(1, 2, 3, 4, 5, wide, 77);
+}
+
+double call_pick_xmm_after_pair_revert(void) {
+    return pick_xmm_after_pair_revert(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                                      8.0 + 9.0 * I, 10.5);
+}
+#endif
+
+int main(void) {
+    const __int128 wide = ((__int128)0x123456789abcdefULL << 64) |
+                          (__int128)0xfedcba9876543210ULL;
+    if (pick_gp4(11, 22, 33, 44) != 44) return 1;
+    if (pick_fp4(1.25, 2.5, 3.75, 4.5) != 4.5) return 2;
+    if (echo_gp_pair(9, wide) != wide) return 3;
+    if (consume_xmm_pair(9.0, 2.0 + 3.0 * I) != 302.0) return 4;
+    if (call_pick_gp_after_pair_revert() != 77) return 5;
+    if (call_pick_xmm_after_pair_revert() != 10.5) return 6;
+    return 0;
+}
+"#,
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "callees.f90",
+        r#"function pick_gp4(a, b, c, d) result(r) bind(c, name="pick_gp4")
+  use iso_c_binding
+  integer(c_int), value :: a, b, c, d
+  integer(c_int) :: r
+  r = d
+end function pick_gp4
+
+function pick_fp4(a, b, c, d) result(r) bind(c, name="pick_fp4")
+  use iso_c_binding
+  real(c_double), value :: a, b, c, d
+  real(c_double) :: r
+  r = d
+end function pick_fp4
+
+function echo_gp_pair(dead, wide) result(r) bind(c, name="echo_gp_pair")
+  use iso_c_binding
+  integer(c_int), value :: dead
+  integer(16), value :: wide
+  integer(16) :: r
+  r = wide
+end function echo_gp_pair
+
+function consume_xmm_pair(dead, z) result(r) bind(c, name="consume_xmm_pair")
+  use iso_c_binding
+  real(c_double), value :: dead
+  complex(c_double_complex), value :: z
+  real(c_double) :: r
+  r = real(z, c_double) + 100.0_c_double * aimag(z)
+end function consume_xmm_pair
+
+function pick_gp_after_pair_revert(a1, a2, a3, a4, a5, wide, tail) result(r) &
+    bind(c, name="pick_gp_after_pair_revert")
+  use iso_c_binding
+  integer(c_int), value :: a1, a2, a3, a4, a5, tail
+  integer(16), value :: wide
+  integer(c_int) :: r
+  r = tail
+end function pick_gp_after_pair_revert
+
+function pick_xmm_after_pair_revert(a1, a2, a3, a4, a5, a6, a7, z, tail) &
+    result(r) bind(c, name="pick_xmm_after_pair_revert")
+  use iso_c_binding
+  real(c_double), value :: a1, a2, a3, a4, a5, a6, a7, tail
+  complex(c_double_complex), value :: z
+  real(c_double) :: r
+  r = tail
+end function pick_xmm_after_pair_revert
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("callees_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("entry_liveins_{tag}.bin"));
+        link_program(&[&c_obj, &f_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} entry-livein probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "entry-livein ABI mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn bind_c_narrow_returns_ignore_dirty_upper_register_bits() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_narrow_returns_ignore_dirty_upper_register_bits count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("narrow_returns");
+    let c_src = write_program_in(
+        &dir,
+        "dirty_returns.c",
+        r#"#include <stdbool.h>
+#include <stdint.h>
+
+#if defined(__x86_64__)
+__attribute__((naked)) int8_t dirty_i8(void) {
+    __asm__ volatile("movl $0x12345680, %eax\n\tret");
+}
+
+__attribute__((naked)) int16_t dirty_i16(void) {
+    __asm__ volatile("movl $0x12348000, %eax\n\tret");
+}
+
+__attribute__((naked)) bool dirty_bool(void) {
+    __asm__ volatile("movl $0x12345600, %eax\n\tret");
+}
+#else
+int8_t dirty_i8(void) { return INT8_MIN; }
+int16_t dirty_i16(void) { return INT16_MIN; }
+bool dirty_bool(void) { return false; }
+#endif
+"#,
+    );
+    let c_obj = dir.join("dirty_returns.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use iso_c_binding
+  implicit none
+  interface
+    function dirty_i8() result(v) bind(c, name="dirty_i8")
+      import :: c_signed_char
+      integer(c_signed_char) :: v
+    end function dirty_i8
+    function dirty_i16() result(v) bind(c, name="dirty_i16")
+      import :: c_short
+      integer(c_short) :: v
+    end function dirty_i16
+    function dirty_bool() result(v) bind(c, name="dirty_bool")
+      import :: c_bool
+      logical(c_bool) :: v
+    end function dirty_bool
+  end interface
+
+  if (dirty_i8() >= 0_c_signed_char) error stop 1
+  if (dirty_i16() >= 0_c_short) error stop 2
+  if (dirty_bool()) error stop 3
+  print *, "ok"
+end program p
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("main_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("narrow_returns_{tag}.bin"));
+        link_program(&[&f_obj, &c_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} narrow-return probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "narrow return ABI mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn bind_c_narrow_register_arguments_are_canonical() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_narrow_register_arguments_are_canonical count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("narrow_args");
+    let c_src = write_program_in(
+        &dir,
+        "observe_args.c",
+        r#"#include <stdbool.h>
+#include <stdint.h>
+
+#if defined(__x86_64__)
+__attribute__((naked)) int32_t observe_i8(int8_t value) {
+    __asm__ volatile("movl %edi, %eax\n\tret");
+}
+
+__attribute__((naked)) int32_t observe_i16(int16_t value) {
+    __asm__ volatile("movl %edi, %eax\n\tret");
+}
+
+__attribute__((naked)) int32_t observe_bool(bool value) {
+    __asm__ volatile("movl %edi, %eax\n\tret");
+}
+#else
+int32_t observe_i8(int8_t value) { return value; }
+int32_t observe_i16(int16_t value) { return value; }
+int32_t observe_bool(bool value) { return value; }
+#endif
+"#,
+    );
+    let c_obj = dir.join("observe_args.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use iso_c_binding
+  implicit none
+  interface
+    function observe_i8(value) result(v) bind(c, name="observe_i8")
+      import :: c_int, c_signed_char
+      integer(c_signed_char), value :: value
+      integer(c_int) :: v
+    end function observe_i8
+    function observe_i16(value) result(v) bind(c, name="observe_i16")
+      import :: c_int, c_short
+      integer(c_short), value :: value
+      integer(c_int) :: v
+    end function observe_i16
+    function observe_bool(value) result(v) bind(c, name="observe_bool")
+      import :: c_bool, c_int
+      logical(c_bool), value :: value
+      integer(c_int) :: v
+    end function observe_bool
+  end interface
+
+  if (observe_i8(ibset(0_c_signed_char, 7)) /= -128_c_int) error stop 1
+  if (observe_i16(ibset(0_c_short, 15)) /= -32768_c_int) error stop 2
+  if (observe_bool(.false._c_bool) /= 0_c_int) error stop 3
+  if (observe_bool(.true._c_bool) /= 1_c_int) error stop 4
+  print *, "ok"
+end program p
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("main_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("narrow_args_{tag}.bin"));
+        link_program(&[&f_obj, &c_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} narrow-argument probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "narrow argument ABI mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
+fn optional_value_presence_distinguishes_omission_from_zero() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=optional_value_presence_distinguishes_omission_from_zero count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("optional_value_presence");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  implicit none
+  logical :: yes, no
+  integer, allocatable :: values(:)
+
+  yes = .true.
+  no = .false.
+  call check_integer(.false.)
+  call check_integer(.true., 0)
+  call check_integer(.true., (yes ? 0 : .nil.))
+  call check_integer(.false., (no ? 0 : .nil.))
+  call check_real(.false.)
+  call check_real(.true., 0.0)
+  call check_logical(.false.)
+  call check_logical(.true., .false.)
+  call check_with_character(.false., text='abc')
+  call check_with_character(.true., 0, 'xyz')
+  call check_spilled_presence(1, 2, 3, 4, 5, 6, 7, 8, .false.)
+  call check_spilled_presence(1, 2, 3, 4, 5, 6, 7, 8, .true., 0)
+  call forward_integer(.false.)
+  call forward_integer(.true., 0)
+  call forward_reference(.false.)
+  call forward_reference(.true., 0)
+  if (value_function(.false.) /= -1) error stop 21
+  if (value_function(.true., 0) /= 0) error stop 22
+  if (forward_character_reference() /= 'A') error stop 23
+  if (forward_character_reference(0) /= 'P') error stop 24
+  if (forward_character_value() /= 'A') error stop 25
+  if (forward_character_value(0) /= 'P') error stop 26
+  values = forward_array_reference()
+  if (size(values) /= 1 .or. values(1) /= 0) error stop 27
+  values = forward_array_reference(0)
+  if (size(values) /= 1 .or. values(1) /= 1) error stop 28
+  values = forward_array_value()
+  if (size(values) /= 1 .or. values(1) /= 0) error stop 29
+  values = forward_array_value(0)
+  if (size(values) /= 1 .or. values(1) /= 1) error stop 30
+  print *, 'ok'
+
+contains
+
+  subroutine check_integer(expect, x)
+    logical, value :: expect
+    integer, optional, value :: x
+    if (present(x) .neqv. expect) error stop 1
+    if (present(x)) then
+      if (x /= 0) error stop 2
+    end if
+  end subroutine check_integer
+
+  subroutine check_real(expect, x)
+    logical, value :: expect
+    real, optional, value :: x
+    if (present(x) .neqv. expect) error stop 3
+    if (present(x)) then
+      if (x /= 0.0) error stop 4
+    end if
+  end subroutine check_real
+
+  subroutine check_logical(expect, x)
+    logical, value :: expect
+    logical, optional, value :: x
+    if (present(x) .neqv. expect) error stop 5
+    if (present(x)) then
+      if (x) error stop 6
+    end if
+  end subroutine check_logical
+
+  subroutine check_with_character(expect, x, text)
+    logical, value :: expect
+    integer, optional, value :: x
+    character(len=*), intent(in) :: text
+    if (present(x) .neqv. expect) error stop 31
+    if (len(text) /= 3) error stop 32
+    if (text /= 'abc' .and. text /= 'xyz') error stop 33
+  end subroutine check_with_character
+
+  subroutine check_spilled_presence(a1, a2, a3, a4, a5, a6, a7, a8, expect, x)
+    integer, value :: a1, a2, a3, a4, a5, a6, a7, a8
+    logical, value :: expect
+    integer, optional, value :: x
+    if (a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 /= 36) error stop 34
+    if (present(x) .neqv. expect) error stop 35
+    if (present(x)) then
+      if (x /= 0) error stop 36
+    end if
+  end subroutine check_spilled_presence
+
+  subroutine forward_integer(expect, x)
+    logical, value :: expect
+    integer, optional, value :: x
+    call check_integer(expect, x)
+  end subroutine forward_integer
+
+  subroutine forward_reference(expect, x)
+    logical, value :: expect
+    integer, optional :: x
+    call check_integer(expect, x)
+  end subroutine forward_reference
+
+  integer function value_function(expect, x) result(value)
+    logical, value :: expect
+    integer, optional, value :: x
+    if (present(x) .neqv. expect) error stop 7
+    if (present(x)) then
+      value = x
+    else
+      value = -1
+    end if
+  end function value_function
+
+  character(1) function classify_character(x) result(value)
+    integer, optional, value :: x
+    if (present(x)) then
+      value = 'P'
+    else
+      value = 'A'
+    end if
+  end function classify_character
+
+  character(1) function forward_character_reference(x) result(value)
+    integer, optional :: x
+    value = classify_character(x)
+  end function forward_character_reference
+
+  character(1) function forward_character_value(x) result(value)
+    integer, optional, value :: x
+    value = classify_character(x)
+  end function forward_character_value
+
+  function classify_array(x) result(values)
+    integer, optional, value :: x
+    integer, allocatable :: values(:)
+    allocate(values(1))
+    if (present(x)) then
+      values = 1
+    else
+      values = 0
+    end if
+  end function classify_array
+
+  function forward_array_reference(x) result(values)
+    integer, optional :: x
+    integer, allocatable :: values(:)
+    values = classify_array(x)
+  end function forward_array_reference
+
+  function forward_array_value(x) result(values)
+    integer, optional, value :: x
+    integer, allocatable :: values(:)
+    values = classify_array(x)
+  end function forward_array_value
+end program p
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let obj = dir.join(format!("main_{tag}.o"));
+        compile_fortran_object_at_f2023(&src, &obj, opt_level);
+
+        let exe = dir.join(format!("optional_value_presence_{tag}.bin"));
+        link_program(&[&obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} optional VALUE probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "optional VALUE presence mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected optional VALUE output at {}: {}",
+            opt_level,
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_c_optional_value_presence_matches_c_bool_abi() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_optional_value_presence_matches_c_bool_abi count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("bind_c_optional_value_presence");
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        r#"#include <stdbool.h>
+#include <stdint.h>
+
+void optional_value_probe(int32_t value, int32_t *out, bool value_present);
+
+int main(void) {
+    int32_t out = 99;
+    optional_value_probe(123, &out, false);
+    if (out != -1) return 1;
+    optional_value_probe(0, &out, true);
+    if (out != 0) return 2;
+    return 0;
+}
+"#,
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "probe.f90",
+        r#"subroutine optional_value_probe(value, out) bind(C, name="optional_value_probe")
+  use iso_c_binding
+  implicit none
+  integer(c_int), optional, value :: value
+  integer(c_int), intent(out) :: out
+  if (present(value)) then
+    out = value
+  else
+    out = -1
+  end if
+end subroutine optional_value_probe
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("probe_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("bind_c_optional_value_presence_{tag}.bin"));
+        link_program(&[&c_obj, &f_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} C ABI presence probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "C ABI optional VALUE presence mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_tu_optional_value_presence_survives_amod_import() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=cross_tu_optional_value_presence_survives_amod_import count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("cross_tu_optional_value_presence");
+    let module_src = write_program_in(
+        &dir,
+        "presence_provider.f90",
+        r#"module presence_provider
+  implicit none
+  type :: presence_checker
+  contains
+    procedure :: verify => verify_bound_presence
+    procedure :: classify => classify_bound_presence
+    procedure :: forward_reference => forward_bound_reference
+    procedure :: forward_value => forward_bound_value
+  end type presence_checker
+contains
+  subroutine verify_presence(expect, i, r, flag)
+    logical, value :: expect
+    integer, optional, value :: i
+    real(8), optional, value :: r
+    logical, optional, value :: flag
+    if (present(i) .neqv. expect) error stop 1
+    if (present(r) .neqv. expect) error stop 2
+    if (present(flag) .neqv. expect) error stop 3
+    if (expect) then
+      if (i /= 0) error stop 4
+      if (r /= 0.0_8) error stop 5
+      if (flag) error stop 6
+    end if
+  end subroutine verify_presence
+
+  subroutine verify_bound_presence(self, expect, x)
+    class(presence_checker), intent(inout) :: self
+    logical, value :: expect
+    integer, optional, value :: x
+    if (present(x) .neqv. expect) error stop 7
+    if (present(x)) then
+      if (x /= 0) error stop 8
+    end if
+  end subroutine verify_bound_presence
+
+  integer function classify_bound_presence(self, x) result(value)
+    class(presence_checker), intent(inout) :: self
+    integer, optional, value :: x
+    if (present(x)) then
+      value = x
+    else
+      value = -1
+    end if
+  end function classify_bound_presence
+
+  integer function forward_bound_reference(self, x) result(value)
+    class(presence_checker), intent(inout) :: self
+    integer, optional :: x
+    value = self%classify(x)
+  end function forward_bound_reference
+
+  integer function forward_bound_value(self, x) result(value)
+    class(presence_checker), intent(inout) :: self
+    integer, optional, value :: x
+    value = self%classify(x)
+  end function forward_bound_value
+
+  integer function classify_value(x) result(value)
+    integer, optional, value :: x
+    if (present(x)) then
+      value = x
+    else
+      value = -1
+    end if
+  end function classify_value
+
+  character(1) function classify_character(x) result(value)
+    integer, optional, value :: x
+    if (present(x)) then
+      value = 'P'
+    else
+      value = 'A'
+    end if
+  end function classify_character
+
+  character(1) function forward_character_reference(x) result(value)
+    integer, optional :: x
+    value = classify_character(x)
+  end function forward_character_reference
+
+  character(1) function forward_character_value(x) result(value)
+    integer, optional, value :: x
+    value = classify_character(x)
+  end function forward_character_value
+end module presence_provider
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use presence_provider, only: check => verify_presence, classify_value, &
+                               classify_character, forward_character_reference, &
+                               forward_character_value, presence_checker
+  implicit none
+  type(presence_checker) :: checker
+  logical :: yes, no
+  yes = .true.
+  no = .false.
+  call check(.false.)
+  call check(expect=.true., flag=.false., r=0.0_8, i=0)
+  call checker%verify(.false.)
+  call checker%verify(.true., 0)
+  call checker%verify(.false., (no ? 0 : .nil.))
+  call checker%verify(.true., (yes ? 0 : .nil.))
+  if (checker%forward_reference() /= -1) error stop 9
+  if (checker%forward_reference(0) /= 0) error stop 10
+  if (checker%forward_value() /= -1) error stop 19
+  if (checker%forward_value(0) /= 0) error stop 20
+  if (classify_value() /= -1) error stop 11
+  if (classify_value(0) /= 0) error stop 12
+  if (classify_character() /= 'A') error stop 13
+  if (classify_character(0) /= 'P') error stop 14
+  if (forward_character_reference() /= 'A') error stop 15
+  if (forward_character_reference(0) /= 'P') error stop 16
+  if (forward_character_value() /= 'A') error stop 17
+  if (forward_character_value(0) /= 'P') error stop 18
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    let module_obj = dir.join("presence_provider.o");
+    let compile_module = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-O0", "-J"])
+        .arg(&dir)
+        .arg(&module_src)
+        .arg("-o")
+        .arg(&module_obj)
+        .output()
+        .expect("cross-TU optional VALUE module compile failed to spawn");
+    assert!(
+        compile_module.status.success(),
+        "cross-TU optional VALUE module compile failed: {}",
+        String::from_utf8_lossy(&compile_module.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-O0", "--std=f2023", "-I"])
+        .arg(&dir)
+        .arg("-J")
+        .arg(&dir)
+        .arg(&main_src)
+        .arg("-o")
+        .arg(&main_obj)
+        .output()
+        .expect("cross-TU optional VALUE caller compile failed to spawn");
+    assert!(
+        compile_main.status.success(),
+        "cross-TU optional VALUE caller compile failed: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("cross_tu_optional_value_presence.bin");
+    link_program(&[&main_obj, &module_obj], &exe);
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-TU optional VALUE runtime failed");
+    assert!(
+        run.status.success(),
+        "cross-TU optional VALUE runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected cross-TU optional VALUE output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn procedure_pointer_optional_value_presence_matches_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=procedure_pointer_optional_value_presence_matches_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("procptr_optional_value_presence");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"module callbacks
+  implicit none
+  abstract interface
+    subroutine callback_interface(expect, x)
+      logical, value :: expect
+      integer, optional, value :: x
+    end subroutine callback_interface
+    integer function classifier_interface(x)
+      integer, optional, value :: x
+    end function classifier_interface
+  end interface
+  type :: callback_holder
+    procedure(callback_interface), pointer, nopass :: invoke => null()
+    procedure(classifier_interface), pointer, nopass :: classify => null()
+  end type callback_holder
+contains
+  subroutine callback_target(expect, x)
+    logical, value :: expect
+    integer, optional, value :: x
+    if (present(x) .neqv. expect) error stop 1
+    if (present(x)) then
+      if (x /= 0) error stop 2
+    end if
+  end subroutine callback_target
+
+  integer function classifier_target(x) result(value)
+    integer, optional, value :: x
+    if (present(x)) then
+      value = x
+    else
+      value = -1
+    end if
+  end function classifier_target
+end module callbacks
+
+program p
+  use callbacks
+  implicit none
+  type(callback_holder) :: holder
+  holder%invoke => callback_target
+  holder%classify => classifier_target
+  call holder%invoke(.false.)
+  call holder%invoke(.true., 0)
+  if (holder%classify() /= -1) error stop 3
+  if (holder%classify(0) /= 0) error stop 4
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    let exe = dir.join("procptr_optional_value_presence.bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("procedure-pointer optional VALUE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure-pointer optional VALUE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&exe)
+        .output()
+        .expect("procedure-pointer optional VALUE runtime failed");
+    assert!(
+        run.status.success(),
+        "procedure-pointer optional VALUE runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected procedure-pointer optional VALUE output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

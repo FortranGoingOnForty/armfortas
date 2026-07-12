@@ -7,6 +7,7 @@ const MACOS_SUITES: &[&str] = &[
     "abi_differential",
     "x86_object_smoke",
     "x86_afs_as_differential",
+    "x86_complex_value_runtime",
     "elf_link_e2e",
     "elf_static_link",
 ];
