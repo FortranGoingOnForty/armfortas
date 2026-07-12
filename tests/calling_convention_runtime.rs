@@ -159,6 +159,76 @@ int32_t pick_gp_after_pair_revert(int32_t, int32_t, int32_t, int32_t, int32_t,
                                   __int128, int32_t);
 double pick_xmm_after_pair_revert(double, double, double, double, double, double,
                                   double, double complex, double);
+int32_t call_pick_gp_after_pair_revert(void);
+double call_pick_xmm_after_pair_revert(void);
+
+#if defined(__x86_64__) && defined(__ELF__)
+/* C frontends disagree on reopening a register file after a two-register
+   argument reverts to the stack. Drive the SysV layout directly so this
+   probe isolates armfortas entry copies. */
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl call_pick_gp_after_pair_revert\n"
+    ".type call_pick_gp_after_pair_revert,@function\n"
+    "call_pick_gp_after_pair_revert:\n"
+    "subq $24, %rsp\n"
+    "movabsq $0xfedcba9876543210, %rax\n"
+    "movq %rax, 0(%rsp)\n"
+    "movabsq $0x0123456789abcdef, %rax\n"
+    "movq %rax, 8(%rsp)\n"
+    "movl $1, %edi\n"
+    "movl $2, %esi\n"
+    "movl $3, %edx\n"
+    "movl $4, %ecx\n"
+    "movl $5, %r8d\n"
+    "movl $77, %r9d\n"
+    "call pick_gp_after_pair_revert\n"
+    "addq $24, %rsp\n"
+    "ret\n"
+    ".size call_pick_gp_after_pair_revert, .-call_pick_gp_after_pair_revert\n"
+    ".p2align 4\n"
+    ".globl call_pick_xmm_after_pair_revert\n"
+    ".type call_pick_xmm_after_pair_revert,@function\n"
+    "call_pick_xmm_after_pair_revert:\n"
+    "subq $24, %rsp\n"
+    "movabsq $0x4020000000000000, %rax\n"
+    "movq %rax, 0(%rsp)\n"
+    "movabsq $0x4022000000000000, %rax\n"
+    "movq %rax, 8(%rsp)\n"
+    "movabsq $0x3ff0000000000000, %rax\n"
+    "movq %rax, %xmm0\n"
+    "movabsq $0x4000000000000000, %rax\n"
+    "movq %rax, %xmm1\n"
+    "movabsq $0x4008000000000000, %rax\n"
+    "movq %rax, %xmm2\n"
+    "movabsq $0x4010000000000000, %rax\n"
+    "movq %rax, %xmm3\n"
+    "movabsq $0x4014000000000000, %rax\n"
+    "movq %rax, %xmm4\n"
+    "movabsq $0x4018000000000000, %rax\n"
+    "movq %rax, %xmm5\n"
+    "movabsq $0x401c000000000000, %rax\n"
+    "movq %rax, %xmm6\n"
+    "movabsq $0x4025000000000000, %rax\n"
+    "movq %rax, %xmm7\n"
+    "call pick_xmm_after_pair_revert\n"
+    "addq $24, %rsp\n"
+    "ret\n"
+    ".size call_pick_xmm_after_pair_revert, .-call_pick_xmm_after_pair_revert\n"
+);
+#else
+int32_t call_pick_gp_after_pair_revert(void) {
+    const __int128 wide = ((__int128)0x123456789abcdefULL << 64) |
+                          (__int128)0xfedcba9876543210ULL;
+    return pick_gp_after_pair_revert(1, 2, 3, 4, 5, wide, 77);
+}
+
+double call_pick_xmm_after_pair_revert(void) {
+    return pick_xmm_after_pair_revert(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
+                                      8.0 + 9.0 * I, 10.5);
+}
+#endif
 
 int main(void) {
     const __int128 wide = ((__int128)0x123456789abcdefULL << 64) |
@@ -167,9 +237,8 @@ int main(void) {
     if (pick_fp4(1.25, 2.5, 3.75, 4.5) != 4.5) return 2;
     if (echo_gp_pair(9, wide) != wide) return 3;
     if (consume_xmm_pair(9.0, 2.0 + 3.0 * I) != 302.0) return 4;
-    if (pick_gp_after_pair_revert(1, 2, 3, 4, 5, wide, 77) != 77) return 5;
-    if (pick_xmm_after_pair_revert(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0,
-                                   8.0 + 9.0 * I, 10.5) != 10.5) return 6;
+    if (call_pick_gp_after_pair_revert() != 77) return 5;
+    if (call_pick_xmm_after_pair_revert() != 10.5) return 6;
     return 0;
 }
 "#,
