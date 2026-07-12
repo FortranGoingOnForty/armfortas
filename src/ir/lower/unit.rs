@@ -380,6 +380,23 @@ pub(crate) fn lower_unit(
                     }
                 })
                 .collect();
+            let mut hidden_presence_params: Vec<(String, ValueId)> = Vec::new();
+            for arg in args {
+                let DummyArg::Name(n) = arg else {
+                    continue;
+                };
+                if !arg_has_value_attr(n, decls) || !decl_is_optional(n, decls) {
+                    continue;
+                }
+                let pid = ValueId(params.len() as u32);
+                params.push(Param {
+                    name: optional_value_presence_local_name(n),
+                    ty: IrType::Bool,
+                    id: pid,
+                    fortran_noalias: false,
+                });
+                hidden_presence_params.push((n.to_lowercase(), pid));
+            }
             // Append hidden-length i64 params for character(len=*) dummies.
             // Per the standard Fortran ABI, these trail the normal params.
             //
@@ -487,6 +504,7 @@ pub(crate) fn lower_unit(
                 .iter()
                 .filter(|p| {
                     !p.name.starts_with("__len_")
+                        && !p.name.starts_with("__present_")
                         && !p.name.starts_with("__host_")
                         && !p.name.starts_with("__proc_closure_")
                 })
@@ -502,6 +520,16 @@ pub(crate) fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
                 b.set_local_modules(module.local_modules.clone());
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
+
+                for (pname, pid) in &hidden_presence_params {
+                    let slot = b.alloca(IrType::Bool);
+                    b.store(*pid, slot);
+                    ctx.insert_scalar(
+                        optional_value_presence_local_name(pname),
+                        slot,
+                        IrType::Bool,
+                    );
+                }
 
                 // Set up hidden-length locals for assumed-len char dummies.
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
@@ -569,6 +597,14 @@ pub(crate) fn lower_unit(
                         ctx.locals.insert(pname.clone(), info);
                         if decl_is_optional(pname, decls) {
                             ctx.optional_locals.insert(pname.clone());
+                            let present = abi_argument_presence(&mut b, *pid);
+                            let presence_slot = b.alloca(IrType::Bool);
+                            b.store(present, presence_slot);
+                            ctx.insert_scalar(
+                                optional_value_presence_local_name(pname),
+                                presence_slot,
+                                IrType::Bool,
+                            );
                         }
                     }
                 }
@@ -963,6 +999,23 @@ pub(crate) fn lower_unit(
             // Trailing pointer params, one per host-local variable the
             // body reads or writes. See `build_host_ref_params`.
             let mut func_params = func_params;
+            let mut hidden_presence_params: Vec<(String, ValueId)> = Vec::new();
+            for arg in args {
+                let DummyArg::Name(n) = arg else {
+                    continue;
+                };
+                if !arg_has_value_attr(n, decls) || !decl_is_optional(n, decls) {
+                    continue;
+                }
+                let pid = ValueId(func_params.len() as u32);
+                func_params.push(Param {
+                    name: optional_value_presence_local_name(n),
+                    ty: IrType::Bool,
+                    id: pid,
+                    fortran_noalias: false,
+                });
+                hidden_presence_params.push((n.to_lowercase(), pid));
+            }
             let mut hidden_len_params: Vec<(String, ValueId)> = Vec::new();
             // See sister site above for why we compute from decls
             // instead of looking up the bare-name map.
@@ -1053,6 +1106,7 @@ pub(crate) fn lower_unit(
                 .filter(|p| {
                     p.name != "_sret"
                         && !p.name.starts_with("__len_")
+                        && !p.name.starts_with("__present_")
                         && !p.name.starts_with("__host_")
                         && !p.name.starts_with("__proc_closure_")
                 })
@@ -1068,6 +1122,16 @@ pub(crate) fn lower_unit(
                 let mut b = FuncBuilder::new(&mut func, ctx.layout);
                 b.set_local_modules(module.local_modules.clone());
                 let _setup_proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
+
+                for (pname, pid) in &hidden_presence_params {
+                    let slot = b.alloca(IrType::Bool);
+                    b.store(*pid, slot);
+                    ctx.insert_scalar(
+                        optional_value_presence_local_name(pname),
+                        slot,
+                        IrType::Bool,
+                    );
+                }
 
                 let mut hidden_len_addrs: HashMap<String, ValueId> = HashMap::new();
                 for (hname, hid) in &hidden_len_params {
@@ -1135,6 +1199,14 @@ pub(crate) fn lower_unit(
                         );
                         if decl_is_optional(pname, decls) {
                             ctx.optional_locals.insert(pname.clone());
+                            let present = abi_argument_presence(&mut b, *pid);
+                            let presence_slot = b.alloca(IrType::Bool);
+                            b.store(present, presence_slot);
+                            ctx.insert_scalar(
+                                optional_value_presence_local_name(pname),
+                                presence_slot,
+                                IrType::Bool,
+                            );
                         }
                     }
                 }
