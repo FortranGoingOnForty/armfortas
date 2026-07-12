@@ -323,6 +323,102 @@ end program p
 }
 
 #[test]
+fn bind_c_narrow_register_arguments_are_canonical() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=bind_c_narrow_register_arguments_are_canonical count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("narrow_args");
+    let c_src = write_program_in(
+        &dir,
+        "observe_args.c",
+        r#"#include <stdbool.h>
+#include <stdint.h>
+
+#if defined(__x86_64__)
+__attribute__((naked)) int32_t observe_i8(int8_t value) {
+    __asm__ volatile("movl %edi, %eax\n\tret");
+}
+
+__attribute__((naked)) int32_t observe_i16(int16_t value) {
+    __asm__ volatile("movl %edi, %eax\n\tret");
+}
+
+__attribute__((naked)) int32_t observe_bool(bool value) {
+    __asm__ volatile("movl %edi, %eax\n\tret");
+}
+#else
+int32_t observe_i8(int8_t value) { return value; }
+int32_t observe_i16(int16_t value) { return value; }
+int32_t observe_bool(bool value) { return value; }
+#endif
+"#,
+    );
+    let c_obj = dir.join("observe_args.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let f_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use iso_c_binding
+  implicit none
+  interface
+    function observe_i8(value) result(v) bind(c, name="observe_i8")
+      import :: c_int, c_signed_char
+      integer(c_signed_char), value :: value
+      integer(c_int) :: v
+    end function observe_i8
+    function observe_i16(value) result(v) bind(c, name="observe_i16")
+      import :: c_int, c_short
+      integer(c_short), value :: value
+      integer(c_int) :: v
+    end function observe_i16
+    function observe_bool(value) result(v) bind(c, name="observe_bool")
+      import :: c_bool, c_int
+      logical(c_bool), value :: value
+      integer(c_int) :: v
+    end function observe_bool
+  end interface
+
+  if (observe_i8(ibset(0_c_signed_char, 7)) /= -128_c_int) error stop 1
+  if (observe_i16(ibset(0_c_short, 15)) /= -32768_c_int) error stop 2
+  if (observe_bool(.false._c_bool) /= 0_c_int) error stop 3
+  if (observe_bool(.true._c_bool) /= 1_c_int) error stop 4
+  print *, "ok"
+end program p
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let f_obj = dir.join(format!("main_{tag}.o"));
+        compile_fortran_object_at(&f_src, &f_obj, opt_level);
+
+        let exe = dir.join(format!("narrow_args_{tag}.bin"));
+        link_program(&[&f_obj, &c_obj], &exe);
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {} narrow-argument probe: {e}", opt_level));
+        assert!(
+            run.status.success(),
+            "narrow argument ABI mismatch at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
 fn bind_c_mixed_gp_fp_value_args_match_c_peer() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

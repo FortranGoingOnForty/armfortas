@@ -2608,12 +2608,15 @@ fn select_call_inst(
         }
         let v = ctx.lookup_vreg(*arg);
         match loc {
-            X86AbiArgLoc::Gp(r) => pending.push(X86Inst {
-                opcode: X86Opcode::MovRR,
-                size: gp_move_size(v.class),
-                operands: vec![X86Operand::VReg(v)],
-                def: Some(X86Operand::Reg(*r)),
-            }),
+            X86AbiArgLoc::Gp(r) => {
+                let (opcode, size) = gp_abi_value_move(ty, v.class);
+                pending.push(X86Inst {
+                    opcode,
+                    size,
+                    operands: vec![X86Operand::VReg(v)],
+                    def: Some(X86Operand::Reg(*r)),
+                });
+            }
             X86AbiArgLoc::Xmm(r) => pending.push(X86Inst {
                 opcode: fp_move(ty),
                 size: fp_size(ty),
@@ -2749,15 +2752,19 @@ fn select_call_inst(
     }
 }
 
-fn emit_phys_to_vreg(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, reg: X86Reg, ty: &IrType) {
-    let (opcode, size) = match ty {
+fn gp_abi_value_move(ty: &IrType, class: X86RegClass) -> (X86Opcode, OpSize) {
+    match ty {
         IrType::Bool => (X86Opcode::Movzx { src: OpSize::B }, OpSize::L),
         IrType::Int(IntWidth::I8) => (X86Opcode::Movsx { src: OpSize::B }, OpSize::L),
         IrType::Int(IntWidth::I16) => (X86Opcode::Movsx { src: OpSize::W }, OpSize::L),
-        _ => match dest.class {
-            X86RegClass::Xmm => (fp_move(ty), fp_size(ty)),
-            class => (X86Opcode::MovRR, gp_move_size(class)),
-        },
+        _ => (X86Opcode::MovRR, gp_move_size(class)),
+    }
+}
+
+fn emit_phys_to_vreg(mf: &mut X86Function, mb: MBlockId, dest: X86VReg, reg: X86Reg, ty: &IrType) {
+    let (opcode, size) = match dest.class {
+        X86RegClass::Xmm => (fp_move(ty), fp_size(ty)),
+        class => gp_abi_value_move(ty, class),
     };
     push(
         mf,
@@ -3651,6 +3658,37 @@ mod tests {
             assert_eq!(inst.size, OpSize::L);
             assert_eq!(inst.operands, vec![X86Operand::Reg(X86Reg::Rax)]);
             assert_eq!(inst.def, Some(X86Operand::VReg(dest)));
+        }
+    }
+
+    #[test]
+    fn narrow_register_call_arguments_extend_from_their_declared_width() {
+        for (ty, expected) in [
+            (IrType::Bool, X86Opcode::Movzx { src: OpSize::B }),
+            (
+                IrType::Int(IntWidth::I8),
+                X86Opcode::Movsx { src: OpSize::B },
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                X86Opcode::Movsx { src: OpSize::W },
+            ),
+        ] {
+            let mf = select_simple(|b| {
+                let arg = match ty {
+                    IrType::Bool => b.const_bool(true),
+                    IrType::Int(width) => b.const_int(1, width),
+                    _ => unreachable!(),
+                };
+                b.call(FuncRef::External("consume".into()), vec![arg], IrType::Void);
+                b.ret_void();
+            });
+            let arg_move = all_insts(&mf)
+                .into_iter()
+                .find(|inst| inst.def == Some(X86Operand::Reg(X86Reg::Rdi)))
+                .expect("register argument move emitted");
+            assert_eq!(arg_move.opcode, expected);
+            assert_eq!(arg_move.size, OpSize::L);
         }
     }
 
