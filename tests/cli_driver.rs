@@ -776,6 +776,131 @@ end program
 }
 
 #[test]
+fn direct_use_association_conflicts_with_local_declarations() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=direct_use_association_conflicts_with_local_declarations count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "use_conflict_after",
+            "module values\n  integer :: answer\nend module\nprogram p\n  use values, only: answer\n  integer :: answer\nend program\n",
+            "answer",
+        ),
+        (
+            "use_conflict_dummy",
+            "module values\n  integer :: x\nend module\nsubroutine s(x)\n  use values, only: x\n  integer :: x\nend subroutine\n",
+            "x",
+        ),
+        (
+            "use_conflict_result",
+            "module values\n  integer :: r\nend module\ninteger function f() result(r)\n  use values, only: r\n  integer :: r\nend function\n",
+            "r",
+        ),
+        (
+            "use_conflict_rename",
+            "module values\n  integer :: x\nend module\nprogram p\n  use values, only: alias => x\n  integer :: alias\nend program\n",
+            "alias",
+        ),
+        (
+            "use_conflict_reexport",
+            "module values\n  integer :: x\nend module\nmodule facade\n  use values\nend module\nprogram p\n  use facade\n  integer :: x\nend program\n",
+            "x",
+        ),
+        (
+            "use_conflict_contained",
+            "module values\ncontains\n  subroutine s\n  end subroutine\nend module\nprogram p\n  use values, only: s\ncontains\n  subroutine s\n  end subroutine\nend program\n",
+            "s",
+        ),
+        (
+            "use_conflict_interface",
+            "module values\ncontains\n  subroutine s\n  end subroutine\nend module\nprogram p\n  use values, only: s\n  interface\n    subroutine s\n    end subroutine\n  end interface\nend program\n",
+            "s",
+        ),
+        (
+            "use_conflict_non_generic",
+            "module values\n  integer :: g\nend module\nprogram p\n  use values, only: g\n  interface g\n    module procedure local_g\n  end interface\ncontains\n  integer function local_g()\n    local_g = 1\n  end function\nend program\n",
+            "g",
+        ),
+        (
+            "use_conflict_mixed_generic",
+            "module generic_values\n  interface g\n    module procedure generic_g\n  end interface\ncontains\n  integer function generic_g()\n    generic_g = 1\n  end function\nend module\nmodule data_values\n  integer :: g\nend module\nprogram p\n  use generic_values, only: g\n  use data_values, only: g\n  interface g\n    module procedure local_g\n  end interface\ncontains\n  integer function local_g()\n    local_g = 2\n  end function\nend program\n",
+            "g",
+        ),
+        (
+            "use_conflict_block",
+            "module values\n  integer :: x\nend module\nprogram p\n  block\n    use values, only: x\n    integer :: x\n  end block\nend program\n",
+            "x",
+        ),
+    ];
+
+    for (stem, source, name) in rejected {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("USE conflict compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success()
+                && stderr.contains(&format!(
+                    "local declaration '{}' conflicts with a USE-associated entity",
+                    name
+                )),
+            "{stem} should reject the local declaration: status={:?} stderr={stderr}",
+            result.status
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let accepted = [
+        (
+            "use_renamed_remote_local",
+            "module values\n  integer :: x\nend module\nprogram p\n  use values, only: alias => x\n  integer :: x\n  x = alias\nend program\n",
+        ),
+        (
+            "use_bare_renamed_remote_local",
+            "module values\n  integer :: x\nend module\nprogram p\n  use values, alias => x\n  integer :: x\n  x = alias\nend program\n",
+        ),
+        (
+            "use_host_shadow_local",
+            "module values\n  integer :: x\nend module\nprogram p\n  use values, only: x\ncontains\n  subroutine s\n    integer :: x\n    x = 1\n  end subroutine\nend program\n",
+        ),
+        (
+            "use_generic_extension",
+            "module generic_values\n  interface g\n    module procedure integer_g\n  end interface\ncontains\n  integer function integer_g(x)\n    integer, intent(in) :: x\n    integer_g = x\n  end function\nend module\nmodule extended_values\n  use generic_values, only: g\n  interface g\n    module procedure real_g\n  end interface\ncontains\n  integer function real_g(x)\n    real, intent(in) :: x\n    real_g = int(x)\n  end function\nend module\nprogram p\n  use extended_values, only: g\n  if (g(1) /= 1) error stop 1\n  if (g(2.0) /= 2) error stop 2\nend program\n",
+        ),
+        (
+            "use_block_generic_extension",
+            "module generic_values\n  interface g\n    module procedure integer_g\n  end interface\ncontains\n  integer function integer_g(x)\n    integer, intent(in) :: x\n    integer_g = x\n  end function\nend module\nprogram p\n  block\n    use generic_values, only: g\n    interface g\n      integer function real_g(x)\n        real, intent(in) :: x\n      end function\n    end interface\n    if (g(1) /= 1) error stop 1\n  end block\nend program\n",
+        ),
+    ];
+
+    for (stem, source) in accepted {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("legal shadow compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "{stem} should compile: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -48367,7 +48492,7 @@ fn amod_proc_attrs_split_preserves_result_array_bounds_with_inner_comma() {
         "f90",
     );
     let main_src = write_program(
-        "program p\n  use mtop\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\n  complex(dp) :: a, b, z(11)\n  a = cmplx(10.0_dp, 5.0_dp, kind=dp)\n  b = cmplx(-10.0_dp, 15.0_dp, kind=dp)\n  z = gen(a, b, 11)\n  if (abs(real(z(1)) - 10.0d0) > 1.0d-12) error stop 1\n  if (abs(aimag(z(1)) - 5.0d0) > 1.0d-12) error stop 2\n  if (abs(real(z(11)) - (-10.0d0)) > 1.0d-12) error stop 3\n  if (abs(aimag(z(11)) - 15.0d0) > 1.0d-12) error stop 4\n  print *, 'ok'\nend program\n",
+        "program p\n  use mtop, only: dp, gen\n  implicit none\n  complex(dp) :: a, b, z(11)\n  a = cmplx(10.0_dp, 5.0_dp, kind=dp)\n  b = cmplx(-10.0_dp, 15.0_dp, kind=dp)\n  z = gen(a, b, 11)\n  if (abs(real(z(1)) - 10.0d0) > 1.0d-12) error stop 1\n  if (abs(aimag(z(1)) - 5.0d0) > 1.0d-12) error stop 2\n  if (abs(real(z(11)) - (-10.0d0)) > 1.0d-12) error stop 3\n  if (abs(aimag(z(11)) - 15.0d0) > 1.0d-12) error stop 4\n  print *, 'ok'\nend program\n",
         "f90",
     );
     let parent_o = unique_path("amod_attrs_parent", "o");

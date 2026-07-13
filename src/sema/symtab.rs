@@ -59,6 +59,12 @@ struct UseCandidate {
     generic_facet: bool,
 }
 
+#[derive(Default)]
+struct DirectUseBinding {
+    generic: bool,
+    non_generic: bool,
+}
+
 /// Scope identifier — an index into the SymbolTable's scope list.
 pub type ScopeId = usize;
 
@@ -494,6 +500,75 @@ impl SymbolTable {
         self.conflicts_with_protected_host_entity(self.current, key.as_ref())
     }
 
+    fn direct_use_binding(&self, scope_id: ScopeId, key: &str) -> DirectUseBinding {
+        let scope = &self.scopes[scope_id];
+        let mut binding = DirectUseBinding::default();
+        for association in &scope.use_associations {
+            if association.is_submodule_access || association.local_name != key {
+                continue;
+            }
+            if association.from_bare_use
+                && association.local_name == association.original_name
+                && self.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+            {
+                continue;
+            }
+            let has_entity = self.resolve_use_candidate(association).is_some();
+            let has_generic = self.scope_has_generic_facet(
+                association.source_scope,
+                &association.original_name,
+                LookupMode::Exported,
+            );
+            binding.generic |= has_generic;
+            binding.non_generic |= has_entity && !has_generic;
+        }
+
+        let mut seen_use_scopes = Vec::new();
+        for association in &scope.use_associations {
+            if association.is_submodule_access
+                || !association.from_bare_use
+                || association.local_name != association.original_name
+                || seen_use_scopes.contains(&association.source_scope)
+                || self.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+            {
+                continue;
+            }
+            seen_use_scopes.push(association.source_scope);
+            let mut visited = Vec::new();
+            let mut cache = HashMap::new();
+            let has_entity = self
+                .lookup_exported_in_guarded(association.source_scope, key, &mut visited, &mut cache)
+                .is_some();
+            let has_generic =
+                self.scope_has_generic_facet(association.source_scope, key, LookupMode::Exported);
+            binding.generic |= has_generic;
+            binding.non_generic |= has_entity && !has_generic;
+        }
+        binding
+    }
+
+    fn local_symbol_conflicts_with_direct_use(&self, scope_id: ScopeId, symbol: &Symbol) -> bool {
+        let key = ensure_ascii_lowercase(&symbol.name);
+        let binding = self.direct_use_binding(scope_id, key.as_ref());
+        binding.non_generic || (binding.generic && symbol.kind != SymbolKind::NamedInterface)
+    }
+
+    pub(crate) fn current_local_use_conflict(&self) -> Option<(String, Span)> {
+        let mut local_symbols: Vec<&Symbol> = self.scopes[self.current].symbols.values().collect();
+        local_symbols.sort_by_key(|symbol| {
+            (
+                symbol.defined_at.file_id,
+                symbol.defined_at.start.line,
+                symbol.defined_at.start.col,
+                symbol.name.to_ascii_lowercase(),
+            )
+        });
+        local_symbols.into_iter().find_map(|symbol| {
+            self.local_symbol_conflicts_with_direct_use(self.current, symbol)
+                .then(|| (symbol.name.clone(), symbol.defined_at))
+        })
+    }
+
     /// Define a symbol in the current scope.
     pub fn define(&mut self, symbol: Symbol) -> Result<(), SemaError> {
         self.clear_lookup_caches();
@@ -503,6 +578,15 @@ impl SymbolTable {
                 span: symbol.defined_at,
                 msg: format!(
                     "local declaration '{}' conflicts with an explicitly imported host entity",
+                    symbol.name
+                ),
+            });
+        }
+        if self.local_symbol_conflicts_with_direct_use(self.current, &symbol) {
+            return Err(SemaError {
+                span: symbol.defined_at,
+                msg: format!(
+                    "local declaration '{}' conflicts with a USE-associated entity",
                     symbol.name
                 ),
             });
@@ -721,6 +805,28 @@ impl SymbolTable {
         associations
             .iter()
             .any(|assoc| assoc.local_name == key && self.resolve_use_candidate(assoc).is_some())
+    }
+
+    pub(crate) fn use_associations_conflict_with_local(
+        &self,
+        associations: &[UseAssociation],
+        local_is_generic: bool,
+    ) -> bool {
+        let mut binding = DirectUseBinding::default();
+        for association in associations {
+            if association.is_submodule_access {
+                continue;
+            }
+            let has_entity = self.resolve_use_candidate(association).is_some();
+            let has_generic = self.scope_has_generic_facet(
+                association.source_scope,
+                &association.original_name,
+                LookupMode::Exported,
+            );
+            binding.generic |= has_generic;
+            binding.non_generic |= has_entity && !has_generic;
+        }
+        binding.non_generic || (binding.generic && !local_is_generic)
     }
 
     fn use_ambiguity_in_guarded(
@@ -2367,7 +2473,7 @@ mod tests {
     }
 
     #[test]
-    fn local_shadows_use() {
+    fn local_declaration_conflicts_with_use_association() {
         let mut st = SymbolTable::new();
 
         let mod_scope = st.push_scope(ScopeKind::Module("mymod".into()));
@@ -2386,11 +2492,10 @@ mod tests {
         });
         let mut local_sym = make_symbol("x", SymbolKind::Variable);
         local_sym.type_info = Some(TypeInfo::Real { kind: None });
-        st.define(local_sym).unwrap();
-
-        // Local shadows USE.
-        let found = st.lookup("x").unwrap();
-        assert!(matches!(found.type_info, Some(TypeInfo::Real { .. })));
+        let err = st
+            .define(local_sym)
+            .expect_err("a local declaration must not shadow a USE-associated entity");
+        assert!(err.msg.contains("USE-associated entity"));
     }
 
     #[test]
@@ -2550,7 +2655,7 @@ mod tests {
     }
 
     #[test]
-    fn local_symbol_suppresses_use_ambiguity() {
+    fn local_declaration_cannot_suppress_use_ambiguity() {
         let mut st = SymbolTable::new();
 
         let left_scope = st.push_scope(ScopeKind::Module("left".into()));
@@ -2570,9 +2675,12 @@ mod tests {
                 from_bare_use: false,
             });
         }
-        st.define(make_symbol("x", SymbolKind::Variable)).unwrap();
+        let err = st
+            .define(make_symbol("x", SymbolKind::Variable))
+            .expect_err("a local declaration must not suppress a USE ambiguity");
 
-        assert_eq!(st.use_ambiguity_in(program_scope, "x", false), None);
+        assert!(err.msg.contains("USE-associated entity"));
+        assert!(st.use_ambiguity_in(program_scope, "x", false).is_some());
     }
 
     #[test]

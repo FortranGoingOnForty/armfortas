@@ -827,8 +827,12 @@ pub(super) fn resolve_unit(
                     const_value: None,
                     const_char_value: None,
                 };
-                if st.define(symbol).is_err() {
-                    let key = fn_name.to_ascii_lowercase();
+                let key = fn_name.to_ascii_lowercase();
+                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
+                if let Err(err) = st.define(symbol) {
+                    if !had_local_symbol {
+                        return Err(err);
+                    }
                     let scope_id = st.current_scope();
                     let is_dummy_arg = st.scope(scope_id).arg_order.iter().any(|arg| arg == &key);
                     if is_dummy_arg {
@@ -863,6 +867,8 @@ pub(super) fn resolve_unit(
                         &specific_names,
                     );
                     let span = unit.span;
+                    let key = generic_name.to_ascii_lowercase();
+                    let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
                     let define_result = st.define(Symbol {
                         name: generic_name.clone(),
                         kind: SymbolKind::NamedInterface,
@@ -876,8 +882,10 @@ pub(super) fn resolve_unit(
                         const_value: None,
                         const_char_value: None,
                     });
-                    if define_result.is_err() {
-                        let key = generic_name.to_ascii_lowercase();
+                    if let Err(err) = define_result {
+                        if !had_local_symbol {
+                            return Err(err);
+                        }
                         if let Some(existing) =
                             st.scope_mut(st.current_scope()).symbols.get_mut(&key)
                         {
@@ -2660,7 +2668,9 @@ fn process_contains(
                         }
                     })
                     .collect();
-                let _ignore_dup = st.define(Symbol {
+                let key = name.to_ascii_lowercase();
+                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
+                let define_result = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
                     type_info: None,
@@ -2671,6 +2681,11 @@ fn process_contains(
                     const_value: None,
                     const_char_value: None,
                 });
+                if let Err(err) = define_result {
+                    if !had_local_symbol {
+                        return Err(err);
+                    }
+                }
             }
             ProgramUnit::Function {
                 name,
@@ -2726,7 +2741,9 @@ fn process_contains(
                     is_separate_module_procedure: fn_is_smp,
                     ..Default::default()
                 };
-                let _ignore_dup = st.define(Symbol {
+                let key = name.to_ascii_lowercase();
+                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
+                let define_result = st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
                     type_info: ret_type_info,
@@ -2737,6 +2754,11 @@ fn process_contains(
                     const_value: None,
                     const_char_value: None,
                 });
+                if let Err(err) = define_result {
+                    if !had_local_symbol {
+                        return Err(err);
+                    }
+                }
             }
             _ => {}
         }

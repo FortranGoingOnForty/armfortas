@@ -167,6 +167,15 @@ pub(super) fn process_uses(
                     span: use_decl.span,
                 });
             }
+            if let Some((name, span)) = st.current_local_use_conflict() {
+                return Err(SemaError {
+                    span,
+                    msg: format!(
+                        "local declaration '{}' conflicts with a USE-associated entity",
+                        name
+                    ),
+                });
+            }
         }
     }
     Ok(())

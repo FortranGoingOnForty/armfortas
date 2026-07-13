@@ -2458,6 +2458,116 @@ fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>)
     }
 }
 
+fn block_local_bindings(
+    decls: &[SpannedDecl],
+    ifaces: &[crate::ast::unit::SpannedUnit],
+) -> Vec<(String, Span, bool)> {
+    use crate::ast::unit::{InterfaceBody, ProgramUnit};
+
+    let mut bindings = Vec::new();
+    for decl in decls {
+        let mut push = |name: &str| bindings.push((name.to_lowercase(), decl.span, false));
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for entity in entities {
+                    push(&entity.name);
+                }
+            }
+            Decl::ParameterStmt { pairs } => {
+                for (name, _) in pairs {
+                    push(name);
+                }
+            }
+            Decl::DerivedTypeDef { name, .. } => push(name),
+            Decl::EnumDef {
+                type_name,
+                enumerators,
+            } => {
+                if let Some(name) = type_name {
+                    push(name);
+                }
+                for (name, _) in enumerators {
+                    push(name);
+                }
+            }
+            Decl::EnumerationTypeDef { name, enumerators } => {
+                push(name);
+                for name in enumerators {
+                    push(name);
+                }
+            }
+            Decl::AttributeStmt { entities, .. } => {
+                for name in entities {
+                    push(name);
+                }
+            }
+            Decl::CommonBlock { vars, .. } => {
+                for name in vars {
+                    push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for iface in ifaces {
+        let ProgramUnit::InterfaceBlock { name, bodies, .. } = &iface.node else {
+            continue;
+        };
+        if let Some(name) = name.as_ref().filter(|name| !name.is_empty()) {
+            bindings.push((name.to_lowercase(), iface.span, true));
+        }
+        for body in bodies {
+            let InterfaceBody::Subprogram(subprogram) = body else {
+                continue;
+            };
+            match &subprogram.node {
+                ProgramUnit::Function { name, .. } | ProgramUnit::Subroutine { name, .. } => {
+                    bindings.push((name.to_lowercase(), subprogram.span, false));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    bindings.sort_by(|left, right| {
+        (left.1.file_id, left.1.start.line, left.1.start.col, &left.0).cmp(&(
+            right.1.file_id,
+            right.1.start.line,
+            right.1.start.col,
+            &right.0,
+        ))
+    });
+    bindings
+}
+
+fn validate_block_use_conflicts(
+    ctx: &mut Ctx<'_>,
+    uses: &[SpannedDecl],
+    ifaces: &[crate::ast::unit::SpannedUnit],
+    decls: &[SpannedDecl],
+) {
+    let mut reported = HashSet::new();
+    for (name, span, is_generic) in block_local_bindings(decls, ifaces) {
+        if !reported.insert(name.clone()) {
+            continue;
+        }
+        let associations = block_use_associations_for_name(ctx.st, uses, &name);
+        if ctx
+            .st
+            .use_associations_conflict_with_local(&associations, is_generic)
+        {
+            ctx.error(
+                span,
+                format!(
+                    "local declaration '{}' conflicts with a USE-associated entity",
+                    name
+                ),
+            );
+        }
+    }
+}
+
 fn collect_reference_stmt(
     stmt: &SpannedStmt,
     shadowed: &HashSet<String>,
@@ -4552,6 +4662,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 ifaces,
                 decls,
             );
+            validate_block_use_conflicts(ctx, uses, ifaces, decls);
             validate_block_use_ambiguities(
                 ctx,
                 stmt.span,
