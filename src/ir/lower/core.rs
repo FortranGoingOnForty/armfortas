@@ -8217,6 +8217,30 @@ pub(super) fn install_globals_as_locals(
         extra.as_deref(),
         st,
         ambiguous_use_warnings,
+        true,
+    );
+}
+
+pub(super) fn install_block_globals_as_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
+    required_names: &HashSet<String>,
+    st: &SymbolTable,
+    ambiguous_use_warnings: &AmbiguousUseWarnings,
+) {
+    install_globals_as_locals_in(
+        b,
+        locals,
+        globals,
+        uses,
+        Some(required_names),
+        None,
+        None,
+        st,
+        ambiguous_use_warnings,
+        false,
     );
 }
 
@@ -8231,6 +8255,7 @@ pub(super) fn install_globals_as_locals_in(
     extra_host: Option<&str>,
     st: &SymbolTable,
     _ambiguous_use_warnings: &AmbiguousUseWarnings,
+    respect_host_association_policy: bool,
 ) {
     use crate::ast::decl::OnlyItem;
 
@@ -8445,11 +8470,13 @@ pub(super) fn install_globals_as_locals_in(
                 continue;
             }
         }
-        if let Some(scope_id) = current_proc_scope() {
-            if st.host_association_is_restricted(scope_id)
-                && st.lookup_in(scope_id, &local_key).is_none()
-            {
-                continue;
+        if respect_host_association_policy {
+            if let Some(scope_id) = current_proc_scope() {
+                if st.host_association_is_restricted(scope_id)
+                    && st.lookup_in(scope_id, &local_key).is_none()
+                {
+                    continue;
+                }
             }
         }
         let resolved_global_key = resolve_exported_global_key(st, globals, &mod_key, &var_key)
@@ -12872,15 +12899,14 @@ fn collect_named_interface_symbols_from_scope<'a>(
     }
 }
 
-fn active_block_use_named_interface_symbols<'a>(
-    st: &'a SymbolTable,
+fn active_block_use_bindings(
+    st: &SymbolTable,
     key: &str,
-) -> Vec<&'a crate::sema::symtab::Symbol> {
+) -> Vec<(crate::sema::symtab::ScopeId, String)> {
     use crate::ast::decl::{Decl, OnlyItem};
 
-    let mut symbols = Vec::new();
-    let mut seen = HashSet::new();
     for uses in active_block_uses().iter().rev() {
+        let mut bindings = Vec::new();
         for use_decl in uses {
             let Decl::UseStmt {
                 module,
@@ -12910,35 +12936,65 @@ fn active_block_use_named_interface_symbols<'a>(
                     }
                 }
             } else {
-                let mut renamed = false;
+                let mut locally_renamed = false;
+                let mut remote_renamed = false;
                 for rename in renames {
                     if rename.local.eq_ignore_ascii_case(key) {
                         original_names.push(rename.remote.to_ascii_lowercase());
-                        renamed = true;
+                        locally_renamed = true;
+                    }
+                    if rename.remote.eq_ignore_ascii_case(key) {
+                        remote_renamed = true;
                     }
                 }
-                if !renamed {
+                if !locally_renamed && !remote_renamed {
                     original_names.push(key.to_string());
                 }
             }
             for original_name in original_names {
-                if !st.scope_exports_name(source_scope, &original_name) {
-                    continue;
-                }
-                if let Some(sym) = st.named_interface_symbol_in_scope(source_scope, &original_name)
-                {
-                    let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
-                    if seen.insert(sym_key) {
-                        symbols.push(sym);
-                    }
-                }
+                bindings.push((source_scope, original_name));
             }
         }
-        if !symbols.is_empty() {
-            return symbols;
+        if !bindings.is_empty() {
+            return bindings;
+        }
+    }
+    Vec::new()
+}
+
+fn active_block_use_named_interface_symbols<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Vec<&'a crate::sema::symtab::Symbol> {
+    let mut symbols = Vec::new();
+    let mut seen = HashSet::new();
+    for (source_scope, original_name) in active_block_use_bindings(st, key) {
+        if !st.scope_exports_name(source_scope, &original_name) {
+            continue;
+        }
+        if let Some(sym) = st.named_interface_symbol_in_scope(source_scope, &original_name) {
+            let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
+            if seen.insert(sym_key) {
+                symbols.push(sym);
+            }
         }
     }
     symbols
+}
+
+fn active_block_use_linkable_symbol<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    active_block_use_bindings(st, key)
+        .into_iter()
+        .find_map(|(source_scope, original_name)| {
+            if !st.scope_exports_name(source_scope, &original_name) {
+                return None;
+            }
+            st.lookup_in(source_scope, &original_name)
+                .filter(|symbol| is_linkable_callable_symbol(symbol))
+        })
 }
 
 fn scope_is_host_associated_or_self(
@@ -19802,6 +19858,9 @@ fn resolved_symbol_call_target_from_scope(
     key: &str,
     fallback_name: &str,
 ) -> (String, String) {
+    if let Some(sym) = active_block_use_linkable_symbol(st, key) {
+        return (symbol_link_name(st, sym), key.to_string());
+    }
     if let Some(scope_id) = scope_id {
         if let Some(sym) = find_linkable_symbol_from_scope(st, key, scope_id) {
             return (symbol_link_name(st, sym), key.to_string());

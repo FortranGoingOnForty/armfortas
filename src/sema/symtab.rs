@@ -133,6 +133,7 @@ impl SymbolTable {
             has_explicit_implicit_stmt: false,
             use_associations: Vec::new(),
             host_association: HostAssociationControl::all(),
+            submodule_ancestor: None,
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
@@ -276,6 +277,7 @@ impl SymbolTable {
             has_explicit_implicit_stmt: false,
             use_associations: Vec::new(),
             host_association: HostAssociationControl::all(),
+            submodule_ancestor: None,
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
@@ -325,7 +327,14 @@ impl SymbolTable {
         self.scopes[scope_id].host_association = control;
     }
 
+    pub(crate) fn set_submodule_ancestor(&mut self, scope_id: ScopeId, ancestor: &str) {
+        self.scopes[scope_id].submodule_ancestor = Some(ancestor.to_ascii_lowercase());
+    }
+
     fn import_host_scope(&self, scope_id: ScopeId) -> Option<ScopeId> {
+        if let Some(host_scope) = self.scopes[scope_id].host_association.host_scope_override {
+            return Some(host_scope);
+        }
         let parent = self.scopes[scope_id].parent?;
         if self.scopes[parent].kind == ScopeKind::Interface {
             self.scopes[parent].parent
@@ -372,11 +381,23 @@ impl SymbolTable {
         })
     }
 
+    pub(crate) fn association_allowed_from_scope(
+        &self,
+        scope_id: ScopeId,
+        association: &UseAssociation,
+        key: &str,
+    ) -> bool {
+        !association.is_submodule_access || self.scopes[scope_id].host_association.allows(key)
+    }
+
     fn scope_has_use_associated_generic_facet(&self, scope_id: ScopeId, key: &str) -> bool {
         let scope = &self.scopes[scope_id];
         let mut visited = vec![(scope_id, key.to_string(), LookupMode::Normal)];
         for association in &scope.use_associations {
             if association.local_name != key {
+                continue;
+            }
+            if !self.association_allowed_from_scope(scope_id, association, key) {
                 continue;
             }
             if association.from_bare_use
@@ -406,14 +427,20 @@ impl SymbolTable {
                 || association.local_name != association.original_name
                 || seen_use_scopes.contains(&association.source_scope)
                 || self.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+                || !self.association_allowed_from_scope(scope_id, association, key)
             {
                 continue;
             }
             seen_use_scopes.push(association.source_scope);
+            let source_mode = if association.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
             if self.scope_has_generic_facet_guarded(
                 association.source_scope,
                 key,
-                LookupMode::Exported,
+                source_mode,
                 &mut visited,
             ) {
                 return true;
@@ -438,23 +465,40 @@ impl SymbolTable {
             return None;
         }
         let host_scope = self.import_host_scope(scope_id)?;
-        let host_symbol = self.lookup_in(host_scope, key.as_ref())?;
+        let Some(host_symbol) = self.lookup_in(host_scope, key.as_ref()) else {
+            return self.inaccessible_host_symbol(host_scope, key.as_ref(), allow_generic_facet);
+        };
         (!self.host_association_allows_symbol(scope_id, key.as_ref(), host_symbol))
             .then_some(host_symbol)
+    }
+
+    fn conflicts_with_protected_host_entity(&self, scope_id: ScopeId, key: &str) -> bool {
+        if !self.scopes[scope_id].host_association.protects(key) {
+            return false;
+        }
+        let Some(host_scope) = self.import_host_scope(scope_id) else {
+            return false;
+        };
+        let direct_conflict = self.lookup_in(host_scope, key).is_some_and(|host_symbol| {
+            self.host_association_allows_symbol(scope_id, key, host_symbol)
+        });
+        direct_conflict
+            || (self
+                .named_interface_facet_symbol_in_scope(host_scope, key)
+                .is_some()
+                && self.host_association_allows_generic_facet(scope_id, key))
+    }
+
+    pub(crate) fn current_use_name_conflicts_with_import(&self, name: &str) -> bool {
+        let key = ensure_ascii_lowercase(name);
+        self.conflicts_with_protected_host_entity(self.current, key.as_ref())
     }
 
     /// Define a symbol in the current scope.
     pub fn define(&mut self, symbol: Symbol) -> Result<(), SemaError> {
         self.clear_lookup_caches();
         let key = symbol.name.to_lowercase();
-        let imported_host_symbol = self
-            .import_host_scope(self.current)
-            .and_then(|host_scope| self.lookup_in(host_scope, &key));
-        let conflicts_with_import = self.scopes[self.current].host_association.protects(&key)
-            && imported_host_symbol.is_some_and(|host_symbol| {
-                self.host_association_allows_symbol(self.current, &key, host_symbol)
-            });
-        if conflicts_with_import {
+        if self.conflicts_with_protected_host_entity(self.current, &key) {
             return Err(SemaError {
                 span: symbol.defined_at,
                 msg: format!(
@@ -731,6 +775,9 @@ impl SymbolTable {
             if assoc.local_name != key {
                 continue;
             }
+            if !self.association_allowed_from_scope(scope_id, assoc, key) {
+                continue;
+            }
             if assoc.from_bare_use
                 && assoc.local_name == assoc.original_name
                 && self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
@@ -768,14 +815,20 @@ impl SymbolTable {
                 || assoc.local_name != assoc.original_name
                 || seen_use_scopes.contains(&assoc.source_scope)
                 || self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
+                || !self.association_allowed_from_scope(scope_id, assoc, key)
             {
                 continue;
             }
             seen_use_scopes.push(assoc.source_scope);
+            let source_mode = if assoc.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
             if let Some(ambiguity) = self.use_ambiguity_in_guarded(
                 assoc.source_scope,
                 key,
-                LookupMode::Exported,
+                source_mode,
                 allow_generic_merge,
                 visited,
             ) {
@@ -783,14 +836,24 @@ impl SymbolTable {
             }
             let mut lookup_visited = Vec::new();
             let mut lookup_cache = HashMap::new();
-            if let Some(symbol) = self.lookup_exported_in_guarded(
-                assoc.source_scope,
-                key,
-                &mut lookup_visited,
-                &mut lookup_cache,
-            ) {
+            let symbol = if assoc.is_submodule_access {
+                self.lookup_in_guarded(
+                    assoc.source_scope,
+                    key,
+                    &mut lookup_visited,
+                    &mut lookup_cache,
+                )
+            } else {
+                self.lookup_exported_in_guarded(
+                    assoc.source_scope,
+                    key,
+                    &mut lookup_visited,
+                    &mut lookup_cache,
+                )
+            };
+            if let Some(symbol) = symbol {
                 let generic_facet = allow_generic_merge
-                    && self.scope_has_generic_facet(assoc.source_scope, key, LookupMode::Exported);
+                    && self.scope_has_generic_facet(assoc.source_scope, key, source_mode);
                 self.push_use_candidate(&mut candidates, symbol, generic_facet);
             }
         }
@@ -959,6 +1022,9 @@ impl SymbolTable {
             if assoc.local_name != key {
                 continue;
             }
+            if !self.association_allowed_from_scope(scope_id, assoc, key) {
+                continue;
+            }
             if assoc.from_bare_use
                 && assoc.local_name == assoc.original_name
                 && self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
@@ -988,26 +1054,35 @@ impl SymbolTable {
                 || assoc.local_name != assoc.original_name
                 || seen_use_scopes.contains(&assoc.source_scope)
                 || self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
+                || !self.association_allowed_from_scope(scope_id, assoc, key)
             {
                 continue;
             }
             seen_use_scopes.push(assoc.source_scope);
             let mut lookup_visited = Vec::new();
             let mut lookup_cache = HashMap::new();
-            saw_binding |= self
-                .lookup_exported_in_guarded(
+            let source_mode = if assoc.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
+            saw_binding |= if assoc.is_submodule_access {
+                self.lookup_in_guarded(
                     assoc.source_scope,
                     key,
                     &mut lookup_visited,
                     &mut lookup_cache,
                 )
-                .is_some();
-            if self.scope_has_generic_facet_guarded(
-                assoc.source_scope,
-                key,
-                LookupMode::Exported,
-                visited,
-            ) {
+            } else {
+                self.lookup_exported_in_guarded(
+                    assoc.source_scope,
+                    key,
+                    &mut lookup_visited,
+                    &mut lookup_cache,
+                )
+            }
+            .is_some();
+            if self.scope_has_generic_facet_guarded(assoc.source_scope, key, source_mode, visited) {
                 visited.pop();
                 return true;
             }
@@ -1065,6 +1140,9 @@ impl SymbolTable {
             // original_name is followed, so unrelated names cannot leak.
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
+                    if !self.association_allowed_from_scope(scope_id, assoc, key) {
+                        continue;
+                    }
                     if assoc.from_bare_use
                         && assoc.local_name == assoc.original_name
                         && self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
@@ -1109,6 +1187,9 @@ impl SymbolTable {
                 if !assoc.from_bare_use {
                     continue;
                 }
+                if !self.association_allowed_from_scope(scope_id, assoc, key) {
+                    continue;
+                }
                 if assoc.local_name != assoc.original_name {
                     continue;
                 }
@@ -1119,9 +1200,12 @@ impl SymbolTable {
                     continue;
                 }
                 seen_use_scopes.push(assoc.source_scope);
-                if let Some(sym) =
+                let symbol = if assoc.is_submodule_access {
+                    self.lookup_in_guarded(assoc.source_scope, key, visited, cache)
+                } else {
                     self.lookup_exported_in_guarded(assoc.source_scope, key, visited, cache)
-                {
+                };
+                if let Some(sym) = symbol {
                     return Some(sym);
                 }
             }
@@ -1222,6 +1306,9 @@ impl SymbolTable {
 
             for assoc in &scope.use_associations {
                 if assoc.local_name == key {
+                    if !self.association_allowed_from_scope(scope_id, assoc, key) {
+                        continue;
+                    }
                     if assoc.is_submodule_access {
                         if let Some(sym) = self.scopes[assoc.source_scope]
                             .symbols
@@ -1253,6 +1340,9 @@ impl SymbolTable {
                 if !assoc.from_bare_use {
                     continue;
                 }
+                if !self.association_allowed_from_scope(scope_id, assoc, key) {
+                    continue;
+                }
                 if assoc.local_name != assoc.original_name {
                     continue;
                 }
@@ -1260,9 +1350,12 @@ impl SymbolTable {
                     continue;
                 }
                 seen_use_scopes.push(assoc.source_scope);
-                if let Some(sym) =
+                let symbol = if assoc.is_submodule_access {
+                    self.lookup_in_guarded(assoc.source_scope, key, visited, cache)
+                } else {
                     self.lookup_exported_in_guarded(assoc.source_scope, key, visited, cache)
-                {
+                };
+                if let Some(sym) = symbol {
                     return Some(sym);
                 }
             }
@@ -1298,9 +1391,20 @@ impl SymbolTable {
     }
 
     pub(crate) fn host_association_is_restricted(&self, scope_id: ScopeId) -> bool {
-        let control = &self.scopes[scope_id].host_association;
-        control.host_declaration_cutoff.is_some()
-            || !matches!(control.policy, HostAssociationPolicy::All)
+        let mut current = Some(scope_id);
+        while let Some(id) = current {
+            let scope = &self.scopes[id];
+            let control = &scope.host_association;
+            if control.host_declaration_cutoff.is_some()
+                || !matches!(control.policy, HostAssociationPolicy::All)
+            {
+                return true;
+            }
+            current = scope
+                .parent
+                .filter(|parent| self.scopes[*parent].kind != ScopeKind::Global);
+        }
+        false
     }
 
     /// Search ALL scopes for a symbol by name.
@@ -1502,6 +1606,24 @@ impl SymbolTable {
             }
         })
     }
+
+    pub fn find_submodule_scope(&self, ancestor: &str, name: &str) -> Option<ScopeId> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| match &scope.kind {
+                ScopeKind::Submodule(scope_name)
+                    if scope_name.eq_ignore_ascii_case(name)
+                        && scope
+                            .submodule_ancestor
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case(ancestor)) =>
+                {
+                    Some(scope.id)
+                }
+                _ => None,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1512,7 +1634,7 @@ pub(crate) enum HostAssociationPolicy {
 }
 
 impl HostAssociationPolicy {
-    fn allows(&self, name: &str) -> bool {
+    pub(crate) fn allows(&self, name: &str) -> bool {
         match self {
             Self::All => true,
             Self::None => false,
@@ -1529,7 +1651,7 @@ pub(crate) enum HostImportProtection {
 }
 
 impl HostImportProtection {
-    fn protects(&self, name: &str) -> bool {
+    pub(crate) fn protects(&self, name: &str) -> bool {
         match self {
             Self::None => false,
             Self::All => true,
@@ -1543,6 +1665,7 @@ pub(crate) struct HostAssociationControl {
     pub policy: HostAssociationPolicy,
     pub protection: HostImportProtection,
     pub host_declaration_cutoff: Option<Span>,
+    pub host_scope_override: Option<ScopeId>,
 }
 
 impl HostAssociationControl {
@@ -1551,6 +1674,7 @@ impl HostAssociationControl {
             policy: HostAssociationPolicy::All,
             protection: HostImportProtection::None,
             host_declaration_cutoff: None,
+            host_scope_override: None,
         }
     }
 
@@ -1574,6 +1698,7 @@ pub struct Scope {
     pub has_explicit_implicit_stmt: bool,
     pub use_associations: Vec<UseAssociation>,
     pub(crate) host_association: HostAssociationControl,
+    pub(crate) submodule_ancestor: Option<String>,
     pub default_access: Access,
     pub pending_access: HashMap<String, Access>,
     /// Ordered dummy argument names (for function/subroutine scopes).
@@ -1955,6 +2080,7 @@ mod tests {
                 policy: HostAssociationPolicy::None,
                 protection: HostImportProtection::None,
                 host_declaration_cutoff: None,
+                host_scope_override: None,
             },
         );
         assert!(st.lookup("x").is_none());
@@ -1966,6 +2092,7 @@ mod tests {
                 policy: HostAssociationPolicy::Only(HashSet::from(["x".into()])),
                 protection: HostImportProtection::None,
                 host_declaration_cutoff: None,
+                host_scope_override: None,
             },
         );
         assert!(st.lookup("X").is_some());
@@ -1998,6 +2125,7 @@ mod tests {
                 policy: HostAssociationPolicy::All,
                 protection: HostImportProtection::None,
                 host_declaration_cutoff: Some(span_at(5)),
+                host_scope_override: None,
             },
         );
 
@@ -2023,6 +2151,7 @@ mod tests {
                     policy: HostAssociationPolicy::All,
                     protection,
                     host_declaration_cutoff: None,
+                    host_scope_override: None,
                 },
             );
 
@@ -2577,6 +2706,20 @@ mod tests {
         assert_eq!(st.find_module_scope("my_module"), Some(mod_id));
         assert_eq!(st.find_module_scope("MY_MODULE"), Some(mod_id)); // case insensitive
         assert_eq!(st.find_module_scope("other"), None);
+    }
+
+    #[test]
+    fn find_submodule_scope() {
+        let mut st = SymbolTable::new();
+        let first_id = st.push_scope(ScopeKind::Submodule("child".into()));
+        st.set_submodule_ancestor(first_id, "first");
+        st.pop_scope();
+        let second_id = st.push_scope(ScopeKind::Submodule("child".into()));
+        st.set_submodule_ancestor(second_id, "second");
+        st.pop_scope();
+        assert_eq!(st.find_submodule_scope("FIRST", "CHILD"), Some(first_id));
+        assert_eq!(st.find_submodule_scope("second", "child"), Some(second_id));
+        assert_eq!(st.find_submodule_scope("first", "other"), None);
     }
 
     // ---- Scope hierarchy ----

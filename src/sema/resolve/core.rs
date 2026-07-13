@@ -207,6 +207,7 @@ fn process_imports(
     imports: &[ImportStmt],
     default_policy: HostAssociationPolicy,
     span: crate::lexer::Span,
+    host_scope_override: Option<ScopeId>,
 ) -> Result<(), SemaError> {
     let has_only = imports
         .iter()
@@ -232,15 +233,20 @@ fn process_imports(
         });
     }
 
-    let parent = st
-        .scope(scope_id)
-        .parent
-        .expect("subprogram scope has a parent");
-    let is_interface_body = st.scope(parent).kind == ScopeKind::Interface;
-    let host_scope = if is_interface_body {
-        st.scope(parent).parent.expect("interface scope has a host")
+    let (host_scope, is_interface_body) = if let Some(host_scope) = host_scope_override {
+        (host_scope, false)
     } else {
-        parent
+        let parent = st
+            .scope(scope_id)
+            .parent
+            .expect("subprogram scope has a parent");
+        let is_interface_body = st.scope(parent).kind == ScopeKind::Interface;
+        let host_scope = if is_interface_body {
+            st.scope(parent).parent.expect("interface scope has a host")
+        } else {
+            parent
+        };
+        (host_scope, is_interface_body)
     };
     let mut imported_names = HashSet::new();
     for name in imports.iter().flat_map(|import| match import {
@@ -282,16 +288,19 @@ fn process_imports(
             policy: default_policy,
             protection: HostImportProtection::None,
             host_declaration_cutoff: is_interface_body.then_some(span),
+            host_scope_override,
         },
         [ImportStmt::All] => HostAssociationControl {
             policy: HostAssociationPolicy::All,
             protection: HostImportProtection::All,
             host_declaration_cutoff: is_interface_body.then_some(span),
+            host_scope_override,
         },
         [ImportStmt::None] => HostAssociationControl {
             policy: HostAssociationPolicy::None,
             protection: HostImportProtection::None,
             host_declaration_cutoff: is_interface_body.then_some(span),
+            host_scope_override,
         },
         imports
             if imports
@@ -302,6 +311,7 @@ fn process_imports(
                 policy: HostAssociationPolicy::All,
                 protection: HostImportProtection::Names(imported_names),
                 host_declaration_cutoff: is_interface_body.then_some(span),
+                host_scope_override,
             }
         }
         imports
@@ -313,6 +323,7 @@ fn process_imports(
                 policy: HostAssociationPolicy::Only(imported_names.clone()),
                 protection: HostImportProtection::Names(imported_names),
                 host_declaration_cutoff: is_interface_body.then_some(span),
+                host_scope_override,
             }
         }
         _ => HostAssociationControl {
@@ -324,6 +335,7 @@ fn process_imports(
             },
             protection: HostImportProtection::Names(imported_names),
             host_declaration_cutoff: is_interface_body.then_some(span),
+            host_scope_override,
         },
     };
     st.set_host_association_control(scope_id, control);
@@ -406,7 +418,7 @@ pub(super) fn resolve_unit(
                 HostAssociationPolicy::All
             };
             let scope_id = st.push_scope(ScopeKind::Subroutine(name.clone()));
-            process_imports(st, scope_id, imports, default_host_policy, unit.span)?;
+            process_imports(st, scope_id, imports, default_host_policy, unit.span, None)?;
 
             // F2008 §12.6.2.5: separate module procedure body — args
             // are inherited from the parent module's interface block.
@@ -487,7 +499,7 @@ pub(super) fn resolve_unit(
                 HostAssociationPolicy::All
             };
             let scope_id = st.push_scope(ScopeKind::Function(name.clone()));
-            process_imports(st, scope_id, imports, default_host_policy, unit.span)?;
+            process_imports(st, scope_id, imports, default_host_policy, unit.span, None)?;
             st.scope_mut(scope_id).arg_order = args
                 .iter()
                 .filter_map(|a| {
@@ -552,23 +564,77 @@ pub(super) fn resolve_unit(
         }
         ProgramUnit::Submodule {
             parent,
-            ancestor: _,
+            ancestor,
             name,
             uses,
+            imports,
             decls,
             contains,
         } => {
-            // Find the parent module scope and inherit its symbols.
-            // If the parent isn't compiled in this TU, load it from .amod.
-            let parent_scope = st
-                .find_module_scope(parent)
-                .or_else(|| load_external_module(st, parent, module_search_paths, layouts));
-            st.push_scope(ScopeKind::Submodule(name.clone()));
-            // Import all parent module symbols into the submodule scope.
+            if imports
+                .iter()
+                .any(|import| matches!(import, ImportStmt::None))
+            {
+                return Err(SemaError {
+                    span: unit.span,
+                    msg: "IMPORT, NONE is not permitted in a submodule".into(),
+                });
+            }
+            // Resolve the immediate semantic parent. A direct child can load
+            // its ancestor module from .amod; a descendant needs the parent
+            // submodule scope retained in this translation unit.
+            let parent_scope = if let Some(immediate_parent) = ancestor {
+                let immediate_scope = st.find_submodule_scope(parent, immediate_parent);
+                if immediate_scope.is_none() && !imports.is_empty() {
+                    return Err(SemaError {
+                        span: unit.span,
+                        msg: format!(
+                            "IMPORT in descendant submodule '{}' requires semantic information for parent submodule '{}'",
+                            name, immediate_parent
+                        ),
+                    });
+                }
+                immediate_scope.or_else(|| {
+                    st.find_module_scope(parent)
+                        .or_else(|| load_external_module(st, parent, module_search_paths, layouts))
+                })
+            } else {
+                st.find_module_scope(parent)
+                    .or_else(|| load_external_module(st, parent, module_search_paths, layouts))
+            };
+            let scope_id = st.push_scope(ScopeKind::Submodule(name.clone()));
+            st.set_submodule_ancestor(scope_id, parent);
+            if let Some(pid) = parent_scope {
+                process_imports(
+                    st,
+                    scope_id,
+                    imports,
+                    HostAssociationPolicy::All,
+                    unit.span,
+                    Some(pid),
+                )?;
+            } else if !imports.is_empty() {
+                return Err(SemaError {
+                    span: unit.span,
+                    msg: format!(
+                        "cannot apply IMPORT because parent module '{}' was not found",
+                        parent
+                    ),
+                });
+            }
+            process_uses(st, uses, module_search_paths, layouts)?;
+            // Import all immediate-parent symbols into the submodule scope.
             // Per F2008 12.2.3.2: submodules see ALL parent entities,
             // including private ones — that's the whole point of the
             // submodule mechanism (host association).
             if let Some(pid) = parent_scope {
+                st.add_use_association(UseAssociation {
+                    local_name: String::new(),
+                    original_name: String::new(),
+                    source_scope: pid,
+                    is_submodule_access: true,
+                    from_bare_use: true,
+                });
                 let parent_syms: Vec<(String, String)> = st
                     .scope(pid)
                     .symbols
@@ -585,10 +651,8 @@ pub(super) fn resolve_unit(
                     });
                 }
             }
-            process_uses(st, uses, module_search_paths, layouts)?;
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;
-            let scope_id = st.current_scope();
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
@@ -1107,6 +1171,9 @@ fn exported_const_int_params(
     }
 
     for assoc in &scope.use_associations {
+        if !st.association_allowed_from_scope(scope_id, assoc, &assoc.local_name) {
+            continue;
+        }
         // First try the source scope's own symbols, then chase through
         // its USE chain.  stdlib_kinds re-exports `int32` from
         // iso_fortran_env, so `use stdlib_kinds, only: bits_kind => int32`
@@ -1157,6 +1224,9 @@ fn exported_const_int_params(
         for (name, value) in
             exported_const_int_params(st, assoc.source_scope, _visible_cache, exported_cache)
         {
+            if !st.association_allowed_from_scope(scope_id, assoc, &name) {
+                continue;
+            }
             out.entry(name).or_insert(value);
         }
     }
@@ -1188,6 +1258,9 @@ fn exported_const_char_params(
     }
 
     for assoc in &scope.use_associations {
+        if !st.association_allowed_from_scope(scope_id, assoc, &assoc.local_name) {
+            continue;
+        }
         let direct_value = st
             .scope(assoc.source_scope)
             .symbols
@@ -1234,6 +1307,9 @@ fn exported_const_char_params(
         for (name, value) in
             exported_const_char_params(st, assoc.source_scope, _visible_cache, exported_cache)
         {
+            if !st.association_allowed_from_scope(scope_id, assoc, &name) {
+                continue;
+            }
             out.entry(name).or_insert(value);
         }
     }
@@ -1264,6 +1340,9 @@ fn visible_const_int_params(
     }
 
     for assoc in &scope.use_associations {
+        if !st.association_allowed_from_scope(scope_id, assoc, &assoc.local_name) {
+            continue;
+        }
         if out.contains_key(&assoc.local_name) {
             continue;
         }
@@ -1309,6 +1388,9 @@ fn visible_const_int_params(
         for (name, value) in
             exported_const_int_params(st, assoc.source_scope, visible_cache, exported_cache)
         {
+            if !st.association_allowed_from_scope(scope_id, assoc, &name) {
+                continue;
+            }
             out.entry(name).or_insert(value);
         }
     }
@@ -1348,6 +1430,9 @@ fn visible_const_char_params(
     }
 
     for assoc in &scope.use_associations {
+        if !st.association_allowed_from_scope(scope_id, assoc, &assoc.local_name) {
+            continue;
+        }
         if out.contains_key(&assoc.local_name) {
             continue;
         }
@@ -1396,6 +1481,9 @@ fn visible_const_char_params(
         for (name, value) in
             exported_const_char_params(st, assoc.source_scope, visible_cache, exported_cache)
         {
+            if !st.association_allowed_from_scope(scope_id, assoc, &name) {
+                continue;
+            }
             out.entry(name).or_insert(value);
         }
     }

@@ -7734,10 +7734,36 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                 })
                 .collect();
-            let saved: Vec<(String, Option<LocalInfo>)> = block_keys
+            let mut block_imports = HashMap::new();
+            if !uses.is_empty() {
+                let required_import_names = collect_required_import_names(&effective_decls, body);
+                install_block_globals_as_locals(
+                    b,
+                    &mut block_imports,
+                    ctx.globals,
+                    uses,
+                    &required_import_names,
+                    ctx.st,
+                    &ctx.ambiguous_use_warnings,
+                );
+            }
+            let block_key_set: HashSet<&str> = block_keys.iter().map(String::as_str).collect();
+            let mut scoped_keys = block_keys.clone();
+            scoped_keys.extend(
+                block_imports
+                    .keys()
+                    .filter(|key| !block_key_set.contains(key.as_str()))
+                    .cloned(),
+            );
+            let saved: Vec<(String, Option<LocalInfo>)> = scoped_keys
                 .iter()
                 .map(|k| (k.clone(), ctx.locals.get(k).cloned()))
                 .collect();
+            for (key, info) in block_imports {
+                if !block_key_set.contains(key.as_str()) {
+                    ctx.locals.insert(key, info);
+                }
+            }
             if !effective_decls.is_empty() {
                 // Remove shadowed keys so alloc_decls creates fresh allocas.
                 for k in &block_keys {
@@ -7760,19 +7786,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ctx.st,
                     ctx.proc_scope_id,
                     Some(ctx.type_layouts),
-                );
-            }
-            if !uses.is_empty() {
-                let required_import_names = collect_required_import_names(&effective_decls, body);
-                install_globals_as_locals(
-                    b,
-                    &mut ctx.locals,
-                    ctx.globals,
-                    uses,
-                    Some(&required_import_names),
-                    None,
-                    ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
             }
             let bb_cleanup = b.create_block("block_cleanup");

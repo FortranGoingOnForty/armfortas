@@ -7307,6 +7307,436 @@ fn invalid_import_constraints_are_rejected() {
 }
 
 #[test]
+fn block_import_controls_host_access_and_protection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_import_controls_host_access_and_protection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let accepted = write_program(
+        "program p\n  implicit none\n  integer, parameter :: visible = 1, hidden = 2\n  block\n    import :: visible\n    integer :: value\n    value = visible + hidden\n  end block\nend program\n",
+        "f90",
+    );
+    let accepted_out = unique_path("block_named_import", "o");
+    let accepted_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            accepted.to_str().unwrap(),
+            "-o",
+            accepted_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        accepted_result.status.success(),
+        "named BLOCK IMPORT must not narrow host access: {}",
+        String::from_utf8_lossy(&accepted_result.stderr)
+    );
+
+    let local_replacement = write_program(
+        "program p\n  implicit none\n  integer :: hidden\n  block\n    import, none\n    integer :: hidden\n    hidden = 3\n    block\n      import :: hidden\n      print *, hidden\n    end block\n  end block\nend program\n",
+        "f90",
+    );
+    let local_replacement_out = unique_path("block_import_local_replacement", "o");
+    let local_replacement_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            local_replacement.to_str().unwrap(),
+            "-o",
+            local_replacement_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        local_replacement_result.status.success(),
+        "IMPORT, NONE must permit an explicit BLOCK-local replacement: {}",
+        String::from_utf8_lossy(&local_replacement_result.stderr)
+    );
+
+    let cases = [
+        (
+            "only_hidden",
+            "program p\n  implicit none\n  integer, parameter :: visible = 1, hidden = 2\n  block\n    import, only: visible\n    integer :: value\n    value = hidden\n  end block\nend program\n",
+            "host entity 'hidden' is not accessible under this IMPORT policy",
+        ),
+        (
+            "none_hidden",
+            "program p\n  implicit none\n  integer, parameter :: hidden = 2\n  block\n    import, none\n    print *, hidden\n  end block\nend program\n",
+            "host entity 'hidden' is not accessible under this IMPORT policy",
+        ),
+        (
+            "named_collision",
+            "program p\n  implicit none\n  integer :: visible\n  block\n    import :: visible\n    integer :: visible\n  end block\nend program\n",
+            "conflicts with an explicitly imported host entity",
+        ),
+        (
+            "use_collision",
+            "module provider\n  integer :: visible\nend module\nprogram p\n  use provider, only: imported_visible => visible\n  implicit none\n  integer :: visible\n  block\n    use provider, only: visible\n    import :: visible\n  end block\nend program\n",
+            "conflicts with an explicitly imported host entity",
+        ),
+        (
+            "nested_hidden",
+            "program p\n  implicit none\n  integer :: hidden\n  block\n    import, none\n    block\n      import :: hidden\n      print *, hidden\n    end block\n  end block\nend program\n",
+            "IMPORT name 'hidden' does not identify a host entity",
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(&format!("block_import_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(!result.status.success(), "case {label} should fail");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "case {label}: {stderr}");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let _ = std::fs::remove_file(&accepted_out);
+    let _ = std::fs::remove_file(&accepted);
+    let _ = std::fs::remove_file(&local_replacement_out);
+    let _ = std::fs::remove_file(&local_replacement);
+}
+
+#[test]
+fn block_use_bindings_shadow_and_restore_host_entities() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_use_bindings_shadow_and_restore_host_entities count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let module_dir = unique_dir("block_use_modules");
+    let src = write_program(
+        r#"
+module block_provider
+  implicit none
+  integer :: direct = 2, remote = 3
+  integer, parameter :: wide_kind = 8
+end module
+module block_facade
+  use block_provider, only: reexport => direct
+  implicit none
+  public :: reexport
+end module
+module block_outer_procedures
+contains
+  integer function pick()
+    pick = 1
+  end function
+end module
+module block_inner_procedures
+contains
+  integer function pick()
+    pick = 2
+  end function
+end module
+program p
+  use block_outer_procedures, only: pick
+  implicit none
+  integer :: direct = 1, renamed = 1, reexport = 1
+  block
+    use block_provider, only: direct
+    import, none
+    if (direct /= 2) stop 1
+  end block
+  if (direct /= 1) stop 2
+  block
+    use block_provider, only: renamed => remote
+    import, none
+    if (renamed /= 3) stop 3
+  end block
+  if (renamed /= 1) stop 4
+  block
+    use block_facade, only: reexport
+    import, none
+    if (reexport /= 2) stop 5
+  end block
+  if (reexport /= 1) stop 6
+  block
+    use block_provider, only: wide_kind
+    import, none
+    integer(wide_kind) :: wide
+    if (storage_size(wide) /= 64) stop 7
+  end block
+  block
+    use block_inner_procedures, only: pick
+    import, none
+    if (pick() /= 2) stop 8
+  end block
+  if (pick() /= 1) stop 9
+end program
+"#,
+        "f90",
+    );
+    let exe = unique_path("block_use_shadow", "exe");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK-local USE program must compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&exe).output().expect("run failed to spawn");
+    assert!(
+        run.status.success(),
+        "BLOCK-local USE bindings must shadow and restore host entities: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&exe);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_dir_all(&module_dir);
+}
+
+#[test]
+fn submodule_import_controls_parent_access_and_protection() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_import_controls_parent_access_and_protection count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let module_dir = unique_dir("submodule_import_modules");
+
+    let accepted = write_program(
+        "module import_parent\n  implicit none\n  integer, parameter :: visible = 1, hidden = 2\n  interface\n    module subroutine run(value)\n      integer, intent(out) :: value\n    end subroutine\n  end interface\nend module\nsubmodule(import_parent) import_child\n  import :: visible\ncontains\n  module subroutine run(value)\n    integer, intent(out) :: value\n    value = visible + hidden\n  end subroutine\nend submodule\n",
+        "f90",
+    );
+    let accepted_out = unique_path("submodule_named_import", "o");
+    let accepted_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            accepted.to_str().unwrap(),
+            "-o",
+            accepted_out.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        accepted_result.status.success(),
+        "named submodule IMPORT must not narrow parent access: {}",
+        String::from_utf8_lossy(&accepted_result.stderr)
+    );
+
+    let inherited = write_program(
+        "module import_provider\n  integer, parameter :: inherited = 3\nend module\nmodule import_parent\n  use import_provider, only: inherited\n  interface\n    module subroutine run(value)\n      integer, intent(out) :: value\n    end subroutine\n  end interface\nend module\nsubmodule(import_parent) import_child\n  import, only: inherited\ncontains\n  module subroutine run(value)\n    integer, intent(out) :: value\n    value = inherited\n  end subroutine\nend submodule\n",
+        "f90",
+    );
+    let inherited_out = unique_path("submodule_inherited_import", "o");
+    let inherited_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            inherited.to_str().unwrap(),
+            "-o",
+            inherited_out.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        inherited_result.status.success(),
+        "ONLY must expose a use-associated parent entity: {}",
+        String::from_utf8_lossy(&inherited_result.stderr)
+    );
+
+    let descendant = write_program(
+        "module import_parent\n  integer, parameter :: visible = 1, hidden = 2\nend module\nsubmodule(import_parent) parent_child\n  import, only: visible\nend submodule\nsubmodule(import_parent:parent_child) grandchild\n  import, only: visible\nend submodule\n",
+        "f90",
+    );
+    let descendant_out = unique_path("descendant_submodule_import", "o");
+    let descendant_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            descendant.to_str().unwrap(),
+            "-o",
+            descendant_out.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        descendant_result.status.success(),
+        "a descendant must import from an in-memory parent submodule: {}",
+        String::from_utf8_lossy(&descendant_result.stderr)
+    );
+
+    let qualified_descendant = write_program(
+        "module first_parent\n  integer, parameter :: first_value = 1\nend module\nmodule second_parent\n  integer, parameter :: second_value = 2\nend module\nsubmodule(second_parent) shared_parent\n  import, only: second_value\nend submodule\nsubmodule(first_parent) shared_parent\n  import, only: first_value\nend submodule\nsubmodule(second_parent:shared_parent) selected_descendant\n  import, only: second_value\nend submodule\n",
+        "f90",
+    );
+    let qualified_descendant_out = unique_path("qualified_descendant_submodule_import", "o");
+    let qualified_descendant_result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            qualified_descendant.to_str().unwrap(),
+            "-o",
+            qualified_descendant_out.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        qualified_descendant_result.status.success(),
+        "a descendant must select its ancestor-qualified parent scope: {}",
+        String::from_utf8_lossy(&qualified_descendant_result.stderr)
+    );
+
+    let cases = [
+        (
+            "none",
+            "module import_parent\nend module\nsubmodule(import_parent) import_child\n  import, none\nend submodule\n",
+            "IMPORT, NONE is not permitted in a submodule",
+        ),
+        (
+            "only_hidden",
+            "module import_parent\n  integer, parameter :: visible = 1, hidden = 2\n  interface\n    module subroutine run(value)\n      integer, intent(out) :: value\n    end subroutine\n  end interface\nend module\nsubmodule(import_parent) import_child\n  import, only: visible\ncontains\n  module subroutine run(value)\n    integer, intent(out) :: value\n    integer(hidden) :: local\n    local = 0\n    value = visible\n  end subroutine\nend submodule\n",
+            "host entity 'hidden' is not accessible under this IMPORT policy",
+        ),
+        (
+            "local_collision",
+            "module import_parent\n  integer :: visible\nend module\nsubmodule(import_parent) import_child\n  import, all\n  integer :: visible\nend submodule\n",
+            "conflicts with an explicitly imported host entity",
+        ),
+        (
+            "use_collision",
+            "module provider\n  integer :: visible\nend module\nmodule import_parent\n  integer :: visible\nend module\nsubmodule(import_parent) import_child\n  use provider, only: visible\n  import :: visible\nend submodule\n",
+            "USE association 'visible' conflicts with an explicitly imported host entity",
+        ),
+        (
+            "descendant_hidden",
+            "module import_parent\n  integer, parameter :: visible = 1, hidden = 2\nend module\nsubmodule(import_parent) parent_child\n  import, only: visible\nend submodule\nsubmodule(import_parent:parent_child) grandchild\n  import :: hidden\nend submodule\n",
+            "IMPORT name 'hidden' does not identify a host entity",
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(&format!("submodule_import_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "-J",
+                module_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(!result.status.success(), "case {label} should fail");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "case {label}: {stderr}");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let _ = std::fs::remove_file(&accepted_out);
+    let _ = std::fs::remove_file(&accepted);
+    let _ = std::fs::remove_file(&inherited_out);
+    let _ = std::fs::remove_file(&inherited);
+    let _ = std::fs::remove_file(&descendant_out);
+    let _ = std::fs::remove_file(&descendant);
+    let _ = std::fs::remove_file(&qualified_descendant_out);
+    let _ = std::fs::remove_file(&qualified_descendant);
+    let _ = std::fs::remove_dir_all(&module_dir);
+}
+
+#[test]
+fn submodule_use_replaces_hidden_parent_parameter() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_use_replaces_hidden_parent_parameter count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let module_dir = unique_dir("submodule_parameter_modules");
+    let src = write_program(
+        r#"
+module parameter_provider
+  implicit none
+  integer, parameter :: hidden = 8
+end module
+module parameter_parent
+  implicit none
+  integer, parameter :: visible = 1, hidden = 4
+  interface
+    module subroutine measure(bits)
+      integer, intent(out) :: bits
+    end subroutine
+  end interface
+end module
+submodule(parameter_parent) parameter_child
+  use parameter_provider, only: hidden
+  import, only: visible
+contains
+  module subroutine measure(bits)
+    integer, intent(out) :: bits
+    integer(hidden) :: value
+    bits = storage_size(value)
+  end subroutine
+end submodule
+program p
+  use parameter_parent, only: measure
+  implicit none
+  integer :: bits
+  call measure(bits)
+  if (bits /= 64) stop 1
+end program
+"#,
+        "f90",
+    );
+    let exe = unique_path("submodule_parameter_replacement", "exe");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "submodule-local USE replacement must compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&exe).output().expect("run failed to spawn");
+    assert!(
+        run.status.success(),
+        "submodule-local USE parameter must control layout: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&exe);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_dir_all(&module_dir);
+}
+
+#[test]
 fn internal_import_controls_host_access_without_narrowing_named_form() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

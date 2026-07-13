@@ -15,6 +15,26 @@ use super::core::{
     LOADED_EXTERNAL_MODULES,
 };
 
+fn add_use_association(
+    st: &mut SymbolTable,
+    association: UseAssociation,
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    if !association.local_name.is_empty()
+        && st.current_use_name_conflicts_with_import(&association.local_name)
+    {
+        return Err(SemaError {
+            span,
+            msg: format!(
+                "USE association '{}' conflicts with an explicitly imported host entity",
+                association.local_name
+            ),
+        });
+    }
+    st.add_use_association(association);
+    Ok(())
+}
+
 pub(super) fn process_uses(
     st: &mut SymbolTable,
     uses: &[SpannedDecl],
@@ -46,31 +66,43 @@ pub(super) fn process_uses(
                     for item in only_items {
                         match item {
                             OnlyItem::Name(name) => {
-                                st.add_use_association(UseAssociation {
-                                    local_name: name.clone(),
-                                    original_name: name.clone(),
-                                    source_scope: mod_scope,
-                                    is_submodule_access: false,
-                                    from_bare_use: false,
-                                });
+                                add_use_association(
+                                    st,
+                                    UseAssociation {
+                                        local_name: name.clone(),
+                                        original_name: name.clone(),
+                                        source_scope: mod_scope,
+                                        is_submodule_access: false,
+                                        from_bare_use: false,
+                                    },
+                                    use_decl.span,
+                                )?;
                             }
                             OnlyItem::Generic(name) => {
-                                st.add_use_association(UseAssociation {
-                                    local_name: name.clone(),
-                                    original_name: name.clone(),
-                                    source_scope: mod_scope,
-                                    is_submodule_access: false,
-                                    from_bare_use: false,
-                                });
+                                add_use_association(
+                                    st,
+                                    UseAssociation {
+                                        local_name: name.clone(),
+                                        original_name: name.clone(),
+                                        source_scope: mod_scope,
+                                        is_submodule_access: false,
+                                        from_bare_use: false,
+                                    },
+                                    use_decl.span,
+                                )?;
                             }
                             OnlyItem::Rename(rename) => {
-                                st.add_use_association(UseAssociation {
-                                    local_name: rename.local.clone(),
-                                    original_name: rename.remote.clone(),
-                                    source_scope: mod_scope,
-                                    is_submodule_access: false,
-                                    from_bare_use: false,
-                                });
+                                add_use_association(
+                                    st,
+                                    UseAssociation {
+                                        local_name: rename.local.clone(),
+                                        original_name: rename.remote.clone(),
+                                        source_scope: mod_scope,
+                                        is_submodule_access: false,
+                                        from_bare_use: false,
+                                    },
+                                    use_decl.span,
+                                )?;
                             }
                         }
                     }
@@ -81,13 +113,17 @@ pub(super) fn process_uses(
                     // local symbols. Empty façade modules such as
                     // stdlib_sparse re-export through their USE chain; without
                     // this edge the consumer has no source scope to walk.
-                    st.add_use_association(UseAssociation {
-                        local_name: String::new(),
-                        original_name: String::new(),
-                        source_scope: mod_scope,
-                        is_submodule_access: false,
-                        from_bare_use: true,
-                    });
+                    add_use_association(
+                        st,
+                        UseAssociation {
+                            local_name: String::new(),
+                            original_name: String::new(),
+                            source_scope: mod_scope,
+                            is_submodule_access: false,
+                            from_bare_use: true,
+                        },
+                        use_decl.span,
+                    )?;
                     let mod_symbols: Vec<(String, String)> = st
                         .scope(mod_scope)
                         .symbols
@@ -96,25 +132,33 @@ pub(super) fn process_uses(
                         .map(|(key, sym)| (sym.name.clone(), key.clone()))
                         .collect();
                     for (name, _key) in &mod_symbols {
-                        st.add_use_association(UseAssociation {
-                            local_name: name.clone(),
-                            original_name: name.clone(),
-                            source_scope: mod_scope,
-                            is_submodule_access: false,
-                            from_bare_use: true,
-                        });
+                        add_use_association(
+                            st,
+                            UseAssociation {
+                                local_name: name.clone(),
+                                original_name: name.clone(),
+                                source_scope: mod_scope,
+                                is_submodule_access: false,
+                                from_bare_use: true,
+                            },
+                            use_decl.span,
+                        )?;
                     }
                     // Apply renames. Renames inside a bare USE rebind a
                     // single name; the name itself is no longer bare so
                     // it doesn't extend transitive lookup.
                     for rename in renames {
-                        st.add_use_association(UseAssociation {
-                            local_name: rename.local.clone(),
-                            original_name: rename.remote.clone(),
-                            source_scope: mod_scope,
-                            is_submodule_access: false,
-                            from_bare_use: true,
-                        });
+                        add_use_association(
+                            st,
+                            UseAssociation {
+                                local_name: rename.local.clone(),
+                                original_name: rename.remote.clone(),
+                                source_scope: mod_scope,
+                                is_submodule_access: false,
+                                from_bare_use: true,
+                            },
+                            use_decl.span,
+                        )?;
                     }
                 }
             } else {

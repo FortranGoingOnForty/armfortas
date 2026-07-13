@@ -113,6 +113,8 @@ pub enum Stmt {
         /// These imports are scoped to the block body and do not leak
         /// into the enclosing procedure.
         uses: Vec<super::decl::SpannedDecl>,
+        /// IMPORT controls for host association within the BLOCK.
+        imports: Vec<super::unit::ImportStmt>,
         /// Interface blocks declared inside the BLOCK specification part.
         /// They are only visible within the block body.
         ifaces: Vec<super::unit::SpannedUnit>,

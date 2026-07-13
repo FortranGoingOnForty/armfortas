@@ -38,6 +38,7 @@ pub enum ProgramUnit {
         ancestor: Option<String>,
         name: String,
         uses: Vec<SpannedDecl>,
+        imports: Vec<ImportStmt>,
         decls: Vec<SpannedDecl>,
         contains: Vec<SpannedUnit>,
     },

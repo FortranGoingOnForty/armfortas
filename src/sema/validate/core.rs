@@ -166,11 +166,25 @@ struct BlockBindingAttrs {
     pointer: bool,
 }
 
+#[derive(Clone)]
+struct BlockImportControl {
+    policy: HostAssociationPolicy,
+    protection: HostImportProtection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LexicalHostVisibility {
+    Visible,
+    Hidden,
+    Missing,
+}
+
 enum AmbiguityLexicalFrame {
     Block {
         span: Span,
         uses: Vec<SpannedDecl>,
         bindings: HashSet<String>,
+        import_control: BlockImportControl,
     },
     Associate {
         bindings: HashSet<String>,
@@ -2419,6 +2433,26 @@ fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>)
             Decl::ParameterStmt { pairs } => {
                 out.extend(pairs.iter().map(|(name, _)| name.to_lowercase()));
             }
+            Decl::DerivedTypeDef { name, .. } => {
+                out.insert(name.to_lowercase());
+            }
+            Decl::EnumDef {
+                type_name,
+                enumerators,
+            } => {
+                out.extend(type_name.iter().map(|name| name.to_lowercase()));
+                out.extend(enumerators.iter().map(|(name, _)| name.to_lowercase()));
+            }
+            Decl::EnumerationTypeDef { name, enumerators } => {
+                out.insert(name.to_lowercase());
+                out.extend(enumerators.iter().map(|name| name.to_lowercase()));
+            }
+            Decl::AttributeStmt { entities, .. } => {
+                out.extend(entities.iter().map(|name| name.to_lowercase()));
+            }
+            Decl::CommonBlock { vars, .. } => {
+                out.extend(vars.iter().map(|name| name.to_lowercase()));
+            }
             _ => {}
         }
     }
@@ -2955,9 +2989,229 @@ fn block_use_associations_for_name(
     associations
 }
 
+fn lexical_host_visibility(ctx: &Ctx<'_>, name: &str) -> LexicalHostVisibility {
+    let key = name.to_lowercase();
+    let mut hidden = false;
+    for frame in ctx.ambiguity_lexical_frames.iter().rev() {
+        match frame {
+            AmbiguityLexicalFrame::Associate { bindings } => {
+                if bindings.contains(&key) {
+                    return if hidden {
+                        LexicalHostVisibility::Hidden
+                    } else {
+                        LexicalHostVisibility::Visible
+                    };
+                }
+            }
+            AmbiguityLexicalFrame::Block {
+                uses,
+                bindings,
+                import_control,
+                ..
+            } => {
+                let associations = block_use_associations_for_name(ctx.st, uses, &key);
+                let use_binding = ctx.st.use_associations_bind_name(&associations, &key)
+                    || ctx
+                        .st
+                        .use_ambiguity_from_associations(ctx.scope_id, &key, &associations, true)
+                        .is_some();
+                if bindings.contains(&key) || use_binding {
+                    return if hidden {
+                        LexicalHostVisibility::Hidden
+                    } else {
+                        LexicalHostVisibility::Visible
+                    };
+                }
+                if !import_control.policy.allows(&key) {
+                    hidden = true;
+                }
+            }
+        }
+    }
+
+    let symbol_exists = ctx.st.lookup_in(ctx.scope_id, &key).is_some()
+        || ctx
+            .st
+            .named_interface_facet_symbol_in_scope(ctx.scope_id, &key)
+            .is_some();
+    if symbol_exists {
+        return if hidden {
+            LexicalHostVisibility::Hidden
+        } else {
+            LexicalHostVisibility::Visible
+        };
+    }
+    if hidden
+        && ctx
+            .st
+            .inaccessible_host_symbol(ctx.scope_id, &key, true)
+            .is_some()
+    {
+        LexicalHostVisibility::Hidden
+    } else {
+        LexicalHostVisibility::Missing
+    }
+}
+
+fn collect_block_use_binding_names(
+    st: &SymbolTable,
+    uses: &[SpannedDecl],
+    out: &mut HashSet<String>,
+) {
+    use crate::ast::decl::OnlyItem;
+
+    for use_decl in uses {
+        let Decl::UseStmt {
+            module,
+            renames,
+            only,
+            ..
+        } = &use_decl.node
+        else {
+            continue;
+        };
+        if let Some(items) = only {
+            out.extend(items.iter().map(|item| match item {
+                OnlyItem::Name(name) | OnlyItem::Generic(name) => name.to_lowercase(),
+                OnlyItem::Rename(rename) => rename.local.to_lowercase(),
+            }));
+            continue;
+        }
+
+        out.extend(renames.iter().map(|rename| rename.local.to_lowercase()));
+        let renamed_remote: HashSet<String> = renames
+            .iter()
+            .map(|rename| rename.remote.to_lowercase())
+            .collect();
+        let Some(source_scope) = st.find_module_scope(module) else {
+            continue;
+        };
+        let source = st.scope(source_scope);
+        for symbol in source.symbols.values() {
+            let key = symbol.name.to_lowercase();
+            if symbol.attrs.access != Access::Private && !renamed_remote.contains(&key) {
+                out.insert(key);
+            }
+        }
+        for association in &source.use_associations {
+            let key = association.local_name.to_lowercase();
+            if !key.is_empty()
+                && !renamed_remote.contains(&key)
+                && st.scope_exports_name(source_scope, &key)
+            {
+                out.insert(key);
+            }
+        }
+    }
+}
+
+fn validate_block_imports(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    block_name: Option<&str>,
+    uses: &[SpannedDecl],
+    imports: &[ImportStmt],
+    ifaces: &[SpannedUnit],
+    decls: &[SpannedDecl],
+) -> BlockImportControl {
+    let has_only = imports
+        .iter()
+        .any(|import| matches!(import, ImportStmt::Only(_)));
+    if has_only
+        && imports
+            .iter()
+            .any(|import| !matches!(import, ImportStmt::Only(_)))
+    {
+        ctx.error(
+            span,
+            "IMPORT, ONLY cannot be combined with another IMPORT form",
+        );
+    }
+    if imports.len() > 1
+        && imports
+            .iter()
+            .any(|import| matches!(import, ImportStmt::All | ImportStmt::None))
+    {
+        ctx.error(
+            span,
+            "IMPORT, ALL and IMPORT, NONE must be the only IMPORT statement in a scope",
+        );
+    }
+
+    let imported_names: HashSet<String> = imports
+        .iter()
+        .flat_map(|import| match import {
+            ImportStmt::Default(names) | ImportStmt::Only(names) => names.as_slice(),
+            ImportStmt::All | ImportStmt::None => &[],
+        })
+        .map(|name| name.to_lowercase())
+        .collect();
+    for name in &imported_names {
+        if lexical_host_visibility(ctx, name) != LexicalHostVisibility::Visible {
+            ctx.error(
+                span,
+                format!("IMPORT name '{}' does not identify a host entity", name),
+            );
+        }
+    }
+
+    let control = match imports {
+        [] => BlockImportControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::None,
+        },
+        [ImportStmt::All] => BlockImportControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::All,
+        },
+        [ImportStmt::None] => BlockImportControl {
+            policy: HostAssociationPolicy::None,
+            protection: HostImportProtection::None,
+        },
+        imports
+            if imports
+                .iter()
+                .all(|import| matches!(import, ImportStmt::Only(_))) =>
+        {
+            BlockImportControl {
+                policy: HostAssociationPolicy::Only(imported_names.clone()),
+                protection: HostImportProtection::Names(imported_names),
+            }
+        }
+        _ => BlockImportControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::Names(imported_names),
+        },
+    };
+
+    let mut bindings = HashSet::new();
+    collect_block_binding_names(decls, &mut bindings);
+    extend_declared_names_from_ifaces(&mut bindings, ifaces);
+    collect_block_use_binding_names(ctx.st, uses, &mut bindings);
+    if let Some(name) = block_name {
+        bindings.insert(name.to_lowercase());
+    }
+    for name in bindings {
+        if control.protection.protects(&name)
+            && lexical_host_visibility(ctx, &name) == LexicalHostVisibility::Visible
+        {
+            ctx.error(
+                span,
+                format!(
+                    "BLOCK entity '{}' conflicts with an explicitly imported host entity",
+                    name
+                ),
+            );
+        }
+    }
+
+    control
+}
+
 fn validate_block_use_ambiguities(
     ctx: &mut Ctx<'_>,
     block_span: Span,
+    import_control: &BlockImportControl,
     uses: &[SpannedDecl],
     ifaces: &[SpannedUnit],
     implicit: &[SpannedDecl],
@@ -2994,6 +3248,26 @@ fn validate_block_use_ambiguities(
             block_binding_found = true;
         }
 
+        if block_ambiguity.is_none()
+            && !block_binding_found
+            && !(allow_generic_merge && is_intrinsic_name(&reference.name))
+        {
+            let host_visibility = lexical_host_visibility(ctx, &reference.name);
+            if host_visibility == LexicalHostVisibility::Hidden
+                || (host_visibility == LexicalHostVisibility::Visible
+                    && !import_control.policy.allows(&reference.name))
+            {
+                ctx.error(
+                    reference.span,
+                    format!(
+                        "host entity '{}' is not accessible under this IMPORT policy",
+                        reference.name
+                    ),
+                );
+                continue;
+            }
+        }
+
         if block_ambiguity.is_none() && !block_binding_found {
             for frame in ctx.ambiguity_lexical_frames.iter().rev() {
                 let (origin_span, frame_uses) = match frame {
@@ -3008,6 +3282,7 @@ fn validate_block_use_ambiguities(
                         span,
                         uses,
                         bindings,
+                        ..
                     } => {
                         if bindings.contains(&reference.name) {
                             block_binding_found = true;
@@ -4259,15 +4534,34 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_stmt(ctx, inner);
         }
         Stmt::Block {
+            name,
             uses,
+            imports,
             ifaces,
             implicit,
             decls,
             body,
-            ..
         } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
-            validate_block_use_ambiguities(ctx, stmt.span, uses, ifaces, implicit, decls, body);
+            let import_control = validate_block_imports(
+                ctx,
+                stmt.span,
+                name.as_deref(),
+                uses,
+                imports,
+                ifaces,
+                decls,
+            );
+            validate_block_use_ambiguities(
+                ctx,
+                stmt.span,
+                &import_control,
+                uses,
+                ifaces,
+                implicit,
+                decls,
+                body,
+            );
             validate_decls(ctx, uses);
             validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
@@ -4283,6 +4577,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     span: stmt.span,
                     uses: uses.clone(),
                     bindings: ambiguity_bindings,
+                    import_control,
                 });
             ctx.block_decl_frames.push(frame);
             validate_stmts(ctx, body);
@@ -8543,6 +8838,7 @@ end subroutine
                 ancestor: None,
                 name: "child_mod".into(),
                 uses: vec![],
+                imports: vec![],
                 decls: vec![],
                 contains: vec![],
             },
