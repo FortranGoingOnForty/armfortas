@@ -46872,6 +46872,65 @@ fn amod_result_name_prefers_header_result_over_same_typed_locals() {
 }
 
 #[test]
+fn amod_result_bounds_follow_selected_result_deterministically() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=amod_result_bounds_follow_selected_result_deterministically count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("amod_result_bounds_determinism");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_programs/defined_unary_array_result_assignment.f90");
+    let expected_record = "@function flip_matrix -> real, result_rank=2, result_name=out, result_array_bounds=\"(size(a, 2); size(a, 1))\"";
+    let mut first_amod = None;
+
+    for iteration in 0..16 {
+        let obj = dir.join(format!("result_bounds_{iteration}.o"));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-O0",
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                source.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("result-bounds determinism compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "result-bounds compile failed on iteration {iteration}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let amod = fs::read_to_string(dir.join("defined_unary_array_result_assignment_m.amod"))
+            .expect("missing result-bounds .amod");
+        let record = amod
+            .lines()
+            .find(|line| line.starts_with("@function flip_matrix"));
+        assert_eq!(
+            record,
+            Some(expected_record),
+            "wrong result interface on iteration {iteration}"
+        );
+        if let Some(first) = &first_amod {
+            assert_eq!(
+                &amod, first,
+                "result interface changed across fresh compiler processes"
+            );
+        } else {
+            first_amod = Some(amod);
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn f2008_submodule_explicit_iface_smp_body_with_runtime_shape_result() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

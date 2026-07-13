@@ -808,7 +808,7 @@ fn emit_procedure(
         // had a `result(X)` clause). Submodule bodies that reference the
         // result by its declared name need this preserved across the
         // .amod boundary so sema can register the right symbol.
-        let result_var_name: Option<String> = st
+        let result_var: Option<&Symbol> = st
             .scopes
             .iter()
             .find(|s| {
@@ -882,11 +882,11 @@ fn emit_procedure(
                     .into_iter()
                     .next()
                     .or_else(|| fallback_candidates.into_iter().next())
-                    .map(|(_, sym)| sym.name.clone())
+                    .map(|(_, candidate)| candidate)
             });
-        if let Some(result_var_name) = result_var_name {
-            if !result_var_name.eq_ignore_ascii_case(name) {
-                write!(out, ", result_name={}", result_var_name).unwrap();
+        if let Some(result_var) = result_var {
+            if !result_var.name.eq_ignore_ascii_case(name) {
+                write!(out, ", result_name={}", result_var.name).unwrap();
             }
         }
         // Sprint35-SMP Phase 3: serialize the result variable's
@@ -896,39 +896,9 @@ fn emit_procedure(
         // `res(i) = …` lowers against an AssumedShape result and the
         // function prologue fails to allocate the runtime-shape buffer.
         if !sym.attrs.allocatable && !sym.attrs.pointer && sym.attrs.result_rank > 0 {
-            let bounds = st
-                .scopes
-                .iter()
-                .find(|s| {
-                    let matches_name = match &s.kind {
-                        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                            n.eq_ignore_ascii_case(name)
-                        }
-                        _ => false,
-                    };
-                    if !matches_name {
-                        return false;
-                    }
-                    let Some(parent_id) = s.parent else {
-                        return false;
-                    };
-                    parent_id == mod_scope_id
-                        || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
-                            && st.scope(parent_id).parent == Some(mod_scope_id)
-                })
-                .and_then(|pscope| {
-                    let arg_set: std::collections::HashSet<String> =
-                        pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                    pscope
-                        .symbols
-                        .iter()
-                        .find(|(key, sym)| {
-                            !arg_set.contains(*key)
-                                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-                        })
-                        .map(|(_, sym)| sym.attrs.array_spec.clone())
-                })
-                .and_then(|specs| stringify_array_bounds(&specs));
+            let bounds = result_var
+                .map(|result| &result.attrs.array_spec)
+                .and_then(|specs| stringify_array_bounds(specs));
             if let Some(s) = bounds {
                 write!(out, ", result_array_bounds=\"{}\"", s).unwrap();
             }
