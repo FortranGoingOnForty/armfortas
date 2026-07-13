@@ -22581,7 +22581,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         return;
     }
     // F2018 §11.2.2 (renamed USE) + §11.2.3 (submodules see host's USEs).
-    // Without `@use_rename` records, the .amod format collapses
+    // Without exact `@use_only` records, the .amod format collapses
     // `use stdlib_kinds, only: block_kind => int64` to just
     // `@uses stdlib_kinds`, so a submodule body that does
     // `integer(block_kind) :: dummy` cannot resolve `block_kind` after
@@ -29979,6 +29979,196 @@ fn empty_facade_module_reexports_public_use_associated_params_through_amod() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn amod_only_edges_preserve_filtered_reexports() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=amod_only_edges_preserve_filtered_reexports count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("amod_only_edges");
+    let base_src = write_program_in(
+        &dir,
+        "filtered_base.f90",
+        "module filtered_base\n  implicit none\n  integer, parameter :: visible = 7, remote = 8, excluded = 99\nend module\n",
+    );
+    let mixed_src = write_program_in(
+        &dir,
+        "mixed_base.f90",
+        "module mixed_base\n  implicit none\n  integer, parameter :: mixed_plain = 10, mixed_remote = 11\nend module\n",
+    );
+    let renamed_src = write_program_in(
+        &dir,
+        "renamed_base.f90",
+        "module renamed_base\n  implicit none\n  integer, parameter :: bare_only_remote = 12\nend module\n",
+    );
+    let facade_src = write_program_in(
+        &dir,
+        "filtered_facade.f90",
+        "module filtered_facade\n  use filtered_base, only: visible, alias => remote\n  use mixed_base\n  use mixed_base, only: mixed_alias => mixed_remote\n  use mixed_base, bare_alias => mixed_remote\n  use renamed_base, bare_only_alias => bare_only_remote\n  implicit none\nend module\n",
+    );
+    let allowed_src = write_program_in(
+        &dir,
+        "allowed.f90",
+        "program p\n  use filtered_facade\n  implicit none\n  if (visible /= 7) stop 1\n  if (alias /= 8) stop 2\n  if (mixed_plain /= 10) stop 3\n  if (mixed_alias /= 11) stop 4\n  if (bare_alias /= 11) stop 5\n  if (mixed_remote /= 11) stop 6\n  if (bare_only_alias /= 12) stop 7\nend program\n",
+    );
+    let excluded_src = write_program_in(
+        &dir,
+        "excluded.f90",
+        "program p\n  use filtered_facade\n  implicit none\n  print *, excluded\nend program\n",
+    );
+    let remote_src = write_program_in(
+        &dir,
+        "remote.f90",
+        "program p\n  use filtered_facade\n  implicit none\n  print *, remote\nend program\n",
+    );
+    let bare_only_remote_src = write_program_in(
+        &dir,
+        "bare_only_remote.f90",
+        "program p\n  use filtered_facade\n  implicit none\n  print *, bare_only_remote\nend program\n",
+    );
+
+    for (src, obj) in [
+        (&base_src, dir.join("filtered_base.o")),
+        (&mixed_src, dir.join("mixed_base.o")),
+        (&renamed_src, dir.join("renamed_base.o")),
+        (&facade_src, dir.join("filtered_facade.o")),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("filtered facade compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "filtered facade compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
+        .expect("missing filtered facade .amod");
+    assert!(facade_amod.starts_with("#!amod 5\n"), "{facade_amod}");
+    let use_records = |amod: &str| {
+        amod.lines()
+            .filter(|line| line.starts_with("@use"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let expected_records = vec![
+        "@uses mixed_base".to_string(),
+        "@uses mixed_base".to_string(),
+        "@uses renamed_base".to_string(),
+        "@use_only alias = remote from filtered_base".to_string(),
+        "@use_only mixed_alias = mixed_remote from mixed_base".to_string(),
+        "@use_only visible = visible from filtered_base".to_string(),
+        "@use_rename bare_alias = mixed_remote from mixed_base".to_string(),
+        "@use_rename bare_only_alias = bare_only_remote from renamed_base".to_string(),
+    ];
+    assert_eq!(
+        use_records(&facade_amod),
+        expected_records,
+        "dependency records were not serialized exactly"
+    );
+    assert!(
+        !facade_amod.contains("@uses filtered_base")
+            && !facade_amod.contains("@use_rename alias = remote from filtered_base"),
+        "ONLY-qualified dependency was also serialized as a bare edge:\n{facade_amod}"
+    );
+
+    for iteration in 0..3 {
+        let repeat_obj = dir.join(format!("filtered_facade_repeat_{iteration}.o"));
+        let repeat = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                facade_src.to_str().unwrap(),
+                "-o",
+                repeat_obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("repeated filtered facade compile failed to spawn");
+        assert!(
+            repeat.status.success(),
+            "repeated filtered facade compile failed: {}",
+            String::from_utf8_lossy(&repeat.stderr)
+        );
+        let repeated_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
+            .expect("missing repeated filtered facade .amod");
+        assert_eq!(
+            use_records(&repeated_amod),
+            expected_records,
+            "dependency record order changed on iteration {iteration}"
+        );
+    }
+
+    let allowed_obj = dir.join("allowed.o");
+    let allowed = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            allowed_src.to_str().unwrap(),
+            "-o",
+            allowed_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allowed filtered facade consumer failed to spawn");
+    assert!(
+        allowed.status.success(),
+        "recorded ONLY names must remain accessible: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    for (label, src) in [
+        ("excluded", &excluded_src),
+        ("remote", &remote_src),
+        ("bare_only_remote", &bare_only_remote_src),
+    ] {
+        let out = dir.join(format!("{label}.o"));
+        let denied = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("filtered facade rejection compile failed to spawn");
+        assert!(
+            !denied.status.success(),
+            "{label} must not leak through the serialized ONLY edge"
+        );
+        assert!(
+            String::from_utf8_lossy(&denied.stderr).contains(label),
+            "missing diagnostic for filtered name {label}: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -52247,7 +52437,7 @@ fn use_renamed_derived_local_copies_pointer_function_result() {
 
     let amod = fs::read_to_string(dir.join("facade_m.amod")).expect("missing facade_m.amod");
     assert!(
-        amod.contains("@use_rename json_object = toml_table from table_api"),
+        amod.contains("@use_only json_object = toml_table from table_api"),
         "facade .amod should preserve the derived type rename:\n{}",
         amod
     );

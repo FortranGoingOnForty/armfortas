@@ -1309,6 +1309,12 @@ impl SymbolTable {
                     if !self.association_allowed_from_scope(scope_id, assoc, key) {
                         continue;
                     }
+                    if assoc.from_bare_use
+                        && assoc.local_name == assoc.original_name
+                        && self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key)
+                    {
+                        continue;
+                    }
                     if assoc.is_submodule_access {
                         if let Some(sym) = self.scopes[assoc.source_scope]
                             .symbols
@@ -1344,6 +1350,9 @@ impl SymbolTable {
                     continue;
                 }
                 if assoc.local_name != assoc.original_name {
+                    continue;
+                }
+                if self.use_name_is_fully_renamed(scope_id, assoc.source_scope, key) {
                     continue;
                 }
                 if seen_use_scopes.contains(&assoc.source_scope) {
