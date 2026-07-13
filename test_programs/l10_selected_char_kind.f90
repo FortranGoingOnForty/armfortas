@@ -14,5 +14,5 @@ program l10_selected_char_kind
   print '(i0)', selected_char_kind(nm)
 ! CHECK: -1
   print '(i0)', selected_char_kind('iso_10646')
-! CHECK: 4
+! CHECK: -1
 end program l10_selected_char_kind

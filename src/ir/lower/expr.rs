@@ -3936,7 +3936,7 @@ pub(crate) fn lower_expr_full(
             b.const_i32(0) // fallback for unresolved component access
         }
 
-        Expr::ArrayConstructor { values, .. } => {
+        Expr::ArrayConstructor { values, type_spec } => {
             // Allocate a temporary stack array, store each literal
             // element into it, return the base pointer. Element
             // type is inferred from the first element's IR type
@@ -3950,7 +3950,9 @@ pub(crate) fn lower_expr_full(
             // routes through lower_array_assign for direct stores.
             let first_expr = first_array_constructor_expr(values);
             let first_ti =
-                first_array_constructor_type_info(values, Some(locals), st, type_layouts);
+                array_constructor_type_spec_info(type_spec.as_deref(), st).or_else(|| {
+                    first_array_constructor_type_info(values, Some(locals), st, type_layouts)
+                });
             let elem_ty = match first_ti.as_ref() {
                 Some(crate::sema::symtab::TypeInfo::Derived(name))
                 | Some(crate::sema::symtab::TypeInfo::Class(name)) => type_layouts

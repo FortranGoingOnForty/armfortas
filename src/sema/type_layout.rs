@@ -787,14 +787,12 @@ fn eval_const_int_expr(
                         return None;
                     };
                     if let Expr::StringLiteral { value, .. } = &e.node {
-                        let name = value.trim();
+                        let name = value.trim_end_matches(' ');
                         Some(
                             if name.eq_ignore_ascii_case("default")
                                 || name.eq_ignore_ascii_case("ascii")
                             {
                                 1
-                            } else if name.eq_ignore_ascii_case("iso_10646") {
-                                4
                             } else {
                                 -1
                             },

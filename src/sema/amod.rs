@@ -411,7 +411,7 @@ pub fn write_amod(
     }
 
     // ---- Procedures ----
-    let interface_specifics: BTreeSet<String> = syms
+    let interface_specifics: BTreeSet<String> = all_syms
         .iter()
         .filter(|(_, sym)| {
             matches!(sym.kind, SymbolKind::NamedInterface)
@@ -606,14 +606,14 @@ fn emit_variable(
             .map(|iface| format!("type({})", iface))
             .unwrap_or_else(|| "unknown".to_string())
     } else if let (
-        Some(TypeInfo::Character { len: None, .. }),
+        Some(TypeInfo::Character { len: None, kind }),
         Some(ModuleGlobalInfo {
             char_kind: crate::ir::lower::CharKind::Fixed(n),
             ..
         }),
     ) = (sym.type_info.as_ref(), global_info)
     {
-        format!("character(len={})", n)
+        character_type_to_string(Some(*n), *kind)
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
@@ -670,14 +670,14 @@ fn emit_parameter(
     let global_key = (mod_key.to_string(), name.to_lowercase());
     let global_info = globals.get(&global_key);
     let type_str = if let (
-        Some(TypeInfo::Character { len: None, .. }),
+        Some(TypeInfo::Character { len: None, kind }),
         Some(ModuleGlobalInfo {
             char_kind: crate::ir::lower::CharKind::Fixed(n),
             ..
         }),
     ) = (sym.type_info.as_ref(), global_info)
     {
-        format!("character(len={})", n)
+        character_type_to_string(Some(*n), *kind)
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
@@ -912,7 +912,7 @@ fn emit_procedure(
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
     }
-    if sym.attrs.access == Access::Private {
+    if !is_public(sym, st.scope(mod_scope_id)) {
         write!(out, ", private").unwrap();
     }
     if let Some(binding_label) = &sym.attrs.binding_label {
@@ -1357,15 +1357,20 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
             Some(k) => format!("logical({})", k),
             None => "logical".to_string(),
         },
-        Some(TypeInfo::Character { len, kind: _ }) => match len {
-            Some(n) => format!("character(len={})", n),
-            None => "character(len=:)".to_string(),
-        },
+        Some(TypeInfo::Character { len, kind }) => character_type_to_string(*len, *kind),
         Some(TypeInfo::Derived(name)) => format!("type({})", name),
         Some(TypeInfo::Class(name)) => format!("class({})", name),
         Some(TypeInfo::ClassStar) => "class(*)".to_string(),
         Some(TypeInfo::TypeStar) => "type(*)".to_string(),
         None => "unknown".to_string(),
+    }
+}
+
+fn character_type_to_string(len: Option<i64>, kind: Option<u8>) -> String {
+    let len = len.map_or_else(|| ":".to_string(), |len| len.to_string());
+    match kind {
+        Some(kind) => format!("character(len={len},kind={kind})"),
+        None => format!("character(len={len})"),
     }
 }
 
@@ -2463,27 +2468,21 @@ fn parse_type_info(s: &str) -> Option<TypeInfo> {
         return Some(TypeInfo::Logical { kind });
     }
     if s.starts_with("character") {
-        // character(len=N) or character(len=:)
+        let mut len = None;
+        let mut kind = None;
         if let Some(inner) = s
-            .strip_prefix("character(len=")
-            .and_then(|r| r.strip_suffix(')'))
+            .strip_prefix("character(")
+            .and_then(|rest| rest.strip_suffix(')'))
         {
-            if inner == ":" {
-                return Some(TypeInfo::Character {
-                    len: None,
-                    kind: None,
-                });
-            } else if let Ok(n) = inner.parse::<i64>() {
-                return Some(TypeInfo::Character {
-                    len: Some(n),
-                    kind: None,
-                });
+            for spec in inner.split(',').map(str::trim) {
+                if let Some(value) = spec.strip_prefix("len=") {
+                    len = (value != ":").then(|| value.parse::<i64>().ok()).flatten();
+                } else if let Some(value) = spec.strip_prefix("kind=") {
+                    kind = value.parse::<u8>().ok();
+                }
             }
         }
-        return Some(TypeInfo::Character {
-            len: None,
-            kind: None,
-        });
+        return Some(TypeInfo::Character { len, kind });
     }
     if let Some(inner) = s.strip_prefix("type(").and_then(|r| r.strip_suffix(')')) {
         return Some(TypeInfo::Derived(inner.to_string()));
@@ -2760,6 +2759,73 @@ mod tests {
     #[should_panic(expected = "malformed @dims")]
     fn parse_var_rejects_corrupt_dims() {
         parse_var("@var a : integer @dims 1:oops", false);
+    }
+
+    #[test]
+    fn character_kind_type_info_round_trips() {
+        for info in [
+            TypeInfo::Character {
+                len: Some(8),
+                kind: Some(4),
+            },
+            TypeInfo::Character {
+                len: None,
+                kind: Some(4),
+            },
+        ] {
+            let encoded = type_info_to_string(Some(&info));
+            assert_eq!(parse_type_info(&encoded), Some(info));
+            assert!(encoded.contains("kind=4"), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn legacy_character_type_info_keeps_unknown_kind() {
+        assert_eq!(
+            parse_type_info("character(len=8)"),
+            Some(TypeInfo::Character {
+                len: Some(8),
+                kind: None,
+            })
+        );
+        assert_eq!(
+            parse_type_info("character(len=:)"),
+            Some(TypeInfo::Character {
+                len: None,
+                kind: None,
+            })
+        );
+    }
+
+    #[test]
+    fn character_kind_survives_all_type_record_parsers() {
+        let var = parse_var("@var text : character(len=8,kind=4)", false);
+        assert_eq!(
+            var.type_info,
+            Some(TypeInfo::Character {
+                len: Some(8),
+                kind: Some(4),
+            })
+        );
+
+        let arg = parse_arg("  @arg text : character(len=:,kind=4), intent(in)");
+        assert_eq!(
+            arg.type_info,
+            Some(TypeInfo::Character {
+                len: None,
+                kind: Some(4),
+            })
+        );
+
+        let mut lines = "@end function\n".lines().peekable();
+        let proc = parse_proc("@function make_text -> character(len=8,kind=4)", &mut lines);
+        assert_eq!(
+            proc.return_type,
+            Some(TypeInfo::Character {
+                len: Some(8),
+                kind: Some(4),
+            })
+        );
     }
 
     #[test]

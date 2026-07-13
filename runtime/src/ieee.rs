@@ -224,6 +224,70 @@ pub extern "C" fn afs_ieee_copy_sign_r4(x: f32, y: f32) -> f32 {
     x.copysign(y)
 }
 
+#[no_mangle]
+pub extern "C" fn afs_fraction_r8(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    let significand = bits & 0x000f_ffff_ffff_ffff;
+    if exponent == 0x7ff {
+        return if significand == 0 { f64::NAN } else { x };
+    }
+    if exponent == 0 {
+        if significand == 0 {
+            return x;
+        }
+        let highest_bit = 63 - significand.leading_zeros();
+        let normalized = (significand << (52 - highest_bit)) & 0x000f_ffff_ffff_ffff;
+        return f64::from_bits((bits & (1 << 63)) | (1022_u64 << 52) | normalized);
+    }
+    f64::from_bits((bits & (1 << 63)) | (1022_u64 << 52) | (bits & 0x000f_ffff_ffff_ffff))
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fraction_r4(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exponent = (bits >> 23) & 0xff;
+    let significand = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        return if significand == 0 { f32::NAN } else { x };
+    }
+    if exponent == 0 {
+        if significand == 0 {
+            return x;
+        }
+        let highest_bit = 31 - significand.leading_zeros();
+        let normalized = (significand << (23 - highest_bit)) & 0x007f_ffff;
+        return f32::from_bits((bits & (1 << 31)) | (126_u32 << 23) | normalized);
+    }
+    f32::from_bits((bits & (1 << 31)) | (126_u32 << 23) | (bits & 0x007f_ffff))
+}
+
+#[no_mangle]
+pub extern "C" fn afs_exponent_r8(x: f64) -> i32 {
+    let bits = x.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let significand = bits & 0x000f_ffff_ffff_ffff;
+    match exponent {
+        0x7ff => i32::MAX,
+        0 if significand == 0 => 0,
+        0 => (63 - significand.leading_zeros()) as i32 - 1073,
+        _ => exponent - 1022,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_exponent_r4(x: f32) -> i32 {
+    let bits = x.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let significand = bits & 0x007f_ffff;
+    match exponent {
+        0xff => i32::MAX,
+        0 if significand == 0 => 0,
+        0 => (31 - significand.leading_zeros()) as i32 - 148,
+        _ => exponent - 126,
+    }
+}
+
 /// IEEE_LOGB(x): unbiased exponent as a real. logb(±0) = -inf,
 /// logb(±inf)=+inf, logb(nan)=nan (matches C logb / 60559 logB).
 #[no_mangle]
@@ -893,5 +957,27 @@ mod tests {
         assert!(afs_ieee_next_after_r8(1.0, 0.0) < 1.0);
         assert_eq!(afs_ieee_copy_sign_r8(3.0, -1.0), -3.0);
         assert_eq!(afs_ieee_scalb_r8(1.5, 3), 12.0);
+    }
+
+    #[test]
+    fn fraction_and_exponent_cover_model_edges() {
+        assert_eq!(afs_fraction_r8(3.0), 0.75);
+        assert_eq!(afs_fraction_r8(-6.5), -0.8125);
+        assert_eq!(afs_exponent_r8(3.0), 2);
+        assert_eq!(afs_exponent_r8(-6.5), 3);
+
+        let subnormal_r8 = f64::from_bits(1);
+        assert_eq!(afs_fraction_r8(subnormal_r8), 0.5);
+        assert_eq!(afs_exponent_r8(subnormal_r8), -1073);
+        let subnormal_r4 = f32::from_bits(1);
+        assert_eq!(afs_fraction_r4(subnormal_r4), 0.5);
+        assert_eq!(afs_exponent_r4(subnormal_r4), -148);
+
+        assert_eq!(afs_fraction_r8(-0.0).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(afs_exponent_r8(-0.0), 0);
+        assert!(afs_fraction_r8(f64::INFINITY).is_nan());
+        assert!(afs_fraction_r8(f64::NAN).is_nan());
+        assert_eq!(afs_exponent_r8(f64::INFINITY), i32::MAX);
+        assert_eq!(afs_exponent_r8(f64::NAN), i32::MAX);
     }
 }

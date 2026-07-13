@@ -1268,6 +1268,14 @@ mod tests {
     }
 
     #[test]
+    fn selected_char_kind_ignores_only_trailing_blanks() {
+        assert_eq!(afs_selected_char_kind(b"ASCII   ".as_ptr(), 8), 1);
+        assert_eq!(afs_selected_char_kind(b" ASCII".as_ptr(), 6), -1);
+        assert_eq!(afs_selected_char_kind(b"\tASCII".as_ptr(), 6), -1);
+        assert_eq!(afs_selected_char_kind(b"ASCII\t".as_ptr(), 6), -1);
+    }
+
+    #[test]
     fn lge_lgt_lle_llt() {
         assert_eq!(afs_lge(b"b".as_ptr(), 1, b"a".as_ptr(), 1), 1);
         assert_eq!(afs_lgt(b"b".as_ptr(), 1, b"a".as_ptr(), 1), 1);
@@ -1278,10 +1286,10 @@ mod tests {
     }
 }
 
-/// SELECTED_CHAR_KIND (F2003 16.9.180): DEFAULT/ASCII are kind 1;
-/// ISO_10646 answers 4 to match the constant-fold path, though UCS-4
-/// character DATA is not implemented; anything else is -1. Trailing
-/// blanks in the name are insignificant.
+/// SELECTED_CHAR_KIND (F2003 16.9.180): DEFAULT/ASCII are kind 1.
+/// Other character sets return -1 because the byte-oriented runtime
+/// does not implement another character kind. Trailing blanks in the
+/// name are insignificant.
 #[no_mangle]
 pub extern "C" fn afs_selected_char_kind(ptr: *const u8, len: i64) -> i32 {
     let s: &[u8] = if ptr.is_null() || len <= 0 {
@@ -1290,11 +1298,9 @@ pub extern "C" fn afs_selected_char_kind(ptr: *const u8, len: i64) -> i32 {
         unsafe { std::slice::from_raw_parts(ptr, len as usize) }
     };
     let name = String::from_utf8_lossy(s);
-    let name = name.trim();
+    let name = name.trim_end_matches(' ');
     if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
         1
-    } else if name.eq_ignore_ascii_case("iso_10646") {
-        4
     } else {
         -1
     }

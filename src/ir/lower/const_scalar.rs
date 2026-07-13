@@ -57,11 +57,9 @@ pub(super) fn parse_boz_const_scalar(
 }
 
 pub(super) fn selected_char_kind_value(name: &str) -> i128 {
-    let name = name.trim();
+    let name = name.trim_end_matches(' ');
     if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
         1
-    } else if name.eq_ignore_ascii_case("iso_10646") {
-        4
     } else {
         -1
     }

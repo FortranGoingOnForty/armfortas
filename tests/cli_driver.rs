@@ -239,6 +239,187 @@ fn cpp_input_is_rejected_before_fortran_preprocessing() {
 }
 
 #[test]
+fn incompatible_intrinsic_assignment_is_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=incompatible_intrinsic_assignment_is_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("assignment_type");
+    let src = write_program_in(
+        &dir,
+        "assignment_type.f90",
+        "program assignment_type\n  implicit none\n  integer :: value\n  value = .true.\n  print *, value\nend program assignment_type\n",
+    );
+    let output = dir.join("assignment_type.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assignment compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "incompatible intrinsic assignment must fail"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("intrinsic assignment cannot convert LOGICAL(4) to INTEGER(4)"),
+        "missing assignment type diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn class_star_defined_assignment_accepts_concrete_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_defined_assignment_accepts_concrete_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_any\n  end interface\n  type(box_t) :: box\n  box = 41\n  if (box%value /= 42) error stop 1\n  print *, 'ok'\ncontains\n  subroutine assign_any(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    class(*), intent(in) :: rhs\n    select type (rhs)\n    type is (integer)\n      lhs%value = rhs + 1\n    class default\n      error stop 2\n    end select\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class(*) defined-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class(*) defined-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class(*) defined-assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "class(*) defined assignment: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn typed_array_constructor_uses_local_kind_for_defined_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_array_constructor_uses_local_kind_for_defined_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: k = 8\n  type :: box_t\n    integer(8) :: total = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_values\n  end interface\n  type(box_t) :: box\n  box = [integer(kind=k) :: 1, 2]\n  if (box%total /= 3_8) error stop 1\n  print *, 'ok'\ncontains\n  subroutine assign_values(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer(8), intent(in) :: rhs(:)\n    lhs%total = sum(rhs)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("typed_constructor_local_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("typed constructor defined-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed constructor defined-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("typed constructor defined-assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "typed constructor defined assignment: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn mixed_type_untyped_array_constructor_is_rejected() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: values(2)\n  values = [1, .true.]\nend program\n",
+        "f90",
+    );
+    let out = unique_path("mixed_array_constructor", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed array-constructor compile failed to spawn");
+    assert!(
+        !compile.status.success()
+            && String::from_utf8_lossy(&compile.stderr)
+                .contains("array constructor element type mismatch"),
+        "mixed array constructor was not rejected: status={:?} stdout={} stderr={}",
+        compile.status,
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_use_kind_controls_character_assignment_compatibility() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_use_kind_controls_character_assignment_compatibility count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "module block_kinds\n  implicit none\n  integer, parameter :: wide_character = 2\nend module\nprogram p\n  implicit none\n  block\n    use block_kinds, only: wide_character\n    character(kind=wide_character + 0) :: text\n    text = 'x'\n  end block\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_use_character_kind", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK kind assignment compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "a BLOCK-local imported character kind must affect assignment validation"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("intrinsic assignment cannot convert CHARACTER(1) to CHARACTER(2)"),
+        "missing BLOCK-local character kind diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_f_procpointer_associates_c_funptr_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -16749,6 +16930,191 @@ fn block_interface_declares_callable_under_implicit_none() {
 }
 
 #[test]
+fn block_local_defined_assignment_dispatches() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_defined_assignment_dispatches count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  type(box_t) :: box\n  block\n    interface assignment(=)\n      procedure :: assign_integer\n    end interface\n    box = 7\n  end block\n  if (box%value /= 7) error stop 1\n  print *, 'ok'\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK defined-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK defined-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("BLOCK defined-assignment run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "BLOCK defined-assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_defined_assignment_restores_host_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_defined_assignment_restores_host_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_logical\n  end interface\n  type(box_t) :: box\n  block\n    interface assignment(=)\n      procedure :: assign_integer\n    end interface\n    box = 7\n  end block\n  if (box%value /= 7) error stop 1\n  box = .true.\n  if (box%value /= 11) error stop 2\n  print *, 'ok'\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\n  subroutine assign_logical(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    logical, intent(in) :: rhs\n    lhs%value = merge(11, 0, rhs)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_defined_assignment_restore", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK defined-assignment restoration compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK defined-assignment restoration compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("BLOCK defined-assignment restoration run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "BLOCK defined-assignment restoration run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_generic_restores_intrinsic_after_exit() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_generic_restores_intrinsic_after_exit count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  block\n    interface scale\n      procedure :: local_scale\n    end interface\n    if (scale(2) /= 42) error stop 1\n  end block\n  if (scale(3.0, 2) /= 12.0) error stop 2\n  print *, 'ok'\ncontains\n  integer function local_scale(value)\n    integer, intent(in) :: value\n    local_scale = 42 + value - value\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_generic_intrinsic_restore", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK intrinsic restoration compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK intrinsic restoration compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("BLOCK intrinsic restoration run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "BLOCK intrinsic restoration run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_candidates_keep_duplicate_specific_owners() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_candidates_keep_duplicate_specific_owners count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module integer_host\n  implicit none\n  interface choose\n    module procedure pick\n  end interface\ncontains\n  integer function pick(value)\n    integer, intent(in) :: value\n    pick = value\n  end function\nend module\nmodule logical_host\n  implicit none\n  interface choose\n    module procedure pick\n  end interface\ncontains\n  function pick(value) result(values)\n    logical, intent(in) :: value\n    logical :: values(2)\n    values = value\n  end function\nend module\nprogram p\n  use integer_host, only: choose\n  use logical_host, only: choose\n  implicit none\n  logical :: values(2)\n  values = choose(.true.)\n  if (.not. all(values)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_duplicate_specific_owners", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("duplicate generic owner compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "duplicate generic owner compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("duplicate generic owner run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "duplicate generic owner run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn same_name_generic_facet_uses_selected_result_metadata() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_generic_facet_uses_selected_result_metadata count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module same_name_host\n  implicit none\n  interface pick\n    module procedure pick\n    module procedure pick_logical\n  end interface\ncontains\n  integer function pick(value)\n    integer, intent(in) :: value\n    pick = value\n  end function\n  function pick_logical(value) result(values)\n    logical, intent(in) :: value\n    logical :: values(2)\n    values = value\n  end function\nend module\nprogram p\n  use same_name_host, only: pick\n  implicit none\n  logical :: values(2)\n  values = pick(.true.)\n  if (.not. all(values)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("same_name_generic_result_metadata", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("same-name generic run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "same-name generic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn named_block_exit_after_deferred_char_assignment_skips_remaining_body() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -25244,6 +25610,13 @@ fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    let amod = std::fs::read_to_string(dir.join("mp.amod")).expect("missing mp.amod");
+    for specific in ["priv_a", "priv_b"] {
+        assert!(
+            amod.contains(&format!("@subroutine {specific}, private")),
+            "private generic specific {specific} should retain its signature in mp.amod: {amod}"
+        );
+    }
     let link = Command::new(compiler("armfortas"))
         .current_dir(&dir)
         .args(["parent.o", "child.o", "main.o", "-o", "priv_iface_bin"])
@@ -28316,7 +28689,7 @@ fn fdefault_integer_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  integer :: x\n  print *, kind(x)\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_integer\n  end interface\n  integer :: x\n  type(box_t) :: box\n  x = 5\n  box = x\n  if (box%value /= 5) error stop 1\n  print *, kind(x)\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("defint", "bin");
@@ -28341,6 +28714,31 @@ fn fdefault_integer_8_changes_default_kind() {
         "expected kind 8: {:?}",
         stdout
     );
+
+    let invalid_src = write_program(
+        "program p\n  implicit none\n  integer :: value\n  value = .true.\nend program\n",
+        "f90",
+    );
+    let invalid_out = unique_path("defint_assignment_diag", "o");
+    let invalid = Command::new(compiler("armfortas"))
+        .args([
+            "-fdefault-integer-8",
+            "-c",
+            invalid_src.to_str().unwrap(),
+            "-o",
+            invalid_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("default-integer assignment diagnostic compile failed to spawn");
+    assert!(
+        !invalid.status.success()
+            && String::from_utf8_lossy(&invalid.stderr).contains("LOGICAL(8) to INTEGER(8)"),
+        "default-integer assignment diagnostic used the wrong kind: {}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+
+    let _ = std::fs::remove_file(&invalid_out);
+    let _ = std::fs::remove_file(&invalid_src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
@@ -28355,7 +28753,7 @@ fn fdefault_real_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  real :: y\n  print *, kind(y)\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    real :: value = 0.0\n  end type\n  interface assignment(=)\n    procedure :: assign_real\n  end interface\n  real :: y\n  type(box_t) :: box\n  y = 2.5\n  box = y\n  if (box%value /= 2.5) error stop 1\n  print *, kind(y)\ncontains\n  subroutine assign_real(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    real, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("defreal", "bin");
@@ -47828,7 +48226,7 @@ fn selected_char_kind_folds_character_parameter_name() {
         return;
     }
     let src = write_program(
-        "module kinds\n  implicit none\n  integer, parameter :: cdk = selected_char_kind('DEFAULT')\n  character(kind=cdk,len=*), parameter :: json_fortran_string_kind = 'ISO_10646'\n  integer, parameter :: ck = selected_char_kind(json_fortran_string_kind)\ncontains\n  subroutine check()\n    if (cdk /= 1) error stop 1\n    if (ck /= 4) error stop 2\n  end subroutine\nend module\n\nprogram p\n  use kinds, only : check\n  implicit none\n  if (selected_char_kind('ASCII') /= 1) error stop 3\n  if (selected_char_kind('ISO_10646') /= 4) error stop 4\n  call check()\n  print *, 'ok'\nend program\n",
+        "module kinds\n  implicit none\n  integer, parameter :: cdk = selected_char_kind('DEFAULT')\n  character(kind=cdk,len=*), parameter :: json_fortran_string_kind = 'ISO_10646'\n  integer, parameter :: ck = selected_char_kind(json_fortran_string_kind)\n  integer, parameter :: leading = selected_char_kind(' ASCII')\n  integer, parameter :: trailing = selected_char_kind('ASCII   ')\ncontains\n  subroutine check()\n    if (cdk /= 1) error stop 1\n    if (ck /= -1) error stop 2\n    if (leading /= -1) error stop 3\n    if (trailing /= 1) error stop 4\n  end subroutine\nend module\n\nprogram p\n  use kinds, only : check\n  implicit none\n  character(len=12) :: name\n  if (selected_char_kind('ASCII') /= 1) error stop 5\n  if (selected_char_kind('ISO_10646') /= -1) error stop 6\n  if (selected_char_kind(' ASCII') /= -1) error stop 7\n  name = 'ISO_10646'\n  if (selected_char_kind(name) /= -1) error stop 8\n  name = 'ASCII'\n  if (selected_char_kind(name) /= 1) error stop 9\n  name = ' ASCII'\n  if (selected_char_kind(name) /= -1) error stop 10\n  name = achar(9) // 'ASCII'\n  if (selected_char_kind(name) /= -1) error stop 11\n  call check()\n  print *, 'ok'\nend program\n",
         "f90",
     );
     let out = unique_path("selected_char_kind_param_name", "bin");
@@ -47847,6 +48245,43 @@ fn selected_char_kind_folds_character_parameter_name() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "selected_char_kind: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fraction_exponent_and_scale_lower_scalar_and_array_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fraction_exponent_and_scale_lower_scalar_and_array_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real(4) :: x4(2,2), f4(2,2), s4(2,2), sub4\n  real(8) :: x8(2,2), f8(2,2), s8(2,2), sub8\n  integer :: e4(2,2), e8(2,2)\n  sub4 = tiny(1.0) * epsilon(1.0)\n  sub8 = tiny(1.0d0) * epsilon(1.0d0)\n  x4 = reshape([3.0, -6.5, sub4, 0.0], [2,2])\n  x8 = reshape([3.0d0, -6.5d0, sub8, 0.0d0], [2,2])\n  f4 = fraction(x4)\n  f8 = fraction(x8)\n  e4 = exponent(x4)\n  e8 = exponent(x8)\n  if (any(f4 /= reshape([0.75, -0.8125, 0.5, 0.0], [2,2]))) error stop 1\n  if (any(f8 /= reshape([0.75d0, -0.8125d0, 0.5d0, 0.0d0], [2,2]))) error stop 2\n  if (any(e4 /= reshape([2, 3, -148, 0], [2,2]))) error stop 3\n  if (any(e8 /= reshape([2, 3, -1073, 0], [2,2]))) error stop 4\n  s4 = scale(x4, reshape([2, -2, 149, 17], [2,2]))\n  s8 = scale(x8, reshape([2, -2, 1074, 17], [2,2]))\n  if (any(s4 /= reshape([12.0, -1.625, 1.0, 0.0], [2,2]))) error stop 5\n  if (any(s8 /= reshape([12.0d0, -1.625d0, 1.0d0, 0.0d0], [2,2]))) error stop 6\n  s8 = scale(x8, 2_8)\n  if (any(s8 /= 4.0d0 * x8)) error stop 7\n  if (scale(3.0, 2_1) /= 12.0) error stop 8\n  if (scale(3.0, 2_2) /= 12.0) error stop 9\n  if (scale(3.0, 2_4) /= 12.0) error stop 10\n  if (scale(3.0d0, 2_8) /= 12.0d0) error stop 11\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fraction_exponent_scale", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("model intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "model intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("model intrinsic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "model intrinsic run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)

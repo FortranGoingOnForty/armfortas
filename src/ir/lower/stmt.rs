@@ -15,7 +15,7 @@ use crate::ir::inst::*;
 use crate::ir::types::*;
 
 use super::core::*;
-use super::ctx::{BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
+use super::ctx::{BlockScopeGuard, BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
 use super::helpers::coerce_to_type;
 
 fn is_unlimited_polymorphic_local(info: &LocalInfo) -> bool {
@@ -7644,6 +7644,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             ..
         } => {
             let _block_use_guard = BlockUseGuard::enter(uses);
+            let _block_scope_guard =
+                BlockScopeGuard::enter(ctx.st.statement_block_scope(stmt.span));
             // F2008 BLOCK: declarations are scoped to the body.
             // Save any locals that the BLOCK's decls shadow, run
             // the body, then restore the originals.  F2018 §11.1.4

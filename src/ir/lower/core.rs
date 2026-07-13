@@ -25,8 +25,8 @@ use super::const_scalar::{
     selected_char_kind_value, ConstScalar,
 };
 use super::ctx::{
-    active_block_uses, current_proc_scope, current_smp_extra_host, AmbiguousUseWarnings, CharKind,
-    HiddenResultAbi, LocalInfo, LowerCtx, ProcScopeGuard,
+    active_block_scopes, active_block_uses, current_proc_scope, current_smp_extra_host,
+    AmbiguousUseWarnings, CharKind, HiddenResultAbi, LocalInfo, LowerCtx, ProcScopeGuard,
 };
 use super::helpers::{
     clamp_nonnegative_i64, coerce_to_type, const_range_for_ir_type, widen_to_i64,
@@ -11026,68 +11026,26 @@ pub(super) fn array_constructor_type_spec_info(
     type_spec: Option<&str>,
     st: &SymbolTable,
 ) -> Option<crate::sema::symtab::TypeInfo> {
-    use crate::sema::symtab::TypeInfo;
-    let raw = type_spec?.trim().to_ascii_lowercase();
+    let raw = type_spec?.trim();
     if raw.is_empty() {
         return None;
     }
-    let kind_inside = raw
-        .find('(')
-        .zip(raw.rfind(')'))
-        .filter(|(lp, rp)| rp > lp)
-        .map(|(lp, rp)| raw[lp + 1..rp].trim().to_string());
-    let prefix = raw.split('(').next().unwrap_or(&raw).trim();
-    let normalized_kind = kind_inside.as_deref().map(|k| {
-        k.strip_prefix("kind=")
-            .or_else(|| k.strip_prefix("kind ="))
-            .unwrap_or(k)
-            .trim()
-    });
-    if prefix == "double" {
-        return Some(TypeInfo::DoublePrecision);
+    let scope_id = active_block_scopes()
+        .last()
+        .copied()
+        .or_else(current_proc_scope)
+        .unwrap_or_else(|| st.current_scope());
+    if let Some(parsed) = parse_array_constructor_type_spec(raw) {
+        return Some(
+            crate::sema::resolve::type_resolution::type_spec_to_info_in_scope(
+                &parsed, st, scope_id,
+            ),
+        );
     }
-    match prefix {
-        "integer" => Some(TypeInfo::Integer {
-            kind: normalized_kind.map(|k| int_kind_to_width(k, st)),
-        }),
-        "real" => Some(TypeInfo::Real {
-            kind: normalized_kind.map(|k| real_kind_to_width(k, st)),
-        }),
-        "complex" => Some(TypeInfo::Complex {
-            kind: normalized_kind.map(|k| real_kind_to_width(k, st)),
-        }),
-        "logical" => Some(TypeInfo::Logical {
-            kind: normalized_kind.map(|k| int_kind_to_width(k, st)),
-        }),
-        "character" => Some(TypeInfo::Character {
-            kind: Some(1),
-            len: None,
-        }),
-        _ => {
-            if let Some(sym) = st
-                .find_symbol_any_scope(&raw)
-                .filter(|sym| matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType))
-            {
-                return Some(TypeInfo::Derived(sym.name.clone()));
-            }
-            let parsed = parse_array_constructor_type_spec(&raw)?;
-            match parsed {
-                TypeSpec::Type(name) => {
-                    let key = name.to_ascii_lowercase();
-                    let resolved = st
-                        .find_symbol_any_scope(&key)
-                        .filter(|sym| {
-                            matches!(sym.kind, crate::sema::symtab::SymbolKind::DerivedType)
-                        })
-                        .map(|sym| sym.name.clone())
-                        .unwrap_or(key);
-                    Some(TypeInfo::Derived(resolved))
-                }
-                TypeSpec::Class(name) => Some(TypeInfo::Class(name.to_ascii_lowercase())),
-                _ => None,
-            }
-        }
-    }
+
+    let symbol = st.lookup_in(scope_id, &raw.to_ascii_lowercase())?;
+    matches!(symbol.kind, crate::sema::symtab::SymbolKind::DerivedType)
+        .then(|| crate::sema::symtab::TypeInfo::Derived(symbol.name.clone()))
 }
 
 fn parse_array_constructor_type_spec(type_spec: &str) -> Option<TypeSpec> {
@@ -12736,6 +12694,11 @@ pub(super) fn find_named_interface_symbol<'a>(
     name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
     let key = name.to_ascii_lowercase();
+    for scope_id in active_block_scopes().into_iter().rev() {
+        if let Some(sym) = st.named_interface_symbol_in_scope(scope_id, &key) {
+            return Some(sym);
+        }
+    }
     if let Some(scope_id) = current_proc_scope() {
         if let Some(sym) = named_interface_symbol_in_scope_chain(st, scope_id, &key) {
             return Some(sym);
@@ -12776,7 +12739,10 @@ pub(super) fn find_named_interface_symbol<'a>(
     // from modules loaded only for type info.
     use crate::sema::symtab::ScopeKind;
     for scope in st.all_scopes() {
-        let in_tu = !matches!(scope.kind, ScopeKind::Module(_) | ScopeKind::Submodule(_));
+        let in_tu = !matches!(
+            scope.kind,
+            ScopeKind::Module(_) | ScopeKind::Submodule(_) | ScopeKind::Block
+        );
         if !in_tu {
             continue;
         }
@@ -12819,7 +12785,7 @@ fn use_associated_named_interface_symbols<'a>(
     let mut seen = HashSet::new();
     let mut visited = HashSet::new();
     for scope in st.all_scopes() {
-        if matches!(scope.kind, ScopeKind::Submodule(_)) {
+        if matches!(scope.kind, ScopeKind::Submodule(_) | ScopeKind::Block) {
             continue;
         }
         for assoc in &scope.use_associations {
@@ -13027,7 +12993,7 @@ pub(super) fn user_callable_shadows_intrinsic(
     caller_link_name: &str,
     name: &str,
 ) -> bool {
-    use crate::sema::symtab::SymbolKind;
+    use crate::sema::symtab::{ScopeKind, SymbolKind};
 
     fn is_user_callable(sym: &crate::sema::symtab::Symbol) -> bool {
         !sym.attrs.intrinsic
@@ -13062,6 +13028,9 @@ pub(super) fn user_callable_shadows_intrinsic(
     }
 
     st.all_scopes().iter().any(|scope| {
+        if matches!(scope.kind, ScopeKind::Block) {
+            return false;
+        }
         scope
             .use_associations
             .iter()
@@ -13080,6 +13049,7 @@ pub(super) struct SpecificProcCandidate {
 }
 
 pub(super) fn append_named_interface_specific_candidates(
+    st: &SymbolTable,
     sym: &crate::sema::symtab::Symbol,
     specifics: &mut Vec<SpecificProcCandidate>,
     seen: &mut HashSet<(String, crate::sema::symtab::ScopeId)>,
@@ -13089,10 +13059,15 @@ pub(super) fn append_named_interface_specific_candidates(
     {
         for specific in &sym.arg_names {
             let specific_key = specific.to_ascii_lowercase();
-            if seen.insert((specific_key, sym.scope)) {
+            let owner_scope = st
+                .lookup_in(sym.scope, &specific_key)
+                .filter(|symbol| is_linkable_callable_symbol(symbol))
+                .map(|symbol| symbol.scope)
+                .unwrap_or(sym.scope);
+            if seen.insert((specific_key, owner_scope)) {
                 specifics.push(SpecificProcCandidate {
                     name: specific.clone(),
-                    owner_scope: sym.scope,
+                    owner_scope,
                 });
             }
         }
@@ -13103,8 +13078,18 @@ fn specific_candidate_is_elemental(st: &SymbolTable, candidate: &SpecificProcCan
     use crate::sema::symtab::SymbolKind;
 
     let key = candidate.name.to_ascii_lowercase();
-    st.all_scopes().iter().any(|scope| {
-        scope.symbols.get(&key).is_some_and(|sym| {
+    find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
+        .or_else(|| {
+            let scope = procedure_scope_for_candidate(st, candidate)?;
+            scope.parent.and_then(|parent| {
+                st.scope(parent).symbols.get(&key).or_else(|| {
+                    st.scope(parent)
+                        .parent
+                        .and_then(|id| st.scope(id).symbols.get(&key))
+                })
+            })
+        })
+        .is_some_and(|sym| {
             sym.attrs.elemental
                 && matches!(
                     sym.kind,
@@ -13115,7 +13100,6 @@ fn specific_candidate_is_elemental(st: &SymbolTable, candidate: &SpecificProcCan
                         | SymbolKind::ProcedurePointer
                 )
         })
-    })
 }
 
 fn is_defined_operator_interface_name(name: &str) -> bool {
@@ -13131,34 +13115,46 @@ pub(super) fn named_interface_specific_candidates(
     let mut specifics = Vec::new();
     let mut seen = HashSet::new();
 
+    for scope_id in active_block_scopes().into_iter().rev() {
+        if let Some(sym) = st.named_interface_symbol_in_scope(scope_id, &key) {
+            append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
+            for use_sym in active_block_use_named_interface_symbols(st, &key) {
+                append_named_interface_specific_candidates(st, use_sym, &mut specifics, &mut seen);
+            }
+            if !specifics.is_empty() {
+                return Some(specifics);
+            }
+        }
+    }
+
     if let Some(scope_id) = current_proc_scope() {
         if let Some(sym) = named_interface_symbol_in_scope_chain(st, scope_id, &key) {
-            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+            append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
         }
         if specifics.is_empty() {
             if let Some(sym) = st.lookup_in(scope_id, &key) {
                 if is_named_interface_like(sym) {
-                    append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+                    append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
                 }
             }
         }
     }
 
     for sym in active_block_use_named_interface_symbols(st, &key) {
-        append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+        append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
     }
 
     if specifics.is_empty() && !defined_operator {
         if let Some(sym) = st.lookup(&key) {
             if is_named_interface_like(sym) {
-                append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+                append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
             }
         }
     }
 
     if !defined_operator {
         for sym in use_associated_named_interface_symbols(st, &key) {
-            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+            append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
         }
     }
     if !specifics.is_empty() {
@@ -13179,6 +13175,7 @@ pub(super) fn named_interface_specific_candidates(
             scope.kind,
             crate::sema::symtab::ScopeKind::Module(_)
                 | crate::sema::symtab::ScopeKind::Submodule(_)
+                | crate::sema::symtab::ScopeKind::Block
         );
         if !in_tu {
             continue;
@@ -13191,10 +13188,10 @@ pub(super) fn named_interface_specific_candidates(
             ) {
                 function_exists = true;
             }
-            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+            append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
         }
         if let Some(sym) = st.named_interface_symbol_in_scope(scope.id, &key) {
-            append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+            append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
         }
     }
     if function_exists {
@@ -13206,7 +13203,7 @@ pub(super) fn named_interface_specific_candidates(
                 continue;
             }
             if let Some(sym) = st.named_interface_symbol_in_scope(scope.id, &key) {
-                append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+                append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
             }
         }
     }
@@ -13240,10 +13237,20 @@ fn operator_interface_specific_candidates(
         .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
         .collect();
     for sym in active_block_use_named_interface_symbols(st, &iface_key) {
-        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
+        append_named_interface_specific_candidates(
+            st,
+            sym,
+            &mut all_candidates,
+            &mut seen_candidates,
+        );
     }
     for sym in use_associated_named_interface_symbols(st, &iface_key) {
-        append_named_interface_specific_candidates(sym, &mut all_candidates, &mut seen_candidates);
+        append_named_interface_specific_candidates(
+            st,
+            sym,
+            &mut all_candidates,
+            &mut seen_candidates,
+        );
     }
     (!all_candidates.is_empty()).then_some(all_candidates)
 }
@@ -13397,19 +13404,28 @@ pub(super) fn procedure_scope_for_candidate<'a>(
     st: &'a SymbolTable,
     candidate: &SpecificProcCandidate,
 ) -> Option<&'a crate::sema::symtab::Scope> {
+    let matches_name = |scope: &&crate::sema::symtab::Scope| {
+        matches!(
+            &scope.kind,
+            crate::sema::symtab::ScopeKind::Function(name)
+                | crate::sema::symtab::ScopeKind::Subroutine(name)
+                if name.eq_ignore_ascii_case(&candidate.name)
+        )
+    };
     st.all_scopes()
         .iter()
-        .find(|scope| {
-            let matches_name = match &scope.kind {
-                crate::sema::symtab::ScopeKind::Function(name)
-                | crate::sema::symtab::ScopeKind::Subroutine(name) => {
-                    name.eq_ignore_ascii_case(&candidate.name)
-                }
-                _ => false,
-            };
-            matches_name && scope.parent == Some(candidate.owner_scope)
+        .filter(matches_name)
+        .find(|scope| scope.parent == Some(candidate.owner_scope))
+        .or_else(|| {
+            st.all_scopes().iter().filter(matches_name).find(|scope| {
+                scope.parent.is_some_and(|parent| {
+                    matches!(
+                        st.scope(parent).kind,
+                        crate::sema::symtab::ScopeKind::Interface
+                    ) && st.scope(parent).parent == Some(candidate.owner_scope)
+                })
+            })
         })
-        .or_else(|| procedure_scope_by_name(st, &candidate.name))
 }
 
 pub(super) fn declared_args_for_scope(
@@ -14059,6 +14075,7 @@ fn resolve_generic_call_actuals_from_specifics(
 }
 
 fn named_interface_specific_candidates_from_symbol(
+    st: &SymbolTable,
     sym: &crate::sema::symtab::Symbol,
 ) -> Option<Vec<SpecificProcCandidate>> {
     if !is_named_interface_like(sym) {
@@ -14066,7 +14083,7 @@ fn named_interface_specific_candidates_from_symbol(
     }
     let mut specifics = Vec::new();
     let mut seen = HashSet::new();
-    append_named_interface_specific_candidates(sym, &mut specifics, &mut seen);
+    append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
     (!specifics.is_empty()).then_some(specifics)
 }
 
@@ -14632,7 +14649,6 @@ pub(super) fn specific_candidate_declared_result_rank(
 ) -> Option<usize> {
     let key = candidate.name.to_ascii_lowercase();
     find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
-        .or_else(|| find_linkable_symbol_any_scope(st, &key))
         .and_then(function_symbol_declared_result_rank)
         .or_else(|| {
             let scope = procedure_scope_for_candidate(st, candidate)?;
@@ -15293,14 +15309,26 @@ pub(super) fn same_intrinsic_semantic_type(
         a.unwrap_or(default) == b.unwrap_or(default)
     }
     match (l, r) {
-        (TypeInfo::Integer { kind: a }, TypeInfo::Integer { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Real { kind: a }, TypeInfo::Real { kind: b }) => kind_eq(*a, *b, 4),
+        (TypeInfo::Integer { kind: a }, TypeInfo::Integer { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_int_kind())
+        }
+        (TypeInfo::Real { kind: a }, TypeInfo::Real { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_real_kind())
+        }
         (TypeInfo::Real { kind: a }, TypeInfo::DoublePrecision)
-        | (TypeInfo::DoublePrecision, TypeInfo::Real { kind: a }) => kind_eq(*a, Some(8), 4),
+        | (TypeInfo::DoublePrecision, TypeInfo::Real { kind: a }) => {
+            kind_eq(*a, Some(8), crate::driver::defaults::default_real_kind())
+        }
         (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
-        (TypeInfo::Complex { kind: a }, TypeInfo::Complex { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Logical { kind: a }, TypeInfo::Logical { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Character { .. }, TypeInfo::Character { .. }) => true,
+        (TypeInfo::Complex { kind: a }, TypeInfo::Complex { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Logical { kind: a }, TypeInfo::Logical { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_int_kind())
+        }
+        (TypeInfo::Character { kind: a, .. }, TypeInfo::Character { kind: b, .. }) => {
+            kind_eq(*a, *b, 1)
+        }
         (TypeInfo::Derived(a), TypeInfo::Derived(b)) => a.eq_ignore_ascii_case(b),
         (TypeInfo::Class(a), TypeInfo::Class(b)) => a.eq_ignore_ascii_case(b),
         _ => false,
@@ -15525,15 +15553,30 @@ pub(super) fn defined_assignment_arg_semantic_match(
             Some(TypeInfo::Class(actual_name)) | Some(TypeInfo::Derived(actual_name))
                 if type_is_same_or_extension(decl_name, actual_name)
         ),
-        TypeInfo::Character { .. } => matches!(actual, Some(TypeInfo::Character { .. }) | None),
+        TypeInfo::Character {
+            kind: declared_kind,
+            ..
+        } => match actual {
+            Some(TypeInfo::Character {
+                kind: actual_kind, ..
+            }) => kind_eq(*declared_kind, *actual_kind, 1),
+            None => true,
+            _ => false,
+        },
         TypeInfo::Integer { kind: dk } => match actual {
-            Some(TypeInfo::Integer { kind: ak }) => kind_eq(*dk, *ak, 4),
+            Some(TypeInfo::Integer { kind: ak }) => {
+                kind_eq(*dk, *ak, crate::driver::defaults::default_int_kind())
+            }
             None => true,
             _ => false,
         },
         TypeInfo::Real { kind: dk } => match actual {
-            Some(TypeInfo::Real { kind: ak }) => kind_eq(*dk, *ak, 4),
-            Some(TypeInfo::DoublePrecision) => kind_eq(*dk, Some(8), 4),
+            Some(TypeInfo::Real { kind: ak }) => {
+                kind_eq(*dk, *ak, crate::driver::defaults::default_real_kind())
+            }
+            Some(TypeInfo::DoublePrecision) => {
+                kind_eq(*dk, Some(8), crate::driver::defaults::default_real_kind())
+            }
             None => true,
             _ => false,
         },
@@ -15542,16 +15585,20 @@ pub(super) fn defined_assignment_arg_semantic_match(
             Some(TypeInfo::DoublePrecision) | Some(TypeInfo::Real { kind: Some(8) }) | None
         ),
         TypeInfo::Complex { kind: dk } => match actual {
-            Some(TypeInfo::Complex { kind: ak }) => kind_eq(*dk, *ak, 4),
+            Some(TypeInfo::Complex { kind: ak }) => {
+                kind_eq(*dk, *ak, crate::driver::defaults::default_real_kind())
+            }
             None => true,
             _ => false,
         },
         TypeInfo::Logical { kind: dk } => match actual {
-            Some(TypeInfo::Logical { kind: ak }) => kind_eq(*dk, *ak, 4),
+            Some(TypeInfo::Logical { kind: ak }) => {
+                kind_eq(*dk, *ak, crate::driver::defaults::default_int_kind())
+            }
             None => true,
             _ => false,
         },
-        TypeInfo::ClassStar => matches!(actual, Some(TypeInfo::ClassStar) | None),
+        TypeInfo::ClassStar => true,
         TypeInfo::TypeStar => matches!(actual, Some(TypeInfo::TypeStar) | None),
     }
 }
@@ -15641,12 +15688,16 @@ fn operator_arg_semantic_match_impl(
         // first specific in declaration order. F2018 §10.1.5: a defined
         // operator must have an exact specific match.
         TypeInfo::Integer { kind: dk } => match actual {
-            Some(TypeInfo::Integer { kind: ak }) => intrinsic_kind_matches(*dk, *ak, 4),
+            Some(TypeInfo::Integer { kind: ak }) => {
+                intrinsic_kind_matches(*dk, *ak, crate::driver::defaults::default_int_kind())
+            }
             None => true,
             _ => false,
         },
         TypeInfo::Real { kind: dk } => match actual {
-            Some(TypeInfo::Real { kind: ak }) => intrinsic_kind_matches(*dk, *ak, 4),
+            Some(TypeInfo::Real { kind: ak }) => {
+                intrinsic_kind_matches(*dk, *ak, crate::driver::defaults::default_real_kind())
+            }
             None => true,
             _ => false,
         },
@@ -15655,12 +15706,16 @@ fn operator_arg_semantic_match_impl(
             Some(TypeInfo::DoublePrecision) | Some(TypeInfo::Real { kind: Some(8) }) | None
         ),
         TypeInfo::Complex { kind: dk } => match actual {
-            Some(TypeInfo::Complex { kind: ak }) => intrinsic_kind_matches(*dk, *ak, 4),
+            Some(TypeInfo::Complex { kind: ak }) => {
+                intrinsic_kind_matches(*dk, *ak, crate::driver::defaults::default_real_kind())
+            }
             None => true,
             _ => false,
         },
         TypeInfo::Logical { kind: dk } => match actual {
-            Some(TypeInfo::Logical { kind: ak }) => intrinsic_kind_matches(*dk, *ak, 4),
+            Some(TypeInfo::Logical { kind: ak }) => {
+                intrinsic_kind_matches(*dk, *ak, crate::driver::defaults::default_int_kind())
+            }
             None => true,
             _ => false,
         },
@@ -15758,34 +15813,55 @@ pub(super) fn generic_declared_semantic_match(
         } => matches!(
             actual,
             TypeInfo::Integer { kind: actual_kind }
-                if intrinsic_kind_matches(*declared_kind, *actual_kind, 4)
+                if intrinsic_kind_matches(
+                    *declared_kind,
+                    *actual_kind,
+                    crate::driver::defaults::default_int_kind(),
+                )
         ),
         TypeInfo::Real {
             kind: declared_kind,
         } => match actual {
-            TypeInfo::Real { kind: actual_kind } => {
-                intrinsic_kind_matches(*declared_kind, *actual_kind, 4)
-            }
-            TypeInfo::DoublePrecision => declared_kind.is_none_or(|kind| kind == 8),
+            TypeInfo::Real { kind: actual_kind } => intrinsic_kind_matches(
+                *declared_kind,
+                *actual_kind,
+                crate::driver::defaults::default_real_kind(),
+            ),
+            TypeInfo::DoublePrecision => intrinsic_kind_matches(
+                *declared_kind,
+                Some(8),
+                crate::driver::defaults::default_real_kind(),
+            ),
             _ => false,
         },
-        TypeInfo::DoublePrecision => matches!(
-            actual,
-            TypeInfo::DoublePrecision | TypeInfo::Real { kind: Some(8) }
-        ),
+        TypeInfo::DoublePrecision => match actual {
+            TypeInfo::DoublePrecision => true,
+            TypeInfo::Real { kind } => {
+                kind.unwrap_or_else(crate::driver::defaults::default_real_kind) == 8
+            }
+            _ => false,
+        },
         TypeInfo::Complex {
             kind: declared_kind,
         } => matches!(
             actual,
             TypeInfo::Complex { kind: actual_kind }
-                if intrinsic_kind_matches(*declared_kind, *actual_kind, 4)
+                if intrinsic_kind_matches(
+                    *declared_kind,
+                    *actual_kind,
+                    crate::driver::defaults::default_real_kind(),
+                )
         ),
         TypeInfo::Logical {
             kind: declared_kind,
         } => matches!(
             actual,
             TypeInfo::Logical { kind: actual_kind }
-                if intrinsic_kind_matches(*declared_kind, *actual_kind, 4)
+                if intrinsic_kind_matches(
+                    *declared_kind,
+                    *actual_kind,
+                    crate::driver::defaults::default_int_kind(),
+                )
         ),
         TypeInfo::Derived(decl_name) => matches!(
             actual,
@@ -15988,7 +16064,7 @@ pub(super) fn literal_expr_type_info_in_context(
                     if text.to_lowercase().contains('d') {
                         8
                     } else {
-                        4
+                        crate::driver::defaults::default_real_kind()
                     }
                 });
             Some(TypeInfo::Real { kind: Some(kind) })
@@ -16007,7 +16083,7 @@ pub(super) fn literal_expr_type_info_in_context(
             let kind = kind
                 .as_deref()
                 .and_then(|kind_str| named_kind_value(kind_str, locals, None, Some(st)))
-                .unwrap_or(4);
+                .unwrap_or_else(crate::driver::defaults::default_int_kind);
             Some(TypeInfo::Logical { kind: Some(kind) })
         }
         Expr::ComplexLiteral { real, imag } => {
@@ -16026,7 +16102,7 @@ pub(super) fn literal_expr_type_info_in_context(
                 .into_iter()
                 .chain(component_kind(imag))
                 .max()
-                .unwrap_or(4);
+                .unwrap_or_else(crate::driver::defaults::default_real_kind);
             Some(TypeInfo::Complex { kind: Some(kind) })
         }
         Expr::BozLiteral { .. } => {
@@ -16272,7 +16348,6 @@ pub(super) fn generic_function_call_type_info(
     let key = candidate.name.to_ascii_lowercase();
 
     find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
-        .or_else(|| find_linkable_symbol_any_scope(st, &key))
         .and_then(|sym| {
             (sym.kind == SymbolKind::Function)
                 .then(|| sym.type_info.clone())
@@ -16342,7 +16417,6 @@ pub(super) fn specific_candidate_result_type_info(
 
     let key = candidate.name.to_ascii_lowercase();
     find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
-        .or_else(|| find_linkable_symbol_any_scope(st, &key))
         .and_then(|sym| {
             matches!(
                 sym.kind,
@@ -16768,6 +16842,14 @@ pub(super) fn local_intrinsic_call_type_info(
             return Some(crate::sema::symtab::TypeInfo::Complex { kind: Some(kind) });
         }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
+    }
+    if matches!(lower_name.as_str(), "char" | "achar") {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+            return Some(crate::sema::symtab::TypeInfo::Character {
+                len: Some(1),
+                kind: Some(kind),
+            });
+        }
     }
 
     let arg_types: Option<Vec<_>> = args
@@ -17764,7 +17846,10 @@ pub(super) fn try_defined_assignment_for_array_element(
         .unwrap_or(false);
     let rhs_wants_descriptor = resolved_declared_args
         .get(1)
-        .is_some_and(|arg| assignment_formal_wants_descriptor(arg));
+        .is_some_and(|arg| assignment_formal_wants_descriptor(arg))
+        || descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, &rk)
+            .and_then(|flags| flags.get(1).copied())
+            .unwrap_or(false);
     let rhs_for_call_final = if rhs_is_char_star {
         lower_arg_by_ref_full(
             b,
@@ -18071,7 +18156,10 @@ pub(super) fn try_defined_assignment(
         .unwrap_or(false);
     let rhs_wants_descriptor = resolved_declared_args
         .get(1)
-        .is_some_and(|arg| assignment_formal_wants_descriptor(arg));
+        .is_some_and(|arg| assignment_formal_wants_descriptor(arg))
+        || descriptor_param_mask_for_lookup(ctx.st, ctx.descriptor_params, &rk)
+            .and_then(|flags| flags.get(1).copied())
+            .unwrap_or(false);
     let rhs_for_call_final = if rhs_is_char_star {
         lower_arg_by_ref_full(
             b,
@@ -19264,7 +19352,7 @@ pub(super) fn resolve_subroutine_call_name(
                 // — otherwise an in-module call could not reach a specific
                 // re-exported through a chain (fpm/tomlf get_value).
                 if let Some(specifics) = named_interface_specific_candidates(st, key)
-                    .or_else(|| named_interface_specific_candidates_from_symbol(sym))
+                    .or_else(|| named_interface_specific_candidates_from_symbol(st, sym))
                 {
                     match resolve_generic_call_actuals_from_specifics(
                         st,
@@ -19769,6 +19857,52 @@ fn is_linkable_callable_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
     )
 }
 
+fn find_linkable_symbol_for_callee<'a>(
+    st: &'a SymbolTable,
+    callee_name: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    if let Some(symbol) = st.all_scopes().iter().find_map(|scope| {
+        scope.symbols.values().find(|symbol| {
+            is_linkable_callable_symbol(symbol)
+                && symbol_link_name(st, symbol).eq_ignore_ascii_case(callee_name)
+        })
+    }) {
+        return Some(symbol);
+    }
+
+    let key = callee_name.to_ascii_lowercase();
+    if let Some(symbol) = current_proc_scope()
+        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+        .filter(|symbol| is_linkable_callable_symbol(symbol))
+    {
+        return Some(symbol);
+    }
+
+    if let Some(scope_id) = callee_scope_id_for_lookup(st, callee_name) {
+        let procedure_scope = st.scope(scope_id);
+        let procedure_name = match &procedure_scope.kind {
+            crate::sema::symtab::ScopeKind::Function(name)
+            | crate::sema::symtab::ScopeKind::Subroutine(name) => name.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        let mut parent = procedure_scope.parent;
+        while let Some(scope_id) = parent {
+            let scope = st.scope(scope_id);
+            if let Some(symbol) = scope
+                .symbols
+                .get(&procedure_name)
+                .filter(|symbol| is_linkable_callable_symbol(symbol))
+            {
+                return Some(symbol);
+            }
+            parent = scope.parent;
+        }
+    }
+
+    let key = canonical_procedure_abi_key(st, callee_name);
+    find_linkable_symbol_any_scope(st, &key).filter(|symbol| is_linkable_callable_symbol(symbol))
+}
+
 fn unique_concrete_procedure_symbol_any_scope<'a>(
     st: &'a SymbolTable,
     key: &str,
@@ -19896,9 +20030,7 @@ pub(super) fn resolved_symbol_call_target_for_candidate(
     candidate: &SpecificProcCandidate,
 ) -> (String, String) {
     let key = candidate.name.to_lowercase();
-    if let Some(sym) = find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
-        .or_else(|| find_linkable_symbol_any_scope(st, &key))
-    {
+    if let Some(sym) = find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope) {
         let call_name = symbol_link_name(st, sym);
         return (call_name, key);
     }
@@ -24754,8 +24886,7 @@ pub(super) fn callee_return_derived_info(
     callee_name: &str,
 ) -> Option<(String, bool)> {
     use crate::sema::symtab::{SymbolKind, TypeInfo};
-    let key = canonical_procedure_abi_key(st, callee_name);
-    if let Some(sym) = st.scopes.iter().find_map(|scope| scope.symbols.get(&key)) {
+    if let Some(sym) = find_linkable_symbol_for_callee(st, callee_name) {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
         }
@@ -24866,11 +24997,8 @@ fn callee_return_ir_type_from_scope(
 }
 
 pub(super) fn callee_return_ir_type(st: &SymbolTable, callee_name: &str) -> Option<IrType> {
-    let key = canonical_procedure_abi_key(st, callee_name);
-    if let Some(ir_ty) = st
-        .scopes
-        .iter()
-        .find_map(|scope| scope.symbols.get(&key).and_then(callee_symbol_ir_type))
+    if let Some(ir_ty) =
+        find_linkable_symbol_for_callee(st, callee_name).and_then(callee_symbol_ir_type)
     {
         return Some(ir_ty);
     }
@@ -24944,9 +25072,7 @@ pub(super) fn callee_character_return_abi(
 ) -> Option<CharacterReturnAbi> {
     use crate::sema::symtab::TypeInfo;
 
-    let key = canonical_procedure_abi_key(st, callee_name);
-    let sym =
-        find_linkable_symbol_any_scope(st, &key).filter(|sym| is_linkable_callable_symbol(sym))?;
+    let sym = find_linkable_symbol_for_callee(st, callee_name)?;
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
@@ -24963,9 +25089,7 @@ pub(super) fn callee_hidden_result_abi(
 ) -> Option<HiddenResultAbi> {
     use crate::sema::symtab::TypeInfo;
 
-    let key = canonical_procedure_abi_key(st, callee_name);
-    let sym =
-        find_linkable_symbol_any_scope(st, &key).filter(|sym| is_linkable_callable_symbol(sym))?;
+    let sym = find_linkable_symbol_for_callee(st, callee_name)?;
     // Rank check must come BEFORE the Character match arm: a function
     // returning `character :: cstr(N)` is rank-1, and the caller has to
     // allocate a 392-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)
@@ -43518,47 +43642,7 @@ fn generic_interface_has_elemental_candidate_for_actuals(
 /// so without elemental dispatch a `sqrt(w)` for array `w` would emit
 /// a single scalar FSqrt over the descriptor pointer (wrong).
 pub(super) fn is_elemental_math_intrinsic(name: &str) -> bool {
-    matches!(
-        name.to_lowercase().as_str(),
-        "abs" | "iabs" | "dabs" | "cabs" | "cdabs" | "zabs"
-        | "acos" | "asin" | "atan" | "atan2"
-        | "cos" | "sin" | "tan" | "sinh" | "cosh" | "tanh"
-        | "asinh" | "acosh" | "atanh"
-        | "exp" | "log" | "log10"
-        | "sqrt" | "dsqrt" | "csqrt" | "zsqrt" | "cdsqrt"
-        | "hypot" | "anint" | "dnint" | "aint" | "dint"
-        | "ceiling" | "floor" | "nint" | "int" | "real" | "dble"
-        | "logical" | "conjg" | "aimag" | "dimag"
-        | "mod" | "modulo" | "sign" | "dim" | "max" | "min"
-        | "ichar" | "iachar" | "achar" | "char"
-        // F2018 §17.11 IEEE elemental intrinsics from `ieee_arithmetic`.
-        // Without this dispatch, `ieee_is_nan(arr)` falls through to the
-        // scalar `lower_intrinsic` arm which emits `fcmp ne desc, desc`
-        // on the array's descriptor pointer — garbage that downstream
-        // either rejects (IR verifier, "fcmp on non-float") or lets
-        // through silently to corrupt the next allocaed slot.  stdlib
-        // hits this in the rank-N branch of `median_all_*` (`if any(
-        // ieee_is_nan(x))`) for `median`, `cov`, `sort_*`, etc.
-        | "ieee_is_nan" | "ieee_is_finite" | "ieee_is_negative"
-        | "ieee_is_normal" | "ieee_signbit" | "ieee_value"
-        // F2018 §16.9 character elementals — scalar form is already
-        // wired in lower_intrinsic; flagging them here lets reductions
-        // like `sum(len_trim(strs))` materialize the per-element
-        // result array via `lower_rank1_elemental_call_descriptor`.
-        // LEN is excluded: it is an inquiry function (§16.9.108), not
-        // elemental — LEN(array) is the scalar element length, so it
-        // must not expand element-wise (printed `5 5 5` for a rank-1
-        // deferred-length char array instead of the scalar 5).
-        | "len_trim" | "index" | "scan" | "verify"
-        | "adjustl" | "adjustr" | "lge" | "lgt" | "lle" | "llt"
-        // F2018 §16.9 bit-manipulation elementals.
-        | "popcnt" | "popcount" | "poppar" | "leadz" | "trailz"
-        | "btest" | "iand" | "ior" | "ieor" | "ishft" | "ishftc"
-        | "ibits" | "ibset" | "ibclr" | "not"
-        | "shifta" | "shiftl" | "shiftr" | "dshiftl" | "dshiftr"
-        | "bge" | "bgt" | "ble" | "blt"
-        | "merge_bits" | "maskl" | "maskr"
-    )
+    crate::sema::types::is_elemental_intrinsic(name)
 }
 
 /// F2018 §15.8.3 elemental subroutine call expansion.
@@ -43603,7 +43687,7 @@ pub(super) fn try_lower_elemental_subroutine_call(
     let caller_scope_id = callee_scope_id_for_lookup(ctx.st, b.func().name.as_str());
     let scoped_specifics = caller_scope_id
         .and_then(|scope_id| ctx.st.lookup_in(scope_id, callee_key))
-        .and_then(named_interface_specific_candidates_from_symbol);
+        .and_then(|symbol| named_interface_specific_candidates_from_symbol(ctx.st, symbol));
     let resolved_candidate = if let Some(specifics) = scoped_specifics.as_deref() {
         resolve_generic_call_actuals_from_specifics(
             ctx.st,

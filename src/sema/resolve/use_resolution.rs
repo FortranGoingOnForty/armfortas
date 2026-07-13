@@ -2,7 +2,7 @@
 //!
 //! Extracted from `core.rs` in Sprint 14. Contains the four functions
 //! that handle USE association: `process_uses` (the main entry point),
-//! `ensure_uses_loaded`, `preload_stmt_uses`, and `load_external_module`
+//! `preload_stmt_uses` and `load_external_module`
 //! (the .amod loader that synthesises a module scope when a USE'd
 //! module wasn't seen in-file).
 
@@ -185,21 +185,6 @@ pub(super) fn process_uses(
 /// We do not model block-local use associations in the symbol table yet, but we
 /// still need the referenced modules loaded so later validation and lowering can
 /// resolve imported procedures, derived types, and module globals.
-pub(super) fn ensure_uses_loaded(
-    st: &mut SymbolTable,
-    uses: &[SpannedDecl],
-    module_search_paths: &[std::path::PathBuf],
-    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
-) {
-    for use_decl in uses {
-        if let Decl::UseStmt { module, .. } = &use_decl.node {
-            if st.find_module_scope(module).is_none() {
-                let _ = load_external_module(st, module, module_search_paths, type_layouts);
-            }
-        }
-    }
-}
-
 pub(super) fn preload_stmt_uses(
     st: &mut SymbolTable,
     stmts: &[crate::ast::stmt::SpannedStmt],
@@ -253,11 +238,14 @@ pub(super) fn preload_stmt_uses(
             Stmt::Block {
                 uses, ifaces, body, ..
             } => {
-                ensure_uses_loaded(st, uses, module_search_paths, type_layouts);
+                let block_scope = st.push_scope(ScopeKind::Block);
+                st.register_statement_block_scope(stmt.span, block_scope);
+                let _ = process_uses(st, uses, module_search_paths, type_layouts);
                 for iface in ifaces {
                     let _ = resolve_unit(st, iface, module_search_paths, type_layouts);
                 }
                 preload_stmt_uses(st, body, module_search_paths, type_layouts);
+                st.pop_scope();
             }
             Stmt::SelectCase { cases, .. } => {
                 for case in cases {

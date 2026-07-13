@@ -11,7 +11,7 @@
 use crate::ast::decl::{self, TypeSpec};
 use crate::sema::symtab::{SymbolTable, TypeInfo};
 
-use super::core::eval_const_int_expr;
+use super::core::{eval_const_int_expr, eval_const_int_expr_in_scope};
 
 /// Integer kind backing an IEEE intrinsic-module opaque type (l09),
 /// or `None` if `name` is not one. The class/round/flag tag types are
@@ -32,18 +32,16 @@ pub(crate) fn is_ieee_opaque_type(name: &str) -> bool {
     ieee_opaque_int_kind(name).is_some()
 }
 
-pub(super) fn extract_kind(sel: &Option<decl::KindSelector>, st: &SymbolTable) -> Option<u8> {
-    use crate::ast::expr::Expr;
+fn extract_kind_in_scope(
+    sel: &Option<decl::KindSelector>,
+    st: &SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> Option<u8> {
     match sel {
-        Some(decl::KindSelector::Expr(e)) | Some(decl::KindSelector::Star(e)) => match &e.node {
-            Expr::IntegerLiteral { text, .. } => text.parse().ok(),
-            Expr::Name { name } => {
-                let key = name.to_lowercase();
-                st.lookup_in(st.current_scope(), &key)
-                    .and_then(|sym| sym.const_value.map(|v| v as u8))
-            }
-            _ => None,
-        },
+        Some(decl::KindSelector::Expr(expr)) | Some(decl::KindSelector::Star(expr)) => {
+            eval_const_int_expr_in_scope(expr, st, scope_id)
+                .and_then(|kind| u8::try_from(kind).ok())
+        }
         None => None,
     }
 }
@@ -139,10 +137,14 @@ fn typed_character_array_constructor_len(type_spec: &str, st: &SymbolTable) -> O
     usize::try_from(len).ok()
 }
 
-pub(super) fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTable) -> Option<i64> {
+fn extract_char_len_in_scope(
+    sel: &Option<decl::CharSelector>,
+    st: &SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> Option<i64> {
     match sel {
         Some(cs) => match &cs.len {
-            Some(decl::LenSpec::Expr(e)) => eval_const_int_expr(e, st),
+            Some(decl::LenSpec::Expr(expr)) => eval_const_int_expr_in_scope(expr, st, scope_id),
             Some(decl::LenSpec::Star) => None,  // assumed length
             Some(decl::LenSpec::Colon) => None, // deferred length
             None => Some(1),
@@ -151,25 +153,44 @@ pub(super) fn extract_char_len(sel: &Option<decl::CharSelector>, st: &SymbolTabl
     }
 }
 
-pub(super) fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
+fn extract_char_kind_in_scope(
+    sel: &Option<decl::CharSelector>,
+    st: &SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> Option<u8> {
+    sel.as_ref()
+        .and_then(|selector| selector.kind.as_ref())
+        .and_then(|kind| eval_const_int_expr_in_scope(kind, st, scope_id))
+        .and_then(|kind| u8::try_from(kind).ok())
+}
+
+pub(crate) fn type_spec_to_info(ts: &TypeSpec, st: &SymbolTable) -> TypeInfo {
+    type_spec_to_info_in_scope(ts, st, st.current_scope())
+}
+
+pub(crate) fn type_spec_to_info_in_scope(
+    ts: &TypeSpec,
+    st: &SymbolTable,
+    scope_id: crate::sema::symtab::ScopeId,
+) -> TypeInfo {
     match ts {
         TypeSpec::Integer(sel) => TypeInfo::Integer {
-            kind: extract_kind(sel, st),
+            kind: extract_kind_in_scope(sel, st, scope_id),
         },
         TypeSpec::Real(sel) => TypeInfo::Real {
-            kind: extract_kind(sel, st),
+            kind: extract_kind_in_scope(sel, st, scope_id),
         },
         TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
         TypeSpec::Complex(sel) => TypeInfo::Complex {
-            kind: extract_kind(sel, st),
+            kind: extract_kind_in_scope(sel, st, scope_id),
         },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
         TypeSpec::Logical(sel) => TypeInfo::Logical {
-            kind: extract_kind(sel, st),
+            kind: extract_kind_in_scope(sel, st, scope_id),
         },
         TypeSpec::Character(sel) => TypeInfo::Character {
-            len: extract_char_len(sel, st),
-            kind: None,
+            len: extract_char_len_in_scope(sel, st, scope_id),
+            kind: extract_char_kind_in_scope(sel, st, scope_id),
         },
         TypeSpec::Type(name) if ieee_opaque_int_kind(name).is_some() => {
             // The IEEE_ARITHMETIC/IEEE_EXCEPTIONS opaque types carry a

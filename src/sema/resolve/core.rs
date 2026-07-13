@@ -1622,10 +1622,9 @@ fn parse_boz_i64(text: &str, base: crate::ast::expr::BozBase) -> Option<i64> {
 }
 
 fn selected_char_kind_value(name: &str) -> i64 {
+    let name = name.trim_end_matches(' ');
     if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
         1
-    } else if name.eq_ignore_ascii_case("iso_10646") {
-        4
     } else {
         -1
     }
@@ -1706,25 +1705,33 @@ fn eval_const_char_expr_with_params(
 }
 
 fn eval_const_char_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -> Option<String> {
+    eval_const_char_expr_in_scope(expr, st, st.current_scope())
+}
+
+fn eval_const_char_expr_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    scope_id: ScopeId,
+) -> Option<String> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(value.clone()),
         Expr::Name { name } => {
-            let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
+            let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
             if sym.attrs.parameter {
                 sym.const_char_value.clone()
             } else {
                 None
             }
         }
-        Expr::ParenExpr { inner } => eval_const_char_expr(inner, st),
+        Expr::ParenExpr { inner } => eval_const_char_expr_in_scope(inner, st, scope_id),
         Expr::BinaryOp {
             op: crate::ast::expr::BinaryOp::Concat,
             left,
             right,
         } => {
-            let mut out = eval_const_char_expr(left, st)?;
-            out.push_str(&eval_const_char_expr(right, st)?);
+            let mut out = eval_const_char_expr_in_scope(left, st, scope_id)?;
+            out.push_str(&eval_const_char_expr_in_scope(right, st, scope_id)?);
             Some(out)
         }
         Expr::FunctionCall { callee, args } => {
@@ -1740,7 +1747,7 @@ fn eval_const_char_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) 
                             None
                         }
                     })?;
-                    let code = eval_const_int_expr(first_arg, st)?;
+                    let code = eval_const_int_expr_in_scope(first_arg, st, scope_id)?;
                     if !(0..=255).contains(&code) {
                         return None;
                     }
@@ -1866,7 +1873,7 @@ fn eval_const_int_expr_with_params(
                         return None;
                     };
                     eval_const_char_expr_with_params(e, const_params, const_char_params)
-                        .map(|name| selected_char_kind_value(name.trim()))
+                        .map(|name| selected_char_kind_value(&name))
                 }
                 "kind" => {
                     let arg = args.first()?;
@@ -2778,6 +2785,14 @@ pub(super) fn eval_const_int_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> Option<i64> {
+    eval_const_int_expr_in_scope(expr, st, st.current_scope())
+}
+
+pub(super) fn eval_const_int_expr_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    scope_id: ScopeId,
+) -> Option<i64> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::IntegerLiteral { text, .. } => {
@@ -2786,8 +2801,7 @@ pub(super) fn eval_const_int_expr(
         }
         Expr::BozLiteral { text, base } => parse_boz_i64(text, *base),
         Expr::Name { name } => {
-            // Look up the name in the current scope chain.
-            let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
+            let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
             if sym.attrs.parameter {
                 sym.const_value
             } else {
@@ -2795,7 +2809,7 @@ pub(super) fn eval_const_int_expr(
             }
         }
         Expr::UnaryOp { op, operand } => {
-            let v = eval_const_int_expr(operand, st)?;
+            let v = eval_const_int_expr_in_scope(operand, st, scope_id)?;
             match op {
                 crate::ast::expr::UnaryOp::Minus => Some(-v),
                 crate::ast::expr::UnaryOp::Plus => Some(v),
@@ -2803,8 +2817,8 @@ pub(super) fn eval_const_int_expr(
             }
         }
         Expr::BinaryOp { op, left, right } => {
-            let l = eval_const_int_expr(left, st)?;
-            let r = eval_const_int_expr(right, st)?;
+            let l = eval_const_int_expr_in_scope(left, st, scope_id)?;
+            let r = eval_const_int_expr_in_scope(right, st, scope_id)?;
             match op {
                 crate::ast::expr::BinaryOp::Add => Some(l + r),
                 crate::ast::expr::BinaryOp::Sub => Some(l - r),
@@ -2813,13 +2827,13 @@ pub(super) fn eval_const_int_expr(
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => eval_const_int_expr(inner, st),
+        Expr::ParenExpr { inner } => eval_const_int_expr_in_scope(inner, st, scope_id),
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
                 let first_arg_val = args.first().and_then(|a| {
                     if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                        eval_const_int_expr(e, st)
+                        eval_const_int_expr_in_scope(e, st, scope_id)
                     } else {
                         None
                     }
@@ -2874,7 +2888,7 @@ pub(super) fn eval_const_int_expr(
                             let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                                 return None;
                             };
-                            let value = eval_const_int_expr(e, st)?;
+                            let value = eval_const_int_expr_in_scope(e, st, scope_id)?;
                             acc = Some(match acc {
                                 None => value,
                                 Some(prev) if is_max => prev.max(value),
@@ -2888,8 +2902,8 @@ pub(super) fn eval_const_int_expr(
                         let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                             return None;
                         };
-                        eval_const_char_expr(e, st)
-                            .map(|value| selected_char_kind_value(value.trim()))
+                        eval_const_char_expr_in_scope(e, st, scope_id)
+                            .map(|value| selected_char_kind_value(&value))
                     }
                     "kind" => {
                         if let Some(arg) = args.first() {
@@ -2927,7 +2941,7 @@ pub(super) fn eval_const_int_expr(
                                 .parse::<f64>()
                                 .ok()
                                 .map(|v| v.trunc() as i64),
-                            _ => eval_const_int_expr(e, st),
+                            _ => eval_const_int_expr_in_scope(e, st, scope_id),
                         }
                     }
                     "range" => {
@@ -2937,11 +2951,11 @@ pub(super) fn eval_const_int_expr(
                         };
                         let ty = match &e.node {
                             Expr::Name { name } => st
-                                .lookup_in(st.current_scope(), &name.to_lowercase())
+                                .lookup_in(scope_id, &name.to_lowercase())
                                 .and_then(|sym| sym.type_info.as_ref()),
                             Expr::ParenExpr { inner } => match &inner.node {
                                 Expr::Name { name } => st
-                                    .lookup_in(st.current_scope(), &name.to_lowercase())
+                                    .lookup_in(scope_id, &name.to_lowercase())
                                     .and_then(|sym| sym.type_info.as_ref()),
                                 _ => None,
                             },

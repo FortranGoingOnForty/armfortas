@@ -185,8 +185,20 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
     insert_type(st, m, "c_funptr");
 
     // ---- Null pointer constants ----
-    insert_param(st, m, "c_null_ptr", ik(8));
-    insert_param(st, m, "c_null_funptr", ik(8));
+    insert_param_val(
+        st,
+        m,
+        "c_null_ptr",
+        TypeInfo::Derived("c_ptr".into()),
+        Some(0),
+    );
+    insert_param_val(
+        st,
+        m,
+        "c_null_funptr",
+        TypeInfo::Derived("c_funptr".into()),
+        Some(0),
+    );
 
     // ---- Procedures ----
     for name in [
