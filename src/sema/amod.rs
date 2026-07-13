@@ -22,7 +22,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
-const AMOD_VERSION: u32 = 6;
+const AMOD_VERSION: u32 = 7;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
 /// is `lower:upper` or just `upper`. Returns None if any dim is not
@@ -912,6 +912,9 @@ fn emit_procedure(
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
     }
+    if sym.attrs.is_separate_module_interface {
+        write!(out, ", module_interface").unwrap();
+    }
     if !is_public(sym, st.scope(mod_scope_id)) {
         write!(out, ", private").unwrap();
     }
@@ -1485,6 +1488,7 @@ pub struct AmodProc {
     pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
+    pub is_separate_module_interface: bool,
     pub access: Access,
     pub binding_label: Option<String>,
     pub args: Vec<AmodArg>,
@@ -2101,6 +2105,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let attr_chunks = split_attrs_top_level(attrs_str);
     let pure = attr_chunks.iter().any(|a| a == "pure");
     let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let is_separate_module_interface = attr_chunks.iter().any(|a| a == "module_interface");
     let result_allocatable = attr_chunks.iter().any(|a| a == "result_allocatable");
     let result_pointer = attr_chunks.iter().any(|a| a == "result_pointer");
     let result_rank = attr_chunks
@@ -2161,6 +2166,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_array_bounds,
         pure,
         elemental,
+        is_separate_module_interface,
         access,
         binding_label,
         args,
@@ -2931,7 +2937,7 @@ mod tests {
 
     #[test]
     fn only_qualified_dependencies_round_trip_exact_bindings() {
-        let amod_text = r#"#!amod 6
+        let amod_text = r#"#!amod 7
 # module: facade
 # source: facade.f90
 
@@ -2977,7 +2983,7 @@ mod tests {
             "@use_rename local = from provider",
         ] {
             let amod_text =
-                format!("#!amod 6\n# module: facade\n# source: facade.f90\n\n{record}\n");
+                format!("#!amod 7\n# module: facade\n# source: facade.f90\n\n{record}\n");
             let err = parse_amod(&amod_text, Path::new("bad.amod")).unwrap_err();
             assert!(
                 err.contains("corrupt .amod file")
@@ -3125,7 +3131,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 6
+            r#"#!amod 7
 # module: cache_test
 # source: cache_test.f90
 
@@ -3155,7 +3161,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 6
+            r#"#!amod 7
 # module: truncated_test
 # source: truncated_test.f90
 
@@ -3189,7 +3195,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 5
+            r#"#!amod 6
 # module: stale_test
 # source: stale_test.f90
 
@@ -3203,7 +3209,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 5 (compiler requires 6)")
+            err.contains("incompatible .amod version 6 (compiler requires 7)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

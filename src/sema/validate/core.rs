@@ -1313,9 +1313,32 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
         return;
     };
 
-    // Locate the interface procedure scope in the ancestor module,
-    // tolerating one Interface-block hop (as the lowering does).
     let proc_lc = name.to_lowercase();
+    let Some(interface_owner) = ctx
+        .st
+        .find_separate_module_interface_scope(parent_mod, &proc_lc)
+    else {
+        let ancestor_name = ctx
+            .st
+            .scope(submod_id)
+            .submodule_ancestor
+            .as_deref()
+            .unwrap_or(match &ctx.st.scope(parent_mod).kind {
+                ScopeKind::Module(name) | ScopeKind::Submodule(name) => name.as_str(),
+                _ => "<unknown>",
+            });
+        ctx.error(
+            span,
+            format!(
+                "separate module procedure '{name}' has no matching interface in ancestor \
+                 module '{ancestor_name}' (F2008 C1414)"
+            ),
+        );
+        return;
+    };
+
+    // Locate the signature scope, tolerating one Interface-block hop for a
+    // source declaration and a direct child for an .amod-loaded declaration.
     let iface = ctx.st.all_scopes().iter().find_map(|s| {
         let nm = match &s.kind {
             ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n,
@@ -1325,24 +1348,18 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
             return None;
         }
         let p = s.parent?;
-        if p == parent_mod
+        if p == interface_owner
             || (matches!(ctx.st.scope(p).kind, ScopeKind::Interface)
-                && ctx.st.scope(p).parent == Some(parent_mod))
+                && ctx.st.scope(p).parent == Some(interface_owner))
         {
             Some(s.id)
         } else {
             None
         }
     });
-    // No interface scope located. This is NOT necessarily an error: a
-    // separate module procedure can implement a specific inside a GENERIC
-    // interface, whose members are loaded from the parent `.amod` as
-    // NamedInterface symbols without a per-specific proc scope. Diagnosing
-    // "no matching interface" here would false-positive on those valid
-    // SMPs (cli_driver submodule_dispatching_private_parent_generic_…),
-    // so bail quietly — the signature checks below only run when a real
-    // interface scope is found, which keeps them false-positive-safe. A
-    // robust truly-missing-interface check is deferred (see noted_items).
+    // The marker proves the declaration exists. A current .amod also carries
+    // the signature scope, but keep this fallback diagnostic-safe if a source
+    // representation lacks one.
     let Some(iface) = iface else {
         return;
     };
@@ -12409,6 +12426,156 @@ end subroutine
         assert!(errs
             .iter()
             .any(|e| e.contains("IMPURE") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn rejects_separate_module_procedure_without_ancestor_interface() {
+        let errs = errors_from(
+            "\
+module missing_interface_parent
+  implicit none
+end module missing_interface_parent
+
+submodule (missing_interface_parent) missing_interface_child
+contains
+  module subroutine stray()
+  end subroutine stray
+end submodule missing_interface_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("separate module procedure 'stray'")
+                    && err.contains("no matching interface")
+                    && err.contains("missing_interface_parent")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_generic_specific_with_ancestor_interface() {
+        let errs = errors_from(
+            "\
+module generic_parent
+  implicit none
+  interface update
+    module subroutine update_integer(value)
+      integer, intent(out) :: value
+    end subroutine update_integer
+  end interface update
+end module generic_parent
+
+submodule (generic_parent) generic_child
+contains
+  module procedure update_integer
+    value = 1
+  end procedure update_integer
+end submodule generic_child
+",
+        );
+
+        assert!(
+            !errs.iter().any(|err| err.contains("no matching interface")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nonmodule_ancestor_interface_for_separate_body() {
+        let errs = errors_from(
+            "\
+module ordinary_interface_parent
+  implicit none
+  interface
+    subroutine ordinary()
+    end subroutine ordinary
+  end interface
+end module ordinary_interface_parent
+
+submodule (ordinary_interface_parent) ordinary_interface_child
+contains
+  module subroutine ordinary()
+  end subroutine ordinary
+end submodule ordinary_interface_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("separate module procedure 'ordinary'")
+                    && err.contains("no matching interface")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_defined_ancestor_procedure_for_separate_body() {
+        let errs = errors_from(
+            "\
+module defined_procedure_parent
+  implicit none
+contains
+  subroutine already_defined()
+  end subroutine already_defined
+end module defined_procedure_parent
+
+submodule (defined_procedure_parent) defined_procedure_child
+contains
+  module subroutine already_defined()
+  end subroutine already_defined
+end submodule defined_procedure_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("separate module procedure 'already_defined'")
+                    && err.contains("no matching interface")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_descendant_bodies_declared_in_root_ancestor() {
+        let errs = errors_from(
+            "\
+module nested_parent
+  implicit none
+  interface
+    module subroutine set_explicit(value)
+      integer, intent(out) :: value
+    end subroutine set_explicit
+    module subroutine set_abbreviated(value)
+      integer, intent(out) :: value
+    end subroutine set_abbreviated
+  end interface
+end module nested_parent
+
+submodule (nested_parent) middle
+end submodule middle
+
+submodule (nested_parent:middle) leaf
+contains
+  module subroutine set_explicit(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine set_explicit
+
+  module procedure set_abbreviated
+    value = 2
+  end procedure set_abbreviated
+end submodule leaf
+",
+        );
+
+        assert!(
+            !errs.iter().any(|err| err.contains("no matching interface")),
+            "{errs:?}"
+        );
     }
 
     #[test]

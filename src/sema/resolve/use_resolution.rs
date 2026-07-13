@@ -503,6 +503,7 @@ pub(super) fn load_external_module(
             pointer: proc.result_pointer,
             pure: proc.pure,
             elemental: proc.elemental,
+            is_separate_module_interface: proc.is_separate_module_interface,
             binding_label: proc.binding_label.clone(),
             result_rank: proc.result_rank,
             array_spec: result_array_spec,

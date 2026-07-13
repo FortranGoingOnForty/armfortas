@@ -723,8 +723,11 @@ pub(super) fn resolve_unit(
                             // Capture result rank from the function's
                             // own decls (interface-block bodies declare
                             // the result variable here).
-                            let result_attrs_for_iface =
+                            let mut result_attrs_for_iface =
                                 function_result_attrs(fn_name, result, decls);
+                            result_attrs_for_iface.is_separate_module_interface = prefix
+                                .iter()
+                                .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
@@ -760,6 +763,9 @@ pub(super) fn resolve_unit(
                                 || prefix
                                     .iter()
                                     .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                            let is_separate_module_interface = prefix
+                                .iter()
+                                .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Subroutine,
@@ -768,7 +774,10 @@ pub(super) fn resolve_unit(
                                 normalized_bind_name(bind.as_ref(), fn_name),
                                 pure,
                                 elemental,
-                                SymbolAttrs::default(),
+                                SymbolAttrs {
+                                    is_separate_module_interface,
+                                    ..Default::default()
+                                },
                             ));
                         }
                         _ => {}
@@ -819,6 +828,7 @@ pub(super) fn resolve_unit(
                         pointer: result_attrs.pointer,
                         result_rank: result_attrs.result_rank,
                         array_spec: result_attrs.array_spec.clone(),
+                        is_separate_module_interface: result_attrs.is_separate_module_interface,
                         ..Default::default()
                     },
                     defined_at: span,
@@ -847,6 +857,8 @@ pub(super) fn resolve_unit(
                                 attrs.pointer = result_attrs.pointer;
                                 attrs.result_rank = result_attrs.result_rank;
                                 attrs.array_spec = result_attrs.array_spec;
+                                attrs.is_separate_module_interface =
+                                    result_attrs.is_separate_module_interface;
                                 existing.kind = kind;
                                 existing.type_info = ti;
                                 existing.attrs = attrs;
@@ -1062,6 +1074,11 @@ fn inject_separate_module_procedure_args(
     let Some(parent_module_scope) = parent_module_scope else {
         return;
     };
+    let Some(interface_owner_scope) =
+        st.find_separate_module_interface_scope(parent_module_scope, proc_name)
+    else {
+        return;
+    };
 
     // Find the matching procedure scope inside the parent module.
     // F2008-style submodules declare the procedure inside an explicit
@@ -1070,12 +1087,12 @@ fn inject_separate_module_procedure_args(
     // procedure scope. Tolerate one Interface hop.
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
-        let direct_parent_matches = scope.parent == Some(parent_module_scope);
+        let direct_parent_matches = scope.parent == Some(interface_owner_scope);
         let via_interface = scope
             .parent
             .map(|pid| {
                 matches!(st.scope(pid).kind, ScopeKind::Interface)
-                    && st.scope(pid).parent == Some(parent_module_scope)
+                    && st.scope(pid).parent == Some(interface_owner_scope)
             })
             .unwrap_or(false);
         if !direct_parent_matches && !via_interface {

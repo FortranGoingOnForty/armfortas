@@ -2333,7 +2333,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 6\n", "#!amod 5\n", 1);
+        .replacen("#!amod 7\n", "#!amod 6\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -2360,7 +2360,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 5 (compiler requires 6)")
+        stderr.contains("incompatible .amod version 6 (compiler requires 7)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -25878,7 +25878,9 @@ fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
     let amod = std::fs::read_to_string(dir.join("mp.amod")).expect("missing mp.amod");
     for specific in ["priv_a", "priv_b"] {
         assert!(
-            amod.contains(&format!("@subroutine {specific}, private")),
+            amod.contains(&format!(
+                "@subroutine {specific}, module_interface, private"
+            )),
             "private generic specific {specific} should retain its signature in mp.amod: {amod}"
         );
     }
@@ -25902,6 +25904,159 @@ fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_submodule_requires_ancestor_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_submodule_requires_ancestor_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("missing_smp_interface");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module split_parent\n  implicit none\n  interface\n    module subroutine declared()\n    end subroutine declared\n  end interface\nend module split_parent\n",
+    );
+    let valid_child = write_program_in(
+        &dir,
+        "valid_child.f90",
+        "submodule (split_parent) valid_child\ncontains\n  module subroutine declared()\n  end subroutine declared\nend submodule valid_child\n",
+    );
+    let misspelled_child = write_program_in(
+        &dir,
+        "misspelled_child.f90",
+        "submodule (split_parent) misspelled_child\ncontains\n  module subroutine declraed()\n  end subroutine declraed\nend submodule misspelled_child\n",
+    );
+
+    let parent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", parent.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "parent.o"])
+        .output()
+        .expect("parent compile failed to spawn");
+    assert!(
+        parent_compile.status.success(),
+        "parent compile failed: {}",
+        String::from_utf8_lossy(&parent_compile.stderr)
+    );
+    let parent_amod =
+        fs::read_to_string(dir.join("split_parent.amod")).expect("missing split_parent.amod");
+    assert!(
+        parent_amod.contains("@subroutine declared, module_interface"),
+        "separate-procedure interface marker was not serialized: {parent_amod}"
+    );
+
+    let valid_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", valid_child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "valid_child.o"])
+        .output()
+        .expect("valid child compile failed to spawn");
+    assert!(
+        valid_compile.status.success(),
+        "declared separate procedure should compile: {}",
+        String::from_utf8_lossy(&valid_compile.stderr)
+    );
+
+    let invalid_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            misspelled_child.file_name().unwrap().to_str().unwrap(),
+        ])
+        .args(["-o", "misspelled_child.o"])
+        .output()
+        .expect("misspelled child compile failed to spawn");
+    assert!(
+        !invalid_compile.status.success(),
+        "an undeclared separate procedure must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&invalid_compile.stderr);
+    assert!(
+        stderr.contains("separate module procedure 'declraed'")
+            && stderr.contains("no matching interface")
+            && stderr.contains("split_parent"),
+        "unexpected missing-interface diagnostic: {stderr}"
+    );
+
+    let defined_parent = write_program_in(
+        &dir,
+        "defined_parent.f90",
+        "module defined_parent\n  implicit none\ncontains\n  subroutine already_defined()\n  end subroutine already_defined\nend module defined_parent\n",
+    );
+    let duplicate_child = write_program_in(
+        &dir,
+        "duplicate_child.f90",
+        "submodule (defined_parent) duplicate_child\ncontains\n  module subroutine already_defined()\n  end subroutine already_defined\nend submodule duplicate_child\n",
+    );
+    let defined_parent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", defined_parent.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "defined_parent.o"])
+        .output()
+        .expect("defined parent compile failed to spawn");
+    assert!(
+        defined_parent_compile.status.success(),
+        "defined parent compile failed: {}",
+        String::from_utf8_lossy(&defined_parent_compile.stderr)
+    );
+    let duplicate_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", duplicate_child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "duplicate_child.o"])
+        .output()
+        .expect("duplicate child compile failed to spawn");
+    assert!(
+        !duplicate_compile.status.success(),
+        "a defined ancestor procedure must not stand in for a separate-procedure interface"
+    );
+    let stderr = String::from_utf8_lossy(&duplicate_compile.stderr);
+    assert!(
+        stderr.contains("separate module procedure 'already_defined'")
+            && stderr.contains("no matching interface")
+            && stderr.contains("defined_parent"),
+        "unexpected defined-procedure diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn descendant_submodule_uses_root_ancestor_interfaces() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descendant_submodule_uses_root_ancestor_interfaces count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("nested_ancestor_interfaces");
+    let src = write_program_in(
+        &dir,
+        "nested_ancestor_interfaces.f90",
+        "module nested_parent\n  implicit none\n  interface\n    module subroutine set_explicit(value)\n      integer, intent(out) :: value\n    end subroutine set_explicit\n    module subroutine set_abbreviated(value)\n      integer, intent(out) :: value\n    end subroutine set_abbreviated\n  end interface\nend module nested_parent\n\nsubmodule (nested_parent) middle\nend submodule middle\n\nsubmodule (nested_parent:middle) leaf\ncontains\n  module subroutine set_explicit(value)\n    integer, intent(out) :: value\n    value = 11\n  end subroutine set_explicit\n\n  module procedure set_abbreviated\n    implicit none\n    value = 22\n  end procedure set_abbreviated\nend submodule leaf\n",
+    );
+    let out = dir.join("nested_ancestor_interfaces.o");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-J", dir.to_str().unwrap()])
+        .args([src.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", out.file_name().unwrap().to_str().unwrap()])
+        .output()
+        .expect("nested submodule compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "descendant procedures should use root ancestor interfaces: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -31381,7 +31536,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 6\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 7\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

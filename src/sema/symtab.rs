@@ -744,6 +744,39 @@ impl SymbolTable {
         symbols
     }
 
+    pub(crate) fn find_separate_module_interface_scope(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Option<ScopeId> {
+        let key = ensure_ascii_lowercase(name);
+        let mut pending = vec![scope_id];
+        let mut visited = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate) {
+                continue;
+            }
+            if self.scopes[candidate]
+                .symbols
+                .get(key.as_ref())
+                .is_some_and(|symbol| {
+                    matches!(symbol.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                        && symbol.attrs.is_separate_module_interface
+                })
+            {
+                return Some(candidate);
+            }
+            pending.extend(
+                self.scopes[candidate]
+                    .use_associations
+                    .iter()
+                    .filter(|association| association.is_submodule_access)
+                    .map(|association| association.source_scope),
+            );
+        }
+        None
+    }
+
     fn collect_named_interface_symbols_in_guarded<'a>(
         &'a self,
         scope_id: ScopeId,
@@ -2170,6 +2203,10 @@ pub struct SymbolAttrs {
     /// under the parent module's name, not the submodule's, so call
     /// sites match `_afs_modproc_<parent>_<proc>`.
     pub is_separate_module_procedure: bool,
+    /// Procedure interface body declared with the MODULE prefix in an
+    /// ancestor module. Only these interfaces may be implemented by a
+    /// separate module procedure in a descendant submodule.
+    pub is_separate_module_interface: bool,
 }
 
 impl Default for SymbolAttrs {
@@ -2194,6 +2231,7 @@ impl Default for SymbolAttrs {
             result_rank: 0,
             array_spec: Vec::new(),
             is_separate_module_procedure: false,
+            is_separate_module_interface: false,
         }
     }
 }
