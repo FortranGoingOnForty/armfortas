@@ -1343,6 +1343,15 @@ impl SymbolTable {
         self.scope_exports_key(scope_id, key.as_ref())
     }
 
+    pub(crate) fn scope_has_exported_entity(&self, scope_id: ScopeId, name: &str) -> bool {
+        let key = ensure_ascii_lowercase(name);
+        let mut visited = Vec::new();
+        let mut cache = HashMap::new();
+        self.lookup_exported_in_guarded(scope_id, key.as_ref(), &mut visited, &mut cache)
+            .is_some()
+            || self.scope_has_generic_facet(scope_id, key.as_ref(), LookupMode::Exported)
+    }
+
     fn scope_exports_key(&self, scope_id: ScopeId, key: &str) -> bool {
         let scope = &self.scopes[scope_id];
         let mut saw_symbol = false;
@@ -2420,6 +2429,42 @@ mod tests {
             !st.scope_exports_name(mod_scope, "missing"),
             "default PUBLIC governs declared or imported names, not arbitrary misses"
         );
+    }
+
+    #[test]
+    fn exported_entity_check_resolves_visibility_and_reexports() {
+        let mut st = SymbolTable::new();
+
+        let source_scope = st.push_scope(ScopeKind::Module("source".into()));
+        st.define(make_symbol("visible", SymbolKind::Variable))
+            .unwrap();
+        let mut hidden = make_symbol("hidden", SymbolKind::Variable);
+        hidden.attrs.access = Access::Private;
+        st.define(hidden).unwrap();
+        st.define(make_symbol(
+            "operator(.combine.)",
+            SymbolKind::NamedInterface,
+        ))
+        .unwrap();
+        st.pop_scope();
+
+        assert!(st.scope_has_exported_entity(source_scope, "visible"));
+        assert!(st.scope_has_exported_entity(source_scope, "operator(.combine.)"));
+        assert!(!st.scope_has_exported_entity(source_scope, "hidden"));
+        assert!(!st.scope_has_exported_entity(source_scope, "missing"));
+
+        let facade_scope = st.push_scope(ScopeKind::Module("facade".into()));
+        st.add_use_association(UseAssociation {
+            local_name: "renamed".into(),
+            original_name: "visible".into(),
+            source_scope,
+            is_submodule_access: false,
+            from_bare_use: false,
+        });
+        st.pop_scope();
+
+        assert!(st.scope_has_exported_entity(facade_scope, "renamed"));
+        assert!(!st.scope_has_exported_entity(facade_scope, "visible"));
     }
 
     #[test]

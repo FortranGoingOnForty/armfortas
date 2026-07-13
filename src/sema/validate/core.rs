@@ -16,7 +16,7 @@ use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
-use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeAttr, TypeSpec};
+use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec};
 use crate::ast::expr::{Expr, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
@@ -3168,8 +3168,6 @@ fn collect_block_use_binding_names(
     uses: &[SpannedDecl],
     out: &mut HashSet<String>,
 ) {
-    use crate::ast::decl::OnlyItem;
-
     for use_decl in uses {
         let Decl::UseStmt {
             module,
@@ -3180,22 +3178,32 @@ fn collect_block_use_binding_names(
         else {
             continue;
         };
+        let Some(source_scope) = st.find_module_scope(module) else {
+            continue;
+        };
         if let Some(items) = only {
-            out.extend(items.iter().map(|item| match item {
-                OnlyItem::Name(name) | OnlyItem::Generic(name) => name.to_lowercase(),
-                OnlyItem::Rename(rename) => rename.local.to_lowercase(),
-            }));
+            for item in items {
+                let (local, remote) = match item {
+                    OnlyItem::Name(name) | OnlyItem::Generic(name) => (name, name),
+                    OnlyItem::Rename(rename) => (&rename.local, &rename.remote),
+                };
+                if st.scope_has_exported_entity(source_scope, remote) {
+                    out.insert(local.to_lowercase());
+                }
+            }
             continue;
         }
 
-        out.extend(renames.iter().map(|rename| rename.local.to_lowercase()));
+        out.extend(
+            renames
+                .iter()
+                .filter(|rename| st.scope_has_exported_entity(source_scope, &rename.remote))
+                .map(|rename| rename.local.to_lowercase()),
+        );
         let renamed_remote: HashSet<String> = renames
             .iter()
             .map(|rename| rename.remote.to_lowercase())
             .collect();
-        let Some(source_scope) = st.find_module_scope(module) else {
-            continue;
-        };
         let source = st.scope(source_scope);
         for symbol in source.symbols.values() {
             let key = symbol.name.to_lowercase();
@@ -3654,9 +3662,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             contains,
             ..
         } => {
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -3683,9 +3689,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F90, "MODULE");
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -3742,9 +3746,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     _ => {}
                 }
             }
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -3889,9 +3891,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     _ => {}
                 }
             }
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -3949,14 +3949,13 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     ),
                 );
             }
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             validate_decls(ctx, decls);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
-        ProgramUnit::BlockData { decls, .. } => {
+        ProgramUnit::BlockData { uses, decls, .. } => {
             warn_legacy_feature(ctx, unit.span, "BLOCK DATA");
+            validate_decls(ctx, uses);
             validate_decls(ctx, decls);
         }
         ProgramUnit::InterfaceBlock {
@@ -3998,9 +3997,64 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
 
 // ---- Declaration validation ----
 
+fn validate_use_decl(ctx: &mut Ctx<'_>, decl: &SpannedDecl) {
+    let Decl::UseStmt {
+        module,
+        renames,
+        only,
+        ..
+    } = &decl.node
+    else {
+        return;
+    };
+
+    let Some(module_scope) = ctx.st.find_module_scope(module) else {
+        ctx.error(decl.span, format!("module '{}' not found", module));
+        return;
+    };
+    if module_scope == ctx.scope_id {
+        ctx.error(decl.span, format!("module '{}' cannot USE itself", module));
+        return;
+    }
+
+    if let Some(items) = only {
+        for item in items {
+            let target = match item {
+                OnlyItem::Name(name) | OnlyItem::Generic(name) => name,
+                OnlyItem::Rename(rename) => &rename.remote,
+            };
+            if !ctx.st.scope_has_exported_entity(module_scope, target) {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "USE target '{}' is not exported by module '{}'",
+                        target, module
+                    ),
+                );
+            }
+        }
+    } else {
+        for rename in renames {
+            if !ctx
+                .st
+                .scope_has_exported_entity(module_scope, &rename.remote)
+            {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "USE target '{}' is not exported by module '{}'",
+                        rename.remote, module
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
     for decl in decls {
         validate_decl_const_int_exprs(ctx, decl);
+        validate_use_decl(ctx, decl);
 
         if let Decl::TypeDecl {
             attrs,

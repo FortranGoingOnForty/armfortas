@@ -1544,6 +1544,312 @@ end program
 }
 
 #[test]
+fn use_targets_must_be_exported_by_provider() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=use_targets_must_be_exported_by_provider count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let module_dir = unique_dir("use_target_validation");
+    let rejected_cases = [
+        (
+            "missing_only",
+            r#"
+module missing_only_source
+  integer, parameter :: present = 1
+end module
+program demo
+  use missing_only_source, only: absent
+  implicit none
+  print *, 'accepted'
+end program
+"#,
+            "absent",
+            "missing_only_source",
+        ),
+        (
+            "private_only",
+            r#"
+module private_only_source
+  implicit none
+  private
+  integer, parameter :: hidden = 1
+end module
+program demo
+  use private_only_source, only: hidden
+  implicit none
+  print *, 'accepted'
+end program
+"#,
+            "hidden",
+            "private_only_source",
+        ),
+        (
+            "missing_only_rename",
+            r#"
+module missing_only_rename_source
+  integer, parameter :: present = 1
+end module
+program demo
+  use missing_only_rename_source, only: local => absent
+  implicit none
+  print *, 'accepted'
+end program
+"#,
+            "absent",
+            "missing_only_rename_source",
+        ),
+        (
+            "missing_bare_rename",
+            r#"
+module missing_bare_rename_source
+  integer, parameter :: present = 1
+end module
+program demo
+  use missing_bare_rename_source, local => absent
+  implicit none
+  print *, 'accepted'
+end program
+"#,
+            "absent",
+            "missing_bare_rename_source",
+        ),
+        (
+            "block_missing_only",
+            r#"
+module block_missing_only_source
+  integer, parameter :: present = 1
+end module
+program demo
+  implicit none
+  block
+    use block_missing_only_source, only: absent
+    print *, 'accepted'
+  end block
+end program
+"#,
+            "absent",
+            "block_missing_only_source",
+        ),
+        (
+            "block_private_only",
+            r#"
+module block_private_only_source
+  implicit none
+  private
+  integer, parameter :: hidden = 1
+end module
+program demo
+  implicit none
+  block
+    use block_private_only_source, only: hidden
+    print *, 'accepted'
+  end block
+end program
+"#,
+            "hidden",
+            "block_private_only_source",
+        ),
+        (
+            "block_missing_bare_rename",
+            r#"
+module block_missing_bare_rename_source
+  integer, parameter :: present = 1
+end module
+program demo
+  implicit none
+  block
+    use block_missing_bare_rename_source, local => absent
+    print *, 'accepted'
+  end block
+end program
+"#,
+            "absent",
+            "block_missing_bare_rename_source",
+        ),
+    ];
+    for (name, source, target, module) in rejected_cases {
+        let src = write_program(source, "f90");
+        let out = module_dir.join(format!("{name}.o"));
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-J",
+                module_dir.to_str().unwrap(),
+                "-I",
+                module_dir.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "an unexported USE target should be rejected ({name})"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "USE target '{target}' is not exported by module '{module}'"
+            )),
+            "missing USE-target diagnostic for {name}: {stderr}"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let forward_source = write_program(
+        r#"
+module forward_facade
+  use forward_source, only: forwarded => present, pick
+  implicit none
+end module
+
+module forward_source
+  implicit none
+  integer, parameter :: present = 3
+  interface pick
+    module procedure pick_integer
+  end interface
+contains
+  integer function pick_integer(value)
+    integer, intent(in) :: value
+    pick_integer = value
+  end function
+end module
+
+program demo
+  use forward_facade, only: forwarded, pick
+  implicit none
+  if (pick(forwarded) /= 3) error stop 1
+end program
+"#,
+        "f90",
+    );
+    let forward_out = module_dir.join("forward_provider.o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            forward_source.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+            "-I",
+            module_dir.to_str().unwrap(),
+            "-o",
+            forward_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("forward-provider compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "a later in-file provider should be validated after population: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let _ = std::fs::remove_file(&forward_source);
+
+    let provider = write_program(
+        r#"
+module external_only_source
+  implicit none
+  private
+  public :: present
+  integer, parameter :: present = 1
+  integer, parameter :: hidden = 2
+end module
+"#,
+        "f90",
+    );
+    let provider_out = module_dir.join("external_only_source.o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+            "-I",
+            module_dir.to_str().unwrap(),
+            "-o",
+            provider_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    for (name, target) in [
+        ("external_missing", "absent"),
+        ("external_private", "hidden"),
+    ] {
+        let consumer = write_program(
+            &format!(
+                "program demo\n  use external_only_source, only: {target}\n  implicit none\n  print *, 'accepted'\nend program\n"
+            ),
+            "f90",
+        );
+        let out = module_dir.join(format!("{name}.o"));
+        let result = Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                consumer.to_str().unwrap(),
+                "-J",
+                module_dir.to_str().unwrap(),
+                "-I",
+                module_dir.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("consumer compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "an .amod consumer should reject {target}"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "USE target '{target}' is not exported by module 'external_only_source'"
+            )),
+            "source and .amod diagnostics should agree for {target}: {stderr}"
+        );
+        let _ = std::fs::remove_file(&consumer);
+    }
+
+    let consumer = write_program(
+        "program demo\n  use external_only_source, only: present\n  implicit none\n  print *, present\nend program\n",
+        "f90",
+    );
+    let consumer_out = module_dir.join("external_present.o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-J",
+            module_dir.to_str().unwrap(),
+            "-I",
+            module_dir.to_str().unwrap(),
+            "-o",
+            consumer_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("valid consumer compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "an exported .amod target should remain valid: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_file(&consumer);
+    let _ = std::fs::remove_file(&provider);
+    let _ = std::fs::remove_dir_all(&module_dir);
+}
+
+#[test]
 fn only_filtered_name_stays_accessible_when_imported_from_another_module() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
