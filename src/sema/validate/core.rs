@@ -6203,48 +6203,8 @@ fn block_use_imported_names(
     st: &SymbolTable,
     uses: &[crate::ast::decl::SpannedDecl],
 ) -> std::collections::HashSet<String> {
-    use crate::ast::decl::OnlyItem;
-    use crate::sema::symtab::Access;
-
     let mut imported = std::collections::HashSet::new();
-    for use_decl in uses {
-        let crate::ast::decl::Decl::UseStmt {
-            module,
-            renames,
-            only,
-            ..
-        } = &use_decl.node
-        else {
-            continue;
-        };
-        if let Some(only_items) = only {
-            for item in only_items {
-                match item {
-                    OnlyItem::Name(name) => {
-                        imported.insert(name.to_lowercase());
-                    }
-                    OnlyItem::Generic(name) => {
-                        imported.insert(name.to_lowercase());
-                    }
-                    OnlyItem::Rename(rename) => {
-                        imported.insert(rename.local.to_lowercase());
-                    }
-                }
-            }
-            continue;
-        }
-
-        if let Some(scope_id) = st.find_module_scope(module) {
-            for sym in st.scope(scope_id).symbols.values() {
-                if sym.attrs.access != Access::Private {
-                    imported.insert(sym.name.to_lowercase());
-                }
-            }
-        }
-        for rename in renames {
-            imported.insert(rename.local.to_lowercase());
-        }
-    }
+    collect_block_use_binding_names(st, uses, &mut imported);
     imported
 }
 

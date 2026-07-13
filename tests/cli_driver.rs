@@ -1391,6 +1391,156 @@ end program
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+
+    let rejected_cases = [
+        (
+            "rename_hides_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  use rename_source, local => original
+  implicit none
+  print *, original
+end program
+"#,
+            "original",
+        ),
+        (
+            "each_rename_hides_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  use rename_source, first => original
+  use rename_source, second => original
+  implicit none
+  print *, original
+end program
+"#,
+            "original",
+        ),
+        (
+            "block_rename_hides_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  implicit none
+  block
+    use rename_source, local => original
+    print *, original
+  end block
+end program
+"#,
+            "original",
+        ),
+        (
+            "each_block_rename_hides_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  implicit none
+  block
+    use rename_source, first => original
+    use rename_source, second => original
+    print *, original
+  end block
+end program
+"#,
+            "original",
+        ),
+    ];
+    for (name, source, remote_name) in rejected_cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(name, "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "a bare USE rename should hide its remote name ({name})"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "variable '{remote_name}' used but not declared (IMPLICIT NONE is active)"
+            )),
+            "missing hidden-remote diagnostic for {name}: {stderr}"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let restored_cases = [
+        (
+            "unrenamed_use_restores_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  use rename_source, local => original
+  use rename_source
+  implicit none
+  print *, original, local
+end program
+"#,
+        ),
+        (
+            "block_unrenamed_use_restores_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  implicit none
+  block
+    use rename_source, local => original
+    use rename_source
+    print *, original, local
+  end block
+end program
+"#,
+        ),
+        (
+            "block_prior_unrenamed_use_restores_remote",
+            r#"
+module rename_source
+  integer, parameter :: original = 19
+end module
+program demo
+  implicit none
+  block
+    use rename_source
+    use rename_source, local => original
+    print *, original, local
+  end block
+end program
+"#,
+        ),
+    ];
+    for (name, source) in restored_cases {
+        let src = write_program(source, "f90");
+        let out = unique_path(name, "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "an unrenamed USE should restore the remote binding ({name}): {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&src);
+    }
 }
 
 #[test]

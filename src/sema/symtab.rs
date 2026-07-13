@@ -2767,6 +2767,67 @@ mod tests {
         assert_eq!(st.use_ambiguity_in(program_scope, "y", false), None);
     }
 
+    #[test]
+    fn bare_use_rename_hides_remote_until_unrenamed_use_restores_it() {
+        let mut st = SymbolTable::new();
+
+        let module_scope = st.push_scope(ScopeKind::Module("provider".into()));
+        st.define(make_symbol("remote", SymbolKind::Variable))
+            .unwrap();
+        st.pop_scope();
+
+        st.push_scope(ScopeKind::Program("main".into()));
+        for assoc in [
+            UseAssociation {
+                local_name: String::new(),
+                original_name: String::new(),
+                source_scope: module_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            },
+            UseAssociation {
+                local_name: "remote".into(),
+                original_name: "remote".into(),
+                source_scope: module_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            },
+            UseAssociation {
+                local_name: "local".into(),
+                original_name: "remote".into(),
+                source_scope: module_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            },
+        ] {
+            st.add_use_association(assoc);
+        }
+
+        assert!(st.lookup("local").is_some());
+        assert!(st.lookup("remote").is_none());
+
+        for assoc in [
+            UseAssociation {
+                local_name: String::new(),
+                original_name: String::new(),
+                source_scope: module_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            },
+            UseAssociation {
+                local_name: "remote".into(),
+                original_name: "remote".into(),
+                source_scope: module_scope,
+                is_submodule_access: false,
+                from_bare_use: true,
+            },
+        ] {
+            st.add_use_association(assoc);
+        }
+
+        assert!(st.lookup("remote").is_some());
+    }
+
     // ---- Implicit typing ----
 
     #[test]
