@@ -278,7 +278,7 @@ impl<'a> Parser<'a> {
         let name = self.advance().clone().text;
         self.skip_newlines();
 
-        let (uses, imports, _implicit, decls, _body, ifaces) =
+        let (uses, imports, implicit, decls, _body, ifaces) =
             self.parse_unit_body(&["submodule"])?;
         let mut contains = self.parse_contains_section()?;
         // Carry interface blocks declared at the submodule's
@@ -297,6 +297,7 @@ impl<'a> Parser<'a> {
                 name,
                 uses,
                 imports,
+                implicit,
                 decls,
                 contains,
             },
@@ -1553,6 +1554,21 @@ mod tests {
         assert!(matches!(
             imports.as_slice(),
             [ImportStmt::Only(names)] if names.len() == 1 && names[0] == "visible"
+        ));
+    }
+
+    #[test]
+    fn submodule_preserves_implicit_none() {
+        let u = parse_unit("submodule(parent) child\n  implicit none\nend submodule\n");
+        let ProgramUnit::Submodule { implicit, .. } = &u.node else {
+            panic!("not Submodule");
+        };
+        assert!(matches!(
+            implicit.as_slice(),
+            [Spanned {
+                node: crate::ast::decl::Decl::ImplicitNone { .. },
+                ..
+            }]
         ));
     }
 

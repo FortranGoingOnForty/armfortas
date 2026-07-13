@@ -568,6 +568,7 @@ pub(super) fn resolve_unit(
             name,
             uses,
             imports,
+            implicit,
             decls,
             contains,
         } => {
@@ -623,6 +624,7 @@ pub(super) fn resolve_unit(
                 });
             }
             process_uses(st, uses, module_search_paths, layouts)?;
+            process_implicit(st, implicit)?;
             // Import all immediate-parent symbols into the submodule scope.
             // Per F2008 12.2.3.2: submodules see ALL parent entities,
             // including private ones — that's the whole point of the
@@ -3131,6 +3133,20 @@ mod tests {
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.implicit_rules.none_type);
+    }
+
+    #[test]
+    fn submodule_implicit_none_is_retained_in_scope() {
+        let st = resolve_source(
+            "module parent\nend module parent\nsubmodule(parent) child\n  implicit none\nend submodule child\n",
+        );
+        let submodule_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Submodule(name) if name == "child"))
+            .unwrap();
+        assert!(submodule_scope.implicit_rules.none_type);
+        assert!(submodule_scope.has_explicit_implicit_stmt);
     }
 
     #[test]

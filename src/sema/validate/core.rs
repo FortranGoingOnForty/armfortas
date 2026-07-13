@@ -4072,6 +4072,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         ProgramUnit::Submodule {
             parent,
             uses,
+            implicit,
             decls,
             contains,
             ..
@@ -4096,6 +4097,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 );
             }
             validate_decls(ctx, uses);
+            validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
@@ -7596,19 +7598,15 @@ pub(super) fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<
     }
 }
 
-// ---- IMPLICIT NONE enforcement ----
+// ---- Implicit typing enforcement ----
 
-/// Check that all variable references in a statement list are declared
-/// when IMPLICIT NONE is active in the current scope.
+/// Check that every variable reference is declared or covered by the
+/// current scope's implicit typing map.
 fn check_implicit_none(
     ctx: &mut Ctx,
     stmts: &[SpannedStmt],
     decls: &[crate::ast::decl::SpannedDecl],
 ) {
-    if !ctx.st.is_implicit_none(ctx.scope_id) {
-        return;
-    }
-
     // Collect declared names in this scope (from declarations).
     let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
     extend_declared_names_from_decls(&mut declared, decls);
@@ -7635,7 +7633,12 @@ fn check_implicit_none(
     let mut undeclared = Vec::new();
     let mut resolution_cache: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    let outer_implicit_letters: std::collections::HashSet<char> = std::collections::HashSet::new();
+    let scope_rules = &ctx.st.scopes[ctx.scope_id].implicit_rules;
+    let outer_implicit_letters: std::collections::HashSet<char> = if scope_rules.none_type {
+        std::collections::HashSet::new()
+    } else {
+        scope_rules.rules.keys().copied().collect()
+    };
     for stmt in stmts {
         walk_stmt_for_undeclared(
             ctx.st,
@@ -7653,12 +7656,14 @@ fn check_implicit_none(
     for (name, span) in &undeclared {
         let key = name.to_lowercase();
         if reported.insert(key) {
+            let reason = if ctx.st.is_implicit_none(ctx.scope_id) {
+                "IMPLICIT NONE is active"
+            } else {
+                "no implicit type is available"
+            };
             ctx.error(
                 *span,
-                format!(
-                    "variable '{}' used but not declared (IMPLICIT NONE is active)",
-                    name
-                ),
+                format!("variable '{}' used but not declared ({reason})", name),
             );
         }
     }
@@ -12642,6 +12647,70 @@ end submodule intent_child
     }
 
     #[test]
+    fn submodule_implicit_none_applies_to_separate_procedure_bodies() {
+        let errs = errors_from(
+            "\
+module implicit_parent
+  interface
+    module subroutine run()
+    end subroutine run
+  end interface
+end module implicit_parent
+
+submodule (implicit_parent) implicit_child
+  implicit none
+contains
+  module subroutine run()
+    typo = 1
+  end subroutine run
+end submodule implicit_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("variable 'typo' used but not declared")
+                    && err.contains("IMPLICIT NONE is active")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn separate_procedure_partially_overrides_submodule_implicit_none() {
+        let errs = errors_from(
+            "\
+module implicit_parent
+  interface
+    module subroutine run()
+    end subroutine run
+  end interface
+end module implicit_parent
+
+submodule (implicit_parent) implicit_child
+  implicit none
+contains
+  module subroutine run()
+    implicit integer(t-t)
+    typo = 1
+    xray = 2
+  end subroutine run
+end submodule implicit_child
+",
+        );
+
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("variable 'xray' used but not declared")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("variable 'typo'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
     fn submodule_requires_f2008() {
         use crate::lexer::{Position, Span};
 
@@ -12657,6 +12726,7 @@ end submodule intent_child
                 name: "child_mod".into(),
                 uses: vec![],
                 imports: vec![],
+                implicit: vec![],
                 decls: vec![],
                 contains: vec![],
             },

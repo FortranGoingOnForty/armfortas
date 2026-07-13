@@ -1895,6 +1895,9 @@ impl SymbolTable {
     pub fn set_implicit_rule(&mut self, start: char, end: char, itype: ImplicitType) {
         let scope = &mut self.scopes[self.current];
         scope.has_explicit_implicit_stmt = true;
+        if scope.implicit_rules.none_type {
+            scope.implicit_rules.rules.clear();
+        }
         scope.implicit_rules.none_type = false;
         for c in start..=end {
             scope
@@ -3161,6 +3164,19 @@ mod tests {
             st.implicit_type("index"),
             Some(ImplicitType::DoublePrecision)
         );
+    }
+
+    #[test]
+    fn implicit_rule_partially_overrides_inherited_none() {
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Module("parent".into()));
+        st.set_implicit_none(true, false);
+        st.push_scope(ScopeKind::Subroutine("child".into()));
+        st.set_implicit_rule('t', 't', ImplicitType::Integer);
+
+        assert_eq!(st.implicit_type("typo"), Some(ImplicitType::Integer));
+        assert_eq!(st.implicit_type("xray"), None);
+        assert_eq!(st.implicit_type("index"), None);
     }
 
     // ---- Module scope finding ----

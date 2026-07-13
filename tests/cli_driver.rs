@@ -26086,6 +26086,60 @@ fn descendant_submodule_uses_root_ancestor_interfaces() {
 }
 
 #[test]
+fn split_file_submodule_retains_implicit_none() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_submodule_retains_implicit_none count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_implicit_none");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module implicit_parent\n  interface\n    module subroutine run()\n    end subroutine run\n  end interface\nend module implicit_parent\n",
+    );
+    let child = write_program_in(
+        &dir,
+        "child.f90",
+        "submodule (implicit_parent) implicit_child\n  implicit none\ncontains\n  module subroutine run()\n    typo = 1\n  end subroutine run\nend submodule implicit_child\n",
+    );
+
+    let parent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", parent.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "parent.o"])
+        .output()
+        .expect("implicit parent compile failed to spawn");
+    assert!(
+        parent_compile.status.success(),
+        "implicit parent compile failed: {}",
+        String::from_utf8_lossy(&parent_compile.stderr)
+    );
+
+    let child_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "child.o"])
+        .output()
+        .expect("implicit child compile failed to spawn");
+    assert!(
+        !child_compile.status.success(),
+        "submodule-local IMPLICIT NONE must reject undeclared names"
+    );
+    let stderr = String::from_utf8_lossy(&child_compile.stderr);
+    assert!(
+        stderr.contains("variable 'typo' used but not declared")
+            && stderr.contains("IMPLICIT NONE is active"),
+        "unexpected submodule IMPLICIT NONE diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_parameter_array_scalar_broadcast_init_keeps_array_global() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
