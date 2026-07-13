@@ -25922,7 +25922,7 @@ fn split_file_submodule_requires_ancestor_interface() {
     let parent = write_program_in(
         &dir,
         "parent.f90",
-        "module split_parent\n  implicit none\n  interface\n    module subroutine declared()\n    end subroutine declared\n  end interface\nend module split_parent\n",
+        "module split_parent\n  implicit none\n  interface\n    module subroutine declared()\n    end subroutine declared\n    module subroutine preserve(value)\n      integer, intent(in) :: value\n    end subroutine preserve\n  end interface\nend module split_parent\n",
     );
     let valid_child = write_program_in(
         &dir,
@@ -25933,6 +25933,11 @@ fn split_file_submodule_requires_ancestor_interface() {
         &dir,
         "misspelled_child.f90",
         "submodule (split_parent) misspelled_child\ncontains\n  module subroutine declraed()\n  end subroutine declraed\nend submodule misspelled_child\n",
+    );
+    let intent_child = write_program_in(
+        &dir,
+        "intent_child.f90",
+        "submodule (split_parent) intent_child\ncontains\n  module subroutine preserve(value)\n    integer, intent(out) :: value\n  end subroutine preserve\nend submodule intent_child\n",
     );
 
     let parent_compile = Command::new(compiler("armfortas"))
@@ -25984,6 +25989,25 @@ fn split_file_submodule_requires_ancestor_interface() {
             && stderr.contains("no matching interface")
             && stderr.contains("split_parent"),
         "unexpected missing-interface diagnostic: {stderr}"
+    );
+
+    let intent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", intent_child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "intent_child.o"])
+        .output()
+        .expect("INTENT-mismatched child compile failed to spawn");
+    assert!(
+        !intent_compile.status.success(),
+        "a separate procedure with mismatched INTENT must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&intent_compile.stderr);
+    assert!(
+        stderr.contains("dummy argument 'value'")
+            && stderr.contains("INTENT(OUT)")
+            && stderr.contains("INTENT(IN)")
+            && stderr.contains("does not match"),
+        "unexpected INTENT diagnostic: {stderr}"
     );
 
     let defined_parent = write_program_in(

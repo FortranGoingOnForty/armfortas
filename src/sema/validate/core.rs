@@ -1285,6 +1285,15 @@ fn smp_type_compatible(a: &TypeInfo, b: &TypeInfo) -> bool {
     }
 }
 
+fn smp_intent_name(intent: Option<Intent>) -> &'static str {
+    match intent {
+        Some(Intent::In) => "INTENT(IN)",
+        Some(Intent::Out) => "INTENT(OUT)",
+        Some(Intent::InOut) => "INTENT(INOUT)",
+        None => "no INTENT",
+    }
+}
+
 /// F2008 §12.6.2.5 / C1414/C1418: a separate module procedure body must
 /// match its interface in the ancestor module — the interface must exist,
 /// and the dummy arguments must agree in number, type, kind, and rank.
@@ -1404,6 +1413,17 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
                      {} but its interface declares rank {} (F2008 C1418)",
                     bsym.attrs.array_spec.len(),
                     isym.attrs.array_spec.len()
+                ),
+            );
+        }
+        if isym.attrs.intent != bsym.attrs.intent {
+            ctx.error(
+                span,
+                format!(
+                    "dummy argument '{ba}' of separate module procedure '{name}' has {}, \
+                     which does not match {} in its ancestor interface (F2008 C1418)",
+                    smp_intent_name(bsym.attrs.intent),
+                    smp_intent_name(isym.attrs.intent)
                 ),
             );
         }
@@ -12574,6 +12594,49 @@ end submodule leaf
 
         assert!(
             !errs.iter().any(|err| err.contains("no matching interface")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_separate_procedure_intent_mismatches() {
+        let errs = errors_from(
+            "\
+module intent_parent
+  implicit none
+  interface
+    module subroutine input_to_output(value)
+      integer, intent(in) :: value
+    end subroutine input_to_output
+    module subroutine inout_to_unspecified(value)
+      integer, intent(inout) :: value
+    end subroutine inout_to_unspecified
+    module subroutine unspecified_to_input(value)
+      integer :: value
+    end subroutine unspecified_to_input
+  end interface
+end module intent_parent
+
+submodule (intent_parent) intent_child
+contains
+  module subroutine input_to_output(value)
+    integer, intent(out) :: value
+  end subroutine input_to_output
+  module subroutine inout_to_unspecified(value)
+    integer :: value
+  end subroutine inout_to_unspecified
+  module subroutine unspecified_to_input(value)
+    integer, intent(in) :: value
+  end subroutine unspecified_to_input
+end submodule intent_child
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("INTENT") && err.contains("does not match"))
+                .count(),
+            3,
             "{errs:?}"
         );
     }
