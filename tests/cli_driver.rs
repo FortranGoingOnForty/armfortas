@@ -1850,6 +1850,79 @@ end module
 }
 
 #[test]
+fn stale_amod_requests_provider_rebuild() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stale_amod_requests_provider_rebuild count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("stale_amod");
+    let provider = write_program_in(
+        &dir,
+        "stale_provider.f90",
+        "module stale_provider\n  integer, parameter :: value = 1\nend module\n",
+    );
+    let provider_out = dir.join("stale_provider.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let amod_path = dir.join("stale_provider.amod");
+    let stale = fs::read_to_string(&amod_path)
+        .expect("missing provider .amod")
+        .replacen("#!amod 5\n", "#!amod 4\n", 1);
+    fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
+
+    let consumer = write_program_in(
+        &dir,
+        "stale_consumer.f90",
+        "program demo\n  use stale_provider, only: value\n  print *, value\nend program\n",
+    );
+    let consumer_out = dir.join("stale_consumer.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            "-o",
+            consumer_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("consumer compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "a stale .amod must fail the build"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("incompatible .amod version 4 (compiler requires 5)")
+            && stderr.contains("rebuild the provider module"),
+        "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn only_filtered_name_stays_accessible_when_imported_from_another_module() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -30673,8 +30746,19 @@ fn amod_only_edges_preserve_filtered_reexports() {
         "ONLY-qualified dependency was also serialized as a bare edge:\n{facade_amod}"
     );
 
-    for iteration in 0..3 {
-        let repeat_obj = dir.join(format!("filtered_facade_repeat_{iteration}.o"));
+    let artifact_hash = |contents: &str| {
+        contents
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            })
+    };
+    let mut writer_hashes = std::collections::HashSet::new();
+    for iteration in 0..30 {
+        let writer_dir = dir.join(format!("writer_{iteration}"));
+        std::fs::create_dir_all(&writer_dir).expect("cannot create fresh writer directory");
+        let repeat_obj = writer_dir.join("filtered_facade.o");
         let repeat = Command::new(compiler("armfortas"))
             .current_dir(&dir)
             .args([
@@ -30682,7 +30766,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
                 "-I",
                 dir.to_str().unwrap(),
                 "-J",
-                dir.to_str().unwrap(),
+                writer_dir.to_str().unwrap(),
                 facade_src.to_str().unwrap(),
                 "-o",
                 repeat_obj.to_str().unwrap(),
@@ -30694,14 +30778,24 @@ fn amod_only_edges_preserve_filtered_reexports() {
             "repeated filtered facade compile failed: {}",
             String::from_utf8_lossy(&repeat.stderr)
         );
-        let repeated_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
+        let repeated_amod = fs::read_to_string(writer_dir.join("filtered_facade.amod"))
             .expect("missing repeated filtered facade .amod");
         assert_eq!(
             use_records(&repeated_amod),
             expected_records,
             "dependency record order changed on iteration {iteration}"
         );
+        assert_eq!(
+            repeated_amod, facade_amod,
+            "fresh writer {iteration} produced different module bytes"
+        );
+        writer_hashes.insert(artifact_hash(&repeated_amod));
     }
+    assert_eq!(
+        writer_hashes.len(),
+        1,
+        "30 fresh writers must produce one module artifact hash"
+    );
 
     let allowed_obj = dir.join("allowed.o");
     let allowed = Command::new(compiler("armfortas"))
