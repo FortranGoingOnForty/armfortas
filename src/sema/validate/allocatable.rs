@@ -87,6 +87,9 @@ pub(super) struct LeafComponent<'a> {
     /// Any ancestor is ALLOCATABLE — per §8.5.14, an allocated
     /// subobject of an allocatable is also a valid target.
     pub(super) ancestor_is_allocatable: bool,
+    /// Any ancestor is a pointer. Defining a subobject reached through
+    /// that pointer defines its target, not the pointer-bearing ancestor.
+    pub(super) ancestor_is_pointer: bool,
 }
 
 /// Walk an expression down to its leaf component access and return
@@ -128,6 +131,7 @@ pub(super) fn leaf_field_layout<'a>(
     };
     let mut ancestor_is_target = sym.attrs.target;
     let mut ancestor_is_allocatable = sym.attrs.allocatable;
+    let mut ancestor_is_pointer = sym.attrs.pointer;
     let mut current_layout = layouts
         .get_for_scope(ctx.scope_id, &base_type)
         .or_else(|| layouts.get(&base_type))?;
@@ -141,6 +145,9 @@ pub(super) fn leaf_field_layout<'a>(
             }
             if field.allocatable {
                 ancestor_is_allocatable = true;
+            }
+            if field.pointer {
+                ancestor_is_pointer = true;
             }
         }
         leaf = Some(field);
@@ -157,5 +164,6 @@ pub(super) fn leaf_field_layout<'a>(
         field,
         ancestor_is_target,
         ancestor_is_allocatable,
+        ancestor_is_pointer,
     })
 }

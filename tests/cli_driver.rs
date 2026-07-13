@@ -284,6 +284,271 @@ fn incompatible_intrinsic_assignment_is_rejected() {
 }
 
 #[test]
+fn incompatible_explicit_interface_actual_is_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=incompatible_explicit_interface_actual_is_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("explicit_interface_type");
+    let src = write_program_in(
+        &dir,
+        "explicit_interface_type.f90",
+        "module typed_api\n  implicit none\ncontains\n  subroutine accept(value)\n    integer(8), intent(in) :: value\n  end subroutine accept\nend module typed_api\nprogram caller\n  use typed_api, only: accept\n  implicit none\n  logical(1) :: flag\n  call accept(flag)\nend program caller\n",
+    );
+    let output = dir.join("explicit_interface_type.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("explicit-interface compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "incompatible explicit-interface actual must fail"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("argument 'value' type mismatch: expected INTEGER(8), got LOGICAL(1)"),
+        "missing explicit-interface type diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_module_interface_rejects_incompatible_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=loaded_module_interface_rejects_incompatible_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("loaded_explicit_interface");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module typed_api\n  implicit none\ncontains\n  subroutine accept(values)\n    integer(8), intent(in) :: values(:)\n  end subroutine accept\n  subroutine set_value(value)\n    integer, intent(out) :: value\n    value = 1\n  end subroutine set_value\nend module typed_api\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use typed_api, only: accept, set_value\n  implicit none\n  real(4) :: scalar\n  call accept(scalar)\n  call set_value(1)\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            caller.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("caller compile failed to spawn");
+    assert!(
+        !caller_result.status.success(),
+        "loaded interface must reject incompatible actual"
+    );
+    let stderr = String::from_utf8_lossy(&caller_result.stderr);
+    assert!(
+        stderr.contains("expected INTEGER(8), got REAL(4)"),
+        "missing loaded-interface type diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected rank 1, got rank 0"),
+        "missing loaded-interface rank diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "actual argument for INTENT(OUT/INOUT) dummy 'value' must be a definable variable"
+        ),
+        "missing loaded-interface intent diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_assumed_rank_interface_accepts_any_actual_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=loaded_assumed_rank_interface_accepts_any_actual_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("loaded_assumed_rank");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module rank_api\n  implicit none\ncontains\n  subroutine accept_any(value)\n    class(*), dimension(..), intent(in) :: value\n  end subroutine accept_any\nend module rank_api\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-rank provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "assumed-rank provider compile failed: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use rank_api, only: accept_any\n  implicit none\n  integer :: matrix(2, 2)\n  call accept_any(matrix)\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            caller.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-rank caller compile failed to spawn");
+    assert!(
+        caller_result.status.success(),
+        "loaded assumed-rank interface rejected rank-2 actual: {}",
+        String::from_utf8_lossy(&caller_result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_interfaces_validate_generic_and_procedure_pointer_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=loaded_interfaces_validate_generic_and_procedure_pointer_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("loaded_callable_interfaces");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module callable_api\n  implicit none\n  abstract interface\n    subroutine action_interface(value)\n      integer(8), intent(in) :: value\n    end subroutine action_interface\n  end interface\n  interface required_generic\n    module procedure required_value\n  end interface required_generic\n  procedure(action_interface), pointer :: action\ncontains\n  integer function required_value(value)\n    integer, intent(in) :: value\n    required_value = value\n  end function required_value\nend module callable_api\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2023",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callable-interface provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "callable-interface provider compile failed: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use callable_api, only: action, required_generic\n  implicit none\n  logical(1) :: flag\n  integer :: result\n  call action(flag)\n  result = required_generic((.true. ? 7 : .nil.))\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2023",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            caller.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callable-interface caller compile failed to spawn");
+    assert!(
+        !caller_result.status.success(),
+        "loaded explicit interfaces must reject incompatible actuals"
+    );
+    let stderr = String::from_utf8_lossy(&caller_result.stderr);
+    assert!(
+        stderr.contains("argument 'value' type mismatch: expected INTEGER(8), got LOGICAL(1)"),
+        "missing loaded procedure-pointer diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("dummy argument 'value' is not OPTIONAL (F2023 C1525)"),
+        "missing loaded generic C1525 diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn class_star_defined_assignment_accepts_concrete_rhs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -2068,7 +2333,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 5\n", "#!amod 4\n", 1);
+        .replacen("#!amod 6\n", "#!amod 5\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -2095,7 +2360,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 4 (compiler requires 5)")
+        stderr.contains("incompatible .amod version 5 (compiler requires 6)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -31116,7 +31381,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 5\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 6\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

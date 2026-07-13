@@ -1065,12 +1065,8 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 _ => {}
             }
         }
-        // Argument association: an enumeration actual requires a dummy
-        // of the same enumeration type and vice versa (no implicit
-        // INTEGER bridge — an integer actual against an enumeration
-        // dummy read garbage before this check existed). Checked for
-        // CALL to a uniquely-resolvable subroutine; anything ambiguous
-        // (generics, externals without a visible body) is skipped.
+        // C pointer interop has additional argument constraints beyond the
+        // shared direct-interface validator below.
         Stmt::Call { callee, args } => {
             let Expr::Name { name } = &callee.node else {
                 return;
@@ -1082,100 +1078,6 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             }
             if name.eq_ignore_ascii_case("c_f_pointer") {
                 validate_c_f_pointer(ctx, args);
-                return;
-            }
-            let Some(arg_names) = ctx.lookup(name).and_then(|sym| {
-                matches!(sym.kind, crate::sema::symtab::SymbolKind::Subroutine)
-                    .then(|| sym.arg_names.clone())
-            }) else {
-                return;
-            };
-            let target = name.to_ascii_lowercase();
-            let mut scopes = ctx.st.all_scopes().iter().filter(|scope| {
-                matches!(&scope.kind, crate::sema::symtab::ScopeKind::Subroutine(n)
-                    if n.eq_ignore_ascii_case(&target))
-            });
-            let (Some(callee_scope), None) = (scopes.next(), scopes.next()) else {
-                return;
-            };
-            for (i, arg) in args.iter().enumerate() {
-                let dummy_name = match arg.keyword.as_deref() {
-                    Some(kw) => kw.to_ascii_lowercase(),
-                    None => match arg_names.get(i) {
-                        Some(n) => n.to_ascii_lowercase(),
-                        None => continue,
-                    },
-                };
-                // F2023 C1525: a `.NIL.` conditional-argument arm selects
-                // the absent association — legal only against an OPTIONAL
-                // dummy. Passing it to a required dummy hands the callee a
-                // null it must dereference (PRESENT() would be false but
-                // the storage is absent).
-                if let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value {
-                    if expr_has_nil_arm(actual) {
-                        let dummy_optional = callee_scope
-                            .symbols
-                            .get(&dummy_name)
-                            .map(|sym| sym.attrs.optional)
-                            .unwrap_or(false);
-                        if !dummy_optional {
-                            ctx.error(
-                                actual.span,
-                                format!(
-                                    "a .NIL. conditional-argument arm requires an OPTIONAL \
-                                     dummy, but '{dummy_name}' is not OPTIONAL (F2023 C1525)"
-                                ),
-                            );
-                        }
-                    }
-                }
-                let dummy_enum =
-                    callee_scope
-                        .symbols
-                        .get(&dummy_name)
-                        .and_then(|sym| match &sym.type_info {
-                            Some(TypeInfo::Enumeration(n)) => Some(EnumClass::Enum(n.clone())),
-                            Some(_) => Some(EnumClass::NotEnum),
-                            None => None,
-                        });
-                let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value else {
-                    continue;
-                };
-                let actual_enum = enum_class_of(ctx, actual);
-                match (dummy_enum, actual_enum) {
-                    (Some(EnumClass::Enum(a)), EnumClass::Enum(b)) if a != b => {
-                        ctx.error(
-                            actual.span,
-                            format!(
-                                "actual argument of enumeration type '{}' is not \
-                                 compatible with dummy '{}' of enumeration type '{}'",
-                                b, dummy_name, a
-                            ),
-                        );
-                    }
-                    (Some(EnumClass::Enum(a)), EnumClass::NotEnum) => {
-                        ctx.error(
-                            actual.span,
-                            format!(
-                                "dummy argument '{}' has enumeration type '{}'; pass \
-                                 a value of that type (constructor '{}(int-expr)')",
-                                dummy_name, a, a
-                            ),
-                        );
-                    }
-                    (Some(EnumClass::NotEnum), EnumClass::Enum(b)) => {
-                        ctx.error(
-                            actual.span,
-                            format!(
-                                "actual argument of enumeration type '{}' is not \
-                                 compatible with non-enumeration dummy '{}'; convert \
-                                 with INT(v)",
-                                b, dummy_name
-                            ),
-                        );
-                    }
-                    _ => {}
-                }
             }
         }
         Stmt::Print { format, items } if is_star(format) => {
@@ -1617,7 +1519,7 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     ctx.error(
                         arm.span,
                         ".NIL. is only valid as an arm of a conditional actual \
-                         argument in a CALL statement",
+                         argument in a procedure reference",
                     );
                 }
             }
@@ -1711,12 +1613,16 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     check_intrinsic_call_types(ctx, expr.span, name, args);
                 }
             }
+            validate_explicit_interface_call(ctx, callee, args, DirectProcedureKind::Function);
             // F2023 conditional arguments in FUNCTION references select the
             // argument association per arm on the fn-call lowering path
             // (lower_call_arg_maybe_conditional), the same as CALL.
+            let saved = ctx.in_call_arg;
+            ctx.in_call_arg = true;
             for arg in args {
                 validate_const_int_subscript(ctx, &arg.value);
             }
+            ctx.in_call_arg = saved;
         }
         Expr::ArrayConstructor { type_spec, values } => {
             if type_spec.is_none() {
@@ -5010,7 +4916,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
             }
-            validate_call_site_intent(ctx, callee, args, stmt.span);
+            validate_explicit_interface_call(ctx, callee, args, DirectProcedureKind::Subroutine);
         }
 
         // Nullify: items must be pointers.
@@ -5413,6 +5319,21 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
         Expr::ArrayConstructor { type_spec, values } => {
             validation_array_constructor_type_info(ctx, type_spec.as_deref(), values)
         }
+        Expr::ComplexLiteral { real, imag } => {
+            let component_kind =
+                |component: &SpannedExpr| match validation_expr_type_info(ctx, component)? {
+                    TypeInfo::Real { kind } => Some(default_real_kind(kind)),
+                    TypeInfo::DoublePrecision => Some(8),
+                    TypeInfo::Integer { .. } => None,
+                    _ => None,
+                };
+            let kind = component_kind(real)
+                .into_iter()
+                .chain(component_kind(imag))
+                .max()
+                .unwrap_or_else(crate::driver::defaults::default_real_kind);
+            Some(TypeInfo::Complex { kind: Some(kind) })
+        }
         Expr::UnaryOp { op, operand } => {
             let interface_name = format!("operator({op})");
             defined_operator_result_metadata(ctx, &interface_name, &[operand.as_ref()])
@@ -5470,18 +5391,34 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     })
                     .collect();
                 if let Some(arg_types) = arg_types {
-                    if matches!(name.to_ascii_lowercase().as_str(), "char" | "achar") {
-                        let kind = call_rank_argument_expr(args, 1, &["kind"])
-                            .and_then(|kind_expr| {
-                                eval_const_int_expr_checked(ctx, kind_expr).ok().flatten()
-                            })
-                            .and_then(|value| u8::try_from(value.value).ok());
-                        if let Some(kind) = kind {
-                            return Some(TypeInfo::Character {
+                    let key = name.to_ascii_lowercase();
+                    let kind_position = match key.as_str() {
+                        "cmplx" => Some(2),
+                        "int" | "nint" | "floor" | "ceiling" | "real" | "logical" | "char"
+                        | "achar" | "ichar" | "iachar" => Some(1),
+                        _ => None,
+                    };
+                    let requested_kind = kind_position
+                        .and_then(|position| call_rank_argument_expr(args, position, &["kind"]))
+                        .and_then(|kind_expr| {
+                            eval_const_int_expr_checked(ctx, kind_expr).ok().flatten()
+                        })
+                        .and_then(|value| u8::try_from(value.value).ok());
+                    if let Some(kind) = requested_kind {
+                        let type_info = match key.as_str() {
+                            "int" | "nint" | "floor" | "ceiling" | "ichar" | "iachar" => {
+                                TypeInfo::Integer { kind: Some(kind) }
+                            }
+                            "real" => TypeInfo::Real { kind: Some(kind) },
+                            "cmplx" => TypeInfo::Complex { kind: Some(kind) },
+                            "logical" => TypeInfo::Logical { kind: Some(kind) },
+                            "char" | "achar" => TypeInfo::Character {
                                 len: Some(1),
                                 kind: Some(kind),
-                            });
-                        }
+                            },
+                            _ => unreachable!(),
+                        };
+                        return Some(type_info);
                     }
                     if let Some(type_) = intrinsic_result_type(name, &arg_types) {
                         return fortran_type_to_validation_type_info(type_);
@@ -5726,7 +5663,7 @@ fn defined_assignment_type_matches(
     }
 
     match (declared, actual) {
-        (TypeInfo::Derived(declared), TypeInfo::Derived(actual)) => {
+        (TypeInfo::Derived(declared), TypeInfo::Derived(actual) | TypeInfo::Class(actual)) => {
             assignment_type_names_match(ctx, declared_scope, declared, actual)
         }
         (TypeInfo::Class(declared), TypeInfo::Class(actual) | TypeInfo::Derived(actual)) => {
@@ -5906,6 +5843,32 @@ fn generic_dummy_type_matches(
         || defined_assignment_type_matches(ctx, scope, dummy, actual)
 }
 
+fn explicit_actual_rank_matches(
+    ctx: &Ctx<'_>,
+    actual: &SpannedExpr,
+    actual_rank: usize,
+    dummy_rank: usize,
+    assumed_rank: bool,
+    allows_sequence_association: bool,
+    dummy_type: Option<&TypeInfo>,
+    elemental: bool,
+) -> bool {
+    if (elemental && dummy_rank == 0) || assumed_rank || actual_rank == dummy_rank {
+        return true;
+    }
+    if !allows_sequence_association {
+        return false;
+    }
+    let character_storage = matches!(
+        (dummy_type, validation_expr_type_info(ctx, actual)),
+        (
+            Some(TypeInfo::Character { .. }),
+            Some(TypeInfo::Character { .. })
+        )
+    );
+    actual_rank > 0 || is_array_element_designator(ctx, actual) || character_storage
+}
+
 fn call_candidate_matches(
     ctx: &Ctx<'_>,
     scope: &Scope,
@@ -5928,6 +5891,7 @@ fn call_candidate_matches(
     let mut matched = vec![false; scope.arg_order.len()];
     let mut position = 0;
     let mut seen_keyword = false;
+    let mut elemental_rank = None;
     for (keyword, actual) in actuals {
         let dummy_index = if let Some(keyword) = keyword {
             seen_keyword = true;
@@ -5978,7 +5942,35 @@ fn call_candidate_matches(
         }
         if let Some(actual_rank) = validation_expr_rank(ctx, actual) {
             let dummy_rank = dummy.attrs.array_spec.len();
-            if !(symbol.attrs.elemental && dummy_rank == 0) && dummy_rank != actual_rank {
+            if symbol.attrs.elemental && dummy_rank == 0 && actual_rank > 0 {
+                if elemental_rank.is_some_and(|rank| rank != actual_rank) {
+                    return false;
+                }
+                elemental_rank = Some(actual_rank);
+            }
+            let assumed_rank = dummy
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank));
+            let allows_sequence_association = !dummy.attrs.array_spec.is_empty()
+                && dummy.attrs.array_spec.iter().all(|spec| {
+                    matches!(
+                        spec,
+                        crate::ast::decl::ArraySpec::Explicit { .. }
+                            | crate::ast::decl::ArraySpec::AssumedSize { .. }
+                    )
+                });
+            if !explicit_actual_rank_matches(
+                ctx,
+                actual,
+                actual_rank,
+                dummy_rank,
+                assumed_rank,
+                allows_sequence_association,
+                dummy.type_info.as_ref(),
+                symbol.attrs.elemental,
+            ) {
                 return false;
             }
         }
@@ -6724,57 +6716,571 @@ fn call_target_function_name(
     matches!(sym.kind, SymbolKind::Function).then(|| sym.name.clone())
 }
 
-/// Validate call-site argument intent constraints.
-/// Can't pass a literal, parameter, or expression to intent(out/inout).
-fn validate_call_site_intent(
-    ctx: &mut Ctx,
-    callee: &crate::ast::expr::SpannedExpr,
-    args: &[crate::ast::expr::Argument],
-    span: Span,
-) {
-    // Look up the callee to find its dummy argument intents.
-    let callee_name = if let Expr::Name { name } = &callee.node {
-        name.clone()
-    } else {
-        return;
-    };
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectProcedureKind {
+    Function,
+    Subroutine,
+}
 
-    // For each actual argument, check if it's an lvalue when the dummy requires out/inout.
-    // We can only check this if the callee's dummy arg info is in the symbol table.
-    // For now, check the simpler case: passing a literal or parameter to ANY subroutine arg.
-    for arg in args {
-        let actual = match &arg.value {
-            crate::ast::expr::SectionSubscript::Element(e) => e,
-            _ => continue,
-        };
-        // Check if actual is a literal (not an lvalue).
-        let is_literal = matches!(
-            actual.node,
-            Expr::IntegerLiteral { .. }
-                | Expr::RealLiteral { .. }
-                | Expr::StringLiteral { .. }
-                | Expr::LogicalLiteral { .. }
-                | Expr::ComplexLiteral { .. }
-        );
-        // Check if actual is a named constant (parameter).
-        let is_parameter = if let Some(name) = extract_base_name(actual) {
-            ctx.lookup(&name)
-                .map(|s| s.attrs.parameter)
-                .unwrap_or(false)
-        } else {
-            false
-        };
+enum ExplicitInterfaceResolution {
+    None,
+    Resolved(ExplicitProcedureInterface),
+    Invalid(String),
+}
 
-        if is_literal || is_parameter {
-            // We can't tell without the callee's interface whether this arg is
-            // intent(out/inout). But if the callee IS known and has dummy arg info,
-            // we could check. For now, this infrastructure is in place for when
-            // we have full interface resolution.
-            // Full check deferred until interfaces are tracked in symbol table.
+struct ExplicitDummyArg {
+    name: String,
+    type_info: Option<TypeInfo>,
+    intent: Option<Intent>,
+    optional: bool,
+    allocatable: bool,
+    pointer: bool,
+    procedure: bool,
+    rank: usize,
+    assumed_rank: bool,
+    allows_sequence_association: bool,
+}
+
+struct ExplicitProcedureInterface {
+    name: String,
+    declared_scope: ScopeId,
+    elemental: bool,
+    dummies: Vec<ExplicitDummyArg>,
+}
+
+fn procedure_scope_kind_matches(scope: &Scope, expected_kind: DirectProcedureKind) -> bool {
+    matches!(
+        (&scope.kind, expected_kind),
+        (ScopeKind::Function(_), DirectProcedureKind::Function)
+            | (ScopeKind::Subroutine(_), DirectProcedureKind::Subroutine)
+    )
+}
+
+fn build_explicit_procedure_interface(
+    ctx: &Ctx<'_>,
+    call_name: &str,
+    symbol: &Symbol,
+    procedure_scope: &Scope,
+) -> Option<ExplicitProcedureInterface> {
+    let mut dummies = Vec::with_capacity(procedure_scope.arg_order.len());
+    for dummy_name in &procedure_scope.arg_order {
+        let dummy = procedure_scope
+            .symbols
+            .get(&dummy_name.to_ascii_lowercase())?;
+        let assumed_rank = dummy
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank));
+        let allows_sequence_association = !dummy.attrs.array_spec.is_empty()
+            && dummy.attrs.array_spec.iter().all(|spec| {
+                matches!(
+                    spec,
+                    crate::ast::decl::ArraySpec::Explicit { .. }
+                        | crate::ast::decl::ArraySpec::AssumedSize { .. }
+                )
+            });
+        dummies.push(ExplicitDummyArg {
+            name: dummy.name.clone(),
+            type_info: dummy.type_info.clone(),
+            intent: dummy.attrs.intent,
+            optional: dummy.attrs.optional,
+            allocatable: dummy.attrs.allocatable,
+            pointer: dummy.attrs.pointer,
+            procedure: dummy.attrs.external || dummy.attrs.procedure_iface.is_some(),
+            rank: dummy.attrs.array_spec.len(),
+            assumed_rank,
+            allows_sequence_association,
+        });
+    }
+
+    let declared_scope = ctx
+        .type_layouts
+        .filter(|layouts| layouts.scope_path(procedure_scope.id).is_some())
+        .map_or(symbol.scope, |_| procedure_scope.id);
+
+    Some(ExplicitProcedureInterface {
+        name: call_name.to_string(),
+        declared_scope,
+        elemental: symbol.attrs.elemental,
+        dummies,
+    })
+}
+
+fn resolve_generic_procedure_interface(
+    ctx: &Ctx<'_>,
+    name: &str,
+    args: &[Argument],
+    expected_kind: DirectProcedureKind,
+    interfaces: &[&Symbol],
+) -> ExplicitInterfaceResolution {
+    let mut candidates = Vec::new();
+    let mut seen_scopes = HashSet::new();
+    for interface in interfaces {
+        for candidate_name in &interface.arg_names {
+            let owner_scope = interface_specific_owner_scope(ctx, interface, candidate_name);
+            let Some(scope) = assignment_candidate_scope(ctx, candidate_name, owner_scope) else {
+                continue;
+            };
+            if !procedure_scope_kind_matches(scope, expected_kind) || !seen_scopes.insert(scope.id)
+            {
+                continue;
+            }
+            let Some(symbol) = candidate_symbol(ctx, candidate_name, owner_scope, scope) else {
+                continue;
+            };
+            candidates.push((scope, symbol));
         }
     }
-    let _ = callee_name;
-    let _ = span;
+
+    let matches: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|(scope, symbol)| call_candidate_matches(ctx, scope, symbol, args, None))
+        .collect();
+    let [(scope, symbol)] = matches.as_slice() else {
+        return ExplicitInterfaceResolution::None;
+    };
+    build_explicit_procedure_interface(ctx, name, symbol, scope).map_or(
+        ExplicitInterfaceResolution::None,
+        ExplicitInterfaceResolution::Resolved,
+    )
+}
+
+fn direct_procedure_interface(
+    ctx: &Ctx<'_>,
+    callee: &SpannedExpr,
+    args: &[Argument],
+    expected_kind: DirectProcedureKind,
+) -> ExplicitInterfaceResolution {
+    let Expr::Name { name } = &callee.node else {
+        return ExplicitInterfaceResolution::None;
+    };
+    let interfaces = ctx.lookup_lexical_named_interfaces(name);
+    if !interfaces.is_empty() {
+        return resolve_generic_procedure_interface(ctx, name, args, expected_kind, &interfaces);
+    }
+
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        return ExplicitInterfaceResolution::None;
+    };
+    if let Some(interface_name) = symbol.attrs.procedure_iface.as_deref() {
+        let interface_symbol = ctx
+            .st
+            .lookup_in(symbol.scope, interface_name)
+            .or_else(|| ctx.lookup_lexical(interface_name));
+        let Some(interface_symbol) = interface_symbol else {
+            return ExplicitInterfaceResolution::Invalid(format!(
+                "explicit interface '{}' for procedure '{}' is unavailable",
+                interface_name, name
+            ));
+        };
+        let Some(procedure_scope) =
+            assignment_candidate_scope(ctx, &interface_symbol.name, interface_symbol.scope)
+        else {
+            return ExplicitInterfaceResolution::Invalid(format!(
+                "explicit interface '{}' for procedure '{}' has no procedure signature",
+                interface_name, name
+            ));
+        };
+        if !procedure_scope_kind_matches(procedure_scope, expected_kind) {
+            let expected = match expected_kind {
+                DirectProcedureKind::Function => "function",
+                DirectProcedureKind::Subroutine => "subroutine",
+            };
+            return ExplicitInterfaceResolution::Invalid(format!(
+                "procedure '{}' does not have a {} interface",
+                name, expected
+            ));
+        }
+        return build_explicit_procedure_interface(ctx, name, interface_symbol, procedure_scope)
+            .map_or(
+                ExplicitInterfaceResolution::None,
+                ExplicitInterfaceResolution::Resolved,
+            );
+    }
+
+    let kind_matches = matches!(
+        (&symbol.kind, expected_kind),
+        (SymbolKind::Function, DirectProcedureKind::Function)
+            | (SymbolKind::Subroutine, DirectProcedureKind::Subroutine)
+    );
+    if !kind_matches || symbol.attrs.intrinsic {
+        return ExplicitInterfaceResolution::None;
+    }
+
+    let Some(procedure_scope) = assignment_candidate_scope(ctx, &symbol.name, symbol.scope) else {
+        return ExplicitInterfaceResolution::None;
+    };
+    let interface_parent = procedure_scope
+        .parent
+        .is_some_and(|parent| matches!(ctx.st.scope(parent).kind, ScopeKind::Interface));
+    if matches!(ctx.st.scope(symbol.scope).kind, ScopeKind::Global) && !interface_parent {
+        // A separately defined external procedure still has an implicit
+        // interface unless the caller declared an interface body for it.
+        return ExplicitInterfaceResolution::None;
+    }
+
+    build_explicit_procedure_interface(ctx, name, symbol, procedure_scope).map_or(
+        ExplicitInterfaceResolution::None,
+        ExplicitInterfaceResolution::Resolved,
+    )
+}
+
+fn argument_span(arg: &Argument, fallback: Span) -> Span {
+    match &arg.value {
+        SectionSubscript::Element(expr) => expr.span,
+        SectionSubscript::Range { start, end, stride } => start
+            .as_ref()
+            .map(|expr| expr.span)
+            .or_else(|| end.as_ref().map(|expr| expr.span))
+            .or_else(|| stride.as_ref().map(|expr| expr.span))
+            .unwrap_or(fallback),
+    }
+}
+
+fn is_array_element_designator(ctx: &Ctx<'_>, actual: &SpannedExpr) -> bool {
+    let Expr::FunctionCall { callee, args } = &actual.node else {
+        return false;
+    };
+    args.iter()
+        .all(|arg| matches!(arg.value, SectionSubscript::Element(_)))
+        && validation_expr_rank(ctx, callee).is_some_and(|rank| rank > 0)
+}
+
+fn named_actual_is_definable(
+    ctx: &Ctx<'_>,
+    name: &str,
+    path_has_pointer: bool,
+    defines_association: bool,
+) -> Option<bool> {
+    if ctx.is_associate_name(name) {
+        return None;
+    }
+    if let Some(binding) = ctx.block_binding_attrs(name) {
+        let defines_pointer_target = !defines_association && (path_has_pointer || binding.pointer);
+        return Some(!binding.parameter && (!binding.intent_in || defines_pointer_target));
+    }
+    let symbol = ctx.lookup_lexical(name)?;
+    if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+        return Some(false);
+    }
+    Some(
+        !symbol.attrs.parameter
+            && (!matches!(symbol.attrs.intent, Some(Intent::In))
+                || (!defines_association && (path_has_pointer || symbol.attrs.pointer))),
+    )
+}
+
+fn actual_is_definable(
+    ctx: &Ctx<'_>,
+    actual: &SpannedExpr,
+    defines_association: bool,
+) -> Option<bool> {
+    match &actual.node {
+        Expr::Name { name } => named_actual_is_definable(ctx, name, false, defines_association),
+        Expr::ComponentAccess { .. } => {
+            let base = extract_base_name(actual)?;
+            let through_pointer = leaf_field_layout(ctx, actual)
+                .is_some_and(|leaf| leaf.field.pointer || leaf.ancestor_is_pointer);
+            named_actual_is_definable(ctx, &base, through_pointer, defines_association)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let has_vector_subscript = args.iter().any(|arg| match &arg.value {
+                SectionSubscript::Element(index) => {
+                    validation_expr_rank(ctx, index).is_some_and(|rank| rank > 0)
+                }
+                SectionSubscript::Range { .. } => false,
+            });
+            match &callee.node {
+                Expr::Name { name } => {
+                    let symbol = ctx.lookup_lexical(name)?;
+                    match symbol.kind {
+                        SymbolKind::Variable | SymbolKind::Parameter => {
+                            if has_vector_subscript {
+                                return Some(false);
+                            }
+                            named_actual_is_definable(ctx, name, false, defines_association)
+                        }
+                        SymbolKind::Function => Some(symbol.attrs.pointer && !defines_association),
+                        _ => Some(false),
+                    }
+                }
+                Expr::ComponentAccess { .. } => {
+                    let leaf = leaf_field_layout(ctx, callee)?;
+                    if leaf.field.procedure_pointer {
+                        return None;
+                    }
+                    if has_vector_subscript {
+                        return Some(false);
+                    }
+                    let base = extract_base_name(callee)?;
+                    named_actual_is_definable(
+                        ctx,
+                        &base,
+                        leaf.field.pointer || leaf.ancestor_is_pointer,
+                        defines_association,
+                    )
+                }
+                _ => Some(false),
+            }
+        }
+        Expr::NilArgument => None,
+        Expr::ParenExpr { .. }
+        | Expr::ConditionalExpr { .. }
+        | Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::ArrayConstructor { .. } => Some(false),
+    }
+}
+
+fn validate_explicit_actual(
+    ctx: &mut Ctx,
+    interface: &ExplicitProcedureInterface,
+    dummy: &ExplicitDummyArg,
+    actual: &SpannedExpr,
+    elemental_rank: &mut Option<usize>,
+) {
+    if expr_has_nil_arm(actual) && !dummy.optional {
+        ctx.error(
+            actual.span,
+            format!(
+                "dummy argument '{}' is not OPTIONAL (F2023 C1525)",
+                dummy.name
+            ),
+        );
+    }
+    if dummy.procedure || matches!(actual.node, Expr::NilArgument) {
+        return;
+    }
+
+    if let (Some(dummy_type), Some(actual_type)) = (
+        dummy.type_info.as_ref(),
+        validation_expr_type_info(ctx, actual).as_ref(),
+    ) {
+        match (dummy_type, actual_type) {
+            (TypeInfo::Enumeration(expected), TypeInfo::Enumeration(actual_name)) => {
+                if !expected.eq_ignore_ascii_case(actual_name) {
+                    ctx.error(
+                        actual.span,
+                        format!(
+                            "actual argument of enumeration type '{}' is not compatible with dummy '{}' of enumeration type '{}'",
+                            actual_name, dummy.name, expected
+                        ),
+                    );
+                }
+            }
+            (TypeInfo::Enumeration(expected), _) => {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "dummy argument '{}' has enumeration type '{}'; pass a value of that type (constructor '{}(int-expr)')",
+                        dummy.name, expected, expected
+                    ),
+                );
+            }
+            (TypeInfo::ClassStar | TypeInfo::TypeStar, TypeInfo::Enumeration(_)) => {}
+            (_, TypeInfo::Enumeration(actual_name)) => {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "actual argument of enumeration type '{}' is not compatible with non-enumeration dummy '{}'; convert with INT(v)",
+                        actual_name, dummy.name
+                    ),
+                );
+            }
+            _ if !generic_dummy_type_matches(
+                ctx,
+                interface.declared_scope,
+                dummy_type,
+                actual_type,
+            ) =>
+            {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "argument '{}' type mismatch: expected {}, got {}",
+                        dummy.name,
+                        intrinsic_assignment_type_name(dummy_type),
+                        intrinsic_assignment_type_name(actual_type)
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if matches!(dummy.intent, Some(Intent::Out | Intent::InOut))
+        && matches!(
+            actual_is_definable(ctx, actual, dummy.pointer || dummy.allocatable),
+            Some(false)
+        )
+    {
+        ctx.error(
+            actual.span,
+            format!(
+                "actual argument for INTENT(OUT/INOUT) dummy '{}' must be a definable variable",
+                dummy.name
+            ),
+        );
+    }
+
+    let Some(actual_rank) = validation_expr_rank(ctx, actual) else {
+        return;
+    };
+    if interface.elemental && dummy.rank == 0 {
+        if actual_rank > 0 {
+            if let Some(expected_rank) = *elemental_rank {
+                if actual_rank != expected_rank {
+                    ctx.error(
+                        actual.span,
+                        format!(
+                            "elemental procedure '{}' has nonconforming rank-{expected_rank} and rank-{actual_rank} actual arguments",
+                            interface.name
+                        ),
+                    );
+                }
+            } else {
+                *elemental_rank = Some(actual_rank);
+            }
+        }
+        return;
+    }
+    if dummy.assumed_rank || actual_rank == dummy.rank {
+        return;
+    }
+    if dummy.allows_sequence_association {
+        let character_storage = matches!(
+            (&dummy.type_info, validation_expr_type_info(ctx, actual)),
+            (
+                Some(TypeInfo::Character { .. }),
+                Some(TypeInfo::Character { .. })
+            )
+        );
+        if actual_rank > 0 || is_array_element_designator(ctx, actual) || character_storage {
+            return;
+        }
+    }
+    ctx.error(
+        actual.span,
+        format!(
+            "argument '{}' rank mismatch: expected rank {}, got rank {}",
+            dummy.name, dummy.rank, actual_rank
+        ),
+    );
+}
+
+fn validate_explicit_interface_call(
+    ctx: &mut Ctx<'_>,
+    callee: &SpannedExpr,
+    args: &[Argument],
+    expected_kind: DirectProcedureKind,
+) {
+    let interface = match direct_procedure_interface(ctx, callee, args, expected_kind) {
+        ExplicitInterfaceResolution::None => return,
+        ExplicitInterfaceResolution::Resolved(interface) => interface,
+        ExplicitInterfaceResolution::Invalid(message) => {
+            ctx.error(callee.span, message);
+            return;
+        }
+    };
+    let mut matched = vec![false; interface.dummies.len()];
+    let mut position = 0usize;
+    let mut seen_keyword = false;
+    let mut reported_too_many = false;
+    let mut elemental_rank = None;
+
+    for arg in args {
+        let span = argument_span(arg, callee.span);
+        let dummy_index = if let Some(keyword) = arg.keyword.as_deref() {
+            seen_keyword = true;
+            let Some(index) = interface
+                .dummies
+                .iter()
+                .position(|dummy| dummy.name.eq_ignore_ascii_case(keyword))
+            else {
+                ctx.error(
+                    span,
+                    format!(
+                        "unknown keyword argument '{}' in call to '{}'",
+                        keyword, interface.name
+                    ),
+                );
+                continue;
+            };
+            index
+        } else {
+            if seen_keyword {
+                ctx.error(
+                    span,
+                    format!(
+                        "positional argument follows a keyword argument in call to '{}'",
+                        interface.name
+                    ),
+                );
+                continue;
+            }
+            while position < matched.len() && matched[position] {
+                position += 1;
+            }
+            if position == matched.len() {
+                if !reported_too_many {
+                    ctx.error(
+                        span,
+                        format!(
+                            "too many actual arguments in call to '{}' (expected at most {})",
+                            interface.name,
+                            interface.dummies.len()
+                        ),
+                    );
+                    reported_too_many = true;
+                }
+                continue;
+            }
+            let index = position;
+            position += 1;
+            index
+        };
+
+        if matched[dummy_index] {
+            ctx.error(
+                span,
+                format!(
+                    "duplicate actual argument for dummy '{}' in call to '{}'",
+                    interface.dummies[dummy_index].name, interface.name
+                ),
+            );
+            continue;
+        }
+        matched[dummy_index] = true;
+        if let SectionSubscript::Element(actual) = &arg.value {
+            validate_explicit_actual(
+                ctx,
+                &interface,
+                &interface.dummies[dummy_index],
+                actual,
+                &mut elemental_rank,
+            );
+        }
+    }
+
+    for (supplied, dummy) in matched.iter().zip(&interface.dummies) {
+        if !supplied && !dummy.optional {
+            ctx.error(
+                callee.span,
+                format!(
+                    "missing required argument '{}' in call to '{}'",
+                    dummy.name, interface.name
+                ),
+            );
+        }
+    }
 }
 
 /// Register a label as defined.
@@ -8008,6 +8514,588 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    #[test]
+    fn rejects_direct_subroutine_argument_type_kind_and_rank_mismatches() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(value, values)
+    integer(8), intent(in) :: value
+    real(4), intent(in) :: values(:)
+  end subroutine accept
+
+  subroutine invoke()
+    logical(1) :: flag
+    integer(4) :: narrow
+    real(4) :: scalar, values(2)
+    call accept(flag, values)
+    call accept(narrow, values)
+    call accept(1_8, scalar)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got INTEGER(4)")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'values' rank mismatch")
+                    && err.contains("expected rank 1, got rank 0")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_direct_function_argument_type_mismatch() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  integer function classify(value) result(code)
+    integer(8), intent(in) :: value
+    code = int(value)
+  end function classify
+
+  subroutine invoke()
+    logical(1) :: flag
+    integer :: code
+    code = classify(flag)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_direct_call_argument_association_errors() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(required, extra)
+    integer, intent(in) :: required
+    integer, intent(in), optional :: extra
+  end subroutine accept
+
+  subroutine invoke()
+    call accept(extra=1)
+    call accept(required=1, 2)
+    call accept(1, required=2)
+    call accept(unknown=1, required=2)
+    call accept(1, 2, 3)
+    call accept(1)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("missing required argument 'required'")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("positional argument follows a keyword argument")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("duplicate actual argument for dummy 'required'")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("unknown keyword argument 'unknown'")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("too many actual arguments")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn direct_call_validation_uses_the_resolved_owner_scope() {
+        let errs = errors_from(
+            "\
+module integer_api
+  implicit none
+contains
+  subroutine accept(value)
+    integer(8), intent(in) :: value
+  end subroutine accept
+end module integer_api
+
+module logical_api
+  implicit none
+contains
+  subroutine accept(value)
+    logical(1), intent(in) :: value
+  end subroutine accept
+end module logical_api
+
+program caller
+  use integer_api, only: accept
+  implicit none
+  logical(1) :: flag
+  call accept(flag)
+end program caller
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_dummy_types_from_an_explicit_interface_body() {
+        let errs = errors_from(
+            "\
+program caller
+  implicit none
+  interface
+    subroutine accept(value)
+      integer(8), intent(in) :: value
+    end subroutine accept
+  end interface
+  logical(1) :: flag
+  call accept(flag)
+end program caller
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_separately_defined_externals_as_implicit_interfaces() {
+        let errs = errors_from(
+            "\
+program caller
+  implicit none
+  external :: accept
+  logical(1) :: flag
+  call accept(flag)
+end program caller
+
+subroutine accept(value)
+  integer(8), intent(in) :: value
+end subroutine accept
+",
+        );
+
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("argument 'value' type mismatch")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_calls_through_explicit_procedure_entities() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  abstract interface
+    subroutine action_interface(value)
+      integer(8), intent(in) :: value
+    end subroutine action_interface
+    integer function transform_interface(value)
+      integer(8), intent(in) :: value
+    end function transform_interface
+  end interface
+contains
+  subroutine invoke(action)
+    procedure(action_interface) :: action
+    procedure(action_interface), pointer :: action_pointer
+    procedure(transform_interface), pointer :: transform_pointer
+    logical(1) :: flag
+    integer :: result
+    call action(flag)
+    call action_pointer(flag)
+    result = transform_pointer(flag)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| {
+                    err.contains("argument 'value' type mismatch")
+                        && err.contains("expected INTEGER(8), got LOGICAL(1)")
+                })
+                .count(),
+            3,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_unlimited_polymorphic_assumed_rank_actuals() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(anything)
+    class(*), intent(in), dimension(..) :: anything
+  end subroutine accept
+
+  subroutine invoke()
+    integer :: matrix(2, 2)
+    call accept(matrix)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_requested_intrinsic_kinds_and_complex_literal_kinds() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(i, r, z)
+    integer(8), intent(in) :: i
+    real(8), intent(in) :: r
+    complex(8), intent(in) :: z
+  end subroutine accept
+
+  subroutine invoke()
+    call accept(int(1, kind=8), real(1, 8), cmplx(1.0, 2.0, kind=8))
+    call accept(1_8, 2.0_8, (1.0_8, 2.0_8))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_sequence_association_rank_remapping() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  real function outer(values) result(total)
+    real, intent(in) :: values(:, :, :)
+    total = flatten(values, size(values))
+  contains
+    real function flatten(storage, count)
+      integer, intent(in) :: count
+      real, intent(in) :: storage(count)
+      flatten = sum(storage)
+    end function flatten
+  end function outer
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_character_storage_sequence_association() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  integer function count_chars(storage) result(count)
+    character(len=1), intent(in) :: storage(*)
+    count = 4
+  end function count_chars
+
+  subroutine invoke()
+    character(len=4) :: text
+    integer :: count
+    count = count_chars(text)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn same_name_generic_facet_is_not_validated_as_a_direct_specific() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  interface pick
+    module procedure pick
+    module procedure pick_logical
+  end interface pick
+contains
+  integer function pick(value)
+    integer, intent(in) :: value
+    pick = value
+  end function pick
+
+  logical function pick_logical(value)
+    logical, intent(in) :: value
+    pick_logical = value
+  end function pick_logical
+
+  subroutine invoke()
+    logical :: selected
+    selected = pick(.true.)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn validates_conditional_nil_against_selected_generic_specifics() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  interface required_generic
+    module procedure required_value
+  end interface required_generic
+  interface optional_generic
+    module procedure optional_value
+  end interface optional_generic
+contains
+  integer function required_value(value)
+    integer, intent(in) :: value
+    required_value = value
+  end function required_value
+
+  integer function optional_value(value)
+    integer, intent(in), optional :: value
+    optional_value = 0
+    if (present(value)) optional_value = value
+  end function optional_value
+
+  subroutine invoke()
+    integer :: result
+    result = required_generic((.true. ? 7 : .nil.))
+    result = optional_generic((.true. ? 7 : .nil.))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter().filter(|err| err.contains("C1525")).count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nondefinable_out_and_inout_actuals() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine fill(output, state)
+    integer, intent(out) :: output
+    integer, intent(inout) :: state
+    output = state
+  end subroutine fill
+
+  integer function make_value()
+    make_value = 1
+  end function make_value
+
+  subroutine invoke()
+    integer, parameter :: constant = 1
+    integer :: value, values(2), indices(1)
+    indices = [1]
+    call fill(1, value)
+    call fill(value + 1, value)
+    call fill(constant, value)
+    call fill(make_value(), value)
+    call fill(value, values(indices))
+    call fill(value, (value))
+    call fill(values(1), values(2))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            6,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_pointer_mediated_definable_actuals() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  integer, target :: storage
+  type :: inner_t
+    integer :: value
+  end type inner_t
+  type :: outer_t
+    type(inner_t), pointer :: inner
+  end type outer_t
+contains
+  subroutine set_value(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine set_value
+
+  subroutine update_target(object)
+    type(outer_t), intent(in) :: object
+    call set_value(object%inner%value)
+  end subroutine update_target
+
+  subroutine update_pointer_target(value)
+    integer, pointer, intent(in) :: value
+    call set_value(value)
+  end subroutine update_pointer_target
+
+  function get_storage() result(pointer_result)
+    integer, pointer :: pointer_result
+    pointer_result => storage
+  end function get_storage
+
+  subroutine invoke()
+    call set_value(get_storage())
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("must be a definable variable")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_intent_in_pointers_for_pointer_association_dummies() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  type :: holder_t
+    integer, pointer :: value
+  end type holder_t
+contains
+  subroutine reset_pointer(value)
+    integer, pointer, intent(out) :: value
+    nullify(value)
+  end subroutine reset_pointer
+
+  subroutine invoke(actual, object)
+    integer, pointer, intent(in) :: actual
+    type(holder_t), intent(in) :: object
+    call reset_pointer(actual)
+    call reset_pointer(object%value)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_intent_in_allocatables_for_allocatable_association_dummies() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  type :: holder_t
+    integer, allocatable :: values(:)
+  end type holder_t
+contains
+  subroutine reset_allocatable(values)
+    integer, allocatable, intent(out) :: values(:)
+  end subroutine reset_allocatable
+
+  subroutine invoke(values, object)
+    integer, allocatable, intent(in) :: values(:)
+    type(holder_t), intent(in) :: object
+    call reset_allocatable(values)
+    call reset_allocatable(object%values)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -10042,10 +11130,12 @@ program p
     enumerator :: red, green, blue
   end enumeration type
   type(color) :: c
+  integer :: n
   c = red
   call takes_int(c)
   call takes_color(2)
   call takes_color(c)
+  n = takes_color_fn(2)
 contains
   subroutine takes_int(n)
     integer, intent(in) :: n
@@ -10056,6 +11146,10 @@ contains
     integer :: m
     m = int(x)
   end subroutine
+  integer function takes_color_fn(x)
+    type(color), intent(in) :: x
+    takes_color_fn = int(x)
+  end function
 end program
 ",
         );
@@ -10070,7 +11164,14 @@ end program
             "{:?}",
             errs
         );
-        assert_eq!(errs.len(), 2, "{:?}", errs);
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("dummy argument 'x' has enumeration type 'color'"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert_eq!(errs.len(), 3, "{:?}", errs);
     }
 
     #[test]
@@ -11096,6 +12197,58 @@ end program
         assert!(
             !errs.iter().any(|e| e.contains("only supported in CALL")),
             "conditional arg in a function reference should be accepted, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nil_arm_to_required_function_dummy_rejected() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  result = required((.true. ? 7 : .nil.))
+contains
+  integer function required(value)
+    integer, intent(in) :: value
+    required = value
+  end function required
+end program
+",
+        );
+
+        assert!(errs.iter().any(|err| err.contains("C1525")), "{errs:?}");
+        assert!(
+            !errs.iter().any(|err| err.contains("only valid as an arm")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn nil_arm_to_optional_function_dummy_accepted() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  result = maybe((.true. ? 7 : .nil.))
+contains
+  integer function maybe(value)
+    integer, intent(in), optional :: value
+    if (present(value)) then
+      maybe = value
+    else
+      maybe = 0
+    end if
+  end function maybe
+end program
+",
+        );
+
+        assert!(!errs.iter().any(|err| err.contains("C1525")), "{errs:?}");
+        assert!(
+            !errs.iter().any(|err| err.contains("only valid as an arm")),
+            "{errs:?}"
         );
     }
 

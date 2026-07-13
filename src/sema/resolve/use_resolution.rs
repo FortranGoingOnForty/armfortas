@@ -546,7 +546,9 @@ pub(super) fn load_external_module(
             // explicit-shape dummies must stay explicit-shaped, though: using
             // AssumedShape here makes lowering pass a descriptor to callees
             // whose ABI expects a bare element pointer.
-            let array_spec: Vec<ArraySpec> = if arg.rank == 0 {
+            let array_spec: Vec<ArraySpec> = if arg.assumed_rank {
+                vec![ArraySpec::AssumedRank]
+            } else if arg.rank == 0 {
                 Vec::new()
             } else {
                 let template = if arg.allocatable || arg.pointer {
@@ -672,7 +674,7 @@ pub(super) fn load_external_module(
             .owner_module
             .get_or_insert_with(|| module_name.to_string());
         layout.owner_scope = Some(scope_id);
-        layout.owner_path = Some(module_name.to_ascii_lowercase());
+        layout.owner_path = layout.owner_module.as_deref().map(str::to_ascii_lowercase);
         type_layouts.insert(layout.clone());
         // Also add a DerivedType symbol.
         let attrs = SymbolAttrs {

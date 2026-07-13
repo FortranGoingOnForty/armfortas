@@ -22,7 +22,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
-const AMOD_VERSION: u32 = 5;
+const AMOD_VERSION: u32 = 6;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
 /// is `lower:upper` or just `upper`. Returns None if any dim is not
@@ -1060,6 +1060,14 @@ fn emit_procedure(
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
                 }
+                if arg_sym
+                    .attrs
+                    .array_spec
+                    .iter()
+                    .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank))
+                {
+                    arg_attrs.push("assumed-rank");
+                }
                 // F2018 §15.4.3.6: a `procedure(iface) :: name` dummy is
                 // a procedure formal. The producer side stores this as a
                 // Variable with EXTERNAL set; without preserving the flag
@@ -1440,6 +1448,9 @@ pub struct AmodArg {
     /// the dummy name as an external symbol — see the SGGES3 / selctg
     /// failure in stdlib_lapack_eigv_gen.
     pub procedure_iface: Option<String>,
+    /// True when the source dummy used DIMENSION(..). Rank alone cannot
+    /// distinguish assumed-rank from a rank-one assumed-shape dummy.
+    pub assumed_rank: bool,
     /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
     /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
     /// `array_spec` of this rank, deriving each dim's kind from the
@@ -2194,6 +2205,9 @@ fn parse_arg(line: &str) -> AmodArg {
     let external = attr_str
         .split(", ")
         .any(|tok| tok.trim().eq_ignore_ascii_case("external"));
+    let assumed_rank = attr_str
+        .split(", ")
+        .any(|tok| tok.trim().eq_ignore_ascii_case("assumed-rank"));
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
     let rank = attr_str
@@ -2219,6 +2233,7 @@ fn parse_arg(line: &str) -> AmodArg {
         hidden,
         external,
         procedure_iface,
+        assumed_rank,
         rank,
     }
 }
@@ -2916,7 +2931,7 @@ mod tests {
 
     #[test]
     fn only_qualified_dependencies_round_trip_exact_bindings() {
-        let amod_text = r#"#!amod 5
+        let amod_text = r#"#!amod 6
 # module: facade
 # source: facade.f90
 
@@ -2962,7 +2977,7 @@ mod tests {
             "@use_rename local = from provider",
         ] {
             let amod_text =
-                format!("#!amod 5\n# module: facade\n# source: facade.f90\n\n{record}\n");
+                format!("#!amod 6\n# module: facade\n# source: facade.f90\n\n{record}\n");
             let err = parse_amod(&amod_text, Path::new("bad.amod")).unwrap_err();
             assert!(
                 err.contains("corrupt .amod file")
@@ -3068,6 +3083,12 @@ mod tests {
   @arg buf : real, intent(out), descriptor, allocatable, rank=1
     @abi pass=x0 width=8
 @end subroutine
+
+@subroutine takes_assumed_rank
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg value : class(*), intent(in), descriptor, assumed-rank, rank=1
+    @abi pass=x0 width=8
+@end subroutine
 "#;
         let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
         let assumed = iface
@@ -3086,6 +3107,14 @@ mod tests {
             .unwrap();
         assert_eq!(alloc.args[0].rank, 1);
         assert!(alloc.args[0].allocatable);
+
+        let assumed_rank = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "takes_assumed_rank")
+            .unwrap();
+        assert_eq!(assumed_rank.args[0].rank, 1);
+        assert!(assumed_rank.args[0].assumed_rank);
     }
 
     #[test]
@@ -3096,7 +3125,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 5
+            r#"#!amod 6
 # module: cache_test
 # source: cache_test.f90
 
@@ -3126,7 +3155,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 5
+            r#"#!amod 6
 # module: truncated_test
 # source: truncated_test.f90
 
@@ -3160,7 +3189,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 4
+            r#"#!amod 5
 # module: stale_test
 # source: stale_test.f90
 
@@ -3174,7 +3203,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 4")
+            err.contains("incompatible .amod version 5 (compiler requires 6)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );
