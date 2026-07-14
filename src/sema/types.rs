@@ -81,25 +81,33 @@ pub enum Bound {
 }
 
 impl FortranType {
-    /// Default integer: integer(4).
+    /// Processor-default integer kind.
     pub fn default_integer() -> Self {
-        Self::Integer { kind: 4 }
+        Self::Integer {
+            kind: crate::driver::defaults::default_int_kind(),
+        }
     }
-    /// Default real: real(4).
+    /// Processor-default real kind.
     pub fn default_real() -> Self {
-        Self::Real { kind: 4 }
+        Self::Real {
+            kind: crate::driver::defaults::default_real_kind(),
+        }
     }
     /// Default double precision: real(8).
     pub fn double_precision() -> Self {
         Self::Real { kind: 8 }
     }
-    /// Default complex: complex(4).
+    /// Processor-default complex kind.
     pub fn default_complex() -> Self {
-        Self::Complex { kind: 4 }
+        Self::Complex {
+            kind: crate::driver::defaults::default_real_kind(),
+        }
     }
-    /// Default logical: logical(4).
+    /// Processor-default logical kind.
     pub fn default_logical() -> Self {
-        Self::Logical { kind: 4 }
+        Self::Logical {
+            kind: crate::driver::defaults::default_int_kind(),
+        }
     }
     /// Default character: character(1, len=1).
     pub fn default_character() -> Self {
@@ -363,17 +371,17 @@ pub fn type_info_to_fortran_type(info: &super::symtab::TypeInfo) -> FortranType 
     match info {
         TypeInfo::Enumeration(name) => FortranType::Enumeration { name: name.clone() },
         TypeInfo::Integer { kind } => FortranType::Integer {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
         },
         TypeInfo::Real { kind } => FortranType::Real {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
         },
         TypeInfo::DoublePrecision => FortranType::Real { kind: 8 },
         TypeInfo::Complex { kind } => FortranType::Complex {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
         },
         TypeInfo::Logical { kind } => FortranType::Logical {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
         },
         TypeInfo::Character { len, kind } => FortranType::Character {
             kind: kind.unwrap_or(1),
@@ -410,7 +418,7 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
             let k = kind
                 .as_ref()
                 .and_then(|s| s.parse::<u8>().ok())
-                .unwrap_or(4);
+                .unwrap_or_else(crate::driver::defaults::default_int_kind);
             FortranType::Integer { kind: k }
         }
         Expr::RealLiteral { text, kind, .. } => {
@@ -422,7 +430,7 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
                 if lower.contains('d') {
                     FortranType::Real { kind: 8 }
                 } else {
-                    FortranType::Real { kind: 4 }
+                    FortranType::default_real()
                 }
             }
         }
@@ -440,7 +448,7 @@ pub fn literal_type(expr: &crate::ast::expr::Expr) -> FortranType {
             let k = kind
                 .as_ref()
                 .and_then(|s| s.parse::<u8>().ok())
-                .unwrap_or(4);
+                .unwrap_or_else(crate::driver::defaults::default_int_kind);
             FortranType::Logical { kind: k }
         }
         Expr::ComplexLiteral { .. } => FortranType::default_complex(),
@@ -559,16 +567,16 @@ pub fn type_spec_to_fortran_type(
 
     match head.as_str() {
         "integer" => Some(FortranType::Integer {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
         }),
         "real" => Some(FortranType::Real {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
         }),
         "complex" => Some(FortranType::Complex {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_real_kind),
         }),
         "logical" => Some(FortranType::Logical {
-            kind: kind.unwrap_or(4),
+            kind: kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
         }),
         "character" => Some(FortranType::Character {
             kind: 1,
@@ -625,7 +633,7 @@ pub fn expr_type(
             kind: kind
                 .as_deref()
                 .and_then(|k| resolve_kind_suffix(k, symtab))
-                .unwrap_or(4),
+                .unwrap_or_else(crate::driver::defaults::default_int_kind),
         },
         Expr::RealLiteral { text, kind, .. } => {
             if let Some(kind) = kind.as_deref().and_then(|k| resolve_kind_suffix(k, symtab)) {
@@ -633,7 +641,7 @@ pub fn expr_type(
             } else if text.to_lowercase().contains('d') {
                 FortranType::Real { kind: 8 }
             } else {
-                FortranType::Real { kind: 4 }
+                FortranType::default_real()
             }
         }
         Expr::StringLiteral { kind, value, .. } => FortranType::Character {
@@ -647,7 +655,7 @@ pub fn expr_type(
             kind: kind
                 .as_deref()
                 .and_then(|k| resolve_kind_suffix(k, symtab))
-                .unwrap_or(4),
+                .unwrap_or_else(crate::driver::defaults::default_int_kind),
         },
         Expr::ComplexLiteral { .. } | Expr::BozLiteral { .. } => literal_type(&expr.node),
 
@@ -730,6 +738,15 @@ pub fn expr_type(
                 if matches!(name.to_lowercase().as_str(), "cmplx") {
                     if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab) {
                         return FortranType::Complex { kind };
+                    }
+                }
+
+                if matches!(name.to_lowercase().as_str(), "char" | "achar") {
+                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
+                        return FortranType::Character {
+                            kind,
+                            len: CharLen::Known(1),
+                        };
                     }
                 }
 
@@ -994,6 +1011,145 @@ fn is_specific_match(dummy_args: &[DummyArgDesc], actual_types: &[FortranType]) 
 }
 
 /// Get the type of a common intrinsic function call.
+pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "abs"
+            | "iabs"
+            | "dabs"
+            | "cabs"
+            | "cdabs"
+            | "zabs"
+            | "acos"
+            | "asin"
+            | "atan"
+            | "atan2"
+            | "cos"
+            | "sin"
+            | "tan"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "asinh"
+            | "acosh"
+            | "atanh"
+            | "exp"
+            | "log"
+            | "log10"
+            | "gamma"
+            | "log_gamma"
+            | "fraction"
+            | "exponent"
+            | "scale"
+            | "erf"
+            | "erfc"
+            | "sqrt"
+            | "dsqrt"
+            | "csqrt"
+            | "zsqrt"
+            | "cdsqrt"
+            | "hypot"
+            | "acosd"
+            | "asind"
+            | "atand"
+            | "atan2d"
+            | "cosd"
+            | "sind"
+            | "tand"
+            | "acospi"
+            | "asinpi"
+            | "atanpi"
+            | "atan2pi"
+            | "cospi"
+            | "sinpi"
+            | "tanpi"
+            | "anint"
+            | "dnint"
+            | "aint"
+            | "dint"
+            | "ceiling"
+            | "floor"
+            | "nint"
+            | "int"
+            | "real"
+            | "dble"
+            | "cmplx"
+            | "logical"
+            | "conjg"
+            | "aimag"
+            | "dimag"
+            | "mod"
+            | "modulo"
+            | "sign"
+            | "dim"
+            | "max"
+            | "min"
+            | "ichar"
+            | "iachar"
+            | "achar"
+            | "char"
+            | "ieee_is_nan"
+            | "ieee_is_finite"
+            | "ieee_is_normal"
+            | "ieee_class"
+            | "ieee_unordered"
+            | "ieee_value"
+            | "ieee_copy_sign"
+            | "ieee_logb"
+            | "ieee_rint"
+            | "ieee_scalb"
+            | "ieee_next_after"
+            | "ieee_max"
+            | "ieee_min"
+            | "ieee_max_mag"
+            | "ieee_min_mag"
+            | "ieee_max_num"
+            | "ieee_min_num"
+            | "ieee_max_num_mag"
+            | "ieee_min_num_mag"
+            | "len_trim"
+            | "index"
+            | "scan"
+            | "verify"
+            | "adjustl"
+            | "adjustr"
+            | "lge"
+            | "lgt"
+            | "lle"
+            | "llt"
+            | "popcnt"
+            | "popcount"
+            | "poppar"
+            | "leadz"
+            | "trailz"
+            | "btest"
+            | "iand"
+            | "ior"
+            | "ieor"
+            | "ishft"
+            | "ishftc"
+            | "ibits"
+            | "ibset"
+            | "ibclr"
+            | "not"
+            | "shifta"
+            | "shiftl"
+            | "shiftr"
+            | "dshiftl"
+            | "dshiftr"
+            | "bge"
+            | "bgt"
+            | "ble"
+            | "blt"
+            | "merge_bits"
+            | "maskl"
+            | "maskr"
+            | "merge"
+            | "is_iostat_end"
+            | "is_iostat_eor"
+    )
+}
+
 pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<FortranType> {
     let lower = name.to_lowercase();
     match lower.as_str() {
@@ -1008,6 +1164,16 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         }
         "max" | "min" => args.first().cloned(),
         "sign" | "mod" | "modulo" => args.first().cloned(),
+        "fraction" => match args.first()? {
+            FortranType::Real { kind } => Some(FortranType::Real { kind: *kind }),
+            _ => None,
+        },
+        "scale" => match (args.first()?, args.get(1)?) {
+            (FortranType::Real { kind }, FortranType::Integer { .. }) => {
+                Some(FortranType::Real { kind: *kind })
+            }
+            _ => None,
+        },
 
         // Real-valued math.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
@@ -1070,10 +1236,13 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "any" | "all" => Some(FortranType::default_logical()),
 
         // Character-valued.
-        "trim" | "adjustl" | "adjustr" | "repeat" => Some(FortranType::Character {
-            kind: 1,
-            len: CharLen::Unknown,
-        }),
+        "trim" | "adjustl" | "adjustr" | "repeat" => match args.first()? {
+            FortranType::Character { kind, .. } => Some(FortranType::Character {
+                kind: *kind,
+                len: CharLen::Unknown,
+            }),
+            _ => None,
+        },
         // F2023 F_C_STRING: deferred-length c_char result (TRIM//NUL).
         "f_c_string" => Some(FortranType::Character {
             kind: 1,
@@ -1106,24 +1275,30 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Inquiry intrinsics.
         "huge" | "tiny" | "epsilon" | "next" | "previous" => args.first().cloned(),
-        "precision" | "range" | "digits" | "radix" | "exponent" => {
-            Some(FortranType::default_integer())
-        }
+        "precision" | "range" | "digits" | "radix" => Some(FortranType::default_integer()),
+        "exponent" => matches!(args.first()?, FortranType::Real { .. })
+            .then(FortranType::default_integer),
         "storage_size" | "c_sizeof" => Some(FortranType::default_integer()),
         "iachar" | "ichar" => Some(FortranType::default_integer()),
 
         // System / misc.
         "command_argument_count" => Some(FortranType::default_integer()),
         "null" => Some(FortranType::Unknown), // null pointer — type from context
-        "new_line" => Some(FortranType::Character {
-            kind: 1,
-            len: CharLen::Known(1),
-        }),
+        "new_line" => match args.first()? {
+            FortranType::Character { kind, .. } => Some(FortranType::Character {
+                kind: *kind,
+                len: CharLen::Known(1),
+            }),
+            _ => None,
+        },
         "logical" => Some(FortranType::default_logical()),
 
         // iso_c_binding.
-        "c_loc" | "c_funloc" => Some(FortranType::Derived {
+        "c_loc" => Some(FortranType::Derived {
             name: "c_ptr".into(),
+        }),
+        "c_funloc" => Some(FortranType::Derived {
+            name: "c_funptr".into(),
         }),
         "c_associated" => Some(FortranType::default_logical()),
 
@@ -2855,6 +3030,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, FortranType::default_logical());
+    }
+
+    #[test]
+    fn c_location_intrinsics_have_distinct_pointer_types() {
+        assert_eq!(
+            intrinsic_result_type("c_loc", &[]),
+            Some(FortranType::Derived {
+                name: "c_ptr".into()
+            })
+        );
+        assert_eq!(
+            intrinsic_result_type("c_funloc", &[]),
+            Some(FortranType::Derived {
+                name: "c_funptr".into()
+            })
+        );
     }
 
     #[test]

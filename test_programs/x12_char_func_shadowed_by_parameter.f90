@@ -65,7 +65,7 @@ contains
 end module
 
 program p
-  use toml_mod
+  use toml_mod, only: name_is_json
   use charconst_mod, only: lower
   implicit none
   write(*, '(a,l1)') 'json=', name_is_json('a.JSON')

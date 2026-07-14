@@ -13,12 +13,15 @@ use std::collections::{HashMap, HashSet};
 
 use super::statement_functions::detect_statement_functions;
 use super::type_resolution::{derived_char_init_len, entity_char_len_to_info, type_spec_to_info};
-use super::use_resolution::{load_external_module, preload_stmt_uses, process_uses};
+use super::use_resolution::{
+    load_external_module, load_external_submodule, preload_stmt_uses, process_uses,
+};
 
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
     /// return them to the driver for globals extraction.
     pub(super) static LOADED_EXTERNAL_MODULES: RefCell<Vec<crate::sema::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
+    pub(super) static LOADING_EXTERNAL_SUBMODULES: RefCell<HashSet<(String, String)>> = RefCell::new(HashSet::new());
 }
 
 pub(super) fn merge_specific_names(into: &mut Vec<String>, additional: &[String]) {
@@ -81,6 +84,7 @@ pub fn resolve_file(
     // Second pass: populate all scopes (loads .amod files lazily on USE miss).
     // Track which external modules were loaded.
     LOADED_EXTERNAL_MODULES.with(|cell| cell.borrow_mut().clear());
+    LOADING_EXTERNAL_SUBMODULES.with(|cell| cell.borrow_mut().clear());
     for unit in units {
         resolve_unit(&mut st, unit, module_search_paths, &mut layouts)?;
     }
@@ -568,6 +572,7 @@ pub(super) fn resolve_unit(
             name,
             uses,
             imports,
+            implicit,
             decls,
             contains,
         } => {
@@ -580,76 +585,72 @@ pub(super) fn resolve_unit(
                     msg: "IMPORT, NONE is not permitted in a submodule".into(),
                 });
             }
-            // Resolve the immediate semantic parent. A direct child can load
-            // its ancestor module from .amod; a descendant needs the parent
-            // submodule scope retained in this translation unit.
+            // Resolve the exact immediate semantic parent. Descendants load
+            // the parent submodule's .smod identity record and AMOD companion;
+            // the ancestor module is not a substitute for that scope.
             let parent_scope = if let Some(immediate_parent) = ancestor {
-                let immediate_scope = st.find_submodule_scope(parent, immediate_parent);
-                if immediate_scope.is_none() && !imports.is_empty() {
-                    return Err(SemaError {
-                        span: unit.span,
-                        msg: format!(
-                            "IMPORT in descendant submodule '{}' requires semantic information for parent submodule '{}'",
-                            name, immediate_parent
-                        ),
-                    });
-                }
-                immediate_scope.or_else(|| {
-                    st.find_module_scope(parent)
-                        .or_else(|| load_external_module(st, parent, module_search_paths, layouts))
-                })
+                st.find_submodule_scope(parent, immediate_parent)
+                    .or_else(|| {
+                        load_external_submodule(
+                            st,
+                            parent,
+                            immediate_parent,
+                            module_search_paths,
+                            layouts,
+                        )
+                    })
             } else {
                 st.find_module_scope(parent)
                     .or_else(|| load_external_module(st, parent, module_search_paths, layouts))
-            };
+            }
+            .ok_or_else(|| SemaError {
+                span: unit.span,
+                msg: if let Some(immediate_parent) = ancestor {
+                    format!(
+                        "immediate parent submodule '{}:{}' was not found",
+                        parent, immediate_parent
+                    )
+                } else {
+                    format!("parent module '{}' was not found", parent)
+                },
+            })?;
             let scope_id = st.push_scope(ScopeKind::Submodule(name.clone()));
             st.set_submodule_ancestor(scope_id, parent);
-            if let Some(pid) = parent_scope {
-                process_imports(
-                    st,
-                    scope_id,
-                    imports,
-                    HostAssociationPolicy::All,
-                    unit.span,
-                    Some(pid),
-                )?;
-            } else if !imports.is_empty() {
-                return Err(SemaError {
-                    span: unit.span,
-                    msg: format!(
-                        "cannot apply IMPORT because parent module '{}' was not found",
-                        parent
-                    ),
-                });
-            }
+            process_imports(
+                st,
+                scope_id,
+                imports,
+                HostAssociationPolicy::All,
+                unit.span,
+                Some(parent_scope),
+            )?;
             process_uses(st, uses, module_search_paths, layouts)?;
+            process_implicit(st, implicit)?;
             // Import all immediate-parent symbols into the submodule scope.
             // Per F2008 12.2.3.2: submodules see ALL parent entities,
             // including private ones — that's the whole point of the
             // submodule mechanism (host association).
-            if let Some(pid) = parent_scope {
+            st.add_use_association(UseAssociation {
+                local_name: String::new(),
+                original_name: String::new(),
+                source_scope: parent_scope,
+                is_submodule_access: true,
+                from_bare_use: true,
+            });
+            let parent_syms: Vec<(String, String)> = st
+                .scope(parent_scope)
+                .symbols
+                .iter()
+                .map(|(key, sym)| (sym.name.clone(), key.clone()))
+                .collect();
+            for (sym_name, _key) in &parent_syms {
                 st.add_use_association(UseAssociation {
-                    local_name: String::new(),
-                    original_name: String::new(),
-                    source_scope: pid,
+                    local_name: sym_name.clone(),
+                    original_name: sym_name.clone(),
+                    source_scope: parent_scope,
                     is_submodule_access: true,
                     from_bare_use: true,
                 });
-                let parent_syms: Vec<(String, String)> = st
-                    .scope(pid)
-                    .symbols
-                    .iter()
-                    .map(|(key, sym)| (sym.name.clone(), key.clone()))
-                    .collect();
-                for (sym_name, _key) in &parent_syms {
-                    st.add_use_association(UseAssociation {
-                        local_name: sym_name.clone(),
-                        original_name: sym_name.clone(),
-                        source_scope: pid,
-                        is_submodule_access: true,
-                        from_bare_use: true,
-                    });
-                }
             }
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;
@@ -723,8 +724,11 @@ pub(super) fn resolve_unit(
                             // Capture result rank from the function's
                             // own decls (interface-block bodies declare
                             // the result variable here).
-                            let result_attrs_for_iface =
+                            let mut result_attrs_for_iface =
                                 function_result_attrs(fn_name, result, decls);
+                            result_attrs_for_iface.is_separate_module_interface = prefix
+                                .iter()
+                                .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
@@ -760,6 +764,9 @@ pub(super) fn resolve_unit(
                                 || prefix
                                     .iter()
                                     .any(|p| matches!(p, crate::ast::unit::Prefix::Pure));
+                            let is_separate_module_interface = prefix
+                                .iter()
+                                .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Subroutine,
@@ -768,7 +775,10 @@ pub(super) fn resolve_unit(
                                 normalized_bind_name(bind.as_ref(), fn_name),
                                 pure,
                                 elemental,
-                                SymbolAttrs::default(),
+                                SymbolAttrs {
+                                    is_separate_module_interface,
+                                    ..Default::default()
+                                },
                             ));
                         }
                         _ => {}
@@ -819,6 +829,7 @@ pub(super) fn resolve_unit(
                         pointer: result_attrs.pointer,
                         result_rank: result_attrs.result_rank,
                         array_spec: result_attrs.array_spec.clone(),
+                        is_separate_module_interface: result_attrs.is_separate_module_interface,
                         ..Default::default()
                     },
                     defined_at: span,
@@ -847,6 +858,8 @@ pub(super) fn resolve_unit(
                                 attrs.pointer = result_attrs.pointer;
                                 attrs.result_rank = result_attrs.result_rank;
                                 attrs.array_spec = result_attrs.array_spec;
+                                attrs.is_separate_module_interface =
+                                    result_attrs.is_separate_module_interface;
                                 existing.kind = kind;
                                 existing.type_info = ti;
                                 existing.attrs = attrs;
@@ -1062,6 +1075,11 @@ fn inject_separate_module_procedure_args(
     let Some(parent_module_scope) = parent_module_scope else {
         return;
     };
+    let Some(interface_owner_scope) =
+        st.find_separate_module_interface_scope(parent_module_scope, proc_name)
+    else {
+        return;
+    };
 
     // Find the matching procedure scope inside the parent module.
     // F2008-style submodules declare the procedure inside an explicit
@@ -1070,12 +1088,12 @@ fn inject_separate_module_procedure_args(
     // procedure scope. Tolerate one Interface hop.
     let proc_lc = proc_name.to_lowercase();
     let iface_scope = st.all_scopes().iter().find_map(|scope| {
-        let direct_parent_matches = scope.parent == Some(parent_module_scope);
+        let direct_parent_matches = scope.parent == Some(interface_owner_scope);
         let via_interface = scope
             .parent
             .map(|pid| {
                 matches!(st.scope(pid).kind, ScopeKind::Interface)
-                    && st.scope(pid).parent == Some(parent_module_scope)
+                    && st.scope(pid).parent == Some(interface_owner_scope)
             })
             .unwrap_or(false);
         if !direct_parent_matches && !via_interface {
@@ -1622,10 +1640,9 @@ fn parse_boz_i64(text: &str, base: crate::ast::expr::BozBase) -> Option<i64> {
 }
 
 fn selected_char_kind_value(name: &str) -> i64 {
+    let name = name.trim_end_matches(' ');
     if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
         1
-    } else if name.eq_ignore_ascii_case("iso_10646") {
-        4
     } else {
         -1
     }
@@ -1706,25 +1723,33 @@ fn eval_const_char_expr_with_params(
 }
 
 fn eval_const_char_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) -> Option<String> {
+    eval_const_char_expr_in_scope(expr, st, st.current_scope())
+}
+
+fn eval_const_char_expr_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    scope_id: ScopeId,
+) -> Option<String> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::StringLiteral { value, .. } => Some(value.clone()),
         Expr::Name { name } => {
-            let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
+            let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
             if sym.attrs.parameter {
                 sym.const_char_value.clone()
             } else {
                 None
             }
         }
-        Expr::ParenExpr { inner } => eval_const_char_expr(inner, st),
+        Expr::ParenExpr { inner } => eval_const_char_expr_in_scope(inner, st, scope_id),
         Expr::BinaryOp {
             op: crate::ast::expr::BinaryOp::Concat,
             left,
             right,
         } => {
-            let mut out = eval_const_char_expr(left, st)?;
-            out.push_str(&eval_const_char_expr(right, st)?);
+            let mut out = eval_const_char_expr_in_scope(left, st, scope_id)?;
+            out.push_str(&eval_const_char_expr_in_scope(right, st, scope_id)?);
             Some(out)
         }
         Expr::FunctionCall { callee, args } => {
@@ -1740,7 +1765,7 @@ fn eval_const_char_expr(expr: &crate::ast::expr::SpannedExpr, st: &SymbolTable) 
                             None
                         }
                     })?;
-                    let code = eval_const_int_expr(first_arg, st)?;
+                    let code = eval_const_int_expr_in_scope(first_arg, st, scope_id)?;
                     if !(0..=255).contains(&code) {
                         return None;
                     }
@@ -1866,7 +1891,7 @@ fn eval_const_int_expr_with_params(
                         return None;
                     };
                     eval_const_char_expr_with_params(e, const_params, const_char_params)
-                        .map(|name| selected_char_kind_value(name.trim()))
+                        .map(|name| selected_char_kind_value(&name))
                 }
                 "kind" => {
                     let arg = args.first()?;
@@ -2778,6 +2803,14 @@ pub(super) fn eval_const_int_expr(
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
 ) -> Option<i64> {
+    eval_const_int_expr_in_scope(expr, st, st.current_scope())
+}
+
+pub(super) fn eval_const_int_expr_in_scope(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    scope_id: ScopeId,
+) -> Option<i64> {
     use crate::ast::expr::Expr;
     match &expr.node {
         Expr::IntegerLiteral { text, .. } => {
@@ -2786,8 +2819,7 @@ pub(super) fn eval_const_int_expr(
         }
         Expr::BozLiteral { text, base } => parse_boz_i64(text, *base),
         Expr::Name { name } => {
-            // Look up the name in the current scope chain.
-            let sym = st.lookup_in(st.current_scope(), &name.to_lowercase())?;
+            let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
             if sym.attrs.parameter {
                 sym.const_value
             } else {
@@ -2795,7 +2827,7 @@ pub(super) fn eval_const_int_expr(
             }
         }
         Expr::UnaryOp { op, operand } => {
-            let v = eval_const_int_expr(operand, st)?;
+            let v = eval_const_int_expr_in_scope(operand, st, scope_id)?;
             match op {
                 crate::ast::expr::UnaryOp::Minus => Some(-v),
                 crate::ast::expr::UnaryOp::Plus => Some(v),
@@ -2803,8 +2835,8 @@ pub(super) fn eval_const_int_expr(
             }
         }
         Expr::BinaryOp { op, left, right } => {
-            let l = eval_const_int_expr(left, st)?;
-            let r = eval_const_int_expr(right, st)?;
+            let l = eval_const_int_expr_in_scope(left, st, scope_id)?;
+            let r = eval_const_int_expr_in_scope(right, st, scope_id)?;
             match op {
                 crate::ast::expr::BinaryOp::Add => Some(l + r),
                 crate::ast::expr::BinaryOp::Sub => Some(l - r),
@@ -2813,13 +2845,13 @@ pub(super) fn eval_const_int_expr(
                 _ => None,
             }
         }
-        Expr::ParenExpr { inner } => eval_const_int_expr(inner, st),
+        Expr::ParenExpr { inner } => eval_const_int_expr_in_scope(inner, st, scope_id),
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
                 let first_arg_val = args.first().and_then(|a| {
                     if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                        eval_const_int_expr(e, st)
+                        eval_const_int_expr_in_scope(e, st, scope_id)
                     } else {
                         None
                     }
@@ -2874,7 +2906,7 @@ pub(super) fn eval_const_int_expr(
                             let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                                 return None;
                             };
-                            let value = eval_const_int_expr(e, st)?;
+                            let value = eval_const_int_expr_in_scope(e, st, scope_id)?;
                             acc = Some(match acc {
                                 None => value,
                                 Some(prev) if is_max => prev.max(value),
@@ -2888,8 +2920,8 @@ pub(super) fn eval_const_int_expr(
                         let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                             return None;
                         };
-                        eval_const_char_expr(e, st)
-                            .map(|value| selected_char_kind_value(value.trim()))
+                        eval_const_char_expr_in_scope(e, st, scope_id)
+                            .map(|value| selected_char_kind_value(&value))
                     }
                     "kind" => {
                         if let Some(arg) = args.first() {
@@ -2927,7 +2959,7 @@ pub(super) fn eval_const_int_expr(
                                 .parse::<f64>()
                                 .ok()
                                 .map(|v| v.trunc() as i64),
-                            _ => eval_const_int_expr(e, st),
+                            _ => eval_const_int_expr_in_scope(e, st, scope_id),
                         }
                     }
                     "range" => {
@@ -2937,11 +2969,11 @@ pub(super) fn eval_const_int_expr(
                         };
                         let ty = match &e.node {
                             Expr::Name { name } => st
-                                .lookup_in(st.current_scope(), &name.to_lowercase())
+                                .lookup_in(scope_id, &name.to_lowercase())
                                 .and_then(|sym| sym.type_info.as_ref()),
                             Expr::ParenExpr { inner } => match &inner.node {
                                 Expr::Name { name } => st
-                                    .lookup_in(st.current_scope(), &name.to_lowercase())
+                                    .lookup_in(scope_id, &name.to_lowercase())
                                     .and_then(|sym| sym.type_info.as_ref()),
                                 _ => None,
                             },
@@ -3100,6 +3132,20 @@ mod tests {
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.implicit_rules.none_type);
+    }
+
+    #[test]
+    fn submodule_implicit_none_is_retained_in_scope() {
+        let st = resolve_source(
+            "module parent\nend module parent\nsubmodule(parent) child\n  implicit none\nend submodule child\n",
+        );
+        let submodule_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Submodule(name) if name == "child"))
+            .unwrap();
+        assert!(submodule_scope.implicit_rules.none_type);
+        assert!(submodule_scope.has_explicit_implicit_stmt);
     }
 
     #[test]

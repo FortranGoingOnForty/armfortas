@@ -1855,21 +1855,46 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             } else {
                 parent_key.clone()
             };
-            let smod_stem = if let Some(ancestor) = ancestor {
-                format!("{}@{}@{}", parent_key, ancestor.to_lowercase(), name_key)
-            } else {
-                format!("{}@{}", parent_key, name_key)
-            };
+            let artifact_stem = format!("{}@{}", parent_key, name_key);
+            let interface_name = format!("{}.amod", artifact_stem);
+            let submodule_scope_id =
+                st.find_submodule_scope(&parent_key, &name_key)
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot emit interface for unresolved submodule '{}:{}'",
+                            parent_key, name_key
+                        )
+                    })?;
+            let interface_text = crate::sema::amod::write_amod(
+                name,
+                opts.input.to_str().unwrap_or(""),
+                &source,
+                &st,
+                submodule_scope_id,
+                &module_globals,
+                &type_layouts,
+                &ir_module,
+                &local_descriptor_params,
+                &local_char_len_star_params,
+            );
+            let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
+            let interface_path = module_artifact_dir.join(&interface_name);
+            write_module_file_atomic(&interface_path, &interface_text)?;
+            if opts.verbose {
+                eprintln!(" amod: {}", interface_path.display());
+            }
             let smod_text = format!(
-                "#!smod 1\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n",
+                "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
+                crate::sema::amod::SMOD_VERSION,
                 env!("CARGO_PKG_VERSION"),
                 opts.input.to_str().unwrap_or(""),
                 parent_spec,
-                name_key
+                name_key,
+                interface_name,
+                interface_fingerprint
             );
-            let smod_path = module_artifact_dir.join(format!("{}.smod", smod_stem));
-            fs::write(&smod_path, &smod_text)
-                .map_err(|e| format!("cannot write '{}': {}", smod_path.display(), e))?;
+            let smod_path = module_artifact_dir.join(format!("{}.smod", artifact_stem));
+            write_module_file_atomic(&smod_path, &smod_text)?;
             if opts.verbose {
                 eprintln!(" smod: {}", smod_path.display());
             }

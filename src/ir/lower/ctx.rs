@@ -45,6 +45,9 @@ thread_local! {
     /// the current BLOCK.
     static ACTIVE_BLOCK_USES: RefCell<Vec<Vec<crate::ast::decl::SpannedDecl>>> =
         const { RefCell::new(Vec::new()) };
+
+    static ACTIVE_BLOCK_SCOPES: RefCell<Vec<crate::sema::symtab::ScopeId>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 pub(super) fn current_proc_scope() -> Option<crate::sema::symtab::ScopeId> {
@@ -57,6 +60,10 @@ pub(super) fn current_smp_extra_host() -> Option<String> {
 
 pub(super) fn active_block_uses() -> Vec<Vec<crate::ast::decl::SpannedDecl>> {
     ACTIVE_BLOCK_USES.with(|uses| uses.borrow().clone())
+}
+
+pub(super) fn active_block_scopes() -> Vec<crate::sema::symtab::ScopeId> {
+    ACTIVE_BLOCK_SCOPES.with(|scopes| scopes.borrow().clone())
 }
 
 /// RAII guard: install `scope` as the current procedure scope until
@@ -108,6 +115,28 @@ impl Drop for BlockUseGuard {
         ACTIVE_BLOCK_USES.with(|active| {
             active.borrow_mut().pop();
         });
+    }
+}
+
+pub(super) struct BlockScopeGuard(bool);
+
+impl BlockScopeGuard {
+    pub(super) fn enter(scope: Option<crate::sema::symtab::ScopeId>) -> Self {
+        if let Some(scope) = scope {
+            ACTIVE_BLOCK_SCOPES.with(|active| active.borrow_mut().push(scope));
+            return BlockScopeGuard(true);
+        }
+        BlockScopeGuard(false)
+    }
+}
+
+impl Drop for BlockScopeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            ACTIVE_BLOCK_SCOPES.with(|active| {
+                active.borrow_mut().pop();
+            });
+        }
     }
 }
 

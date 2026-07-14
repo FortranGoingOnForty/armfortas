@@ -39,6 +39,7 @@ pub enum ProgramUnit {
         name: String,
         uses: Vec<SpannedDecl>,
         imports: Vec<ImportStmt>,
+        implicit: Vec<SpannedDecl>,
         decls: Vec<SpannedDecl>,
         contains: Vec<SpannedUnit>,
     },

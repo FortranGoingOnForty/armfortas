@@ -34,6 +34,38 @@ fn truncate_bit_value_to_width(b: &mut FuncBuilder, value: ValueId, width: IntWi
     }
 }
 
+fn saturating_i32(b: &mut FuncBuilder, value: ValueId) -> ValueId {
+    let Some(IrType::Int(width)) = b.func().value_type(value) else {
+        return value;
+    };
+    match width {
+        IntWidth::I8 | IntWidth::I16 => b.int_extend(value, IntWidth::I32, true),
+        IntWidth::I32 => value,
+        IntWidth::I64 => {
+            let min = b.const_i64(i64::from(i32::MIN));
+            let max = b.const_i64(i64::from(i32::MAX));
+            let below = b.icmp(CmpOp::Lt, value, min);
+            let above = b.icmp(CmpOp::Gt, value, max);
+            let truncated = b.int_trunc(value, IntWidth::I32);
+            let min_i32 = b.const_i32(i32::MIN);
+            let max_i32 = b.const_i32(i32::MAX);
+            let upper = b.select(above, max_i32, truncated);
+            b.select(below, min_i32, upper)
+        }
+        IntWidth::I128 => {
+            let min = b.const_i128(i128::from(i32::MIN));
+            let max = b.const_i128(i128::from(i32::MAX));
+            let below = b.icmp(CmpOp::Lt, value, min);
+            let above = b.icmp(CmpOp::Gt, value, max);
+            let truncated = b.int_trunc(value, IntWidth::I32);
+            let min_i32 = b.const_i32(i32::MIN);
+            let max_i32 = b.const_i32(i32::MAX);
+            let upper = b.select(above, max_i32, truncated);
+            b.select(below, min_i32, upper)
+        }
+    }
+}
+
 /// Lower a Fortran intrinsic function call to IR instructions.
 /// Returns Some(ValueId) if recognized, None for external functions.
 pub(crate) fn lower_intrinsic(
@@ -971,6 +1003,58 @@ pub(crate) fn lower_intrinsic(
                 ))
             } else {
                 None
+            }
+        }
+        "fraction" => args.first().map(|arg| {
+            let ty = b
+                .func()
+                .value_type(*arg)
+                .unwrap_or(IrType::Float(FloatWidth::F64));
+            let suffix = if matches!(ty, IrType::Float(FloatWidth::F32)) {
+                "r4"
+            } else {
+                "r8"
+            };
+            b.call(
+                FuncRef::External(format!("afs_fraction_{suffix}")),
+                vec![*arg],
+                ty,
+            )
+        }),
+        "exponent" => args.first().map(|arg| {
+            let suffix = if matches!(
+                b.func().value_type(*arg),
+                Some(IrType::Float(FloatWidth::F32))
+            ) {
+                "r4"
+            } else {
+                "r8"
+            };
+            b.call(
+                FuncRef::External(format!("afs_exponent_{suffix}")),
+                vec![*arg],
+                IrType::Int(IntWidth::I32),
+            )
+        }),
+        "scale" => {
+            if args.len() < 2 {
+                None
+            } else {
+                let ty = b
+                    .func()
+                    .value_type(args[0])
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let function = if matches!(ty, IrType::Float(FloatWidth::F32)) {
+                    "scalbnf"
+                } else {
+                    "scalbn"
+                };
+                let exponent = saturating_i32(b, args[1]);
+                Some(b.call(
+                    FuncRef::External(function.into()),
+                    vec![args[0], exponent],
+                    ty,
+                ))
             }
         }
         // F2023 degree / half-revolution trig → runtime (afs_*), not

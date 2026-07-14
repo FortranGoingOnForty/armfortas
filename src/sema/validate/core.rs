@@ -5,7 +5,10 @@
 //! symbol resolution (resolve.rs) and type checking (types.rs).
 
 use crate::sema::symtab::*;
-use crate::sema::types::expr_type;
+use crate::sema::types::{
+    binary_op_result_type, expr_type, intrinsic_result_type, type_info_to_fortran_type,
+    unary_op_result_type,
+};
 
 use super::allocatable::{
     allocate_item_needs_explicit_shape, expr_selects_component, leaf_field_layout,
@@ -17,7 +20,7 @@ use super::pure_elemental::{
     validate_pure_call,
 };
 use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec};
-use crate::ast::expr::{Expr, SpannedExpr};
+use crate::ast::expr::{AcValue, Argument, Expr, SectionSubscript, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
 use crate::lexer::Span;
@@ -159,11 +162,13 @@ pub(super) struct Ctx<'a> {
     ambiguity_lexical_frames: Vec<AmbiguityLexicalFrame>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct BlockBindingAttrs {
     intent_in: bool,
     parameter: bool,
     pointer: bool,
+    type_info: Option<TypeInfo>,
+    rank: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -182,6 +187,7 @@ enum LexicalHostVisibility {
 enum AmbiguityLexicalFrame {
     Block {
         span: Span,
+        scope_id: Option<ScopeId>,
         uses: Vec<SpannedDecl>,
         bindings: HashSet<String>,
         import_control: BlockImportControl,
@@ -266,12 +272,12 @@ impl<'a> Ctx<'a> {
         self.block_binding_attrs(name).is_some()
     }
 
-    fn block_binding_attrs(&self, name: &str) -> Option<BlockBindingAttrs> {
+    fn block_binding_attrs(&self, name: &str) -> Option<&BlockBindingAttrs> {
         let key = name.to_lowercase();
         self.block_decl_frames
             .iter()
             .rev()
-            .find_map(|frame| frame.get(&key).copied())
+            .find_map(|frame| frame.get(&key))
     }
 
     /// Look up a symbol in the current validation scope.
@@ -283,6 +289,100 @@ impl<'a> Ctx<'a> {
         let resolved = self.st.lookup_in(self.scope_id, name);
         self.lookup_cache.borrow_mut().insert(key, resolved);
         resolved
+    }
+
+    fn lookup_lexical(&self, name: &str) -> Option<&'a Symbol> {
+        let key = name.to_lowercase();
+        for frame in self.ambiguity_lexical_frames.iter().rev() {
+            match frame {
+                AmbiguityLexicalFrame::Associate { bindings } => {
+                    if bindings.contains(&key) {
+                        return None;
+                    }
+                }
+                AmbiguityLexicalFrame::Block {
+                    scope_id,
+                    uses,
+                    bindings,
+                    import_control,
+                    ..
+                } => {
+                    if let Some(symbol) = scope_id.and_then(|scope_id| {
+                        self.st
+                            .scope(scope_id)
+                            .symbols
+                            .get(&key)
+                            .or_else(|| self.st.named_interface_symbol_in_scope(scope_id, &key))
+                    }) {
+                        return Some(symbol);
+                    }
+                    if bindings.contains(&key) {
+                        return None;
+                    }
+                    let associations = block_use_associations_for_name(self.st, uses, &key);
+                    if let Some(symbol) = self.st.lookup_from_use_associations(&associations, &key)
+                    {
+                        return Some(symbol);
+                    }
+                    if !import_control.policy.allows(&key) {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.lookup(name)
+    }
+
+    fn lookup_lexical_named_interfaces(&self, name: &str) -> Vec<&'a Symbol> {
+        let key = name.to_lowercase();
+        for frame in self.ambiguity_lexical_frames.iter().rev() {
+            match frame {
+                AmbiguityLexicalFrame::Associate { bindings } => {
+                    if bindings.contains(&key) {
+                        return Vec::new();
+                    }
+                }
+                AmbiguityLexicalFrame::Block {
+                    scope_id,
+                    uses,
+                    bindings,
+                    import_control,
+                    ..
+                } => {
+                    if let Some(symbol) = scope_id.and_then(|scope_id| {
+                        self.st
+                            .named_interface_facet_symbol_in_scope(scope_id, &key)
+                    }) {
+                        return vec![symbol];
+                    }
+                    if bindings.contains(&key) {
+                        return Vec::new();
+                    }
+                    let associations = block_use_associations_for_name(self.st, uses, &key);
+                    let symbols = self
+                        .st
+                        .named_interface_symbols_from_use_associations(&associations, &key);
+                    if !symbols.is_empty() {
+                        return symbols;
+                    }
+                    if !import_control.policy.allows(&key) {
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+        self.st.named_interface_symbols_in(self.scope_id, &key)
+    }
+
+    fn lexical_scope_id(&self) -> ScopeId {
+        self.ambiguity_lexical_frames
+            .iter()
+            .rev()
+            .find_map(|frame| match frame {
+                AmbiguityLexicalFrame::Block { scope_id, .. } => *scope_id,
+                AmbiguityLexicalFrame::Associate { .. } => None,
+            })
+            .unwrap_or(self.scope_id)
     }
 
     pub(super) fn error(&mut self, span: Span, msg: impl Into<String>) {
@@ -380,6 +480,10 @@ fn default_int_kind(kind: Option<u8>) -> u8 {
     kind.unwrap_or_else(crate::driver::defaults::default_int_kind)
 }
 
+fn default_real_kind(kind: Option<u8>) -> u8 {
+    kind.unwrap_or_else(crate::driver::defaults::default_real_kind)
+}
+
 fn parse_int_literal_kind(ctx: &Ctx<'_>, kind: &Option<String>) -> u8 {
     if let Some(kind_name) = kind {
         if let Ok(n) = kind_name.parse::<u8>() {
@@ -450,6 +554,61 @@ fn eval_real_complex_kind(
     }
 }
 
+fn validate_supported_character_type_spec(ctx: &mut Ctx<'_>, span: Span, type_spec: &TypeSpec) {
+    let TypeSpec::Character(Some(selector)) = type_spec else {
+        return;
+    };
+    let Some(kind_expr) = selector.kind.as_ref() else {
+        return;
+    };
+    let Ok(Some(kind)) = eval_const_int_expr_checked(ctx, kind_expr) else {
+        return;
+    };
+    if kind.value != 1 {
+        ctx.error(
+            span,
+            format!(
+                "CHARACTER(kind={}) data is not supported: the backend and runtime support only CHARACTER(kind=1)",
+                kind.value
+            ),
+        );
+    }
+}
+
+fn validate_supported_character_type_info(ctx: &mut Ctx<'_>, span: Span, info: Option<TypeInfo>) {
+    let Some(TypeInfo::Character {
+        kind: Some(kind), ..
+    }) = info
+    else {
+        return;
+    };
+    if kind != 1 {
+        ctx.error(
+            span,
+            format!(
+                "CHARACTER(kind={kind}) data is not supported: the backend and runtime support only CHARACTER(kind=1)"
+            ),
+        );
+    }
+}
+
+fn character_literal_kind(ctx: &Ctx<'_>, kind: &str) -> Option<i128> {
+    kind.parse::<i128>().ok().or_else(|| {
+        ctx.lookup_lexical(kind)
+            .and_then(|symbol| symbol.const_value)
+            .map(i128::from)
+    })
+}
+
+fn selected_character_kind(name: &str) -> i128 {
+    let name = name.trim_end_matches(' ');
+    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
+        1
+    } else {
+        -1
+    }
+}
+
 fn checked_int_value(value: i128, kind: u8, span: Span) -> Result<ConstIntValue, ConstIntError> {
     let Some((min, max)) = int_kind_bounds(kind) else {
         return Ok(ConstIntValue { value, kind });
@@ -484,7 +643,7 @@ fn eval_const_int_expr_checked(
             checked_int_value(value, parse_int_literal_kind(ctx, kind), expr.span).map(Some)
         }
         Expr::Name { name } => {
-            let Some(sym) = ctx.lookup(name) else {
+            let Some(sym) = ctx.lookup_lexical(name) else {
                 return Ok(None);
             };
             let Some(kind) = const_int_kind_of_symbol(sym) else {
@@ -572,6 +731,35 @@ fn eval_const_int_expr_checked(
             checked_int_value(value, kind, expr.span).map(Some)
         }
         Expr::ParenExpr { inner } => eval_const_int_expr_checked(ctx, inner),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return Ok(None);
+            };
+            let Some(first) = call_rank_argument_expr(args, 0, &["name", "x"]) else {
+                return Ok(None);
+            };
+            let value = match name.to_ascii_lowercase().as_str() {
+                "selected_char_kind" => match &first.node {
+                    Expr::StringLiteral { value, .. } => selected_character_kind(value),
+                    _ => return Ok(None),
+                },
+                "kind" => match validation_expr_type_info(ctx, first) {
+                    Some(TypeInfo::Integer { kind })
+                    | Some(TypeInfo::Real { kind })
+                    | Some(TypeInfo::Complex { kind })
+                    | Some(TypeInfo::Logical { kind })
+                    | Some(TypeInfo::Character { kind, .. }) => i128::from(kind.unwrap_or(1)),
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            checked_int_value(
+                value,
+                crate::driver::defaults::default_int_kind(),
+                expr.span,
+            )
+            .map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -877,12 +1065,8 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 _ => {}
             }
         }
-        // Argument association: an enumeration actual requires a dummy
-        // of the same enumeration type and vice versa (no implicit
-        // INTEGER bridge — an integer actual against an enumeration
-        // dummy read garbage before this check existed). Checked for
-        // CALL to a uniquely-resolvable subroutine; anything ambiguous
-        // (generics, externals without a visible body) is skipped.
+        // C pointer interop has additional argument constraints beyond the
+        // shared direct-interface validator below.
         Stmt::Call { callee, args } => {
             let Expr::Name { name } = &callee.node else {
                 return;
@@ -894,100 +1078,6 @@ fn validate_stmt_enum_usage(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             }
             if name.eq_ignore_ascii_case("c_f_pointer") {
                 validate_c_f_pointer(ctx, args);
-                return;
-            }
-            let Some(arg_names) = ctx.lookup(name).and_then(|sym| {
-                matches!(sym.kind, crate::sema::symtab::SymbolKind::Subroutine)
-                    .then(|| sym.arg_names.clone())
-            }) else {
-                return;
-            };
-            let target = name.to_ascii_lowercase();
-            let mut scopes = ctx.st.all_scopes().iter().filter(|scope| {
-                matches!(&scope.kind, crate::sema::symtab::ScopeKind::Subroutine(n)
-                    if n.eq_ignore_ascii_case(&target))
-            });
-            let (Some(callee_scope), None) = (scopes.next(), scopes.next()) else {
-                return;
-            };
-            for (i, arg) in args.iter().enumerate() {
-                let dummy_name = match arg.keyword.as_deref() {
-                    Some(kw) => kw.to_ascii_lowercase(),
-                    None => match arg_names.get(i) {
-                        Some(n) => n.to_ascii_lowercase(),
-                        None => continue,
-                    },
-                };
-                // F2023 C1525: a `.NIL.` conditional-argument arm selects
-                // the absent association — legal only against an OPTIONAL
-                // dummy. Passing it to a required dummy hands the callee a
-                // null it must dereference (PRESENT() would be false but
-                // the storage is absent).
-                if let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value {
-                    if expr_has_nil_arm(actual) {
-                        let dummy_optional = callee_scope
-                            .symbols
-                            .get(&dummy_name)
-                            .map(|sym| sym.attrs.optional)
-                            .unwrap_or(false);
-                        if !dummy_optional {
-                            ctx.error(
-                                actual.span,
-                                format!(
-                                    "a .NIL. conditional-argument arm requires an OPTIONAL \
-                                     dummy, but '{dummy_name}' is not OPTIONAL (F2023 C1525)"
-                                ),
-                            );
-                        }
-                    }
-                }
-                let dummy_enum =
-                    callee_scope
-                        .symbols
-                        .get(&dummy_name)
-                        .and_then(|sym| match &sym.type_info {
-                            Some(TypeInfo::Enumeration(n)) => Some(EnumClass::Enum(n.clone())),
-                            Some(_) => Some(EnumClass::NotEnum),
-                            None => None,
-                        });
-                let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value else {
-                    continue;
-                };
-                let actual_enum = enum_class_of(ctx, actual);
-                match (dummy_enum, actual_enum) {
-                    (Some(EnumClass::Enum(a)), EnumClass::Enum(b)) if a != b => {
-                        ctx.error(
-                            actual.span,
-                            format!(
-                                "actual argument of enumeration type '{}' is not \
-                                 compatible with dummy '{}' of enumeration type '{}'",
-                                b, dummy_name, a
-                            ),
-                        );
-                    }
-                    (Some(EnumClass::Enum(a)), EnumClass::NotEnum) => {
-                        ctx.error(
-                            actual.span,
-                            format!(
-                                "dummy argument '{}' has enumeration type '{}'; pass \
-                                 a value of that type (constructor '{}(int-expr)')",
-                                dummy_name, a, a
-                            ),
-                        );
-                    }
-                    (Some(EnumClass::NotEnum), EnumClass::Enum(b)) => {
-                        ctx.error(
-                            actual.span,
-                            format!(
-                                "actual argument of enumeration type '{}' is not \
-                                 compatible with non-enumeration dummy '{}'; convert \
-                                 with INT(v)",
-                                b, dummy_name
-                            ),
-                        );
-                    }
-                    _ => {}
-                }
             }
         }
         Stmt::Print { format, items } if is_star(format) => {
@@ -1195,6 +1285,15 @@ fn smp_type_compatible(a: &TypeInfo, b: &TypeInfo) -> bool {
     }
 }
 
+fn smp_intent_name(intent: Option<Intent>) -> &'static str {
+    match intent {
+        Some(Intent::In) => "INTENT(IN)",
+        Some(Intent::Out) => "INTENT(OUT)",
+        Some(Intent::InOut) => "INTENT(INOUT)",
+        None => "no INTENT",
+    }
+}
+
 /// F2008 §12.6.2.5 / C1414/C1418: a separate module procedure body must
 /// match its interface in the ancestor module — the interface must exist,
 /// and the dummy arguments must agree in number, type, kind, and rank.
@@ -1223,9 +1322,32 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
         return;
     };
 
-    // Locate the interface procedure scope in the ancestor module,
-    // tolerating one Interface-block hop (as the lowering does).
     let proc_lc = name.to_lowercase();
+    let Some(interface_owner) = ctx
+        .st
+        .find_separate_module_interface_scope(parent_mod, &proc_lc)
+    else {
+        let ancestor_name = ctx
+            .st
+            .scope(submod_id)
+            .submodule_ancestor
+            .as_deref()
+            .unwrap_or(match &ctx.st.scope(parent_mod).kind {
+                ScopeKind::Module(name) | ScopeKind::Submodule(name) => name.as_str(),
+                _ => "<unknown>",
+            });
+        ctx.error(
+            span,
+            format!(
+                "separate module procedure '{name}' has no matching interface in ancestor \
+                 module '{ancestor_name}' (F2008 C1414)"
+            ),
+        );
+        return;
+    };
+
+    // Locate the signature scope, tolerating one Interface-block hop for a
+    // source declaration and a direct child for an .amod-loaded declaration.
     let iface = ctx.st.all_scopes().iter().find_map(|s| {
         let nm = match &s.kind {
             ScopeKind::Function(n) | ScopeKind::Subroutine(n) => n,
@@ -1235,24 +1357,18 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
             return None;
         }
         let p = s.parent?;
-        if p == parent_mod
+        if p == interface_owner
             || (matches!(ctx.st.scope(p).kind, ScopeKind::Interface)
-                && ctx.st.scope(p).parent == Some(parent_mod))
+                && ctx.st.scope(p).parent == Some(interface_owner))
         {
             Some(s.id)
         } else {
             None
         }
     });
-    // No interface scope located. This is NOT necessarily an error: a
-    // separate module procedure can implement a specific inside a GENERIC
-    // interface, whose members are loaded from the parent `.amod` as
-    // NamedInterface symbols without a per-specific proc scope. Diagnosing
-    // "no matching interface" here would false-positive on those valid
-    // SMPs (cli_driver submodule_dispatching_private_parent_generic_…),
-    // so bail quietly — the signature checks below only run when a real
-    // interface scope is found, which keeps them false-positive-safe. A
-    // robust truly-missing-interface check is deferred (see noted_items).
+    // The marker proves the declaration exists. A current .amod also carries
+    // the signature scope, but keep this fallback diagnostic-safe if a source
+    // representation lacks one.
     let Some(iface) = iface else {
         return;
     };
@@ -1297,6 +1413,17 @@ fn validate_smp_body(ctx: &mut Ctx<'_>, name: &str, prefix: &[Prefix], span: Spa
                      {} but its interface declares rank {} (F2008 C1418)",
                     bsym.attrs.array_spec.len(),
                     isym.attrs.array_spec.len()
+                ),
+            );
+        }
+        if isym.attrs.intent != bsym.attrs.intent {
+            ctx.error(
+                span,
+                format!(
+                    "dummy argument '{ba}' of separate module procedure '{name}' has {}, \
+                     which does not match {} in its ancestor interface (F2008 C1418)",
+                    smp_intent_name(bsym.attrs.intent),
+                    smp_intent_name(isym.attrs.intent)
                 ),
             );
         }
@@ -1429,7 +1556,7 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     ctx.error(
                         arm.span,
                         ".NIL. is only valid as an arm of a conditional actual \
-                         argument in a CALL statement",
+                         argument in a procedure reference",
                     );
                 }
             }
@@ -1520,22 +1647,35 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     .all(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Element(_)))
                 {
                     check_intrinsic_call_arity(ctx, expr.span, name, args.len(), false);
+                    check_intrinsic_call_types(ctx, expr.span, name, args);
                 }
             }
+            validate_explicit_interface_call(ctx, callee, args, DirectProcedureKind::Function);
             // F2023 conditional arguments in FUNCTION references select the
             // argument association per arm on the fn-call lowering path
             // (lower_call_arg_maybe_conditional), the same as CALL.
+            let saved = ctx.in_call_arg;
+            ctx.in_call_arg = true;
             for arg in args {
                 validate_const_int_subscript(ctx, &arg.value);
             }
+            ctx.in_call_arg = saved;
         }
-        Expr::ArrayConstructor { values, .. } => {
+        Expr::ArrayConstructor { type_spec, values } => {
+            if type_spec.is_none() {
+                validate_untyped_array_constructor_elements(ctx, values);
+            }
             for value in values {
                 validate_const_int_ac_value(ctx, value);
             }
         }
         Expr::ComponentAccess { base, .. } => {
             validate_component_access(ctx, expr);
+            validate_supported_character_type_info(
+                ctx,
+                expr.span,
+                validation_expr_type_info(ctx, expr),
+            );
             validate_const_int_expr_tree(ctx, base);
         }
         Expr::ComplexLiteral { real, imag } => {
@@ -1543,9 +1683,28 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
             validate_const_int_expr_tree(ctx, imag);
         }
         Expr::ParenExpr { inner } => validate_const_int_expr_tree(ctx, inner),
-        Expr::Name { .. }
-        | Expr::RealLiteral { .. }
-        | Expr::StringLiteral { .. }
+        Expr::Name { name } => {
+            let info = ctx
+                .lookup_lexical(name)
+                .and_then(|symbol| symbol.type_info.clone());
+            validate_supported_character_type_info(ctx, expr.span, info);
+        }
+        Expr::StringLiteral {
+            kind: Some(kind), ..
+        } => {
+            if let Some(kind) = character_literal_kind(ctx, kind) {
+                if kind != 1 {
+                    ctx.error(
+                        expr.span,
+                        format!(
+                            "CHARACTER(kind={kind}) data is not supported: the backend and runtime support only CHARACTER(kind=1)"
+                        ),
+                    );
+                }
+            }
+        }
+        Expr::RealLiteral { .. }
+        | Expr::StringLiteral { kind: None, .. }
         | Expr::LogicalLiteral { .. }
         | Expr::BozLiteral { .. } => {}
     }
@@ -3663,11 +3822,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ..
         } => {
             validate_decls(ctx, uses);
-            for implicit_stmt in implicit {
-                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
-                }
-            }
+            validate_decls(ctx, implicit);
             if !contains.is_empty() {
                 ctx.require_std(
                     unit.span,
@@ -3690,11 +3845,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         } => {
             ctx.require_std(unit.span, FortranStandard::F90, "MODULE");
             validate_decls(ctx, uses);
-            for implicit_stmt in implicit {
-                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
-                }
-            }
+            validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
@@ -3747,11 +3898,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 }
             }
             validate_decls(ctx, uses);
-            for implicit_stmt in implicit {
-                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
-                }
-            }
+            validate_decls(ctx, implicit);
             if !contains.is_empty() {
                 ctx.require_std(
                     unit.span,
@@ -3862,6 +4009,9 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     }
                 }
             }
+            if let Some(return_type) = return_type {
+                validate_supported_character_type_spec(ctx, unit.span, return_type);
+            }
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
             let is_impure = prefix.iter().any(|p| matches!(p, Prefix::Impure));
@@ -3892,11 +4042,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                 }
             }
             validate_decls(ctx, uses);
-            for implicit_stmt in implicit {
-                if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
-                    ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
-                }
-            }
+            validate_decls(ctx, implicit);
             if !contains.is_empty() {
                 ctx.require_std(
                     unit.span,
@@ -3925,31 +4071,42 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         }
         ProgramUnit::Submodule {
             parent,
+            ancestor,
             uses,
+            implicit,
             decls,
             contains,
             ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F2008, "SUBMODULE");
-            // F2008 C1113: the parent (ancestor module or parent
-            // submodule) must be available. If neither a module nor a
-            // submodule of that name is in scope (in-file or loaded from
-            // an .amod), the submodule can't inherit anything — diagnose
-            // it instead of silently producing a dangling unit.
-            let parent_exists = ctx.st.find_module_scope(parent).is_some()
-                || ctx.st.all_scopes().iter().any(|s| {
-                    matches!(&s.kind, ScopeKind::Submodule(n) if n.eq_ignore_ascii_case(parent))
-                });
+            // F2008 C1113: a descendant names an exact parent submodule,
+            // while a direct child names its ancestor module.
+            let parent_exists = if let Some(immediate_parent) = ancestor {
+                ctx.st
+                    .find_submodule_scope(parent, immediate_parent)
+                    .is_some()
+            } else {
+                ctx.st.find_module_scope(parent).is_some()
+            };
             if !parent_exists {
-                ctx.error(
-                    unit.span,
-                    format!(
-                        "SUBMODULE parent '{parent}' not found — no such module or \
-                         submodule is available (compile it first or provide its .amod)"
-                    ),
-                );
+                if let Some(immediate_parent) = ancestor {
+                    ctx.error(
+                        unit.span,
+                        format!(
+                            "SUBMODULE immediate parent submodule '{parent}:{immediate_parent}' not found (compile it first and provide its .smod and .amod files)"
+                        ),
+                    );
+                } else {
+                    ctx.error(
+                        unit.span,
+                        format!(
+                            "SUBMODULE parent module '{parent}' not found (compile it first or provide its .amod)"
+                        ),
+                    );
+                }
             }
             validate_decls(ctx, uses);
+            validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
@@ -4065,6 +4222,8 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+
+            validate_supported_character_type_spec(ctx, decl.span, type_spec);
 
             // RANK(n) (F2023 8.5.17). The parser already desugared the
             // shape to a deferred-shape Dimension; here the marker
@@ -4331,6 +4490,12 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             ctx.require_std(decl.span, FortranStandard::F90, "IMPLICIT NONE");
         }
 
+        if let Decl::ImplicitStmt { specs } = &decl.node {
+            for spec in specs {
+                validate_supported_character_type_spec(ctx, decl.span, &spec.type_spec);
+            }
+        }
+
         if matches!(decl.node, Decl::UseStmt { .. }) {
             ctx.require_std(decl.span, FortranStandard::F90, "USE statement");
         }
@@ -4377,6 +4542,11 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 ctx.require_std(decl.span, FortranStandard::F2003, "ABSTRACT type");
             }
             validate_unsupported_component_forms(ctx, components);
+            for component in components {
+                if let Decl::TypeDecl { type_spec, .. } = &component.node {
+                    validate_supported_character_type_spec(ctx, component.span, type_spec);
+                }
+            }
             validate_derived_type(
                 ctx,
                 name,
@@ -4524,6 +4694,15 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::Assignment { target, value } => {
             validate_assignment_target(ctx, target, stmt.span);
             reject_pure_nonlocal_definition(ctx, target, stmt.span, "assignment");
+            let resolves_defined_assignment =
+                assignment_resolves_defined_assignment(ctx, target, value);
+            validate_intrinsic_assignment(
+                ctx,
+                target,
+                value,
+                stmt.span,
+                resolves_defined_assignment,
+            );
             if ctx.in_pure {
                 check_pure_expr_calls(ctx, value);
             }
@@ -4549,6 +4728,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             items,
             opts,
         } => {
+            if let Some(type_spec) = type_spec {
+                validate_supported_character_type_spec(ctx, stmt.span, type_spec);
+            }
             let option_presence =
                 validate_allocation_options(ctx, stmt.span, "ALLOCATE", opts, type_spec.is_some());
             let has_source = option_presence.source;
@@ -4733,13 +4915,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             for iface in ifaces {
                 validate_unit(ctx, iface);
             }
-            let frame = block_binding_frame(decls);
+            let frame = block_binding_frame(ctx, stmt.span, decls);
             let mut ambiguity_bindings = HashSet::new();
             collect_block_binding_names(decls, &mut ambiguity_bindings);
             extend_declared_names_from_ifaces(&mut ambiguity_bindings, ifaces);
             ctx.ambiguity_lexical_frames
                 .push(AmbiguityLexicalFrame::Block {
                     span: stmt.span,
+                    scope_id: ctx.st.statement_block_scope(stmt.span),
                     uses: uses.clone(),
                     bindings: ambiguity_bindings,
                     import_control,
@@ -4781,7 +4964,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             if ctx.in_pure {
                 validate_pure_call(ctx, callee, stmt.span);
             }
-            validate_call_site_intent(ctx, callee, args, stmt.span);
+            validate_explicit_interface_call(ctx, callee, args, DirectProcedureKind::Subroutine);
         }
 
         // Nullify: items must be pointers.
@@ -4994,20 +5177,374 @@ fn fortran_type_to_validation_type_info(
     }
 }
 
+fn symbol_declared_result_rank(symbol: &Symbol) -> Option<usize> {
+    if !matches!(
+        symbol.kind,
+        SymbolKind::Function
+            | SymbolKind::ExternalProc
+            | SymbolKind::IntrinsicProc
+            | SymbolKind::ProcedurePointer
+    ) {
+        return None;
+    }
+    let rank = usize::from(symbol.attrs.result_rank).max(symbol.attrs.array_spec.len());
+    (rank > 0 || symbol.type_info.is_some()).then_some(rank)
+}
+
+fn max_elemental_actual_rank(ctx: &Ctx<'_>, args: &[Argument]) -> Option<usize> {
+    args.iter()
+        .filter_map(|arg| match &arg.value {
+            SectionSubscript::Element(actual) => validation_expr_rank(ctx, actual),
+            SectionSubscript::Range { .. } => None,
+        })
+        .max()
+}
+
+fn callable_invocation_rank(ctx: &Ctx<'_>, symbol: &Symbol, args: &[Argument]) -> Option<usize> {
+    let declared_rank = symbol_declared_result_rank(symbol)?;
+    if symbol.attrs.elemental && declared_rank == 0 {
+        max_elemental_actual_rank(ctx, args).or(Some(0))
+    } else {
+        Some(declared_rank)
+    }
+}
+
+fn procedure_interface_call_result_metadata(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    args: &[Argument],
+) -> Option<(TypeInfo, usize)> {
+    let interface_name = symbol.attrs.procedure_iface.as_deref()?;
+    let interface_symbol = ctx
+        .st
+        .lookup_in(symbol.scope, interface_name)
+        .or_else(|| ctx.lookup_lexical(interface_name))?;
+    let procedure_scope =
+        assignment_candidate_scope(ctx, &interface_symbol.name, interface_symbol.scope)?;
+    candidate_result_metadata(ctx, procedure_scope, interface_symbol, args, None)
+}
+
+fn component_call_result_metadata(
+    ctx: &Ctx<'_>,
+    callee: &SpannedExpr,
+    args: &[Argument],
+) -> Option<(TypeInfo, usize)> {
+    let Expr::ComponentAccess { base, component } = &callee.node else {
+        return None;
+    };
+
+    if let Some(leaf) = leaf_field_layout(ctx, callee) {
+        if leaf.field.procedure_pointer {
+            let TypeInfo::Derived(interface_name) = &leaf.field.type_info else {
+                return None;
+            };
+            let symbol = ctx
+                .lookup_lexical(interface_name)
+                .or_else(|| ctx.st.find_symbol_any_scope(interface_name))?;
+            return Some((
+                symbol.type_info.clone()?,
+                callable_invocation_rank(ctx, symbol, args)?,
+            ));
+        }
+        return None;
+    }
+
+    let type_name = match validation_expr_type_info(ctx, base)? {
+        TypeInfo::Derived(name) | TypeInfo::Class(name) => name,
+        _ => return None,
+    };
+    let layouts = ctx.type_layouts?;
+    let layout = layouts
+        .get_for_scope(ctx.scope_id, &type_name)
+        .or_else(|| layouts.get(&type_name))?;
+    let owner_scope = layout.owner_scope.unwrap_or(ctx.scope_id);
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for binding in layout.bound_proc_candidates(component) {
+        let key = (
+            binding.target_name.to_ascii_lowercase(),
+            binding.abi_name.to_ascii_lowercase(),
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let Some(scope) = assignment_candidate_scope(ctx, &binding.target_name, owner_scope)
+            .or_else(|| assignment_candidate_scope(ctx, &binding.abi_name, owner_scope))
+        else {
+            continue;
+        };
+        let Some(symbol) = candidate_symbol(ctx, &binding.target_name, owner_scope, scope)
+            .or_else(|| candidate_symbol(ctx, &binding.abi_name, owner_scope, scope))
+        else {
+            continue;
+        };
+        let passed_object = (!binding.nopass).then_some(base.as_ref());
+        if !call_candidate_matches(ctx, scope, symbol, args, passed_object) {
+            continue;
+        }
+        if let Some(metadata) = candidate_result_metadata(ctx, scope, symbol, args, passed_object) {
+            matches.push(metadata);
+        }
+    }
+    let [metadata] = matches.as_slice() else {
+        return None;
+    };
+    Some(metadata.clone())
+}
+
+fn validation_array_constructor_type_info(
+    ctx: &Ctx<'_>,
+    type_spec: Option<&str>,
+    values: &[AcValue],
+) -> Option<TypeInfo> {
+    if let Some(raw) = type_spec {
+        let tokens = crate::lexer::tokenize(raw, 0, crate::lexer::SourceForm::FreeForm).ok()?;
+        let mut parser = crate::parser::Parser::new(&tokens);
+        if let Some(Ok(parsed)) = parser.try_parse_type_spec() {
+            if parser.peek() == &crate::lexer::TokenKind::Eof {
+                return Some(
+                    crate::sema::resolve::type_resolution::type_spec_to_info_in_scope(
+                        &parsed,
+                        ctx.st,
+                        ctx.lexical_scope_id(),
+                    ),
+                );
+            }
+        }
+
+        let symbol = ctx.lookup_lexical(raw.trim())?;
+        if matches!(symbol.kind, SymbolKind::DerivedType) {
+            return Some(TypeInfo::Derived(symbol.name.clone()));
+        }
+    }
+
+    values.iter().find_map(|value| match value {
+        AcValue::Expr(expr) => validation_expr_type_info(ctx, expr),
+        AcValue::ImpliedDo(implied) => {
+            validation_array_constructor_type_info(ctx, None, &implied.values)
+        }
+    })
+}
+
+fn validate_untyped_array_constructor_elements(ctx: &mut Ctx<'_>, values: &[AcValue]) {
+    let Some(expected) = validation_array_constructor_type_info(ctx, None, values) else {
+        return;
+    };
+
+    fn validate_values(ctx: &mut Ctx<'_>, expected: &TypeInfo, values: &[AcValue]) {
+        for value in values {
+            match value {
+                AcValue::Expr(expr) => {
+                    let Some(actual) = validation_expr_type_info(ctx, expr) else {
+                        continue;
+                    };
+                    if !defined_assignment_type_matches(
+                        ctx,
+                        ctx.lexical_scope_id(),
+                        expected,
+                        &actual,
+                    ) {
+                        ctx.error(
+                            expr.span,
+                            format!(
+                                "array constructor element type mismatch: expected {}, got {}",
+                                intrinsic_assignment_type_name(expected),
+                                intrinsic_assignment_type_name(&actual)
+                            ),
+                        );
+                    }
+                }
+                AcValue::ImpliedDo(implied) => {
+                    validate_values(ctx, expected, &implied.values);
+                }
+            }
+        }
+    }
+
+    validate_values(ctx, &expected, values);
+}
+
+#[derive(Clone)]
+struct ValidationExprMetadata {
+    type_info: Option<TypeInfo>,
+    rank: Option<usize>,
+}
+
+fn validation_expr_metadata(ctx: &Ctx<'_>, expr: &SpannedExpr) -> ValidationExprMetadata {
+    match &expr.node {
+        Expr::UnaryOp { op, operand } => {
+            let operand_expr = operand.as_ref();
+            let operand_metadata = validation_expr_metadata(ctx, operand_expr);
+            let interface_name = format!("operator({op})");
+            if let Some((type_info, rank)) = defined_operator_result_metadata(
+                ctx,
+                &interface_name,
+                &[operand_expr],
+                std::slice::from_ref(&operand_metadata),
+            ) {
+                return ValidationExprMetadata {
+                    type_info: Some(type_info),
+                    rank: Some(rank),
+                };
+            }
+            let type_info = operand_metadata.type_info.as_ref().and_then(|type_info| {
+                unary_op_result_type(op, &type_info_to_fortran_type(type_info))
+                    .and_then(fortran_type_to_validation_type_info)
+            });
+            ValidationExprMetadata {
+                type_info,
+                rank: operand_metadata.rank,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let left_metadata = validation_expr_metadata(ctx, left);
+            let right_metadata = validation_expr_metadata(ctx, right);
+            let interface_name = format!("operator({op})");
+            if let Some((type_info, rank)) = defined_operator_result_metadata(
+                ctx,
+                &interface_name,
+                &[left.as_ref(), right.as_ref()],
+                &[left_metadata.clone(), right_metadata.clone()],
+            ) {
+                return ValidationExprMetadata {
+                    type_info: Some(type_info),
+                    rank: Some(rank),
+                };
+            }
+            let type_info = match (
+                left_metadata.type_info.as_ref(),
+                right_metadata.type_info.as_ref(),
+            ) {
+                (Some(left), Some(right)) => binary_op_result_type(
+                    op,
+                    &type_info_to_fortran_type(left),
+                    &type_info_to_fortran_type(right),
+                )
+                .and_then(fortran_type_to_validation_type_info),
+                _ => None,
+            };
+            let rank = match (left_metadata.rank, right_metadata.rank) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(rank), None) | (None, Some(rank)) => Some(rank),
+                (None, None) => None,
+            };
+            ValidationExprMetadata { type_info, rank }
+        }
+        _ => ValidationExprMetadata {
+            type_info: validation_expr_type_info(ctx, expr),
+            rank: validation_expr_rank(ctx, expr),
+        },
+    }
+}
+
 fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
-    if expr_selects_component(expr) {
+    if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(leaf) = leaf_field_layout(ctx, expr) {
             return Some(leaf.field.type_info.clone());
         }
     }
     let resolved = match &expr.node {
-        Expr::Name { name } => ctx.lookup(name).and_then(|symbol| symbol.type_info.clone()),
+        Expr::Name { name } => ctx
+            .block_binding_attrs(name)
+            .and_then(|binding| binding.type_info.clone())
+            .or_else(|| {
+                ctx.lookup_lexical(name)
+                    .and_then(|symbol| symbol.type_info.clone())
+            }),
         Expr::ParenExpr { inner } => validation_expr_type_info(ctx, inner),
-        Expr::FunctionCall { callee, .. } => {
+        Expr::ArrayConstructor { type_spec, values } => {
+            validation_array_constructor_type_info(ctx, type_spec.as_deref(), values)
+        }
+        Expr::ComplexLiteral { real, imag } => {
+            let component_kind =
+                |component: &SpannedExpr| match validation_expr_type_info(ctx, component)? {
+                    TypeInfo::Real { kind } => Some(default_real_kind(kind)),
+                    TypeInfo::DoublePrecision => Some(8),
+                    TypeInfo::Integer { .. } => None,
+                    _ => None,
+                };
+            let kind = component_kind(real)
+                .into_iter()
+                .chain(component_kind(imag))
+                .max()
+                .unwrap_or_else(crate::driver::defaults::default_real_kind);
+            Some(TypeInfo::Complex { kind: Some(kind) })
+        }
+        Expr::UnaryOp { .. } | Expr::BinaryOp { .. } => {
+            validation_expr_metadata(ctx, expr).type_info
+        }
+        Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
-                return validation_expr_type_info(ctx, callee);
+                if let Some((type_info, _)) = component_call_result_metadata(ctx, callee, args) {
+                    return Some(type_info);
+                }
+                let leaf = leaf_field_layout(ctx, expr)?;
+                return (!leaf.field.procedure_pointer).then(|| leaf.field.type_info.clone());
             };
-            ctx.lookup(name).and_then(|symbol| {
+            if let Some((type_info, _)) = named_generic_call_result_metadata(ctx, name, args) {
+                return Some(type_info);
+            }
+            let symbol = ctx.lookup_lexical(name);
+            if let Some(metadata) = symbol
+                .and_then(|symbol| procedure_interface_call_result_metadata(ctx, symbol, args))
+            {
+                return Some(metadata.0);
+            }
+            let user_callable = symbol.is_some_and(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::ProcedurePointer
+                        | SymbolKind::NamedInterface
+                ) && !symbol.attrs.intrinsic
+            });
+            if is_intrinsic_name(name) && !user_callable {
+                let arg_types: Option<Vec<_>> = args
+                    .iter()
+                    .map(|arg| match &arg.value {
+                        SectionSubscript::Element(expr) => validation_expr_type_info(ctx, expr)
+                            .map(|info| type_info_to_fortran_type(&info)),
+                        SectionSubscript::Range { .. } => None,
+                    })
+                    .collect();
+                if let Some(arg_types) = arg_types {
+                    let key = name.to_ascii_lowercase();
+                    let kind_position = match key.as_str() {
+                        "cmplx" => Some(2),
+                        "int" | "nint" | "floor" | "ceiling" | "real" | "logical" | "char"
+                        | "achar" | "ichar" | "iachar" => Some(1),
+                        _ => None,
+                    };
+                    let requested_kind = kind_position
+                        .and_then(|position| call_rank_argument_expr(args, position, &["kind"]))
+                        .and_then(|kind_expr| {
+                            eval_const_int_expr_checked(ctx, kind_expr).ok().flatten()
+                        })
+                        .and_then(|value| u8::try_from(value.value).ok());
+                    if let Some(kind) = requested_kind {
+                        let type_info = match key.as_str() {
+                            "int" | "nint" | "floor" | "ceiling" | "ichar" | "iachar" => {
+                                TypeInfo::Integer { kind: Some(kind) }
+                            }
+                            "real" => TypeInfo::Real { kind: Some(kind) },
+                            "cmplx" => TypeInfo::Complex { kind: Some(kind) },
+                            "logical" => TypeInfo::Logical { kind: Some(kind) },
+                            "char" | "achar" => TypeInfo::Character {
+                                len: Some(1),
+                                kind: Some(kind),
+                            },
+                            _ => unreachable!(),
+                        };
+                        return Some(type_info);
+                    }
+                    if let Some(type_) = intrinsic_result_type(name, &arg_types) {
+                        return fortran_type_to_validation_type_info(type_);
+                    }
+                }
+            }
+            symbol.and_then(|symbol| {
                 if matches!(symbol.kind, SymbolKind::DerivedType) {
                     Some(TypeInfo::Derived(symbol.name.clone()))
                 } else {
@@ -5136,6 +5673,104 @@ fn assignment_type_is_same_or_extension(
     }
 }
 
+fn intrinsic_assignment_type_name(type_info: &TypeInfo) -> String {
+    match type_info {
+        TypeInfo::Integer { kind } => format!("INTEGER({})", default_int_kind(*kind)),
+        TypeInfo::Real { kind } => format!("REAL({})", default_real_kind(*kind)),
+        TypeInfo::DoublePrecision => "DOUBLE PRECISION".to_string(),
+        TypeInfo::Complex { kind } => format!("COMPLEX({})", default_real_kind(*kind)),
+        TypeInfo::Logical { kind } => format!("LOGICAL({})", default_int_kind(*kind)),
+        TypeInfo::Character { kind, .. } => format!("CHARACTER({})", kind.unwrap_or(1)),
+        TypeInfo::Derived(name) => format!("TYPE({name})"),
+        TypeInfo::Class(name) => format!("CLASS({name})"),
+        TypeInfo::ClassStar => "CLASS(*)".to_string(),
+        TypeInfo::TypeStar => "TYPE(*)".to_string(),
+        TypeInfo::Enumeration(name) => format!("ENUMERATION({name})"),
+    }
+}
+
+fn intrinsic_assignment_types_compatible(
+    ctx: &Ctx<'_>,
+    target: &TypeInfo,
+    value: &TypeInfo,
+) -> bool {
+    let numeric = |type_info: &TypeInfo| {
+        matches!(
+            type_info,
+            TypeInfo::Integer { .. }
+                | TypeInfo::Real { .. }
+                | TypeInfo::DoublePrecision
+                | TypeInfo::Complex { .. }
+        )
+    };
+
+    if numeric(target) && numeric(value) {
+        return true;
+    }
+
+    match (target, value) {
+        (TypeInfo::Logical { .. }, TypeInfo::Logical { .. }) => true,
+        (TypeInfo::Character { kind: target, .. }, TypeInfo::Character { kind: value, .. }) => {
+            target.unwrap_or(1) == value.unwrap_or(1)
+        }
+        (TypeInfo::Derived(target), TypeInfo::Derived(value) | TypeInfo::Class(value)) => {
+            assignment_type_names_match(ctx, ctx.scope_id, target, value)
+        }
+        (TypeInfo::Class(target), TypeInfo::Derived(value) | TypeInfo::Class(value)) => {
+            assignment_type_is_same_or_extension(ctx, ctx.scope_id, target, value)
+        }
+        (TypeInfo::ClassStar, _) => true,
+        (TypeInfo::TypeStar, _) | (_, TypeInfo::TypeStar) => true,
+        // Enumeration assignment has stricter, name-based diagnostics in
+        // validate_stmt_enum_usage.
+        (TypeInfo::Enumeration(_), _) | (_, TypeInfo::Enumeration(_)) => true,
+        _ => false,
+    }
+}
+
+fn validate_intrinsic_assignment(
+    ctx: &mut Ctx<'_>,
+    target: &SpannedExpr,
+    value: &SpannedExpr,
+    span: Span,
+    uses_defined_assignment: bool,
+) {
+    if uses_defined_assignment {
+        return;
+    }
+
+    if let (Some(target_rank), Some(value_rank)) = (
+        validation_expr_rank(ctx, target),
+        validation_expr_rank(ctx, value),
+    ) {
+        if value_rank != 0 && target_rank != value_rank {
+            ctx.error(
+                span,
+                format!(
+                    "intrinsic assignment rank mismatch: rank-{value_rank} expression cannot be assigned to rank-{target_rank} variable"
+                ),
+            );
+        }
+    }
+
+    let Some(target_type) = validation_expr_type_info(ctx, target) else {
+        return;
+    };
+    let Some(value_type) = validation_expr_type_info(ctx, value) else {
+        return;
+    };
+    if !intrinsic_assignment_types_compatible(ctx, &target_type, &value_type) {
+        ctx.error(
+            value.span,
+            format!(
+                "intrinsic assignment cannot convert {} to {}",
+                intrinsic_assignment_type_name(&value_type),
+                intrinsic_assignment_type_name(&target_type)
+            ),
+        );
+    }
+}
+
 fn defined_assignment_type_matches(
     ctx: &Ctx<'_>,
     declared_scope: ScopeId,
@@ -5147,22 +5782,34 @@ fn defined_assignment_type_matches(
     }
 
     match (declared, actual) {
-        (TypeInfo::Derived(declared), TypeInfo::Derived(actual)) => {
+        (TypeInfo::Derived(declared), TypeInfo::Derived(actual) | TypeInfo::Class(actual)) => {
             assignment_type_names_match(ctx, declared_scope, declared, actual)
         }
         (TypeInfo::Class(declared), TypeInfo::Class(actual) | TypeInfo::Derived(actual)) => {
             assignment_type_is_same_or_extension(ctx, declared_scope, declared, actual)
         }
-        (TypeInfo::ClassStar, TypeInfo::ClassStar)
-        | (TypeInfo::TypeStar, TypeInfo::TypeStar)
+        (TypeInfo::ClassStar, _) => true,
+        (TypeInfo::TypeStar, TypeInfo::TypeStar)
         | (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
-        (TypeInfo::Character { .. }, TypeInfo::Character { .. }) => true,
-        (TypeInfo::Integer { kind: a }, TypeInfo::Integer { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Real { kind: a }, TypeInfo::Real { kind: b }) => kind_eq(*a, *b, 4),
+        (TypeInfo::Character { kind: declared, .. }, TypeInfo::Character { kind: actual, .. }) => {
+            kind_eq(*declared, *actual, 1)
+        }
+        (TypeInfo::Integer { kind: a }, TypeInfo::Integer { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_int_kind())
+        }
+        (TypeInfo::Real { kind: a }, TypeInfo::Real { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_real_kind())
+        }
         (TypeInfo::Real { kind }, TypeInfo::DoublePrecision)
-        | (TypeInfo::DoublePrecision, TypeInfo::Real { kind }) => kind_eq(*kind, Some(8), 4),
-        (TypeInfo::Complex { kind: a }, TypeInfo::Complex { kind: b }) => kind_eq(*a, *b, 4),
-        (TypeInfo::Logical { kind: a }, TypeInfo::Logical { kind: b }) => kind_eq(*a, *b, 4),
+        | (TypeInfo::DoublePrecision, TypeInfo::Real { kind }) => {
+            kind_eq(*kind, Some(8), crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Complex { kind: a }, TypeInfo::Complex { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Logical { kind: a }, TypeInfo::Logical { kind: b }) => {
+            kind_eq(*a, *b, crate::driver::defaults::default_int_kind())
+        }
         (TypeInfo::Enumeration(a), TypeInfo::Enumeration(b)) => a.eq_ignore_ascii_case(b),
         _ => false,
     }
@@ -5173,60 +5820,707 @@ fn assignment_candidate_scope<'a>(
     name: &str,
     owner_scope: ScopeId,
 ) -> Option<&'a Scope> {
+    let matches_name = |scope: &&Scope| {
+        matches!(
+            &scope.kind,
+            ScopeKind::Function(candidate) | ScopeKind::Subroutine(candidate)
+                if candidate.eq_ignore_ascii_case(name)
+        )
+    };
     ctx.st
         .all_scopes()
         .iter()
-        .find(|scope| {
-            matches!(
-                &scope.kind,
-                ScopeKind::Function(candidate) | ScopeKind::Subroutine(candidate)
-                    if candidate.eq_ignore_ascii_case(name)
-            ) && scope.parent == Some(owner_scope)
-        })
+        .filter(matches_name)
+        .find(|scope| scope.parent == Some(owner_scope))
         .or_else(|| {
-            ctx.st.all_scopes().iter().find(|scope| {
-                matches!(
-                    &scope.kind,
-                    ScopeKind::Function(candidate) | ScopeKind::Subroutine(candidate)
-                        if candidate.eq_ignore_ascii_case(name)
-                )
+            ctx.st
+                .all_scopes()
+                .iter()
+                .filter(matches_name)
+                .find(|scope| {
+                    scope.parent.is_some_and(|parent| {
+                        matches!(ctx.st.scope(parent).kind, ScopeKind::Interface)
+                            && ctx.st.scope(parent).parent == Some(owner_scope)
+                    })
+                })
+        })
+}
+
+fn interface_specific_owner_scope(ctx: &Ctx<'_>, interface: &Symbol, name: &str) -> ScopeId {
+    ctx.st
+        .lookup_in(interface.scope, name)
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Function
+                    | SymbolKind::Subroutine
+                    | SymbolKind::ExternalProc
+                    | SymbolKind::IntrinsicProc
+                    | SymbolKind::ProcedurePointer
+            )
+        })
+        .map(|symbol| symbol.scope)
+        .unwrap_or(interface.scope)
+}
+
+fn defined_interface_candidates(
+    ctx: &Ctx<'_>,
+    interface_name: &str,
+    operand_types: &[&TypeInfo],
+) -> Vec<(String, ScopeId)> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |name: &str, owner_scope: ScopeId| {
+        let key = (name.to_ascii_lowercase(), owner_scope);
+        if seen.insert(key.clone()) {
+            candidates.push((key.0, owner_scope));
+        }
+    };
+
+    for interface in ctx.lookup_lexical_named_interfaces(interface_name) {
+        for name in &interface.arg_names {
+            push(name, interface_specific_owner_scope(ctx, interface, name));
+        }
+    }
+
+    if let Some(layouts) = ctx.type_layouts {
+        for operand_type in operand_types {
+            let type_name = match operand_type {
+                TypeInfo::Derived(name) | TypeInfo::Class(name) => name,
+                _ => continue,
+            };
+            let Some(layout) = layouts
+                .get_for_scope(ctx.scope_id, type_name)
+                .or_else(|| layouts.get(type_name))
+            else {
+                continue;
+            };
+            let owner_scope = layout.owner_scope.unwrap_or(ctx.scope_id);
+            for binding in layout.bound_proc_candidates(interface_name) {
+                push(&binding.target_name, owner_scope);
+                if !binding.abi_name.eq_ignore_ascii_case(&binding.target_name) {
+                    push(&binding.abi_name, owner_scope);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn candidate_symbol<'a>(
+    ctx: &'a Ctx<'_>,
+    name: &str,
+    owner_scope: ScopeId,
+    procedure_scope: &Scope,
+) -> Option<&'a Symbol> {
+    let key = name.to_ascii_lowercase();
+    ctx.st.scope(owner_scope).symbols.get(&key).or_else(|| {
+        let mut scope_id = procedure_scope.parent;
+        while let Some(current) = scope_id {
+            if let Some(symbol) = ctx.st.scope(current).symbols.get(&key) {
+                return Some(symbol);
+            }
+            if current == owner_scope {
+                break;
+            }
+            scope_id = ctx.st.scope(current).parent;
+        }
+        None
+    })
+}
+
+fn result_symbol_in_procedure_scope(scope: &Scope) -> Option<&Symbol> {
+    let ScopeKind::Function(function_name) = &scope.kind else {
+        return None;
+    };
+    let argument_names: HashSet<_> = scope
+        .arg_order
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    scope
+        .symbols
+        .get(&function_name.to_ascii_lowercase())
+        .filter(|symbol| !argument_names.contains(&symbol.name.to_ascii_lowercase()))
+        .or_else(|| {
+            scope.symbols.iter().find_map(|(name, symbol)| {
+                (!argument_names.contains(name)
+                    && matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter))
+                .then_some(symbol)
             })
         })
+}
+
+fn generic_dummy_type_matches(
+    ctx: &Ctx<'_>,
+    scope: ScopeId,
+    dummy: &TypeInfo,
+    actual: &TypeInfo,
+) -> bool {
+    matches!(dummy, TypeInfo::ClassStar | TypeInfo::TypeStar)
+        || defined_assignment_type_matches(ctx, scope, dummy, actual)
+}
+
+fn explicit_actual_rank_matches(
+    ctx: &Ctx<'_>,
+    actual: &SpannedExpr,
+    actual_type: Option<&TypeInfo>,
+    actual_rank: usize,
+    dummy_rank: usize,
+    assumed_rank: bool,
+    allows_sequence_association: bool,
+    dummy_type: Option<&TypeInfo>,
+    elemental: bool,
+) -> bool {
+    if (elemental && dummy_rank == 0) || assumed_rank || actual_rank == dummy_rank {
+        return true;
+    }
+    if !allows_sequence_association {
+        return false;
+    }
+    let character_storage = matches!(
+        (dummy_type, actual_type),
+        (
+            Some(TypeInfo::Character { .. }),
+            Some(TypeInfo::Character { .. })
+        )
+    );
+    actual_rank > 0 || is_array_element_designator(ctx, actual) || character_storage
+}
+
+fn call_candidate_matches(
+    ctx: &Ctx<'_>,
+    scope: &Scope,
+    symbol: &Symbol,
+    args: &[Argument],
+    passed_object: Option<&SpannedExpr>,
+) -> bool {
+    let mut actuals: Vec<(Option<&str>, Option<&SpannedExpr>)> = Vec::with_capacity(args.len() + 1);
+    if let Some(object) = passed_object {
+        actuals.push((None, Some(object)));
+    }
+    actuals.extend(args.iter().map(|arg| {
+        let expr = match &arg.value {
+            SectionSubscript::Element(expr) => Some(expr),
+            SectionSubscript::Range { .. } => None,
+        };
+        (arg.keyword.as_deref(), expr)
+    }));
+
+    let mut matched = vec![false; scope.arg_order.len()];
+    let mut position = 0;
+    let mut seen_keyword = false;
+    let mut elemental_rank = None;
+    for (keyword, actual) in actuals {
+        let dummy_index = if let Some(keyword) = keyword {
+            seen_keyword = true;
+            let Some(index) = scope
+                .arg_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(keyword))
+            else {
+                return false;
+            };
+            index
+        } else {
+            if seen_keyword {
+                return false;
+            }
+            while position < matched.len() && matched[position] {
+                position += 1;
+            }
+            if position == matched.len() {
+                return false;
+            }
+            let index = position;
+            position += 1;
+            index
+        };
+        if matched[dummy_index] {
+            return false;
+        }
+        matched[dummy_index] = true;
+
+        let Some(actual) = actual else {
+            continue;
+        };
+        let Some(dummy) = scope
+            .arg_order
+            .get(dummy_index)
+            .and_then(|name| scope.symbols.get(name))
+        else {
+            return false;
+        };
+        let actual_type = validation_expr_type_info(ctx, actual);
+        if let (Some(dummy_type), Some(actual_type)) =
+            (dummy.type_info.as_ref(), actual_type.as_ref())
+        {
+            if !generic_dummy_type_matches(ctx, scope.id, dummy_type, actual_type) {
+                return false;
+            }
+        }
+        if let Some(actual_rank) = validation_expr_rank(ctx, actual) {
+            let dummy_rank = dummy.attrs.array_spec.len();
+            if symbol.attrs.elemental && dummy_rank == 0 && actual_rank > 0 {
+                if elemental_rank.is_some_and(|rank| rank != actual_rank) {
+                    return false;
+                }
+                elemental_rank = Some(actual_rank);
+            }
+            let assumed_rank = dummy
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank));
+            let allows_sequence_association = !dummy.attrs.array_spec.is_empty()
+                && dummy.attrs.array_spec.iter().all(|spec| {
+                    matches!(
+                        spec,
+                        crate::ast::decl::ArraySpec::Explicit { .. }
+                            | crate::ast::decl::ArraySpec::AssumedSize { .. }
+                    )
+                });
+            if !explicit_actual_rank_matches(
+                ctx,
+                actual,
+                actual_type.as_ref(),
+                actual_rank,
+                dummy_rank,
+                assumed_rank,
+                allows_sequence_association,
+                dummy.type_info.as_ref(),
+                symbol.attrs.elemental,
+            ) {
+                return false;
+            }
+        }
+    }
+
+    scope.arg_order.iter().enumerate().all(|(index, name)| {
+        matched[index]
+            || scope
+                .symbols
+                .get(name)
+                .is_some_and(|dummy| dummy.attrs.optional)
+    })
+}
+
+fn candidate_result_metadata(
+    ctx: &Ctx<'_>,
+    scope: &Scope,
+    symbol: &Symbol,
+    args: &[Argument],
+    passed_object: Option<&SpannedExpr>,
+) -> Option<(TypeInfo, usize)> {
+    let result_symbol = result_symbol_in_procedure_scope(scope);
+    let type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| result_symbol.and_then(|result| result.type_info.clone()))?;
+    let declared_rank = symbol_declared_result_rank(symbol).or_else(|| {
+        result_symbol
+            .map(|result| usize::from(result.attrs.result_rank).max(result.attrs.array_spec.len()))
+    })?;
+    let rank = if symbol.attrs.elemental && declared_rank == 0 {
+        max_elemental_actual_rank(ctx, args)
+            .into_iter()
+            .chain(passed_object.and_then(|object| validation_expr_rank(ctx, object)))
+            .max()
+            .unwrap_or(0)
+    } else {
+        declared_rank
+    };
+    Some((type_info, rank))
+}
+
+fn named_generic_call_result_metadata(
+    ctx: &Ctx<'_>,
+    name: &str,
+    args: &[Argument],
+) -> Option<(TypeInfo, usize)> {
+    let mut matches = Vec::new();
+    for interface in ctx.lookup_lexical_named_interfaces(name) {
+        for candidate_name in &interface.arg_names {
+            let owner_scope = interface_specific_owner_scope(ctx, interface, candidate_name);
+            let Some(scope) = assignment_candidate_scope(ctx, candidate_name, owner_scope) else {
+                continue;
+            };
+            let Some(symbol) = candidate_symbol(ctx, candidate_name, owner_scope, scope) else {
+                continue;
+            };
+            if !call_candidate_matches(ctx, scope, symbol, args, None) {
+                continue;
+            }
+            if let Some(metadata) = candidate_result_metadata(ctx, scope, symbol, args, None) {
+                matches.push(metadata);
+            }
+        }
+    }
+    let [metadata] = matches.as_slice() else {
+        return None;
+    };
+    Some(metadata.clone())
+}
+
+fn operator_candidate_matches(
+    ctx: &Ctx<'_>,
+    scope: &Scope,
+    symbol: &Symbol,
+    operands: &[&SpannedExpr],
+    operand_metadata: &[ValidationExprMetadata],
+) -> bool {
+    if operands.len() != operand_metadata.len() || operands.len() > scope.arg_order.len() {
+        return false;
+    }
+
+    let mut elemental_rank = None;
+    for (index, (actual, metadata)) in operands.iter().zip(operand_metadata).enumerate() {
+        let Some(dummy) = scope
+            .arg_order
+            .get(index)
+            .and_then(|name| scope.symbols.get(name))
+        else {
+            return false;
+        };
+        if let (Some(dummy_type), Some(actual_type)) =
+            (dummy.type_info.as_ref(), metadata.type_info.as_ref())
+        {
+            if !generic_dummy_type_matches(ctx, scope.id, dummy_type, actual_type) {
+                return false;
+            }
+        }
+        if let Some(actual_rank) = metadata.rank {
+            let dummy_rank = dummy.attrs.array_spec.len();
+            if symbol.attrs.elemental && dummy_rank == 0 && actual_rank > 0 {
+                if elemental_rank.is_some_and(|rank| rank != actual_rank) {
+                    return false;
+                }
+                elemental_rank = Some(actual_rank);
+            }
+            let assumed_rank = dummy
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank));
+            let allows_sequence_association = !dummy.attrs.array_spec.is_empty()
+                && dummy.attrs.array_spec.iter().all(|spec| {
+                    matches!(
+                        spec,
+                        crate::ast::decl::ArraySpec::Explicit { .. }
+                            | crate::ast::decl::ArraySpec::AssumedSize { .. }
+                    )
+                });
+            if !explicit_actual_rank_matches(
+                ctx,
+                actual,
+                metadata.type_info.as_ref(),
+                actual_rank,
+                dummy_rank,
+                assumed_rank,
+                allows_sequence_association,
+                dummy.type_info.as_ref(),
+                symbol.attrs.elemental,
+            ) {
+                return false;
+            }
+        }
+    }
+
+    scope.arg_order.iter().skip(operands.len()).all(|name| {
+        scope
+            .symbols
+            .get(name)
+            .is_some_and(|dummy| dummy.attrs.optional)
+    })
+}
+
+fn operator_candidate_result_metadata(
+    scope: &Scope,
+    symbol: &Symbol,
+    operand_metadata: &[ValidationExprMetadata],
+) -> Option<(TypeInfo, usize)> {
+    let result_symbol = result_symbol_in_procedure_scope(scope);
+    let type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| result_symbol.and_then(|result| result.type_info.clone()))?;
+    let declared_rank = symbol_declared_result_rank(symbol).or_else(|| {
+        result_symbol
+            .map(|result| usize::from(result.attrs.result_rank).max(result.attrs.array_spec.len()))
+    })?;
+    let rank = if symbol.attrs.elemental && declared_rank == 0 {
+        operand_metadata
+            .iter()
+            .filter_map(|metadata| metadata.rank)
+            .max()
+            .unwrap_or(0)
+    } else {
+        declared_rank
+    };
+    Some((type_info, rank))
+}
+
+fn defined_operator_result_metadata(
+    ctx: &Ctx<'_>,
+    interface_name: &str,
+    operands: &[&SpannedExpr],
+    operand_metadata: &[ValidationExprMetadata],
+) -> Option<(TypeInfo, usize)> {
+    let operand_types: Vec<&TypeInfo> = operand_metadata
+        .iter()
+        .map(|metadata| metadata.type_info.as_ref())
+        .collect::<Option<_>>()?;
+    let mut matches = Vec::new();
+    for (name, owner_scope) in defined_interface_candidates(ctx, interface_name, &operand_types) {
+        let Some(scope) = assignment_candidate_scope(ctx, &name, owner_scope) else {
+            continue;
+        };
+        let Some(symbol) = candidate_symbol(ctx, &name, owner_scope, scope) else {
+            continue;
+        };
+        if !operator_candidate_matches(ctx, scope, symbol, operands, operand_metadata) {
+            continue;
+        }
+        if let Some(metadata) = operator_candidate_result_metadata(scope, symbol, operand_metadata)
+        {
+            matches.push(metadata);
+        }
+    }
+    let [metadata] = matches.as_slice() else {
+        return None;
+    };
+    Some(metadata.clone())
+}
+
+fn call_rank_argument_expr<'a>(
+    args: &'a [Argument],
+    position: usize,
+    keywords: &[&str],
+) -> Option<&'a SpannedExpr> {
+    args.iter()
+        .find(|arg| {
+            arg.keyword.as_deref().is_some_and(|keyword| {
+                keywords
+                    .iter()
+                    .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
+            })
+        })
+        .or_else(|| {
+            args.iter()
+                .filter(|arg| arg.keyword.is_none())
+                .nth(position)
+        })
+        .and_then(|arg| match &arg.value {
+            SectionSubscript::Element(expr) => Some(expr),
+            SectionSubscript::Range { .. } => None,
+        })
+}
+
+fn reduction_dim_argument_expr<'a>(
+    ctx: &Ctx<'_>,
+    args: &'a [Argument],
+    position: usize,
+) -> Option<&'a SpannedExpr> {
+    if let Some(expr) = args
+        .iter()
+        .find(|arg| {
+            arg.keyword
+                .as_deref()
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case("dim"))
+        })
+        .and_then(|arg| match &arg.value {
+            SectionSubscript::Element(expr) => Some(expr),
+            SectionSubscript::Range { .. } => None,
+        })
+    {
+        return Some(expr);
+    }
+
+    let expr = args
+        .iter()
+        .filter(|arg| arg.keyword.is_none())
+        .nth(position)
+        .and_then(|arg| match &arg.value {
+            SectionSubscript::Element(expr) => Some(expr),
+            SectionSubscript::Range { .. } => None,
+        })?;
+    matches!(
+        validation_expr_type_info(ctx, expr),
+        Some(TypeInfo::Integer { .. })
+    )
+    .then_some(expr)
+}
+
+fn intrinsic_result_rank_is_scalar(name: &str) -> bool {
+    matches!(
+        name,
+        "allocated"
+            | "associated"
+            | "bit_size"
+            | "c_associated"
+            | "c_funloc"
+            | "c_loc"
+            | "c_sizeof"
+            | "command_argument_count"
+            | "compiler_options"
+            | "compiler_version"
+            | "digits"
+            | "dot_product"
+            | "epsilon"
+            | "f_c_string"
+            | "huge"
+            | "ieee_selected_real_kind"
+            | "ieee_support_datatype"
+            | "ieee_support_denormal"
+            | "ieee_support_divide"
+            | "ieee_support_flag"
+            | "ieee_support_halting"
+            | "ieee_support_inf"
+            | "ieee_support_io"
+            | "ieee_support_nan"
+            | "ieee_support_rounding"
+            | "ieee_support_sqrt"
+            | "ieee_support_standard"
+            | "ieee_support_subnormal"
+            | "ieee_support_underflow_control"
+            | "kind"
+            | "len"
+            | "maxexponent"
+            | "minexponent"
+            | "new_line"
+            | "precision"
+            | "present"
+            | "radix"
+            | "range"
+            | "rank"
+            | "repeat"
+            | "same_type_as"
+            | "selected_char_kind"
+            | "selected_int_kind"
+            | "selected_logical_kind"
+            | "selected_real_kind"
+            | "size"
+            | "storage_size"
+            | "tiny"
+            | "trim"
+    )
+}
+
+fn intrinsic_call_result_rank(ctx: &Ctx<'_>, name: &str, args: &[Argument]) -> Option<usize> {
+    let key = name.to_ascii_lowercase();
+    if crate::sema::types::is_elemental_intrinsic(&key) {
+        return max_elemental_actual_rank(ctx, args).or(Some(0));
+    }
+    if intrinsic_result_rank_is_scalar(&key) {
+        return Some(0);
+    }
+
+    let source_rank = |position, keywords: &[&str]| {
+        call_rank_argument_expr(args, position, keywords)
+            .and_then(|expr| validation_expr_rank(ctx, expr))
+    };
+    match key.as_str() {
+        "reshape" => {
+            let shape = call_rank_argument_expr(args, 1, &["shape"])?;
+            match &shape.node {
+                Expr::ArrayConstructor { values, .. } => Some(values.len()),
+                _ => None,
+            }
+        }
+        "transpose" => source_rank(0, &["matrix"]),
+        "matmul" => {
+            let lhs = source_rank(0, &["matrix_a"]);
+            let rhs = source_rank(1, &["matrix_b"]);
+            match (lhs, rhs) {
+                (Some(2), Some(2)) => Some(2),
+                (Some(2), Some(1)) | (Some(1), Some(2)) => Some(1),
+                (Some(1), Some(1)) => Some(0),
+                (Some(lhs), Some(rhs)) => Some(lhs.max(rhs).min(2)),
+                (Some(rank), None) | (None, Some(rank)) => Some(rank.min(2)),
+                (None, None) => None,
+            }
+        }
+        "pack" => Some(1),
+        "unpack" => source_rank(1, &["mask"]),
+        "spread" => source_rank(0, &["source"]).map(|rank| rank + 1),
+        "cshift" | "eoshift" => source_rank(0, &["array"]),
+        "shape" => Some(1),
+        "lbound" | "ubound" => {
+            let has_dim = call_rank_argument_expr(args, 1, &["dim"]).is_some();
+            Some(usize::from(!has_dim))
+        }
+        "all" | "any" | "count" | "norm2" => {
+            let rank = source_rank(0, &["array", "mask"])?;
+            let has_dim = call_rank_argument_expr(args, 1, &["dim"]).is_some();
+            Some(if has_dim { rank.saturating_sub(1) } else { 0 })
+        }
+        "sum" | "product" | "maxval" | "minval" => {
+            let rank = source_rank(0, &["array"])?;
+            let has_dim = reduction_dim_argument_expr(ctx, args, 1).is_some();
+            Some(if has_dim { rank.saturating_sub(1) } else { 0 })
+        }
+        "maxloc" | "minloc" => {
+            let rank = source_rank(0, &["array"])?;
+            let has_dim = reduction_dim_argument_expr(ctx, args, 1).is_some();
+            Some(if has_dim { rank.saturating_sub(1) } else { 1 })
+        }
+        "findloc" => {
+            let rank = source_rank(0, &["array"])?;
+            let has_dim = reduction_dim_argument_expr(ctx, args, 2).is_some();
+            Some(if has_dim { rank.saturating_sub(1) } else { 1 })
+        }
+        "merge" => max_elemental_actual_rank(ctx, args).or(Some(0)),
+        "transfer" => {
+            if call_rank_argument_expr(args, 2, &["size"]).is_some() {
+                Some(1)
+            } else {
+                source_rank(1, &["mold"])
+            }
+        }
+        _ => None,
+    }
 }
 
 fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
     use crate::ast::expr::SectionSubscript;
 
     match &expr.node {
-        Expr::Name { name } => ctx.lookup(name).map(|symbol| symbol.attrs.array_spec.len()),
-        Expr::ParenExpr { inner } | Expr::UnaryOp { operand: inner, .. } => {
-            validation_expr_rank(ctx, inner)
-        }
+        Expr::Name { name } => ctx
+            .block_binding_attrs(name)
+            .and_then(|binding| binding.rank)
+            .or_else(|| {
+                ctx.lookup_lexical(name)
+                    .map(|symbol| symbol.attrs.array_spec.len())
+            }),
+        Expr::ParenExpr { inner } => validation_expr_rank(ctx, inner),
+        Expr::UnaryOp { .. } => validation_expr_metadata(ctx, expr).rank,
         Expr::ComponentAccess { base, .. } => {
             let base_rank = validation_expr_rank(ctx, base)?;
             let field_rank = leaf_field_layout(ctx, expr)?.field.dims.len();
             Some(base_rank + field_rank)
         }
-        Expr::BinaryOp { left, right, .. } => match (
-            validation_expr_rank(ctx, left),
-            validation_expr_rank(ctx, right),
-        ) {
-            (Some(left), Some(right)) => Some(left.max(right)),
-            (Some(rank), None) | (None, Some(rank)) => Some(rank),
-            (None, None) => None,
-        },
+        Expr::BinaryOp { .. } => validation_expr_metadata(ctx, expr).rank,
         Expr::ConditionalExpr { then_val, .. } => validation_expr_rank(ctx, then_val),
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
-                return None;
-            };
-            let symbol = ctx.lookup(name)?;
-            if matches!(symbol.kind, SymbolKind::DerivedType) {
-                return Some(0);
-            }
-            if !symbol.attrs.array_spec.is_empty() {
+                if let Some((_, rank)) = component_call_result_metadata(ctx, callee, args) {
+                    return Some(rank);
+                }
+                let leaf = leaf_field_layout(ctx, expr)?;
+                if leaf.field.procedure_pointer {
+                    return None;
+                }
+                if matches!(leaf.field.type_info, TypeInfo::Character { .. })
+                    && args
+                        .iter()
+                        .any(|arg| matches!(arg.value, SectionSubscript::Range { .. }))
+                    && validation_expr_rank(ctx, callee) == Some(0)
+                {
+                    return Some(0);
+                }
                 if args.is_empty() {
-                    return Some(symbol.attrs.array_spec.len());
+                    return Some(leaf.field.dims.len());
                 }
                 return Some(
                     args.iter()
@@ -5238,12 +6532,57 @@ fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
                         })
                         .count(),
                 );
+            };
+            let symbol = ctx.lookup_lexical(name);
+            if symbol.is_some_and(|symbol| matches!(symbol.kind, SymbolKind::DerivedType)) {
+                return Some(0);
             }
-            matches!(
-                symbol.kind,
-                SymbolKind::Function | SymbolKind::NamedInterface
-            )
-            .then_some(symbol.attrs.result_rank as usize)
+            if let Some((_, rank)) = named_generic_call_result_metadata(ctx, name, args) {
+                return Some(rank);
+            }
+            if let Some((_, rank)) = symbol
+                .and_then(|symbol| procedure_interface_call_result_metadata(ctx, symbol, args))
+            {
+                return Some(rank);
+            }
+            if let Some(symbol) = symbol {
+                if matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && !symbol.attrs.array_spec.is_empty()
+                {
+                    if args.is_empty() {
+                        return Some(symbol.attrs.array_spec.len());
+                    }
+                    return Some(
+                        args.iter()
+                            .filter(|arg| match &arg.value {
+                                SectionSubscript::Range { .. } => true,
+                                SectionSubscript::Element(index) => {
+                                    validation_expr_rank(ctx, index).is_some_and(|rank| rank > 0)
+                                }
+                            })
+                            .count(),
+                    );
+                }
+                let user_callable = matches!(
+                    symbol.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::ProcedurePointer
+                        | SymbolKind::NamedInterface
+                ) && !symbol.attrs.intrinsic;
+                if is_intrinsic_name(name) && !user_callable {
+                    if let Some(rank) = intrinsic_call_result_rank(ctx, name, args) {
+                        return Some(rank);
+                    }
+                }
+                if let Some(rank) = callable_invocation_rank(ctx, symbol, args) {
+                    return Some(rank);
+                }
+            }
+            is_intrinsic_name(name)
+                .then(|| intrinsic_call_result_rank(ctx, name, args))
+                .flatten()
         }
         Expr::ArrayConstructor { .. } => Some(1),
         Expr::IntegerLiteral { .. }
@@ -5256,14 +6595,11 @@ fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
     }
 }
 
-fn assignment_uses_defined_assignment(
+fn assignment_resolves_defined_assignment(
     ctx: &Ctx<'_>,
     target: &SpannedExpr,
     value: &SpannedExpr,
 ) -> bool {
-    if validation_expr_rank(ctx, target) != Some(0) || validation_expr_rank(ctx, value) != Some(0) {
-        return false;
-    }
     let Some(lhs_type) = validation_expr_type_info(ctx, target) else {
         return false;
     };
@@ -5271,14 +6607,7 @@ fn assignment_uses_defined_assignment(
         return false;
     };
 
-    let mut candidates: Vec<(String, ScopeId)> = Vec::new();
-    if let Some(interface) = ctx.lookup("assignment(=)") {
-        if matches!(interface.kind, SymbolKind::NamedInterface) {
-            for name in &interface.arg_names {
-                candidates.push((name.clone(), interface.scope));
-            }
-        }
-    }
+    let candidates = defined_interface_candidates(ctx, "assignment(=)", &[&lhs_type, &rhs_type]);
 
     candidates.into_iter().any(|(name, owner_scope)| {
         let Some(scope) = assignment_candidate_scope(ctx, &name, owner_scope) else {
@@ -5292,10 +6621,27 @@ fn assignment_uses_defined_assignment(
         if declared_args.len() != 2 {
             return false;
         }
-        if declared_args
-            .iter()
-            .any(|argument| !argument.attrs.array_spec.is_empty())
-        {
+        let Some(target_rank) = validation_expr_rank(ctx, target) else {
+            return false;
+        };
+        let Some(value_rank) = validation_expr_rank(ctx, value) else {
+            return false;
+        };
+        let declared_ranks = [
+            declared_args[0].attrs.array_spec.len(),
+            declared_args[1].attrs.array_spec.len(),
+        ];
+        let elemental = candidate_symbol(ctx, &name, owner_scope, scope).is_some_and(|symbol| {
+            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                && symbol.attrs.elemental
+        });
+        let ranks_match = if elemental && declared_ranks == [0, 0] {
+            (target_rank == 0 && value_rank == 0)
+                || (target_rank > 0 && (value_rank == 0 || target_rank == value_rank))
+        } else {
+            declared_ranks == [target_rank, value_rank]
+        };
+        if !ranks_match {
             return false;
         }
         let Some(lhs_declared) = declared_args[0].type_info.as_ref() else {
@@ -5307,6 +6653,16 @@ fn assignment_uses_defined_assignment(
         defined_assignment_type_matches(ctx, scope.id, lhs_declared, &lhs_type)
             && defined_assignment_type_matches(ctx, scope.id, rhs_declared, &rhs_type)
     })
+}
+
+fn assignment_uses_defined_assignment(
+    ctx: &Ctx<'_>,
+    target: &SpannedExpr,
+    value: &SpannedExpr,
+) -> bool {
+    validation_expr_rank(ctx, target) == Some(0)
+        && validation_expr_rank(ctx, value) == Some(0)
+        && assignment_resolves_defined_assignment(ctx, target, value)
 }
 
 fn allocate_option_expr<'a>(opts: &'a [IoControl], keyword: &str) -> Option<&'a SpannedExpr> {
@@ -5611,57 +6967,581 @@ fn call_target_function_name(
     matches!(sym.kind, SymbolKind::Function).then(|| sym.name.clone())
 }
 
-/// Validate call-site argument intent constraints.
-/// Can't pass a literal, parameter, or expression to intent(out/inout).
-fn validate_call_site_intent(
-    ctx: &mut Ctx,
-    callee: &crate::ast::expr::SpannedExpr,
-    args: &[crate::ast::expr::Argument],
-    span: Span,
-) {
-    // Look up the callee to find its dummy argument intents.
-    let callee_name = if let Expr::Name { name } = &callee.node {
-        name.clone()
-    } else {
-        return;
-    };
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectProcedureKind {
+    Function,
+    Subroutine,
+}
 
-    // For each actual argument, check if it's an lvalue when the dummy requires out/inout.
-    // We can only check this if the callee's dummy arg info is in the symbol table.
-    // For now, check the simpler case: passing a literal or parameter to ANY subroutine arg.
-    for arg in args {
-        let actual = match &arg.value {
-            crate::ast::expr::SectionSubscript::Element(e) => e,
-            _ => continue,
-        };
-        // Check if actual is a literal (not an lvalue).
-        let is_literal = matches!(
-            actual.node,
-            Expr::IntegerLiteral { .. }
-                | Expr::RealLiteral { .. }
-                | Expr::StringLiteral { .. }
-                | Expr::LogicalLiteral { .. }
-                | Expr::ComplexLiteral { .. }
-        );
-        // Check if actual is a named constant (parameter).
-        let is_parameter = if let Some(name) = extract_base_name(actual) {
-            ctx.lookup(&name)
-                .map(|s| s.attrs.parameter)
-                .unwrap_or(false)
-        } else {
-            false
-        };
+enum ExplicitInterfaceResolution {
+    None,
+    Resolved(ExplicitProcedureInterface),
+    Invalid(String),
+}
 
-        if is_literal || is_parameter {
-            // We can't tell without the callee's interface whether this arg is
-            // intent(out/inout). But if the callee IS known and has dummy arg info,
-            // we could check. For now, this infrastructure is in place for when
-            // we have full interface resolution.
-            // Full check deferred until interfaces are tracked in symbol table.
+struct ExplicitDummyArg {
+    name: String,
+    type_info: Option<TypeInfo>,
+    intent: Option<Intent>,
+    optional: bool,
+    allocatable: bool,
+    pointer: bool,
+    procedure: bool,
+    rank: usize,
+    assumed_rank: bool,
+    allows_sequence_association: bool,
+}
+
+struct ExplicitProcedureInterface {
+    name: String,
+    declared_scope: ScopeId,
+    elemental: bool,
+    dummies: Vec<ExplicitDummyArg>,
+}
+
+fn procedure_scope_kind_matches(scope: &Scope, expected_kind: DirectProcedureKind) -> bool {
+    matches!(
+        (&scope.kind, expected_kind),
+        (ScopeKind::Function(_), DirectProcedureKind::Function)
+            | (ScopeKind::Subroutine(_), DirectProcedureKind::Subroutine)
+    )
+}
+
+fn build_explicit_procedure_interface(
+    ctx: &Ctx<'_>,
+    call_name: &str,
+    symbol: &Symbol,
+    procedure_scope: &Scope,
+) -> Option<ExplicitProcedureInterface> {
+    let mut dummies = Vec::with_capacity(procedure_scope.arg_order.len());
+    for dummy_name in &procedure_scope.arg_order {
+        let dummy = procedure_scope
+            .symbols
+            .get(&dummy_name.to_ascii_lowercase())?;
+        let assumed_rank = dummy
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank));
+        let allows_sequence_association = !dummy.attrs.array_spec.is_empty()
+            && dummy.attrs.array_spec.iter().all(|spec| {
+                matches!(
+                    spec,
+                    crate::ast::decl::ArraySpec::Explicit { .. }
+                        | crate::ast::decl::ArraySpec::AssumedSize { .. }
+                )
+            });
+        dummies.push(ExplicitDummyArg {
+            name: dummy.name.clone(),
+            type_info: dummy.type_info.clone(),
+            intent: dummy.attrs.intent,
+            optional: dummy.attrs.optional,
+            allocatable: dummy.attrs.allocatable,
+            pointer: dummy.attrs.pointer,
+            procedure: dummy.attrs.external || dummy.attrs.procedure_iface.is_some(),
+            rank: dummy.attrs.array_spec.len(),
+            assumed_rank,
+            allows_sequence_association,
+        });
+    }
+
+    let declared_scope = ctx
+        .type_layouts
+        .filter(|layouts| layouts.scope_path(procedure_scope.id).is_some())
+        .map_or(symbol.scope, |_| procedure_scope.id);
+
+    Some(ExplicitProcedureInterface {
+        name: call_name.to_string(),
+        declared_scope,
+        elemental: symbol.attrs.elemental,
+        dummies,
+    })
+}
+
+fn resolve_generic_procedure_interface(
+    ctx: &Ctx<'_>,
+    name: &str,
+    args: &[Argument],
+    expected_kind: DirectProcedureKind,
+    interfaces: &[&Symbol],
+) -> ExplicitInterfaceResolution {
+    let mut candidates = Vec::new();
+    let mut seen_scopes = HashSet::new();
+    for interface in interfaces {
+        for candidate_name in &interface.arg_names {
+            let owner_scope = interface_specific_owner_scope(ctx, interface, candidate_name);
+            let Some(scope) = assignment_candidate_scope(ctx, candidate_name, owner_scope) else {
+                continue;
+            };
+            if !procedure_scope_kind_matches(scope, expected_kind) || !seen_scopes.insert(scope.id)
+            {
+                continue;
+            }
+            let Some(symbol) = candidate_symbol(ctx, candidate_name, owner_scope, scope) else {
+                continue;
+            };
+            candidates.push((scope, symbol));
         }
     }
-    let _ = callee_name;
-    let _ = span;
+
+    let matches: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|(scope, symbol)| call_candidate_matches(ctx, scope, symbol, args, None))
+        .collect();
+    let [(scope, symbol)] = matches.as_slice() else {
+        return ExplicitInterfaceResolution::None;
+    };
+    build_explicit_procedure_interface(ctx, name, symbol, scope).map_or(
+        ExplicitInterfaceResolution::None,
+        ExplicitInterfaceResolution::Resolved,
+    )
+}
+
+fn direct_procedure_interface(
+    ctx: &Ctx<'_>,
+    callee: &SpannedExpr,
+    args: &[Argument],
+    expected_kind: DirectProcedureKind,
+) -> ExplicitInterfaceResolution {
+    let Expr::Name { name } = &callee.node else {
+        return ExplicitInterfaceResolution::None;
+    };
+    let interfaces = ctx.lookup_lexical_named_interfaces(name);
+    if !interfaces.is_empty() {
+        return resolve_generic_procedure_interface(ctx, name, args, expected_kind, &interfaces);
+    }
+
+    let Some(symbol) = ctx.lookup_lexical(name) else {
+        return ExplicitInterfaceResolution::None;
+    };
+    if let Some(interface_name) = symbol.attrs.procedure_iface.as_deref() {
+        let interface_symbol = ctx
+            .st
+            .lookup_in(symbol.scope, interface_name)
+            .or_else(|| ctx.lookup_lexical(interface_name));
+        let Some(interface_symbol) = interface_symbol else {
+            return ExplicitInterfaceResolution::Invalid(format!(
+                "explicit interface '{}' for procedure '{}' is unavailable",
+                interface_name, name
+            ));
+        };
+        let Some(procedure_scope) =
+            assignment_candidate_scope(ctx, &interface_symbol.name, interface_symbol.scope)
+        else {
+            return ExplicitInterfaceResolution::Invalid(format!(
+                "explicit interface '{}' for procedure '{}' has no procedure signature",
+                interface_name, name
+            ));
+        };
+        if !procedure_scope_kind_matches(procedure_scope, expected_kind) {
+            let expected = match expected_kind {
+                DirectProcedureKind::Function => "function",
+                DirectProcedureKind::Subroutine => "subroutine",
+            };
+            return ExplicitInterfaceResolution::Invalid(format!(
+                "procedure '{}' does not have a {} interface",
+                name, expected
+            ));
+        }
+        return build_explicit_procedure_interface(ctx, name, interface_symbol, procedure_scope)
+            .map_or(
+                ExplicitInterfaceResolution::None,
+                ExplicitInterfaceResolution::Resolved,
+            );
+    }
+
+    let kind_matches = matches!(
+        (&symbol.kind, expected_kind),
+        (SymbolKind::Function, DirectProcedureKind::Function)
+            | (SymbolKind::Subroutine, DirectProcedureKind::Subroutine)
+    );
+    if !kind_matches || symbol.attrs.intrinsic {
+        return ExplicitInterfaceResolution::None;
+    }
+
+    let Some(procedure_scope) = assignment_candidate_scope(ctx, &symbol.name, symbol.scope) else {
+        return ExplicitInterfaceResolution::None;
+    };
+    let interface_parent = procedure_scope
+        .parent
+        .is_some_and(|parent| matches!(ctx.st.scope(parent).kind, ScopeKind::Interface));
+    if matches!(ctx.st.scope(symbol.scope).kind, ScopeKind::Global) && !interface_parent {
+        // A separately defined external procedure still has an implicit
+        // interface unless the caller declared an interface body for it.
+        return ExplicitInterfaceResolution::None;
+    }
+
+    build_explicit_procedure_interface(ctx, name, symbol, procedure_scope).map_or(
+        ExplicitInterfaceResolution::None,
+        ExplicitInterfaceResolution::Resolved,
+    )
+}
+
+fn argument_span(arg: &Argument, fallback: Span) -> Span {
+    match &arg.value {
+        SectionSubscript::Element(expr) => expr.span,
+        SectionSubscript::Range { start, end, stride } => start
+            .as_ref()
+            .map(|expr| expr.span)
+            .or_else(|| end.as_ref().map(|expr| expr.span))
+            .or_else(|| stride.as_ref().map(|expr| expr.span))
+            .unwrap_or(fallback),
+    }
+}
+
+fn is_array_element_designator(ctx: &Ctx<'_>, actual: &SpannedExpr) -> bool {
+    let Expr::FunctionCall { callee, args } = &actual.node else {
+        return false;
+    };
+    args.iter()
+        .all(|arg| matches!(arg.value, SectionSubscript::Element(_)))
+        && validation_expr_rank(ctx, callee).is_some_and(|rank| rank > 0)
+}
+
+fn named_actual_is_definable(
+    ctx: &Ctx<'_>,
+    name: &str,
+    path_has_pointer: bool,
+    defines_association: bool,
+) -> Option<bool> {
+    if ctx.is_associate_name(name) {
+        return None;
+    }
+    if let Some(binding) = ctx.block_binding_attrs(name) {
+        let defines_pointer_target = !defines_association && (path_has_pointer || binding.pointer);
+        return Some(!binding.parameter && (!binding.intent_in || defines_pointer_target));
+    }
+    let symbol = ctx.lookup_lexical(name)?;
+    if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+        return Some(false);
+    }
+    Some(
+        !symbol.attrs.parameter
+            && (!matches!(symbol.attrs.intent, Some(Intent::In))
+                || (!defines_association && (path_has_pointer || symbol.attrs.pointer))),
+    )
+}
+
+fn actual_is_definable(
+    ctx: &Ctx<'_>,
+    actual: &SpannedExpr,
+    defines_association: bool,
+) -> Option<bool> {
+    match &actual.node {
+        Expr::Name { name } => named_actual_is_definable(ctx, name, false, defines_association),
+        Expr::ComponentAccess { .. } => {
+            let base = extract_base_name(actual)?;
+            let through_pointer = leaf_field_layout(ctx, actual)
+                .is_some_and(|leaf| leaf.field.pointer || leaf.ancestor_is_pointer);
+            named_actual_is_definable(ctx, &base, through_pointer, defines_association)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let has_vector_subscript = args.iter().any(|arg| match &arg.value {
+                SectionSubscript::Element(index) => {
+                    validation_expr_rank(ctx, index).is_some_and(|rank| rank > 0)
+                }
+                SectionSubscript::Range { .. } => false,
+            });
+            match &callee.node {
+                Expr::Name { name } => {
+                    let symbol = ctx.lookup_lexical(name)?;
+                    match symbol.kind {
+                        SymbolKind::Variable | SymbolKind::Parameter => {
+                            if has_vector_subscript {
+                                return Some(false);
+                            }
+                            named_actual_is_definable(ctx, name, false, defines_association)
+                        }
+                        SymbolKind::Function => Some(symbol.attrs.pointer && !defines_association),
+                        _ => Some(false),
+                    }
+                }
+                Expr::ComponentAccess { .. } => {
+                    let leaf = leaf_field_layout(ctx, callee)?;
+                    if leaf.field.procedure_pointer {
+                        return None;
+                    }
+                    if has_vector_subscript {
+                        return Some(false);
+                    }
+                    let base = extract_base_name(callee)?;
+                    named_actual_is_definable(
+                        ctx,
+                        &base,
+                        leaf.field.pointer || leaf.ancestor_is_pointer,
+                        defines_association,
+                    )
+                }
+                _ => Some(false),
+            }
+        }
+        Expr::NilArgument => None,
+        Expr::ConditionalExpr {
+            then_val, else_val, ..
+        } => {
+            let then_definable = actual_is_definable(ctx, then_val, defines_association);
+            let else_definable = actual_is_definable(ctx, else_val, defines_association);
+            match (then_definable, else_definable) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (None, None) => None,
+            }
+        }
+        Expr::ParenExpr { .. }
+        | Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::ArrayConstructor { .. } => Some(false),
+    }
+}
+
+fn validate_explicit_actual(
+    ctx: &mut Ctx,
+    interface: &ExplicitProcedureInterface,
+    dummy: &ExplicitDummyArg,
+    actual: &SpannedExpr,
+    elemental_rank: &mut Option<usize>,
+) {
+    if expr_has_nil_arm(actual) && !dummy.optional {
+        ctx.error(
+            actual.span,
+            format!(
+                "dummy argument '{}' is not OPTIONAL (F2023 C1525)",
+                dummy.name
+            ),
+        );
+    }
+    if dummy.procedure || matches!(actual.node, Expr::NilArgument) {
+        return;
+    }
+
+    if let (Some(dummy_type), Some(actual_type)) = (
+        dummy.type_info.as_ref(),
+        validation_expr_type_info(ctx, actual).as_ref(),
+    ) {
+        match (dummy_type, actual_type) {
+            (TypeInfo::Enumeration(expected), TypeInfo::Enumeration(actual_name)) => {
+                if !expected.eq_ignore_ascii_case(actual_name) {
+                    ctx.error(
+                        actual.span,
+                        format!(
+                            "actual argument of enumeration type '{}' is not compatible with dummy '{}' of enumeration type '{}'",
+                            actual_name, dummy.name, expected
+                        ),
+                    );
+                }
+            }
+            (TypeInfo::Enumeration(expected), _) => {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "dummy argument '{}' has enumeration type '{}'; pass a value of that type (constructor '{}(int-expr)')",
+                        dummy.name, expected, expected
+                    ),
+                );
+            }
+            (TypeInfo::ClassStar | TypeInfo::TypeStar, TypeInfo::Enumeration(_)) => {}
+            (_, TypeInfo::Enumeration(actual_name)) => {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "actual argument of enumeration type '{}' is not compatible with non-enumeration dummy '{}'; convert with INT(v)",
+                        actual_name, dummy.name
+                    ),
+                );
+            }
+            _ if !generic_dummy_type_matches(
+                ctx,
+                interface.declared_scope,
+                dummy_type,
+                actual_type,
+            ) =>
+            {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "argument '{}' type mismatch: expected {}, got {}",
+                        dummy.name,
+                        intrinsic_assignment_type_name(dummy_type),
+                        intrinsic_assignment_type_name(actual_type)
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if matches!(dummy.intent, Some(Intent::Out | Intent::InOut))
+        && matches!(
+            actual_is_definable(ctx, actual, dummy.pointer || dummy.allocatable),
+            Some(false)
+        )
+    {
+        ctx.error(
+            actual.span,
+            format!(
+                "actual argument for INTENT(OUT/INOUT) dummy '{}' must be a definable variable",
+                dummy.name
+            ),
+        );
+    }
+
+    let Some(actual_rank) = validation_expr_rank(ctx, actual) else {
+        return;
+    };
+    if interface.elemental && dummy.rank == 0 {
+        if actual_rank > 0 {
+            if let Some(expected_rank) = *elemental_rank {
+                if actual_rank != expected_rank {
+                    ctx.error(
+                        actual.span,
+                        format!(
+                            "elemental procedure '{}' has nonconforming rank-{expected_rank} and rank-{actual_rank} actual arguments",
+                            interface.name
+                        ),
+                    );
+                }
+            } else {
+                *elemental_rank = Some(actual_rank);
+            }
+        }
+        return;
+    }
+    if dummy.assumed_rank || actual_rank == dummy.rank {
+        return;
+    }
+    if dummy.allows_sequence_association {
+        let character_storage = matches!(
+            (&dummy.type_info, validation_expr_type_info(ctx, actual)),
+            (
+                Some(TypeInfo::Character { .. }),
+                Some(TypeInfo::Character { .. })
+            )
+        );
+        if actual_rank > 0 || is_array_element_designator(ctx, actual) || character_storage {
+            return;
+        }
+    }
+    ctx.error(
+        actual.span,
+        format!(
+            "argument '{}' rank mismatch: expected rank {}, got rank {}",
+            dummy.name, dummy.rank, actual_rank
+        ),
+    );
+}
+
+fn validate_explicit_interface_call(
+    ctx: &mut Ctx<'_>,
+    callee: &SpannedExpr,
+    args: &[Argument],
+    expected_kind: DirectProcedureKind,
+) {
+    let interface = match direct_procedure_interface(ctx, callee, args, expected_kind) {
+        ExplicitInterfaceResolution::None => return,
+        ExplicitInterfaceResolution::Resolved(interface) => interface,
+        ExplicitInterfaceResolution::Invalid(message) => {
+            ctx.error(callee.span, message);
+            return;
+        }
+    };
+    let mut matched = vec![false; interface.dummies.len()];
+    let mut position = 0usize;
+    let mut seen_keyword = false;
+    let mut reported_too_many = false;
+    let mut elemental_rank = None;
+
+    for arg in args {
+        let span = argument_span(arg, callee.span);
+        let dummy_index = if let Some(keyword) = arg.keyword.as_deref() {
+            seen_keyword = true;
+            let Some(index) = interface
+                .dummies
+                .iter()
+                .position(|dummy| dummy.name.eq_ignore_ascii_case(keyword))
+            else {
+                ctx.error(
+                    span,
+                    format!(
+                        "unknown keyword argument '{}' in call to '{}'",
+                        keyword, interface.name
+                    ),
+                );
+                continue;
+            };
+            index
+        } else {
+            if seen_keyword {
+                ctx.error(
+                    span,
+                    format!(
+                        "positional argument follows a keyword argument in call to '{}'",
+                        interface.name
+                    ),
+                );
+                continue;
+            }
+            while position < matched.len() && matched[position] {
+                position += 1;
+            }
+            if position == matched.len() {
+                if !reported_too_many {
+                    ctx.error(
+                        span,
+                        format!(
+                            "too many actual arguments in call to '{}' (expected at most {})",
+                            interface.name,
+                            interface.dummies.len()
+                        ),
+                    );
+                    reported_too_many = true;
+                }
+                continue;
+            }
+            let index = position;
+            position += 1;
+            index
+        };
+
+        if matched[dummy_index] {
+            ctx.error(
+                span,
+                format!(
+                    "duplicate actual argument for dummy '{}' in call to '{}'",
+                    interface.dummies[dummy_index].name, interface.name
+                ),
+            );
+            continue;
+        }
+        matched[dummy_index] = true;
+        if let SectionSubscript::Element(actual) = &arg.value {
+            validate_explicit_actual(
+                ctx,
+                &interface,
+                &interface.dummies[dummy_index],
+                actual,
+                &mut elemental_rank,
+            );
+        }
+    }
+
+    for (supplied, dummy) in matched.iter().zip(&interface.dummies) {
+        if !supplied && !dummy.optional {
+            ctx.error(
+                callee.span,
+                format!(
+                    "missing required argument '{}' in call to '{}'",
+                    dummy.name, interface.name
+                ),
+            );
+        }
+    }
 }
 
 /// Register a label as defined.
@@ -5855,16 +7735,48 @@ fn validate_associate(
     ctx.associate_frames.pop();
 }
 
-fn block_binding_frame(decls: &[SpannedDecl]) -> HashMap<String, BlockBindingAttrs> {
+fn block_binding_frame(
+    ctx: &Ctx<'_>,
+    block_span: Span,
+    decls: &[SpannedDecl],
+) -> HashMap<String, BlockBindingAttrs> {
     let mut frame = HashMap::new();
+    let scope_id = ctx
+        .st
+        .statement_block_scope(block_span)
+        .unwrap_or(ctx.scope_id);
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl {
-                attrs, entities, ..
+                type_spec,
+                attrs,
+                entities,
             } => {
                 let binding_attrs = block_attrs_from_decl(attrs.as_slice());
+                let type_info = Some(
+                    crate::sema::resolve::type_resolution::type_spec_to_info_in_scope(
+                        type_spec, ctx.st, scope_id,
+                    ),
+                );
+                let dimension_rank = attrs.iter().find_map(|attr| match attr {
+                    Attribute::Dimension(dims) => Some(dims.len()),
+                    _ => None,
+                });
                 for entity in entities {
-                    frame.insert(entity.name.to_lowercase(), binding_attrs);
+                    let rank = entity
+                        .array_spec
+                        .as_ref()
+                        .map(Vec::len)
+                        .or(dimension_rank)
+                        .unwrap_or(0);
+                    frame.insert(
+                        entity.name.to_lowercase(),
+                        BlockBindingAttrs {
+                            type_info: type_info.clone(),
+                            rank: Some(rank),
+                            ..binding_attrs.clone()
+                        },
+                    );
                 }
             }
             Decl::ParameterStmt { pairs } => {
@@ -5873,6 +7785,7 @@ fn block_binding_frame(decls: &[SpannedDecl]) -> HashMap<String, BlockBindingAtt
                         name.to_lowercase(),
                         BlockBindingAttrs {
                             parameter: true,
+                            rank: Some(0),
                             ..BlockBindingAttrs::default()
                         },
                     );
@@ -5907,19 +7820,15 @@ pub(super) fn extract_base_name(expr: &crate::ast::expr::SpannedExpr) -> Option<
     }
 }
 
-// ---- IMPLICIT NONE enforcement ----
+// ---- Implicit typing enforcement ----
 
-/// Check that all variable references in a statement list are declared
-/// when IMPLICIT NONE is active in the current scope.
+/// Check that every variable reference is declared or covered by the
+/// current scope's implicit typing map.
 fn check_implicit_none(
     ctx: &mut Ctx,
     stmts: &[SpannedStmt],
     decls: &[crate::ast::decl::SpannedDecl],
 ) {
-    if !ctx.st.is_implicit_none(ctx.scope_id) {
-        return;
-    }
-
     // Collect declared names in this scope (from declarations).
     let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
     extend_declared_names_from_decls(&mut declared, decls);
@@ -5946,7 +7855,12 @@ fn check_implicit_none(
     let mut undeclared = Vec::new();
     let mut resolution_cache: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    let outer_implicit_letters: std::collections::HashSet<char> = std::collections::HashSet::new();
+    let scope_rules = &ctx.st.scopes[ctx.scope_id].implicit_rules;
+    let outer_implicit_letters: std::collections::HashSet<char> = if scope_rules.none_type {
+        std::collections::HashSet::new()
+    } else {
+        scope_rules.rules.keys().copied().collect()
+    };
     for stmt in stmts {
         walk_stmt_for_undeclared(
             ctx.st,
@@ -5964,12 +7878,14 @@ fn check_implicit_none(
     for (name, span) in &undeclared {
         let key = name.to_lowercase();
         if reported.insert(key) {
+            let reason = if ctx.st.is_implicit_none(ctx.scope_id) {
+                "IMPLICIT NONE is active"
+            } else {
+                "no implicit type is available"
+            };
             ctx.error(
                 *span,
-                format!(
-                    "variable '{}' used but not declared (IMPLICIT NONE is active)",
-                    name
-                ),
+                format!("variable '{}' used but not declared ({reason})", name),
             );
         }
     }
@@ -6553,6 +8469,155 @@ fn intrinsic_not_implemented(name: &str) -> bool {
     matches!(name, "iall" | "iany" | "iparity" | "parity")
 }
 
+#[derive(Clone, Copy)]
+enum IntrinsicArgumentType {
+    Integer,
+    Real,
+}
+
+impl IntrinsicArgumentType {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+        }
+    }
+
+    fn matches(self, info: &TypeInfo) -> bool {
+        matches!(
+            (self, info),
+            (Self::Integer, TypeInfo::Integer { .. }) | (Self::Real, TypeInfo::Real { .. })
+        )
+    }
+}
+
+fn require_intrinsic_argument_type(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    position: usize,
+    keyword: &str,
+    expected: IntrinsicArgumentType,
+) {
+    let Some(actual) = call_rank_argument_expr(args, position, &[keyword])
+        .and_then(|expr| validation_expr_type_info(ctx, expr))
+    else {
+        return;
+    };
+    if !expected.matches(&actual) {
+        ctx.error(
+            span,
+            format!(
+                "intrinsic '{intrinsic}' argument type mismatch: {} must be {}",
+                keyword.to_ascii_uppercase(),
+                expected.name()
+            ),
+        );
+    }
+}
+
+fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
+    let key = name.to_ascii_lowercase();
+    if !is_intrinsic_name(&key) || intrinsic_name_is_shadowed(ctx, &key) {
+        return;
+    }
+
+    validate_elemental_intrinsic_rank_conformance(ctx, span, &key, args);
+
+    match key.as_str() {
+        "fraction" | "exponent" => {
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                0,
+                "x",
+                IntrinsicArgumentType::Real,
+            );
+        }
+        "scale" => {
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                0,
+                "x",
+                IntrinsicArgumentType::Real,
+            );
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                1,
+                "i",
+                IntrinsicArgumentType::Integer,
+            );
+        }
+        "char" | "achar" => {
+            let Some(kind_expr) = call_rank_argument_expr(args, 1, &["kind"]) else {
+                return;
+            };
+            let Ok(Some(kind)) = eval_const_int_expr_checked(ctx, kind_expr) else {
+                return;
+            };
+            if kind.value != 1 {
+                ctx.error(
+                    span,
+                    format!(
+                        "CHARACTER(kind={}) data is not supported: the backend and runtime support only CHARACTER(kind=1)",
+                        kind.value
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn intrinsic_name_is_shadowed(ctx: &Ctx<'_>, name: &str) -> bool {
+    ctx.lookup_lexical(name)
+        .is_some_and(|symbol| !symbol.attrs.intrinsic)
+        || !ctx.lookup_lexical_named_interfaces(name).is_empty()
+}
+
+fn validate_elemental_intrinsic_rank_conformance(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    name: &str,
+    args: &[Argument],
+) {
+    if !crate::sema::types::is_elemental_intrinsic(name) {
+        return;
+    }
+
+    let mut expected_rank = None;
+    for actual in args.iter().filter_map(|arg| match &arg.value {
+        SectionSubscript::Element(actual) => Some(actual),
+        SectionSubscript::Range { .. } => None,
+    }) {
+        let Some(rank) = validation_expr_rank(ctx, actual).filter(|rank| *rank > 0) else {
+            continue;
+        };
+        if let Some(expected) = expected_rank {
+            if rank != expected {
+                ctx.error(
+                    span,
+                    format!(
+                        "elemental intrinsic '{name}' has nonconforming rank-{expected} and rank-{rank} arguments"
+                    ),
+                );
+                return;
+            }
+        } else {
+            expected_rank = Some(rank);
+        }
+    }
+}
+
 /// Reject a reference to an intrinsic with the wrong form (subroutine
 /// in function position or vice versa) or an argument count outside
 /// the standard's bounds (`atan2(1.0)` used to compile silently and
@@ -6567,7 +8632,7 @@ pub(super) fn check_intrinsic_call_arity(
     is_call: bool,
 ) {
     let key = name.to_lowercase();
-    if ctx.lookup(&key).is_some() || !is_intrinsic_name(&key) {
+    if intrinsic_name_is_shadowed(ctx, &key) || !is_intrinsic_name(&key) {
         return;
     }
     let is_sub = intrinsic_is_subroutine(&key);
@@ -6713,6 +8778,1753 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    #[test]
+    fn rejects_direct_subroutine_argument_type_kind_and_rank_mismatches() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(value, values)
+    integer(8), intent(in) :: value
+    real(4), intent(in) :: values(:)
+  end subroutine accept
+
+  subroutine invoke()
+    logical(1) :: flag
+    integer(4) :: narrow
+    real(4) :: scalar, values(2)
+    call accept(flag, values)
+    call accept(narrow, values)
+    call accept(1_8, scalar)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got INTEGER(4)")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'values' rank mismatch")
+                    && err.contains("expected rank 1, got rank 0")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_direct_function_argument_type_mismatch() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  integer function classify(value) result(code)
+    integer(8), intent(in) :: value
+    code = int(value)
+  end function classify
+
+  subroutine invoke()
+    logical(1) :: flag
+    integer :: code
+    code = classify(flag)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_direct_call_argument_association_errors() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(required, extra)
+    integer, intent(in) :: required
+    integer, intent(in), optional :: extra
+  end subroutine accept
+
+  subroutine invoke()
+    call accept(extra=1)
+    call accept(required=1, 2)
+    call accept(1, required=2)
+    call accept(unknown=1, required=2)
+    call accept(1, 2, 3)
+    call accept(1)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("missing required argument 'required'")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("positional argument follows a keyword argument")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("duplicate actual argument for dummy 'required'")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("unknown keyword argument 'unknown'")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("too many actual arguments")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn direct_call_validation_uses_the_resolved_owner_scope() {
+        let errs = errors_from(
+            "\
+module integer_api
+  implicit none
+contains
+  subroutine accept(value)
+    integer(8), intent(in) :: value
+  end subroutine accept
+end module integer_api
+
+module logical_api
+  implicit none
+contains
+  subroutine accept(value)
+    logical(1), intent(in) :: value
+  end subroutine accept
+end module logical_api
+
+program caller
+  use integer_api, only: accept
+  implicit none
+  logical(1) :: flag
+  call accept(flag)
+end program caller
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_dummy_types_from_an_explicit_interface_body() {
+        let errs = errors_from(
+            "\
+program caller
+  implicit none
+  interface
+    subroutine accept(value)
+      integer(8), intent(in) :: value
+    end subroutine accept
+  end interface
+  logical(1) :: flag
+  call accept(flag)
+end program caller
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("argument 'value' type mismatch")
+                    && err.contains("expected INTEGER(8), got LOGICAL(1)")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_separately_defined_externals_as_implicit_interfaces() {
+        let errs = errors_from(
+            "\
+program caller
+  implicit none
+  external :: accept
+  logical(1) :: flag
+  call accept(flag)
+end program caller
+
+subroutine accept(value)
+  integer(8), intent(in) :: value
+end subroutine accept
+",
+        );
+
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("argument 'value' type mismatch")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_calls_through_explicit_procedure_entities() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  abstract interface
+    subroutine action_interface(value)
+      integer(8), intent(in) :: value
+    end subroutine action_interface
+    integer function transform_interface(value)
+      integer(8), intent(in) :: value
+    end function transform_interface
+  end interface
+contains
+  subroutine invoke(action)
+    procedure(action_interface) :: action
+    procedure(action_interface), pointer :: action_pointer
+    procedure(transform_interface), pointer :: transform_pointer
+    logical(1) :: flag
+    integer :: result
+    call action(flag)
+    call action_pointer(flag)
+    result = transform_pointer(flag)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| {
+                    err.contains("argument 'value' type mismatch")
+                        && err.contains("expected INTEGER(8), got LOGICAL(1)")
+                })
+                .count(),
+            3,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_unlimited_polymorphic_assumed_rank_actuals() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(anything)
+    class(*), intent(in), dimension(..) :: anything
+  end subroutine accept
+
+  subroutine invoke()
+    integer :: matrix(2, 2)
+    call accept(matrix)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_requested_intrinsic_kinds_and_complex_literal_kinds() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine accept(i, r, z)
+    integer(8), intent(in) :: i
+    real(8), intent(in) :: r
+    complex(8), intent(in) :: z
+  end subroutine accept
+
+  subroutine invoke()
+    call accept(int(1, kind=8), real(1, 8), cmplx(1.0, 2.0, kind=8))
+    call accept(1_8, 2.0_8, (1.0_8, 2.0_8))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_sequence_association_rank_remapping() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  real function outer(values) result(total)
+    real, intent(in) :: values(:, :, :)
+    total = flatten(values, size(values))
+  contains
+    real function flatten(storage, count)
+      integer, intent(in) :: count
+      real, intent(in) :: storage(count)
+      flatten = sum(storage)
+    end function flatten
+  end function outer
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_character_storage_sequence_association() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  integer function count_chars(storage) result(count)
+    character(len=1), intent(in) :: storage(*)
+    count = 4
+  end function count_chars
+
+  subroutine invoke()
+    character(len=4) :: text
+    integer :: count
+    count = count_chars(text)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn same_name_generic_facet_is_not_validated_as_a_direct_specific() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  interface pick
+    module procedure pick
+    module procedure pick_logical
+  end interface pick
+contains
+  integer function pick(value)
+    integer, intent(in) :: value
+    pick = value
+  end function pick
+
+  logical function pick_logical(value)
+    logical, intent(in) :: value
+    pick_logical = value
+  end function pick_logical
+
+  subroutine invoke()
+    logical :: selected
+    selected = pick(.true.)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn validates_conditional_nil_against_selected_generic_specifics() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  interface required_generic
+    module procedure required_value
+  end interface required_generic
+  interface optional_generic
+    module procedure optional_value
+  end interface optional_generic
+contains
+  integer function required_value(value)
+    integer, intent(in) :: value
+    required_value = value
+  end function required_value
+
+  integer function optional_value(value)
+    integer, intent(in), optional :: value
+    optional_value = 0
+    if (present(value)) optional_value = value
+  end function optional_value
+
+  subroutine invoke()
+    integer :: result
+    result = required_generic((.true. ? 7 : .nil.))
+    result = optional_generic((.true. ? 7 : .nil.))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter().filter(|err| err.contains("C1525")).count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nondefinable_out_and_inout_actuals() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine fill(output, state)
+    integer, intent(out) :: output
+    integer, intent(inout) :: state
+    output = state
+  end subroutine fill
+
+  integer function make_value()
+    make_value = 1
+  end function make_value
+
+  subroutine invoke()
+    integer, parameter :: constant = 1
+    integer :: value, values(2), indices(1)
+    indices = [1]
+    call fill(1, value)
+    call fill(value + 1, value)
+    call fill(constant, value)
+    call fill(make_value(), value)
+    call fill(value, values(indices))
+    call fill(value, (value))
+    call fill(values(1), values(2))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            6,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_conditional_out_actual_arms_as_associations() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine fill(output)
+    integer, intent(out) :: output
+    output = 1
+  end subroutine fill
+
+  subroutine invoke(select_left)
+    logical, intent(in) :: select_left
+    integer :: left, right
+    call fill((select_left ? left : right))
+    call fill((select_left ? left : right + 1))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_pointer_mediated_definable_actuals() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  integer, target :: storage
+  type :: inner_t
+    integer :: value
+  end type inner_t
+  type :: outer_t
+    type(inner_t), pointer :: inner
+  end type outer_t
+contains
+  subroutine set_value(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine set_value
+
+  subroutine update_target(object)
+    type(outer_t), intent(in) :: object
+    call set_value(object%inner%value)
+  end subroutine update_target
+
+  subroutine update_pointer_target(value)
+    integer, pointer, intent(in) :: value
+    call set_value(value)
+  end subroutine update_pointer_target
+
+  function get_storage() result(pointer_result)
+    integer, pointer :: pointer_result
+    pointer_result => storage
+  end function get_storage
+
+  subroutine invoke()
+    call set_value(get_storage())
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("must be a definable variable")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_intent_in_pointers_for_pointer_association_dummies() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  type :: holder_t
+    integer, pointer :: value
+  end type holder_t
+contains
+  subroutine reset_pointer(value)
+    integer, pointer, intent(out) :: value
+    nullify(value)
+  end subroutine reset_pointer
+
+  subroutine invoke(actual, object)
+    integer, pointer, intent(in) :: actual
+    type(holder_t), intent(in) :: object
+    call reset_pointer(actual)
+    call reset_pointer(object%value)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_intent_in_allocatables_for_allocatable_association_dummies() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+  type :: holder_t
+    integer, allocatable :: values(:)
+  end type holder_t
+contains
+  subroutine reset_allocatable(values)
+    integer, allocatable, intent(out) :: values(:)
+  end subroutine reset_allocatable
+
+  subroutine invoke(values, object)
+    integer, allocatable, intent(in) :: values(:)
+    type(holder_t), intent(in) :: object
+    call reset_allocatable(values)
+    call reset_allocatable(object%values)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_intrinsic_assignment_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: left_t
+    integer :: value
+  end type
+  type :: right_t
+    integer :: value
+  end type
+  integer :: number
+  logical :: flag
+  character(len=4) :: text
+  type(left_t) :: left
+  type(right_t) :: right
+  number = .true.
+  flag = 1
+  text = 1
+  left = right
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            4,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn procedure_dummy_call_uses_later_interface_result_type() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+contains
+  integer function wrapper(f) result(r)
+    procedure(iface) :: f
+    r = f(0)
+  end function wrapper
+
+  integer function iface(x)
+    integer, intent(in) :: x
+    iface = x
+  end function iface
+end module m
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_intrinsic_assignment_rank_mismatches() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: scalar
+  integer :: vector(2)
+  integer :: matrix(2, 2)
+  vector = scalar
+  scalar = vector
+  matrix = vector
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_compatible_intrinsic_assignment_conversions() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: item_t
+    integer :: value
+  end type
+  integer(8) :: number
+  real(4) :: measure
+  complex(8) :: pair
+  logical(1) :: small_flag
+  logical(4) :: flag
+  character(len=2) :: short_text
+  character(len=8) :: long_text
+  type(item_t) :: left, right
+  number = measure
+  measure = number
+  pair = measure
+  small_flag = flag
+  short_text = long_text
+  left = right
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_defined_assignment_for_incompatible_intrinsic_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface assignment(=)
+    subroutine assign_flag(lhs, rhs)
+      integer, intent(out) :: lhs
+      logical, intent(in) :: rhs
+    end subroutine
+  end interface
+  integer :: number
+  number = .true.
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("intrinsic assignment")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_defined_assignment_from_scalar_intrinsic_result() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: box_t
+    character(len=:), allocatable :: text
+  end type
+  interface assignment(=)
+    module procedure assign_box_text
+  end interface
+  interface trim
+    module procedure trim_box
+  end interface
+contains
+  function trim_box(value) result(output)
+    type(box_t), intent(in) :: value
+    type(box_t) :: output
+    output = trim(\" x \")
+    output = repeat(\"x\", 2)
+    output = new_line(\"x\")
+  end function trim_box
+
+  subroutine assign_box_text(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    character(len=*), intent(in) :: rhs
+    lhs%text = rhs
+  end subroutine assign_box_text
+end module m
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_defined_assignment_from_scalar_inquiry_results() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface assignment(=)
+    module procedure assign_box_integer
+  end interface
+contains
+  subroutine exercise(input, output)
+    real, intent(in) :: input
+    type(box_t), intent(out) :: output
+    output = selected_int_kind(9)
+    output = precision(input)
+    output = command_argument_count()
+  end subroutine exercise
+
+  subroutine assign_box_integer(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    integer, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine assign_box_integer
+end module m
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_type_bound_defined_assignment_for_mixed_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  contains
+    procedure :: assign_integer
+    generic :: assignment(=) => assign_integer
+  end type
+  type(box_t) :: box
+  box = 7
+contains
+  subroutine assign_integer(lhs, rhs)
+    class(box_t), intent(out) :: lhs
+    integer, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("intrinsic assignment")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_defined_assignment_with_unlimited_polymorphic_rhs() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface assignment(=)
+    subroutine assign_any(lhs, rhs)
+      import :: box_t
+      type(box_t), intent(out) :: lhs
+      class(*), intent(in) :: rhs
+    end subroutine
+  end interface
+  type(box_t) :: box
+  box = 7
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("intrinsic assignment")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_block_local_defined_assignment_interface() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  type(box_t) :: box
+  block
+    interface assignment(=)
+      procedure :: assign_integer
+    end interface
+    box = 7
+  end block
+contains
+  subroutine assign_integer(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    integer, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("intrinsic assignment")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn block_local_defined_assignment_is_not_visible_after_exit() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  type(box_t) :: box
+  block
+    interface assignment(=)
+      procedure :: assign_integer
+    end interface
+  end block
+  box = 7
+contains
+  subroutine assign_integer(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    integer, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn block_local_defined_assignment_restores_host_interface_after_exit() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface assignment(=)
+    procedure :: assign_logical
+  end interface
+  type(box_t) :: box
+  block
+    interface assignment(=)
+      procedure :: assign_integer
+    end interface
+    box = 7
+  end block
+  box = .true.
+  box = 7
+contains
+  subroutine assign_integer(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    integer, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine
+  subroutine assign_logical(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    logical, intent(in) :: rhs
+    lhs%value = merge(1, 0, rhs)
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_uses_block_imported_types_and_ranks() {
+        let errs = errors_from(
+            "\
+module imported_values
+  implicit none
+  logical :: value
+  integer :: values(2)
+end module
+program p
+  implicit none
+  integer :: value
+  integer :: values
+  block
+    use imported_values, only: value, values
+    logical :: flag
+    integer :: scalar
+    flag = value
+    scalar = values
+  end block
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("LOGICAL(4) to INTEGER(4)")),
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_block_and_component_assignments() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: holder_t
+    integer :: values(2)
+  end type
+  type(holder_t) :: holder
+  block
+    integer :: local
+    local = .true.
+  end block
+  holder%values(1) = .true.
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err
+                    .contains("intrinsic assignment cannot convert LOGICAL(4) to INTEGER(4)"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_character_component_substring_has_scalar_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: holder_t
+    character(8) :: text
+  end type
+  type(holder_t) :: holder
+  character :: first
+  first = holder%text(1:1)
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("intrinsic assignment rank mismatch")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_binary_expression_rank_mismatch() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: scalar
+  integer :: vector(2)
+  scalar = vector + 1
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_c_pointer_assignment_types() {
+        let errs = errors_from(
+            "\
+program p
+  use iso_c_binding, only: c_ptr, c_funptr, c_null_ptr, c_null_funptr, c_funloc
+  implicit none
+  type(c_ptr) :: data_pointer
+  type(c_funptr) :: procedure_pointer
+  data_pointer = c_null_ptr
+  procedure_pointer = c_null_funptr
+  procedure_pointer = c_funloc(callback)
+  data_pointer = procedure_pointer
+  procedure_pointer = data_pointer
+  data_pointer = .true.
+contains
+  subroutine callback() bind(c)
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            3,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn procedure_component_call_uses_interface_result_type_and_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  abstract interface
+    integer function get_value()
+    end function
+    function get_values() result(values)
+      integer :: values(2)
+    end function
+  end interface
+  type :: holder_t
+    procedure(get_value), pointer, nopass :: get
+    procedure(get_values), pointer, nopass :: get_many
+  end type
+  type(holder_t) :: holder
+  integer :: value
+  logical :: flag
+  value = holder%get()
+  flag = holder%get()
+  value = holder%get_many()
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn generic_function_call_uses_selected_result_type_and_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface pick
+    function make_values(value) result(values)
+      integer, intent(in) :: value
+      logical :: values(2)
+    end function
+  end interface
+  integer :: scalar
+  scalar = pick(1)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn type_bound_generic_call_uses_selected_result_type_and_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: picker_t
+  contains
+    procedure :: pick_integer
+    procedure :: pick_logical
+    generic :: pick => pick_integer, pick_logical
+  end type
+  type(picker_t) :: picker
+  integer :: scalar
+  scalar = picker%pick(.true.)
+contains
+  integer function pick_integer(self, value)
+    class(picker_t), intent(in) :: self
+    integer, intent(in) :: value
+    pick_integer = value
+  end function
+  function pick_logical(self, value) result(values)
+    class(picker_t), intent(in) :: self
+    logical, intent(in) :: value
+    logical :: values(2)
+    values = value
+  end function
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_elemental_function_call_rank_mismatches() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: scalar
+  integer :: values(2)
+  real :: real_scalar
+  real :: real_values(2)
+  scalar = abs(values)
+  scalar = twice(values)
+  scalar = cmplx(values)
+  real_scalar = gamma(real_values)
+  real_scalar = acosd(real_values)
+  scalar = ior(values, 1)
+  real_scalar = fraction(real_values)
+  scalar = exponent(real_values)
+  real_scalar = scale(real_values, 2)
+contains
+  elemental integer function twice(value)
+    integer, intent(in) :: value
+    twice = value * 2
+  end function
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            9,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_long_intrinsic_operator_chain_with_unrelated_defined_operator() {
+        let expression = (0..56).map(|_| "1").collect::<Vec<_>>().join("+");
+        let source = format!(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface operator(+)
+    function add_boxes(lhs, rhs) result(value)
+      import :: box_t
+      type(box_t), intent(in) :: lhs, rhs
+      type(box_t) :: value
+    end function
+  end interface
+  integer :: total
+  total = {expression}
+end program
+"
+        );
+
+        let errs = errors_from(&source);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn unrelated_defined_operator_does_not_hide_rank_mismatch() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface operator(+)
+    function add_boxes(lhs, rhs) result(value)
+      import :: box_t
+      type(box_t), intent(in) :: lhs, rhs
+      type(box_t) :: value
+    end function
+  end interface
+  integer :: scalar
+  integer :: values(2)
+  scalar = values + 1
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn matching_defined_operator_uses_declared_result_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface operator(.reduce.)
+    function reduce_values(lhs, rhs) result(value)
+      integer, intent(in) :: lhs(:), rhs(:)
+      integer :: value
+    end function
+  end interface
+  integer :: scalar
+  integer :: values(2)
+  scalar = values .reduce. values
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("intrinsic assignment rank mismatch")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn matching_defined_operator_uses_declared_result_type() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface operator(.combine.)
+    function combine_values(lhs, rhs) result(value)
+      integer, intent(in) :: lhs, rhs
+      real :: value
+    end function
+  end interface
+  integer :: number
+  logical :: flag
+  flag = number .combine. number
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn matching_defined_unary_operator_uses_declared_result_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface operator(.collapse.)
+    function collapse_values(values) result(value)
+      integer, intent(in) :: values(:)
+      integer :: value
+    end function
+  end interface
+  integer :: values(2)
+  integer :: scalar
+  scalar = .collapse. values
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("intrinsic assignment rank mismatch")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn defined_assignment_requires_matching_character_kind() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface assignment(=)
+    subroutine assign_wide(lhs, rhs)
+      character(kind=4), intent(out) :: lhs
+      integer, intent(in) :: rhs
+    end subroutine
+  end interface
+  character(kind=1) :: text
+  text = 1
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn typed_array_constructor_uses_local_named_kind() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer, parameter :: k = 8
+  type :: box_t
+    integer :: value
+  end type
+  interface assignment(=)
+    subroutine assign_values(lhs, rhs)
+      import :: box_t
+      type(box_t), intent(out) :: lhs
+      integer(8), intent(in) :: rhs(:)
+    end subroutine
+  end interface
+  type(box_t) :: box
+  box = [integer(kind=k) :: 1, 2]
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("intrinsic assignment")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nondefault_character_intrinsics_before_lowering() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  character(kind=4) :: text
+  text = char(65, kind=4)
+  text = achar(65, 4)
+  text = trim(text)
+  text = adjustl(text)
+  text = adjustr(text)
+  text = repeat(text, 2)
+  text = new_line(text)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("CHARACTER(kind=4) data is not supported")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_character_data_forms() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer, parameter :: wide = 4
+  character(kind=4) :: scalar
+  character(kind=wide), allocatable :: values(:)
+  character(kind=selected_char_kind('ISO_10646')) :: selected
+  character(kind=4), allocatable :: dynamic
+  type :: wrapper
+    character(kind=4) :: component
+  end type
+  print *, wide_'A'
+  print *, char(65, kind=4)
+  allocate(character(kind=4, len=2) :: dynamic)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .filter(|err| err.contains("CHARACTER(kind=4) data is not supported"))
+                .count()
+                >= 7,
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("CHARACTER(kind=-1) data is not supported")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_default_character_data_forms() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  character(kind=1) :: text
+  text = char(65, kind=1)
+  text = achar(65, 1)
+  text = trim(text)
+  text = adjustl(text)
+  text = adjustr(text)
+  text = repeat(text, 2)
+  text = new_line(text)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_fraction_exponent_and_scale_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: i
+  real :: x
+  x = fraction(i)
+  i = exponent(i)
+  x = scale(x, x)
+end program
+",
+        );
+        for intrinsic in ["fraction", "exponent", "scale"] {
+            assert!(
+                errs.iter()
+                    .any(|err| err.contains(intrinsic) && err.contains("argument type")),
+                "missing {intrinsic} diagnostic: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_nonconforming_elemental_intrinsic_ranks() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  real :: x(2), result(2, 2)
+  integer :: exponent_value(2, 2)
+  result = scale(x, exponent_value)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("elemental intrinsic 'scale'")
+                    && err.contains("nonconforming")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn block_local_generic_shadows_intrinsic_arity() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  block
+    interface scale
+      procedure :: user_scale
+    end interface
+    integer :: value
+    value = scale(1)
+  end block
+contains
+  integer function user_scale(value)
+    integer, intent(in) :: value
+    user_scale = value
+  end function
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("intrinsic 'scale' takes")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn selected_char_kind_preserves_leading_whitespace() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  character(kind=selected_char_kind(' ASCII')) :: text
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("CHARACTER(kind=-1) data is not supported")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_type_untyped_array_constructor() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: values(2)
+  values = [1, .true.]
+end program
+",
+        );
+        assert!(
+            errs.iter().any(
+                |err| err.contains("array constructor element type mismatch")
+                    && err.contains("expected INTEGER(4), got LOGICAL(4)")
+            ),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nested_block_character_expression_kind_mismatches() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  block
+    character(kind=1) :: narrow
+    block
+      character(kind=4) :: wide
+      narrow = trim(wide)
+      narrow = adjustl(wide)
+      narrow = adjustr(wide)
+      narrow = repeat(wide, 2)
+      narrow = new_line(wide)
+      narrow = wide // wide
+    end block
+  end block
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            6,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_positional_reduction_masks_without_dim_rank() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: values(2, 2)
+  logical :: mask(2, 2)
+  integer :: total
+  total = sum(values, mask)
+  total = product(values, mask)
+  total = maxval(values, mask)
+  total = minval(values, mask)
+end program
+",
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|err| err.contains("intrinsic assignment rank mismatch")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn elemental_defined_assignment_requires_array_lhs_for_array_rhs() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface assignment(=)
+    elemental subroutine assign_flag(lhs, rhs)
+      import :: box_t
+      type(box_t), intent(out) :: lhs
+      logical, intent(in) :: rhs
+    end subroutine
+  end interface
+  type(box_t) :: scalar, many(2)
+  logical :: flag, flags(2)
+  many = flag
+  scalar = flags
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment rank mismatch"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic assignment cannot convert"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -7732,10 +11544,12 @@ program p
     enumerator :: red, green, blue
   end enumeration type
   type(color) :: c
+  integer :: n
   c = red
   call takes_int(c)
   call takes_color(2)
   call takes_color(c)
+  n = takes_color_fn(2)
 contains
   subroutine takes_int(n)
     integer, intent(in) :: n
@@ -7746,6 +11560,10 @@ contains
     integer :: m
     m = int(x)
   end subroutine
+  integer function takes_color_fn(x)
+    type(color), intent(in) :: x
+    takes_color_fn = int(x)
+  end function
 end program
 ",
         );
@@ -7760,7 +11578,14 @@ end program
             "{:?}",
             errs
         );
-        assert_eq!(errs.len(), 2, "{:?}", errs);
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("dummy argument 'x' has enumeration type 'color'"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert_eq!(errs.len(), 3, "{:?}", errs);
     }
 
     #[test]
@@ -8790,6 +12615,58 @@ end program
     }
 
     #[test]
+    fn nil_arm_to_required_function_dummy_rejected() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  result = required((.true. ? 7 : .nil.))
+contains
+  integer function required(value)
+    integer, intent(in) :: value
+    required = value
+  end function required
+end program
+",
+        );
+
+        assert!(errs.iter().any(|err| err.contains("C1525")), "{errs:?}");
+        assert!(
+            !errs.iter().any(|err| err.contains("only valid as an arm")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn nil_arm_to_optional_function_dummy_accepted() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  result = maybe((.true. ? 7 : .nil.))
+contains
+  integer function maybe(value)
+    integer, intent(in), optional :: value
+    if (present(value)) then
+      maybe = value
+    else
+      maybe = 0
+    end if
+  end function maybe
+end program
+",
+        );
+
+        assert!(!errs.iter().any(|err| err.contains("C1525")), "{errs:?}");
+        assert!(
+            !errs.iter().any(|err| err.contains("only valid as an arm")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
     fn do_concurrent_ok_with_f2008() {
         let errs = errors_with_std(
             "\
@@ -8949,6 +12826,263 @@ end subroutine
     }
 
     #[test]
+    fn rejects_separate_module_procedure_without_ancestor_interface() {
+        let errs = errors_from(
+            "\
+module missing_interface_parent
+  implicit none
+end module missing_interface_parent
+
+submodule (missing_interface_parent) missing_interface_child
+contains
+  module subroutine stray()
+  end subroutine stray
+end submodule missing_interface_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("separate module procedure 'stray'")
+                    && err.contains("no matching interface")
+                    && err.contains("missing_interface_parent")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_generic_specific_with_ancestor_interface() {
+        let errs = errors_from(
+            "\
+module generic_parent
+  implicit none
+  interface update
+    module subroutine update_integer(value)
+      integer, intent(out) :: value
+    end subroutine update_integer
+  end interface update
+end module generic_parent
+
+submodule (generic_parent) generic_child
+contains
+  module procedure update_integer
+    value = 1
+  end procedure update_integer
+end submodule generic_child
+",
+        );
+
+        assert!(
+            !errs.iter().any(|err| err.contains("no matching interface")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nonmodule_ancestor_interface_for_separate_body() {
+        let errs = errors_from(
+            "\
+module ordinary_interface_parent
+  implicit none
+  interface
+    subroutine ordinary()
+    end subroutine ordinary
+  end interface
+end module ordinary_interface_parent
+
+submodule (ordinary_interface_parent) ordinary_interface_child
+contains
+  module subroutine ordinary()
+  end subroutine ordinary
+end submodule ordinary_interface_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("separate module procedure 'ordinary'")
+                    && err.contains("no matching interface")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_defined_ancestor_procedure_for_separate_body() {
+        let errs = errors_from(
+            "\
+module defined_procedure_parent
+  implicit none
+contains
+  subroutine already_defined()
+  end subroutine already_defined
+end module defined_procedure_parent
+
+submodule (defined_procedure_parent) defined_procedure_child
+contains
+  module subroutine already_defined()
+  end subroutine already_defined
+end submodule defined_procedure_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("separate module procedure 'already_defined'")
+                    && err.contains("no matching interface")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_descendant_bodies_declared_in_root_ancestor() {
+        let errs = errors_from(
+            "\
+module nested_parent
+  implicit none
+  interface
+    module subroutine set_explicit(value)
+      integer, intent(out) :: value
+    end subroutine set_explicit
+    module subroutine set_abbreviated(value)
+      integer, intent(out) :: value
+    end subroutine set_abbreviated
+  end interface
+end module nested_parent
+
+submodule (nested_parent) middle
+end submodule middle
+
+submodule (nested_parent:middle) leaf
+contains
+  module subroutine set_explicit(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine set_explicit
+
+  module procedure set_abbreviated
+    value = 2
+  end procedure set_abbreviated
+end submodule leaf
+",
+        );
+
+        assert!(
+            !errs.iter().any(|err| err.contains("no matching interface")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_separate_procedure_intent_mismatches() {
+        let errs = errors_from(
+            "\
+module intent_parent
+  implicit none
+  interface
+    module subroutine input_to_output(value)
+      integer, intent(in) :: value
+    end subroutine input_to_output
+    module subroutine inout_to_unspecified(value)
+      integer, intent(inout) :: value
+    end subroutine inout_to_unspecified
+    module subroutine unspecified_to_input(value)
+      integer :: value
+    end subroutine unspecified_to_input
+  end interface
+end module intent_parent
+
+submodule (intent_parent) intent_child
+contains
+  module subroutine input_to_output(value)
+    integer, intent(out) :: value
+  end subroutine input_to_output
+  module subroutine inout_to_unspecified(value)
+    integer :: value
+  end subroutine inout_to_unspecified
+  module subroutine unspecified_to_input(value)
+    integer, intent(in) :: value
+  end subroutine unspecified_to_input
+end submodule intent_child
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("INTENT") && err.contains("does not match"))
+                .count(),
+            3,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn submodule_implicit_none_applies_to_separate_procedure_bodies() {
+        let errs = errors_from(
+            "\
+module implicit_parent
+  interface
+    module subroutine run()
+    end subroutine run
+  end interface
+end module implicit_parent
+
+submodule (implicit_parent) implicit_child
+  implicit none
+contains
+  module subroutine run()
+    typo = 1
+  end subroutine run
+end submodule implicit_child
+",
+        );
+
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("variable 'typo' used but not declared")
+                    && err.contains("IMPLICIT NONE is active")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn separate_procedure_partially_overrides_submodule_implicit_none() {
+        let errs = errors_from(
+            "\
+module implicit_parent
+  interface
+    module subroutine run()
+    end subroutine run
+  end interface
+end module implicit_parent
+
+submodule (implicit_parent) implicit_child
+  implicit none
+contains
+  module subroutine run()
+    implicit integer(t-t)
+    typo = 1
+    xray = 2
+  end subroutine run
+end submodule implicit_child
+",
+        );
+
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("variable 'xray' used but not declared")),
+            "{errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("variable 'typo'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
     fn submodule_requires_f2008() {
         use crate::lexer::{Position, Span};
 
@@ -8964,6 +13098,7 @@ end subroutine
                 name: "child_mod".into(),
                 uses: vec![],
                 imports: vec![],
+                implicit: vec![],
                 decls: vec![],
                 contains: vec![],
             },

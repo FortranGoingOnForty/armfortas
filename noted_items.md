@@ -110,20 +110,8 @@ Deferred items from the l00 F2023 inventory (2026-06-10):
   - Assumed-length (`character(*), value`) additionally needs the length on
     a hidden parameter; keep it rejected even after fixed-length works.
 - l07 submodule deferrals (the sprint shipped the cross-TU SMP function
-  fix, dep_scan ordering, and interface-mismatch / unknown-parent
-  diagnostics; these are the remaining lower-value gaps):
-  - "Separate module procedure has no matching interface" (F2008 C1414)
-    is NOT diagnosed. A first attempt false-positived on SMPs that
-    implement a specific inside a GENERIC interface: those members load
-    from the parent `.amod` as NamedInterface symbols with no per-specific
-    proc scope, so the interface-scope lookup misses them and wrongly
-    rejected valid code (cli_driver
-    submodule_dispatching_private_parent_generic_interface_resolves_via_amod).
-    A robust check must also consult generic-interface members + `.amod`
-    NamedInterface symbols; deferred. The signature-mismatch and
-    unknown-parent diagnostics (which only fire when an interface IS
-    found, or check the module not the proc) shipped and are
-    false-positive-safe.
+  fix, dep_scan ordering, ancestor-interface / interface-mismatch /
+  unknown-parent diagnostics; these are the remaining lower-value gaps):
   - `END PROCEDURE wrong_name` (mismatched end-name on an SMP body) is
     not diagnosed — parser-level check, not yet added.
   - Duplicate SMP definitions across sibling submodules are not

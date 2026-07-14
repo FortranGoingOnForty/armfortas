@@ -122,6 +122,7 @@ pub struct SymbolTable {
     export_lookup_cache: RefCell<PersistentLookupCache>,
     use_ambiguity_cache: RefCell<UseAmbiguityCache>,
     named_interface_presence_cache: RefCell<HashMap<String, bool>>,
+    statement_block_scopes: HashMap<(u32, u32, u32, u32, u32), ScopeId>,
     /// (scope_id, lowercase fname) → statement function definition.
     /// Populated by sema's `detect_statement_functions` pass during
     /// `resolve_unit` for Subroutine/Function/Program arms.
@@ -151,8 +152,34 @@ impl SymbolTable {
             export_lookup_cache: RefCell::new(HashMap::new()),
             use_ambiguity_cache: RefCell::new(HashMap::new()),
             named_interface_presence_cache: RefCell::new(HashMap::new()),
+            statement_block_scopes: HashMap::new(),
             statement_functions: HashMap::new(),
         }
+    }
+
+    pub(crate) fn register_statement_block_scope(&mut self, span: Span, scope_id: ScopeId) {
+        self.statement_block_scopes.insert(
+            (
+                span.file_id,
+                span.start.line,
+                span.start.col,
+                span.end.line,
+                span.end.col,
+            ),
+            scope_id,
+        );
+    }
+
+    pub(crate) fn statement_block_scope(&self, span: Span) -> Option<ScopeId> {
+        self.statement_block_scopes
+            .get(&(
+                span.file_id,
+                span.start.line,
+                span.start.col,
+                span.end.line,
+                span.end.col,
+            ))
+            .copied()
     }
 
     fn lookup_cache(&self, mode: LookupMode) -> &RefCell<PersistentLookupCache> {
@@ -671,6 +698,206 @@ impl SymbolTable {
             .or_else(|| self.named_interface_symbol_in_scope(scope_id, key.as_ref()))
     }
 
+    pub(crate) fn named_interface_symbols_in(&self, scope_id: ScopeId, name: &str) -> Vec<&Symbol> {
+        let key = ensure_ascii_lowercase(name);
+        let mut symbols = Vec::new();
+        let mut seen = HashSet::new();
+        let mut visited = HashSet::new();
+        self.collect_named_interface_symbols_in_guarded(
+            scope_id,
+            key.as_ref(),
+            LookupMode::Normal,
+            &mut visited,
+            &mut seen,
+            &mut symbols,
+        );
+        symbols
+    }
+
+    pub(crate) fn named_interface_symbols_from_use_associations(
+        &self,
+        associations: &[UseAssociation],
+        name: &str,
+    ) -> Vec<&Symbol> {
+        let key = ensure_ascii_lowercase(name);
+        let mut symbols = Vec::new();
+        let mut seen = HashSet::new();
+        let mut visited = HashSet::new();
+        for association in associations {
+            if association.local_name != key.as_ref() {
+                continue;
+            }
+            let source_mode = if association.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
+            self.collect_named_interface_symbols_in_guarded(
+                association.source_scope,
+                &association.original_name,
+                source_mode,
+                &mut visited,
+                &mut seen,
+                &mut symbols,
+            );
+        }
+        symbols
+    }
+
+    pub(crate) fn find_separate_module_interface_scope(
+        &self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Option<ScopeId> {
+        let key = ensure_ascii_lowercase(name);
+        let mut pending = vec![scope_id];
+        let mut visited = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate) {
+                continue;
+            }
+            if self.scopes[candidate]
+                .symbols
+                .get(key.as_ref())
+                .is_some_and(|symbol| {
+                    matches!(symbol.kind, SymbolKind::Function | SymbolKind::Subroutine)
+                        && symbol.attrs.is_separate_module_interface
+                })
+            {
+                return Some(candidate);
+            }
+            pending.extend(
+                self.scopes[candidate]
+                    .use_associations
+                    .iter()
+                    .filter(|association| association.is_submodule_access)
+                    .map(|association| association.source_scope),
+            );
+        }
+        None
+    }
+
+    fn collect_named_interface_symbols_in_guarded<'a>(
+        &'a self,
+        scope_id: ScopeId,
+        key: &str,
+        mode: LookupMode,
+        visited: &mut HashSet<(ScopeId, String, LookupMode)>,
+        seen: &mut HashSet<(ScopeId, String)>,
+        symbols: &mut Vec<&'a Symbol>,
+    ) {
+        let visit_key = (scope_id, key.to_string(), mode);
+        if !visited.insert(visit_key) {
+            return;
+        }
+        if mode == LookupMode::Exported && !self.scope_exports_key(scope_id, key) {
+            return;
+        }
+
+        let scope = &self.scopes[scope_id];
+        if let Some(symbol) = self.named_interface_facet_symbol_in_scope(scope_id, key) {
+            if mode == LookupMode::Normal || symbol_exports(symbol, scope) {
+                let symbol_key = (symbol.scope, symbol.name.to_ascii_lowercase());
+                if seen.insert(symbol_key) {
+                    symbols.push(symbol);
+                }
+            }
+            return;
+        }
+        if scope.symbols.contains_key(key) {
+            return;
+        }
+
+        let mut saw_binding = false;
+        for association in &scope.use_associations {
+            if association.local_name != key
+                || !self.association_allowed_from_scope(scope_id, association, key)
+                || (association.from_bare_use
+                    && association.local_name == association.original_name
+                    && self.use_name_is_fully_renamed(scope_id, association.source_scope, key))
+            {
+                continue;
+            }
+            saw_binding |= self.resolve_use_candidate(association).is_some();
+            let source_mode = if association.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
+            self.collect_named_interface_symbols_in_guarded(
+                association.source_scope,
+                &association.original_name,
+                source_mode,
+                visited,
+                seen,
+                symbols,
+            );
+        }
+
+        let mut seen_use_scopes = Vec::new();
+        for association in &scope.use_associations {
+            if !association.from_bare_use
+                || association.local_name != association.original_name
+                || seen_use_scopes.contains(&association.source_scope)
+                || self.use_name_is_fully_renamed(scope_id, association.source_scope, key)
+                || !self.association_allowed_from_scope(scope_id, association, key)
+            {
+                continue;
+            }
+            seen_use_scopes.push(association.source_scope);
+            let mut lookup_visited = Vec::new();
+            let mut lookup_cache = HashMap::new();
+            let source_mode = if association.is_submodule_access {
+                LookupMode::Normal
+            } else {
+                LookupMode::Exported
+            };
+            saw_binding |= if association.is_submodule_access {
+                self.lookup_in_guarded(
+                    association.source_scope,
+                    key,
+                    &mut lookup_visited,
+                    &mut lookup_cache,
+                )
+            } else {
+                self.lookup_exported_in_guarded(
+                    association.source_scope,
+                    key,
+                    &mut lookup_visited,
+                    &mut lookup_cache,
+                )
+            }
+            .is_some();
+            self.collect_named_interface_symbols_in_guarded(
+                association.source_scope,
+                key,
+                source_mode,
+                visited,
+                seen,
+                symbols,
+            );
+        }
+
+        if !saw_binding
+            && mode == LookupMode::Normal
+            && self.host_association_allows_generic_facet(scope_id, key)
+        {
+            if let Some(parent) = scope
+                .parent
+                .filter(|parent| self.scopes[*parent].kind != ScopeKind::Global)
+            {
+                self.collect_named_interface_symbols_in_guarded(
+                    parent,
+                    key,
+                    LookupMode::Normal,
+                    visited,
+                    seen,
+                    symbols,
+                );
+            }
+        }
+    }
+
     pub fn may_have_named_interface_name(&self, name: &str) -> bool {
         let key = ensure_ascii_lowercase(name);
         if let Some(cached) = self
@@ -805,6 +1032,18 @@ impl SymbolTable {
         associations
             .iter()
             .any(|assoc| assoc.local_name == key && self.resolve_use_candidate(assoc).is_some())
+    }
+
+    pub(crate) fn lookup_from_use_associations<'a>(
+        &'a self,
+        associations: &[UseAssociation],
+        name: &str,
+    ) -> Option<&'a Symbol> {
+        let key = ensure_ascii_lowercase(name);
+        associations
+            .iter()
+            .filter(|association| association.local_name == key)
+            .find_map(|association| self.resolve_use_candidate(association))
     }
 
     pub(crate) fn use_associations_conflict_with_local(
@@ -1656,6 +1895,9 @@ impl SymbolTable {
     pub fn set_implicit_rule(&mut self, start: char, end: char, itype: ImplicitType) {
         let scope = &mut self.scopes[self.current];
         scope.has_explicit_implicit_stmt = true;
+        if scope.implicit_rules.none_type {
+            scope.implicit_rules.rules.clear();
+        }
         scope.implicit_rules.none_type = false;
         for c in start..=end {
             scope
@@ -1964,6 +2206,10 @@ pub struct SymbolAttrs {
     /// under the parent module's name, not the submodule's, so call
     /// sites match `_afs_modproc_<parent>_<proc>`.
     pub is_separate_module_procedure: bool,
+    /// Procedure interface body declared with the MODULE prefix in an
+    /// ancestor module. Only these interfaces may be implemented by a
+    /// separate module procedure in a descendant submodule.
+    pub is_separate_module_interface: bool,
 }
 
 impl Default for SymbolAttrs {
@@ -1988,6 +2234,7 @@ impl Default for SymbolAttrs {
             result_rank: 0,
             array_spec: Vec::new(),
             is_separate_module_procedure: false,
+            is_separate_module_interface: false,
         }
     }
 }
@@ -2917,6 +3164,19 @@ mod tests {
             st.implicit_type("index"),
             Some(ImplicitType::DoublePrecision)
         );
+    }
+
+    #[test]
+    fn implicit_rule_partially_overrides_inherited_none() {
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Module("parent".into()));
+        st.set_implicit_none(true, false);
+        st.push_scope(ScopeKind::Subroutine("child".into()));
+        st.set_implicit_rule('t', 't', ImplicitType::Integer);
+
+        assert_eq!(st.implicit_type("typo"), Some(ImplicitType::Integer));
+        assert_eq!(st.implicit_type("xray"), None);
+        assert_eq!(st.implicit_type("index"), None);
     }
 
     // ---- Module scope finding ----

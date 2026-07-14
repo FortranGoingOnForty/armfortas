@@ -22,7 +22,8 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
-const AMOD_VERSION: u32 = 5;
+const AMOD_VERSION: u32 = 7;
+pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
 /// is `lower:upper` or just `upper`. Returns None if any dim is not
@@ -240,6 +241,39 @@ pub fn write_amod(
     // ---- Header ----
     writeln!(out, "#!amod {}", AMOD_VERSION).unwrap();
     writeln!(out, "# module: {}", mod_key).unwrap();
+    if matches!(scope.kind, ScopeKind::Submodule(_)) {
+        if let Some(ancestor) = &scope.submodule_ancestor {
+            writeln!(out, "# ancestor-module: {}", ancestor.to_lowercase()).unwrap();
+        }
+        if let Some(parent) = scope.use_associations.iter().find_map(|association| {
+            if !association.is_submodule_access || !association.local_name.is_empty() {
+                return None;
+            }
+            match &st.scope(association.source_scope).kind {
+                ScopeKind::Submodule(name) => Some(name.to_lowercase()),
+                _ => None,
+            }
+        }) {
+            writeln!(out, "# parent-submodule: {}", parent).unwrap();
+        }
+        match &scope.host_association.policy {
+            HostAssociationPolicy::All => {
+                writeln!(out, "# host-association: all").unwrap();
+            }
+            HostAssociationPolicy::None => {
+                writeln!(out, "# host-association: none").unwrap();
+            }
+            HostAssociationPolicy::Only(names) => {
+                let mut names: Vec<_> = names.iter().map(String::as_str).collect();
+                names.sort_unstable();
+                write!(out, "# host-association: only").unwrap();
+                for name in names {
+                    write!(out, " {}", name).unwrap();
+                }
+                writeln!(out).unwrap();
+            }
+        }
+    }
     writeln!(out, "# source: {}", source_path).unwrap();
     writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
@@ -411,7 +445,7 @@ pub fn write_amod(
     }
 
     // ---- Procedures ----
-    let interface_specifics: BTreeSet<String> = syms
+    let interface_specifics: BTreeSet<String> = all_syms
         .iter()
         .filter(|(_, sym)| {
             matches!(sym.kind, SymbolKind::NamedInterface)
@@ -419,15 +453,12 @@ pub fn write_amod(
         })
         .flat_map(|(_, sym)| sym.arg_names.iter().cloned())
         .collect();
-    // Public derived types can expose private bound procedure targets across
-    // translation units. Those targets must be serialized too so imported
-    // type-bound calls can recover full dummy-argument ABI metadata such as
-    // OPTIONAL slots.
+    // Descendant submodules inherit private ancestor procedures. Retain every
+    // procedure with its access marker; ordinary USE association still filters
+    // private entries while submodule host association can reconstruct them.
     let mut proc_export_names: BTreeSet<String> = interface_specifics;
-    for (name, sym) in &syms {
-        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
-            && is_public(sym, scope)
-        {
+    for (name, sym) in &all_syms {
+        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) {
             proc_export_names.insert(name.to_lowercase());
         }
     }
@@ -606,14 +637,14 @@ fn emit_variable(
             .map(|iface| format!("type({})", iface))
             .unwrap_or_else(|| "unknown".to_string())
     } else if let (
-        Some(TypeInfo::Character { len: None, .. }),
+        Some(TypeInfo::Character { len: None, kind }),
         Some(ModuleGlobalInfo {
             char_kind: crate::ir::lower::CharKind::Fixed(n),
             ..
         }),
     ) = (sym.type_info.as_ref(), global_info)
     {
-        format!("character(len={})", n)
+        character_type_to_string(Some(*n), *kind)
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
@@ -670,14 +701,14 @@ fn emit_parameter(
     let global_key = (mod_key.to_string(), name.to_lowercase());
     let global_info = globals.get(&global_key);
     let type_str = if let (
-        Some(TypeInfo::Character { len: None, .. }),
+        Some(TypeInfo::Character { len: None, kind }),
         Some(ModuleGlobalInfo {
             char_kind: crate::ir::lower::CharKind::Fixed(n),
             ..
         }),
     ) = (sym.type_info.as_ref(), global_info)
     {
-        format!("character(len={})", n)
+        character_type_to_string(Some(*n), *kind)
     } else {
         type_info_to_string(sym.type_info.as_ref())
     };
@@ -912,7 +943,13 @@ fn emit_procedure(
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
     }
-    if sym.attrs.access == Access::Private {
+    if sym.attrs.is_separate_module_interface {
+        write!(out, ", module_interface").unwrap();
+    }
+    if sym.attrs.is_separate_module_procedure {
+        write!(out, ", module_procedure").unwrap();
+    }
+    if !is_public(sym, st.scope(mod_scope_id)) {
         write!(out, ", private").unwrap();
     }
     if let Some(binding_label) = &sym.attrs.binding_label {
@@ -921,11 +958,12 @@ fn emit_procedure(
     writeln!(out).unwrap();
 
     let name_lc = name.to_lowercase();
-    let ir_func = ir_module.functions.iter().find(|f| {
-        f.name.eq_ignore_ascii_case(name)
-            || f.name.eq_ignore_ascii_case(&name_lc)
-            || f.name.to_lowercase().ends_with(&format!("_{}", name_lc))
-    });
+    let link_name = crate::ir::lower::symbol_link_name(st, sym);
+    let metadata_name = crate::ir::lower::symbol_abi_metadata_name(st, sym).to_lowercase();
+    let ir_func = ir_module
+        .functions
+        .iter()
+        .find(|func| func.name.eq_ignore_ascii_case(&link_name));
     let visible_ir_params: Vec<_> = ir_func
         .map(|func| {
             func.params
@@ -974,8 +1012,12 @@ fn emit_procedure(
         });
 
     let is_bind_c = sym.attrs.binding_label.is_some();
-    let declared_descriptor_params = descriptor_params.get(&name.to_lowercase());
-    let declared_char_len_star_params = char_len_star_params.get(&name_lc);
+    let declared_descriptor_params = descriptor_params
+        .get(&metadata_name)
+        .or_else(|| descriptor_params.get(&name_lc));
+    let declared_char_len_star_params = char_len_star_params
+        .get(&metadata_name)
+        .or_else(|| char_len_star_params.get(&name_lc));
     let hidden_char_len_args: Vec<String> = proc_scope
         .map(|pscope| {
             pscope
@@ -1059,6 +1101,14 @@ fn emit_procedure(
                 }
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
+                }
+                if arg_sym
+                    .attrs
+                    .array_spec
+                    .iter()
+                    .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank))
+                {
+                    arg_attrs.push("assumed-rank");
                 }
                 // F2018 §15.4.3.6: a `procedure(iface) :: name` dummy is
                 // a procedure formal. The producer side stores this as a
@@ -1357,10 +1407,7 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
             Some(k) => format!("logical({})", k),
             None => "logical".to_string(),
         },
-        Some(TypeInfo::Character { len, kind: _ }) => match len {
-            Some(n) => format!("character(len={})", n),
-            None => "character(len=:)".to_string(),
-        },
+        Some(TypeInfo::Character { len, kind }) => character_type_to_string(*len, *kind),
         Some(TypeInfo::Derived(name)) => format!("type({})", name),
         Some(TypeInfo::Class(name)) => format!("class({})", name),
         Some(TypeInfo::ClassStar) => "class(*)".to_string(),
@@ -1369,8 +1416,20 @@ fn type_info_to_string(info: Option<&TypeInfo>) -> String {
     }
 }
 
+fn character_type_to_string(len: Option<i64>, kind: Option<u8>) -> String {
+    let len = len.map_or_else(|| ":".to_string(), |len| len.to_string());
+    match kind {
+        Some(kind) => format!("character(len={len},kind={kind})"),
+        None => format!("character(len={len})"),
+    }
+}
+
 fn fnv1a_hex(content: &str) -> String {
     fnv1a_hex_bytes(content.as_bytes())
+}
+
+pub(crate) fn artifact_fingerprint(content: &str) -> String {
+    fnv1a_hex(content)
 }
 
 fn fnv1a_hex_bytes(content: &[u8]) -> String {
@@ -1435,6 +1494,9 @@ pub struct AmodArg {
     /// the dummy name as an external symbol — see the SGGES3 / selctg
     /// failure in stdlib_lapack_eigv_gen.
     pub procedure_iface: Option<String>,
+    /// True when the source dummy used DIMENSION(..). Rank alone cannot
+    /// distinguish assumed-rank from a rank-one assumed-shape dummy.
+    pub assumed_rank: bool,
     /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
     /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
     /// `array_spec` of this rank, deriving each dim's kind from the
@@ -1469,6 +1531,8 @@ pub struct AmodProc {
     pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
+    pub is_separate_module_interface: bool,
+    pub is_separate_module_procedure: bool,
     pub access: Access,
     pub binding_label: Option<String>,
     pub args: Vec<AmodArg>,
@@ -1522,10 +1586,20 @@ pub struct UseRename {
     pub source_module: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmodHostAssociation {
+    All,
+    None,
+    Only(Vec<String>),
+}
+
 /// Complete module interface parsed from an .amod file.
 #[derive(Debug, Clone)]
 pub struct ModuleInterface {
     pub module_name: String,
+    pub submodule_ancestor: Option<String>,
+    pub submodule_parent: Option<String>,
+    pub host_association: AmodHostAssociation,
     pub dependencies: Vec<String>,
     pub only_imports: Vec<UseRename>,
     pub renames: Vec<UseRename>,
@@ -1584,17 +1658,7 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
 
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    validate_amod_integrity(&content, path)?;
-    let version = amod_version(&content, path)?;
-    if version != AMOD_VERSION {
-        return Err(format!(
-            "{}: incompatible .amod version {} (compiler requires {}); rebuild the provider module",
-            path.display(),
-            version,
-            AMOD_VERSION
-        ));
-    }
-    let iface = parse_amod(&content, path)?;
+    let iface = read_amod_content(&content, path)?;
 
     if let Some(stored) = mtime {
         AMOD_CACHE.with(|c| {
@@ -1604,6 +1668,20 @@ pub fn read_amod(path: &Path) -> Result<ModuleInterface, String> {
     }
 
     Ok(iface)
+}
+
+pub(crate) fn read_amod_content(content: &str, path: &Path) -> Result<ModuleInterface, String> {
+    validate_amod_integrity(content, path)?;
+    let version = amod_version(content, path)?;
+    if version != AMOD_VERSION {
+        return Err(format!(
+            "{}: incompatible .amod version {} (compiler requires {}); rebuild the provider module",
+            path.display(),
+            version,
+            AMOD_VERSION
+        ));
+    }
+    parse_amod(content, path)
 }
 
 fn amod_version(content: &str, path: &Path) -> Result<u32, String> {
@@ -1716,6 +1794,27 @@ fn parse_use_binding(rest: &str, directive: &str, path: &Path) -> Result<UseRena
     })
 }
 
+fn parse_host_association(value: &str, path: &Path) -> Result<AmodHostAssociation, String> {
+    let mut parts = value.split_whitespace();
+    let policy = match parts.next() {
+        Some("all") if parts.next().is_none() => AmodHostAssociation::All,
+        Some("none") if parts.next().is_none() => AmodHostAssociation::None,
+        Some("only") => {
+            let mut names: Vec<String> = parts.map(str::to_ascii_lowercase).collect();
+            names.sort_unstable();
+            names.dedup();
+            AmodHostAssociation::Only(names)
+        }
+        _ => {
+            return Err(format!(
+                "{}: corrupt .amod file (malformed host-association header); rebuild the provider module",
+                path.display()
+            ));
+        }
+    };
+    Ok(policy)
+}
+
 fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     let mut lines = content.lines().peekable();
 
@@ -1727,6 +1826,9 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let mut module_name = String::new();
+    let mut submodule_ancestor = None;
+    let mut submodule_parent = None;
+    let mut host_association = AmodHostAssociation::All;
     let mut checksum = None;
 
     // Parse # key: value header lines.
@@ -1735,6 +1837,11 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             if let Some((key, val)) = rest.split_once(": ") {
                 match key {
                     "module" => module_name = val.trim().to_string(),
+                    "ancestor-module" => submodule_ancestor = Some(val.trim().to_string()),
+                    "parent-submodule" => submodule_parent = Some(val.trim().to_string()),
+                    "host-association" => {
+                        host_association = parse_host_association(val.trim(), path)?
+                    }
                     "checksum" => checksum = Some(val.trim().to_string()),
                     _ => {} // skip other metadata
                 }
@@ -1856,6 +1963,9 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
     Ok(ModuleInterface {
         module_name,
+        submodule_ancestor,
+        submodule_parent,
+        host_association,
         dependencies,
         only_imports,
         renames,
@@ -2085,6 +2195,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let attr_chunks = split_attrs_top_level(attrs_str);
     let pure = attr_chunks.iter().any(|a| a == "pure");
     let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let is_separate_module_interface = attr_chunks.iter().any(|a| a == "module_interface");
+    let is_separate_module_procedure = attr_chunks.iter().any(|a| a == "module_procedure");
     let result_allocatable = attr_chunks.iter().any(|a| a == "result_allocatable");
     let result_pointer = attr_chunks.iter().any(|a| a == "result_pointer");
     let result_rank = attr_chunks
@@ -2145,6 +2257,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_array_bounds,
         pure,
         elemental,
+        is_separate_module_interface,
+        is_separate_module_procedure,
         access,
         binding_label,
         args,
@@ -2189,6 +2303,9 @@ fn parse_arg(line: &str) -> AmodArg {
     let external = attr_str
         .split(", ")
         .any(|tok| tok.trim().eq_ignore_ascii_case("external"));
+    let assumed_rank = attr_str
+        .split(", ")
+        .any(|tok| tok.trim().eq_ignore_ascii_case("assumed-rank"));
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
     let rank = attr_str
@@ -2214,6 +2331,7 @@ fn parse_arg(line: &str) -> AmodArg {
         hidden,
         external,
         procedure_iface,
+        assumed_rank,
         rank,
     }
 }
@@ -2463,27 +2581,21 @@ fn parse_type_info(s: &str) -> Option<TypeInfo> {
         return Some(TypeInfo::Logical { kind });
     }
     if s.starts_with("character") {
-        // character(len=N) or character(len=:)
+        let mut len = None;
+        let mut kind = None;
         if let Some(inner) = s
-            .strip_prefix("character(len=")
-            .and_then(|r| r.strip_suffix(')'))
+            .strip_prefix("character(")
+            .and_then(|rest| rest.strip_suffix(')'))
         {
-            if inner == ":" {
-                return Some(TypeInfo::Character {
-                    len: None,
-                    kind: None,
-                });
-            } else if let Ok(n) = inner.parse::<i64>() {
-                return Some(TypeInfo::Character {
-                    len: Some(n),
-                    kind: None,
-                });
+            for spec in inner.split(',').map(str::trim) {
+                if let Some(value) = spec.strip_prefix("len=") {
+                    len = (value != ":").then(|| value.parse::<i64>().ok()).flatten();
+                } else if let Some(value) = spec.strip_prefix("kind=") {
+                    kind = value.parse::<u8>().ok();
+                }
             }
         }
-        return Some(TypeInfo::Character {
-            len: None,
-            kind: None,
-        });
+        return Some(TypeInfo::Character { len, kind });
     }
     if let Some(inner) = s.strip_prefix("type(").and_then(|r| r.strip_suffix(')')) {
         return Some(TypeInfo::Derived(inner.to_string()));
@@ -2626,21 +2738,34 @@ pub fn extract_module_globals(
     out
 }
 
-/// Extract char_len_star_params from a loaded ModuleInterface.
-/// For each procedure with character(len=*) args, produces a
-/// Vec<bool> (per-position, true = assumed-length character).
+fn procedure_abi_owner<'a>(iface: &'a ModuleInterface, proc: &AmodProc) -> &'a str {
+    if proc.is_separate_module_interface || proc.is_separate_module_procedure {
+        iface
+            .submodule_ancestor
+            .as_deref()
+            .unwrap_or(&iface.module_name)
+    } else {
+        &iface.module_name
+    }
+}
+
+/// Extract optional-parameter masks from a loaded ModuleInterface.
 pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for proc in &iface.procedures {
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let flags: Vec<bool> = visible_args.iter().map(|a| a.optional).collect();
+        let key = proc.name.to_lowercase();
+        out.insert(
+            format!(
+                "afs_modproc_{}_{}",
+                procedure_abi_owner(iface, proc).to_lowercase(),
+                key
+            ),
+            flags.clone(),
+        );
         if flags.iter().any(|flag| *flag) {
-            let key = proc.name.to_lowercase();
-            out.insert(key.clone(), flags.clone());
-            out.insert(
-                format!("afs_modproc_{}_{}", iface.module_name.to_lowercase(), key),
-                flags,
-            );
+            out.insert(key, flags);
         }
     }
     out
@@ -2680,7 +2805,11 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
             out.insert(
-                format!("afs_modproc_{}_{}", iface.module_name.to_lowercase(), key),
+                format!(
+                    "afs_modproc_{}_{}",
+                    procedure_abi_owner(iface, proc).to_lowercase(),
+                    key
+                ),
                 flags,
             );
         }
@@ -2700,7 +2829,11 @@ pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
             out.insert(
-                format!("afs_modproc_{}_{}", iface.module_name.to_lowercase(), key),
+                format!(
+                    "afs_modproc_{}_{}",
+                    procedure_abi_owner(iface, proc).to_lowercase(),
+                    key
+                ),
                 flags,
             );
         }
@@ -2760,6 +2893,73 @@ mod tests {
     #[should_panic(expected = "malformed @dims")]
     fn parse_var_rejects_corrupt_dims() {
         parse_var("@var a : integer @dims 1:oops", false);
+    }
+
+    #[test]
+    fn character_kind_type_info_round_trips() {
+        for info in [
+            TypeInfo::Character {
+                len: Some(8),
+                kind: Some(4),
+            },
+            TypeInfo::Character {
+                len: None,
+                kind: Some(4),
+            },
+        ] {
+            let encoded = type_info_to_string(Some(&info));
+            assert_eq!(parse_type_info(&encoded), Some(info));
+            assert!(encoded.contains("kind=4"), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn legacy_character_type_info_keeps_unknown_kind() {
+        assert_eq!(
+            parse_type_info("character(len=8)"),
+            Some(TypeInfo::Character {
+                len: Some(8),
+                kind: None,
+            })
+        );
+        assert_eq!(
+            parse_type_info("character(len=:)"),
+            Some(TypeInfo::Character {
+                len: None,
+                kind: None,
+            })
+        );
+    }
+
+    #[test]
+    fn character_kind_survives_all_type_record_parsers() {
+        let var = parse_var("@var text : character(len=8,kind=4)", false);
+        assert_eq!(
+            var.type_info,
+            Some(TypeInfo::Character {
+                len: Some(8),
+                kind: Some(4),
+            })
+        );
+
+        let arg = parse_arg("  @arg text : character(len=:,kind=4), intent(in)");
+        assert_eq!(
+            arg.type_info,
+            Some(TypeInfo::Character {
+                len: None,
+                kind: Some(4),
+            })
+        );
+
+        let mut lines = "@end function\n".lines().peekable();
+        let proc = parse_proc("@function make_text -> character(len=8,kind=4)", &mut lines);
+        assert_eq!(
+            proc.return_type,
+            Some(TypeInfo::Character {
+                len: Some(8),
+                kind: Some(4),
+            })
+        );
     }
 
     #[test]
@@ -2850,7 +3050,7 @@ mod tests {
 
     #[test]
     fn only_qualified_dependencies_round_trip_exact_bindings() {
-        let amod_text = r#"#!amod 5
+        let amod_text = r#"#!amod 7
 # module: facade
 # source: facade.f90
 
@@ -2896,7 +3096,7 @@ mod tests {
             "@use_rename local = from provider",
         ] {
             let amod_text =
-                format!("#!amod 5\n# module: facade\n# source: facade.f90\n\n{record}\n");
+                format!("#!amod 7\n# module: facade\n# source: facade.f90\n\n{record}\n");
             let err = parse_amod(&amod_text, Path::new("bad.amod")).unwrap_err();
             assert!(
                 err.contains("corrupt .amod file")
@@ -3002,6 +3202,12 @@ mod tests {
   @arg buf : real, intent(out), descriptor, allocatable, rank=1
     @abi pass=x0 width=8
 @end subroutine
+
+@subroutine takes_assumed_rank
+  @abi cc=aapcs64 hidden_char_lens=0
+  @arg value : class(*), intent(in), descriptor, assumed-rank, rank=1
+    @abi pass=x0 width=8
+@end subroutine
 "#;
         let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
         let assumed = iface
@@ -3020,6 +3226,14 @@ mod tests {
             .unwrap();
         assert_eq!(alloc.args[0].rank, 1);
         assert!(alloc.args[0].allocatable);
+
+        let assumed_rank = iface
+            .procedures
+            .iter()
+            .find(|p| p.name == "takes_assumed_rank")
+            .unwrap();
+        assert_eq!(assumed_rank.args[0].rank, 1);
+        assert!(assumed_rank.args[0].assumed_rank);
     }
 
     #[test]
@@ -3030,7 +3244,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 5
+            r#"#!amod 7
 # module: cache_test
 # source: cache_test.f90
 
@@ -3055,12 +3269,110 @@ mod tests {
     }
 
     #[test]
+    fn supplied_amod_bytes_preserve_submodule_contracts_without_cache_lookup() {
+        clear_amod_cache();
+        let path = std::env::temp_dir().join(format!(
+            "amod_supplied_content_test_{}.amod",
+            std::process::id()
+        ));
+        let cached_text = add_integrity_headers(
+            r#"#!amod 7
+# module: cached_parent
+# source: cached_parent.f90
+
+@param cached : integer = 1
+"#
+            .to_string(),
+        );
+        std::fs::write(&path, cached_text).unwrap();
+        let cached = read_amod(&path).expect("cache seed read");
+        assert_eq!(cached.module_name, "cached_parent");
+
+        let supplied_text = add_integrity_headers(
+            r#"#!amod 7
+# module: supplied_parent
+# ancestor-module: supplied_root
+# parent-submodule: supplied_middle
+# host-association: only kept local_value
+# source: supplied_parent.f90
+
+@function implemented -> integer, module_procedure
+@end function
+"#
+            .to_string(),
+        );
+        let supplied =
+            read_amod_content(&supplied_text, &path).expect("supplied content should parse");
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(supplied.module_name, "supplied_parent");
+        assert_eq!(
+            supplied.host_association,
+            AmodHostAssociation::Only(vec!["kept".into(), "local_value".into()])
+        );
+        assert!(supplied.procedures[0].is_separate_module_procedure);
+        assert_eq!(
+            AMOD_CACHE_HITS.with(|hits| *hits.borrow()),
+            0,
+            "parsing supplied bytes must not consult the path cache"
+        );
+    }
+
+    #[test]
+    fn ancestor_owned_procedure_metadata_uses_root_link_name() {
+        let text = add_integrity_headers(
+            r#"#!amod 7
+# module: child
+# ancestor-module: root
+# parent-submodule: middle
+# source: child.f90
+
+@subroutine compute, module_procedure
+  @arg values : integer, intent(in), descriptor, rank=1
+    @abi pass=x0 width=8
+  @arg text : character(*), intent(in)
+    @abi pass=x1 width=8
+  @arg bias : integer, intent(in), optional
+    @abi pass=x2 width=8
+  @arg text@len : integer, hidden
+    @abi pass=x3 width=8
+@end subroutine
+
+@subroutine required, module_procedure
+  @arg value : integer, intent(in)
+    @abi pass=x0 width=8
+@end subroutine
+"#
+            .to_string(),
+        );
+        let iface = read_amod_content(&text, Path::new("child.amod")).unwrap();
+        let root_key = "afs_modproc_root_compute";
+
+        assert_eq!(
+            extract_optional_params(&iface).get(root_key),
+            Some(&vec![false, false, true])
+        );
+        assert_eq!(
+            extract_descriptor_params(&iface).get(root_key),
+            Some(&vec![true, false, false])
+        );
+        assert_eq!(
+            extract_char_len_star_params(&iface).get(root_key),
+            Some(&vec![false, true, false])
+        );
+        assert_eq!(
+            extract_optional_params(&iface).get("afs_modproc_root_required"),
+            Some(&vec![false])
+        );
+    }
+
+    #[test]
     fn read_amod_rejects_truncated_integrity_body() {
         clear_amod_cache();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 5
+            r#"#!amod 7
 # module: truncated_test
 # source: truncated_test.f90
 
@@ -3094,7 +3406,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 4
+            r#"#!amod 6
 # module: stale_test
 # source: stale_test.f90
 
@@ -3108,7 +3420,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 4")
+            err.contains("incompatible .amod version 6 (compiler requires 7)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

@@ -46,3 +46,13 @@ matched without relying on source-line echoing.
 
 Semantic validation does not reject a variable that appears in both `SHARED`
 and `REDUCE` locality specifications on the same `DO CONCURRENT` construct.
+
+## XFAIL-006 - ISO_10646 character kind is unsupported
+
+**Status:** Active compiler limitation.
+
+The backend and runtime support only `CHARACTER(kind=1)`, so
+`SELECTED_CHAR_KIND('ISO_10646')` returns `-1`. The imported UCS-4 `SPLIT`
+fixture remains an expected failure until armfortas supports a nondefault
+character representation throughout semantic analysis, lowering, codegen, and
+the runtime.

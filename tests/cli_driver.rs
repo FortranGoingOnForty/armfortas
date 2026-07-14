@@ -239,6 +239,452 @@ fn cpp_input_is_rejected_before_fortran_preprocessing() {
 }
 
 #[test]
+fn incompatible_intrinsic_assignment_is_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=incompatible_intrinsic_assignment_is_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("assignment_type");
+    let src = write_program_in(
+        &dir,
+        "assignment_type.f90",
+        "program assignment_type\n  implicit none\n  integer :: value\n  value = .true.\n  print *, value\nend program assignment_type\n",
+    );
+    let output = dir.join("assignment_type.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assignment compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "incompatible intrinsic assignment must fail"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("intrinsic assignment cannot convert LOGICAL(4) to INTEGER(4)"),
+        "missing assignment type diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn incompatible_explicit_interface_actual_is_rejected() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=incompatible_explicit_interface_actual_is_rejected count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("explicit_interface_type");
+    let src = write_program_in(
+        &dir,
+        "explicit_interface_type.f90",
+        "module typed_api\n  implicit none\ncontains\n  subroutine accept(value)\n    integer(8), intent(in) :: value\n  end subroutine accept\nend module typed_api\nprogram caller\n  use typed_api, only: accept\n  implicit none\n  logical(1) :: flag\n  call accept(flag)\nend program caller\n",
+    );
+    let output = dir.join("explicit_interface_type.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("explicit-interface compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "incompatible explicit-interface actual must fail"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("argument 'value' type mismatch: expected INTEGER(8), got LOGICAL(1)"),
+        "missing explicit-interface type diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_module_interface_rejects_incompatible_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=loaded_module_interface_rejects_incompatible_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("loaded_explicit_interface");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module typed_api\n  implicit none\ncontains\n  subroutine accept(values)\n    integer(8), intent(in) :: values(:)\n  end subroutine accept\n  subroutine set_value(value)\n    integer, intent(out) :: value\n    value = 1\n  end subroutine set_value\nend module typed_api\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "provider compile failed: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use typed_api, only: accept, set_value\n  implicit none\n  real(4) :: scalar\n  call accept(scalar)\n  call set_value(1)\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            caller.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("caller compile failed to spawn");
+    assert!(
+        !caller_result.status.success(),
+        "loaded interface must reject incompatible actual"
+    );
+    let stderr = String::from_utf8_lossy(&caller_result.stderr);
+    assert!(
+        stderr.contains("expected INTEGER(8), got REAL(4)"),
+        "missing loaded-interface type diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected rank 1, got rank 0"),
+        "missing loaded-interface rank diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "actual argument for INTENT(OUT/INOUT) dummy 'value' must be a definable variable"
+        ),
+        "missing loaded-interface intent diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_assumed_rank_interface_accepts_any_actual_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=loaded_assumed_rank_interface_accepts_any_actual_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("loaded_assumed_rank");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module rank_api\n  implicit none\ncontains\n  subroutine accept_any(value)\n    class(*), dimension(..), intent(in) :: value\n  end subroutine accept_any\nend module rank_api\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-rank provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "assumed-rank provider compile failed: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use rank_api, only: accept_any\n  implicit none\n  integer :: matrix(2, 2)\n  call accept_any(matrix)\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2018",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            caller.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assumed-rank caller compile failed to spawn");
+    assert!(
+        caller_result.status.success(),
+        "loaded assumed-rank interface rejected rank-2 actual: {}",
+        String::from_utf8_lossy(&caller_result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loaded_interfaces_validate_generic_and_procedure_pointer_actuals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=loaded_interfaces_validate_generic_and_procedure_pointer_actuals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("loaded_callable_interfaces");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module callable_api\n  implicit none\n  abstract interface\n    subroutine action_interface(value)\n      integer(8), intent(in) :: value\n    end subroutine action_interface\n  end interface\n  interface required_generic\n    module procedure required_value\n  end interface required_generic\n  procedure(action_interface), pointer :: action\ncontains\n  integer function required_value(value)\n    integer, intent(in) :: value\n    required_value = value\n  end function required_value\nend module callable_api\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2023",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callable-interface provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "callable-interface provider compile failed: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let caller = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use callable_api, only: action, required_generic\n  implicit none\n  logical(1) :: flag\n  integer :: result\n  call action(flag)\n  result = required_generic((.true. ? 7 : .nil.))\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-std=f2023",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            caller.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callable-interface caller compile failed to spawn");
+    assert!(
+        !caller_result.status.success(),
+        "loaded explicit interfaces must reject incompatible actuals"
+    );
+    let stderr = String::from_utf8_lossy(&caller_result.stderr);
+    assert!(
+        stderr.contains("argument 'value' type mismatch: expected INTEGER(8), got LOGICAL(1)"),
+        "missing loaded procedure-pointer diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains("dummy argument 'value' is not OPTIONAL (F2023 C1525)"),
+        "missing loaded generic C1525 diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn class_star_defined_assignment_accepts_concrete_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=class_star_defined_assignment_accepts_concrete_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_any\n  end interface\n  type(box_t) :: box\n  box = 41\n  if (box%value /= 42) error stop 1\n  print *, 'ok'\ncontains\n  subroutine assign_any(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    class(*), intent(in) :: rhs\n    select type (rhs)\n    type is (integer)\n      lhs%value = rhs + 1\n    class default\n      error stop 2\n    end select\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("class_star_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("class(*) defined-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "class(*) defined-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("class(*) defined-assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "class(*) defined assignment: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn typed_array_constructor_uses_local_kind_for_defined_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_array_constructor_uses_local_kind_for_defined_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: k = 8\n  type :: box_t\n    integer(8) :: total = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_values\n  end interface\n  type(box_t) :: box\n  box = [integer(kind=k) :: 1, 2]\n  if (box%total /= 3_8) error stop 1\n  print *, 'ok'\ncontains\n  subroutine assign_values(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer(8), intent(in) :: rhs(:)\n    lhs%total = sum(rhs)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("typed_constructor_local_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("typed constructor defined-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed constructor defined-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("typed constructor defined-assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "typed constructor defined assignment: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn mixed_type_untyped_array_constructor_is_rejected() {
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: values(2)\n  values = [1, .true.]\nend program\n",
+        "f90",
+    );
+    let out = unique_path("mixed_array_constructor", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("mixed array-constructor compile failed to spawn");
+    assert!(
+        !compile.status.success()
+            && String::from_utf8_lossy(&compile.stderr)
+                .contains("array constructor element type mismatch"),
+        "mixed array constructor was not rejected: status={:?} stdout={} stderr={}",
+        compile.status,
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_use_kind_controls_character_assignment_compatibility() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_use_kind_controls_character_assignment_compatibility count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        "module block_kinds\n  implicit none\n  integer, parameter :: wide_character = 2\nend module\nprogram p\n  implicit none\n  block\n    use block_kinds, only: wide_character\n    character(kind=wide_character + 0) :: text\n    text = 'x'\n  end block\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_use_character_kind", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK kind assignment compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "a BLOCK-local imported character kind must affect assignment validation"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("intrinsic assignment cannot convert CHARACTER(1) to CHARACTER(2)"),
+        "missing BLOCK-local character kind diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn c_f_procpointer_associates_c_funptr_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -1887,7 +2333,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 5\n", "#!amod 4\n", 1);
+        .replacen("#!amod 7\n", "#!amod 6\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -1914,7 +2360,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 4 (compiler requires 5)")
+        stderr.contains("incompatible .amod version 6 (compiler requires 7)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -5157,6 +5603,45 @@ fn bind_c_name_call_uses_declared_c_symbol() {
             .any(|sym| sym.trim_start_matches('_') == "getpid_c"),
         "bind(c, name=...) should not call the local Fortran alias: {:?}",
         undefined
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fortran_name_precedes_bind_c_label_for_result_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fortran_name_precedes_bind_c_label_for_result_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module collision_m\n  implicit none\n  interface\n    integer function c_alias() bind(c, name='path')\n    end function c_alias\n  end interface\ncontains\n  function path() result(text)\n    character(len=:), allocatable :: text\n    text = 'OK'\n  end function path\nend module collision_m\n\nprogram p\n  use collision_m, only: path\n  implicit none\n  character(len=:), allocatable :: text\n  text = path()\n  print '(a)', text\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("bind_c_label_result_collision", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BIND(C) label collision compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BIND(C) label collision compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("BIND(C) label collision run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "OK",
+        "BIND(C) label collision run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -16749,6 +17234,191 @@ fn block_interface_declares_callable_under_implicit_none() {
 }
 
 #[test]
+fn block_local_defined_assignment_dispatches() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_defined_assignment_dispatches count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  type(box_t) :: box\n  block\n    interface assignment(=)\n      procedure :: assign_integer\n    end interface\n    box = 7\n  end block\n  if (box%value /= 7) error stop 1\n  print *, 'ok'\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK defined-assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK defined-assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("BLOCK defined-assignment run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "BLOCK defined-assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_defined_assignment_restores_host_dispatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_defined_assignment_restores_host_dispatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_logical\n  end interface\n  type(box_t) :: box\n  block\n    interface assignment(=)\n      procedure :: assign_integer\n    end interface\n    box = 7\n  end block\n  if (box%value /= 7) error stop 1\n  box = .true.\n  if (box%value /= 11) error stop 2\n  print *, 'ok'\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\n  subroutine assign_logical(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    logical, intent(in) :: rhs\n    lhs%value = merge(11, 0, rhs)\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_defined_assignment_restore", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK defined-assignment restoration compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK defined-assignment restoration compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("BLOCK defined-assignment restoration run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "BLOCK defined-assignment restoration run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn block_local_generic_restores_intrinsic_after_exit() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=block_local_generic_restores_intrinsic_after_exit count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  block\n    interface scale\n      procedure :: local_scale\n    end interface\n    if (scale(2) /= 42) error stop 1\n  end block\n  if (scale(3.0, 2) /= 12.0) error stop 2\n  print *, 'ok'\ncontains\n  integer function local_scale(value)\n    integer, intent(in) :: value\n    local_scale = 42 + value - value\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("block_generic_intrinsic_restore", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BLOCK intrinsic restoration compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BLOCK intrinsic restoration compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("BLOCK intrinsic restoration run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "BLOCK intrinsic restoration run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn generic_candidates_keep_duplicate_specific_owners() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_candidates_keep_duplicate_specific_owners count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module integer_host\n  implicit none\n  interface choose\n    module procedure pick\n  end interface\ncontains\n  integer function pick(value)\n    integer, intent(in) :: value\n    pick = value\n  end function\nend module\nmodule logical_host\n  implicit none\n  interface choose\n    module procedure pick\n  end interface\ncontains\n  function pick(value) result(values)\n    logical, intent(in) :: value\n    logical :: values(2)\n    values = value\n  end function\nend module\nprogram p\n  use integer_host, only: choose\n  use logical_host, only: choose\n  implicit none\n  logical :: values(2)\n  values = choose(.true.)\n  if (.not. all(values)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_duplicate_specific_owners", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("duplicate generic owner compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "duplicate generic owner compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("duplicate generic owner run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "duplicate generic owner run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn same_name_generic_facet_uses_selected_result_metadata() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_generic_facet_uses_selected_result_metadata count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module same_name_host\n  implicit none\n  interface pick\n    module procedure pick\n    module procedure pick_logical\n  end interface\ncontains\n  integer function pick(value)\n    integer, intent(in) :: value\n    pick = value\n  end function\n  function pick_logical(value) result(values)\n    logical, intent(in) :: value\n    logical :: values(2)\n    values = value\n  end function\nend module\nprogram p\n  use same_name_host, only: pick\n  implicit none\n  logical :: values(2)\n  values = pick(.true.)\n  if (.not. all(values)) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("same_name_generic_result_metadata", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name generic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name generic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("same-name generic run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "same-name generic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn named_block_exit_after_deferred_char_assignment_skips_remaining_body() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -25244,6 +25914,15 @@ fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    let amod = std::fs::read_to_string(dir.join("mp.amod")).expect("missing mp.amod");
+    for specific in ["priv_a", "priv_b"] {
+        assert!(
+            amod.contains(&format!(
+                "@subroutine {specific}, module_interface, private"
+            )),
+            "private generic specific {specific} should retain its signature in mp.amod: {amod}"
+        );
+    }
     let link = Command::new(compiler("armfortas"))
         .current_dir(&dir)
         .args(["parent.o", "child.o", "main.o", "-o", "priv_iface_bin"])
@@ -25264,6 +25943,1031 @@ fn submodule_dispatching_private_parent_generic_interface_resolves_via_amod() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_submodule_requires_ancestor_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_submodule_requires_ancestor_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("missing_smp_interface");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module split_parent\n  implicit none\n  interface\n    module subroutine declared()\n    end subroutine declared\n    module subroutine preserve(value)\n      integer, intent(in) :: value\n    end subroutine preserve\n  end interface\nend module split_parent\n",
+    );
+    let valid_child = write_program_in(
+        &dir,
+        "valid_child.f90",
+        "submodule (split_parent) valid_child\ncontains\n  module subroutine declared()\n  end subroutine declared\nend submodule valid_child\n",
+    );
+    let misspelled_child = write_program_in(
+        &dir,
+        "misspelled_child.f90",
+        "submodule (split_parent) misspelled_child\ncontains\n  module subroutine declraed()\n  end subroutine declraed\nend submodule misspelled_child\n",
+    );
+    let intent_child = write_program_in(
+        &dir,
+        "intent_child.f90",
+        "submodule (split_parent) intent_child\ncontains\n  module subroutine preserve(value)\n    integer, intent(out) :: value\n  end subroutine preserve\nend submodule intent_child\n",
+    );
+
+    let parent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", parent.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "parent.o"])
+        .output()
+        .expect("parent compile failed to spawn");
+    assert!(
+        parent_compile.status.success(),
+        "parent compile failed: {}",
+        String::from_utf8_lossy(&parent_compile.stderr)
+    );
+    let parent_amod =
+        fs::read_to_string(dir.join("split_parent.amod")).expect("missing split_parent.amod");
+    assert!(
+        parent_amod.contains("@subroutine declared, module_interface"),
+        "separate-procedure interface marker was not serialized: {parent_amod}"
+    );
+
+    let valid_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", valid_child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "valid_child.o"])
+        .output()
+        .expect("valid child compile failed to spawn");
+    assert!(
+        valid_compile.status.success(),
+        "declared separate procedure should compile: {}",
+        String::from_utf8_lossy(&valid_compile.stderr)
+    );
+
+    let invalid_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            misspelled_child.file_name().unwrap().to_str().unwrap(),
+        ])
+        .args(["-o", "misspelled_child.o"])
+        .output()
+        .expect("misspelled child compile failed to spawn");
+    assert!(
+        !invalid_compile.status.success(),
+        "an undeclared separate procedure must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&invalid_compile.stderr);
+    assert!(
+        stderr.contains("separate module procedure 'declraed'")
+            && stderr.contains("no matching interface")
+            && stderr.contains("split_parent"),
+        "unexpected missing-interface diagnostic: {stderr}"
+    );
+
+    let intent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", intent_child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "intent_child.o"])
+        .output()
+        .expect("INTENT-mismatched child compile failed to spawn");
+    assert!(
+        !intent_compile.status.success(),
+        "a separate procedure with mismatched INTENT must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&intent_compile.stderr);
+    assert!(
+        stderr.contains("dummy argument 'value'")
+            && stderr.contains("INTENT(OUT)")
+            && stderr.contains("INTENT(IN)")
+            && stderr.contains("does not match"),
+        "unexpected INTENT diagnostic: {stderr}"
+    );
+
+    let defined_parent = write_program_in(
+        &dir,
+        "defined_parent.f90",
+        "module defined_parent\n  implicit none\ncontains\n  subroutine already_defined()\n  end subroutine already_defined\nend module defined_parent\n",
+    );
+    let duplicate_child = write_program_in(
+        &dir,
+        "duplicate_child.f90",
+        "submodule (defined_parent) duplicate_child\ncontains\n  module subroutine already_defined()\n  end subroutine already_defined\nend submodule duplicate_child\n",
+    );
+    let defined_parent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", defined_parent.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "defined_parent.o"])
+        .output()
+        .expect("defined parent compile failed to spawn");
+    assert!(
+        defined_parent_compile.status.success(),
+        "defined parent compile failed: {}",
+        String::from_utf8_lossy(&defined_parent_compile.stderr)
+    );
+    let duplicate_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", duplicate_child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "duplicate_child.o"])
+        .output()
+        .expect("duplicate child compile failed to spawn");
+    assert!(
+        !duplicate_compile.status.success(),
+        "a defined ancestor procedure must not stand in for a separate-procedure interface"
+    );
+    let stderr = String::from_utf8_lossy(&duplicate_compile.stderr);
+    assert!(
+        stderr.contains("separate module procedure 'already_defined'")
+            && stderr.contains("no matching interface")
+            && stderr.contains("defined_parent"),
+        "unexpected defined-procedure diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn descendant_submodule_uses_root_ancestor_interfaces() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descendant_submodule_uses_root_ancestor_interfaces count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("nested_ancestor_interfaces");
+    let src = write_program_in(
+        &dir,
+        "nested_ancestor_interfaces.f90",
+        "module nested_parent\n  implicit none\n  interface\n    module subroutine set_explicit(value)\n      integer, intent(out) :: value\n    end subroutine set_explicit\n    module subroutine set_abbreviated(value)\n      integer, intent(out) :: value\n    end subroutine set_abbreviated\n  end interface\nend module nested_parent\n\nsubmodule (nested_parent) middle\nend submodule middle\n\nsubmodule (nested_parent:middle) leaf\ncontains\n  module subroutine set_explicit(value)\n    integer, intent(out) :: value\n    value = 11\n  end subroutine set_explicit\n\n  module procedure set_abbreviated\n    implicit none\n    value = 22\n  end procedure set_abbreviated\nend submodule leaf\n",
+    );
+    let out = dir.join("nested_ancestor_interfaces.o");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-J", dir.to_str().unwrap()])
+        .args([src.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", out.file_name().unwrap().to_str().unwrap()])
+        .output()
+        .expect("nested submodule compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "descendant procedures should use root ancestor interfaces: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_requires_immediate_parent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_requires_immediate_parent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("missing_immediate_submodule_parent");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module nested_root\n  implicit none\nend module nested_root\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (nested_root:no_such_parent) nested_leaf\nend submodule nested_leaf\n",
+    );
+
+    let root_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", root.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "root.o"])
+        .output()
+        .expect("root compile failed to spawn");
+    assert!(
+        root_compile.status.success(),
+        "root compile failed: {}",
+        String::from_utf8_lossy(&root_compile.stderr)
+    );
+
+    let leaf_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "leaf.o"])
+        .output()
+        .expect("leaf compile failed to spawn");
+    assert!(
+        !leaf_compile.status.success(),
+        "a valid root module must not satisfy a missing immediate submodule parent"
+    );
+    let stderr = String::from_utf8_lossy(&leaf_compile.stderr);
+    assert!(
+        stderr.contains("nested_root:no_such_parent")
+            && stderr.contains("immediate parent submodule"),
+        "unexpected missing-parent diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn descendant_submodule_rejects_reverse_order_and_parent_cycles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descendant_submodule_rejects_reverse_order_and_parent_cycles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("invalid_submodule_order");
+    let reverse = write_program_in(
+        &dir,
+        "reverse.f90",
+        "module order_root\nend module order_root\nsubmodule (order_root:order_middle) order_leaf\nend submodule order_leaf\nsubmodule (order_root) order_middle\nend submodule order_middle\n",
+    );
+    let reverse_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", reverse.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "reverse.o"])
+        .output()
+        .expect("reverse-order compile failed to spawn");
+    assert!(
+        !reverse_compile.status.success(),
+        "a descendant must not bind to a parent declared later in the file"
+    );
+    let stderr = String::from_utf8_lossy(&reverse_compile.stderr);
+    assert!(
+        stderr.contains("order_root:order_middle") && stderr.contains("immediate parent submodule"),
+        "unexpected reverse-order diagnostic: {stderr}"
+    );
+
+    let cycle = write_program_in(
+        &dir,
+        "cycle.f90",
+        "module cycle_root\nend module cycle_root\nsubmodule (cycle_root:cycle_right) cycle_left\nend submodule cycle_left\nsubmodule (cycle_root:cycle_left) cycle_right\nend submodule cycle_right\n",
+    );
+    let cycle_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", cycle.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "cycle.o"])
+        .output()
+        .expect("cyclic-parent compile failed to spawn");
+    assert!(
+        !cycle_compile.status.success(),
+        "a cyclic submodule parent chain must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&cycle_compile.stderr);
+    assert!(
+        stderr.contains("cycle_root:cycle_right") && stderr.contains("immediate parent submodule"),
+        "unexpected parent-cycle diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_uses_immediate_parent_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_uses_immediate_parent_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("cross_tu_submodule_parent");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module chain_root\n  implicit none\n  private\n  integer, parameter :: root_secret = 40\nend module chain_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (chain_root) chain_middle\n  implicit none\n  integer, parameter :: middle_value = root_secret + 1\nend submodule chain_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (chain_root:chain_middle) chain_leaf\n  implicit none\n  integer, parameter :: leaf_value = middle_value + root_secret\nend submodule chain_leaf\n",
+    );
+    let grandchild = write_program_in(
+        &dir,
+        "grandchild.f90",
+        "submodule (chain_root:chain_leaf) chain_grandchild\n  implicit none\n  integer, parameter :: grand_value = leaf_value + middle_value + root_secret\nend submodule chain_grandchild\n",
+    );
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+
+    for (source, object) in [(&root, "root.o"), (&middle, "middle.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("provider compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "provider compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+    assert!(
+        module_dir.join("chain_root@chain_middle.smod").exists(),
+        "middle submodule should emit its compatibility record"
+    );
+    assert!(
+        module_dir.join("chain_root@chain_middle.amod").exists(),
+        "middle submodule should emit its semantic interface"
+    );
+
+    let leaf_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "leaf.o"])
+        .output()
+        .expect("leaf compile failed to spawn");
+    assert!(
+        leaf_compile.status.success(),
+        "descendant should inherit immediate-parent and private root declarations: {}",
+        String::from_utf8_lossy(&leaf_compile.stderr)
+    );
+    assert!(
+        module_dir.join("chain_root@chain_leaf.smod").exists()
+            && module_dir.join("chain_root@chain_leaf.amod").exists(),
+        "a nested submodule should emit canonical artifacts for its descendants"
+    );
+
+    let grandchild_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", grandchild.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "grandchild.o"])
+        .output()
+        .expect("grandchild compile failed to spawn");
+    assert!(
+        grandchild_compile.status.success(),
+        "deeper descendants should inherit the complete parent chain: {}",
+        String::from_utf8_lossy(&grandchild_compile.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_preserves_implemented_parent_procedure_owner() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_preserves_implemented_parent_procedure_owner count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_implemented_procedure_owner");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module owner_root\n  implicit none\n  private\n  public :: read_value\n  interface\n    module function implemented_value() result(value)\n      integer :: value\n    end function implemented_value\n    module subroutine read_value(value)\n      integer, intent(out) :: value\n    end subroutine read_value\n  end interface\nend module owner_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (owner_root) owner_middle\ncontains\n  module function implemented_value() result(value)\n    integer :: value\n    value = 42\n  end function implemented_value\nend submodule owner_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (owner_root:owner_middle) owner_leaf\ncontains\n  module subroutine read_value(value)\n    integer, intent(out) :: value\n    value = implemented_value()\n  end subroutine read_value\nend submodule owner_leaf\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program owner_user\n  use owner_root, only: read_value\n  implicit none\n  integer :: value\n  call read_value(value)\n  if (value /= 42) error stop 1\n  print *, 'ok'\nend program owner_user\n",
+    );
+    let forbidden = write_program_in(
+        &dir,
+        "forbidden.f90",
+        "program forbidden_owner_user\n  use owner_root, only: implemented_value\n  implicit none\n  print *, implemented_value()\nend program forbidden_owner_user\n",
+    );
+
+    for (source, object) in [
+        (&root, "root.o"),
+        (&middle, "middle.o"),
+        (&leaf, "leaf.o"),
+        (&main, "main.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("implemented-parent compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "implemented-parent compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let forbidden_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", forbidden.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "forbidden.o"])
+        .output()
+        .expect("private-procedure compile failed to spawn");
+    assert!(
+        !forbidden_compile.status.success(),
+        "serializing a private ancestor procedure must not export it through USE"
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["root.o", "middle.o", "leaf.o", "main.o"])
+        .args(["-o", "implemented_parent"])
+        .output()
+        .expect("implemented-parent link failed to spawn");
+    assert!(
+        link.status.success(),
+        "implemented-parent link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(dir.join("implemented_parent"))
+        .output()
+        .expect("implemented-parent run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "implemented-parent executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_preserves_ancestor_owned_abi_metadata() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_preserves_ancestor_owned_abi_metadata count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_ancestor_abi_owner");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module abi_owner_root\n  implicit none\n  interface\n    module subroutine compute_payload(result, values, text, bias)\n      integer, intent(out) :: result\n      integer, intent(in) :: values(:)\n      character(*), intent(in) :: text\n      integer, intent(in), optional, value :: bias\n    end subroutine compute_payload\n    module subroutine required_payload(result, text)\n      integer, intent(out) :: result\n      character(*), intent(in) :: text\n    end subroutine required_payload\n    module subroutine run_case(result)\n      integer, intent(out) :: result\n    end subroutine run_case\n  end interface\nend module abi_owner_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (abi_owner_root) abi_owner_middle\ncontains\n  module subroutine required_payload(result, text)\n    integer, intent(out) :: result\n    character(*), intent(in) :: text\n    result = len(text)\n  end subroutine required_payload\nend submodule abi_owner_middle\n",
+    );
+    let unrelated = write_program_in(
+        &dir,
+        "unrelated.f90",
+        "module unrelated_abi\n  implicit none\ncontains\n  subroutine compute_payload(result, value)\n    integer, intent(out) :: result\n    integer, intent(in) :: value\n    result = value\n  end subroutine compute_payload\n  subroutine required_payload(result, text, bias)\n    integer, intent(out) :: result\n    integer, intent(in) :: text\n    integer, intent(in), optional :: bias\n    result = text\n    if (present(bias)) result = result + bias\n  end subroutine required_payload\nend module unrelated_abi\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "module earlier_collision\n  implicit none\ncontains\n  subroutine compute_payload(result, value)\n    integer, intent(out) :: result\n    integer, intent(in) :: value\n    result = value\n  end subroutine compute_payload\nend module earlier_collision\n\nsubmodule (abi_owner_root:abi_owner_middle) abi_owner_leaf\n  use unrelated_abi, only: unrelated_compute => compute_payload, unrelated_required => required_payload\n  implicit none\ncontains\n  module subroutine compute_payload(result, values, text, bias)\n    integer, intent(out) :: result\n    integer, intent(in) :: values(:)\n    character(*), intent(in) :: text\n    integer, intent(in), optional, value :: bias\n    result = sum(values) + len(text)\n    if (present(bias)) result = result + bias\n  end subroutine compute_payload\n  module subroutine run_case(result)\n    integer, intent(out) :: result\n    integer :: required\n    integer :: values(2) = [10, 11]\n    call compute_payload(result, values, 'abc')\n    call required_payload(required, 'hello')\n    result = result + required\n  end subroutine run_case\nend submodule abi_owner_leaf\n\nsubroutine compute_payload(result, value)\n  integer, intent(out) :: result\n  integer, intent(in) :: value\n  result = value\nend subroutine compute_payload\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program abi_owner_user\n  use abi_owner_root, only: run_case\n  implicit none\n  integer :: result\n  call run_case(result)\n  if (result /= 29) error stop 1\n  print *, 'ok'\nend program abi_owner_user\n",
+    );
+
+    for (source, object) in [
+        (&root, "root.o"),
+        (&middle, "middle.o"),
+        (&unrelated, "unrelated.o"),
+        (&leaf, "leaf.o"),
+        (&main, "main.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("ancestor-ABI compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "ancestor-ABI compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let leaf_interface = fs::read_to_string(module_dir.join("abi_owner_root@abi_owner_leaf.amod"))
+        .expect("missing descendant semantic interface");
+    let compute_interface = leaf_interface
+        .split("@subroutine compute_payload")
+        .nth(1)
+        .and_then(|tail| tail.split("@end subroutine").next())
+        .expect("missing compute_payload interface");
+    assert!(
+        compute_interface
+            .lines()
+            .any(|line| line.contains("@arg values") && line.contains("descriptor")),
+        "same-named procedures corrupted descriptor metadata: {compute_interface}"
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["root.o", "middle.o", "unrelated.o", "leaf.o", "main.o"])
+        .args(["-o", "ancestor_abi"])
+        .output()
+        .expect("ancestor-ABI link failed to spawn");
+    assert!(
+        link.status.success(),
+        "ancestor-ABI link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(dir.join("ancestor_abi"))
+        .output()
+        .expect("ancestor-ABI run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "ancestor-ABI executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_retains_parent_import_policy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_retains_parent_import_policy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_parent_import_policy");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module import_policy_root\n  implicit none\n  integer, parameter :: visible = 1, hidden = 2\nend module import_policy_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (import_policy_root) import_policy_middle\n  import, only: visible\n  implicit none\n  integer, parameter :: middle_local = visible + 1\nend submodule import_policy_middle\n",
+    );
+    let accepted = write_program_in(
+        &dir,
+        "accepted.f90",
+        "submodule (import_policy_root:import_policy_middle) import_policy_accepted\n  import :: visible, middle_local\n  implicit none\n  integer, parameter :: selected = visible + middle_local\nend submodule import_policy_accepted\n",
+    );
+    let rejected = write_program_in(
+        &dir,
+        "rejected.f90",
+        "submodule (import_policy_root:import_policy_middle) import_policy_rejected\n  import :: hidden\nend submodule import_policy_rejected\n",
+    );
+
+    for (source, object) in [(&root, "root.o"), (&middle, "middle.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("import-policy provider compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "import-policy provider compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let accepted_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", accepted.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "accepted.o"])
+        .output()
+        .expect("accepted import-policy compile failed to spawn");
+    assert!(
+        accepted_compile.status.success(),
+        "allowed parent entities should remain visible: {}",
+        String::from_utf8_lossy(&accepted_compile.stderr)
+    );
+
+    let rejected_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", rejected.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "rejected.o"])
+        .output()
+        .expect("rejected import-policy compile failed to spawn");
+    assert!(
+        !rejected_compile.status.success(),
+        "a descendant must not recover an ancestor entity hidden by its parent"
+    );
+    let stderr = String::from_utf8_lossy(&rejected_compile.stderr);
+    assert!(
+        stderr.contains("IMPORT name 'hidden' does not identify a host entity"),
+        "unexpected restricted-parent diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_preserves_parent_procedure_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_preserves_parent_procedure_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_parent_procedure");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module procedure_root\n  implicit none\n  private\n  public :: run_chain\n  type :: payload_t\n    integer :: value = 0\n  end type payload_t\n  interface\n    module subroutine run_chain(result, values, bias)\n      integer, intent(out) :: result\n      integer, intent(in) :: values(:)\n      integer, intent(in), optional, value :: bias\n    end subroutine run_chain\n  end interface\nend module procedure_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (procedure_root) procedure_middle\n  implicit none\n  interface build\n    module function make_payload(values, scale) result(value)\n      import :: payload_t\n      integer, intent(in) :: values(:)\n      integer, intent(in), value :: scale\n      type(payload_t) :: value\n    end function make_payload\n  end interface build\nend submodule procedure_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (procedure_root:procedure_middle) procedure_leaf\n  implicit none\ncontains\n  module function make_payload(values, scale) result(value)\n    integer, intent(in) :: values(:)\n    integer, intent(in), value :: scale\n    type(payload_t) :: value\n    value%value = sum(values) * scale\n  end function make_payload\n  module subroutine run_chain(result, values, bias)\n    integer, intent(out) :: result\n    integer, intent(in) :: values(:)\n    integer, intent(in), optional, value :: bias\n    type(payload_t) :: item\n    item = build(values, 2)\n    result = item%value\n    if (present(bias)) result = result + bias\n  end subroutine run_chain\nend submodule procedure_leaf\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program procedure_user\n  use procedure_root, only: run_chain\n  implicit none\n  integer :: result\n  integer :: values(2) = [10, 11]\n  call run_chain(result, values, bias=1)\n  if (result /= 43) error stop 1\n  call run_chain(result, values)\n  if (result /= 42) error stop 2\n  print *, 'ok'\nend program procedure_user\n",
+    );
+
+    for (source, object) in [
+        (&root, "root.o"),
+        (&middle, "middle.o"),
+        (&leaf, "leaf.o"),
+        (&main, "main.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("procedure-chain compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "procedure-chain compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["root.o", "middle.o", "leaf.o", "main.o"])
+        .args(["-o", "procedure_chain"])
+        .output()
+        .expect("procedure-chain link failed to spawn");
+    assert!(
+        link.status.success(),
+        "procedure-chain link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(dir.join("procedure_chain"))
+        .output()
+        .expect("procedure-chain run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure-chain executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submodule_loading_preserves_module_search_precedence() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_loading_preserves_module_search_precedence count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_search_precedence");
+    let first = dir.join("first");
+    let second = dir.join("second");
+    let output = dir.join("output");
+    fs::create_dir_all(&first).expect("cannot create first module directory");
+    fs::create_dir_all(&second).expect("cannot create second module directory");
+    fs::create_dir_all(&output).expect("cannot create output module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module precedence_root\nend module precedence_root\n",
+    );
+    let first_dep = write_program_in(
+        &dir,
+        "first_dep.f90",
+        "module precedence_dep\n  integer, parameter :: first_only = 1\nend module precedence_dep\n",
+    );
+    let second_dep = write_program_in(
+        &dir,
+        "second_dep.f90",
+        "module precedence_dep\n  integer, parameter :: second_only = 2\nend module precedence_dep\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (precedence_root) precedence_middle\n  use precedence_dep\nend submodule precedence_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (precedence_root:precedence_middle) precedence_leaf\n  implicit none\n  integer, parameter :: selected = first_only\nend submodule precedence_leaf\n",
+    );
+
+    for module_dir in [&first, &second] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", root.file_name().unwrap().to_str().unwrap()])
+            .arg("-J")
+            .arg(module_dir)
+            .args(["-o", "root.o"])
+            .output()
+            .expect("root compile failed to spawn");
+        assert!(compile.status.success(), "root compile failed");
+    }
+    for (source, module_dir, object) in [
+        (&first_dep, &first, "first_dep.o"),
+        (&second_dep, &second, "second_dep.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .arg("-J")
+            .arg(module_dir)
+            .args(["-o", object])
+            .output()
+            .expect("dependency compile failed to spawn");
+        assert!(compile.status.success(), "dependency compile failed");
+    }
+    let middle_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", middle.file_name().unwrap().to_str().unwrap()])
+        .arg("-I")
+        .arg(&second)
+        .arg("-J")
+        .arg(&second)
+        .args(["-o", "middle.o"])
+        .output()
+        .expect("middle compile failed to spawn");
+    assert!(
+        middle_compile.status.success(),
+        "middle compile failed: {}",
+        String::from_utf8_lossy(&middle_compile.stderr)
+    );
+
+    let leaf_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .arg("-I")
+        .arg(&first)
+        .arg("-I")
+        .arg(&second)
+        .arg("-J")
+        .arg(&output)
+        .args(["-o", "leaf.o"])
+        .output()
+        .expect("leaf compile failed to spawn");
+    assert!(
+        leaf_compile.status.success(),
+        "submodule loading changed -I precedence: {}",
+        String::from_utf8_lossy(&leaf_compile.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_rejects_missing_or_stale_parent_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_rejects_missing_or_stale_parent_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("invalid_submodule_parent_interface");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module metadata_root\nend module metadata_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (metadata_root) metadata_middle\nend submodule metadata_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (metadata_root:metadata_middle) metadata_leaf\nend submodule metadata_leaf\n",
+    );
+
+    for (source, object) in [(&root, "root.o"), (&middle, "middle.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-o", object])
+            .output()
+            .expect("provider compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "provider compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let interface = dir.join("metadata_root@metadata_middle.amod");
+    let interface_text = fs::read_to_string(&interface).expect("missing submodule interface");
+    let smod = dir.join("metadata_root@metadata_middle.smod");
+    let smod_text = fs::read_to_string(&smod).expect("missing submodule record");
+    fs::remove_file(&interface).expect("cannot remove submodule interface");
+    let missing_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "missing.o"])
+        .output()
+        .expect("missing-interface compile failed to spawn");
+    assert!(
+        !missing_compile.status.success(),
+        "the metadata-only .smod record must not satisfy semantic parent resolution"
+    );
+
+    fs::write(&interface, &interface_text).expect("cannot restore submodule interface");
+    fs::remove_file(&smod).expect("cannot remove submodule record");
+    let missing_record_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "missing_record.o"])
+        .output()
+        .expect("missing-record compile failed to spawn");
+    assert!(
+        !missing_record_compile.status.success(),
+        "the semantic companion must not bypass its .smod identity record"
+    );
+
+    let legacy_smod = smod_text.replacen("#!smod 2", "#!smod 1", 1);
+    fs::write(&smod, legacy_smod).expect("cannot write legacy submodule record");
+    let legacy_record_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "legacy_record.o"])
+        .output()
+        .expect("legacy-record compile failed to spawn");
+    assert!(
+        !legacy_record_compile.status.success(),
+        "a metadata-only version-1 record must require a parent rebuild"
+    );
+    let stderr = String::from_utf8_lossy(&legacy_record_compile.stderr);
+    assert!(
+        stderr.contains("incompatible .smod version 1") && stderr.contains("compiler requires 2"),
+        "unexpected legacy-record diagnostic: {stderr}"
+    );
+
+    fs::write(&smod, smod_text).expect("cannot restore submodule record");
+    fs::write(
+        &middle,
+        "submodule (metadata_root) metadata_middle\n  integer, parameter :: generation = 2\nend submodule metadata_middle\n",
+    )
+    .expect("cannot update parent submodule source");
+    let rebuilt_middle = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", middle.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "middle.o"])
+        .output()
+        .expect("rebuilt parent compile failed to spawn");
+    assert!(
+        rebuilt_middle.status.success(),
+        "rebuilt parent compile failed: {}",
+        String::from_utf8_lossy(&rebuilt_middle.stderr)
+    );
+    fs::write(&interface, interface_text).expect("cannot restore stale semantic interface");
+    let stale_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "stale.o"])
+        .output()
+        .expect("stale-interface compile failed to spawn");
+    assert!(
+        !stale_compile.status.success(),
+        "an incompatible immediate-parent interface must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&stale_compile.stderr);
+    assert!(
+        stderr.contains("does not match the checksum in")
+            && stderr.contains("metadata_root:metadata_middle"),
+        "unexpected stale-interface diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_submodule_retains_implicit_none() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_submodule_retains_implicit_none count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_implicit_none");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module implicit_parent\n  interface\n    module subroutine run()\n    end subroutine run\n  end interface\nend module implicit_parent\n",
+    );
+    let child = write_program_in(
+        &dir,
+        "child.f90",
+        "submodule (implicit_parent) implicit_child\n  implicit none\ncontains\n  module subroutine run()\n    typo = 1\n  end subroutine run\nend submodule implicit_child\n",
+    );
+
+    let parent_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", parent.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "parent.o"])
+        .output()
+        .expect("implicit parent compile failed to spawn");
+    assert!(
+        parent_compile.status.success(),
+        "implicit parent compile failed: {}",
+        String::from_utf8_lossy(&parent_compile.stderr)
+    );
+
+    let child_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", child.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "child.o"])
+        .output()
+        .expect("implicit child compile failed to spawn");
+    assert!(
+        !child_compile.status.success(),
+        "submodule-local IMPLICIT NONE must reject undeclared names"
+    );
+    let stderr = String::from_utf8_lossy(&child_compile.stderr);
+    assert!(
+        stderr.contains("variable 'typo' used but not declared")
+            && stderr.contains("IMPLICIT NONE is active"),
+        "unexpected submodule IMPLICIT NONE diagnostic: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -28316,7 +30020,7 @@ fn fdefault_integer_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  integer :: x\n  print *, kind(x)\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    procedure :: assign_integer\n  end interface\n  integer :: x\n  type(box_t) :: box\n  x = 5\n  box = x\n  if (box%value /= 5) error stop 1\n  print *, kind(x)\ncontains\n  subroutine assign_integer(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    integer, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("defint", "bin");
@@ -28341,6 +30045,31 @@ fn fdefault_integer_8_changes_default_kind() {
         "expected kind 8: {:?}",
         stdout
     );
+
+    let invalid_src = write_program(
+        "program p\n  implicit none\n  integer :: value\n  value = .true.\nend program\n",
+        "f90",
+    );
+    let invalid_out = unique_path("defint_assignment_diag", "o");
+    let invalid = Command::new(compiler("armfortas"))
+        .args([
+            "-fdefault-integer-8",
+            "-c",
+            invalid_src.to_str().unwrap(),
+            "-o",
+            invalid_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("default-integer assignment diagnostic compile failed to spawn");
+    assert!(
+        !invalid.status.success()
+            && String::from_utf8_lossy(&invalid.stderr).contains("LOGICAL(8) to INTEGER(8)"),
+        "default-integer assignment diagnostic used the wrong kind: {}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+
+    let _ = std::fs::remove_file(&invalid_out);
+    let _ = std::fs::remove_file(&invalid_src);
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }
@@ -28355,7 +30084,7 @@ fn fdefault_real_8_changes_default_kind() {
         return;
     }
     let src = write_program(
-        "program p\n  real :: y\n  print *, kind(y)\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    real :: value = 0.0\n  end type\n  interface assignment(=)\n    procedure :: assign_real\n  end interface\n  real :: y\n  type(box_t) :: box\n  y = 2.5\n  box = y\n  if (box%value /= 2.5) error stop 1\n  print *, kind(y)\ncontains\n  subroutine assign_real(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    real, intent(in) :: rhs\n    lhs%value = rhs\n  end subroutine\nend program\n",
         "f90",
     );
     let out = unique_path("defreal", "bin");
@@ -30718,7 +32447,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 5\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 7\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -47828,7 +49557,7 @@ fn selected_char_kind_folds_character_parameter_name() {
         return;
     }
     let src = write_program(
-        "module kinds\n  implicit none\n  integer, parameter :: cdk = selected_char_kind('DEFAULT')\n  character(kind=cdk,len=*), parameter :: json_fortran_string_kind = 'ISO_10646'\n  integer, parameter :: ck = selected_char_kind(json_fortran_string_kind)\ncontains\n  subroutine check()\n    if (cdk /= 1) error stop 1\n    if (ck /= 4) error stop 2\n  end subroutine\nend module\n\nprogram p\n  use kinds, only : check\n  implicit none\n  if (selected_char_kind('ASCII') /= 1) error stop 3\n  if (selected_char_kind('ISO_10646') /= 4) error stop 4\n  call check()\n  print *, 'ok'\nend program\n",
+        "module kinds\n  implicit none\n  integer, parameter :: cdk = selected_char_kind('DEFAULT')\n  character(kind=cdk,len=*), parameter :: json_fortran_string_kind = 'ISO_10646'\n  integer, parameter :: ck = selected_char_kind(json_fortran_string_kind)\n  integer, parameter :: leading = selected_char_kind(' ASCII')\n  integer, parameter :: trailing = selected_char_kind('ASCII   ')\ncontains\n  subroutine check()\n    if (cdk /= 1) error stop 1\n    if (ck /= -1) error stop 2\n    if (leading /= -1) error stop 3\n    if (trailing /= 1) error stop 4\n  end subroutine\nend module\n\nprogram p\n  use kinds, only : check\n  implicit none\n  character(len=12) :: name\n  if (selected_char_kind('ASCII') /= 1) error stop 5\n  if (selected_char_kind('ISO_10646') /= -1) error stop 6\n  if (selected_char_kind(' ASCII') /= -1) error stop 7\n  name = 'ISO_10646'\n  if (selected_char_kind(name) /= -1) error stop 8\n  name = 'ASCII'\n  if (selected_char_kind(name) /= 1) error stop 9\n  name = ' ASCII'\n  if (selected_char_kind(name) /= -1) error stop 10\n  name = achar(9) // 'ASCII'\n  if (selected_char_kind(name) /= -1) error stop 11\n  call check()\n  print *, 'ok'\nend program\n",
         "f90",
     );
     let out = unique_path("selected_char_kind_param_name", "bin");
@@ -47847,6 +49576,43 @@ fn selected_char_kind_folds_character_parameter_name() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "selected_char_kind: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fraction_exponent_and_scale_lower_scalar_and_array_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fraction_exponent_and_scale_lower_scalar_and_array_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real(4) :: x4(2,2), f4(2,2), s4(2,2), sub4\n  real(8) :: x8(2,2), f8(2,2), s8(2,2), sub8\n  integer :: e4(2,2), e8(2,2)\n  sub4 = tiny(1.0) * epsilon(1.0)\n  sub8 = tiny(1.0d0) * epsilon(1.0d0)\n  x4 = reshape([3.0, -6.5, sub4, 0.0], [2,2])\n  x8 = reshape([3.0d0, -6.5d0, sub8, 0.0d0], [2,2])\n  f4 = fraction(x4)\n  f8 = fraction(x8)\n  e4 = exponent(x4)\n  e8 = exponent(x8)\n  if (any(f4 /= reshape([0.75, -0.8125, 0.5, 0.0], [2,2]))) error stop 1\n  if (any(f8 /= reshape([0.75d0, -0.8125d0, 0.5d0, 0.0d0], [2,2]))) error stop 2\n  if (any(e4 /= reshape([2, 3, -148, 0], [2,2]))) error stop 3\n  if (any(e8 /= reshape([2, 3, -1073, 0], [2,2]))) error stop 4\n  s4 = scale(x4, reshape([2, -2, 149, 17], [2,2]))\n  s8 = scale(x8, reshape([2, -2, 1074, 17], [2,2]))\n  if (any(s4 /= reshape([12.0, -1.625, 1.0, 0.0], [2,2]))) error stop 5\n  if (any(s8 /= reshape([12.0d0, -1.625d0, 1.0d0, 0.0d0], [2,2]))) error stop 6\n  s8 = scale(x8, 2_8)\n  if (any(s8 /= 4.0d0 * x8)) error stop 7\n  if (scale(3.0, 2_1) /= 12.0) error stop 8\n  if (scale(3.0, 2_2) /= 12.0) error stop 9\n  if (scale(3.0, 2_4) /= 12.0) error stop 10\n  if (scale(3.0d0, 2_8) /= 12.0d0) error stop 11\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fraction_exponent_scale", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("model intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "model intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("model intrinsic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "model intrinsic run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)

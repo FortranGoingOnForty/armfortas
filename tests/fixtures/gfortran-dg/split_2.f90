@@ -4,6 +4,7 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! FLAGS: --std=f2023
 ! EXIT_CODE: 0
+! XFAIL: XFAIL-006 ISO_10646 character data requires a supported nondefault character kind
 program b
   integer, parameter :: ucs4 = selected_char_kind('ISO_10646')
   character(kind=ucs4, len=:), allocatable :: input, set
