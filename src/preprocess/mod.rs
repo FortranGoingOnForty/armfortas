@@ -153,7 +153,16 @@ impl std::error::Error for PreprocError {}
 
 /// Preprocess Fortran source text with given configuration.
 pub fn preprocess(source: &str, config: &PreprocConfig) -> Result<PreprocOutput, PreprocError> {
-    let mut pp = Preprocessor::new(config);
+    let mut pp = Preprocessor::new(config, true);
+    pp.process(source, &config.filename)
+}
+
+/// Preprocess for dependency discovery without emitting user-facing warnings.
+pub(crate) fn preprocess_for_dependency_scan(
+    source: &str,
+    config: &PreprocConfig,
+) -> Result<PreprocOutput, PreprocError> {
+    let mut pp = Preprocessor::new(config, false);
     pp.process(source, &config.filename)
 }
 
@@ -189,6 +198,8 @@ struct Preprocessor {
     fixed_form: bool,
     /// GNU-style preprocessing compatibility mode.
     cpp_compat: bool,
+    /// Whether active #warning directives should be printed.
+    emit_warnings: bool,
     /// Whether source stripping is currently inside a C-style block comment.
     in_c_block_comment: bool,
     /// #line overrides for source map reporting.
@@ -197,12 +208,13 @@ struct Preprocessor {
 }
 
 impl Preprocessor {
-    fn new(config: &PreprocConfig) -> Self {
+    fn new(config: &PreprocConfig, emit_warnings: bool) -> Self {
         Self {
             defines: config.defines.clone(),
             include_paths: config.include_paths.clone(),
             fixed_form: config.fixed_form,
             cpp_compat: config.cpp_compat,
+            emit_warnings,
             in_c_block_comment: false,
             line_override: None,
             cond_stack: Vec::new(),
@@ -420,7 +432,9 @@ impl Preprocessor {
                 msg: format!("#error {}", args),
             }),
             "warning" => {
-                eprintln!("{}:{}: warning: #warning {}", filename, line_num, args);
+                if self.emit_warnings {
+                    eprintln!("{}:{}: warning: #warning {}", filename, line_num, args);
+                }
                 Ok(())
             }
             "line" => self.do_line(args, filename, line_num),

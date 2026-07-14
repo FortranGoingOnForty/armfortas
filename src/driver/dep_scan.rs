@@ -28,11 +28,17 @@ pub struct FileDeps {
     pub submodule_of: Option<(String, String)>,
 }
 
-/// Scan a source file for MODULE and USE statements.
+/// Preprocess and scan a source file for MODULE and USE statements.
 /// Uses a simple line-by-line keyword scan — no lexer or parser needed.
-pub fn scan_file(path: &Path) -> Result<FileDeps, String> {
+pub fn scan_file(
+    path: &Path,
+    config: &crate::preprocess::PreprocConfig,
+) -> Result<FileDeps, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
+    let content = crate::preprocess::preprocess_for_dependency_scan(&content, config)
+        .map_err(|e| e.to_string())?
+        .text;
 
     let mut defines = Vec::new();
     let mut uses = Vec::new();
@@ -241,10 +247,24 @@ mod tests {
             "module mymod\n  use other_mod\n  implicit none\nend module\n",
         )
         .unwrap();
-        let deps = scan_file(&f).unwrap();
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
         assert_eq!(deps.defines, vec!["mymod"]);
         assert_eq!(deps.uses, vec!["other_mod"]);
         assert_eq!(deps.submodule_of, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_ignores_inactive_preprocessor_branches() {
+        let dir = std::env::temp_dir().join("dep_scan_inactive_branch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.F90");
+        std::fs::write(&f, "module a\n#if 0\n  use b\n#endif\nend module a\n").unwrap();
+
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
+        assert_eq!(deps.defines, vec!["a"]);
+        assert!(deps.uses.is_empty(), "inactive USE became a dependency");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -258,7 +278,7 @@ mod tests {
             "submodule (myparent) impl\ncontains\n  module procedure foo\n  end procedure\nend submodule\n",
         )
         .unwrap();
-        let deps = scan_file(&f).unwrap();
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
         // Depends on the parent module; `module procedure foo` is not a def.
         assert_eq!(deps.uses, vec!["myparent"]);
         assert_eq!(deps.defines, vec!["myparent:impl"]);
@@ -275,7 +295,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("grand.f90");
         std::fs::write(&f, "submodule (anc:par) grand\nend submodule\n").unwrap();
-        let deps = scan_file(&f).unwrap();
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
         assert_eq!(deps.uses, vec!["anc:par"]);
         assert_eq!(deps.defines, vec!["anc:grand"]);
         assert_eq!(

@@ -214,6 +214,77 @@ fn combined_compile_preserves_target_and_preprocessor_options() {
 }
 
 #[test]
+fn combined_compile_ignores_macro_disabled_dependency_edges() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("a.F90"),
+        "#warning dependency scan should stay quiet\nmodule a\n#ifndef ACTIVE_BUILD\n  use b\n#endif\n#ifndef __x86_64__\n  use b\n#endif\n#ifndef __FreeBSD__\n  use b\n#endif\nend module a\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("b.F90"), "module b\n  use a\nend module b\n").unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            "--target",
+            "x86_64-freebsd",
+            "-DACTIVE_BUILD",
+            "-c",
+            "b.F90",
+            "a.F90",
+        ])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "inactive branch created a dependency cycle:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(dir.join("a.o").is_file());
+    assert!(dir.join("b.o").is_file());
+    assert_eq!(
+        String::from_utf8_lossy(&result.stderr)
+            .matches("#warning dependency scan should stay quiet")
+            .count(),
+        1,
+        "dependency preprocessing duplicated user-facing warnings"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_orders_dependencies_from_preprocessor_includes() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let includes = dir.join("includes");
+    std::fs::create_dir_all(&includes).unwrap();
+    std::fs::write(includes.join("dependency.inc"), "  use b\n").unwrap();
+    std::fs::write(
+        dir.join("a.F90"),
+        "module a\n#include \"dependency.inc\"\nend module a\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("b.F90"), "module b\nend module b\n").unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-Iincludes", "-c", "a.F90", "b.F90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "included dependency did not affect compilation order:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(dir.join("a.o").is_file());
+    assert!(dir.join("b.o").is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_link_keeps_equal_basename_sources_distinct() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

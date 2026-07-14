@@ -1333,6 +1333,36 @@ pub fn execute(opts: &Options) -> Result<(), String> {
     }
 }
 
+fn source_form_for_input(opts: &Options, input: &Path) -> SourceForm {
+    match opts.source_form_override {
+        Some(SourceFormOverride::Free) => SourceForm::FreeForm,
+        Some(SourceFormOverride::Fixed) => SourceForm::FixedForm,
+        None => detect_source_form(&input.to_string_lossy()),
+    }
+}
+
+fn preproc_config_for_input(
+    opts: &Options,
+    input: &Path,
+    source_form: SourceForm,
+) -> crate::preprocess::PreprocConfig {
+    let mut config = crate::preprocess::PreprocConfig {
+        filename: input.to_str().unwrap_or("<input>").to_string(),
+        fixed_form: matches!(source_form, SourceForm::FixedForm),
+        cpp_compat: opts.cpp_compat,
+        // Share `-I` paths with the preprocessor so `#include "foo.inc"`
+        // can find headers after searching relative to the current file.
+        include_paths: opts.module_search_paths.clone(),
+        ..crate::preprocess::PreprocConfig::for_target(&opts.target)
+    };
+    for (name, value) in &opts.preprocessor_defines {
+        config
+            .defines
+            .insert(name.clone(), crate::preprocess::MacroDef::object(value));
+    }
+    config
+}
+
 /// Compile a Fortran source file through the full pipeline.
 pub fn compile(opts: &Options) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
@@ -1371,11 +1401,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let file_str = opts.input.display().to_string();
 
     // 2. Preprocess.
-    let source_form = match opts.source_form_override {
-        Some(SourceFormOverride::Free) => SourceForm::FreeForm,
-        Some(SourceFormOverride::Fixed) => SourceForm::FixedForm,
-        None => detect_source_form(&opts.input.to_string_lossy()),
-    };
+    let source_form = source_form_for_input(opts, &opts.input);
     if opts.std == Some(crate::sema::validate::FortranStandard::F77)
         && matches!(source_form, SourceForm::FreeForm)
     {
@@ -1430,22 +1456,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     let phase = phases.start("preprocess");
-    let mut pp_config = crate::preprocess::PreprocConfig {
-        filename: opts.input.to_str().unwrap_or("<input>").to_string(),
-        fixed_form: matches!(source_form, SourceForm::FixedForm),
-        cpp_compat: opts.cpp_compat,
-        // Share `-I` paths with the preprocessor so `#include "foo.inc"`
-        // can find headers (e.g. stdlib's `include/macros.inc`).  The
-        // resolver searches relative-to-current-file first, then this
-        // list — both gfortran and flang do the same.
-        include_paths: opts.module_search_paths.clone(),
-        ..crate::preprocess::PreprocConfig::for_target(&opts.target)
-    };
-    for (name, value) in &opts.preprocessor_defines {
-        pp_config
-            .defines
-            .insert(name.clone(), crate::preprocess::MacroDef::object(value));
-    }
+    let pp_config = preproc_config_for_input(opts, &opts.input, source_form);
     let pp_result =
         crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
@@ -2447,7 +2458,11 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     // Scan dependencies (sources only).
     let file_deps: Vec<dep_scan::FileDeps> = source_inputs
         .iter()
-        .map(|p| dep_scan::scan_file(p))
+        .map(|p| {
+            let source_form = source_form_for_input(opts, p);
+            let pp_config = preproc_config_for_input(opts, p, source_form);
+            dep_scan::scan_file(p, &pp_config)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Topological sort.
