@@ -4,7 +4,7 @@
 ! would otherwise dereference a null). The valid OPTIONAL case runs in
 ! l02_conditional_args.f90.
 ! FLAGS: --std=f2023
-! ERROR_EXPECTED: requires an OPTIONAL dummy
+! ERROR_EXPECTED: dummy argument 'x' is not OPTIONAL (F2023 C1525)
 program l02a_nil_required_reject
   implicit none
   integer :: a
