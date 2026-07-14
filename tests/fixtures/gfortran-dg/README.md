@@ -95,7 +95,7 @@ on 2026-06-10.
 | selected_logical_kind_3 | run, requires fortran_integer_16 | FLAGS f2023; EXIT_CODE 0 (effective-target dropped; armfortas has kind-16 integers) | `-S` clean but emits unresolvable `bl _selected_logical_kind` → cannot link | SELECTED_LOGICAL_KIND missing (l04); parameter-context call is laxness #2 in the matrix |
 | selected_logical_kind_4 | run, default flags; non-constant context | FLAGS f2023; EXIT_CODE 0 | compile error: `'selected_logical_kind' used but not declared` | SELECTED_LOGICAL_KIND missing (l04) |
 | split_1 | run, default flags; forward/backward SPLIT | FLAGS f2023; EXIT_CODE 0 | `-S` clean but emits unresolvable `bl _split` → cannot link | SPLIT missing (l04) |
-| split_2 | run, default flags; UCS-4 SPLIT | FLAGS f2023; EXIT_CODE 0 | `-S` clean, same unresolvable `_split` | SPLIT missing (l04) |
+| split_2 | run, default flags; UCS-4 SPLIT | FLAGS f2023; EXIT_CODE 0; XFAIL-006 | rejected because `SELECTED_CHAR_KIND('ISO_10646')` returns `-1` | nondefault character kinds unsupported |
 | split_3 | run + dg-shouldfail "Fortran runtime error" (POS out of range) | FLAGS f2023; EXIT_CODE 1 (armfortas runtime-error convention, provisional until l04) | `-S` clean, unresolvable `_split` | SPLIT missing (l04) |
 | split_4 | run + dg-shouldfail (BACK at string start) | FLAGS f2023; EXIT_CODE 1 (provisional) | `-S` clean, unresolvable `_split` | SPLIT missing (l04) |
 | c_f_pointer_shape_tests_7 | run, -std=f2023; LOWER= honored | FLAGS f2023; EXIT_CODE 0 | `-S` clean but emits external `bl _lbound`/`bl _ubound` (matrix laxness #4) → cannot link; LOWER honoring unverified | C_F_POINTER LOWER= missing (l06) |
