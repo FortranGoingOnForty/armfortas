@@ -9,6 +9,15 @@ module m
     integer(int8), allocatable :: value(:)
   end type key_type
 
+  type, abstract :: hashmap_type
+    integer :: seen = 0
+    procedure(hasher_fun), pointer, nopass :: hasher => sum_key
+  contains
+    procedure(key_map_entry_ifc), deferred, pass(map) :: key_map_entry
+    procedure, non_overridable, pass(map) :: int8_map_entry
+    generic, public :: map_entry => key_map_entry, int8_map_entry
+  end type hashmap_type
+
   abstract interface
     function hasher_fun(key) result(hash_code)
       import :: int32, key_type
@@ -22,15 +31,6 @@ module m
       type(key_type), intent(in) :: key
     end subroutine key_map_entry_ifc
   end interface
-
-  type, abstract :: hashmap_type
-    integer :: seen = 0
-    procedure(hasher_fun), pointer, nopass :: hasher => sum_key
-  contains
-    procedure(key_map_entry_ifc), deferred, pass(map) :: key_map_entry
-    procedure, non_overridable, pass(map) :: int8_map_entry
-    generic, public :: map_entry => key_map_entry, int8_map_entry
-  end type hashmap_type
 
   type, extends(hashmap_type) :: chaining_hashmap_type
   contains
