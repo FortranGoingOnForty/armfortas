@@ -13,12 +13,15 @@ use std::collections::{HashMap, HashSet};
 
 use super::statement_functions::detect_statement_functions;
 use super::type_resolution::{derived_char_init_len, entity_char_len_to_info, type_spec_to_info};
-use super::use_resolution::{load_external_module, preload_stmt_uses, process_uses};
+use super::use_resolution::{
+    load_external_module, load_external_submodule, preload_stmt_uses, process_uses,
+};
 
 thread_local! {
     /// Track externally loaded module interfaces so resolve_file can
     /// return them to the driver for globals extraction.
     pub(super) static LOADED_EXTERNAL_MODULES: RefCell<Vec<crate::sema::amod::ModuleInterface>> = const { RefCell::new(Vec::new()) };
+    pub(super) static LOADING_EXTERNAL_SUBMODULES: RefCell<HashSet<(String, String)>> = RefCell::new(HashSet::new());
 }
 
 pub(super) fn merge_specific_names(into: &mut Vec<String>, additional: &[String]) {
@@ -81,6 +84,7 @@ pub fn resolve_file(
     // Second pass: populate all scopes (loads .amod files lazily on USE miss).
     // Track which external modules were loaded.
     LOADED_EXTERNAL_MODULES.with(|cell| cell.borrow_mut().clear());
+    LOADING_EXTERNAL_SUBMODULES.with(|cell| cell.borrow_mut().clear());
     for unit in units {
         resolve_unit(&mut st, unit, module_search_paths, &mut layouts)?;
     }
@@ -581,77 +585,72 @@ pub(super) fn resolve_unit(
                     msg: "IMPORT, NONE is not permitted in a submodule".into(),
                 });
             }
-            // Resolve the immediate semantic parent. A direct child can load
-            // its ancestor module from .amod; a descendant needs the parent
-            // submodule scope retained in this translation unit.
+            // Resolve the exact immediate semantic parent. Descendants load
+            // the parent submodule's .smod identity record and AMOD companion;
+            // the ancestor module is not a substitute for that scope.
             let parent_scope = if let Some(immediate_parent) = ancestor {
-                let immediate_scope = st.find_submodule_scope(parent, immediate_parent);
-                if immediate_scope.is_none() && !imports.is_empty() {
-                    return Err(SemaError {
-                        span: unit.span,
-                        msg: format!(
-                            "IMPORT in descendant submodule '{}' requires semantic information for parent submodule '{}'",
-                            name, immediate_parent
-                        ),
-                    });
-                }
-                immediate_scope.or_else(|| {
-                    st.find_module_scope(parent)
-                        .or_else(|| load_external_module(st, parent, module_search_paths, layouts))
-                })
+                st.find_submodule_scope(parent, immediate_parent)
+                    .or_else(|| {
+                        load_external_submodule(
+                            st,
+                            parent,
+                            immediate_parent,
+                            module_search_paths,
+                            layouts,
+                        )
+                    })
             } else {
                 st.find_module_scope(parent)
                     .or_else(|| load_external_module(st, parent, module_search_paths, layouts))
-            };
+            }
+            .ok_or_else(|| SemaError {
+                span: unit.span,
+                msg: if let Some(immediate_parent) = ancestor {
+                    format!(
+                        "immediate parent submodule '{}:{}' was not found",
+                        parent, immediate_parent
+                    )
+                } else {
+                    format!("parent module '{}' was not found", parent)
+                },
+            })?;
             let scope_id = st.push_scope(ScopeKind::Submodule(name.clone()));
             st.set_submodule_ancestor(scope_id, parent);
-            if let Some(pid) = parent_scope {
-                process_imports(
-                    st,
-                    scope_id,
-                    imports,
-                    HostAssociationPolicy::All,
-                    unit.span,
-                    Some(pid),
-                )?;
-            } else if !imports.is_empty() {
-                return Err(SemaError {
-                    span: unit.span,
-                    msg: format!(
-                        "cannot apply IMPORT because parent module '{}' was not found",
-                        parent
-                    ),
-                });
-            }
+            process_imports(
+                st,
+                scope_id,
+                imports,
+                HostAssociationPolicy::All,
+                unit.span,
+                Some(parent_scope),
+            )?;
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             // Import all immediate-parent symbols into the submodule scope.
             // Per F2008 12.2.3.2: submodules see ALL parent entities,
             // including private ones — that's the whole point of the
             // submodule mechanism (host association).
-            if let Some(pid) = parent_scope {
+            st.add_use_association(UseAssociation {
+                local_name: String::new(),
+                original_name: String::new(),
+                source_scope: parent_scope,
+                is_submodule_access: true,
+                from_bare_use: true,
+            });
+            let parent_syms: Vec<(String, String)> = st
+                .scope(parent_scope)
+                .symbols
+                .iter()
+                .map(|(key, sym)| (sym.name.clone(), key.clone()))
+                .collect();
+            for (sym_name, _key) in &parent_syms {
                 st.add_use_association(UseAssociation {
-                    local_name: String::new(),
-                    original_name: String::new(),
-                    source_scope: pid,
+                    local_name: sym_name.clone(),
+                    original_name: sym_name.clone(),
+                    source_scope: parent_scope,
                     is_submodule_access: true,
                     from_bare_use: true,
                 });
-                let parent_syms: Vec<(String, String)> = st
-                    .scope(pid)
-                    .symbols
-                    .iter()
-                    .map(|(key, sym)| (sym.name.clone(), key.clone()))
-                    .collect();
-                for (sym_name, _key) in &parent_syms {
-                    st.add_use_association(UseAssociation {
-                        local_name: sym_name.clone(),
-                        original_name: sym_name.clone(),
-                        source_scope: pid,
-                        is_submodule_access: true,
-                        from_bare_use: true,
-                    });
-                }
             }
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts)?;

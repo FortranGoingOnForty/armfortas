@@ -26086,6 +26086,800 @@ fn descendant_submodule_uses_root_ancestor_interfaces() {
 }
 
 #[test]
+fn split_file_descendant_requires_immediate_parent() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_requires_immediate_parent count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("missing_immediate_submodule_parent");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module nested_root\n  implicit none\nend module nested_root\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (nested_root:no_such_parent) nested_leaf\nend submodule nested_leaf\n",
+    );
+
+    let root_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", root.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "root.o"])
+        .output()
+        .expect("root compile failed to spawn");
+    assert!(
+        root_compile.status.success(),
+        "root compile failed: {}",
+        String::from_utf8_lossy(&root_compile.stderr)
+    );
+
+    let leaf_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "leaf.o"])
+        .output()
+        .expect("leaf compile failed to spawn");
+    assert!(
+        !leaf_compile.status.success(),
+        "a valid root module must not satisfy a missing immediate submodule parent"
+    );
+    let stderr = String::from_utf8_lossy(&leaf_compile.stderr);
+    assert!(
+        stderr.contains("nested_root:no_such_parent")
+            && stderr.contains("immediate parent submodule"),
+        "unexpected missing-parent diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn descendant_submodule_rejects_reverse_order_and_parent_cycles() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descendant_submodule_rejects_reverse_order_and_parent_cycles count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("invalid_submodule_order");
+    let reverse = write_program_in(
+        &dir,
+        "reverse.f90",
+        "module order_root\nend module order_root\nsubmodule (order_root:order_middle) order_leaf\nend submodule order_leaf\nsubmodule (order_root) order_middle\nend submodule order_middle\n",
+    );
+    let reverse_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", reverse.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "reverse.o"])
+        .output()
+        .expect("reverse-order compile failed to spawn");
+    assert!(
+        !reverse_compile.status.success(),
+        "a descendant must not bind to a parent declared later in the file"
+    );
+    let stderr = String::from_utf8_lossy(&reverse_compile.stderr);
+    assert!(
+        stderr.contains("order_root:order_middle") && stderr.contains("immediate parent submodule"),
+        "unexpected reverse-order diagnostic: {stderr}"
+    );
+
+    let cycle = write_program_in(
+        &dir,
+        "cycle.f90",
+        "module cycle_root\nend module cycle_root\nsubmodule (cycle_root:cycle_right) cycle_left\nend submodule cycle_left\nsubmodule (cycle_root:cycle_left) cycle_right\nend submodule cycle_right\n",
+    );
+    let cycle_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", cycle.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "cycle.o"])
+        .output()
+        .expect("cyclic-parent compile failed to spawn");
+    assert!(
+        !cycle_compile.status.success(),
+        "a cyclic submodule parent chain must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&cycle_compile.stderr);
+    assert!(
+        stderr.contains("cycle_root:cycle_right") && stderr.contains("immediate parent submodule"),
+        "unexpected parent-cycle diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_uses_immediate_parent_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_uses_immediate_parent_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("cross_tu_submodule_parent");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module chain_root\n  implicit none\n  private\n  integer, parameter :: root_secret = 40\nend module chain_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (chain_root) chain_middle\n  implicit none\n  integer, parameter :: middle_value = root_secret + 1\nend submodule chain_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (chain_root:chain_middle) chain_leaf\n  implicit none\n  integer, parameter :: leaf_value = middle_value + root_secret\nend submodule chain_leaf\n",
+    );
+    let grandchild = write_program_in(
+        &dir,
+        "grandchild.f90",
+        "submodule (chain_root:chain_leaf) chain_grandchild\n  implicit none\n  integer, parameter :: grand_value = leaf_value + middle_value + root_secret\nend submodule chain_grandchild\n",
+    );
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+
+    for (source, object) in [(&root, "root.o"), (&middle, "middle.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("provider compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "provider compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+    assert!(
+        module_dir.join("chain_root@chain_middle.smod").exists(),
+        "middle submodule should emit its compatibility record"
+    );
+    assert!(
+        module_dir.join("chain_root@chain_middle.amod").exists(),
+        "middle submodule should emit its semantic interface"
+    );
+
+    let leaf_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "leaf.o"])
+        .output()
+        .expect("leaf compile failed to spawn");
+    assert!(
+        leaf_compile.status.success(),
+        "descendant should inherit immediate-parent and private root declarations: {}",
+        String::from_utf8_lossy(&leaf_compile.stderr)
+    );
+    assert!(
+        module_dir.join("chain_root@chain_leaf.smod").exists()
+            && module_dir.join("chain_root@chain_leaf.amod").exists(),
+        "a nested submodule should emit canonical artifacts for its descendants"
+    );
+
+    let grandchild_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", grandchild.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "grandchild.o"])
+        .output()
+        .expect("grandchild compile failed to spawn");
+    assert!(
+        grandchild_compile.status.success(),
+        "deeper descendants should inherit the complete parent chain: {}",
+        String::from_utf8_lossy(&grandchild_compile.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_preserves_implemented_parent_procedure_owner() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_preserves_implemented_parent_procedure_owner count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_implemented_procedure_owner");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module owner_root\n  implicit none\n  private\n  public :: read_value\n  interface\n    module function implemented_value() result(value)\n      integer :: value\n    end function implemented_value\n    module subroutine read_value(value)\n      integer, intent(out) :: value\n    end subroutine read_value\n  end interface\nend module owner_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (owner_root) owner_middle\ncontains\n  module function implemented_value() result(value)\n    integer :: value\n    value = 42\n  end function implemented_value\nend submodule owner_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (owner_root:owner_middle) owner_leaf\ncontains\n  module subroutine read_value(value)\n    integer, intent(out) :: value\n    value = implemented_value()\n  end subroutine read_value\nend submodule owner_leaf\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program owner_user\n  use owner_root, only: read_value\n  implicit none\n  integer :: value\n  call read_value(value)\n  if (value /= 42) error stop 1\n  print *, 'ok'\nend program owner_user\n",
+    );
+    let forbidden = write_program_in(
+        &dir,
+        "forbidden.f90",
+        "program forbidden_owner_user\n  use owner_root, only: implemented_value\n  implicit none\n  print *, implemented_value()\nend program forbidden_owner_user\n",
+    );
+
+    for (source, object) in [
+        (&root, "root.o"),
+        (&middle, "middle.o"),
+        (&leaf, "leaf.o"),
+        (&main, "main.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("implemented-parent compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "implemented-parent compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let forbidden_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", forbidden.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "forbidden.o"])
+        .output()
+        .expect("private-procedure compile failed to spawn");
+    assert!(
+        !forbidden_compile.status.success(),
+        "serializing a private ancestor procedure must not export it through USE"
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["root.o", "middle.o", "leaf.o", "main.o"])
+        .args(["-o", "implemented_parent"])
+        .output()
+        .expect("implemented-parent link failed to spawn");
+    assert!(
+        link.status.success(),
+        "implemented-parent link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(dir.join("implemented_parent"))
+        .output()
+        .expect("implemented-parent run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "implemented-parent executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_preserves_ancestor_owned_abi_metadata() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_preserves_ancestor_owned_abi_metadata count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_ancestor_abi_owner");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module abi_owner_root\n  implicit none\n  interface\n    module subroutine compute_payload(result, values, text, bias)\n      integer, intent(out) :: result\n      integer, intent(in) :: values(:)\n      character(*), intent(in) :: text\n      integer, intent(in), optional, value :: bias\n    end subroutine compute_payload\n    module subroutine required_payload(result, text)\n      integer, intent(out) :: result\n      character(*), intent(in) :: text\n    end subroutine required_payload\n    module subroutine run_case(result)\n      integer, intent(out) :: result\n    end subroutine run_case\n  end interface\nend module abi_owner_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (abi_owner_root) abi_owner_middle\ncontains\n  module subroutine required_payload(result, text)\n    integer, intent(out) :: result\n    character(*), intent(in) :: text\n    result = len(text)\n  end subroutine required_payload\nend submodule abi_owner_middle\n",
+    );
+    let unrelated = write_program_in(
+        &dir,
+        "unrelated.f90",
+        "module unrelated_abi\n  implicit none\ncontains\n  subroutine compute_payload(result, value)\n    integer, intent(out) :: result\n    integer, intent(in) :: value\n    result = value\n  end subroutine compute_payload\n  subroutine required_payload(result, text, bias)\n    integer, intent(out) :: result\n    integer, intent(in) :: text\n    integer, intent(in), optional :: bias\n    result = text\n    if (present(bias)) result = result + bias\n  end subroutine required_payload\nend module unrelated_abi\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "module earlier_collision\n  implicit none\ncontains\n  subroutine compute_payload(result, value)\n    integer, intent(out) :: result\n    integer, intent(in) :: value\n    result = value\n  end subroutine compute_payload\nend module earlier_collision\n\nsubmodule (abi_owner_root:abi_owner_middle) abi_owner_leaf\n  use unrelated_abi, only: unrelated_compute => compute_payload, unrelated_required => required_payload\n  implicit none\ncontains\n  module subroutine compute_payload(result, values, text, bias)\n    integer, intent(out) :: result\n    integer, intent(in) :: values(:)\n    character(*), intent(in) :: text\n    integer, intent(in), optional, value :: bias\n    result = sum(values) + len(text)\n    if (present(bias)) result = result + bias\n  end subroutine compute_payload\n  module subroutine run_case(result)\n    integer, intent(out) :: result\n    integer :: required\n    integer :: values(2) = [10, 11]\n    call compute_payload(result, values, 'abc')\n    call required_payload(required, 'hello')\n    result = result + required\n  end subroutine run_case\nend submodule abi_owner_leaf\n\nsubroutine compute_payload(result, value)\n  integer, intent(out) :: result\n  integer, intent(in) :: value\n  result = value\nend subroutine compute_payload\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program abi_owner_user\n  use abi_owner_root, only: run_case\n  implicit none\n  integer :: result\n  call run_case(result)\n  if (result /= 29) error stop 1\n  print *, 'ok'\nend program abi_owner_user\n",
+    );
+
+    for (source, object) in [
+        (&root, "root.o"),
+        (&middle, "middle.o"),
+        (&unrelated, "unrelated.o"),
+        (&leaf, "leaf.o"),
+        (&main, "main.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("ancestor-ABI compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "ancestor-ABI compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let leaf_interface = fs::read_to_string(module_dir.join("abi_owner_root@abi_owner_leaf.amod"))
+        .expect("missing descendant semantic interface");
+    let compute_interface = leaf_interface
+        .split("@subroutine compute_payload")
+        .nth(1)
+        .and_then(|tail| tail.split("@end subroutine").next())
+        .expect("missing compute_payload interface");
+    assert!(
+        compute_interface
+            .lines()
+            .any(|line| line.contains("@arg values") && line.contains("descriptor")),
+        "same-named procedures corrupted descriptor metadata: {compute_interface}"
+    );
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["root.o", "middle.o", "unrelated.o", "leaf.o", "main.o"])
+        .args(["-o", "ancestor_abi"])
+        .output()
+        .expect("ancestor-ABI link failed to spawn");
+    assert!(
+        link.status.success(),
+        "ancestor-ABI link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(dir.join("ancestor_abi"))
+        .output()
+        .expect("ancestor-ABI run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "ancestor-ABI executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_retains_parent_import_policy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_retains_parent_import_policy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_parent_import_policy");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module import_policy_root\n  implicit none\n  integer, parameter :: visible = 1, hidden = 2\nend module import_policy_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (import_policy_root) import_policy_middle\n  import, only: visible\n  implicit none\n  integer, parameter :: middle_local = visible + 1\nend submodule import_policy_middle\n",
+    );
+    let accepted = write_program_in(
+        &dir,
+        "accepted.f90",
+        "submodule (import_policy_root:import_policy_middle) import_policy_accepted\n  import :: visible, middle_local\n  implicit none\n  integer, parameter :: selected = visible + middle_local\nend submodule import_policy_accepted\n",
+    );
+    let rejected = write_program_in(
+        &dir,
+        "rejected.f90",
+        "submodule (import_policy_root:import_policy_middle) import_policy_rejected\n  import :: hidden\nend submodule import_policy_rejected\n",
+    );
+
+    for (source, object) in [(&root, "root.o"), (&middle, "middle.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("import-policy provider compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "import-policy provider compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let accepted_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", accepted.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "accepted.o"])
+        .output()
+        .expect("accepted import-policy compile failed to spawn");
+    assert!(
+        accepted_compile.status.success(),
+        "allowed parent entities should remain visible: {}",
+        String::from_utf8_lossy(&accepted_compile.stderr)
+    );
+
+    let rejected_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", rejected.file_name().unwrap().to_str().unwrap()])
+        .args(["-I", "mods", "-J", "mods"])
+        .args(["-o", "rejected.o"])
+        .output()
+        .expect("rejected import-policy compile failed to spawn");
+    assert!(
+        !rejected_compile.status.success(),
+        "a descendant must not recover an ancestor entity hidden by its parent"
+    );
+    let stderr = String::from_utf8_lossy(&rejected_compile.stderr);
+    assert!(
+        stderr.contains("IMPORT name 'hidden' does not identify a host entity"),
+        "unexpected restricted-parent diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_preserves_parent_procedure_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_preserves_parent_procedure_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_parent_procedure");
+    let module_dir = dir.join("mods");
+    fs::create_dir_all(&module_dir).expect("cannot create module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module procedure_root\n  implicit none\n  private\n  public :: run_chain\n  type :: payload_t\n    integer :: value = 0\n  end type payload_t\n  interface\n    module subroutine run_chain(result, values, bias)\n      integer, intent(out) :: result\n      integer, intent(in) :: values(:)\n      integer, intent(in), optional, value :: bias\n    end subroutine run_chain\n  end interface\nend module procedure_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (procedure_root) procedure_middle\n  implicit none\n  interface build\n    module function make_payload(values, scale) result(value)\n      import :: payload_t\n      integer, intent(in) :: values(:)\n      integer, intent(in), value :: scale\n      type(payload_t) :: value\n    end function make_payload\n  end interface build\nend submodule procedure_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (procedure_root:procedure_middle) procedure_leaf\n  implicit none\ncontains\n  module function make_payload(values, scale) result(value)\n    integer, intent(in) :: values(:)\n    integer, intent(in), value :: scale\n    type(payload_t) :: value\n    value%value = sum(values) * scale\n  end function make_payload\n  module subroutine run_chain(result, values, bias)\n    integer, intent(out) :: result\n    integer, intent(in) :: values(:)\n    integer, intent(in), optional, value :: bias\n    type(payload_t) :: item\n    item = build(values, 2)\n    result = item%value\n    if (present(bias)) result = result + bias\n  end subroutine run_chain\nend submodule procedure_leaf\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program procedure_user\n  use procedure_root, only: run_chain\n  implicit none\n  integer :: result\n  integer :: values(2) = [10, 11]\n  call run_chain(result, values, bias=1)\n  if (result /= 43) error stop 1\n  call run_chain(result, values)\n  if (result /= 42) error stop 2\n  print *, 'ok'\nend program procedure_user\n",
+    );
+
+    for (source, object) in [
+        (&root, "root.o"),
+        (&middle, "middle.o"),
+        (&leaf, "leaf.o"),
+        (&main, "main.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-I", "mods", "-J", "mods"])
+            .args(["-o", object])
+            .output()
+            .expect("procedure-chain compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "procedure-chain compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["root.o", "middle.o", "leaf.o", "main.o"])
+        .args(["-o", "procedure_chain"])
+        .output()
+        .expect("procedure-chain link failed to spawn");
+    assert!(
+        link.status.success(),
+        "procedure-chain link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(dir.join("procedure_chain"))
+        .output()
+        .expect("procedure-chain run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure-chain executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submodule_loading_preserves_module_search_precedence() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=submodule_loading_preserves_module_search_precedence count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("submodule_search_precedence");
+    let first = dir.join("first");
+    let second = dir.join("second");
+    let output = dir.join("output");
+    fs::create_dir_all(&first).expect("cannot create first module directory");
+    fs::create_dir_all(&second).expect("cannot create second module directory");
+    fs::create_dir_all(&output).expect("cannot create output module directory");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module precedence_root\nend module precedence_root\n",
+    );
+    let first_dep = write_program_in(
+        &dir,
+        "first_dep.f90",
+        "module precedence_dep\n  integer, parameter :: first_only = 1\nend module precedence_dep\n",
+    );
+    let second_dep = write_program_in(
+        &dir,
+        "second_dep.f90",
+        "module precedence_dep\n  integer, parameter :: second_only = 2\nend module precedence_dep\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (precedence_root) precedence_middle\n  use precedence_dep\nend submodule precedence_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (precedence_root:precedence_middle) precedence_leaf\n  implicit none\n  integer, parameter :: selected = first_only\nend submodule precedence_leaf\n",
+    );
+
+    for module_dir in [&first, &second] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", root.file_name().unwrap().to_str().unwrap()])
+            .arg("-J")
+            .arg(module_dir)
+            .args(["-o", "root.o"])
+            .output()
+            .expect("root compile failed to spawn");
+        assert!(compile.status.success(), "root compile failed");
+    }
+    for (source, module_dir, object) in [
+        (&first_dep, &first, "first_dep.o"),
+        (&second_dep, &second, "second_dep.o"),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .arg("-J")
+            .arg(module_dir)
+            .args(["-o", object])
+            .output()
+            .expect("dependency compile failed to spawn");
+        assert!(compile.status.success(), "dependency compile failed");
+    }
+    let middle_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", middle.file_name().unwrap().to_str().unwrap()])
+        .arg("-I")
+        .arg(&second)
+        .arg("-J")
+        .arg(&second)
+        .args(["-o", "middle.o"])
+        .output()
+        .expect("middle compile failed to spawn");
+    assert!(
+        middle_compile.status.success(),
+        "middle compile failed: {}",
+        String::from_utf8_lossy(&middle_compile.stderr)
+    );
+
+    let leaf_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .arg("-I")
+        .arg(&first)
+        .arg("-I")
+        .arg(&second)
+        .arg("-J")
+        .arg(&output)
+        .args(["-o", "leaf.o"])
+        .output()
+        .expect("leaf compile failed to spawn");
+    assert!(
+        leaf_compile.status.success(),
+        "submodule loading changed -I precedence: {}",
+        String::from_utf8_lossy(&leaf_compile.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_file_descendant_rejects_missing_or_stale_parent_interface() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_file_descendant_rejects_missing_or_stale_parent_interface count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("invalid_submodule_parent_interface");
+    let root = write_program_in(
+        &dir,
+        "root.f90",
+        "module metadata_root\nend module metadata_root\n",
+    );
+    let middle = write_program_in(
+        &dir,
+        "middle.f90",
+        "submodule (metadata_root) metadata_middle\nend submodule metadata_middle\n",
+    );
+    let leaf = write_program_in(
+        &dir,
+        "leaf.f90",
+        "submodule (metadata_root:metadata_middle) metadata_leaf\nend submodule metadata_leaf\n",
+    );
+
+    for (source, object) in [(&root, "root.o"), (&middle, "middle.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-o", object])
+            .output()
+            .expect("provider compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "provider compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let interface = dir.join("metadata_root@metadata_middle.amod");
+    let interface_text = fs::read_to_string(&interface).expect("missing submodule interface");
+    let smod = dir.join("metadata_root@metadata_middle.smod");
+    let smod_text = fs::read_to_string(&smod).expect("missing submodule record");
+    fs::remove_file(&interface).expect("cannot remove submodule interface");
+    let missing_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "missing.o"])
+        .output()
+        .expect("missing-interface compile failed to spawn");
+    assert!(
+        !missing_compile.status.success(),
+        "the metadata-only .smod record must not satisfy semantic parent resolution"
+    );
+
+    fs::write(&interface, &interface_text).expect("cannot restore submodule interface");
+    fs::remove_file(&smod).expect("cannot remove submodule record");
+    let missing_record_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "missing_record.o"])
+        .output()
+        .expect("missing-record compile failed to spawn");
+    assert!(
+        !missing_record_compile.status.success(),
+        "the semantic companion must not bypass its .smod identity record"
+    );
+
+    let legacy_smod = smod_text.replacen("#!smod 2", "#!smod 1", 1);
+    fs::write(&smod, legacy_smod).expect("cannot write legacy submodule record");
+    let legacy_record_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "legacy_record.o"])
+        .output()
+        .expect("legacy-record compile failed to spawn");
+    assert!(
+        !legacy_record_compile.status.success(),
+        "a metadata-only version-1 record must require a parent rebuild"
+    );
+    let stderr = String::from_utf8_lossy(&legacy_record_compile.stderr);
+    assert!(
+        stderr.contains("incompatible .smod version 1") && stderr.contains("compiler requires 2"),
+        "unexpected legacy-record diagnostic: {stderr}"
+    );
+
+    fs::write(&smod, smod_text).expect("cannot restore submodule record");
+    fs::write(
+        &middle,
+        "submodule (metadata_root) metadata_middle\n  integer, parameter :: generation = 2\nend submodule metadata_middle\n",
+    )
+    .expect("cannot update parent submodule source");
+    let rebuilt_middle = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", middle.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "middle.o"])
+        .output()
+        .expect("rebuilt parent compile failed to spawn");
+    assert!(
+        rebuilt_middle.status.success(),
+        "rebuilt parent compile failed: {}",
+        String::from_utf8_lossy(&rebuilt_middle.stderr)
+    );
+    fs::write(&interface, interface_text).expect("cannot restore stale semantic interface");
+    let stale_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", leaf.file_name().unwrap().to_str().unwrap()])
+        .args(["-o", "stale.o"])
+        .output()
+        .expect("stale-interface compile failed to spawn");
+    assert!(
+        !stale_compile.status.success(),
+        "an incompatible immediate-parent interface must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&stale_compile.stderr);
+    assert!(
+        stderr.contains("does not match the checksum in")
+            && stderr.contains("metadata_root:metadata_middle"),
+        "unexpected stale-interface diagnostic: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn split_file_submodule_retains_implicit_none() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

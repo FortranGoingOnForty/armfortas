@@ -159,11 +159,30 @@ fn dash_j_writes_smod_alias_for_submodule() {
 
     let smod = mod_dir.join("smod_parent@smod_child.smod");
     assert!(smod.exists(), "expected CMake-compatible .smod output");
+    let smod_text = std::fs::read_to_string(&smod).expect("missing .smod");
     assert!(
-        std::fs::read_to_string(&smod)
-            .expect("missing .smod")
-            .contains("@parent smod_parent"),
+        smod_text.starts_with("#!smod 2\n"),
+        "smod should use the checksum-bound format"
+    );
+    assert!(
+        smod_text.contains("@parent smod_parent"),
         "smod should record its parent"
+    );
+    assert!(
+        smod_text.contains("@interface smod_parent@smod_child.amod"),
+        "smod should identify its semantic interface"
+    );
+    assert!(
+        smod_text.contains(" fnv1a:"),
+        "smod should bind its semantic interface by checksum"
+    );
+    let interface = mod_dir.join("smod_parent@smod_child.amod");
+    assert!(interface.exists(), "expected submodule semantic interface");
+    let interface_text = std::fs::read_to_string(interface).expect("missing submodule interface");
+    assert!(
+        interface_text.contains("# module: smod_child")
+            && interface_text.contains("# ancestor-module: smod_parent"),
+        "submodule interface should retain its semantic identity"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

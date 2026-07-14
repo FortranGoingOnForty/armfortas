@@ -4071,6 +4071,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
         }
         ProgramUnit::Submodule {
             parent,
+            ancestor,
             uses,
             implicit,
             decls,
@@ -4078,23 +4079,31 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F2008, "SUBMODULE");
-            // F2008 C1113: the parent (ancestor module or parent
-            // submodule) must be available. If neither a module nor a
-            // submodule of that name is in scope (in-file or loaded from
-            // an .amod), the submodule can't inherit anything — diagnose
-            // it instead of silently producing a dangling unit.
-            let parent_exists = ctx.st.find_module_scope(parent).is_some()
-                || ctx.st.all_scopes().iter().any(|s| {
-                    matches!(&s.kind, ScopeKind::Submodule(n) if n.eq_ignore_ascii_case(parent))
-                });
+            // F2008 C1113: a descendant names an exact parent submodule,
+            // while a direct child names its ancestor module.
+            let parent_exists = if let Some(immediate_parent) = ancestor {
+                ctx.st
+                    .find_submodule_scope(parent, immediate_parent)
+                    .is_some()
+            } else {
+                ctx.st.find_module_scope(parent).is_some()
+            };
             if !parent_exists {
-                ctx.error(
-                    unit.span,
-                    format!(
-                        "SUBMODULE parent '{parent}' not found — no such module or \
-                         submodule is available (compile it first or provide its .amod)"
-                    ),
-                );
+                if let Some(immediate_parent) = ancestor {
+                    ctx.error(
+                        unit.span,
+                        format!(
+                            "SUBMODULE immediate parent submodule '{parent}:{immediate_parent}' not found (compile it first and provide its .smod and .amod files)"
+                        ),
+                    );
+                } else {
+                    ctx.error(
+                        unit.span,
+                        format!(
+                            "SUBMODULE parent module '{parent}' not found (compile it first or provide its .amod)"
+                        ),
+                    );
+                }
             }
             validate_decls(ctx, uses);
             validate_decls(ctx, implicit);

@@ -1607,16 +1607,45 @@ pub(super) fn compute_char_len_star_flags(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum ProcedureAbiContext<'a> {
+    Unqualified,
+    Module(&'a str),
+    Submodule {
+        name: &'a str,
+        ancestor_module: &'a str,
+    },
+}
+
+impl<'a> ProcedureAbiContext<'a> {
+    fn owner(self, prefix: &[Prefix]) -> Option<&'a str> {
+        match self {
+            Self::Unqualified => None,
+            Self::Module(name) => Some(name),
+            Self::Submodule {
+                name,
+                ancestor_module,
+            } => {
+                if prefix.iter().any(|item| matches!(item, Prefix::Module)) {
+                    Some(ancestor_module)
+                } else {
+                    Some(name)
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn collect_char_len_star_params(
     unit: &ProgramUnit,
     out: &mut HashMap<String, Vec<bool>>,
 ) {
-    collect_char_len_star_params_in(unit, None, out);
+    collect_char_len_star_params_in(unit, ProcedureAbiContext::Unqualified, out);
 }
 
 fn collect_char_len_star_params_in(
     unit: &ProgramUnit,
-    module: Option<&str>,
+    context: ProcedureAbiContext<'_>,
     out: &mut HashMap<String, Vec<bool>>,
 ) {
     use crate::ast::unit::DummyArg;
@@ -1653,42 +1682,60 @@ fn collect_char_len_star_params_in(
         ProgramUnit::Subroutine {
             name,
             args,
+            prefix,
             decls,
             contains,
             ..
         } => {
-            record(name, module, args, decls, out);
+            record(name, context.owner(prefix), args, decls, out);
             for sub in contains {
-                collect_char_len_star_params_in(&sub.node, None, out);
+                collect_char_len_star_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
         ProgramUnit::Function {
             name,
             args,
+            prefix,
             decls,
             contains,
             ..
         } => {
-            record(name, module, args, decls, out);
+            record(name, context.owner(prefix), args, decls, out);
             for sub in contains {
-                collect_char_len_star_params_in(&sub.node, None, out);
+                collect_char_len_star_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
-        ProgramUnit::Module { name, contains, .. }
-        | ProgramUnit::Submodule { name, contains, .. } => {
+        ProgramUnit::Module { name, contains, .. } => {
             for sub in contains {
-                collect_char_len_star_params_in(&sub.node, Some(name), out);
+                collect_char_len_star_params_in(&sub.node, ProcedureAbiContext::Module(name), out);
+            }
+        }
+        ProgramUnit::Submodule {
+            parent,
+            name,
+            contains,
+            ..
+        } => {
+            for sub in contains {
+                collect_char_len_star_params_in(
+                    &sub.node,
+                    ProcedureAbiContext::Submodule {
+                        name,
+                        ancestor_module: parent,
+                    },
+                    out,
+                );
             }
         }
         ProgramUnit::Program { contains, .. } => {
             for sub in contains {
-                collect_char_len_star_params_in(&sub.node, None, out);
+                collect_char_len_star_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
         ProgramUnit::InterfaceBlock { bodies, .. } => {
             for body in bodies {
                 if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
-                    collect_char_len_star_params_in(&sub.node, None, out);
+                    collect_char_len_star_params_in(&sub.node, context, out);
                 }
             }
         }
@@ -1717,12 +1764,12 @@ pub fn collect_char_len_star_params_for_units(
 }
 
 pub(super) fn collect_optional_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
-    collect_optional_params_in(unit, None, out);
+    collect_optional_params_in(unit, ProcedureAbiContext::Unqualified, out);
 }
 
 fn collect_optional_params_in(
     unit: &ProgramUnit,
-    module: Option<&str>,
+    context: ProcedureAbiContext<'_>,
     out: &mut HashMap<String, Vec<bool>>,
 ) {
     use crate::ast::decl::Attribute;
@@ -1743,6 +1790,12 @@ fn collect_optional_params_in(
             })
             .collect();
         if param_names.is_empty() {
+            if let Some(module) = module {
+                out.insert(
+                    module_procedure_symbol_name(module, name).to_lowercase(),
+                    Vec::new(),
+                );
+            }
             return;
         }
         let optional_flags: Vec<bool> = param_names
@@ -1778,36 +1831,61 @@ fn collect_optional_params_in(
         ProgramUnit::Subroutine {
             name,
             args,
+            prefix,
             decls,
             contains,
             ..
         } => {
-            record(name, module, args, decls, out);
+            record(name, context.owner(prefix), args, decls, out);
             for sub in contains {
-                collect_optional_params_in(&sub.node, None, out);
+                collect_optional_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
         ProgramUnit::Function {
             name,
             args,
+            prefix,
             decls,
             contains,
             ..
         } => {
-            record(name, module, args, decls, out);
+            record(name, context.owner(prefix), args, decls, out);
             for sub in contains {
-                collect_optional_params_in(&sub.node, None, out);
+                collect_optional_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
-        ProgramUnit::Module { name, contains, .. }
-        | ProgramUnit::Submodule { name, contains, .. } => {
+        ProgramUnit::Module { name, contains, .. } => {
             for sub in contains {
-                collect_optional_params_in(&sub.node, Some(name), out);
+                collect_optional_params_in(&sub.node, ProcedureAbiContext::Module(name), out);
+            }
+        }
+        ProgramUnit::Submodule {
+            parent,
+            name,
+            contains,
+            ..
+        } => {
+            for sub in contains {
+                collect_optional_params_in(
+                    &sub.node,
+                    ProcedureAbiContext::Submodule {
+                        name,
+                        ancestor_module: parent,
+                    },
+                    out,
+                );
             }
         }
         ProgramUnit::Program { contains, .. } => {
             for sub in contains {
-                collect_optional_params_in(&sub.node, None, out);
+                collect_optional_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
+            }
+        }
+        ProgramUnit::InterfaceBlock { bodies, .. } => {
+            for body in bodies {
+                if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
+                    collect_optional_params_in(&sub.node, context, out);
+                }
             }
         }
         _ => {}
@@ -2699,12 +2777,12 @@ pub(super) fn dummy_local_ir_type(
 /// Record which positional dummy arguments are lowered through an
 /// ArrayDescriptor rather than a raw element pointer.
 pub(super) fn collect_descriptor_params(unit: &ProgramUnit, out: &mut HashMap<String, Vec<bool>>) {
-    collect_descriptor_params_in(unit, None, out);
+    collect_descriptor_params_in(unit, ProcedureAbiContext::Unqualified, out);
 }
 
 fn collect_descriptor_params_in(
     unit: &ProgramUnit,
-    module: Option<&str>,
+    context: ProcedureAbiContext<'_>,
     out: &mut HashMap<String, Vec<bool>>,
 ) {
     use crate::ast::unit::DummyArg;
@@ -2747,42 +2825,60 @@ fn collect_descriptor_params_in(
         ProgramUnit::Subroutine {
             name,
             args,
+            prefix,
             decls,
             contains,
             ..
         } => {
-            record(name, module, args, decls, out);
+            record(name, context.owner(prefix), args, decls, out);
             for sub in contains {
-                collect_descriptor_params_in(&sub.node, None, out);
+                collect_descriptor_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
         ProgramUnit::Function {
             name,
             args,
+            prefix,
             decls,
             contains,
             ..
         } => {
-            record(name, module, args, decls, out);
+            record(name, context.owner(prefix), args, decls, out);
             for sub in contains {
-                collect_descriptor_params_in(&sub.node, None, out);
+                collect_descriptor_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
-        ProgramUnit::Module { name, contains, .. }
-        | ProgramUnit::Submodule { name, contains, .. } => {
+        ProgramUnit::Module { name, contains, .. } => {
             for sub in contains {
-                collect_descriptor_params_in(&sub.node, Some(name), out);
+                collect_descriptor_params_in(&sub.node, ProcedureAbiContext::Module(name), out);
+            }
+        }
+        ProgramUnit::Submodule {
+            parent,
+            name,
+            contains,
+            ..
+        } => {
+            for sub in contains {
+                collect_descriptor_params_in(
+                    &sub.node,
+                    ProcedureAbiContext::Submodule {
+                        name,
+                        ancestor_module: parent,
+                    },
+                    out,
+                );
             }
         }
         ProgramUnit::Program { contains, .. } => {
             for sub in contains {
-                collect_descriptor_params_in(&sub.node, None, out);
+                collect_descriptor_params_in(&sub.node, ProcedureAbiContext::Unqualified, out);
             }
         }
         ProgramUnit::InterfaceBlock { bodies, .. } => {
             for body in bodies {
                 if let crate::ast::unit::InterfaceBody::Subprogram(sub) = body {
-                    collect_descriptor_params_in(&sub.node, None, out);
+                    collect_descriptor_params_in(&sub.node, context, out);
                 }
             }
         }
@@ -19720,10 +19816,10 @@ pub(super) fn same_unit_func_ref(
     FuncRef::External(lowered)
 }
 
-pub(super) fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> String {
-    if let Some(binding_label) = &sym.attrs.binding_label {
-        return binding_label.clone();
-    }
+pub(crate) fn symbol_abi_metadata_name(
+    st: &SymbolTable,
+    sym: &crate::sema::symtab::Symbol,
+) -> String {
     if matches!(
         sym.kind,
         crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine
@@ -19734,19 +19830,14 @@ pub(super) fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symb
                 return module_procedure_symbol_name(module_name, &sym.name);
             }
             crate::sema::symtab::ScopeKind::Submodule(submod_name) => {
-                // F2018 §11.2.3: separate module procedure bodies link
-                // under the parent module's name, not the submodule's.
-                if sym.attrs.is_separate_module_procedure {
-                    if let Some(parent_lc) = scope
-                        .use_associations
-                        .iter()
-                        .find(|u| u.is_submodule_access)
-                        .and_then(|u| match &st.scope(u.source_scope).kind {
-                            crate::sema::symtab::ScopeKind::Module(n) => Some(n.to_lowercase()),
-                            _ => None,
-                        })
-                    {
-                        return module_procedure_symbol_name(&parent_lc, &sym.name);
+                // Separate declarations and their descendant bodies share
+                // the ancestor module's implementation slot. The immediate
+                // host can itself be a submodule, so use the retained root
+                // identity instead of inferring ownership from one host edge.
+                if sym.attrs.is_separate_module_procedure || sym.attrs.is_separate_module_interface
+                {
+                    if let Some(ancestor) = &scope.submodule_ancestor {
+                        return module_procedure_symbol_name(ancestor, &sym.name);
                     }
                 }
                 return module_procedure_symbol_name(submod_name, &sym.name);
@@ -19755,6 +19846,13 @@ pub(super) fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symb
         }
     }
     sym.name.clone()
+}
+
+pub(crate) fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> String {
+    sym.attrs
+        .binding_label
+        .clone()
+        .unwrap_or_else(|| symbol_abi_metadata_name(st, sym))
 }
 
 pub(super) fn abi_key_for_link_name(st: &SymbolTable, link_name: &str) -> Option<String> {
@@ -60842,6 +60940,33 @@ mod tests {
         );
         let ir_text = printer::print_module(&module);
         (module, ir_text)
+    }
+
+    #[test]
+    fn separate_procedure_metadata_uses_ancestor_owner() {
+        let tokens = Lexer::tokenize(
+            "submodule (root:middle) child\ncontains\n  module subroutine compute(values, text, bias)\n    integer, intent(in) :: values(:)\n    character(*), intent(in) :: text\n    integer, intent(in), optional :: bias\n  end subroutine compute\n  module subroutine no_args()\n  end subroutine no_args\n  subroutine helper(values, text, bias)\n    integer, intent(in) :: values(:)\n    character(*), intent(in) :: text\n    integer, intent(in), optional :: bias\n  end subroutine helper\nend submodule child\n",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        let mut optional = HashMap::new();
+        let mut descriptor = HashMap::new();
+        let mut char_len = HashMap::new();
+        collect_optional_params(&units[0].node, &mut optional);
+        collect_descriptor_params(&units[0].node, &mut descriptor);
+        collect_char_len_star_params(&units[0].node, &mut char_len);
+        let root_key = "afs_modproc_root_compute";
+
+        assert_eq!(optional.get(root_key), Some(&vec![false, false, true]));
+        assert_eq!(descriptor.get(root_key), Some(&vec![true, false, false]));
+        assert_eq!(char_len.get(root_key), Some(&vec![false, true, false]));
+        assert_eq!(optional.get("afs_modproc_root_no_args"), Some(&Vec::new()));
+        let child_key = "afs_modproc_child_helper";
+        assert_eq!(optional.get(child_key), Some(&vec![false, false, true]));
+        assert_eq!(descriptor.get(child_key), Some(&vec![true, false, false]));
+        assert_eq!(char_len.get(child_key), Some(&vec![false, true, false]));
     }
 
     #[test]
