@@ -5209,6 +5209,21 @@ fn callable_invocation_rank(ctx: &Ctx<'_>, symbol: &Symbol, args: &[Argument]) -
     }
 }
 
+fn procedure_interface_call_result_metadata(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    args: &[Argument],
+) -> Option<(TypeInfo, usize)> {
+    let interface_name = symbol.attrs.procedure_iface.as_deref()?;
+    let interface_symbol = ctx
+        .st
+        .lookup_in(symbol.scope, interface_name)
+        .or_else(|| ctx.lookup_lexical(interface_name))?;
+    let procedure_scope =
+        assignment_candidate_scope(ctx, &interface_symbol.name, interface_symbol.scope)?;
+    candidate_result_metadata(ctx, procedure_scope, interface_symbol, args, None)
+}
+
 fn component_call_result_metadata(
     ctx: &Ctx<'_>,
     callee: &SpannedExpr,
@@ -5419,6 +5434,11 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                 return Some(type_info);
             }
             let symbol = ctx.lookup_lexical(name);
+            if let Some(metadata) = symbol
+                .and_then(|symbol| procedure_interface_call_result_metadata(ctx, symbol, args))
+            {
+                return Some(metadata.0);
+            }
             let user_callable = symbol.is_some_and(|symbol| {
                 matches!(
                     symbol.kind,
@@ -6340,6 +6360,11 @@ fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
                 return Some(0);
             }
             if let Some((_, rank)) = named_generic_call_result_metadata(ctx, name, args) {
+                return Some(rank);
+            }
+            if let Some((_, rank)) = symbol
+                .and_then(|symbol| procedure_interface_call_result_metadata(ctx, symbol, args))
+            {
                 return Some(rank);
             }
             if let Some(symbol) = symbol {
@@ -9180,6 +9205,29 @@ end program
             4,
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn procedure_dummy_call_uses_later_interface_result_type() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+contains
+  integer function wrapper(f) result(r)
+    procedure(iface) :: f
+    r = f(0)
+  end function wrapper
+
+  integer function iface(x)
+    integer, intent(in) :: x
+    iface = x
+  end function iface
+end module m
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
