@@ -6388,8 +6388,8 @@ fn intrinsic_call_result_rank(ctx: &Ctx<'_>, name: &str, args: &[Argument]) -> O
         "spread" => source_rank(0, &["source"]).map(|rank| rank + 1),
         "cshift" | "eoshift" => source_rank(0, &["array"]),
         "shape" => Some(1),
-        "size" | "rank" | "allocated" | "associated" | "present" | "len" | "storage_size"
-        | "kind" | "dot_product" => Some(0),
+        "size" | "rank" | "allocated" | "associated" | "present" | "len" | "trim"
+        | "storage_size" | "kind" | "dot_product" => Some(0),
         "lbound" | "ubound" => {
             let has_dim = call_rank_argument_expr(args, 1, &["dim"]).is_some();
             Some(usize::from(!has_dim))
@@ -9467,6 +9467,40 @@ end program
             !errs.iter().any(|err| err.contains("intrinsic assignment")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn accepts_defined_assignment_from_scalar_intrinsic_result() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: box_t
+    character(len=:), allocatable :: text
+  end type
+  interface assignment(=)
+    module procedure assign_box_text
+  end interface
+  interface trim
+    module procedure trim_box
+  end interface
+contains
+  function trim_box(value) result(output)
+    type(box_t), intent(in) :: value
+    type(box_t) :: output
+    output = trim(\" x \")
+  end function trim_box
+
+  subroutine assign_box_text(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    character(len=*), intent(in) :: rhs
+    lhs%text = rhs
+  end subroutine assign_box_text
+end module m
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
