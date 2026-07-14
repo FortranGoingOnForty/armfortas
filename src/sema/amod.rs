@@ -2727,6 +2727,10 @@ pub fn extract_module_globals(
                         }
                         _ => crate::ir::lower::CharKind::None,
                     },
+                    logical_kind: match var.type_info.as_ref() {
+                        Some(TypeInfo::Logical { kind }) => Some(kind.unwrap_or(4)),
+                        _ => None,
+                    },
                     const_value: var.const_value.map(i128::from),
                     const_real_value: var.const_real_value,
                     external: true,
@@ -2871,7 +2875,13 @@ fn type_info_to_ir_type(info: Option<&TypeInfo>) -> crate::ir::types::IrType {
             };
             IrType::Array(Box::new(IrType::Float(fw)), 2)
         }
-        Some(TypeInfo::Logical { .. }) => IrType::Bool,
+        Some(TypeInfo::Logical { kind }) => match kind.unwrap_or(4) {
+            1 => IrType::Int(IntWidth::I8),
+            2 => IrType::Int(IntWidth::I16),
+            8 => IrType::Int(IntWidth::I64),
+            16 => IrType::Int(IntWidth::I128),
+            _ => IrType::Bool,
+        },
         Some(TypeInfo::Character { .. }) => IrType::Int(IntWidth::I8),
         _ => IrType::Int(IntWidth::I32),
     }

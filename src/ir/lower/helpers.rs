@@ -157,9 +157,8 @@ pub(super) fn coerce_to_type(b: &mut FuncBuilder, val: ValueId, target: &IrType)
         // reach Bool before a logical op (audit31 Finding 13).
         (IrType::Int(_), IrType::Bool) => {
             let zero = match &src {
+                IrType::Int(IntWidth::I128) => b.const_i128(0),
                 IrType::Int(IntWidth::I64) => b.const_i64(0),
-                IrType::Int(IntWidth::I16) => b.const_i32(0),
-                IrType::Int(IntWidth::I8) => b.const_i32(0),
                 _ => b.const_i32(0),
             };
             // Widen to i32 first if the source is narrower so
