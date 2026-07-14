@@ -777,7 +777,7 @@ pub(crate) fn lower_expr_full(
                     descriptor_params,
                 );
             }
-            let cond_val = lower_expr_full(
+            let cond_raw = lower_expr_full(
                 b,
                 locals,
                 cond,
@@ -787,6 +787,7 @@ pub(crate) fn lower_expr_full(
                 contained_host_refs,
                 descriptor_params,
             );
+            let cond_val = coerce_to_type(b, cond_raw, &IrType::Bool);
             let bb_then = b.create_block("cond_then");
             let bb_else = b.create_block("cond_else");
             let bb_merge = b.create_block("cond_merge");

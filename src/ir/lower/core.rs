@@ -10674,7 +10674,7 @@ pub(super) fn actual_char_arg_runtime_len(
                 );
             }
 
-            let cond_val = super::expr::lower_expr_full(
+            let cond_raw = super::expr::lower_expr_full(
                 b,
                 locals,
                 cond,
@@ -10684,6 +10684,7 @@ pub(super) fn actual_char_arg_runtime_len(
                 contained_host_refs,
                 descriptor_params,
             );
+            let cond_val = coerce_to_type(b, cond_raw, &IrType::Bool);
             let bb_then = b.create_block("cond_char_len_then");
             let bb_else = b.create_block("cond_char_len_else");
             let bb_merge = b.create_block("cond_char_len_merge");
@@ -24114,8 +24115,9 @@ pub(super) fn clear_intent_out_derived_params(
 
         if decl_is_optional(pname, decls) && info.by_ref {
             let ptr_val = b.load(info.addr);
+            let ptr_raw = b.ptr_to_int(ptr_val);
             let zero = b.const_i64(0);
-            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let present = b.icmp(CmpOp::Ne, ptr_raw, zero);
             let bb_clear = b.create_block("intent_out_clear_present");
             let bb_skip = b.create_block("intent_out_clear_skip");
             b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
@@ -24250,8 +24252,9 @@ pub(super) fn clear_intent_out_allocatable_array_params(
 
         if decl_is_optional(pname, decls) && info.by_ref {
             let ptr_val = b.load(info.addr);
+            let ptr_raw = b.ptr_to_int(ptr_val);
             let zero = b.const_i64(0);
-            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let present = b.icmp(CmpOp::Ne, ptr_raw, zero);
             let bb_clear = b.create_block("intent_out_alloc_clear_present");
             let bb_skip = b.create_block("intent_out_alloc_clear_skip");
             b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
@@ -25930,7 +25933,7 @@ pub(super) fn lower_string_expr_full(
                     descriptor_params,
                 );
             }
-            let cond_val = crate::ir::lower::expr::lower_expr_full(
+            let cond_raw = crate::ir::lower::expr::lower_expr_full(
                 b,
                 locals,
                 cond,
@@ -25940,6 +25943,7 @@ pub(super) fn lower_string_expr_full(
                 contained_host_refs,
                 descriptor_params,
             );
+            let cond_val = coerce_to_type(b, cond_raw, &IrType::Bool);
             let bb_then = b.create_block("cond_str_then");
             let bb_else = b.create_block("cond_str_else");
             let bb_merge = b.create_block("cond_str_merge");
@@ -26344,7 +26348,7 @@ pub(super) fn lower_string_expr_full(
                                 IrType::Int(IntWidth::I64),
                             );
                             let content_len = if let Some(asis) = asis_arg {
-                                let asis_val = super::expr::lower_expr_full(
+                                let asis_raw = super::expr::lower_expr_full(
                                     b,
                                     locals,
                                     asis,
@@ -26354,6 +26358,7 @@ pub(super) fn lower_string_expr_full(
                                     contained_host_refs,
                                     descriptor_params,
                                 );
+                                let asis_val = coerce_to_type(b, asis_raw, &IrType::Bool);
                                 b.select(asis_val, src_len, trimmed)
                             } else {
                                 trimmed
@@ -29088,7 +29093,8 @@ pub(super) fn try_lower_select(
     }
 
     // Lower condition, then both value expressions, then emit Select + Store.
-    let cond = super::expr::lower_expr_ctx(b, ctx, condition);
+    let cond_raw = super::expr::lower_expr_ctx(b, ctx, condition);
+    let cond = coerce_to_type(b, cond_raw, &IrType::Bool);
     let tv = super::expr::lower_expr_ctx(b, ctx, then_val_expr);
     let fv = super::expr::lower_expr_ctx(b, ctx, else_val_expr);
     let tv = coerce_to_type(b, tv, &info.ty);
@@ -29212,7 +29218,8 @@ pub(super) fn lower_condition_branch(
             lower_condition_branch(b, ctx, right, bb_true, bb_false);
         }
         _ => {
-            let cond = super::expr::lower_expr_ctx(b, ctx, condition);
+            let raw = super::expr::lower_expr_ctx(b, ctx, condition);
+            let cond = coerce_to_type(b, raw, &IrType::Bool);
             b.cond_branch(cond, bb_true, vec![], bb_false, vec![]);
         }
     }
@@ -49295,7 +49302,8 @@ pub(super) fn lower_forall_nested(
     if specs.is_empty() {
         // Innermost level: apply mask and execute body.
         if let Some(mask_expr) = mask {
-            let cond = super::expr::lower_expr_ctx_tl(b, ctx, mask_expr);
+            let cond_raw = super::expr::lower_expr_ctx_tl(b, ctx, mask_expr);
+            let cond = coerce_to_type(b, cond_raw, &IrType::Bool);
             let bb_body = b.create_block("forall_body");
             let bb_skip = b.create_block("forall_skip");
             b.cond_branch(cond, bb_body, vec![], bb_skip, vec![]);
@@ -52526,9 +52534,7 @@ fn associated_target_address_for_expr(
                 } else {
                     info.addr
                 };
-                let scratch = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                b.store(target_ptr, scratch);
-                Some(b.load_typed(scratch, IrType::Int(IntWidth::I64)))
+                Some(coerce_to_type(b, target_ptr, &IrType::Int(IntWidth::I64)))
             } else {
                 None
             }
@@ -61973,6 +61979,138 @@ end program
         assert!(ir.contains("if_then"));
         assert!(ir.contains("if_else"));
         assert!(ir.contains("if_end"));
+    }
+
+    #[test]
+    fn nondefault_logical_condition_lowers_to_bool() {
+        let module = lower_source(
+            "\
+program test
+  implicit none
+  logical(1) :: flag
+  integer :: x, y, left(2), right(2), selected(2)
+  flag = .true._1
+  left = [1, 2]
+  right = [3, 4]
+  if (flag) then
+    x = 1
+    y = 2
+  else
+    x = 3
+    y = 4
+  end if
+  x = (flag ? 5 : 6)
+  selected = (flag ? left : right)
+  where (flag) y = y + 1
+  if (flag) then
+    x = 7
+  else
+    x = 8
+  end if
+end program
+",
+        );
+        let ir = printer::print_module(&module);
+        let mut condition_count = 0;
+        let mut select_count = 0;
+        for func in &module.functions {
+            for block in &func.blocks {
+                if let Some(crate::ir::inst::Terminator::CondBranch { cond, .. }) =
+                    &block.terminator
+                {
+                    condition_count += 1;
+                    assert_eq!(
+                        func.value_type(*cond),
+                        Some(IrType::Bool),
+                        "conditional branch must receive Bool:\n{ir}"
+                    );
+                }
+                for inst in &block.insts {
+                    if let crate::ir::inst::InstKind::Select(cond, _, _) = &inst.kind {
+                        select_count += 1;
+                        assert_eq!(
+                            func.value_type(*cond),
+                            Some(IrType::Bool),
+                            "select must receive Bool:\n{ir}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            condition_count >= 4,
+            "expected all condition-lowering paths to branch:\n{ir}"
+        );
+        assert!(select_count > 0, "expected the IF select fast path:\n{ir}");
+    }
+
+    #[test]
+    fn specialized_nondefault_logical_conditions_verify() {
+        lower_and_verify(
+            "\
+program test
+  implicit none
+  logical(1) :: flag
+  integer :: a, b
+  character(:), allocatable :: text
+  flag = .true._1
+  a = 1
+  b = 2
+  text = (flag ? 'long' : 'x')
+  call set_value((flag ? a : b))
+  call take_text((flag ? 'wide' : 'z'))
+  text = f_c_string('ab  ', asis=flag)
+contains
+  subroutine set_value(value)
+    integer, intent(out) :: value
+    value = 3
+  end subroutine set_value
+  subroutine take_text(value)
+    character(*), intent(in) :: value
+    if (len(value) < 0) error stop
+  end subroutine take_text
+end program
+",
+        );
+    }
+
+    #[test]
+    fn nondefault_logical_array_masks_verify() {
+        lower_and_verify(
+            "\
+program test
+  implicit none
+  logical(1) :: mask(3)
+  integer :: values(3), i
+  mask = [.true._1, .false._1, .true._1]
+  values = 0
+  where (mask) values = 1
+  forall (i = 1:3, mask(i)) values(i) = i
+end program
+",
+        );
+    }
+
+    #[test]
+    fn wider_logical_conditions_verify() {
+        lower_and_verify(
+            "\
+program test
+  implicit none
+  logical(2) :: flag2
+  logical(8) :: flag8
+  logical(16) :: flag16
+  integer :: value
+  flag2 = .true._2
+  flag8 = .true._8
+  flag16 = .true._16
+  value = 0
+  if (flag2) value = value + 1
+  if (flag8) value = value + 1
+  if (flag16) value = value + 1
+end program
+",
+        );
     }
 
     #[test]

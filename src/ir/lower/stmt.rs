@@ -1718,7 +1718,7 @@ pub(super) fn lower_call_arg_maybe_conditional(
                     materialize,
                 );
             }
-            let cond_val = super::expr::lower_expr_full(
+            let cond_raw = super::expr::lower_expr_full(
                 b,
                 locals,
                 cond,
@@ -1728,6 +1728,7 @@ pub(super) fn lower_call_arg_maybe_conditional(
                 contained_host_refs,
                 descriptor_params,
             );
+            let cond_val = coerce_to_type(b, cond_raw, &IrType::Bool);
             let bb_then = b.create_block("condarg_then");
             let bb_else = b.create_block("condarg_else");
             let bb_merge = b.create_block("condarg_merge");
@@ -1946,7 +1947,8 @@ fn lower_array_conditional_assign(
         lower_stmt(b, ctx, &assign_arm(arm));
         return;
     }
-    let cond_val = super::expr::lower_expr_ctx(b, ctx, cond);
+    let cond_raw = super::expr::lower_expr_ctx(b, ctx, cond);
+    let cond_val = coerce_to_type(b, cond_raw, &IrType::Bool);
     let bb_then = b.create_block("arrcond_then");
     let bb_else = b.create_block("arrcond_else");
     let bb_done = b.create_block("arrcond_done");
@@ -5972,7 +5974,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             collect_array_names_stmt(&prepared_stmt, &ctx.locals, &mut array_names);
 
             if array_names.is_empty() {
-                let cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
+                let raw_cond = super::expr::lower_expr_ctx_tl(b, ctx, &prepared_mask);
+                let cond = coerce_to_type(b, raw_cond, &IrType::Bool);
                 let bb_then = b.create_block("where_stmt");
                 let bb_end = b.create_block("where_stmt_end");
                 b.cond_branch(cond, bb_then, vec![], bb_end, vec![]);
@@ -6056,7 +6059,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let rewritten_mask = rewrite_scalarized_section_refs(&prepared_mask, &array_names);
             let rewritten_stmt = rewrite_scalarized_section_refs_stmt(&prepared_stmt, &array_names);
 
-            let cond = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
+            let cond_raw = super::expr::lower_expr_ctx_tl(b, ctx, &rewritten_mask);
+            let cond = coerce_to_type(b, cond_raw, &IrType::Bool);
             let bb_then = b.create_block("where_stmt_then");
             let bb_incr = b.create_block("where_stmt_incr");
             b.cond_branch(cond, bb_then, vec![], bb_incr, vec![]);

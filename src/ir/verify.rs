@@ -154,10 +154,10 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
-    // 5. Branch arguments must match block parameters.
+    // 5. Branch conditions and arguments must have the expected types.
     for block in &func.blocks {
         if let Some(term) = &block.terminator {
-            check_branch_args(func, term, &block.name, &mut errors);
+            check_branch_types(func, term, &block.name, &mut errors);
         }
     }
 
@@ -286,13 +286,31 @@ fn collect_defined_values(func: &Function) -> HashSet<ValueId> {
     defined
 }
 
-/// Check that branch arguments match block parameters in count and type.
-fn check_branch_args(
+/// Check condition types and match branch arguments to block parameters.
+fn check_branch_types(
     func: &Function,
     term: &Terminator,
     from_block: &str,
     errors: &mut Vec<VerifyError>,
 ) {
+    if let Terminator::CondBranch { cond, .. } = term {
+        match func.value_type(*cond) {
+            Some(IrType::Bool) => {}
+            Some(ty) => errors.push(VerifyError {
+                msg: format!(
+                    "conditional branch from '{}': condition must be Bool, got {}",
+                    from_block, ty
+                ),
+            }),
+            None => errors.push(VerifyError {
+                msg: format!(
+                    "conditional branch from '{}': condition %{} has no type; expected Bool",
+                    from_block, cond.0
+                ),
+            }),
+        }
+    }
+
     let mut check = |dest: BlockId, args: &[ValueId]| {
         let target = func.block(dest);
         if target.params.len() != args.len() {
@@ -574,6 +592,50 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         msg: format!(
                             "logical op %{}: operands must be Bool ({} / {})",
                             inst.id.0, ta, tb,
+                        ),
+                    });
+                }
+            }
+        }
+
+        InstKind::ICmp(_, a, b) => {
+            let ta = func.value_type(*a);
+            let tb = func.value_type(*b);
+            if let (Some(ta), Some(tb)) = (&ta, &tb) {
+                if !ta.is_int() || !tb.is_int() {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "integer compare %{}: operands must be integers ({} / {})",
+                            inst.id.0, ta, tb,
+                        ),
+                    });
+                } else if ta != tb {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "integer compare operand type mismatch: %{} : {} vs %{} : {}",
+                            a.0, ta, b.0, tb,
+                        ),
+                    });
+                }
+            }
+        }
+
+        InstKind::Select(cond, true_val, false_val) => {
+            if let Some(cond_ty) = func.value_type(*cond) {
+                if cond_ty != IrType::Bool {
+                    errors.push(VerifyError {
+                        msg: format!("select condition must be Bool: %{} got {}", cond.0, cond_ty,),
+                    });
+                }
+            }
+            if let (Some(true_ty), Some(false_ty)) =
+                (func.value_type(*true_val), func.value_type(*false_val))
+            {
+                if true_ty != false_ty || true_ty != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "select %{}: arms and result must share type ({} / {} / {})",
+                            inst.id.0, true_ty, false_ty, inst.ty,
                         ),
                     });
                 }
@@ -902,6 +964,69 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(errs.is_empty(), "errors: {:?}", errs);
+    }
+
+    #[test]
+    fn cond_branch_requires_bool_condition() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let cond = b.const_i32(1);
+            let bb_t = b.create_block("then");
+            let bb_f = b.create_block("else");
+            b.cond_branch(cond, bb_t, vec![], bb_f, vec![]);
+
+            b.set_block(bb_t);
+            b.ret_void();
+            b.set_block(bb_f);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter()
+                .any(|e| e.msg.contains("condition must be Bool")),
+            "expected non-Bool branch condition error, got: {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn select_requires_bool_condition() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let cond = b.const_i32(1);
+            let true_val = b.const_i32(2);
+            let false_val = b.const_i32(3);
+            b.select(cond, true_val, false_val);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter()
+                .any(|e| e.msg.contains("select condition must be Bool")),
+            "expected non-Bool select condition error, got: {:?}",
+            errs,
+        );
+    }
+
+    #[test]
+    fn icmp_requires_matching_integer_operands() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let wide = b.const_int(1, IntWidth::I128);
+            let narrow = b.const_i32(1);
+            b.icmp(CmpOp::Eq, wide, narrow);
+            b.ret_void();
+        }
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter()
+                .any(|e| e.msg.contains("integer compare operand type mismatch")),
+            "expected integer compare type mismatch, got: {:?}",
+            errs,
+        );
     }
 
     #[test]
