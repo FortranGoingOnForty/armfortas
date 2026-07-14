@@ -5364,6 +5364,79 @@ fn validate_untyped_array_constructor_elements(ctx: &mut Ctx<'_>, values: &[AcVa
     validate_values(ctx, &expected, values);
 }
 
+#[derive(Clone)]
+struct ValidationExprMetadata {
+    type_info: Option<TypeInfo>,
+    rank: Option<usize>,
+}
+
+fn validation_expr_metadata(ctx: &Ctx<'_>, expr: &SpannedExpr) -> ValidationExprMetadata {
+    match &expr.node {
+        Expr::UnaryOp { op, operand } => {
+            let operand_expr = operand.as_ref();
+            let operand_metadata = validation_expr_metadata(ctx, operand_expr);
+            let interface_name = format!("operator({op})");
+            if let Some((type_info, rank)) = defined_operator_result_metadata(
+                ctx,
+                &interface_name,
+                &[operand_expr],
+                std::slice::from_ref(&operand_metadata),
+            ) {
+                return ValidationExprMetadata {
+                    type_info: Some(type_info),
+                    rank: Some(rank),
+                };
+            }
+            let type_info = operand_metadata.type_info.as_ref().and_then(|type_info| {
+                unary_op_result_type(op, &type_info_to_fortran_type(type_info))
+                    .and_then(fortran_type_to_validation_type_info)
+            });
+            ValidationExprMetadata {
+                type_info,
+                rank: operand_metadata.rank,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let left_metadata = validation_expr_metadata(ctx, left);
+            let right_metadata = validation_expr_metadata(ctx, right);
+            let interface_name = format!("operator({op})");
+            if let Some((type_info, rank)) = defined_operator_result_metadata(
+                ctx,
+                &interface_name,
+                &[left.as_ref(), right.as_ref()],
+                &[left_metadata.clone(), right_metadata.clone()],
+            ) {
+                return ValidationExprMetadata {
+                    type_info: Some(type_info),
+                    rank: Some(rank),
+                };
+            }
+            let type_info = match (
+                left_metadata.type_info.as_ref(),
+                right_metadata.type_info.as_ref(),
+            ) {
+                (Some(left), Some(right)) => binary_op_result_type(
+                    op,
+                    &type_info_to_fortran_type(left),
+                    &type_info_to_fortran_type(right),
+                )
+                .and_then(fortran_type_to_validation_type_info),
+                _ => None,
+            };
+            let rank = match (left_metadata.rank, right_metadata.rank) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(rank), None) | (None, Some(rank)) => Some(rank),
+                (None, None) => None,
+            };
+            ValidationExprMetadata { type_info, rank }
+        }
+        _ => ValidationExprMetadata {
+            type_info: validation_expr_type_info(ctx, expr),
+            rank: validation_expr_rank(ctx, expr),
+        },
+    }
+}
+
 fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeInfo> {
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(leaf) = leaf_field_layout(ctx, expr) {
@@ -5397,30 +5470,8 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                 .unwrap_or_else(crate::driver::defaults::default_real_kind);
             Some(TypeInfo::Complex { kind: Some(kind) })
         }
-        Expr::UnaryOp { op, operand } => {
-            let interface_name = format!("operator({op})");
-            defined_operator_result_metadata(ctx, &interface_name, &[operand.as_ref()])
-                .map(|(type_info, _)| type_info)
-                .or_else(|| {
-                    let operand = validation_expr_type_info(ctx, operand)?;
-                    unary_op_result_type(op, &type_info_to_fortran_type(&operand))
-                        .and_then(fortran_type_to_validation_type_info)
-                })
-        }
-        Expr::BinaryOp { op, left, right } => {
-            let interface_name = format!("operator({op})");
-            defined_operator_result_metadata(ctx, &interface_name, &[left.as_ref(), right.as_ref()])
-                .map(|(type_info, _)| type_info)
-                .or_else(|| {
-                    let left = validation_expr_type_info(ctx, left)?;
-                    let right = validation_expr_type_info(ctx, right)?;
-                    binary_op_result_type(
-                        op,
-                        &type_info_to_fortran_type(&left),
-                        &type_info_to_fortran_type(&right),
-                    )
-                    .and_then(fortran_type_to_validation_type_info)
-                })
+        Expr::UnaryOp { .. } | Expr::BinaryOp { .. } => {
+            validation_expr_metadata(ctx, expr).type_info
         }
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
@@ -5914,6 +5965,7 @@ fn generic_dummy_type_matches(
 fn explicit_actual_rank_matches(
     ctx: &Ctx<'_>,
     actual: &SpannedExpr,
+    actual_type: Option<&TypeInfo>,
     actual_rank: usize,
     dummy_rank: usize,
     assumed_rank: bool,
@@ -5928,7 +5980,7 @@ fn explicit_actual_rank_matches(
         return false;
     }
     let character_storage = matches!(
-        (dummy_type, validation_expr_type_info(ctx, actual)),
+        (dummy_type, actual_type),
         (
             Some(TypeInfo::Character { .. }),
             Some(TypeInfo::Character { .. })
@@ -6032,6 +6084,7 @@ fn call_candidate_matches(
             if !explicit_actual_rank_matches(
                 ctx,
                 actual,
+                actual_type.as_ref(),
                 actual_rank,
                 dummy_rank,
                 assumed_rank,
@@ -6110,36 +6163,127 @@ fn named_generic_call_result_metadata(
     Some(metadata.clone())
 }
 
+fn operator_candidate_matches(
+    ctx: &Ctx<'_>,
+    scope: &Scope,
+    symbol: &Symbol,
+    operands: &[&SpannedExpr],
+    operand_metadata: &[ValidationExprMetadata],
+) -> bool {
+    if operands.len() != operand_metadata.len() || operands.len() > scope.arg_order.len() {
+        return false;
+    }
+
+    let mut elemental_rank = None;
+    for (index, (actual, metadata)) in operands.iter().zip(operand_metadata).enumerate() {
+        let Some(dummy) = scope
+            .arg_order
+            .get(index)
+            .and_then(|name| scope.symbols.get(name))
+        else {
+            return false;
+        };
+        if let (Some(dummy_type), Some(actual_type)) =
+            (dummy.type_info.as_ref(), metadata.type_info.as_ref())
+        {
+            if !generic_dummy_type_matches(ctx, scope.id, dummy_type, actual_type) {
+                return false;
+            }
+        }
+        if let Some(actual_rank) = metadata.rank {
+            let dummy_rank = dummy.attrs.array_spec.len();
+            if symbol.attrs.elemental && dummy_rank == 0 && actual_rank > 0 {
+                if elemental_rank.is_some_and(|rank| rank != actual_rank) {
+                    return false;
+                }
+                elemental_rank = Some(actual_rank);
+            }
+            let assumed_rank = dummy
+                .attrs
+                .array_spec
+                .iter()
+                .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank));
+            let allows_sequence_association = !dummy.attrs.array_spec.is_empty()
+                && dummy.attrs.array_spec.iter().all(|spec| {
+                    matches!(
+                        spec,
+                        crate::ast::decl::ArraySpec::Explicit { .. }
+                            | crate::ast::decl::ArraySpec::AssumedSize { .. }
+                    )
+                });
+            if !explicit_actual_rank_matches(
+                ctx,
+                actual,
+                metadata.type_info.as_ref(),
+                actual_rank,
+                dummy_rank,
+                assumed_rank,
+                allows_sequence_association,
+                dummy.type_info.as_ref(),
+                symbol.attrs.elemental,
+            ) {
+                return false;
+            }
+        }
+    }
+
+    scope.arg_order.iter().skip(operands.len()).all(|name| {
+        scope
+            .symbols
+            .get(name)
+            .is_some_and(|dummy| dummy.attrs.optional)
+    })
+}
+
+fn operator_candidate_result_metadata(
+    scope: &Scope,
+    symbol: &Symbol,
+    operand_metadata: &[ValidationExprMetadata],
+) -> Option<(TypeInfo, usize)> {
+    let result_symbol = result_symbol_in_procedure_scope(scope);
+    let type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| result_symbol.and_then(|result| result.type_info.clone()))?;
+    let declared_rank = symbol_declared_result_rank(symbol).or_else(|| {
+        result_symbol
+            .map(|result| usize::from(result.attrs.result_rank).max(result.attrs.array_spec.len()))
+    })?;
+    let rank = if symbol.attrs.elemental && declared_rank == 0 {
+        operand_metadata
+            .iter()
+            .filter_map(|metadata| metadata.rank)
+            .max()
+            .unwrap_or(0)
+    } else {
+        declared_rank
+    };
+    Some((type_info, rank))
+}
+
 fn defined_operator_result_metadata(
     ctx: &Ctx<'_>,
     interface_name: &str,
     operands: &[&SpannedExpr],
+    operand_metadata: &[ValidationExprMetadata],
 ) -> Option<(TypeInfo, usize)> {
-    let operand_types: Vec<TypeInfo> = operands
+    let operand_types: Vec<&TypeInfo> = operand_metadata
         .iter()
-        .map(|operand| validation_expr_type_info(ctx, operand))
+        .map(|metadata| metadata.type_info.as_ref())
         .collect::<Option<_>>()?;
-    let operand_type_refs: Vec<&TypeInfo> = operand_types.iter().collect();
-    let args: Vec<Argument> = operands
-        .iter()
-        .map(|operand| Argument {
-            keyword: None,
-            value: SectionSubscript::Element((*operand).clone()),
-        })
-        .collect();
     let mut matches = Vec::new();
-    for (name, owner_scope) in defined_interface_candidates(ctx, interface_name, &operand_type_refs)
-    {
+    for (name, owner_scope) in defined_interface_candidates(ctx, interface_name, &operand_types) {
         let Some(scope) = assignment_candidate_scope(ctx, &name, owner_scope) else {
             continue;
         };
         let Some(symbol) = candidate_symbol(ctx, &name, owner_scope, scope) else {
             continue;
         };
-        if !call_candidate_matches(ctx, scope, symbol, &args, None) {
+        if !operator_candidate_matches(ctx, scope, symbol, operands, operand_metadata) {
             continue;
         }
-        if let Some(metadata) = candidate_result_metadata(ctx, scope, symbol, &args, None) {
+        if let Some(metadata) = operator_candidate_result_metadata(scope, symbol, operand_metadata)
+        {
             matches.push(metadata);
         }
     }
@@ -6294,35 +6438,13 @@ fn validation_expr_rank(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<usize> {
                     .map(|symbol| symbol.attrs.array_spec.len())
             }),
         Expr::ParenExpr { inner } => validation_expr_rank(ctx, inner),
-        Expr::UnaryOp { op, operand } => {
-            let interface_name = format!("operator({op})");
-            defined_operator_result_metadata(ctx, &interface_name, &[operand.as_ref()])
-                .map(|(_, rank)| rank)
-                .or_else(|| validation_expr_rank(ctx, operand))
-        }
+        Expr::UnaryOp { .. } => validation_expr_metadata(ctx, expr).rank,
         Expr::ComponentAccess { base, .. } => {
             let base_rank = validation_expr_rank(ctx, base)?;
             let field_rank = leaf_field_layout(ctx, expr)?.field.dims.len();
             Some(base_rank + field_rank)
         }
-        Expr::BinaryOp { op, left, right } => {
-            let interface_name = format!("operator({op})");
-            if let Some((_, rank)) = defined_operator_result_metadata(
-                ctx,
-                &interface_name,
-                &[left.as_ref(), right.as_ref()],
-            ) {
-                return Some(rank);
-            }
-            match (
-                validation_expr_rank(ctx, left),
-                validation_expr_rank(ctx, right),
-            ) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (Some(rank), None) | (None, Some(rank)) => Some(rank),
-                (None, None) => None,
-            }
-        }
+        Expr::BinaryOp { .. } => validation_expr_metadata(ctx, expr).rank,
         Expr::ConditionalExpr { then_val, .. } => validation_expr_rank(ctx, then_val),
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
@@ -9766,6 +9888,33 @@ end program
             9,
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn validates_long_intrinsic_operator_chain_with_unrelated_defined_operator() {
+        let expression = (0..56).map(|_| "1").collect::<Vec<_>>().join("+");
+        let source = format!(
+            "\
+program p
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface operator(+)
+    function add_boxes(lhs, rhs) result(value)
+      import :: box_t
+      type(box_t), intent(in) :: lhs, rhs
+      type(box_t) :: value
+    end function
+  end interface
+  integer :: total
+  total = {expression}
+end program
+"
+        );
+
+        let errs = errors_from(&source);
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
