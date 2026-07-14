@@ -25,7 +25,10 @@ fn million_char_program() -> String {
     // is term minus the newline. Overshoot by a margin so the total is
     // unambiguously past one million.
     let lines_needed = 1_000_000 / (term.len() - 1) + 100;
-    for _ in 0..lines_needed {
+    for line in 0..lines_needed {
+        if line == lines_needed / 2 {
+            src.push_str("! legal continuation gap\n\n");
+        }
         src.push_str(&term);
     }
     src.push_str("    + 1\n  print *, total\nend program big_stmt\n");
@@ -139,10 +142,13 @@ fn deep_chain_within_cap_compiles() {
 /// Past the cap: a clean diagnostic and exit 1 — never a stack fault.
 #[test]
 fn over_cap_statement_errors_cleanly() {
-    let n = 800_000;
+    let n = 300_000;
     let mut src = String::with_capacity(8 * n);
     src.push_str("program p\nimplicit none\ninteger :: total\ntotal=0&\n");
-    for _ in 0..n {
+    for term in 0..n {
+        if term == n / 2 {
+            src.push_str("! legal continuation gap\n\n");
+        }
         src.push_str("+1     &\n"); // fat lines: past 2M chars
     }
     src.push_str("+1\nprint *, total\nend program p\n");

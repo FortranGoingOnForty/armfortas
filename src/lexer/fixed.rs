@@ -1028,7 +1028,7 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
 }
 
 /// Check if a line is a continuation line (non-space, non-zero in column 6).
-fn is_continuation_line(line: &str) -> bool {
+pub(crate) fn is_continuation_line(line: &str) -> bool {
     let bytes = line.as_bytes();
 
     // Tab-form: tab followed by digit 1-9 is continuation.
