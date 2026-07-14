@@ -7221,8 +7221,18 @@ fn actual_is_definable(
             }
         }
         Expr::NilArgument => None,
+        Expr::ConditionalExpr {
+            then_val, else_val, ..
+        } => {
+            let then_definable = actual_is_definable(ctx, then_val, defines_association);
+            let else_definable = actual_is_definable(ctx, else_val, defines_association);
+            match (then_definable, else_definable) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (None, None) => None,
+            }
+        }
         Expr::ParenExpr { .. }
-        | Expr::ConditionalExpr { .. }
         | Expr::IntegerLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::StringLiteral { .. }
@@ -9176,6 +9186,37 @@ end module call_contracts
                 .filter(|err| err.contains("must be a definable variable"))
                 .count(),
             6,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validates_conditional_out_actual_arms_as_associations() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  subroutine fill(output)
+    integer, intent(out) :: output
+    output = 1
+  end subroutine fill
+
+  subroutine invoke(select_left)
+    logical, intent(in) :: select_left
+    integer :: left, right
+    call fill((select_left ? left : right))
+    call fill((select_left ? left : right + 1))
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("must be a definable variable"))
+                .count(),
+            1,
             "{errs:?}"
         );
     }
