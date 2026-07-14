@@ -22,7 +22,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
-const AMOD_VERSION: u32 = 4;
+const AMOD_VERSION: u32 = 5;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
 /// is `lower:upper` or just `upper`. Returns None if any dim is not
@@ -251,6 +251,9 @@ pub fn write_amod(
         .use_associations
         .iter()
         .filter_map(|ua| {
+            if !ua.from_bare_use || !ua.local_name.is_empty() {
+                return None;
+            }
             let src_scope = st.scope(ua.source_scope);
             if let ScopeKind::Module(ref n) = src_scope.kind {
                 Some(n.to_lowercase())
@@ -260,7 +263,6 @@ pub fn write_amod(
         })
         .collect();
     deps.sort();
-    deps.dedup();
     for dep in &deps {
         writeln!(out, "@uses {}", dep).unwrap();
     }
@@ -268,8 +270,39 @@ pub fn write_amod(
         writeln!(out).unwrap();
     }
 
-    // ---- Use renames ----
-    // Record each `use M, only: a => b` as `@use_rename a = b from m`.
+    // ONLY-qualified edges must retain their exact local and provider names.
+    // Reconstructing them as bare USE edges leaks every public provider symbol
+    // through a separately compiled facade.
+    let mut only_out: Vec<(String, String, String)> = scope
+        .use_associations
+        .iter()
+        .filter_map(|ua| {
+            if ua.from_bare_use || ua.local_name.is_empty() {
+                return None;
+            }
+            let src_scope = st.scope(ua.source_scope);
+            if let ScopeKind::Module(ref n) = src_scope.kind {
+                Some((
+                    ua.local_name.clone(),
+                    ua.original_name.clone(),
+                    n.to_lowercase(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    only_out.sort();
+    only_out.dedup();
+    for (local, original, src) in &only_out {
+        writeln!(out, "@use_only {} = {} from {}", local, original, src).unwrap();
+    }
+    if !only_out.is_empty() {
+        writeln!(out).unwrap();
+    }
+
+    // ---- Bare USE renames ----
+    // Record each `use M, a => b` as `@use_rename a = b from m`.
     // Submodule bodies pulled in by host association need to resolve
     // names like `block_kind` (renamed from `int64`) for kind selectors
     // and intrinsic dispatch; without preserving the rename, the .amod
@@ -279,7 +312,7 @@ pub fn write_amod(
         .use_associations
         .iter()
         .filter_map(|ua| {
-            if ua.local_name == ua.original_name {
+            if !ua.from_bare_use || ua.local_name == ua.original_name {
                 return None;
             }
             let src_scope = st.scope(ua.source_scope);
@@ -295,7 +328,6 @@ pub fn write_amod(
         })
         .collect();
     renames_out.sort();
-    renames_out.dedup();
     for (local, original, src) in &renames_out {
         writeln!(out, "@use_rename {} = {} from {}", local, original, src).unwrap();
     }
@@ -776,7 +808,7 @@ fn emit_procedure(
         // had a `result(X)` clause). Submodule bodies that reference the
         // result by its declared name need this preserved across the
         // .amod boundary so sema can register the right symbol.
-        let result_var_name: Option<String> = st
+        let result_var: Option<&Symbol> = st
             .scopes
             .iter()
             .find(|s| {
@@ -850,11 +882,11 @@ fn emit_procedure(
                     .into_iter()
                     .next()
                     .or_else(|| fallback_candidates.into_iter().next())
-                    .map(|(_, sym)| sym.name.clone())
+                    .map(|(_, candidate)| candidate)
             });
-        if let Some(result_var_name) = result_var_name {
-            if !result_var_name.eq_ignore_ascii_case(name) {
-                write!(out, ", result_name={}", result_var_name).unwrap();
+        if let Some(result_var) = result_var {
+            if !result_var.name.eq_ignore_ascii_case(name) {
+                write!(out, ", result_name={}", result_var.name).unwrap();
             }
         }
         // Sprint35-SMP Phase 3: serialize the result variable's
@@ -864,39 +896,9 @@ fn emit_procedure(
         // `res(i) = …` lowers against an AssumedShape result and the
         // function prologue fails to allocate the runtime-shape buffer.
         if !sym.attrs.allocatable && !sym.attrs.pointer && sym.attrs.result_rank > 0 {
-            let bounds = st
-                .scopes
-                .iter()
-                .find(|s| {
-                    let matches_name = match &s.kind {
-                        ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                            n.eq_ignore_ascii_case(name)
-                        }
-                        _ => false,
-                    };
-                    if !matches_name {
-                        return false;
-                    }
-                    let Some(parent_id) = s.parent else {
-                        return false;
-                    };
-                    parent_id == mod_scope_id
-                        || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
-                            && st.scope(parent_id).parent == Some(mod_scope_id)
-                })
-                .and_then(|pscope| {
-                    let arg_set: std::collections::HashSet<String> =
-                        pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                    pscope
-                        .symbols
-                        .iter()
-                        .find(|(key, sym)| {
-                            !arg_set.contains(*key)
-                                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-                        })
-                        .map(|(_, sym)| sym.attrs.array_spec.clone())
-                })
-                .and_then(|specs| stringify_array_bounds(&specs));
+            let bounds = result_var
+                .map(|result| &result.attrs.array_spec)
+                .and_then(|specs| stringify_array_bounds(specs));
             if let Some(s) = bounds {
                 write!(out, ", result_array_bounds=\"{}\"", s).unwrap();
             }
@@ -1509,12 +1511,11 @@ pub struct AmodInterface {
     pub access: Access,
 }
 
-/// One renamed USE association from this module's source: `use M, only: A => B`
-/// becomes `UseRename { local: "a", original: "b", source_module: "m" }`. The
-/// rename is recorded so downstream consumers (esp. submodules) can resolve
-/// the local name at .amod-load time. Without this the kind constant
-/// `block_kind => int64` is irrecoverable from a binary-only build.
-#[derive(Debug, Clone)]
+/// One serialized USE binding. `local` is the name visible in this module,
+/// `original` is the provider name, and `source_module` identifies the edge.
+/// The same shape represents an entry on an ONLY edge or a rename on a bare
+/// edge; `ModuleInterface` keeps those categories separate.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UseRename {
     pub local: String,
     pub original: String,
@@ -1526,6 +1527,7 @@ pub struct UseRename {
 pub struct ModuleInterface {
     pub module_name: String,
     pub dependencies: Vec<String>,
+    pub only_imports: Vec<UseRename>,
     pub renames: Vec<UseRename>,
     pub variables: Vec<AmodVar>,
     pub procedures: Vec<AmodProc>,
@@ -1691,6 +1693,29 @@ pub fn clear_amod_cache() {
     AMOD_CACHE_HITS.with(|h| *h.borrow_mut() = 0);
 }
 
+fn parse_use_binding(rest: &str, directive: &str, path: &Path) -> Result<UseRename, String> {
+    let malformed = || {
+        format!(
+            "{}: corrupt .amod file (malformed {} record); rebuild the provider module",
+            path.display(),
+            directive
+        )
+    };
+    let (lhs, source_module) = rest.split_once(" from ").ok_or_else(&malformed)?;
+    let (local, original) = lhs.split_once(" = ").ok_or_else(&malformed)?;
+    let local = local.trim();
+    let original = original.trim();
+    let source_module = source_module.trim();
+    if local.is_empty() || original.is_empty() || source_module.is_empty() {
+        return Err(malformed());
+    }
+    Ok(UseRename {
+        local: local.to_string(),
+        original: original.to_string(),
+        source_module: source_module.to_string(),
+    })
+}
+
 fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     let mut lines = content.lines().peekable();
 
@@ -1727,6 +1752,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let mut dependencies = Vec::new();
+    let mut only_imports: Vec<UseRename> = Vec::new();
     let mut renames: Vec<UseRename> = Vec::new();
     let mut variables = Vec::new();
     let mut procedures = Vec::new();
@@ -1742,17 +1768,16 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
             dependencies.push(dep.trim().to_string());
+        } else if trimmed == "@use_only" {
+            only_imports.push(parse_use_binding("", "@use_only", path)?);
+        } else if let Some(rest) = trimmed.strip_prefix("@use_only ") {
+            // `@use_only <local> = <original> from <module>`
+            only_imports.push(parse_use_binding(rest, "@use_only", path)?);
+        } else if trimmed == "@use_rename" {
+            renames.push(parse_use_binding("", "@use_rename", path)?);
         } else if let Some(rest) = trimmed.strip_prefix("@use_rename ") {
             // `@use_rename <local> = <original> from <module>`
-            if let Some((lhs, mod_part)) = rest.split_once(" from ") {
-                if let Some((local, original)) = lhs.split_once(" = ") {
-                    renames.push(UseRename {
-                        local: local.trim().to_string(),
-                        original: original.trim().to_string(),
-                        source_module: mod_part.trim().to_string(),
-                    });
-                }
-            }
+            renames.push(parse_use_binding(rest, "@use_rename", path)?);
         } else if trimmed.starts_with("@var ") {
             variables.push(parse_var(trimmed, false));
         } else if trimmed.starts_with("@param ") {
@@ -1832,6 +1857,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     Ok(ModuleInterface {
         module_name,
         dependencies,
+        only_imports,
         renames,
         variables,
         procedures,
@@ -2780,6 +2806,7 @@ mod tests {
         let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
         assert_eq!(iface.module_name, "physics");
         assert_eq!(iface.dependencies, vec!["iso_c_binding"]);
+        assert!(iface.only_imports.is_empty());
         assert_eq!(iface.variables.len(), 2); // call_count + gravity
         assert!(iface.variables.iter().any(|v| v.name == "call_count"
             && v.ir_symbol.as_deref() == Some("afs_mod_physics_call_count")));
@@ -2819,6 +2846,65 @@ mod tests {
                 rank: 1,
             }]
         );
+    }
+
+    #[test]
+    fn only_qualified_dependencies_round_trip_exact_bindings() {
+        let amod_text = r#"#!amod 5
+# module: facade
+# source: facade.f90
+
+@uses bare_dep
+@use_only visible = visible from filtered_dep
+@use_only alias = remote from filtered_dep
+@use_rename local_name = remote_name from bare_dep
+"#;
+        let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
+        assert_eq!(iface.dependencies, vec!["bare_dep"]);
+        assert_eq!(
+            iface.only_imports,
+            vec![
+                UseRename {
+                    local: "visible".into(),
+                    original: "visible".into(),
+                    source_module: "filtered_dep".into(),
+                },
+                UseRename {
+                    local: "alias".into(),
+                    original: "remote".into(),
+                    source_module: "filtered_dep".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            iface.renames,
+            vec![UseRename {
+                local: "local_name".into(),
+                original: "remote_name".into(),
+                source_module: "bare_dep".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_use_bindings_are_rejected() {
+        for record in [
+            "@use_only",
+            "@use_only local = remote",
+            "@use_only = remote from provider",
+            "@use_rename",
+            "@use_rename local = from provider",
+        ] {
+            let amod_text =
+                format!("#!amod 5\n# module: facade\n# source: facade.f90\n\n{record}\n");
+            let err = parse_amod(&amod_text, Path::new("bad.amod")).unwrap_err();
+            assert!(
+                err.contains("corrupt .amod file")
+                    && err.contains("malformed @use_")
+                    && err.contains("rebuild the provider module"),
+                "unexpected error for {record}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2944,7 +3030,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 4
+            r#"#!amod 5
 # module: cache_test
 # source: cache_test.f90
 
@@ -2974,7 +3060,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_truncated_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 4
+            r#"#!amod 5
 # module: truncated_test
 # source: truncated_test.f90
 
@@ -3008,7 +3094,7 @@ mod tests {
             std::process::id()
         ));
         let text = add_integrity_headers(
-            r#"#!amod 3
+            r#"#!amod 4
 # module: stale_test
 # source: stale_test.f90
 
@@ -3022,7 +3108,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 3")
+            err.contains("incompatible .amod version 4")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

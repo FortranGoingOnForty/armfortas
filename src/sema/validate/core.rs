@@ -16,7 +16,7 @@ use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
-use crate::ast::decl::{Attribute, Decl, SpannedDecl, TypeAttr, TypeSpec};
+use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec};
 use crate::ast::expr::{Expr, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
@@ -144,6 +144,19 @@ pub(super) struct Ctx<'a> {
     /// Avoid repeating one unsupported-capture diagnostic for every use
     /// of the same host entity in a finalizer or one of its helpers.
     reported_finalizer_captures: HashSet<(ScopeId, ScopeId, String)>,
+    /// One ambiguity in a host scope can be referenced by several contained
+    /// procedures. Report it once at the first source reference.
+    reported_use_ambiguities: HashSet<(ScopeId, String)>,
+    /// A restricted IMPORT policy can make the same host entity appear in
+    /// several declaration expressions. Diagnose the first reference only.
+    reported_inaccessible_host_entities: HashSet<(ScopeId, String)>,
+    /// BLOCK constructs do not have symbol-table scope IDs, so their
+    /// ambiguity diagnostics are keyed by the construct's source position.
+    reported_block_use_ambiguities: HashSet<(u32, u32, u32, String)>,
+    /// BLOCK and ASSOCIATE constructs are outside the symbol-table scope
+    /// graph. Preserve their interleaved lexical order so local bindings and
+    /// BLOCK USE associations shadow outer names correctly.
+    ambiguity_lexical_frames: Vec<AmbiguityLexicalFrame>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -151,6 +164,31 @@ struct BlockBindingAttrs {
     intent_in: bool,
     parameter: bool,
     pointer: bool,
+}
+
+#[derive(Clone)]
+struct BlockImportControl {
+    policy: HostAssociationPolicy,
+    protection: HostImportProtection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LexicalHostVisibility {
+    Visible,
+    Hidden,
+    Missing,
+}
+
+enum AmbiguityLexicalFrame {
+    Block {
+        span: Span,
+        uses: Vec<SpannedDecl>,
+        bindings: HashSet<String>,
+        import_control: BlockImportControl,
+    },
+    Associate {
+        bindings: HashSet<String>,
+    },
 }
 
 impl<'a> Ctx<'a> {
@@ -182,6 +220,10 @@ impl<'a> Ctx<'a> {
             in_bind_c_unit: false,
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
+            reported_use_ambiguities: HashSet::new(),
+            reported_inaccessible_host_entities: HashSet::new(),
+            reported_block_use_ambiguities: HashSet::new(),
+            ambiguity_lexical_frames: Vec::new(),
         }
     }
 
@@ -2068,10 +2110,41 @@ fn find_scope_for_unit(
         .map(|s| s.id)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReferenceRole {
+    Value,
+    Callable,
+    Type,
+}
+
+#[derive(Debug)]
+struct NameReference {
+    name: String,
+    span: Span,
+    role: ReferenceRole,
+}
+
 #[derive(Default)]
 struct ProcedureReferenceFacts {
-    references: Vec<(String, Span)>,
+    references: Vec<NameReference>,
     calls: HashSet<String>,
+}
+
+fn collect_name_reference(
+    name: &str,
+    span: Span,
+    role: ReferenceRole,
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    let key = name.to_lowercase();
+    if !shadowed.contains(&key) {
+        facts.references.push(NameReference {
+            name: key,
+            span,
+            role,
+        });
+    }
 }
 
 fn collect_reference_subscript(
@@ -2120,10 +2193,7 @@ fn collect_reference_expr(
 ) {
     match &expr.node {
         Expr::Name { name } => {
-            let key = name.to_lowercase();
-            if !shadowed.contains(&key) {
-                facts.references.push((key, expr.span));
-            }
+            collect_name_reference(name, expr.span, ReferenceRole::Value, shadowed, facts);
         }
         Expr::UnaryOp { operand, .. } => collect_reference_expr(operand, shadowed, facts),
         Expr::BinaryOp { left, right, .. } => {
@@ -2138,15 +2208,24 @@ fn collect_reference_expr(
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
                 if !shadowed.contains(&key) {
-                    facts.calls.insert(key);
+                    facts.calls.insert(key.clone());
+                    facts.references.push(NameReference {
+                        name: key,
+                        span: callee.span,
+                        role: ReferenceRole::Callable,
+                    });
                 }
+            } else {
+                collect_reference_expr(callee, shadowed, facts);
             }
-            collect_reference_expr(callee, shadowed, facts);
             for arg in args {
                 collect_reference_subscript(&arg.value, shadowed, facts);
             }
         }
-        Expr::ArrayConstructor { values, .. } => {
+        Expr::ArrayConstructor { type_spec, values } => {
+            if let Some(type_name) = type_spec {
+                collect_name_reference(type_name, expr.span, ReferenceRole::Type, shadowed, facts);
+            }
             for value in values {
                 collect_reference_ac_value(value, shadowed, facts);
             }
@@ -2162,12 +2241,17 @@ fn collect_reference_expr(
             collect_reference_expr(then_val, shadowed, facts);
             collect_reference_expr(else_val, shadowed, facts);
         }
-        Expr::IntegerLiteral { .. }
-        | Expr::RealLiteral { .. }
-        | Expr::StringLiteral { .. }
-        | Expr::LogicalLiteral { .. }
-        | Expr::BozLiteral { .. }
-        | Expr::NilArgument => {}
+        Expr::IntegerLiteral { kind, .. }
+        | Expr::RealLiteral { kind, .. }
+        | Expr::StringLiteral { kind, .. }
+        | Expr::LogicalLiteral { kind, .. } => {
+            if let Some(kind) = kind {
+                if kind.parse::<u8>().is_err() {
+                    collect_name_reference(kind, expr.span, ReferenceRole::Value, shadowed, facts);
+                }
+            }
+        }
+        Expr::BozLiteral { .. } | Expr::NilArgument => {}
     }
 }
 
@@ -2195,6 +2279,7 @@ fn collect_reference_array_spec(
 
 fn collect_reference_type_spec(
     type_spec: &TypeSpec,
+    span: Span,
     shadowed: &HashSet<String>,
     facts: &mut ProcedureReferenceFacts,
 ) {
@@ -2217,6 +2302,12 @@ fn collect_reference_type_spec(
                 collect_reference_expr(kind, shadowed, facts);
             }
         }
+        TypeSpec::Type(name)
+        | TypeSpec::Class(name)
+        | TypeSpec::TypeOf(name)
+        | TypeSpec::ClassOf(name) => {
+            collect_name_reference(name, span, ReferenceRole::Type, shadowed, facts);
+        }
         _ => {}
     }
 }
@@ -2232,7 +2323,7 @@ fn collect_reference_decl(
             attrs,
             entities,
         } => {
-            collect_reference_type_spec(type_spec, shadowed, facts);
+            collect_reference_type_spec(type_spec, decl.span, shadowed, facts);
             for attr in attrs {
                 if let Attribute::Dimension(specs) = attr {
                     for spec in specs {
@@ -2292,9 +2383,41 @@ fn collect_reference_decl(
                 }
             }
         }
-        Decl::DerivedTypeDef { components, .. } => {
+        Decl::DerivedTypeDef {
+            extends,
+            components,
+            type_bound_procs,
+            ..
+        } => {
+            if let Some(parent) = extends {
+                collect_name_reference(parent, decl.span, ReferenceRole::Type, shadowed, facts);
+            }
+            for binding in type_bound_procs {
+                if let Some(interface) = &binding.interface {
+                    collect_name_reference(
+                        interface,
+                        decl.span,
+                        ReferenceRole::Type,
+                        shadowed,
+                        facts,
+                    );
+                }
+            }
             for component in components {
                 collect_reference_decl(component, shadowed, facts);
+            }
+        }
+        Decl::AttributeStmt {
+            attr: Attribute::Dimension(specs),
+            ..
+        } => {
+            for spec in specs {
+                collect_reference_array_spec(spec, shadowed, facts);
+            }
+        }
+        Decl::ImplicitStmt { specs } => {
+            for spec in specs {
+                collect_reference_type_spec(&spec.type_spec, decl.span, shadowed, facts);
             }
         }
         _ => {}
@@ -2310,29 +2433,137 @@ fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>)
             Decl::ParameterStmt { pairs } => {
                 out.extend(pairs.iter().map(|(name, _)| name.to_lowercase()));
             }
+            Decl::DerivedTypeDef { name, .. } => {
+                out.insert(name.to_lowercase());
+            }
+            Decl::EnumDef {
+                type_name,
+                enumerators,
+            } => {
+                out.extend(type_name.iter().map(|name| name.to_lowercase()));
+                out.extend(enumerators.iter().map(|(name, _)| name.to_lowercase()));
+            }
+            Decl::EnumerationTypeDef { name, enumerators } => {
+                out.insert(name.to_lowercase());
+                out.extend(enumerators.iter().map(|name| name.to_lowercase()));
+            }
+            Decl::AttributeStmt { entities, .. } => {
+                out.extend(entities.iter().map(|name| name.to_lowercase()));
+            }
+            Decl::CommonBlock { vars, .. } => {
+                out.extend(vars.iter().map(|name| name.to_lowercase()));
+            }
             _ => {}
         }
     }
 }
 
-fn collect_block_use_names(uses: &[SpannedDecl], out: &mut HashSet<String>) {
-    for use_stmt in uses {
-        let Decl::UseStmt { renames, only, .. } = &use_stmt.node else {
-            continue;
-        };
-        out.extend(renames.iter().map(|rename| rename.local.to_lowercase()));
-        if let Some(items) = only {
-            for item in items {
-                match item {
-                    crate::ast::decl::OnlyItem::Name(name)
-                    | crate::ast::decl::OnlyItem::Generic(name) => {
-                        out.insert(name.to_lowercase());
-                    }
-                    crate::ast::decl::OnlyItem::Rename(rename) => {
-                        out.insert(rename.local.to_lowercase());
-                    }
+fn block_local_bindings(
+    decls: &[SpannedDecl],
+    ifaces: &[crate::ast::unit::SpannedUnit],
+) -> Vec<(String, Span, bool)> {
+    use crate::ast::unit::{InterfaceBody, ProgramUnit};
+
+    let mut bindings = Vec::new();
+    for decl in decls {
+        let mut push = |name: &str| bindings.push((name.to_lowercase(), decl.span, false));
+        match &decl.node {
+            Decl::TypeDecl { entities, .. } => {
+                for entity in entities {
+                    push(&entity.name);
                 }
             }
+            Decl::ParameterStmt { pairs } => {
+                for (name, _) in pairs {
+                    push(name);
+                }
+            }
+            Decl::DerivedTypeDef { name, .. } => push(name),
+            Decl::EnumDef {
+                type_name,
+                enumerators,
+            } => {
+                if let Some(name) = type_name {
+                    push(name);
+                }
+                for (name, _) in enumerators {
+                    push(name);
+                }
+            }
+            Decl::EnumerationTypeDef { name, enumerators } => {
+                push(name);
+                for name in enumerators {
+                    push(name);
+                }
+            }
+            Decl::AttributeStmt { entities, .. } => {
+                for name in entities {
+                    push(name);
+                }
+            }
+            Decl::CommonBlock { vars, .. } => {
+                for name in vars {
+                    push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for iface in ifaces {
+        let ProgramUnit::InterfaceBlock { name, bodies, .. } = &iface.node else {
+            continue;
+        };
+        if let Some(name) = name.as_ref().filter(|name| !name.is_empty()) {
+            bindings.push((name.to_lowercase(), iface.span, true));
+        }
+        for body in bodies {
+            let InterfaceBody::Subprogram(subprogram) = body else {
+                continue;
+            };
+            match &subprogram.node {
+                ProgramUnit::Function { name, .. } | ProgramUnit::Subroutine { name, .. } => {
+                    bindings.push((name.to_lowercase(), subprogram.span, false));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    bindings.sort_by(|left, right| {
+        (left.1.file_id, left.1.start.line, left.1.start.col, &left.0).cmp(&(
+            right.1.file_id,
+            right.1.start.line,
+            right.1.start.col,
+            &right.0,
+        ))
+    });
+    bindings
+}
+
+fn validate_block_use_conflicts(
+    ctx: &mut Ctx<'_>,
+    uses: &[SpannedDecl],
+    ifaces: &[crate::ast::unit::SpannedUnit],
+    decls: &[SpannedDecl],
+) {
+    let mut reported = HashSet::new();
+    for (name, span, is_generic) in block_local_bindings(decls, ifaces) {
+        if !reported.insert(name.clone()) {
+            continue;
+        }
+        let associations = block_use_associations_for_name(ctx.st, uses, &name);
+        if ctx
+            .st
+            .use_associations_conflict_with_local(&associations, is_generic)
+        {
+            ctx.error(
+                span,
+                format!(
+                    "local declaration '{}' conflicts with a USE-associated entity",
+                    name
+                ),
+            );
         }
     }
 }
@@ -2377,10 +2608,7 @@ fn collect_reference_stmt(
             ..
         } => {
             if let Some(var) = var {
-                let key = var.to_lowercase();
-                if !shadowed.contains(&key) {
-                    facts.references.push((key, stmt.span));
-                }
+                collect_name_reference(var, stmt.span, ReferenceRole::Value, shadowed, facts);
             }
             for expr in [start, end, step].into_iter().flatten() {
                 collect_reference_expr(expr, shadowed, facts);
@@ -2418,17 +2646,24 @@ fn collect_reference_stmt(
                         for name in names {
                             let key = name.to_lowercase();
                             if !shadowed.contains(&key) {
-                                facts.references.push((key.clone(), stmt.span));
+                                facts.references.push(NameReference {
+                                    name: key.clone(),
+                                    span: stmt.span,
+                                    role: ReferenceRole::Value,
+                                });
                             }
                             nested_shadowed.insert(key);
                         }
                     }
                     LocalitySpec::Shared(names) => {
                         for name in names {
-                            let key = name.to_lowercase();
-                            if !shadowed.contains(&key) {
-                                facts.references.push((key, stmt.span));
-                            }
+                            collect_name_reference(
+                                name,
+                                stmt.span,
+                                ReferenceRole::Value,
+                                shadowed,
+                                facts,
+                            );
                         }
                     }
                     LocalitySpec::DefaultNone => {}
@@ -2473,9 +2708,18 @@ fn collect_reference_stmt(
             }
             for guard in guards {
                 let body = match guard {
-                    TypeGuard::TypeIs { body, .. }
-                    | TypeGuard::ClassIs { body, .. }
-                    | TypeGuard::ClassDefault { body } => body,
+                    TypeGuard::TypeIs { type_name, body }
+                    | TypeGuard::ClassIs { type_name, body } => {
+                        collect_name_reference(
+                            type_name,
+                            stmt.span,
+                            ReferenceRole::Type,
+                            shadowed,
+                            facts,
+                        );
+                        body
+                    }
+                    TypeGuard::ClassDefault { body } => body,
                 };
                 collect_reference_stmts(body, &nested_shadowed, facts);
             }
@@ -2551,21 +2795,8 @@ fn collect_reference_stmt(
             }
             collect_reference_stmt(stmt, &nested_shadowed, facts);
         }
-        Stmt::Block {
-            uses,
-            implicit,
-            decls,
-            body,
-            ..
-        } => {
-            let mut nested_shadowed = shadowed.clone();
-            collect_block_use_names(uses, &mut nested_shadowed);
-            collect_block_binding_names(decls, &mut nested_shadowed);
-            for decl in uses.iter().chain(implicit).chain(decls) {
-                collect_reference_decl(decl, &nested_shadowed, facts);
-            }
-            collect_reference_stmts(body, &nested_shadowed, facts);
-        }
+        // BLOCK references are validated when that lexical scope is entered.
+        Stmt::Block { .. } => {}
         Stmt::Associate { assocs, body, .. } => {
             for (_, expr) in assocs {
                 collect_reference_expr(expr, shadowed, facts);
@@ -2613,7 +2844,7 @@ fn collect_reference_stmt(
             opts,
         } => {
             if let Some(type_spec) = type_spec {
-                collect_reference_type_spec(type_spec, shadowed, facts);
+                collect_reference_type_spec(type_spec, stmt.span, shadowed, facts);
             }
             for item in items {
                 collect_reference_expr(item, shadowed, facts);
@@ -2639,10 +2870,16 @@ fn collect_reference_stmt(
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
                 if !shadowed.contains(&key) {
-                    facts.calls.insert(key);
+                    facts.calls.insert(key.clone());
+                    facts.references.push(NameReference {
+                        name: key,
+                        span: callee.span,
+                        role: ReferenceRole::Callable,
+                    });
                 }
+            } else {
+                collect_reference_expr(callee, shadowed, facts);
             }
-            collect_reference_expr(callee, shadowed, facts);
             for arg in args {
                 collect_reference_subscript(&arg.value, shadowed, facts);
             }
@@ -2656,10 +2893,7 @@ fn collect_reference_stmt(
         Stmt::Namelist { groups } => {
             for (_, names) in groups {
                 for name in names {
-                    let key = name.to_lowercase();
-                    if !shadowed.contains(&key) {
-                        facts.references.push((key, stmt.span));
-                    }
+                    collect_name_reference(name, stmt.span, ReferenceRole::Value, shadowed, facts);
                 }
             }
         }
@@ -2682,20 +2916,553 @@ fn collect_reference_stmts(
     }
 }
 
-fn procedure_reference_facts(unit: &ProgramUnit) -> ProcedureReferenceFacts {
-    let (decls, body) = match unit {
-        ProgramUnit::Program { decls, body, .. }
-        | ProgramUnit::Subroutine { decls, body, .. }
-        | ProgramUnit::Function { decls, body, .. } => (decls.as_slice(), body.as_slice()),
-        _ => return ProcedureReferenceFacts::default(),
-    };
+fn procedure_reference_facts(unit: &ProgramUnit, unit_span: Span) -> ProcedureReferenceFacts {
     let shadowed = HashSet::new();
     let mut facts = ProcedureReferenceFacts::default();
+    let (decls, body) = match unit {
+        ProgramUnit::Program { decls, body, .. } | ProgramUnit::Subroutine { decls, body, .. } => {
+            (decls.as_slice(), body.as_slice())
+        }
+        ProgramUnit::Function {
+            return_type,
+            decls,
+            body,
+            ..
+        } => {
+            if let Some(return_type) = return_type {
+                collect_reference_type_spec(return_type, unit_span, &shadowed, &mut facts);
+            }
+            (decls.as_slice(), body.as_slice())
+        }
+        ProgramUnit::Module { decls, .. }
+        | ProgramUnit::Submodule { decls, .. }
+        | ProgramUnit::BlockData { decls, .. } => (decls.as_slice(), &[] as &[SpannedStmt]),
+        ProgramUnit::InterfaceBlock { .. } => return facts,
+    };
     for decl in decls {
         collect_reference_decl(decl, &shadowed, &mut facts);
     }
     collect_reference_stmts(body, &shadowed, &mut facts);
     facts
+}
+
+fn procedure_specification_reference_facts(
+    unit: &ProgramUnit,
+    unit_span: Span,
+) -> ProcedureReferenceFacts {
+    let shadowed = HashSet::new();
+    let mut facts = ProcedureReferenceFacts::default();
+    let decls = match unit {
+        ProgramUnit::Program { decls, .. } | ProgramUnit::Subroutine { decls, .. } => {
+            decls.as_slice()
+        }
+        ProgramUnit::Function {
+            return_type, decls, ..
+        } => {
+            if let Some(return_type) = return_type {
+                collect_reference_type_spec(return_type, unit_span, &shadowed, &mut facts);
+            }
+            decls.as_slice()
+        }
+        ProgramUnit::Module { decls, .. }
+        | ProgramUnit::Submodule { decls, .. }
+        | ProgramUnit::BlockData { decls, .. } => decls.as_slice(),
+        ProgramUnit::InterfaceBlock { .. } => return facts,
+    };
+    for decl in decls {
+        collect_reference_decl(decl, &shadowed, &mut facts);
+    }
+    facts
+}
+
+fn validate_use_ambiguities(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
+    for reference in procedure_specification_reference_facts(&unit.node, unit.span).references {
+        if reference.role == ReferenceRole::Callable && is_intrinsic_name(&reference.name) {
+            continue;
+        }
+        if ctx
+            .st
+            .inaccessible_host_symbol(
+                ctx.scope_id,
+                &reference.name,
+                reference.role == ReferenceRole::Callable,
+            )
+            .is_none()
+        {
+            continue;
+        }
+        let report_key = (ctx.scope_id, reference.name.clone());
+        if ctx.reported_inaccessible_host_entities.insert(report_key) {
+            ctx.error(
+                reference.span,
+                format!(
+                    "host entity '{}' is not accessible under this IMPORT policy",
+                    reference.name
+                ),
+            );
+        }
+    }
+
+    let facts = procedure_reference_facts(&unit.node, unit.span);
+    for reference in facts.references {
+        let allow_generic_merge = reference.role == ReferenceRole::Callable;
+        let Some(ambiguity) =
+            ctx.st
+                .use_ambiguity_in(ctx.scope_id, &reference.name, allow_generic_merge)
+        else {
+            continue;
+        };
+        let report_key = (ambiguity.origin_scope, reference.name.clone());
+        if !ctx.reported_use_ambiguities.insert(report_key) {
+            continue;
+        }
+        ctx.error(
+            reference.span,
+            use_ambiguity_message(&reference.name, &ambiguity.providers),
+        );
+    }
+}
+
+fn use_ambiguity_message(name: &str, providers: &[String]) -> String {
+    let providers = match providers {
+        [left, right] => format!("'{}' and '{}'", left, right),
+        providers => providers
+            .iter()
+            .map(|provider| format!("'{}'", provider))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    format!(
+        "ambiguous USE-associated reference '{}' from modules {}",
+        name, providers
+    )
+}
+
+fn block_use_associations_for_name(
+    st: &SymbolTable,
+    uses: &[SpannedDecl],
+    name: &str,
+) -> Vec<UseAssociation> {
+    use crate::ast::decl::OnlyItem;
+
+    let key = name.to_lowercase();
+    let mut associations = Vec::new();
+    for use_decl in uses {
+        let Decl::UseStmt {
+            module,
+            renames,
+            only,
+            ..
+        } = &use_decl.node
+        else {
+            continue;
+        };
+        let Some(source_scope) = st.find_module_scope(module) else {
+            continue;
+        };
+        let original_name = if let Some(items) = only {
+            items.iter().find_map(|item| match item {
+                OnlyItem::Name(item_name) | OnlyItem::Generic(item_name)
+                    if item_name.eq_ignore_ascii_case(&key) =>
+                {
+                    Some(item_name.to_lowercase())
+                }
+                OnlyItem::Rename(rename) if rename.local.eq_ignore_ascii_case(&key) => {
+                    Some(rename.remote.to_lowercase())
+                }
+                _ => None,
+            })
+        } else if let Some(rename) = renames
+            .iter()
+            .find(|rename| rename.local.eq_ignore_ascii_case(&key))
+        {
+            Some(rename.remote.to_lowercase())
+        } else if renames
+            .iter()
+            .any(|rename| rename.remote.eq_ignore_ascii_case(&key))
+        {
+            None
+        } else {
+            Some(key.clone())
+        };
+        let Some(original_name) = original_name else {
+            continue;
+        };
+        associations.push(UseAssociation {
+            local_name: key.clone(),
+            original_name,
+            source_scope,
+            is_submodule_access: false,
+            from_bare_use: only.is_none(),
+        });
+    }
+    associations
+}
+
+fn lexical_host_visibility(ctx: &Ctx<'_>, name: &str) -> LexicalHostVisibility {
+    let key = name.to_lowercase();
+    let mut hidden = false;
+    for frame in ctx.ambiguity_lexical_frames.iter().rev() {
+        match frame {
+            AmbiguityLexicalFrame::Associate { bindings } => {
+                if bindings.contains(&key) {
+                    return if hidden {
+                        LexicalHostVisibility::Hidden
+                    } else {
+                        LexicalHostVisibility::Visible
+                    };
+                }
+            }
+            AmbiguityLexicalFrame::Block {
+                uses,
+                bindings,
+                import_control,
+                ..
+            } => {
+                let associations = block_use_associations_for_name(ctx.st, uses, &key);
+                let use_binding = ctx.st.use_associations_bind_name(&associations, &key)
+                    || ctx
+                        .st
+                        .use_ambiguity_from_associations(ctx.scope_id, &key, &associations, true)
+                        .is_some();
+                if bindings.contains(&key) || use_binding {
+                    return if hidden {
+                        LexicalHostVisibility::Hidden
+                    } else {
+                        LexicalHostVisibility::Visible
+                    };
+                }
+                if !import_control.policy.allows(&key) {
+                    hidden = true;
+                }
+            }
+        }
+    }
+
+    let symbol_exists = ctx.st.lookup_in(ctx.scope_id, &key).is_some()
+        || ctx
+            .st
+            .named_interface_facet_symbol_in_scope(ctx.scope_id, &key)
+            .is_some();
+    if symbol_exists {
+        return if hidden {
+            LexicalHostVisibility::Hidden
+        } else {
+            LexicalHostVisibility::Visible
+        };
+    }
+    if hidden
+        && ctx
+            .st
+            .inaccessible_host_symbol(ctx.scope_id, &key, true)
+            .is_some()
+    {
+        LexicalHostVisibility::Hidden
+    } else {
+        LexicalHostVisibility::Missing
+    }
+}
+
+fn collect_block_use_binding_names(
+    st: &SymbolTable,
+    uses: &[SpannedDecl],
+    out: &mut HashSet<String>,
+) {
+    for use_decl in uses {
+        let Decl::UseStmt {
+            module,
+            renames,
+            only,
+            ..
+        } = &use_decl.node
+        else {
+            continue;
+        };
+        let Some(source_scope) = st.find_module_scope(module) else {
+            continue;
+        };
+        if let Some(items) = only {
+            for item in items {
+                let (local, remote) = match item {
+                    OnlyItem::Name(name) | OnlyItem::Generic(name) => (name, name),
+                    OnlyItem::Rename(rename) => (&rename.local, &rename.remote),
+                };
+                if st.scope_has_exported_entity(source_scope, remote) {
+                    out.insert(local.to_lowercase());
+                }
+            }
+            continue;
+        }
+
+        out.extend(
+            renames
+                .iter()
+                .filter(|rename| st.scope_has_exported_entity(source_scope, &rename.remote))
+                .map(|rename| rename.local.to_lowercase()),
+        );
+        let renamed_remote: HashSet<String> = renames
+            .iter()
+            .map(|rename| rename.remote.to_lowercase())
+            .collect();
+        let source = st.scope(source_scope);
+        for symbol in source.symbols.values() {
+            let key = symbol.name.to_lowercase();
+            if symbol.attrs.access != Access::Private && !renamed_remote.contains(&key) {
+                out.insert(key);
+            }
+        }
+        for association in &source.use_associations {
+            let key = association.local_name.to_lowercase();
+            if !key.is_empty()
+                && !renamed_remote.contains(&key)
+                && st.scope_exports_name(source_scope, &key)
+            {
+                out.insert(key);
+            }
+        }
+    }
+}
+
+fn validate_block_imports(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    block_name: Option<&str>,
+    uses: &[SpannedDecl],
+    imports: &[ImportStmt],
+    ifaces: &[SpannedUnit],
+    decls: &[SpannedDecl],
+) -> BlockImportControl {
+    let has_only = imports
+        .iter()
+        .any(|import| matches!(import, ImportStmt::Only(_)));
+    if has_only
+        && imports
+            .iter()
+            .any(|import| !matches!(import, ImportStmt::Only(_)))
+    {
+        ctx.error(
+            span,
+            "IMPORT, ONLY cannot be combined with another IMPORT form",
+        );
+    }
+    if imports.len() > 1
+        && imports
+            .iter()
+            .any(|import| matches!(import, ImportStmt::All | ImportStmt::None))
+    {
+        ctx.error(
+            span,
+            "IMPORT, ALL and IMPORT, NONE must be the only IMPORT statement in a scope",
+        );
+    }
+
+    let imported_names: HashSet<String> = imports
+        .iter()
+        .flat_map(|import| match import {
+            ImportStmt::Default(names) | ImportStmt::Only(names) => names.as_slice(),
+            ImportStmt::All | ImportStmt::None => &[],
+        })
+        .map(|name| name.to_lowercase())
+        .collect();
+    for name in &imported_names {
+        if lexical_host_visibility(ctx, name) != LexicalHostVisibility::Visible {
+            ctx.error(
+                span,
+                format!("IMPORT name '{}' does not identify a host entity", name),
+            );
+        }
+    }
+
+    let control = match imports {
+        [] => BlockImportControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::None,
+        },
+        [ImportStmt::All] => BlockImportControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::All,
+        },
+        [ImportStmt::None] => BlockImportControl {
+            policy: HostAssociationPolicy::None,
+            protection: HostImportProtection::None,
+        },
+        imports
+            if imports
+                .iter()
+                .all(|import| matches!(import, ImportStmt::Only(_))) =>
+        {
+            BlockImportControl {
+                policy: HostAssociationPolicy::Only(imported_names.clone()),
+                protection: HostImportProtection::Names(imported_names),
+            }
+        }
+        _ => BlockImportControl {
+            policy: HostAssociationPolicy::All,
+            protection: HostImportProtection::Names(imported_names),
+        },
+    };
+
+    let mut bindings = HashSet::new();
+    collect_block_binding_names(decls, &mut bindings);
+    extend_declared_names_from_ifaces(&mut bindings, ifaces);
+    collect_block_use_binding_names(ctx.st, uses, &mut bindings);
+    if let Some(name) = block_name {
+        bindings.insert(name.to_lowercase());
+    }
+    for name in bindings {
+        if control.protection.protects(&name)
+            && lexical_host_visibility(ctx, &name) == LexicalHostVisibility::Visible
+        {
+            ctx.error(
+                span,
+                format!(
+                    "BLOCK entity '{}' conflicts with an explicitly imported host entity",
+                    name
+                ),
+            );
+        }
+    }
+
+    control
+}
+
+fn validate_block_use_ambiguities(
+    ctx: &mut Ctx<'_>,
+    block_span: Span,
+    import_control: &BlockImportControl,
+    uses: &[SpannedDecl],
+    ifaces: &[SpannedUnit],
+    implicit: &[SpannedDecl],
+    decls: &[SpannedDecl],
+    body: &[SpannedStmt],
+) {
+    let mut shadowed = HashSet::new();
+    collect_block_binding_names(decls, &mut shadowed);
+    extend_declared_names_from_ifaces(&mut shadowed, ifaces);
+
+    let mut facts = ProcedureReferenceFacts::default();
+    for decl in implicit.iter().chain(decls) {
+        collect_reference_decl(decl, &shadowed, &mut facts);
+    }
+    collect_reference_stmts(body, &shadowed, &mut facts);
+
+    for reference in facts.references {
+        let allow_generic_merge = reference.role == ReferenceRole::Callable;
+        let mut block_ambiguity = None;
+        let mut block_binding_found = false;
+
+        let associations = block_use_associations_for_name(ctx.st, uses, &reference.name);
+        if let Some(ambiguity) = ctx.st.use_ambiguity_from_associations(
+            ctx.scope_id,
+            &reference.name,
+            &associations,
+            allow_generic_merge,
+        ) {
+            block_ambiguity = Some((block_span, ambiguity));
+        } else if ctx
+            .st
+            .use_associations_bind_name(&associations, &reference.name)
+        {
+            block_binding_found = true;
+        }
+
+        if block_ambiguity.is_none()
+            && !block_binding_found
+            && !(allow_generic_merge && is_intrinsic_name(&reference.name))
+        {
+            let host_visibility = lexical_host_visibility(ctx, &reference.name);
+            if host_visibility == LexicalHostVisibility::Hidden
+                || (host_visibility == LexicalHostVisibility::Visible
+                    && !import_control.policy.allows(&reference.name))
+            {
+                ctx.error(
+                    reference.span,
+                    format!(
+                        "host entity '{}' is not accessible under this IMPORT policy",
+                        reference.name
+                    ),
+                );
+                continue;
+            }
+        }
+
+        if block_ambiguity.is_none() && !block_binding_found {
+            for frame in ctx.ambiguity_lexical_frames.iter().rev() {
+                let (origin_span, frame_uses) = match frame {
+                    AmbiguityLexicalFrame::Associate { bindings } => {
+                        if bindings.contains(&reference.name) {
+                            block_binding_found = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    AmbiguityLexicalFrame::Block {
+                        span,
+                        uses,
+                        bindings,
+                        ..
+                    } => {
+                        if bindings.contains(&reference.name) {
+                            block_binding_found = true;
+                            break;
+                        }
+                        (*span, uses.as_slice())
+                    }
+                };
+                let associations =
+                    block_use_associations_for_name(ctx.st, frame_uses, &reference.name);
+                if let Some(ambiguity) = ctx.st.use_ambiguity_from_associations(
+                    ctx.scope_id,
+                    &reference.name,
+                    &associations,
+                    allow_generic_merge,
+                ) {
+                    block_ambiguity = Some((origin_span, ambiguity));
+                    break;
+                }
+                if ctx
+                    .st
+                    .use_associations_bind_name(&associations, &reference.name)
+                {
+                    block_binding_found = true;
+                    break;
+                }
+            }
+        }
+
+        if let Some((origin_span, ambiguity)) = block_ambiguity {
+            let report_key = (
+                origin_span.file_id,
+                origin_span.start.line,
+                origin_span.start.col,
+                reference.name.clone(),
+            );
+            if ctx.reported_block_use_ambiguities.insert(report_key) {
+                ctx.error(
+                    reference.span,
+                    use_ambiguity_message(&reference.name, &ambiguity.providers),
+                );
+            }
+            continue;
+        }
+        if block_binding_found {
+            continue;
+        }
+
+        let Some(ambiguity) =
+            ctx.st
+                .use_ambiguity_in(ctx.scope_id, &reference.name, allow_generic_merge)
+        else {
+            continue;
+        };
+        let report_key = (ambiguity.origin_scope, reference.name.clone());
+        if ctx.reported_use_ambiguities.insert(report_key) {
+            ctx.error(
+                reference.span,
+                use_ambiguity_message(&reference.name, &ambiguity.providers),
+            );
+        }
+    }
 }
 
 fn contained_unit_name(unit: &ProgramUnit) -> Option<String> {
@@ -2727,11 +3494,12 @@ fn procedure_host_scopes(st: &SymbolTable, owner_scope: ScopeId) -> HashSet<Scop
 fn resolved_contained_calls(
     ctx: &Ctx<'_>,
     unit: &ProgramUnit,
+    unit_span: Span,
     caller_scope: ScopeId,
     owner_scope: ScopeId,
     child_names: &HashSet<String>,
 ) -> HashSet<String> {
-    procedure_reference_facts(unit)
+    procedure_reference_facts(unit, unit_span)
         .calls
         .into_iter()
         .filter(|callee| {
@@ -2747,13 +3515,13 @@ fn resolved_contained_calls(
         .collect()
 }
 
-fn validate_finalizer_capture_references(ctx: &mut Ctx<'_>, unit: &ProgramUnit) {
+fn validate_finalizer_capture_references(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
     if ctx.finalizer_capture_host_scopes.is_empty() {
         return;
     }
-    let facts = procedure_reference_facts(unit);
-    for (name, span) in facts.references {
-        let Some(symbol) = ctx.st.lookup_in(ctx.scope_id, &name) else {
+    let facts = procedure_reference_facts(&unit.node, unit.span);
+    for reference in facts.references {
+        let Some(symbol) = ctx.st.lookup_in(ctx.scope_id, &reference.name) else {
             continue;
         };
         let Some(host_scope) = ctx
@@ -2772,20 +3540,25 @@ fn validate_finalizer_capture_references(ctx: &mut Ctx<'_>, unit: &ProgramUnit) 
         if !requires_host_storage {
             continue;
         }
-        let key = (ctx.scope_id, host_scope, name.clone());
+        let key = (ctx.scope_id, host_scope, reference.name.clone());
         if ctx.reported_finalizer_captures.insert(key) {
             ctx.error(
-                span,
+                reference.span,
                 format!(
                     "local FINAL procedure cannot reference host entity '{}': deferred finalization cannot preserve procedure host associations; move the state to module storage",
-                    name
+                    reference.name
                 ),
             );
         }
     }
 }
 
-fn validate_contained_units(ctx: &mut Ctx<'_>, host: &ProgramUnit, contains: &[SpannedUnit]) {
+fn validate_contained_units(
+    ctx: &mut Ctx<'_>,
+    host: &ProgramUnit,
+    host_span: Span,
+    contains: &[SpannedUnit],
+) {
     if contains.is_empty() {
         return;
     }
@@ -2813,8 +3586,14 @@ fn validate_contained_units(ctx: &mut Ctx<'_>, host: &ProgramUnit, contains: &[S
     }
 
     if !ctx.finalizer_capture_host_scopes.is_empty() {
-        for callee in resolved_contained_calls(ctx, host, ctx.scope_id, ctx.scope_id, &child_names)
-        {
+        for callee in resolved_contained_calls(
+            ctx,
+            host,
+            host_span,
+            ctx.scope_id,
+            ctx.scope_id,
+            &child_names,
+        ) {
             child_scopes
                 .entry(callee)
                 .or_default()
@@ -2827,8 +3606,14 @@ fn validate_contained_units(ctx: &mut Ctx<'_>, host: &ProgramUnit, contains: &[S
         .filter_map(|unit| {
             let name = contained_unit_name(&unit.node)?;
             let caller_scope = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id)?;
-            let calls =
-                resolved_contained_calls(ctx, &unit.node, caller_scope, ctx.scope_id, &child_names);
+            let calls = resolved_contained_calls(
+                ctx,
+                &unit.node,
+                unit.span,
+                caller_scope,
+                ctx.scope_id,
+                &child_names,
+            );
             Some((name, calls))
         })
         .collect();
@@ -2865,7 +3650,8 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
     if let Some(scope_id) = find_scope_for_unit(ctx.st, &unit.node, ctx.scope_id) {
         ctx.scope_id = scope_id;
     }
-    validate_finalizer_capture_references(ctx, &unit.node);
+    validate_use_ambiguities(ctx, unit);
+    validate_finalizer_capture_references(ctx, unit);
 
     match &unit.node {
         ProgramUnit::Program {
@@ -2876,9 +3662,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             contains,
             ..
         } => {
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -2895,7 +3679,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            validate_contained_units(ctx, &unit.node, contains);
+            validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
         ProgramUnit::Module {
             uses,
@@ -2905,16 +3689,14 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             ..
         } => {
             ctx.require_std(unit.span, FortranStandard::F90, "MODULE");
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
                 }
             }
             validate_decls(ctx, decls);
-            validate_contained_units(ctx, &unit.node, contains);
+            validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
         ProgramUnit::Subroutine {
             name,
@@ -2964,9 +3746,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     _ => {}
                 }
             }
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -2992,7 +3772,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            validate_contained_units(ctx, &unit.node, contains);
+            validate_contained_units(ctx, &unit.node, unit.span, contains);
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
@@ -3111,9 +3891,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     _ => {}
                 }
             }
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             for implicit_stmt in implicit {
                 if matches!(implicit_stmt.node, Decl::ImplicitNone { .. }) {
                     ctx.require_std(implicit_stmt.span, FortranStandard::F90, "IMPLICIT NONE");
@@ -3139,7 +3917,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
             validate_label_consistency(ctx, unit.span);
-            validate_contained_units(ctx, &unit.node, contains);
+            validate_contained_units(ctx, &unit.node, unit.span, contains);
             ctx.current_args = saved_args;
             ctx.in_pure = saved_pure;
             ctx.in_elemental = saved_elemental;
@@ -3171,14 +3949,13 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
                     ),
                 );
             }
-            for use_stmt in uses {
-                ctx.require_std(use_stmt.span, FortranStandard::F90, "USE statement");
-            }
+            validate_decls(ctx, uses);
             validate_decls(ctx, decls);
-            validate_contained_units(ctx, &unit.node, contains);
+            validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
-        ProgramUnit::BlockData { decls, .. } => {
+        ProgramUnit::BlockData { uses, decls, .. } => {
             warn_legacy_feature(ctx, unit.span, "BLOCK DATA");
+            validate_decls(ctx, uses);
             validate_decls(ctx, decls);
         }
         ProgramUnit::InterfaceBlock {
@@ -3220,9 +3997,64 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
 
 // ---- Declaration validation ----
 
+fn validate_use_decl(ctx: &mut Ctx<'_>, decl: &SpannedDecl) {
+    let Decl::UseStmt {
+        module,
+        renames,
+        only,
+        ..
+    } = &decl.node
+    else {
+        return;
+    };
+
+    let Some(module_scope) = ctx.st.find_module_scope(module) else {
+        ctx.error(decl.span, format!("module '{}' not found", module));
+        return;
+    };
+    if module_scope == ctx.scope_id {
+        ctx.error(decl.span, format!("module '{}' cannot USE itself", module));
+        return;
+    }
+
+    if let Some(items) = only {
+        for item in items {
+            let target = match item {
+                OnlyItem::Name(name) | OnlyItem::Generic(name) => name,
+                OnlyItem::Rename(rename) => &rename.remote,
+            };
+            if !ctx.st.scope_has_exported_entity(module_scope, target) {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "USE target '{}' is not exported by module '{}'",
+                        target, module
+                    ),
+                );
+            }
+        }
+    } else {
+        for rename in renames {
+            if !ctx
+                .st
+                .scope_has_exported_entity(module_scope, &rename.remote)
+            {
+                ctx.error(
+                    decl.span,
+                    format!(
+                        "USE target '{}' is not exported by module '{}'",
+                        rename.remote, module
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
     for decl in decls {
         validate_decl_const_int_exprs(ctx, decl);
+        validate_use_decl(ctx, decl);
 
         if let Decl::TypeDecl {
             attrs,
@@ -3866,14 +4698,35 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_stmt(ctx, inner);
         }
         Stmt::Block {
+            name,
             uses,
+            imports,
             ifaces,
             implicit,
             decls,
             body,
-            ..
         } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "BLOCK construct");
+            let import_control = validate_block_imports(
+                ctx,
+                stmt.span,
+                name.as_deref(),
+                uses,
+                imports,
+                ifaces,
+                decls,
+            );
+            validate_block_use_conflicts(ctx, uses, ifaces, decls);
+            validate_block_use_ambiguities(
+                ctx,
+                stmt.span,
+                &import_control,
+                uses,
+                ifaces,
+                implicit,
+                decls,
+                body,
+            );
             validate_decls(ctx, uses);
             validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
@@ -3881,9 +4734,20 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 validate_unit(ctx, iface);
             }
             let frame = block_binding_frame(decls);
+            let mut ambiguity_bindings = HashSet::new();
+            collect_block_binding_names(decls, &mut ambiguity_bindings);
+            extend_declared_names_from_ifaces(&mut ambiguity_bindings, ifaces);
+            ctx.ambiguity_lexical_frames
+                .push(AmbiguityLexicalFrame::Block {
+                    span: stmt.span,
+                    uses: uses.clone(),
+                    bindings: ambiguity_bindings,
+                    import_control,
+                });
             ctx.block_decl_frames.push(frame);
             validate_stmts(ctx, body);
             ctx.block_decl_frames.pop();
+            ctx.ambiguity_lexical_frames.pop();
         }
         Stmt::Associate { assocs, body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2003, "ASSOCIATE construct");
@@ -4983,8 +5847,11 @@ fn validate_associate(
             }
         })
         .collect();
-    ctx.associate_frames.push(frame);
+    ctx.associate_frames.push(frame.clone());
+    ctx.ambiguity_lexical_frames
+        .push(AmbiguityLexicalFrame::Associate { bindings: frame });
     validate_stmts(ctx, body);
+    ctx.ambiguity_lexical_frames.pop();
     ctx.associate_frames.pop();
 }
 
@@ -5390,48 +6257,8 @@ fn block_use_imported_names(
     st: &SymbolTable,
     uses: &[crate::ast::decl::SpannedDecl],
 ) -> std::collections::HashSet<String> {
-    use crate::ast::decl::OnlyItem;
-    use crate::sema::symtab::Access;
-
     let mut imported = std::collections::HashSet::new();
-    for use_decl in uses {
-        let crate::ast::decl::Decl::UseStmt {
-            module,
-            renames,
-            only,
-            ..
-        } = &use_decl.node
-        else {
-            continue;
-        };
-        if let Some(only_items) = only {
-            for item in only_items {
-                match item {
-                    OnlyItem::Name(name) => {
-                        imported.insert(name.to_lowercase());
-                    }
-                    OnlyItem::Generic(name) => {
-                        imported.insert(name.to_lowercase());
-                    }
-                    OnlyItem::Rename(rename) => {
-                        imported.insert(rename.local.to_lowercase());
-                    }
-                }
-            }
-            continue;
-        }
-
-        if let Some(scope_id) = st.find_module_scope(module) {
-            for sym in st.scope(scope_id).symbols.values() {
-                if sym.attrs.access != Access::Private {
-                    imported.insert(sym.name.to_lowercase());
-                }
-            }
-        }
-        for rename in renames {
-            imported.insert(rename.local.to_lowercase());
-        }
-    }
+    collect_block_use_binding_names(st, uses, &mut imported);
     imported
 }
 
@@ -8136,6 +8963,7 @@ end subroutine
                 ancestor: None,
                 name: "child_mod".into(),
                 uses: vec![],
+                imports: vec![],
                 decls: vec![],
                 contains: vec![],
             },

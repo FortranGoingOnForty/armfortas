@@ -726,7 +726,7 @@ pub(crate) fn lower_expr_full(
                     b.load_typed(info.addr, info.ty.clone())
                 }
             } else {
-                if let Some(sym) = st.find_symbol_any_scope(&key) {
+                if let Some(sym) = st.lookup_local_then_any(current_proc_scope(), &key) {
                     if let Some(cv) = sym.const_value {
                         if let Some(type_info) = sym.type_info.as_ref() {
                             let target = type_info_to_ir_type(type_info);

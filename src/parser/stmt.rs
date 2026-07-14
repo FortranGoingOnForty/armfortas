@@ -1084,13 +1084,14 @@ impl<'a> Parser<'a> {
                         // Reuse parse_unit_body which already handles the full
                         // interleaving of type-decls, PARAMETER, COMMON, DATA,
                         // derived-type defs, and executable statements.
-        let (uses, _imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["block"])?;
+        let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["block"])?;
         self.consume_end("block")?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
             Stmt::Block {
                 name: None,
                 uses,
+                imports,
                 ifaces,
                 implicit,
                 decls,
@@ -2310,6 +2311,19 @@ end if
     fn block_construct() {
         let s = parse_one("block\n  x = 1\nend block\n");
         assert!(matches!(s.node, Stmt::Block { .. }));
+    }
+
+    #[test]
+    fn block_preserves_imports() {
+        let s = parse_one("block\n  import, only: visible\n  x = visible\nend block\n");
+        let Stmt::Block { imports, .. } = s.node else {
+            panic!("not Block");
+        };
+        assert!(matches!(
+            imports.as_slice(),
+            [crate::ast::unit::ImportStmt::Only(names)]
+                if names.len() == 1 && names[0] == "visible"
+        ));
     }
 
     #[test]

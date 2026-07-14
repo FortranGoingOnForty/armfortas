@@ -986,7 +986,9 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                 {
                     if let Some(nested_refs) = out.get(&nested_name.to_lowercase()) {
                         for r in nested_refs {
-                            if ancestor_names.contains(r) {
+                            if ancestor_names.contains(r)
+                                && host_name_allowed_by_imports(&sub.node, r)
+                            {
                                 refs_set.insert(r.clone());
                             }
                         }
@@ -1057,7 +1059,10 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                     continue;
                 };
                 for r in callee_refs {
-                    if ancestor_names.contains(&r) && refs.insert(r) {
+                    if ancestor_names.contains(&r)
+                        && host_name_allowed_by_imports(&sub.node, &r)
+                        && refs.insert(r)
+                    {
                         changed = true;
                     }
                 }
@@ -1069,6 +1074,32 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             }
         }
     }
+}
+
+fn host_name_allowed_by_imports(unit: &ProgramUnit, name: &str) -> bool {
+    let imports = match unit {
+        ProgramUnit::Subroutine { imports, .. } | ProgramUnit::Function { imports, .. } => imports,
+        _ => return true,
+    };
+    if imports
+        .iter()
+        .any(|import| matches!(import, ImportStmt::None))
+    {
+        return false;
+    }
+    let mut saw_only = false;
+    for import in imports {
+        if let ImportStmt::Only(names) = import {
+            saw_only = true;
+            if names
+                .iter()
+                .any(|imported| imported.eq_ignore_ascii_case(name))
+            {
+                return true;
+            }
+        }
+    }
+    !saw_only
 }
 
 fn collect_called_contained_names(unit: &ProgramUnit, out: &mut std::collections::HashSet<String>) {
@@ -3250,6 +3281,7 @@ pub(super) fn collect_host_references(
             }
         }
     }
+    host_names.retain(|name| host_name_allowed_by_imports(sub, name));
     // Collect names declared locally in the subprogram.
     // Also seed with the function name and any RESULT(r) clause name —
     // those are implicit local names that don't appear in the
@@ -3731,7 +3763,11 @@ pub(super) fn collect_implicit_locals(
         if ctx.internal_funcs.contains_key(&key) {
             continue;
         }
-        if ctx.globals.keys().any(|(_m, v)| v == &key) {
+        if ctx.globals.keys().any(|(_m, v)| v == &key)
+            && !ctx
+                .proc_scope_id
+                .is_some_and(|scope_id| ctx.st.host_association_is_restricted(scope_id))
+        {
             continue;
         }
         // Names that resolve to symbols already known to the sema
@@ -7336,9 +7372,16 @@ pub(super) fn install_host_param_consts(
     // stdlib_math_arg_complex_elemental.f90.
     let mut names: Vec<&String> = host_param_consts.keys().collect();
     names.sort();
+    let proc_scope = current_proc_scope();
     for name in names {
         let value = &host_param_consts[name];
         if locals.contains_key(name) {
+            continue;
+        }
+        let visible_symbol = proc_scope.and_then(|scope_id| st.lookup_in(scope_id, name));
+        if proc_scope.is_some_and(|scope_id| {
+            st.host_association_is_restricted(scope_id) && visible_symbol.is_none()
+        }) {
             continue;
         }
         // Prefer the declared type (e.g. `integer(int32), parameter`) over
@@ -7346,8 +7389,11 @@ pub(super) fn install_host_param_consts(
         // declared kind=4 lands here as I64 because const_scalar_ir_type
         // sees the unsigned bit pattern doesn't fit i32; later `kind()`
         // and generic dispatch then both report the wrong width.
-        let declared_ty = st
-            .find_symbol_any_scope(name)
+        let declared_symbol = match proc_scope {
+            Some(_) => visible_symbol,
+            None => st.find_symbol_any_scope(name),
+        };
+        let declared_ty = declared_symbol
             .and_then(|sym| sym.type_info.clone())
             .and_then(|ti| match ti {
                 crate::sema::symtab::TypeInfo::Integer { kind: Some(k) } => match k {
@@ -8116,6 +8162,26 @@ fn resolve_visible_global_key(
     globals.contains_key(&source_key).then_some(source_key)
 }
 
+fn global_keys_resolve_to_same_symbol(
+    st: &SymbolTable,
+    left: &(String, String),
+    right: &(String, String),
+) -> bool {
+    let Some(left_scope) = st.find_module_scope(&left.0) else {
+        return false;
+    };
+    let Some(right_scope) = st.find_module_scope(&right.0) else {
+        return false;
+    };
+    let Some(left_symbol) = st.lookup_in(left_scope, &left.1) else {
+        return false;
+    };
+    let Some(right_symbol) = st.lookup_in(right_scope, &right.1) else {
+        return false;
+    };
+    std::ptr::eq(left_symbol, right_symbol)
+}
+
 /// Install module globals imported by this function's USE
 /// statements as `LocalInfo` entries. Honors:
 ///   * USE ONLY filtering — only names in the only-list are installed
@@ -8123,8 +8189,8 @@ fn resolve_visible_global_key(
 ///     `use m, x => y` (non-only rename)
 ///   * Cross-module collision detection — if two modules bring in
 ///     the same local key through their use list, the emitted IR
-///     would resolve ambiguously; we skip the second one and note
-///     the collision in an eprintln (sema doesn't yet diagnose).
+///     would resolve ambiguously; validation diagnoses referenced
+///     collisions before this recovery path runs.
 ///
 /// Audit C2/C3/C4: previously this function installed every
 /// global regardless of any USE statement, ignored ONLY filtering,
@@ -8151,6 +8217,30 @@ pub(super) fn install_globals_as_locals(
         extra.as_deref(),
         st,
         ambiguous_use_warnings,
+        true,
+    );
+}
+
+pub(super) fn install_block_globals_as_locals(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    uses: &[crate::ast::decl::SpannedDecl],
+    required_names: &HashSet<String>,
+    st: &SymbolTable,
+    ambiguous_use_warnings: &AmbiguousUseWarnings,
+) {
+    install_globals_as_locals_in(
+        b,
+        locals,
+        globals,
+        uses,
+        Some(required_names),
+        None,
+        None,
+        st,
+        ambiguous_use_warnings,
+        false,
     );
 }
 
@@ -8164,7 +8254,8 @@ pub(super) fn install_globals_as_locals_in(
     host_module: Option<&str>,
     extra_host: Option<&str>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &AmbiguousUseWarnings,
+    _ambiguous_use_warnings: &AmbiguousUseWarnings,
+    respect_host_association_policy: bool,
 ) {
     use crate::ast::decl::OnlyItem;
 
@@ -8372,11 +8463,20 @@ pub(super) fn install_globals_as_locals_in(
 
     pending.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut installed_from: HashMap<String, String> = HashMap::new();
+    let mut installed_from: HashMap<String, (String, String)> = HashMap::new();
     for (local_key, (mod_key, var_key)) in pending {
         if let Some(required) = required_names {
             if !required.contains(&local_key) {
                 continue;
+            }
+        }
+        if respect_host_association_policy {
+            if let Some(scope_id) = current_proc_scope() {
+                if st.host_association_is_restricted(scope_id)
+                    && st.lookup_in(scope_id, &local_key).is_none()
+                {
+                    continue;
+                }
             }
         }
         let resolved_global_key = resolve_exported_global_key(st, globals, &mod_key, &var_key)
@@ -8384,20 +8484,21 @@ pub(super) fn install_globals_as_locals_in(
         if let Some(info) = globals.get(&resolved_global_key) {
             // Collision check: two modules exporting the same local key.
             let resolved_mod = resolved_global_key.0.clone();
-            if let Some(prev_mod) = installed_from.get(&local_key) {
-                if *prev_mod != resolved_mod {
-                    let warning_key = (local_key.clone(), prev_mod.clone(), resolved_mod.clone());
-                    if ambiguous_use_warnings.borrow_mut().insert(warning_key) {
-                        eprintln!(
-                            "warning: ambiguous USE import '{}' from both '{}' and '{}'; \
-                             keeping the first",
-                            local_key, prev_mod, resolved_mod,
-                        );
-                    }
+            if let Some(previous_key) = installed_from.get(&local_key) {
+                if previous_key == &resolved_global_key
+                    || global_keys_resolve_to_same_symbol(st, previous_key, &resolved_global_key)
+                {
+                    continue;
+                }
+                if previous_key.0 != resolved_mod {
+                    // Referenced ambiguities are rejected during validation.
+                    // Collisions that remain here are unreferenced or hidden
+                    // by a more local association, so lowering keeps its
+                    // deterministic first entry without a user diagnostic.
                     continue;
                 }
             }
-            installed_from.insert(local_key.clone(), resolved_mod);
+            installed_from.insert(local_key.clone(), resolved_global_key.clone());
             if !install_global_inline_const(b, locals, local_key.clone(), info) {
                 // Recover the declared rank from the module symbol — a
                 // deferred-shape allocatable/pointer array has no bounds in
@@ -8484,7 +8585,7 @@ pub(super) fn install_globals_as_locals_in(
                                     },
                                 );
                             }
-                            installed_from.insert(local_key, mod_key);
+                            installed_from.insert(local_key, resolved_global_key);
                         }
                     }
                 }
@@ -12798,15 +12899,14 @@ fn collect_named_interface_symbols_from_scope<'a>(
     }
 }
 
-fn active_block_use_named_interface_symbols<'a>(
-    st: &'a SymbolTable,
+fn active_block_use_bindings(
+    st: &SymbolTable,
     key: &str,
-) -> Vec<&'a crate::sema::symtab::Symbol> {
+) -> Vec<(crate::sema::symtab::ScopeId, String)> {
     use crate::ast::decl::{Decl, OnlyItem};
 
-    let mut symbols = Vec::new();
-    let mut seen = HashSet::new();
     for uses in active_block_uses().iter().rev() {
+        let mut bindings = Vec::new();
         for use_decl in uses {
             let Decl::UseStmt {
                 module,
@@ -12836,35 +12936,65 @@ fn active_block_use_named_interface_symbols<'a>(
                     }
                 }
             } else {
-                let mut renamed = false;
+                let mut locally_renamed = false;
+                let mut remote_renamed = false;
                 for rename in renames {
                     if rename.local.eq_ignore_ascii_case(key) {
                         original_names.push(rename.remote.to_ascii_lowercase());
-                        renamed = true;
+                        locally_renamed = true;
+                    }
+                    if rename.remote.eq_ignore_ascii_case(key) {
+                        remote_renamed = true;
                     }
                 }
-                if !renamed {
+                if !locally_renamed && !remote_renamed {
                     original_names.push(key.to_string());
                 }
             }
             for original_name in original_names {
-                if !st.scope_exports_name(source_scope, &original_name) {
-                    continue;
-                }
-                if let Some(sym) = st.named_interface_symbol_in_scope(source_scope, &original_name)
-                {
-                    let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
-                    if seen.insert(sym_key) {
-                        symbols.push(sym);
-                    }
-                }
+                bindings.push((source_scope, original_name));
             }
         }
-        if !symbols.is_empty() {
-            return symbols;
+        if !bindings.is_empty() {
+            return bindings;
+        }
+    }
+    Vec::new()
+}
+
+fn active_block_use_named_interface_symbols<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Vec<&'a crate::sema::symtab::Symbol> {
+    let mut symbols = Vec::new();
+    let mut seen = HashSet::new();
+    for (source_scope, original_name) in active_block_use_bindings(st, key) {
+        if !st.scope_exports_name(source_scope, &original_name) {
+            continue;
+        }
+        if let Some(sym) = st.named_interface_symbol_in_scope(source_scope, &original_name) {
+            let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
+            if seen.insert(sym_key) {
+                symbols.push(sym);
+            }
         }
     }
     symbols
+}
+
+fn active_block_use_linkable_symbol<'a>(
+    st: &'a SymbolTable,
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    active_block_use_bindings(st, key)
+        .into_iter()
+        .find_map(|(source_scope, original_name)| {
+            if !st.scope_exports_name(source_scope, &original_name) {
+                return None;
+            }
+            st.lookup_in(source_scope, &original_name)
+                .filter(|symbol| is_linkable_callable_symbol(symbol))
+        })
 }
 
 fn scope_is_host_associated_or_self(
@@ -19468,7 +19598,18 @@ pub(super) fn same_unit_func_ref(
     // resolve to the lexically last definition (bitset_large_decrease
     // in the sort submodule), so `int32_increase_sort`'s introsort
     // would silently call into bitset_large_decrease's helpers.
-    let caller_scope = current_proc_scope();
+    let Some(caller_scope) = current_proc_scope() else {
+        return FuncRef::External(fallback_call_name);
+    };
+    let caller_sees_internal = st.lookup_in(caller_scope, matched_key).is_some_and(|sym| {
+        matches!(
+            sym.kind,
+            crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine
+        ) && scope_is_host_associated_or_self(st, caller_scope, sym.scope)
+    });
+    if !caller_sees_internal {
+        return FuncRef::External(fallback_call_name);
+    }
     // Host-association ONLY: the rebind exists to redirect calls to
     // contained procedures the caller can actually reach (F2018 §11.2.1).
     // The old path fell back to a global last-match scan when the
@@ -19480,7 +19621,8 @@ pub(super) fn same_unit_func_ref(
     // resize — toml_key strides over a toml_node array, scribbling text
     // pointers into polymorphic val slots. When the walk finds nothing,
     // the already-resolved fallback name is the right answer.
-    let Some(scope_id) = find_procedure_scope_id_for_caller_strict(st, matched_key, caller_scope)
+    let Some(scope_id) =
+        find_procedure_scope_id_for_caller_strict(st, matched_key, Some(caller_scope))
     else {
         return FuncRef::External(fallback_call_name);
     };
@@ -19716,9 +19858,15 @@ fn resolved_symbol_call_target_from_scope(
     key: &str,
     fallback_name: &str,
 ) -> (String, String) {
+    if let Some(sym) = active_block_use_linkable_symbol(st, key) {
+        return (symbol_link_name(st, sym), key.to_string());
+    }
     if let Some(scope_id) = scope_id {
         if let Some(sym) = find_linkable_symbol_from_scope(st, key, scope_id) {
             return (symbol_link_name(st, sym), key.to_string());
+        }
+        if st.host_association_is_restricted(scope_id) {
+            return (fallback_name.to_string(), key.to_string());
         }
     }
     resolved_symbol_call_target(st, key, fallback_name)
