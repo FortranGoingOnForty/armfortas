@@ -5610,6 +5610,45 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 }
 
 #[test]
+fn fortran_name_precedes_bind_c_label_for_result_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fortran_name_precedes_bind_c_label_for_result_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module collision_m\n  implicit none\n  interface\n    integer function c_alias() bind(c, name='path')\n    end function c_alias\n  end interface\ncontains\n  function path() result(text)\n    character(len=:), allocatable :: text\n    text = 'OK'\n  end function path\nend module collision_m\n\nprogram p\n  use collision_m, only: path\n  implicit none\n  character(len=:), allocatable :: text\n  text = path()\n  print '(a)', text\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("bind_c_label_result_collision", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("BIND(C) label collision compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "BIND(C) label collision compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("BIND(C) label collision run failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim() == "OK",
+        "BIND(C) label collision run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn bind_c_subroutine_value_arg_is_passed_by_value() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -19959,15 +19959,6 @@ fn find_linkable_symbol_for_callee<'a>(
     st: &'a SymbolTable,
     callee_name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
-    if let Some(symbol) = st.all_scopes().iter().find_map(|scope| {
-        scope.symbols.values().find(|symbol| {
-            is_linkable_callable_symbol(symbol)
-                && symbol_link_name(st, symbol).eq_ignore_ascii_case(callee_name)
-        })
-    }) {
-        return Some(symbol);
-    }
-
     let key = callee_name.to_ascii_lowercase();
     if let Some(symbol) = current_proc_scope()
         .and_then(|scope_id| st.lookup_in(scope_id, &key))
@@ -19995,6 +19986,15 @@ fn find_linkable_symbol_for_callee<'a>(
             }
             parent = scope.parent;
         }
+    }
+
+    if let Some(symbol) = st.all_scopes().iter().find_map(|scope| {
+        scope.symbols.values().find(|symbol| {
+            is_linkable_callable_symbol(symbol)
+                && symbol_link_name(st, symbol).eq_ignore_ascii_case(callee_name)
+        })
+    }) {
+        return Some(symbol);
     }
 
     let key = canonical_procedure_abi_key(st, callee_name);
