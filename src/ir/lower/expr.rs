@@ -1529,8 +1529,7 @@ pub(crate) fn lower_expr_full(
                                         // Load the incoming pointer stored in the by-ref slot.
                                         // If absent, caller passes 0; if present, non-zero address.
                                         let ptr_val = b.load(info.addr);
-                                        let zero = b.const_i64(0);
-                                        return b.icmp(CmpOp::Ne, ptr_val, zero);
+                                        return abi_argument_presence(b, ptr_val);
                                     }
                                 }
                             }

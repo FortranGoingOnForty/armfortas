@@ -11479,12 +11479,35 @@ pub(super) fn lower_char_intrinsic(
             // length is stored as I64; truncate to I32 so generic
             // dispatch can match `integer` formals (kind=4).
             let arg = arg_spanned(0)?;
-            let (ptr, len) = lower_string_arg(b, arg);
+            let (ptr_to_release, len) =
+                if actual_expr_rank(arg, locals, st, type_layouts).is_some_and(|rank| rank > 0) {
+                    if let Some(len) = actual_char_arg_runtime_len(
+                        b,
+                        locals,
+                        None,
+                        arg,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        (None, len)
+                    } else {
+                        let (ptr, len) = lower_string_arg(b, arg);
+                        (Some(ptr), len)
+                    }
+                } else {
+                    let (ptr, len) = lower_string_arg(b, arg);
+                    (Some(ptr), len)
+                };
             let truncated = match b.func().value_type(len) {
                 Some(IrType::Int(IntWidth::I64)) => b.int_trunc(len, IntWidth::I32),
                 _ => len,
             };
-            release_string_arg(b, arg, ptr);
+            if let Some(ptr) = ptr_to_release {
+                release_string_arg(b, arg, ptr);
+            }
             Some(truncated)
         }
         "len_trim" => {
@@ -24353,8 +24376,9 @@ pub(super) fn clear_intent_out_deferred_char_params(
 
         if decl_is_optional(pname, decls) && info.by_ref {
             let ptr_val = b.load(info.addr);
+            let ptr_raw = b.ptr_to_int(ptr_val);
             let zero = b.const_i64(0);
-            let present = b.icmp(CmpOp::Ne, ptr_val, zero);
+            let present = b.icmp(CmpOp::Ne, ptr_raw, zero);
             let bb_clear = b.create_block("intent_out_char_clear_present");
             let bb_skip = b.create_block("intent_out_char_clear_skip");
             b.cond_branch(present, bb_clear, vec![], bb_skip, vec![]);
@@ -46088,6 +46112,21 @@ pub(super) fn promote_array_desc_to_complex_descriptor(
     result_desc
 }
 
+fn logical_values_equal(b: &mut FuncBuilder, lhs: ValueId, rhs: ValueId) -> ValueId {
+    let both = b.and(lhs, rhs);
+    let either = b.or(lhs, rhs);
+    let not_both = b.not(both);
+    let different = b.and(either, not_both);
+    b.not(different)
+}
+
+fn logical_values_differ(b: &mut FuncBuilder, lhs: ValueId, rhs: ValueId) -> ValueId {
+    let both = b.and(lhs, rhs);
+    let either = b.or(lhs, rhs);
+    let not_both = b.not(both);
+    b.and(either, not_both)
+}
+
 /// F2018 §10.1.5: relational ops over rank-1 array operands produce a
 /// rank-1 logical array of the same shape. Each side is loaded with its
 /// own element type and promoted to a common compare type so mixed-kind
@@ -46311,8 +46350,10 @@ pub(super) fn lower_rank1_array_compare_descriptor(
     };
 
     let cmp = match (operand_ty, op) {
-        (IrType::Int(_) | IrType::Bool, BinaryOp::Eq) => b.icmp(CmpOp::Eq, lhs_val, rhs_val),
-        (IrType::Int(_) | IrType::Bool, BinaryOp::Ne) => b.icmp(CmpOp::Ne, lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Eq) => b.icmp(CmpOp::Eq, lhs_val, rhs_val),
+        (IrType::Int(_), BinaryOp::Ne) => b.icmp(CmpOp::Ne, lhs_val, rhs_val),
+        (IrType::Bool, BinaryOp::Eq) => logical_values_equal(b, lhs_val, rhs_val),
+        (IrType::Bool, BinaryOp::Ne) => logical_values_differ(b, lhs_val, rhs_val),
         (IrType::Int(_), BinaryOp::Lt) => b.icmp(CmpOp::Lt, lhs_val, rhs_val),
         (IrType::Int(_), BinaryOp::Le) => b.icmp(CmpOp::Le, lhs_val, rhs_val),
         (IrType::Int(_), BinaryOp::Gt) => b.icmp(CmpOp::Gt, lhs_val, rhs_val),
@@ -46870,19 +46911,8 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
             }
             (IrType::Bool, BinaryOp::And) => b.and(lhs_val, rhs_val),
             (IrType::Bool, BinaryOp::Or) => b.or(lhs_val, rhs_val),
-            (IrType::Bool, BinaryOp::Eqv) => {
-                let both = b.and(lhs_val, rhs_val);
-                let either = b.or(lhs_val, rhs_val);
-                let not_both = b.not(both);
-                let xor = b.and(either, not_both);
-                b.not(xor)
-            }
-            (IrType::Bool, BinaryOp::Neqv) => {
-                let both = b.and(lhs_val, rhs_val);
-                let either = b.or(lhs_val, rhs_val);
-                let not_both = b.not(both);
-                b.and(either, not_both)
-            }
+            (IrType::Bool, BinaryOp::Eqv) => logical_values_equal(b, lhs_val, rhs_val),
+            (IrType::Bool, BinaryOp::Neqv) => logical_values_differ(b, lhs_val, rhs_val),
             _ => unreachable!("unsupported array op should have returned before block creation"),
         };
         store_array_desc_elem_rank(b, result_desc, &elem_ty, idx, source_rank, result);
@@ -53500,7 +53530,9 @@ fn lower_findloc_rank1_scalar(
     let elem = load_rank1_array_desc_elem(b, desc, elem_ty, cur_idx);
     let raw_match = match elem_ty {
         IrType::Float(_) => b.fcmp(CmpOp::Eq, elem, target),
-        _ => b.icmp(CmpOp::Eq, elem, target),
+        IrType::Bool => logical_values_equal(b, elem, target),
+        IrType::Int(_) => b.icmp(CmpOp::Eq, elem, target),
+        _ => return None,
     };
     let is_match = if let Some((mask_desc, mask_elem_ty)) = &mask_array {
         let mv = load_rank1_array_desc_elem(b, *mask_desc, mask_elem_ty, cur_idx);
@@ -62070,6 +62102,27 @@ contains
     if (len(value) < 0) error stop
   end subroutine take_text
 end program
+",
+        );
+    }
+
+    #[test]
+    fn host_associated_optional_present_verifies() {
+        lower_and_verify(
+            "\
+module m
+contains
+  subroutine outer(value)
+    integer, intent(in), optional :: value
+    call inner()
+  contains
+    subroutine inner()
+      if (present(value)) then
+        if (value < 0) error stop
+      end if
+    end subroutine inner
+  end subroutine outer
+end module m
 ",
         );
     }
