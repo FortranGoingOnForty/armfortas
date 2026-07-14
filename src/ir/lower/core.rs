@@ -19959,6 +19959,15 @@ fn find_linkable_symbol_for_callee<'a>(
     st: &'a SymbolTable,
     callee_name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
+    if let Some(symbol) = st.all_scopes().iter().find_map(|scope| {
+        scope.symbols.values().find(|symbol| {
+            is_linkable_callable_symbol(symbol)
+                && symbol_link_name(st, symbol).eq_ignore_ascii_case(callee_name)
+        })
+    }) {
+        return Some(symbol);
+    }
+
     let key = callee_name.to_ascii_lowercase();
     if let Some(symbol) = current_proc_scope()
         .and_then(|scope_id| st.lookup_in(scope_id, &key))
@@ -19986,15 +19995,6 @@ fn find_linkable_symbol_for_callee<'a>(
             }
             parent = scope.parent;
         }
-    }
-
-    if let Some(symbol) = st.all_scopes().iter().find_map(|scope| {
-        scope.symbols.values().find(|symbol| {
-            is_linkable_callable_symbol(symbol)
-                && symbol_link_name(st, symbol).eq_ignore_ascii_case(callee_name)
-        })
-    }) {
-        return Some(symbol);
     }
 
     let key = canonical_procedure_abi_key(st, callee_name);
@@ -25164,13 +25164,11 @@ pub(in crate::ir::lower) enum CharacterReturnAbi {
     BindCScalarByte,
 }
 
-pub(super) fn callee_character_return_abi(
-    st: &SymbolTable,
-    callee_name: &str,
+fn character_return_abi_for_symbol(
+    sym: &crate::sema::symtab::Symbol,
 ) -> Option<CharacterReturnAbi> {
     use crate::sema::symtab::TypeInfo;
 
-    let sym = find_linkable_symbol_for_callee(st, callee_name)?;
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
@@ -25179,6 +25177,14 @@ pub(super) fn callee_character_return_abi(
     } else {
         Some(CharacterReturnAbi::HiddenDescriptor)
     }
+}
+
+pub(super) fn callee_character_return_abi(
+    st: &SymbolTable,
+    callee_name: &str,
+) -> Option<CharacterReturnAbi> {
+    let sym = find_linkable_symbol_for_callee(st, callee_name)?;
+    character_return_abi_for_symbol(sym)
 }
 
 pub(super) fn callee_hidden_result_abi(
@@ -25300,6 +25306,12 @@ pub(super) fn resolved_named_character_return_abi_for_call(
         // with the same name. Only true procedure-pointer locals stay
         // callable through the data namespace here.
         return None;
+    }
+    if let Some(ret_abi) = current_proc_scope()
+        .and_then(|scope_id| find_linkable_symbol_from_scope(st, &key, scope_id))
+        .and_then(character_return_abi_for_symbol)
+    {
+        return Some(ret_abi);
     }
     if let Some(ret_abi) = callee_character_return_abi(st, &key) {
         return Some(ret_abi);
