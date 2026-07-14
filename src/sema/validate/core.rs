@@ -6352,10 +6352,68 @@ fn reduction_dim_argument_expr<'a>(
     .then_some(expr)
 }
 
+fn intrinsic_result_rank_is_scalar(name: &str) -> bool {
+    matches!(
+        name,
+        "allocated"
+            | "associated"
+            | "bit_size"
+            | "c_associated"
+            | "c_funloc"
+            | "c_loc"
+            | "c_sizeof"
+            | "command_argument_count"
+            | "compiler_options"
+            | "compiler_version"
+            | "digits"
+            | "dot_product"
+            | "epsilon"
+            | "f_c_string"
+            | "huge"
+            | "ieee_selected_real_kind"
+            | "ieee_support_datatype"
+            | "ieee_support_denormal"
+            | "ieee_support_divide"
+            | "ieee_support_flag"
+            | "ieee_support_halting"
+            | "ieee_support_inf"
+            | "ieee_support_io"
+            | "ieee_support_nan"
+            | "ieee_support_rounding"
+            | "ieee_support_sqrt"
+            | "ieee_support_standard"
+            | "ieee_support_subnormal"
+            | "ieee_support_underflow_control"
+            | "kind"
+            | "len"
+            | "maxexponent"
+            | "minexponent"
+            | "new_line"
+            | "precision"
+            | "present"
+            | "radix"
+            | "range"
+            | "rank"
+            | "repeat"
+            | "same_type_as"
+            | "selected_char_kind"
+            | "selected_int_kind"
+            | "selected_logical_kind"
+            | "selected_real_kind"
+            | "size"
+            | "storage_size"
+            | "tiny"
+            | "trim"
+    )
+}
+
 fn intrinsic_call_result_rank(ctx: &Ctx<'_>, name: &str, args: &[Argument]) -> Option<usize> {
     let key = name.to_ascii_lowercase();
     if crate::sema::types::is_elemental_intrinsic(&key) {
         return max_elemental_actual_rank(ctx, args).or(Some(0));
+    }
+    if intrinsic_result_rank_is_scalar(&key) {
+        return Some(0);
     }
 
     let source_rank = |position, keywords: &[&str]| {
@@ -6388,8 +6446,6 @@ fn intrinsic_call_result_rank(ctx: &Ctx<'_>, name: &str, args: &[Argument]) -> O
         "spread" => source_rank(0, &["source"]).map(|rank| rank + 1),
         "cshift" | "eoshift" => source_rank(0, &["array"]),
         "shape" => Some(1),
-        "size" | "rank" | "allocated" | "associated" | "present" | "len" | "trim"
-        | "storage_size" | "kind" | "dot_product" => Some(0),
         "lbound" | "ubound" => {
             let has_dim = call_rank_argument_expr(args, 1, &["dim"]).is_some();
             Some(usize::from(!has_dim))
@@ -9489,6 +9545,8 @@ contains
     type(box_t), intent(in) :: value
     type(box_t) :: output
     output = trim(\" x \")
+    output = repeat(\"x\", 2)
+    output = new_line(\"x\")
   end function trim_box
 
   subroutine assign_box_text(lhs, rhs)
@@ -9496,6 +9554,39 @@ contains
     character(len=*), intent(in) :: rhs
     lhs%text = rhs
   end subroutine assign_box_text
+end module m
+",
+        );
+
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_defined_assignment_from_scalar_inquiry_results() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+  type :: box_t
+    integer :: value
+  end type
+  interface assignment(=)
+    module procedure assign_box_integer
+  end interface
+contains
+  subroutine exercise(input, output)
+    real, intent(in) :: input
+    type(box_t), intent(out) :: output
+    output = selected_int_kind(9)
+    output = precision(input)
+    output = command_argument_count()
+  end subroutine exercise
+
+  subroutine assign_box_integer(lhs, rhs)
+    type(box_t), intent(out) :: lhs
+    integer, intent(in) :: rhs
+    lhs%value = rhs
+  end subroutine assign_box_integer
 end module m
 ",
         );
