@@ -3311,6 +3311,8 @@ pub struct ModuleGlobalInfo {
     pub deferred_char: bool,
     pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
+    /// Declared Fortran LOGICAL kind; nondefault kinds use integer IR storage.
+    pub(crate) logical_kind: Option<u8>,
     /// Folded scalar value for a named constant that still has backing
     /// storage in the current object. Importers should inline this instead
     /// of loading through the global.
@@ -4619,6 +4621,8 @@ pub(super) fn collect_module_globals(
                     } else {
                         char_len.map(CharKind::Fixed).unwrap_or(CharKind::None)
                     };
+                let global_logical_kind =
+                    type_spec_logical_kind(type_spec, Some(&param_consts), Some(st));
 
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
                 let declared_rank = array_spec.map(|specs| specs.len()).unwrap_or(0);
@@ -4671,6 +4675,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: array_char_kind,
+                            logical_kind: global_logical_kind,
                             const_value: None,
                             const_real_value: None,
                             external: false,
@@ -4703,6 +4708,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: true,
                             derived_type: None,
                             char_kind: CharKind::Deferred,
+                            logical_kind: global_logical_kind,
                             const_value: None,
                             const_real_value: None,
                             external: false,
@@ -4867,6 +4873,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
+                            logical_kind: global_logical_kind,
                             const_value: None,
                             const_real_value: None,
                             external: false,
@@ -4894,6 +4901,7 @@ pub(super) fn collect_module_globals(
                                 deferred_char: false,
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
+                                logical_kind: global_logical_kind,
                                 const_value: None,
                                 const_real_value: None,
                                 external: false,
@@ -4933,6 +4941,7 @@ pub(super) fn collect_module_globals(
                                     deferred_char: false,
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
+                                    logical_kind: global_logical_kind,
                                     const_value: None,
                                     const_real_value: None,
                                     external: false,
@@ -4983,6 +4992,7 @@ pub(super) fn collect_module_globals(
                                     deferred_char: false,
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
+                                    logical_kind: global_logical_kind,
                                     const_value: None,
                                     const_real_value: None,
                                     external: false,
@@ -5049,6 +5059,7 @@ pub(super) fn collect_module_globals(
                             deferred_char: false,
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
+                            logical_kind: global_logical_kind,
                             const_value,
                             const_real_value,
                             external: false,
@@ -8163,7 +8174,7 @@ pub(super) fn install_one_global(
             is_pointer: info.is_pointer,
             runtime_dim_upper,
             is_class: false,
-            logical_kind: None,
+            logical_kind: info.logical_kind,
             last_dim_assumed_size: false,
         },
     );
@@ -8207,7 +8218,7 @@ fn install_global_inline_const(
             is_pointer: false,
             runtime_dim_upper: vec![],
             is_class: false,
-            logical_kind: None,
+            logical_kind: info.logical_kind,
             last_dim_assumed_size: false,
         },
     );
@@ -8676,7 +8687,14 @@ pub(super) fn install_globals_as_locals_in(
                                         is_pointer: false,
                                         runtime_dim_upper: vec![],
                                         is_class: false,
-                                        logical_kind: None,
+                                        logical_kind: sym.type_info.as_ref().and_then(
+                                            |ty| match ty {
+                                                crate::sema::symtab::TypeInfo::Logical { kind } => {
+                                                    Some(kind.unwrap_or(4))
+                                                }
+                                                _ => None,
+                                            },
+                                        ),
                                         last_dim_assumed_size: false,
                                     },
                                 );
@@ -64348,6 +64366,40 @@ end module
         assert_eq!(module.globals.len(), 2);
         assert!(module.globals.iter().any(|g| g.name.contains("counter")));
         assert!(module.globals.iter().any(|g| g.name.contains("threshold")));
+    }
+
+    #[test]
+    fn preserves_imported_module_logical_kinds() {
+        let (_, ir) = lower_and_verify(
+            "\
+module module_logical_kinds_m
+  implicit none
+  logical(1) :: narrow(3) = [.true._1, .false._1, .true._1]
+  logical(8) :: wide = .true._8
+  logical :: normal = .false.
+  logical(1), parameter :: enabled = .true._1
+end module
+
+program test
+  use module_logical_kinds_m, only: imported_narrow => narrow, &
+       imported_wide => wide, imported_normal => normal, imported_enabled => enabled
+  implicit none
+  print '(3(l1,1x))', imported_narrow
+  print '(3(l1,1x))', imported_wide, imported_normal, imported_enabled
+end program
+",
+        );
+
+        assert_eq!(
+            ir.matches("call @afs_fmt_push_logical").count(),
+            4,
+            "module LOGICAL values must retain logical formatting semantics:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_fmt_push_int").count(),
+            0,
+            "module LOGICAL values must not be formatted as integers:\n{ir}"
+        );
     }
 
     #[test]

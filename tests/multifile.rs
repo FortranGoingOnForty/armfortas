@@ -486,6 +486,35 @@ fn module_parameter_constants() {
 }
 
 #[test]
+fn imported_logical_kinds_preserve_storage_and_semantics() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=imported_logical_kinds_preserve_storage_and_semantics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    multifile_test(
+        r#"module logical_kinds_m
+  implicit none
+  logical(1) :: narrow(3) = [.true._1, .false._1, .true._1]
+  logical(8) :: wide(2) = [.false._8, .true._8]
+  logical :: normal = .false.
+  logical(1), parameter :: enabled = .true._1
+end module
+"#,
+        r#"program p
+  use logical_kinds_m, only: imported_narrow => narrow, imported_wide => wide, &
+       imported_normal => normal, imported_enabled => enabled
+  implicit none
+  print '(7(l1,1x))', imported_narrow, imported_wide, imported_normal, imported_enabled
+end program
+"#,
+        "T F T F T F T",
+    );
+}
+
+#[test]
 fn use_only_filtering() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
