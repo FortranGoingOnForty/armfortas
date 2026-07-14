@@ -844,6 +844,193 @@ fn generic_interface_beats_private_renamed_import() {
 }
 
 #[test]
+fn imported_deferred_character_results_preserve_ownership() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=imported_deferred_character_results_preserve_ownership count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let mod_f90 = dir.join("character_results.f90");
+    let main_f90 = dir.join("main.f90");
+    let mod_o = dir.join("character_results.o");
+    let main_o = dir.join("main.o");
+    let main_ir = dir.join("main.ir");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &mod_f90,
+        r#"module imported_character_results_m
+  implicit none
+
+  interface make_generic
+    module procedure make_owned_generic, make_borrowed_generic
+  end interface
+
+  type :: producer_t
+  contains
+    procedure :: make_owned_bound
+    procedure :: make_borrowed_bound
+  end type
+
+contains
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+
+  function make_owned_generic(selector) result(value)
+    integer, intent(in) :: selector
+    character(:), allocatable :: value
+    value = 'generic owned'
+  end function
+
+  function make_borrowed_generic(selector) result(value)
+    logical, intent(in) :: selector
+    character(:), pointer :: value
+    character(16), target, save :: storage = 'generic borrowed'
+    value => storage
+  end function
+
+  function make_owned_bound(self) result(value)
+    class(producer_t), intent(in) :: self
+    character(:), allocatable :: value
+    value = 'bound owned'
+  end function
+
+  function make_borrowed_bound(self) result(value)
+    class(producer_t), intent(in) :: self
+    character(:), pointer :: value
+    character(14), target, save :: storage = 'bound borrowed'
+    value => storage
+  end function
+end module
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &main_f90,
+        r#"program p
+  use imported_character_results_m, only: imported_owned => make_owned, &
+       imported_borrowed => make_borrowed, make_generic, producer_t
+  implicit none
+  character(16) :: sink
+  type(producer_t) :: producer
+
+  sink = imported_owned()
+  if (sink(1:5) /= 'owned') error stop 1
+  sink = imported_borrowed()
+  if (sink(1:8) /= 'borrowed') error stop 2
+  sink = make_generic(1)
+  if (sink(1:13) /= 'generic owned') error stop 3
+  sink = make_generic(.true.)
+  if (sink /= 'generic borrowed') error stop 4
+  sink = producer%make_owned_bound()
+  if (sink(1:11) /= 'bound owned') error stop 5
+  sink = producer%make_borrowed_bound()
+  if (sink(1:14) /= 'bound borrowed') error stop 6
+  print *, 'ok'
+end program
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &mod_f90, &mod_o, None);
+    let amod = std::fs::read_to_string(dir.join("imported_character_results_m.amod")).unwrap();
+    assert!(
+        amod.contains("@function make_owned -> character")
+            && amod.contains("result_allocatable")
+            && amod.contains("@function make_borrowed -> character")
+            && amod.contains("result_pointer"),
+        "deferred-character result ownership missing from module interface:\n{}",
+        amod
+    );
+
+    let emit = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg("--emit-ir")
+        .arg(&main_f90)
+        .arg(format!("-I{}", dir.display()))
+        .arg("-o")
+        .arg(&main_ir)
+        .output()
+        .expect("consumer IR emission failed to spawn");
+    assert!(
+        emit.status.success(),
+        "consumer IR emission failed: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir = std::fs::read_to_string(&main_ir).expect("cannot read consumer IR");
+    let program_start = ir
+        .find("func @__prog_p")
+        .expect("missing consumer program IR");
+    let program_tail = &ir[program_start..];
+    let program_end = program_tail
+        .find("\n  func @")
+        .unwrap_or(program_tail.len());
+    let program_ir = &program_tail[..program_end];
+    let call_markers = [
+        ("make_owned", true),
+        ("make_borrowed", false),
+        ("make_owned_generic", true),
+        ("make_borrowed_generic", false),
+        ("make_owned_bound", true),
+        ("make_borrowed_bound", false),
+    ];
+    let call_offsets: Vec<_> = call_markers
+        .iter()
+        .map(|(name, owned)| {
+            let marker = format!("call @afs_modproc_imported_character_results_m_{}", name);
+            (
+                program_ir
+                    .find(&marker)
+                    .unwrap_or_else(|| panic!("missing imported result call {marker}")),
+                *name,
+                *owned,
+            )
+        })
+        .collect();
+    for (index, &(start, name, owned)) in call_offsets.iter().enumerate() {
+        let end = call_offsets
+            .get(index + 1)
+            .map(|entry| entry.0)
+            .unwrap_or(program_ir.len());
+        let segment = &program_ir[start..end];
+        assert_eq!(
+            segment.contains("rt_call @__afs_deallocate"),
+            owned,
+            "imported result ownership was lowered incorrectly for {name}:\n{segment}"
+        );
+    }
+    assert_eq!(
+        program_ir.matches("rt_call @__afs_deallocate").count(),
+        3,
+        "only imported allocatable character results should be released:\n{}",
+        program_ir
+    );
+
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &mod_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "imported deferred-character calls returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn imported_type_bound_result_guides_operator_generic() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

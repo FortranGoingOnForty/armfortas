@@ -10076,6 +10076,8 @@ pub(super) fn lower_substring_full(
     let is_pos = b.icmp(CmpOp::Ge, raw_len, zero);
     let sub_len = b.select(is_pos, raw_len, zero);
     let sub_ptr = b.select(is_pos, sub_ptr_raw, base_ptr);
+    let owned_bases = b.take_owned_string_temp_bases(base_ptr);
+    b.mark_owned_string_temp_bases(sub_ptr, owned_bases);
     (sub_ptr, sub_len)
 }
 
@@ -11358,6 +11360,8 @@ fn lower_character_minmax_string_expr(
         contained_host_refs,
         descriptor_params,
     );
+    let mut owned_bases =
+        take_owned_string_expr_temp_bases(b, first, locals, st, type_layouts, best_ptr);
     let zero = b.const_i32(0);
 
     for arg_expr in iter {
@@ -11371,6 +11375,14 @@ fn lower_character_minmax_string_expr(
             contained_host_refs,
             descriptor_params,
         );
+        owned_bases.extend(take_owned_string_expr_temp_bases(
+            b,
+            arg_expr,
+            locals,
+            st,
+            type_layouts,
+            arg_ptr,
+        ));
         let cmp = b.call(
             FuncRef::External("afs_compare_char".into()),
             vec![best_ptr, best_len, arg_ptr, arg_len],
@@ -11385,6 +11397,7 @@ fn lower_character_minmax_string_expr(
         best_len = b.select(keep_best, best_len, arg_len);
     }
 
+    b.mark_owned_string_temp_bases(best_ptr, owned_bases);
     Some((best_ptr, best_len))
 }
 
@@ -11424,6 +11437,10 @@ pub(super) fn lower_char_intrinsic(
                 descriptor_params,
             )
         };
+    let release_string_arg =
+        |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr, ptr: ValueId| {
+            deallocate_owned_string_expr_temp(b, locals, expr, st, type_layouts, ptr);
+        };
 
     match name {
         "max" | "min" => lower_character_minmax_string_expr(
@@ -11443,44 +11460,36 @@ pub(super) fn lower_char_intrinsic(
             // length is stored as I64; truncate to I32 so generic
             // dispatch can match `integer` formals (kind=4).
             let arg = arg_spanned(0)?;
-            let len = if let Some(len) = actual_char_arg_runtime_len(
-                b,
-                locals,
-                None,
-                arg,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            ) {
-                len
-            } else {
-                lower_string_arg(b, arg).1
-            };
+            let (ptr, len) = lower_string_arg(b, arg);
             let truncated = match b.func().value_type(len) {
                 Some(IrType::Int(IntWidth::I64)) => b.int_trunc(len, IntWidth::I32),
                 _ => len,
             };
+            release_string_arg(b, arg, ptr);
             Some(truncated)
         }
         "len_trim" => {
             // F2018 §16.9.109: LEN_TRIM returns default integer.
-            let (ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let arg = arg_spanned(0)?;
+            let (ptr, len_val) = lower_string_arg(b, arg);
             let raw = b.call(
                 FuncRef::External("afs_len_trim".into()),
                 vec![ptr, len_val],
                 IrType::Int(IntWidth::I64),
             );
+            release_string_arg(b, arg, ptr);
             Some(b.int_trunc(raw, IntWidth::I32))
         }
         "ichar" | "iachar" => {
-            let (ptr, _) = lower_string_arg(b, arg_spanned(0)?);
-            Some(b.call(
+            let arg = arg_spanned(0)?;
+            let (ptr, _) = lower_string_arg(b, arg);
+            let result = b.call(
                 FuncRef::External("afs_ichar_ptr".into()),
                 vec![ptr],
                 IrType::Int(IntWidth::I32),
-            ))
+            );
+            release_string_arg(b, arg, ptr);
+            Some(result)
         }
         "char" | "achar" => {
             let int_arg = args.first().and_then(|a| {
@@ -11510,8 +11519,10 @@ pub(super) fn lower_char_intrinsic(
         "new_line" => Some(b.const_string(b"\n")),
         "index" => {
             // F2018 §16.9.93: INDEX returns default integer.
-            let (hay_ptr, hay_len_val) = lower_string_arg(b, arg_spanned(0)?);
-            let (needle_ptr, needle_len_val) = lower_string_arg(b, arg_spanned(1)?);
+            let hay = arg_spanned(0)?;
+            let needle = arg_spanned(1)?;
+            let (hay_ptr, hay_len_val) = lower_string_arg(b, hay);
+            let (needle_ptr, needle_len_val) = lower_string_arg(b, needle);
             let back_val = arg_spanned(2)
                 .map(|e| super::expr::lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -11520,12 +11531,16 @@ pub(super) fn lower_char_intrinsic(
                 vec![hay_ptr, hay_len_val, needle_ptr, needle_len_val, back_val],
                 IrType::Int(IntWidth::I64),
             );
+            release_string_arg(b, hay, hay_ptr);
+            release_string_arg(b, needle, needle_ptr);
             Some(b.int_trunc(raw, IntWidth::I32))
         }
         "scan" => {
             // F2018 §16.9.169: SCAN returns default integer.
-            let (src_ptr, src_len_val) = lower_string_arg(b, arg_spanned(0)?);
-            let (set_ptr, set_len_val) = lower_string_arg(b, arg_spanned(1)?);
+            let src = arg_spanned(0)?;
+            let set = arg_spanned(1)?;
+            let (src_ptr, src_len_val) = lower_string_arg(b, src);
+            let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
                 .map(|e| super::expr::lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -11534,12 +11549,16 @@ pub(super) fn lower_char_intrinsic(
                 vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
                 IrType::Int(IntWidth::I64),
             );
+            release_string_arg(b, src, src_ptr);
+            release_string_arg(b, set, set_ptr);
             Some(b.int_trunc(raw, IntWidth::I32))
         }
         "verify" => {
             // F2018 §16.9.213: VERIFY returns default integer.
-            let (src_ptr, src_len_val) = lower_string_arg(b, arg_spanned(0)?);
-            let (set_ptr, set_len_val) = lower_string_arg(b, arg_spanned(1)?);
+            let src = arg_spanned(0)?;
+            let set = arg_spanned(1)?;
+            let (src_ptr, src_len_val) = lower_string_arg(b, src);
+            let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
                 .map(|e| super::expr::lower_expr(b, locals, e, st))
                 .unwrap_or_else(|| b.const_i32(0));
@@ -11548,21 +11567,29 @@ pub(super) fn lower_char_intrinsic(
                 vec![src_ptr, src_len_val, set_ptr, set_len_val, back_val],
                 IrType::Int(IntWidth::I64),
             );
+            release_string_arg(b, src, src_ptr);
+            release_string_arg(b, set, set_ptr);
             Some(b.int_trunc(raw, IntWidth::I32))
         }
         "lge" | "lgt" | "lle" | "llt" => {
-            let (lhs_ptr, lhs_len) = lower_string_arg(b, arg_spanned(0)?);
-            let (rhs_ptr, rhs_len) = lower_string_arg(b, arg_spanned(1)?);
+            let lhs = arg_spanned(0)?;
+            let rhs = arg_spanned(1)?;
+            let (lhs_ptr, lhs_len) = lower_string_arg(b, lhs);
+            let (rhs_ptr, rhs_len) = lower_string_arg(b, rhs);
             let raw = b.call(
                 FuncRef::External(format!("afs_{}", name)),
                 vec![lhs_ptr, lhs_len, rhs_ptr, rhs_len],
                 IrType::Int(IntWidth::I32),
             );
             let zero = b.const_i32(0);
-            Some(b.icmp(CmpOp::Ne, raw, zero))
+            let result = b.icmp(CmpOp::Ne, raw, zero);
+            release_string_arg(b, lhs, lhs_ptr);
+            release_string_arg(b, rhs, rhs_ptr);
+            Some(result)
         }
         "adjustl" => {
-            let (src_ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let arg = arg_spanned(0)?;
+            let (src_ptr, len_val) = lower_string_arg(b, arg);
             let one = b.const_i64(1);
             let alloc_len = b.iadd(len_val, one);
             let buf = b.runtime_call(
@@ -11581,10 +11608,13 @@ pub(super) fn lower_char_intrinsic(
                 vec![buf, src_ptr, len_val],
                 IrType::Void,
             );
+            release_string_arg(b, arg, src_ptr);
+            b.mark_owned_string_temp(buf);
             Some(buf)
         }
         "adjustr" => {
-            let (src_ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let arg = arg_spanned(0)?;
+            let (src_ptr, len_val) = lower_string_arg(b, arg);
             let one = b.const_i64(1);
             let alloc_len = b.iadd(len_val, one);
             let buf = b.runtime_call(
@@ -11603,13 +11633,16 @@ pub(super) fn lower_char_intrinsic(
                 vec![buf, src_ptr, len_val],
                 IrType::Void,
             );
+            release_string_arg(b, arg, src_ptr);
+            b.mark_owned_string_temp(buf);
             Some(buf)
         }
         "trim" => {
             // TRIM(s): returns character with trailing blanks removed.
             // Allocate buffer of declared length, memcpy source, return buffer pointer.
             // The actual printed length is discovered by len_trim at the call site.
-            let (src_ptr, len_val) = lower_string_arg(b, arg_spanned(0)?);
+            let arg = arg_spanned(0)?;
+            let (src_ptr, len_val) = lower_string_arg(b, arg);
             let one = b.const_i64(1);
             let alloc_len = b.iadd(len_val, one);
             let buf = b.runtime_call(
@@ -11628,10 +11661,13 @@ pub(super) fn lower_char_intrinsic(
                 vec![buf, src_ptr, len_val],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
+            release_string_arg(b, arg, src_ptr);
+            b.mark_owned_string_temp(buf);
             Some(buf)
         }
         "repeat" => {
-            let (src_ptr, src_len) = lower_string_arg(b, arg_spanned(0)?);
+            let arg = arg_spanned(0)?;
+            let (src_ptr, src_len) = lower_string_arg(b, arg);
             let raw_copies = super::expr::lower_expr(b, locals, arg_spanned(1)?, st);
             let copies = widen_to_i64(b, raw_copies);
             let copies = clamp_nonnegative_i64(b, copies);
@@ -11654,6 +11690,8 @@ pub(super) fn lower_char_intrinsic(
                 vec![src_ptr, src_len, copies, buf],
                 IrType::Void,
             );
+            release_string_arg(b, arg, src_ptr);
+            b.mark_owned_string_temp(buf);
             Some(buf)
         }
         "compiler_version" => {
@@ -11976,7 +12014,8 @@ fn lower_logical_reduction_defined_array_ctor_compare(
         };
         let idx = b.const_i64(i as i64);
         let array_ptr = rank1_array_desc_elem_ptr(b, array_desc, &elem_ty, idx);
-        let (ctor_ptr, _) = lower_string_expr_full(
+        let array_len = b.const_i64(ir_scalar_byte_size(&elem_ty, b.layout));
+        let (ctor_ptr, ctor_len) = lower_string_expr_full(
             b,
             locals,
             ctor_expr,
@@ -11999,7 +12038,9 @@ fn lower_logical_reduction_defined_array_ctor_compare(
                 array_expr,
                 ctor_expr,
                 array_ptr,
+                Some(array_len),
                 ctor_ptr,
+                Some(ctor_len),
             )
         } else {
             emit_resolved_operator_call(
@@ -12014,7 +12055,9 @@ fn lower_logical_reduction_defined_array_ctor_compare(
                 ctor_expr,
                 array_expr,
                 ctor_ptr,
+                Some(ctor_len),
                 array_ptr,
+                Some(array_len),
             )
         };
         let pred = coerce_to_type(b, pred, &IrType::Bool);
@@ -14826,8 +14869,35 @@ pub(super) fn bound_proc_scope<'a>(
     layout: &crate::sema::type_layout::TypeLayout,
     bp: &crate::sema::type_layout::BoundProc,
 ) -> Option<&'a crate::sema::symtab::Scope> {
-    procedure_scope_by_name_in_owner_module(st, &bp.abi_name, layout.owner_module.as_deref())
+    let target_key = abi_key_for_link_name(st, &bp.target_name);
+    procedure_scope_for_link_name(st, &bp.target_name)
+        .or_else(|| {
+            target_key.as_deref().and_then(|key| {
+                procedure_scope_by_name_in_owner_module(st, key, layout.owner_module.as_deref())
+            })
+        })
+        .or_else(|| {
+            procedure_scope_by_name_in_owner_module(
+                st,
+                &bp.abi_name,
+                layout.owner_module.as_deref(),
+            )
+        })
+        .or_else(|| {
+            target_key
+                .as_deref()
+                .and_then(|key| procedure_scope_by_name(st, key))
+        })
         .or_else(|| procedure_scope_by_name(st, &bp.abi_name))
+}
+
+fn procedure_scope_for_link_name<'a>(
+    st: &'a SymbolTable,
+    link_name: &str,
+) -> Option<&'a crate::sema::symtab::Scope> {
+    let symbol = find_linkable_symbol_by_link_name(st, link_name)?;
+    let owner_module = enclosing_scope_module_name(st, symbol.scope);
+    procedure_scope_by_name_in_owner_module(st, &symbol.name, owner_module)
 }
 
 fn procedure_symbol_is_elemental(sym: &crate::sema::symtab::Symbol) -> bool {
@@ -18559,6 +18629,46 @@ pub(super) fn lower_operator_actual_by_ref(b: &mut FuncBuilder, actual: ValueId)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_operator_operand_once(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> (ValueId, Option<ValueId>) {
+    if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+        let (ptr, len) = lower_string_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        (ptr, Some(len))
+    } else {
+        (
+            super::expr::lower_expr_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ),
+            None,
+        )
+    }
+}
+
 pub(super) fn lowered_operator_char_actual_view(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -18569,7 +18679,12 @@ pub(super) fn lowered_operator_char_actual_view(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
     actual: ValueId,
+    actual_len: Option<ValueId>,
 ) -> Option<(ValueId, ValueId)> {
+    if let Some(len) = actual_len {
+        return Some((actual, len));
+    }
+
     if let Some((ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
         return Some((ptr, len));
     }
@@ -18598,21 +18713,7 @@ pub(super) fn lowered_operator_char_actual_view(
         {
             Some(load_string_descriptor_view(b, actual))
         }
-        Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) => {
-            let len = actual_char_arg_runtime_len(
-                b,
-                locals,
-                None,
-                expr,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            )
-            .unwrap_or_else(|| b.const_i64(0));
-            Some((actual, len))
-        }
+        Some(IrType::Ptr(inner)) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) => None,
         _ => None,
     }
 }
@@ -18712,7 +18813,9 @@ pub(super) fn emit_resolved_operator_call(
     left_expr: &crate::ast::expr::SpannedExpr,
     right_expr: &crate::ast::expr::SpannedExpr,
     lhs: ValueId,
+    lhs_char_len: Option<ValueId>,
     rhs: ValueId,
+    rhs_char_len: Option<ValueId>,
 ) -> ValueId {
     let specific_key = specific.to_lowercase();
     let (call_name, _) = resolved_symbol_call_target(st, &specific_key, specific);
@@ -18752,17 +18855,28 @@ pub(super) fn emit_resolved_operator_call(
         );
         Some(desc)
     });
+    if hidden_abi == Some(HiddenResultAbi::StringDescriptor)
+        && procedure_lookup_returns_owned_character_temp(st, &abi_lookup_keys)
+    {
+        if let Some(desc) = hidden_result {
+            b.mark_owned_string_descriptor(desc);
+        }
+    }
 
     let mut call_args = Vec::with_capacity(2 + hidden_result.is_some() as usize + 4);
     let mut call_arg_array_temps = Vec::new();
+    let mut call_arg_character_temps = Vec::new();
     let mut char_actual_lens = [None, None];
     if let Some(desc) = hidden_result {
         call_args.push(desc);
     }
 
-    for (i, (expr, actual)) in [(&left_expr, lhs), (&right_expr, rhs)]
-        .into_iter()
-        .enumerate()
+    for (i, (expr, actual, actual_char_len)) in [
+        (left_expr, lhs, lhs_char_len),
+        (right_expr, rhs, rhs_char_len),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let is_value = callee_value_args
             .as_ref()
@@ -18796,18 +18910,36 @@ pub(super) fn emit_resolved_operator_call(
             .map(|mask| mask.get(i).copied().unwrap_or(false))
             .unwrap_or(false);
         let actual_is_string_descriptor = value_is_string_descriptor_ptr(b, actual);
+        let mut char_ptr_for_cleanup = None;
+        let mut bind_c_owned_bases = Vec::new();
 
-        let lowered = if is_value && wants_bind_c_char {
-            lower_bind_c_char_value_arg(
-                b,
-                locals,
-                expr,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            )
+        let lowered = if wants_bind_c_char {
+            let bind_c_actual = if let Some(len) = actual_char_len {
+                super::stmt::MaterializedCallArg {
+                    value: if is_value {
+                        b.load_typed(actual, IrType::Int(IntWidth::I8))
+                    } else {
+                        actual
+                    },
+                    character_len: Some(len),
+                    owned_character_bases: b.take_owned_string_temp_bases(actual),
+                }
+            } else {
+                lower_bind_c_char_call_arg(
+                    b,
+                    locals,
+                    expr,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                    is_value,
+                )
+            };
+            char_actual_lens[i] = bind_c_actual.character_len;
+            bind_c_owned_bases = bind_c_actual.owned_character_bases;
+            bind_c_actual.value
         } else if is_value {
             coerce_value_call_arg(b, st, abi_primary_key, i, actual)
         } else if wants_descriptor {
@@ -18831,20 +18963,10 @@ pub(super) fn emit_resolved_operator_call(
                 type_layouts,
                 desc,
             );
+            call_arg_character_temps.extend(b.take_owned_string_temp_bases(desc));
             desc
         } else if wants_string_descriptor {
             lower_arg_string_descriptor(b, locals, expr, st, type_layouts)
-        } else if wants_bind_c_char {
-            lower_bind_c_char_arg_raw(
-                b,
-                locals,
-                expr,
-                st,
-                type_layouts,
-                internal_funcs,
-                contained_host_refs,
-                descriptor_params,
-            )
         } else if wants_pointer {
             lower_pointer_dummy_actual(
                 b,
@@ -18871,8 +18993,10 @@ pub(super) fn emit_resolved_operator_call(
                     contained_host_refs,
                     descriptor_params,
                     actual,
+                    actual_char_len,
                 )
                 .unwrap_or_else(|| (lower_operator_actual_by_ref(b, actual), b.const_i64(0)));
+                char_ptr_for_cleanup = Some(char_ptr);
                 char_actual_lens[i] = Some(char_len);
                 let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
                 b.store(char_ptr, slot);
@@ -18881,6 +19005,20 @@ pub(super) fn emit_resolved_operator_call(
                 lower_operator_actual_by_ref(b, actual)
             }
         };
+        let mut owned_bases = bind_c_owned_bases;
+        if owned_bases.is_empty() {
+            owned_bases = char_ptr_for_cleanup
+                .map(|ptr| b.take_owned_string_temp_bases(ptr))
+                .unwrap_or_default();
+        }
+        if owned_bases.is_empty() {
+            owned_bases = b.take_owned_string_temp_bases(actual);
+        }
+        if owned_bases.is_empty() && actual_is_string_descriptor && char_ptr_for_cleanup.is_none() {
+            let (ptr, _) = load_string_descriptor_view(b, actual);
+            owned_bases = b.take_owned_string_temp_bases(ptr);
+        }
+        call_arg_character_temps.extend(owned_bases);
         call_args.push(lowered);
     }
 
@@ -18945,6 +19083,7 @@ pub(super) fn emit_resolved_operator_call(
     };
     let call_result = b.call(func_ref, call_args, ret_ty);
     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
+    deallocate_owned_string_bases(b, &call_arg_character_temps);
 
     if let Some(desc) = hidden_result {
         return desc;
@@ -19305,20 +19444,18 @@ pub(super) fn lower_value_call_slot_with_presence(
     wants_bind_c_char: bool,
 ) -> super::stmt::LoweredCallArg {
     let Some(actual) = actual else {
-        return super::stmt::LoweredCallArg {
-            value: missing_optional_call_arg(b, st, callee_key, arg_index, true),
-            present: b.const_bool(false),
-        };
+        let value = missing_optional_call_arg(b, st, callee_key, arg_index, true);
+        let present = b.const_bool(false);
+        return super::stmt::LoweredCallArg::plain(value, present);
     };
     let crate::ast::expr::SectionSubscript::Element(expr) = &actual.value else {
-        return super::stmt::LoweredCallArg {
-            value: b.const_i32(0),
-            present: b.const_bool(true),
-        };
+        let value = b.const_i32(0);
+        let present = b.const_bool(true);
+        return super::stmt::LoweredCallArg::plain(value, present);
     };
     let mut materialize = |b: &mut FuncBuilder, value_expr: &crate::ast::expr::SpannedExpr| {
         if wants_bind_c_char {
-            lower_bind_c_char_value_arg(
+            lower_bind_c_char_call_arg(
                 b,
                 locals,
                 value_expr,
@@ -19327,6 +19464,7 @@ pub(super) fn lower_value_call_slot_with_presence(
                 internal_funcs,
                 contained_host_refs,
                 descriptor_params,
+                true,
             )
         } else {
             let raw = super::expr::lower_expr_full(
@@ -19339,7 +19477,9 @@ pub(super) fn lower_value_call_slot_with_presence(
                 contained_host_refs,
                 descriptor_params,
             );
-            coerce_value_call_arg(b, st, callee_key, arg_index, raw)
+            super::stmt::MaterializedCallArg::plain(coerce_value_call_arg(
+                b, st, callee_key, arg_index, raw,
+            ))
         }
     };
     super::stmt::lower_call_arg_maybe_conditional(
@@ -20084,24 +20224,34 @@ pub(super) fn resolved_symbol_call_target(
     (fallback_name.to_string(), key.to_string())
 }
 
+fn resolved_linkable_symbol_from_scope<'a>(
+    st: &'a SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    if let Some(sym) = active_block_use_linkable_symbol(st, key) {
+        return Some(sym);
+    }
+    if let Some(scope_id) = scope_id {
+        if let Some(sym) = find_linkable_symbol_from_scope(st, key, scope_id) {
+            return Some(sym);
+        }
+        if st.host_association_is_restricted(scope_id) {
+            return None;
+        }
+    }
+    find_linkable_symbol_any_scope(st, key)
+}
+
 fn resolved_symbol_call_target_from_scope(
     st: &SymbolTable,
     scope_id: Option<crate::sema::symtab::ScopeId>,
     key: &str,
     fallback_name: &str,
 ) -> (String, String) {
-    if let Some(sym) = active_block_use_linkable_symbol(st, key) {
-        return (symbol_link_name(st, sym), key.to_string());
-    }
-    if let Some(scope_id) = scope_id {
-        if let Some(sym) = find_linkable_symbol_from_scope(st, key, scope_id) {
-            return (symbol_link_name(st, sym), key.to_string());
-        }
-        if st.host_association_is_restricted(scope_id) {
-            return (fallback_name.to_string(), key.to_string());
-        }
-    }
-    resolved_symbol_call_target(st, key, fallback_name)
+    resolved_linkable_symbol_from_scope(st, scope_id, key)
+        .map(|sym| (symbol_link_name(st, sym), key.to_string()))
+        .unwrap_or_else(|| (fallback_name.to_string(), key.to_string()))
 }
 
 /// Resolve a bare call name preferring the caller's own scope over a global
@@ -20286,23 +20436,38 @@ pub(super) fn emit_named_function_call(
         type_layouts,
     );
 
+    let caller_scope_id =
+        callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+    let direct_symbol = if resolved_generic.is_none() {
+        resolved_linkable_symbol_from_scope(st, caller_scope_id, &key)
+    } else {
+        None
+    };
+
     let (call_name, callee_key) = match resolved_generic.as_ref() {
         Some(candidate) => resolved_symbol_call_target_for_candidate(st, candidate),
-        None => {
-            // Caller-scope-aware, like the expr.rs function-call fallback:
-            // the scope-blind scan binds the first same-named callable in
-            // source order. fpm defines both M_CLI2::join_path (collapses
-            // "//" via substitute) and fpm_filesystem::join_path (keeps
-            // it); every one of the 164 join_path calls in the binary
-            // bound to M_CLI2's, so a "./" root turned "../toml-f" into
-            // ".../toml-f" and path dependencies could not resolve. This
-            // hidden-character-result path bypasses expr.rs's resolution,
-            // so it needs the same treatment.
-            let resolved_name = callee_name.to_string();
-            let resolved_key = resolved_name.to_lowercase();
-            resolved_symbol_call_target_caller_aware(st, b, &resolved_key, &resolved_name)
-        }
+        None => direct_symbol
+            .map(|sym| (symbol_link_name(st, sym), key.clone()))
+            .unwrap_or_else(|| {
+                // Caller-scope-aware, like the expr.rs function-call fallback:
+                // the scope-blind scan binds the first same-named callable in
+                // source order. fpm defines both M_CLI2::join_path (collapses
+                // "//" via substitute) and fpm_filesystem::join_path (keeps
+                // it); every one of the 164 join_path calls in the binary
+                // bound to M_CLI2's, so a "./" root turned "../toml-f" into
+                // ".../toml-f" and path dependencies could not resolve. This
+                // hidden-character-result path bypasses expr.rs's resolution,
+                // so it needs the same treatment.
+                (callee_name.to_string(), key.clone())
+            }),
     };
+    let returns_owned_character_temp = resolved_generic
+        .as_ref()
+        .is_some_and(|candidate| specific_returns_owned_character_temp(st, candidate))
+        || direct_symbol.is_some_and(|sym| callable_symbol_returns_owned_character_temp(st, sym));
+    if let Some(desc) = hidden_result.filter(|_| returns_owned_character_temp) {
+        b.mark_owned_string_descriptor(desc);
+    }
     let abi_lookup_keys =
         procedure_abi_lookup_keys_for_call_target(st, call_name.as_str(), &[&callee_key, &key]);
     let abi_primary_key = abi_lookup_keys
@@ -20347,6 +20512,8 @@ pub(super) fn emit_named_function_call(
     let mut arg_presence = Vec::with_capacity(arg_slots.len());
     let mut call_arg_array_temps = Vec::new();
     let mut call_arg_sequence_temps = Vec::new();
+    let mut call_arg_character_lens = vec![None; arg_slots.len()];
+    let mut call_arg_character_temps = Vec::new();
     if let Some(desc) = hidden_result {
         call_args.push(desc);
     }
@@ -20407,6 +20574,8 @@ pub(super) fn emit_named_function_call(
                 i,
                 wants_bind_c_char,
             );
+            call_arg_character_lens[i] = lowered.character_len;
+            call_arg_character_temps.extend(lowered.owned_character_bases.iter().copied());
             call_args.push(lowered.value);
             arg_presence.push(lowered.present);
             continue;
@@ -20469,8 +20638,8 @@ pub(super) fn emit_named_function_call(
                     && !wants_bind_c_char;
                 let wants_polymorphic_descriptor =
                     wants_descriptor && dummy_is_class && !dummy_is_allocatable && !wants_pointer;
-                let value = if is_value && wants_bind_c_char {
-                    lower_bind_c_char_value_arg(
+                let value = if wants_bind_c_char {
+                    let actual = lower_bind_c_char_call_arg(
                         b,
                         locals,
                         e,
@@ -20479,7 +20648,11 @@ pub(super) fn emit_named_function_call(
                         internal_funcs,
                         contained_host_refs,
                         descriptor_params,
-                    )
+                        is_value,
+                    );
+                    call_arg_character_lens[i] = actual.character_len;
+                    call_arg_character_temps.extend(actual.owned_character_bases);
+                    actual.value
                 } else if is_value {
                     let raw = super::expr::lower_expr_full(
                         b,
@@ -20513,20 +20686,10 @@ pub(super) fn emit_named_function_call(
                         type_layouts,
                         desc,
                     );
+                    call_arg_character_temps.extend(b.take_owned_string_temp_bases(desc));
                     desc
                 } else if wants_string_descriptor {
                     lower_arg_string_descriptor(b, locals, e, st, type_layouts)
-                } else if wants_bind_c_char {
-                    lower_bind_c_char_arg_raw(
-                        b,
-                        locals,
-                        e,
-                        st,
-                        type_layouts,
-                        internal_funcs,
-                        contained_host_refs,
-                        descriptor_params,
-                    )
                 } else if wants_pointer {
                     lower_pointer_dummy_actual(
                         b,
@@ -20600,6 +20763,19 @@ pub(super) fn emit_named_function_call(
                             lower_arg_by_ref(b, locals, e, st)
                         }
                     })
+                } else if let Some(actual) = lower_materialized_character_actual(
+                    b,
+                    locals,
+                    e,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                ) {
+                    call_arg_character_lens[i] = Some(actual.len);
+                    call_arg_character_temps.extend(actual.owned_bases);
+                    actual.address
                 } else if full_ref_context {
                     lower_arg_by_ref_for_dummy_full(
                         b,
@@ -20676,7 +20852,7 @@ pub(super) fn emit_named_function_call(
             }
             if let Some(arg) = &arg_slots[i] {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    call_args.push(
+                    let len = call_arg_character_lens[i].or_else(|| {
                         actual_char_arg_runtime_len(
                             b,
                             locals,
@@ -20688,8 +20864,8 @@ pub(super) fn emit_named_function_call(
                             contained_host_refs,
                             descriptor_params,
                         )
-                        .unwrap_or_else(|| b.const_i64(0)),
-                    );
+                    });
+                    call_args.push(len.unwrap_or_else(|| b.const_i64(0)));
                 } else {
                     call_args.push(b.const_i64(0));
                 }
@@ -20738,6 +20914,7 @@ pub(super) fn emit_named_function_call(
     let call_result = b.call(func_ref, call_args, ret_ty);
     finish_sequence_association_temps(b, &call_arg_sequence_temps);
     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
+    deallocate_owned_string_bases(b, &call_arg_character_temps);
     call_result
 }
 
@@ -20788,6 +20965,10 @@ pub(super) fn emit_bound_function_call(
     )
     .or_else(|| layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, layout, component));
+    let returns_owned_character_temp = bound_proc_returns_owned_character_temp(st, layout, bp);
+    if let Some(desc) = hidden_result.filter(|_| returns_owned_character_temp) {
+        b.mark_owned_string_descriptor(desc);
+    }
     emit_resolved_bound_proc_call(
         b,
         locals,
@@ -20886,6 +21067,8 @@ pub(super) fn emit_resolved_bound_proc_call(
     let mut arg_presence = Vec::with_capacity(arg_slots.len());
     let mut call_arg_array_temps = Vec::new();
     let mut call_arg_sequence_temps = Vec::new();
+    let mut call_arg_character_lens = vec![None; arg_slots.len()];
+    let mut call_arg_character_temps = Vec::new();
     if let Some(result) = hidden_result {
         call_args.push(result);
     }
@@ -20979,6 +21162,8 @@ pub(super) fn emit_resolved_bound_proc_call(
                 i,
                 wants_bind_c_char,
             );
+            call_arg_character_lens[i] = lowered.character_len;
+            call_arg_character_temps.extend(lowered.owned_character_bases.iter().copied());
             call_args.push(lowered.value);
             arg_presence.push(lowered.present);
             continue;
@@ -21009,8 +21194,8 @@ pub(super) fn emit_resolved_bound_proc_call(
                     };
                     let actual_is_char_sequence =
                         actual_is_character_array_section_designator(locals, e, st, type_layouts);
-                    let value = if is_value && wants_bind_c_char {
-                        lower_bind_c_char_value_arg(
+                    let value = if wants_bind_c_char {
+                        let actual = lower_bind_c_char_call_arg(
                             b,
                             locals,
                             e,
@@ -21019,7 +21204,11 @@ pub(super) fn emit_resolved_bound_proc_call(
                             internal_funcs,
                             contained_host_refs,
                             descriptor_params,
-                        )
+                            is_value,
+                        );
+                        call_arg_character_lens[i] = actual.character_len;
+                        call_arg_character_temps.extend(actual.owned_character_bases);
+                        actual.value
                     } else if is_value {
                         let raw = super::expr::lower_expr_full(
                             b,
@@ -21069,20 +21258,10 @@ pub(super) fn emit_resolved_bound_proc_call(
                             type_layouts,
                             desc,
                         );
+                        call_arg_character_temps.extend(b.take_owned_string_temp_bases(desc));
                         desc
                     } else if wants_string_descriptor {
                         lower_arg_string_descriptor(b, locals, e, st, type_layouts)
-                    } else if wants_bind_c_char {
-                        lower_bind_c_char_arg_raw(
-                            b,
-                            locals,
-                            e,
-                            st,
-                            type_layouts,
-                            internal_funcs,
-                            contained_host_refs,
-                            descriptor_params,
-                        )
                     } else if wants_pointer {
                         lower_pointer_dummy_actual(
                             b,
@@ -21148,6 +21327,19 @@ pub(super) fn emit_resolved_bound_proc_call(
                                 dummy_is_class,
                             )
                         })
+                    } else if let Some(actual) = lower_materialized_character_actual(
+                        b,
+                        locals,
+                        e,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        call_arg_character_lens[i] = Some(actual.len);
+                        call_arg_character_temps.extend(actual.owned_bases);
+                        actual.address
                     } else {
                         lower_arg_by_ref_for_dummy_full(
                             b,
@@ -21222,7 +21414,7 @@ pub(super) fn emit_resolved_bound_proc_call(
             }
             if let Some(arg) = &arg_slots[i] {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    call_args.push(
+                    let len = call_arg_character_lens[i].or_else(|| {
                         actual_char_arg_runtime_len(
                             b,
                             locals,
@@ -21234,8 +21426,8 @@ pub(super) fn emit_resolved_bound_proc_call(
                             contained_host_refs,
                             descriptor_params,
                         )
-                        .unwrap_or_else(|| b.const_i64(0)),
-                    );
+                    });
+                    call_args.push(len.unwrap_or_else(|| b.const_i64(0)));
                 } else {
                     call_args.push(b.const_i64(0));
                 }
@@ -21258,6 +21450,7 @@ pub(super) fn emit_resolved_bound_proc_call(
     let call_result = b.call(func_ref, call_args, ret_ty);
     finish_sequence_association_temps(b, &call_arg_sequence_temps);
     deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
+    deallocate_owned_string_bases(b, &call_arg_character_temps);
     if let Some(result) = hidden_result {
         return Some(result);
     }
@@ -21362,6 +21555,13 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         );
         Some(desc)
     });
+    if hidden_abi == Some(HiddenResultAbi::StringDescriptor)
+        && bound_proc_returns_owned_character_temp(st, base_layout, declared_bp)
+    {
+        if let Some(desc) = hidden_result {
+            b.mark_owned_string_descriptor(desc);
+        }
+    }
     let call_ret_ty = if hidden_result.is_some() {
         IrType::Void
     } else if let Some(ret_ty) = explicit_ret_ty {
@@ -21797,6 +21997,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
 
     let mut call_args = vec![desc_addr];
     let mut arg_presence = Vec::with_capacity(arg_slots.len());
+    let mut call_arg_character_lens = vec![None; arg_slots.len()];
+    let mut call_arg_character_temps = Vec::new();
     for (i, slot) in arg_slots.iter().enumerate() {
         let is_value = callee_value_args
             .as_ref()
@@ -21849,6 +22051,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
                 i,
                 wants_bind_c_char,
             );
+            call_arg_character_lens[i] = lowered.character_len;
+            call_arg_character_temps.extend(lowered.owned_character_bases.iter().copied());
             call_args.push(lowered.value);
             arg_presence.push(lowered.present);
             continue;
@@ -21891,8 +22095,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
         };
         let value = match &arg.value {
             crate::ast::expr::SectionSubscript::Element(e) => {
-                let value = if is_value && wants_bind_c_char {
-                    lower_bind_c_char_value_arg(
+                let value = if wants_bind_c_char {
+                    let actual = lower_bind_c_char_call_arg(
                         b,
                         &ctx.locals,
                         e,
@@ -21901,14 +22105,18 @@ pub(super) fn lower_alloc_return_call_into_desc(
                         Some(ctx.internal_funcs),
                         Some(ctx.contained_host_refs),
                         Some(ctx.descriptor_params),
-                    )
+                        is_value,
+                    );
+                    call_arg_character_lens[i] = actual.character_len;
+                    call_arg_character_temps.extend(actual.owned_character_bases);
+                    actual.value
                 } else if is_value {
                     let raw = super::expr::lower_expr_ctx(b, ctx, e);
                     coerce_value_call_arg(b, ctx.st, abi_primary_key, i, raw)
                 } else if wants_string_descriptor {
                     lower_arg_string_descriptor(b, &ctx.locals, e, ctx.st, Some(ctx.type_layouts))
                 } else if wants_descriptor {
-                    lower_arg_descriptor_full(
+                    let desc = lower_arg_descriptor_full(
                         b,
                         &ctx.locals,
                         e,
@@ -21918,18 +22126,9 @@ pub(super) fn lower_alloc_return_call_into_desc(
                         Some(ctx.contained_host_refs),
                         Some(ctx.descriptor_params),
                         wants_polymorphic_descriptor,
-                    )
-                } else if wants_bind_c_char {
-                    lower_bind_c_char_arg_raw(
-                        b,
-                        &ctx.locals,
-                        e,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                        Some(ctx.internal_funcs),
-                        Some(ctx.contained_host_refs),
-                        Some(ctx.descriptor_params),
-                    )
+                    );
+                    call_arg_character_temps.extend(b.take_owned_string_temp_bases(desc));
+                    desc
                 } else if wants_pointer {
                     lower_pointer_dummy_actual(
                         b,
@@ -21942,6 +22141,19 @@ pub(super) fn lower_alloc_return_call_into_desc(
                         Some(ctx.descriptor_params),
                     )
                     .unwrap_or_else(|| lower_arg_by_ref_ctx(b, ctx, e))
+                } else if let Some(actual) = lower_materialized_character_actual(
+                    b,
+                    &ctx.locals,
+                    e,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) {
+                    call_arg_character_lens[i] = Some(actual.len);
+                    call_arg_character_temps.extend(actual.owned_bases);
+                    actual.address
                 } else {
                     lower_arg_by_ref_ctx(b, ctx, e)
                 };
@@ -21988,7 +22200,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
             }
             if let Some(arg) = &arg_slots[i] {
                 if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    call_args.push(
+                    let len = call_arg_character_lens[i].or_else(|| {
                         actual_char_arg_runtime_len(
                             b,
                             &ctx.locals,
@@ -22000,8 +22212,8 @@ pub(super) fn lower_alloc_return_call_into_desc(
                             Some(ctx.contained_host_refs),
                             Some(ctx.descriptor_params),
                         )
-                        .unwrap_or_else(|| b.const_i64(0)),
-                    );
+                    });
+                    call_args.push(len.unwrap_or_else(|| b.const_i64(0)));
                 } else {
                     call_args.push(b.const_i64(0));
                 }
@@ -22021,6 +22233,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
         call_name,
     );
     b.call(func_ref, call_args, IrType::Void);
+    deallocate_owned_string_bases(b, &call_arg_character_temps);
 }
 
 fn procedure_code_ptr_ir_type() -> IrType {
@@ -24175,6 +24388,7 @@ pub(super) struct HostRefParamInfo {
     string_descriptor_arg: bool,
     allocatable: bool,
     is_pointer: bool,
+    is_class: bool,
     /// SSA value id of an extra hidden i64 length parameter when the
     /// host var is a `character(*)` (assumed-length) variable that needs
     /// its runtime length forwarded alongside the pointer.
@@ -24335,6 +24549,7 @@ pub(super) fn build_host_ref_params(
             string_descriptor_arg: uses_string_descriptor,
             allocatable: alloc,
             is_pointer: ptr_is_pointer,
+            is_class: decl_is_class(hname, host_decls),
             assumed_len_id,
             procedure_dummy_closure_ids,
         });
@@ -24513,7 +24728,7 @@ pub(super) fn install_host_ref_locals(
                 inline_const: None,
                 is_pointer: info.is_pointer,
                 runtime_dim_upper: vec![],
-                is_class: false,
+                is_class: info.is_class,
                 logical_kind: None,
                 last_dim_assumed_size: false,
             },
@@ -25187,6 +25402,14 @@ pub(super) fn callee_character_return_abi(
     character_return_abi_for_symbol(sym)
 }
 
+pub(super) fn procedure_lookup_character_return_abi(
+    st: &SymbolTable,
+    signature_key: &str,
+) -> Option<CharacterReturnAbi> {
+    let lookup_keys = procedure_abi_lookup_keys(st, &[signature_key]);
+    first_procedure_lookup(&lookup_keys, |key| callee_character_return_abi(st, key))
+}
+
 pub(super) fn callee_hidden_result_abi(
     st: &SymbolTable,
     callee_name: &str,
@@ -25306,6 +25529,12 @@ pub(super) fn resolved_named_character_return_abi_for_call(
         // with the same name. Only true procedure-pointer locals stay
         // callable through the data namespace here.
         return None;
+    }
+    if let Some(ret_abi) = procedure_pointer_signature_key(st, &key)
+        .as_deref()
+        .and_then(|signature| procedure_lookup_character_return_abi(st, signature))
+    {
+        return Some(ret_abi);
     }
     if let Some(ret_abi) = current_proc_scope()
         .and_then(|scope_id| find_linkable_symbol_from_scope(st, &key, scope_id))
@@ -25517,53 +25746,103 @@ fn character_expr_type_known(
         .is_some_and(|ti| matches!(ti, crate::sema::symtab::TypeInfo::Character { .. }))
 }
 
-pub(super) fn string_expr_lowers_to_owned_heap_temp(
-    expr: &crate::ast::expr::SpannedExpr,
-    locals: &HashMap<String, LocalInfo>,
+fn symbol_returns_owned_character_temp(sym: &crate::sema::symtab::Symbol) -> bool {
+    matches!(
+        sym.type_info,
+        Some(crate::sema::symtab::TypeInfo::Character { .. })
+    ) && sym.attrs.allocatable
+        && !sym.attrs.pointer
+        && sym.attrs.result_rank == 0
+        && sym.attrs.binding_label.is_none()
+}
+
+fn callable_symbol_returns_owned_character_temp(
     st: &SymbolTable,
-    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    sym: &crate::sema::symtab::Symbol,
 ) -> bool {
-    match &expr.node {
-        Expr::ParenExpr { inner } => {
-            string_expr_lowers_to_owned_heap_temp(inner, locals, st, type_layouts)
+    if let Some(interface_name) = sym.attrs.procedure_iface.as_deref() {
+        let interface_key = interface_name.to_ascii_lowercase();
+        if !interface_key.eq_ignore_ascii_case(&sym.name) {
+            return st
+                .lookup_in(sym.scope, &interface_key)
+                .filter(|interface| is_linkable_callable_symbol(interface))
+                .is_some_and(symbol_returns_owned_character_temp);
         }
-        Expr::BinaryOp {
-            op: BinaryOp::Concat,
-            left,
-            right,
-        } => {
-            character_expr_type_known(left, locals, st, type_layouts)
-                && character_expr_type_known(right, locals, st, type_layouts)
-        }
-        Expr::FunctionCall { callee, args } => {
-            let Expr::Name { name } = &callee.node else {
-                return false;
-            };
-            let first_arg = args.first().and_then(|arg| match &arg.value {
-                crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
-                _ => None,
-            });
-            let first_is_char = first_arg
-                .map(|arg| character_expr_type_known(arg, locals, st, type_layouts))
-                .unwrap_or(false);
-            match name.to_ascii_lowercase().as_str() {
-                "trim" => {
-                    args.len() == 1
-                        && first_is_char
-                        && first_arg
-                            .map(|arg| {
-                                string_expr_lowers_to_owned_heap_temp(arg, locals, st, type_layouts)
-                            })
-                            .unwrap_or(false)
-                }
-                "adjustl" | "adjustr" => args.len() == 1 && first_is_char,
-                "f_c_string" => first_is_char,
-                "repeat" => args.len() >= 2 && first_is_char,
-                _ => false,
-            }
-        }
-        _ => false,
     }
+    symbol_returns_owned_character_temp(sym)
+}
+
+pub(super) fn procedure_lookup_returns_owned_character_temp(
+    st: &SymbolTable,
+    lookup_keys: &[String],
+) -> bool {
+    first_procedure_lookup(lookup_keys, |key| {
+        find_linkable_symbol_by_link_name(st, key)
+            .or_else(|| find_linkable_symbol_any_scope(st, key))
+            .map(|sym| callable_symbol_returns_owned_character_temp(st, sym))
+    })
+    .unwrap_or(false)
+}
+
+fn specific_returns_owned_character_temp(
+    st: &SymbolTable,
+    candidate: &SpecificProcCandidate,
+) -> bool {
+    let key = candidate.name.to_ascii_lowercase();
+    find_linkable_symbol_in_owner_scope(st, &key, candidate.owner_scope)
+        .or_else(|| {
+            let scope = procedure_scope_for_candidate(st, candidate)?;
+            scope.symbols.get(&key).or_else(|| {
+                scope
+                    .parent
+                    .and_then(|parent| st.scope(parent).symbols.get(&key))
+            })
+        })
+        .is_some_and(|sym| callable_symbol_returns_owned_character_temp(st, sym))
+}
+
+fn find_linkable_symbol_by_link_name<'a>(
+    st: &'a SymbolTable,
+    link_name: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    st.all_scopes().iter().find_map(|scope| {
+        scope.symbols.values().find(|sym| {
+            is_linkable_callable_symbol(sym)
+                && symbol_link_name(st, sym).eq_ignore_ascii_case(link_name)
+        })
+    })
+}
+
+fn bound_proc_returns_owned_character_temp(
+    st: &SymbolTable,
+    layout: &crate::sema::type_layout::TypeLayout,
+    bound_proc: &crate::sema::type_layout::BoundProc,
+) -> bool {
+    if let Some(symbol) = find_linkable_symbol_by_link_name(st, &bound_proc.target_name) {
+        return callable_symbol_returns_owned_character_temp(st, symbol);
+    }
+    let Some(scope) = bound_proc_scope(st, layout, bound_proc) else {
+        return false;
+    };
+    let symbol_from_scope = {
+        let crate::sema::symtab::ScopeKind::Function(function_name) = &scope.kind else {
+            return false;
+        };
+        let key = function_name.to_ascii_lowercase();
+        scope.symbols.get(&key).or_else(|| {
+            scope
+                .parent
+                .and_then(|parent| st.scope(parent).symbols.get(&key))
+        })
+    };
+    if let Some(symbol) = symbol_from_scope {
+        return callable_symbol_returns_owned_character_temp(st, symbol);
+    }
+    let crate::sema::symtab::ScopeKind::Function(function_name) = &scope.kind else {
+        return false;
+    };
+    smp_function_result_info(st, scope.id, function_name)
+        .is_some_and(|(_, result)| symbol_returns_owned_character_temp(&result))
 }
 
 pub(super) fn deallocate_owned_string_expr_temp(
@@ -25574,9 +25853,25 @@ pub(super) fn deallocate_owned_string_expr_temp(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     ptr: ValueId,
 ) {
-    if string_expr_lowers_to_owned_heap_temp(expr, locals, st, type_layouts) {
-        b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+    let bases = take_owned_string_expr_temp_bases(b, expr, locals, st, type_layouts, ptr);
+    deallocate_owned_string_bases(b, &bases);
+}
+
+pub(super) fn deallocate_owned_string_bases(b: &mut FuncBuilder, bases: &[ValueId]) {
+    for base in bases {
+        b.runtime_call(RuntimeFunc::Deallocate, vec![*base], IrType::Void);
     }
+}
+
+fn take_owned_string_expr_temp_bases(
+    b: &mut FuncBuilder,
+    _expr: &crate::ast::expr::SpannedExpr,
+    _locals: &HashMap<String, LocalInfo>,
+    _st: &SymbolTable,
+    _type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    ptr: ValueId,
+) -> Vec<ValueId> {
+    b.take_owned_string_temp_bases(ptr)
 }
 
 pub(super) fn lower_string_expr_full(
@@ -25646,7 +25941,9 @@ pub(super) fn lower_string_expr_full(
                 contained_host_refs,
                 descriptor_params,
             );
-            b.branch(bb_merge, vec![t_ptr, t_len]);
+            let t_bases =
+                take_owned_string_expr_temp_bases(b, then_val, locals, st, type_layouts, t_ptr);
+            let bb_then_end = b.current_block();
 
             b.set_block(bb_else);
             let (e_ptr, e_len) = lower_string_expr_full(
@@ -25659,9 +25956,42 @@ pub(super) fn lower_string_expr_full(
                 contained_host_refs,
                 descriptor_params,
             );
-            b.branch(bb_merge, vec![e_ptr, e_len]);
+            let e_bases =
+                take_owned_string_expr_temp_bases(b, else_val, locals, st, type_layouts, e_ptr);
+            let bb_else_end = b.current_block();
+
+            let owned_count = t_bases.len().max(e_bases.len());
+            let mut merged_bases = Vec::with_capacity(owned_count);
+            for _ in 0..owned_count {
+                merged_bases.push(
+                    b.add_block_param(bb_merge, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))),
+                );
+            }
+
+            b.set_block(bb_then_end);
+            let mut then_args = vec![t_ptr, t_len];
+            for index in 0..owned_count {
+                let base = t_bases.get(index).copied().unwrap_or_else(|| {
+                    let zero = b.const_i64(0);
+                    b.int_to_ptr(zero, IrType::Int(IntWidth::I8))
+                });
+                then_args.push(base);
+            }
+            b.branch(bb_merge, then_args);
+
+            b.set_block(bb_else_end);
+            let mut else_args = vec![e_ptr, e_len];
+            for index in 0..owned_count {
+                let base = e_bases.get(index).copied().unwrap_or_else(|| {
+                    let zero = b.const_i64(0);
+                    b.int_to_ptr(zero, IrType::Int(IntWidth::I8))
+                });
+                else_args.push(base);
+            }
+            b.branch(bb_merge, else_args);
 
             b.set_block(bb_merge);
+            b.mark_owned_string_temp_bases(merged_ptr, merged_bases);
             (merged_ptr, merged_len)
         }
         Expr::ComponentAccess { .. } => {
@@ -26037,6 +26367,7 @@ pub(super) fn lower_string_expr_full(
                                 type_layouts,
                                 src_ptr,
                             );
+                            b.mark_owned_string_temp(buf);
                             return (buf, total);
                         }
                     }
@@ -26091,6 +26422,7 @@ pub(super) fn lower_string_expr_full(
                                 type_layouts,
                                 src_ptr,
                             );
+                            b.mark_owned_string_temp(buf);
                             return (buf, total_len);
                         }
                     }
@@ -26124,6 +26456,7 @@ pub(super) fn lower_string_expr_full(
                                 type_layouts,
                                 src_ptr,
                             );
+                            b.mark_owned_string_temp(buf);
                             return (buf, len_val);
                         }
                     }
@@ -26157,6 +26490,7 @@ pub(super) fn lower_string_expr_full(
                                 type_layouts,
                                 src_ptr,
                             );
+                            b.mark_owned_string_temp(buf);
                             return (buf, len_val);
                         }
                     }
@@ -26234,6 +26568,14 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
+                            let mut owned_bases = take_owned_string_expr_temp_bases(
+                                b,
+                                tsrc,
+                                locals,
+                                st,
+                                type_layouts,
+                                t_ptr,
+                            );
                             let (f_ptr, f_len) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -26244,6 +26586,14 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
+                            owned_bases.extend(take_owned_string_expr_temp_bases(
+                                b,
+                                fsrc,
+                                locals,
+                                st,
+                                type_layouts,
+                                f_ptr,
+                            ));
                             let mask_raw = super::expr::lower_expr_full(
                                 b,
                                 locals,
@@ -26257,6 +26607,7 @@ pub(super) fn lower_string_expr_full(
                             let mask = coerce_to_type(b, mask_raw, &IrType::Bool);
                             let ptr = b.select(mask, t_ptr, f_ptr);
                             let len = b.select(mask, t_len, f_len);
+                            b.mark_owned_string_temp_bases(ptr, owned_bases);
                             return (ptr, len);
                         }
                     }
@@ -26367,6 +26718,28 @@ pub(super) fn lower_string_expr_full(
                 );
 
                 if let Some(ret_abi) = resolved_char_return_abi {
+                    if procedure_pointer_signature_key(st, &key).is_some() {
+                        let result = super::expr::lower_expr_full(
+                            b,
+                            locals,
+                            expr,
+                            st,
+                            type_layouts,
+                            internal_funcs,
+                            contained_host_refs,
+                            descriptor_params,
+                        );
+                        return match ret_abi {
+                            CharacterReturnAbi::HiddenDescriptor => {
+                                load_string_descriptor_view(b, result)
+                            }
+                            CharacterReturnAbi::BindCScalarByte => {
+                                let slot = b.alloca(IrType::Int(IntWidth::I8));
+                                b.store(result, slot);
+                                (slot, b.const_i64(1))
+                            }
+                        };
+                    }
                     match ret_abi {
                         CharacterReturnAbi::HiddenDescriptor => {
                             let desc =
@@ -26647,6 +27020,40 @@ pub(super) fn lower_string_expr_full(
                                 }
                             }
                         }
+                        if let Some((_, field)) =
+                            resolve_component_field_access(b, locals, callee, st, tl)
+                        {
+                            if field.pointer && field.procedure_pointer {
+                                if let crate::sema::symtab::TypeInfo::Derived(signature) =
+                                    &field.type_info
+                                {
+                                    if let Some(ret_abi) =
+                                        procedure_lookup_character_return_abi(st, signature)
+                                    {
+                                        let result = super::expr::lower_expr_full(
+                                            b,
+                                            locals,
+                                            expr,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        );
+                                        return match ret_abi {
+                                            CharacterReturnAbi::HiddenDescriptor => {
+                                                load_string_descriptor_view(b, result)
+                                            }
+                                            CharacterReturnAbi::BindCScalarByte => {
+                                                let slot = b.alloca(IrType::Int(IntWidth::I8));
+                                                b.store(result, slot);
+                                                (slot, b.const_i64(1))
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                        }
                         reject_unsupported_polymorphic_component_method_base(
                             callee.span,
                             base,
@@ -26678,7 +27085,7 @@ pub(super) fn lower_string_expr_full(
             let left_is_char = expr_is_character_expr(b, locals, left, st, type_layouts);
             let right_is_char = expr_is_character_expr(b, locals, right, st, type_layouts);
             if !(left_is_char && right_is_char) {
-                let lhs = super::expr::lower_expr_full(
+                let (lhs, lhs_char_len) = lower_operator_operand_once(
                     b,
                     locals,
                     left,
@@ -26688,7 +27095,7 @@ pub(super) fn lower_string_expr_full(
                     contained_host_refs,
                     descriptor_params,
                 );
-                let rhs = super::expr::lower_expr_full(
+                let (rhs, rhs_char_len) = lower_operator_operand_once(
                     b,
                     locals,
                     right,
@@ -26733,7 +27140,9 @@ pub(super) fn lower_string_expr_full(
                         left,
                         right,
                         lhs,
+                        lhs_char_len,
                         rhs,
+                        rhs_char_len,
                     );
                     return match char_abi {
                         Some(CharacterReturnAbi::HiddenDescriptor) => {
@@ -26784,6 +27193,7 @@ pub(super) fn lower_string_expr_full(
             );
             deallocate_owned_string_expr_temp(b, locals, left, st, type_layouts, a_ptr);
             deallocate_owned_string_expr_temp(b, locals, right, st, type_layouts, b_ptr);
+            b.mark_owned_string_temp(result_buf);
             (result_buf, total_len)
         }
         Expr::BinaryOp { .. } => {
@@ -29134,6 +29544,9 @@ pub(super) fn lower_select_case(
     let selector_is_char =
         expr_is_character_expr(b, &ctx.locals, selector, ctx.st, Some(ctx.type_layouts));
     let sel_char = selector_is_char.then(|| lower_string_expr_ctx(b, ctx, selector));
+    let selector_owned_bases = sel_char
+        .map(|(ptr, _)| b.take_owned_string_temp_bases(ptr))
+        .unwrap_or_default();
     let sel_val = (!selector_is_char).then(|| super::expr::lower_expr_ctx(b, ctx, selector));
     let bb_end = b.create_block("select_end");
 
@@ -29264,7 +29677,18 @@ pub(super) fn lower_select_case(
         }
 
         let cond = combined_cond.unwrap_or_else(|| b.const_bool(false));
-        b.cond_branch(cond, bb_body, vec![], bb_next, vec![]);
+        let bb_matched = if selector_owned_bases.is_empty() {
+            bb_body
+        } else {
+            b.create_block(&format!("case_{}_selector_cleanup", i))
+        };
+        b.cond_branch(cond, bb_matched, vec![], bb_next, vec![]);
+
+        if bb_matched != bb_body {
+            b.set_block(bb_matched);
+            deallocate_owned_string_bases(b, &selector_owned_bases);
+            b.branch(bb_body, vec![]);
+        }
 
         b.set_block(bb_body);
         super::stmt::lower_stmts(b, ctx, &case.body);
@@ -29278,27 +29702,33 @@ pub(super) fn lower_select_case(
     b.set_block(bb_current);
     if let Some(body) = default_body {
         let bb_body = b.create_block("case_default_body");
-        b.branch(bb_body, vec![]);
+        if selector_owned_bases.is_empty() {
+            b.branch(bb_body, vec![]);
+        } else {
+            let bb_cleanup = b.create_block("case_default_selector_cleanup");
+            b.branch(bb_cleanup, vec![]);
+            b.set_block(bb_cleanup);
+            deallocate_owned_string_bases(b, &selector_owned_bases);
+            b.branch(bb_body, vec![]);
+        }
         b.set_block(bb_body);
         super::stmt::lower_stmts(b, ctx, body);
         if b.func().block(b.current_block()).terminator.is_none() {
             b.branch(bb_end, vec![]);
         }
     } else {
-        b.branch(bb_end, vec![]);
+        if selector_owned_bases.is_empty() {
+            b.branch(bb_end, vec![]);
+        } else {
+            let bb_cleanup = b.create_block("case_no_match_selector_cleanup");
+            b.branch(bb_cleanup, vec![]);
+            b.set_block(bb_cleanup);
+            deallocate_owned_string_bases(b, &selector_owned_bases);
+            b.branch(bb_end, vec![]);
+        }
     }
 
     b.set_block(bb_end);
-    if let Some((sel_ptr, _)) = sel_char {
-        deallocate_owned_string_expr_temp(
-            b,
-            &ctx.locals,
-            selector,
-            ctx.st,
-            Some(ctx.type_layouts),
-            sel_ptr,
-        );
-    }
 }
 
 /// Lower an array element access: compute flat offset from subscripts, GEP, load.
@@ -31626,6 +32056,7 @@ fn store_char_ac_values_at_off(
                     vec![elem_ptr, dest_len, src_ptr, src_len],
                     IrType::Void,
                 );
+                deallocate_owned_string_expr_temp(b, locals, e, st, type_layouts, src_ptr);
                 let next_off = b.iadd(cur_off, step_bytes);
                 b.store(next_off, off_slot);
             }
@@ -32407,6 +32838,14 @@ pub(super) fn lower_write_items_adv(
                 vec![unit, ptr, len],
                 IrType::Void,
             );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
         } else {
             // Array-shaped expression items (e.g. `print *, A - B` with
             // rank-N operands) must be iterated element-wise. The scalar
@@ -32838,6 +33277,13 @@ pub(super) fn internal_io_alloc_target(
 /// Used by both the fixed-buffer and the deferred-alloc paths so the
 /// two render identically.
 fn internal_write_item_is_char(ctx: &LowerCtx, item: &crate::ast::expr::SpannedExpr) -> bool {
+    if matches!(
+        operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+        Some(crate::sema::symtab::TypeInfo::Character { .. })
+    ) {
+        return true;
+    }
+
     match &item.node {
         Expr::StringLiteral { .. } => true,
         Expr::ParenExpr { inner } => internal_write_item_is_char(ctx, inner),
@@ -32925,6 +33371,14 @@ pub(super) fn lower_internal_write_items(
                 vec![buf_ptr, buf_len, ptr, len, pos],
                 IrType::Void,
             );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
             continue;
         }
 
@@ -33010,6 +33464,14 @@ pub(super) fn lower_internal_write_items_alloc(
                 FuncRef::External("afs_lst_ia_string".into()),
                 vec![ptr, len],
                 IrType::Void,
+            );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
             );
             continue;
         }
@@ -34258,6 +34720,14 @@ pub(super) fn lower_list_char_read_item(
         vec![unit, dest_ptr, dest_len, iostat],
         IrType::Void,
     );
+    deallocate_owned_string_expr_temp(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        dest_ptr,
+    );
     true
 }
 
@@ -34286,6 +34756,14 @@ pub(super) fn lower_internal_char_read_item(
         FuncRef::External("afs_read_internal_string".into()),
         vec![buf_ptr, buf_len, pos, dest_ptr, dest_len, iostat],
         IrType::Void,
+    );
+    deallocate_owned_string_expr_temp(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        dest_ptr,
     );
     true
 }
@@ -34452,6 +34930,12 @@ pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
     }
+    if !matches!(
+        mode,
+        ReadMode::FormattedUnit { .. } | ReadMode::FormattedInternal { .. }
+    ) {
+        return false;
+    }
 
     let (dest_ptr, dest_len) = if let Some((ptr, len)) =
         char_addr_and_substring_bound_len(b, item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
@@ -34522,8 +35006,17 @@ pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
                 IrType::Void,
             );
         }
-        _ => return false,
+        _ => unreachable!("formatted character reads require a formatted mode"),
     }
+
+    deallocate_owned_string_expr_temp(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        dest_ptr,
+    );
 
     bump_formatted_read_index(b, item_idx);
     true
@@ -34551,6 +35044,14 @@ pub(super) fn lower_fmt_leading_zero_override(
             FuncRef::External("afs_fmt_set_leading_zero".into()),
             vec![ptr, len],
             IrType::Void,
+        );
+        deallocate_owned_string_expr_temp(
+            b,
+            &ctx.locals,
+            &c.value,
+            ctx.st,
+            Some(ctx.type_layouts),
+            ptr,
         );
     }
 }
@@ -34664,6 +35165,14 @@ pub(super) fn lower_fmt_push(
             FuncRef::External("afs_fmt_push_string".into()),
             vec![ptr, len],
             IrType::Void,
+        );
+        deallocate_owned_string_expr_temp(
+            b,
+            &ctx.locals,
+            item,
+            ctx.st,
+            Some(ctx.type_layouts),
+            ptr,
         );
     } else {
         let is_logical_item = matches!(
@@ -38629,7 +39138,11 @@ pub(super) fn lower_same_type_as_intrinsic_ast(
     );
     let left_tag = load_array_desc_type_tag(b, left_desc);
     let right_tag = load_array_desc_type_tag(b, right_desc);
-    Some(b.icmp(CmpOp::Eq, left_tag, right_tag))
+    let result = b.icmp(CmpOp::Eq, left_tag, right_tag);
+    let mut owned_bases = b.take_owned_string_temp_bases(left_desc);
+    owned_bases.extend(b.take_owned_string_temp_bases(right_desc));
+    deallocate_owned_string_bases(b, &owned_bases);
+    Some(result)
 }
 
 /// Build a minimal rank-0 CLASS(*) descriptor wrapping `expr` so it
@@ -38665,6 +39178,8 @@ pub(super) fn box_actual_into_class_star_descriptor(
             type_tag,
             vtable,
         );
+        let owned_bases = b.take_owned_string_temp_bases(base_ptr);
+        b.mark_owned_string_temp_bases(desc, owned_bases);
         return desc;
     }
 
@@ -43000,6 +43515,7 @@ pub(super) fn lower_rank1_shift_array_expr_descriptor(
     } else {
         None
     };
+    let mut boundary_character_temps = Vec::new();
     let boundary_char = if !circular && char_elements {
         if let Some(arg) = boundary_arg {
             let crate::ast::expr::SectionSubscript::Element(boundary_expr) = &arg.value else {
@@ -43015,6 +43531,7 @@ pub(super) fn lower_rank1_shift_array_expr_descriptor(
                 contained_host_refs,
                 descriptor_params,
             );
+            boundary_character_temps.extend(b.take_owned_string_temp_bases(ptr));
             Some((ptr, len))
         } else {
             let null = b.int_to_ptr(zero64, IrType::Int(IntWidth::I8));
@@ -43095,6 +43612,7 @@ pub(super) fn lower_rank1_shift_array_expr_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_owned_string_bases(b, &boundary_character_temps);
     deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, source_desc);
     Some((result_desc, elem_ty))
 }
@@ -55557,6 +56075,9 @@ pub(super) fn load_string_descriptor_view(
     desc: ValueId,
 ) -> (ValueId, ValueId) {
     let ptr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    if b.take_owned_string_descriptor(desc) {
+        b.mark_owned_string_temp(ptr);
+    }
     let eight = b.const_i64(8);
     let len_ptr = b.gep(desc, vec![eight], IrType::Int(IntWidth::I8));
     let len = b.load_typed(len_ptr, IrType::Int(IntWidth::I64));
@@ -56215,6 +56736,19 @@ pub(super) fn expr_is_character_expr(
                     ))
                 });
                 if let Some(true) = tbp_char {
+                    return true;
+                }
+                let component_procptr_char = type_layouts.and_then(|tl| {
+                    let (_, field) = resolve_component_field_access(b, locals, callee, st, tl)?;
+                    if !field.pointer || !field.procedure_pointer {
+                        return None;
+                    }
+                    let crate::sema::symtab::TypeInfo::Derived(signature) = &field.type_info else {
+                        return None;
+                    };
+                    Some(procedure_lookup_character_return_abi(st, signature).is_some())
+                });
+                if let Some(true) = component_procptr_char {
                     return true;
                 }
                 type_layouts
@@ -59079,6 +59613,55 @@ pub(super) fn reject_unsupported_polymorphic_component_method_base(
     }
 }
 
+pub(super) struct MaterializedCharacterActual {
+    pub(super) address: ValueId,
+    pub(super) len: ValueId,
+    pub(super) owned_bases: Vec<ValueId>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_materialized_character_actual(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<MaterializedCharacterActual> {
+    if matches!(
+        &expr.node,
+        Expr::Name { .. }
+            | Expr::StringLiteral { .. }
+            | Expr::ComponentAccess { .. }
+            | Expr::NilArgument
+    ) || actual_expr_rank(expr, locals, st, type_layouts).is_some_and(|rank| rank > 0)
+        || !expr_is_character_expr(b, locals, expr, st, type_layouts)
+    {
+        return None;
+    }
+
+    let (ptr, len) = lower_string_expr_full(
+        b,
+        locals,
+        expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let owned_bases = take_owned_string_expr_temp_bases(b, expr, locals, st, type_layouts, ptr);
+    let address = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(ptr, address);
+    Some(MaterializedCharacterActual {
+        address,
+        len,
+        owned_bases,
+    })
+}
+
 pub(super) fn lower_char_arg_by_ref(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -59910,7 +60493,8 @@ pub(super) fn lower_arg_by_ref_for_dummy_full(
     )
 }
 
-pub(super) fn lower_bind_c_char_arg_raw(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_bind_c_char_call_arg(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -59919,42 +60503,47 @@ pub(super) fn lower_bind_c_char_arg_raw(
     internal_funcs: Option<&HashMap<String, u32>>,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
-) -> ValueId {
+    is_value: bool,
+) -> super::stmt::MaterializedCallArg {
     use crate::ast::expr::Expr;
 
-    if let Expr::Name { name } = &expr.node {
-        if let Some(info) = locals.get(&name.to_lowercase()) {
+    let direct = match &expr.node {
+        Expr::Name { name } => locals.get(&name.to_lowercase()).and_then(|info| {
             if !info.dims.is_empty() || local_uses_array_descriptor(info) {
-                return array_data_ptr_for_call(b, info);
+                Some((
+                    array_data_ptr_for_call(b, info),
+                    local_char_runtime_len(b, info),
+                ))
+            } else if let Some((ptr, len)) = local_char_ptr_and_len(b, info) {
+                Some((ptr, Some(len)))
+            } else {
+                None
             }
-            if let Some((ptr, _len)) = local_char_ptr_and_len(b, info) {
-                return ptr;
-            }
-        }
-    }
-
-    if let Expr::ComponentAccess { .. } = &expr.node {
-        if let Some(tl) = type_layouts {
-            if let Some((field_ptr, field)) =
-                resolve_component_field_access(b, locals, expr, st, tl)
-            {
-                return match field_char_kind(&field) {
-                    CharKind::Fixed(_) => fixed_char_component_data_ptr(b, field_ptr, &field),
+        }),
+        Expr::ComponentAccess { .. } => type_layouts.and_then(|tl| {
+            resolve_component_field_access(b, locals, expr, st, tl).map(|(field_ptr, field)| {
+                match field_char_kind(&field) {
+                    CharKind::Fixed(len) => (
+                        fixed_char_component_data_ptr(b, field_ptr, &field),
+                        Some(b.const_i64(len)),
+                    ),
                     CharKind::Deferred if field.size == 32 => {
-                        load_string_descriptor_view(b, field_ptr).0
+                        let (ptr, len) = load_string_descriptor_view(b, field_ptr);
+                        (ptr, Some(len))
                     }
-                    _ => field_ptr,
-                };
-            }
-        }
-    }
+                    _ => (field_ptr, None),
+                }
+            })
+        }),
+        _ => None,
+    };
 
-    if let Some((ptr, _len)) = char_addr_and_runtime_len(b, expr, locals) {
-        return ptr;
-    }
-
-    if expr_is_character_expr(b, locals, expr, st, type_layouts) {
-        return lower_string_expr_full(
+    let (ptr, character_len) = if let Some(direct) = direct {
+        direct
+    } else if let Some((ptr, len)) = char_addr_and_runtime_len(b, expr, locals) {
+        (ptr, Some(len))
+    } else if expr_is_character_expr(b, locals, expr, st, type_layouts) {
+        let (ptr, len) = lower_string_expr_full(
             b,
             locals,
             expr,
@@ -59963,43 +60552,35 @@ pub(super) fn lower_bind_c_char_arg_raw(
             internal_funcs,
             contained_host_refs,
             descriptor_params,
+        );
+        (ptr, Some(len))
+    } else {
+        (
+            lower_arg_by_ref_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            ),
+            None,
         )
-        .0;
+    };
+
+    let owned_character_bases = b.take_owned_string_temp_bases(ptr);
+    let value = if is_value {
+        b.load_typed(ptr, IrType::Int(IntWidth::I8))
+    } else {
+        ptr
+    };
+    super::stmt::MaterializedCallArg {
+        value,
+        character_len,
+        owned_character_bases,
     }
-
-    lower_arg_by_ref_full(
-        b,
-        locals,
-        expr,
-        st,
-        type_layouts,
-        internal_funcs,
-        contained_host_refs,
-        descriptor_params,
-    )
-}
-
-pub(super) fn lower_bind_c_char_value_arg(
-    b: &mut FuncBuilder,
-    locals: &HashMap<String, LocalInfo>,
-    expr: &crate::ast::expr::SpannedExpr,
-    st: &SymbolTable,
-    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
-    internal_funcs: Option<&HashMap<String, u32>>,
-    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
-    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
-) -> ValueId {
-    let ptr = lower_bind_c_char_arg_raw(
-        b,
-        locals,
-        expr,
-        st,
-        type_layouts,
-        internal_funcs,
-        contained_host_refs,
-        descriptor_params,
-    );
-    b.load_typed(ptr, IrType::Int(IntWidth::I8))
 }
 
 pub(super) fn lower_arg_by_ref(
@@ -60646,6 +61227,8 @@ fn lower_transfer_to_character_expr(
         vec![buf, src_addr, result_len],
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
+    deallocate_owned_string_expr_temp(b, locals, source_expr, st, type_layouts, src_addr);
+    b.mark_owned_string_temp(buf);
     Some((buf, result_len))
 }
 
@@ -62050,6 +62633,1587 @@ end program
             ir
         );
         assert!(ir.contains("afs_write_string"));
+    }
+
+    #[test]
+    fn releases_owned_character_results_but_not_pointer_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module unrelated_intrinsic_name_m
+  implicit none
+contains
+  integer function trim(value)
+    integer, intent(in) :: value
+    trim = value
+  end function
+end module
+module result_temp_m
+  implicit none
+  interface make
+    module procedure make_generic
+  end interface
+  type :: factory_t
+  contains
+    procedure :: make_bound
+  end type
+contains
+  function make_direct() result(value)
+    character(:), allocatable :: value
+    value = 'direct'
+  end function
+  function make_generic(index) result(value)
+    integer, intent(in) :: index
+    character(:), allocatable :: value
+    value = 'generic'
+  end function
+  function make_bound(self) result(value)
+    class(factory_t), intent(in) :: self
+    character(:), allocatable :: value
+    value = 'bound'
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+end module
+program p
+  use result_temp_m
+  implicit none
+  type(factory_t) :: factory
+  character(16) :: sink
+  sink = make_direct()
+  sink = make(1)
+  sink = factory%make_bound()
+  sink = make_borrowed()
+  sink = trim(make_direct())
+end program
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing program function IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+        let borrowed_start = program_ir
+            .find("call @afs_modproc_result_temp_m_make_borrowed")
+            .expect("missing pointer-result call");
+        let borrowed_tail = &program_ir[borrowed_start..];
+        let next_owned = borrowed_tail
+            .find("call @afs_modproc_result_temp_m_make_direct")
+            .expect("missing owned call after pointer-result call");
+
+        assert_eq!(
+            program_ir.matches("rt_call @__afs_deallocate").count(),
+            4,
+            "allocatable character results must be released exactly once while pointer results remain borrowed:\n{}",
+            program_ir
+        );
+        assert!(
+            !borrowed_tail[..next_owned].contains("rt_call @__afs_deallocate"),
+            "pointer character result must remain borrowed:\n{}",
+            &borrowed_tail[..next_owned]
+        );
+    }
+
+    #[test]
+    fn releases_only_owned_selected_generic_character_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module generic_result_temp_m
+  implicit none
+  interface make
+    module procedure make_owned, make_borrowed
+  end interface
+contains
+  function make_owned(index) result(value)
+    integer, intent(in) :: index
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed(flag) result(value)
+    logical, intent(in) :: flag
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+end module
+program p
+  use generic_result_temp_m, only: make
+  implicit none
+  character(16) :: sink
+  sink = make(1)
+  sink = make(.true.)
+end program
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing program function IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+        let owned_start = program_ir
+            .find("call @afs_modproc_generic_result_temp_m_make_owned")
+            .expect("missing allocatable-result generic specific call");
+        let borrowed_start = program_ir
+            .find("call @afs_modproc_generic_result_temp_m_make_borrowed")
+            .expect("missing pointer-result generic specific call");
+
+        assert!(
+            program_ir[owned_start..borrowed_start].contains("rt_call @__afs_deallocate"),
+            "selected allocatable-result specific must be released:\n{}",
+            &program_ir[owned_start..borrowed_start]
+        );
+        assert!(
+            !program_ir[borrowed_start..].contains("rt_call @__afs_deallocate"),
+            "selected pointer-result specific must remain borrowed:\n{}",
+            &program_ir[borrowed_start..]
+        );
+        assert_eq!(program_ir.matches("rt_call @__afs_deallocate").count(), 1);
+    }
+
+    #[test]
+    fn preserves_module_owner_when_releasing_bound_character_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module owned_bound_result_m
+  implicit none
+  type :: owned_factory_t
+  contains
+    procedure :: make_bound
+  end type
+contains
+  function make_bound(self) result(value)
+    class(owned_factory_t), intent(in) :: self
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+end module
+module borrowed_bound_result_m
+  implicit none
+  type :: borrowed_factory_t
+  contains
+    procedure :: make_bound
+  end type
+contains
+  function make_bound(self) result(value)
+    class(borrowed_factory_t), intent(in) :: self
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+end module
+program p
+  use owned_bound_result_m, only: owned_factory_t
+  use borrowed_bound_result_m, only: borrowed_factory_t
+  implicit none
+  type(owned_factory_t) :: owned
+  type(borrowed_factory_t) :: borrowed
+  character(16) :: sink
+  sink = owned%make_bound()
+  sink = borrowed%make_bound()
+end program
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing program function IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+        let owned_start = program_ir
+            .find("call @afs_modproc_owned_bound_result_m_make_bound")
+            .expect("missing owned module binding call");
+        let borrowed_start = program_ir
+            .find("call @afs_modproc_borrowed_bound_result_m_make_bound")
+            .expect("missing borrowed module binding call");
+
+        assert!(
+            program_ir[owned_start..borrowed_start].contains("rt_call @__afs_deallocate"),
+            "allocatable result from the selected module binding must be released:\n{}",
+            &program_ir[owned_start..borrowed_start]
+        );
+        assert!(
+            !program_ir[borrowed_start..].contains("rt_call @__afs_deallocate"),
+            "pointer result from the same-named binding in another module must remain borrowed:\n{}",
+            &program_ir[borrowed_start..]
+        );
+        assert_eq!(program_ir.matches("rt_call @__afs_deallocate").count(), 1);
+    }
+
+    #[test]
+    fn releases_dynamic_conditional_character_result_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+module conditional_character_result_m
+  implicit none
+contains
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine choose(flag, sink)
+    logical, intent(in) :: flag
+    character(*), intent(out) :: sink
+    sink = (flag ? make_owned() : make_borrowed())
+  end subroutine
+end module
+",
+        );
+        let choose_start = ir
+            .find("func @afs_modproc_conditional_character_result_m_choose")
+            .expect("missing conditional-result caller IR");
+        let choose_tail = &ir[choose_start..];
+        let choose_end = choose_tail.find("\n  func @").unwrap_or(choose_tail.len());
+        let choose_ir = &choose_tail[..choose_end];
+
+        assert_eq!(
+            choose_ir
+                .matches("call @afs_modproc_conditional_character_result_m_make_owned")
+                .count(),
+            1
+        );
+        assert_eq!(
+            choose_ir
+                .matches("call @afs_modproc_conditional_character_result_m_make_borrowed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            choose_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the selected allocatable result must be released through the merge while the pointer result remains borrowed:\n{}",
+            choose_ir
+        );
+    }
+
+    #[test]
+    fn releases_plain_procedure_pointer_character_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module procedure_pointer_character_result_m
+  implicit none
+  abstract interface
+    function owned_interface() result(value)
+      character(:), allocatable :: value
+    end function
+    function borrowed_interface() result(value)
+      character(:), pointer :: value
+    end function
+  end interface
+contains
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine run()
+    procedure(owned_interface), pointer :: owned
+    procedure(borrowed_interface), pointer :: borrowed
+    character(16) :: sink
+    owned => make_owned
+    borrowed => make_borrowed
+    sink = owned()
+    sink = borrowed()
+  end subroutine
+end module
+",
+        );
+        let run_start = ir
+            .find("func @afs_modproc_procedure_pointer_character_result_m_run")
+            .expect("missing plain procedure-pointer result caller IR");
+        let run_tail = &ir[run_start..];
+        let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
+        let run_ir = &run_tail[..run_end];
+
+        assert_eq!(
+            run_ir.matches("call %").count(),
+            2,
+            "each procedure-pointer result must evaluate once:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "only the allocatable procedure-pointer result must be released:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir.matches("afs_assign_char_fixed").count(),
+            2,
+            "both procedure-pointer results must lower as character values:\n{}",
+            run_ir
+        );
+    }
+
+    #[test]
+    fn releases_procedure_pointer_component_character_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module procedure_pointer_component_result_m
+  implicit none
+  abstract interface
+    function owned_interface() result(value)
+      character(:), allocatable :: value
+    end function
+    function borrowed_interface() result(value)
+      character(:), pointer :: value
+    end function
+  end interface
+  type :: factory_t
+    procedure(owned_interface), pointer, nopass :: owned => null()
+    procedure(borrowed_interface), pointer, nopass :: borrowed => null()
+  end type
+contains
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine run()
+    type(factory_t) :: factory
+    character(16) :: sink
+    factory%owned => make_owned
+    factory%borrowed => make_borrowed
+    sink = factory%owned()
+    sink = factory%borrowed()
+  end subroutine
+end module
+",
+        );
+        let run_start = ir
+            .find("func @afs_modproc_procedure_pointer_component_result_m_run")
+            .expect("missing procedure-pointer-component result caller IR");
+        let run_tail = &ir[run_start..];
+        let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
+        let run_ir = &run_tail[..run_end];
+
+        assert_eq!(
+            run_ir.matches("call %").count(),
+            2,
+            "each component result must evaluate once:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "only the allocatable component result must be released:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir.matches("afs_assign_char_fixed").count(),
+            2,
+            "both component results must lower as character values:\n{}",
+            run_ir
+        );
+    }
+
+    #[test]
+    fn materializes_character_result_actuals_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_actual_m
+  implicit none
+  interface consume
+    module procedure consume_specific
+  end interface
+  abstract interface
+    integer function consume_interface(value) result(length)
+      character(*), intent(in) :: value
+    end function
+  end interface
+  type :: callback_t
+    procedure(consume_interface), pointer, nopass :: invoke => null()
+  end type
+  type :: consumer_t
+  contains
+    procedure :: accept
+    procedure :: measure
+  end type
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  subroutine consume_direct(value)
+    character(*), intent(in) :: value
+  end subroutine
+  subroutine consume_specific(value)
+    character(*), intent(in) :: value
+  end subroutine
+  subroutine accept(self, value)
+    class(consumer_t), intent(in) :: self
+    character(*), intent(in) :: value
+  end subroutine
+  integer function consume_function(value) result(length)
+    character(*), intent(in) :: value
+    length = len(value)
+  end function
+  integer function measure(self, value) result(length)
+    class(consumer_t), intent(in) :: self
+    character(*), intent(in) :: value
+    length = len(value)
+  end function
+end module
+program p
+  use character_actual_m
+  implicit none
+  procedure(consume_interface), pointer :: consume_ptr
+  type(callback_t) :: callback
+  type(consumer_t) :: consumer
+  integer :: length
+  consume_ptr => consume_function
+  callback%invoke => consume_function
+  call consume_direct(make_text())
+  call consume(make_text())
+  call consumer%accept(make_text())
+  length = consume_ptr(make_text())
+  length = callback%invoke(make_text())
+  length = consumer%measure(make_text())
+end program
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing character-actual caller IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+
+        assert_eq!(
+            program_ir
+                .matches("call @afs_modproc_character_actual_m_make_text")
+                .count(),
+            6,
+            "each source actual must evaluate its function exactly once:\n{}",
+            program_ir
+        );
+        assert_eq!(
+            program_ir.matches("rt_call @__afs_deallocate").count(),
+            6,
+            "each owned character actual must be released after its consumer returns:\n{}",
+            program_ir
+        );
+    }
+
+    #[test]
+    fn materializes_bind_c_character_result_actuals_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+module bind_c_character_actual_m
+  use iso_c_binding, only: c_char, c_int
+  implicit none
+contains
+  function make_owned() result(value)
+    character(kind=c_char, len=:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed() result(value)
+    character(kind=c_char, len=:), pointer :: value
+    character(kind=c_char, len=8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine consume_reference(value) bind(C)
+    character(kind=c_char), intent(in) :: value
+  end subroutine
+  subroutine consume_value(value) bind(C)
+    character(kind=c_char), value :: value
+  end subroutine
+  integer(c_int) function consume_function(value) result(answer) bind(C)
+    character(kind=c_char), value :: value
+    answer = iachar(value)
+  end function
+end module
+program p
+  use bind_c_character_actual_m
+  use iso_c_binding, only: c_int
+  implicit none
+  integer(c_int) :: answer
+  call consume_reference(make_owned())
+  call consume_value(make_owned())
+  answer = consume_function(make_owned())
+  call consume_value(make_borrowed())
+end program
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing BIND(C) character-actual caller IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+
+        assert_eq!(
+            program_ir
+                .matches("call @afs_modproc_bind_c_character_actual_m_make_owned")
+                .count(),
+            3,
+            "each owned BIND(C) actual must evaluate exactly once:\n{}",
+            program_ir
+        );
+        assert_eq!(
+            program_ir
+                .matches("call @afs_modproc_bind_c_character_actual_m_make_borrowed")
+                .count(),
+            1,
+            "the borrowed BIND(C) actual must evaluate exactly once:\n{}",
+            program_ir
+        );
+        assert_eq!(
+            program_ir.matches("rt_call @__afs_deallocate").count(),
+            3,
+            "only owned BIND(C) character actuals must be released:\n{}",
+            program_ir
+        );
+        let borrowed_start = program_ir
+            .find("call @afs_modproc_bind_c_character_actual_m_make_borrowed")
+            .expect("missing borrowed BIND(C) character-result call");
+        assert!(
+            !program_ir[borrowed_start..].contains("rt_call @__afs_deallocate"),
+            "the pointer result passed to BIND(C) must remain borrowed:\n{}",
+            &program_ir[borrowed_start..]
+        );
+    }
+
+    #[test]
+    fn materializes_bind_c_procptr_component_character_actuals_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+module bind_c_procptr_component_m
+  use iso_c_binding, only: c_char, c_int
+  implicit none
+  abstract interface
+    integer(c_int) function reference_interface(value) result(answer) bind(C)
+      import c_char, c_int
+      character(kind=c_char), intent(in) :: value
+    end function
+    integer(c_int) function value_interface(value) result(answer) bind(C)
+      import c_char, c_int
+      character(kind=c_char), value :: value
+    end function
+  end interface
+  type :: callback_t
+    procedure(reference_interface), pointer, nopass :: reference => null()
+    procedure(value_interface), pointer, nopass :: by_value => null()
+  end type
+contains
+  function make_owned() result(value)
+    character(kind=c_char, len=:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed() result(value)
+    character(kind=c_char, len=:), pointer :: value
+    character(kind=c_char, len=8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  integer(c_int) function consume_reference(value) result(answer) bind(C)
+    character(kind=c_char), intent(in) :: value
+    answer = iachar(value)
+  end function
+  integer(c_int) function consume_value(value) result(answer) bind(C)
+    character(kind=c_char), value :: value
+    answer = iachar(value)
+  end function
+  subroutine run(flag)
+    logical, intent(in) :: flag
+    type(callback_t) :: callback
+    integer(c_int) :: answer
+    callback%reference => consume_reference
+    callback%by_value => consume_value
+    answer = callback%reference(make_owned())
+    answer = callback%by_value(make_owned())
+    answer = callback%reference((flag ? make_owned() : make_borrowed()))
+    answer = callback%by_value((flag ? make_owned() : make_borrowed()))
+  end subroutine
+end module
+",
+        );
+        let run_start = ir
+            .find("func @afs_modproc_bind_c_procptr_component_m_run")
+            .expect("missing BIND(C) procedure-pointer-component caller IR");
+        let run_tail = &ir[run_start..];
+        let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
+        let run_ir = &run_tail[..run_end];
+
+        assert_eq!(
+            run_ir
+                .matches("call @afs_modproc_bind_c_procptr_component_m_make_owned")
+                .count(),
+            4,
+            "each owned BIND(C) component actual must evaluate once:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir
+                .matches("call @afs_modproc_bind_c_procptr_component_m_make_borrowed")
+                .count(),
+            2,
+            "each borrowed BIND(C) component actual must evaluate once:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir.matches("rt_call @__afs_deallocate").count(),
+            4,
+            "only owned BIND(C) component actuals must be released:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir
+                .matches("alloca ptr<i8> : ptr<ptr<i8>>")
+                .count(),
+            0,
+            "BIND(C) by-reference character actuals must pass raw data pointers, not Fortran pointer slots:\n{}",
+            run_ir
+        );
+    }
+
+    #[test]
+    fn materializes_contained_bind_c_procptr_component_actual_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+program p
+  use iso_c_binding, only: c_char
+  implicit none
+  abstract interface
+    subroutine consume_i(value) bind(C)
+      import c_char
+      character(kind=c_char), intent(in) :: value
+    end subroutine
+  end interface
+  type :: callback_t
+    procedure(consume_i), pointer, nopass :: invoke => null()
+  end type
+  procedure(consume_i) :: consume_reference
+  type(callback_t) :: callback
+  callback%invoke => consume_reference
+  call callback%invoke(make_owned())
+contains
+  function make_owned() result(value)
+    character(kind=c_char, len=:), allocatable :: value
+    value = 'owned'
+  end function
+end program
+subroutine consume_reference(value) bind(C)
+  use iso_c_binding, only: c_char
+  character(kind=c_char), intent(in) :: value
+end subroutine
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing contained BIND(C) component caller IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+
+        assert_eq!(
+            program_ir.matches("call @afs_internal___prog_p_1").count(),
+            1,
+            "the contained character result must evaluate once:\n{}",
+            program_ir
+        );
+        assert_eq!(
+            program_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the contained allocatable character result must be released:\n{}",
+            program_ir
+        );
+        assert_eq!(
+            program_ir.matches("alloca ptr<i8> : ptr<ptr<i8>>").count(),
+            0,
+            "the BIND(C) component call must receive the raw character address:\n{}",
+            program_ir
+        );
+    }
+
+    #[test]
+    fn materializes_conditional_character_actuals_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+module conditional_character_actual_m
+  implicit none
+contains
+  function make_left() result(value)
+    character(:), allocatable :: value
+    value = 'left'
+  end function
+  function make_right() result(value)
+    character(:), pointer :: value
+    character(5), target, save :: storage = 'right'
+    value => storage
+  end function
+  subroutine consume_subroutine(value)
+    character(*), intent(in) :: value
+  end subroutine
+  integer function consume_function(value) result(length)
+    character(*), intent(in) :: value
+    length = len(value)
+  end function
+  subroutine run(flag)
+    logical, intent(in) :: flag
+    character(9) :: existing = 'existing'
+    integer :: length
+    call consume_subroutine((flag ? make_left() : make_right()))
+    length = consume_function((flag ? make_left() : make_right()))
+    length = consume_function((flag ? make_left() : existing))
+  end subroutine
+end module
+",
+        );
+        let run_start = ir
+            .find("func @afs_modproc_conditional_character_actual_m_run")
+            .expect("missing conditional-actual caller IR");
+        let run_tail = &ir[run_start..];
+        let run_end = run_tail.find("\n  func @").unwrap_or(run_tail.len());
+        let run_ir = &run_tail[..run_end];
+
+        assert_eq!(
+            run_ir
+                .matches("call @afs_modproc_conditional_character_actual_m_make_left")
+                .count(),
+            3,
+            "each left arm must be emitted once per conditional actual:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir
+                .matches("call @afs_modproc_conditional_character_actual_m_make_right")
+                .count(),
+            2,
+            "each right arm must be emitted once per conditional actual:\n{}",
+            run_ir
+        );
+        assert_eq!(
+            run_ir.matches("rt_call @__afs_deallocate").count(),
+            3,
+            "each owned arm must be released while borrowed arms remain valid:\n{}",
+            run_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_results_consumed_by_scalar_intrinsics() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_intrinsic_result_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  subroutine consume()
+    integer :: value
+    logical :: ordered
+    value = len(make_text())
+    value = len_trim(make_text())
+    value = ichar(make_text())
+    value = index(make_text(), 'a')
+    value = scan(make_text(), 'a')
+    value = verify(make_text(), 'a')
+    value = selected_char_kind(make_text())
+    ordered = same_type_as(make_text(), 'payload')
+    ordered = lge(make_text(), 'a')
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_intrinsic_result_m_consume")
+            .expect("missing intrinsic consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_intrinsic_result_m_make_text")
+                .count(),
+            9,
+            "each scalar intrinsic argument must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            9,
+            "each scalar intrinsic must release its owned character argument:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_transfer_results_and_owned_sources() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_transfer_result_m
+  implicit none
+contains
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine consume()
+    character(8) :: sink
+    sink = transfer(make_owned(), '1234567')
+    sink = transfer(make_borrowed(), '12345678')
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_transfer_result_m_consume")
+            .expect("missing TRANSFER consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_transfer_result_m_make_owned")
+                .count(),
+            1,
+            "the owned TRANSFER source must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_transfer_result_m_make_borrowed")
+                .count(),
+            1,
+            "the borrowed TRANSFER source must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            3,
+            "both TRANSFER results and only the owned source must be released:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_array_constructor_elements() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_array_constructor_result_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  subroutine consume()
+    character(8) :: values(1)
+    values = [character(8) :: make_text()]
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_array_constructor_result_m_consume")
+            .expect("missing character array-constructor consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_array_constructor_result_m_make_text")
+                .count(),
+            1,
+            "the character array-constructor element must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the copied character array-constructor element must be released:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_eoshift_boundaries() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_eoshift_boundary_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'boundary'
+  end function
+  subroutine consume()
+    character(8) :: source(2) = ['left    ', 'right   ']
+    character(8) :: sink(2)
+    sink = eoshift(source, 1, boundary=make_text())
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_eoshift_boundary_m_consume")
+            .expect("missing EOSHIFT consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_eoshift_boundary_m_make_text")
+                .count(),
+            1,
+            "the EOSHIFT boundary must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the EOSHIFT boundary must be released after the shift loop:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_results_boxed_for_class_star_calls() {
+        let (_, ir) = lower_and_verify(
+            "\
+module class_star_character_actual_m
+  implicit none
+  type :: consumer_t
+  contains
+    procedure :: accept => accept_bound
+  end type
+  abstract interface
+    subroutine accept_interface(value)
+      class(*), intent(in) :: value
+    end subroutine
+  end interface
+  interface accept_generic
+    module procedure accept_direct
+  end interface
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  subroutine accept_direct(value)
+    class(*), intent(in) :: value
+  end subroutine
+  subroutine accept_bound(self, value)
+    class(consumer_t), intent(in) :: self
+    class(*), intent(in) :: value
+  end subroutine
+  subroutine consume()
+    type(consumer_t) :: consumer
+    procedure(accept_interface), pointer :: callback
+    callback => accept_direct
+    call accept_direct(make_text())
+    call accept_generic(make_text())
+    call callback(make_text())
+    call consumer%accept(make_text())
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_class_star_character_actual_m_consume")
+            .expect("missing CLASS(*) character-actual consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_class_star_character_actual_m_make_text")
+                .count(),
+            4,
+            "each CLASS(*) character actual must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            4,
+            "every synchronous CLASS(*) call route must release its boxed character actual:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_results_after_class_star_assignment() {
+        let (_, ir) = lower_and_verify(
+            "\
+module class_star_character_assignment_m
+  implicit none
+  type :: holder_t
+    class(*), allocatable :: value
+  end type
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  subroutine assign_local()
+    class(*), allocatable :: sink
+    sink = make_text()
+  end subroutine
+  subroutine assign_component()
+    type(holder_t) :: holder
+    holder%value = make_text()
+  end subroutine
+  subroutine assign_host()
+    class(*), allocatable :: sink
+    call assign_nested()
+  contains
+    subroutine assign_nested()
+      sink = make_text()
+    end subroutine
+  end subroutine
+end module
+",
+        );
+        for (procedure, marker) in [
+            (
+                "assign_local",
+                "func @afs_modproc_class_star_character_assignment_m_assign_local",
+            ),
+            (
+                "assign_component",
+                "func @afs_modproc_class_star_character_assignment_m_assign_component",
+            ),
+            ("assign_host", "func @afs_internal_"),
+        ] {
+            let start = ir.find(marker).unwrap_or_else(|| {
+                panic!("missing CLASS(*) assignment consumer IR for {procedure}")
+            });
+            let tail = &ir[start..];
+            let end = tail.find("\n  func @").unwrap_or(tail.len());
+            let procedure_ir = &tail[..end];
+
+            assert_eq!(
+                procedure_ir
+                    .matches("call @afs_modproc_class_star_character_assignment_m_make_text")
+                    .count(),
+                1,
+                "the {procedure} source must be evaluated once:\n{procedure_ir}"
+            );
+            assert_eq!(
+                procedure_ir.matches("rt_call @__afs_deallocate").count(),
+                1,
+                "the deep-copied {procedure} source must be released:\n{procedure_ir}"
+            );
+            let allocate = procedure_ir
+                .find("call @afs_allocate_like")
+                .expect("missing CLASS(*) destination allocation");
+            let copy = procedure_ir
+                .find("call @afs_assign_allocatable")
+                .expect("missing CLASS(*) value copy");
+            let release = procedure_ir
+                .find("rt_call @__afs_deallocate")
+                .expect("missing CHARACTER result release");
+            assert!(
+                allocate < release && copy < release,
+                "{procedure} must finish the deep copy before releasing its source:\n{procedure_ir}"
+            );
+        }
+    }
+
+    #[test]
+    fn releases_dynamic_bound_operator_character_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module dynamic_character_result_m
+  implicit none
+  type, abstract :: base_t
+  contains
+    procedure(join_i), deferred :: join
+    generic :: operator(.join.) => join
+  end type
+  type, extends(base_t) :: child_t
+  contains
+    procedure :: join => child_join
+  end type
+  abstract interface
+    function join_i(lhs, rhs) result(value)
+      import :: base_t
+      class(base_t), intent(in) :: lhs, rhs
+      character(:), allocatable :: value
+    end function
+  end interface
+contains
+  function child_join(lhs, rhs) result(value)
+    class(child_t), intent(in) :: lhs
+    class(base_t), intent(in) :: rhs
+    character(:), allocatable :: value
+    value = 'child'
+  end function
+  subroutine consume(lhs, rhs)
+    class(base_t), intent(in) :: lhs, rhs
+    character(16) :: sink
+    sink = lhs .join. rhs
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_dynamic_character_result_m_consume")
+            .expect("missing dynamic character-result caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert!(
+            consume_ir.contains("vtable_dispatch_call"),
+            "expected dynamic vtable dispatch:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the allocatable result returned through dynamic dispatch must be released:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_defined_operator_character_results() {
+        let (_, ir) = lower_and_verify(
+            "\
+module operator_character_result_m
+  implicit none
+  type :: token_t
+    integer :: value
+  end type
+  interface operator(.join.)
+    module procedure join_tokens
+  end interface
+contains
+  function join_tokens(lhs, rhs) result(value)
+    type(token_t), intent(in) :: lhs, rhs
+    character(:), allocatable :: value
+    value = 'joined'
+  end function
+  subroutine consume()
+    type(token_t) :: lhs, rhs
+    character(16) :: sink
+    sink = lhs .join. rhs
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_operator_character_result_m_consume")
+            .expect("missing defined-operator caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert!(
+            consume_ir.contains("call @afs_modproc_operator_character_result_m_join_tokens"),
+            "expected resolved defined-operator call:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the allocatable character result from a defined operator must be released:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_defined_operator_character_operands() {
+        let (_, ir) = lower_and_verify(
+            "\
+module operator_character_operand_m
+  implicit none
+  interface operator(.same.)
+    module procedure same_text
+  end interface
+contains
+  logical function same_text(lhs, rhs) result(value)
+    character(*), intent(in) :: lhs, rhs
+    value = lhs == rhs
+  end function
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine consume()
+    logical :: equal
+    equal = make_owned() .same. make_borrowed()
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_operator_character_operand_m_consume")
+            .expect("missing defined-operator operand caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_operator_character_operand_m_make_owned")
+                .count(),
+            1,
+            "the allocatable operand must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_operator_character_operand_m_make_borrowed")
+                .count(),
+            1,
+            "the pointer operand must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the allocatable operand must be released while the pointer operand remains borrowed:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn materializes_defined_operator_character_operands_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+module operator_character_materialized_operand_m
+  implicit none
+  interface operator(.same.)
+    module procedure same_text
+  end interface
+contains
+  logical function same_text(lhs, rhs) result(value)
+    character(*), intent(in) :: lhs, rhs
+    value = lhs == rhs
+  end function
+  function make_owned() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  subroutine consume()
+    logical :: equal
+    equal = (make_owned() // 'x') .same. 'ownedx'
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_operator_character_materialized_operand_m_consume")
+            .expect("missing materialized defined-operator caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_operator_character_materialized_operand_m_make_owned",)
+                .count(),
+            1,
+            "the materialized operand must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            2,
+            "the function result and concatenation buffer must both be released:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_selectors_before_case_bodies() {
+        let (_, ir) = lower_and_verify(
+            "\
+module select_character_temp_m
+  implicit none
+contains
+  function make_selector() result(value)
+    character(:), allocatable :: value
+    value = 'owned'
+  end function
+  integer function choose() result(value)
+    value = 0
+    select case (make_selector())
+    case ('owned')
+      value = 1
+      return
+    case default
+      value = 2
+    end select
+  end function
+end module
+",
+        );
+        let choose_start = ir
+            .find("func @afs_modproc_select_character_temp_m_choose")
+            .expect("missing character selector caller IR");
+        let choose_tail = &ir[choose_start..];
+        let choose_end = choose_tail.find("\n  func @").unwrap_or(choose_tail.len());
+        let choose_ir = &choose_tail[..choose_end];
+
+        assert_eq!(
+            choose_ir
+                .matches("call @afs_modproc_select_character_temp_m_make_selector")
+                .count(),
+            1,
+            "the selector must be evaluated once:\n{}",
+            choose_ir
+        );
+        assert!(
+            choose_ir.contains("case_0_selector_cleanup")
+                && choose_ir.contains("case_default_selector_cleanup"),
+            "each selector dispatch edge must clean up before entering a body:\n{}",
+            choose_ir
+        );
+        assert_eq!(
+            choose_ir.matches("rt_call @__afs_deallocate").count(),
+            2,
+            "each mutually exclusive selector path needs one cleanup site:\n{}",
+            choose_ir
+        );
+    }
+
+    #[test]
+    fn releases_character_temporaries_consumed_by_io() {
+        let (_, ir) = lower_and_verify(
+            "\
+module io_character_temp_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  function make_format() result(value)
+    character(:), allocatable :: value
+    value = '(a)'
+  end function
+  function make_advance() result(value)
+    character(:), allocatable :: value
+    value = 'yes'
+  end function
+  function make_yes() result(value)
+    character(:), allocatable :: value
+    value = 'yes'
+  end function
+  function make_status() result(value)
+    character(:), allocatable :: value
+    value = 'keep'
+  end function
+  subroutine consume()
+    character(32) :: fixed
+    character(:), allocatable :: dynamic
+    logical :: exists
+    print *, make_text()
+    write(fixed, *) make_text()
+    write(dynamic, *) make_text()
+    write(6, make_format()) make_text()
+    write(6, *, advance=make_advance()) make_text()
+    write(6, '(a)', leading_zero=make_yes()) make_text()
+    read(5, '(a)', advance=make_advance()) fixed
+    read(fixed, make_format()) fixed
+    open(unit=31, file=make_text(), status='unknown', action='readwrite')
+    close(31, status=make_status())
+    inquire(file=make_text(), exist=exists)
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_io_character_temp_m_consume")
+            .expect("missing I/O temporary caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_io_character_temp_m_make_")
+                .count(),
+            14,
+            "each I/O control and item expression must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            14,
+            "each owned I/O string must be released after its synchronous consumer:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn releases_substring_character_expression_temporaries() {
+        let (_, ir) = lower_and_verify(
+            "\
+module substring_character_temp_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(:), allocatable :: value
+    value = 'payload'
+  end function
+  subroutine consume()
+    character(3) :: sink
+    sink = (make_text() // 'x')(2:4)
+    sink = repeat(make_text(), 2)(2:4)
+    sink = adjustl(make_text())(2:4)
+    sink = adjustr(make_text())(2:4)
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_substring_character_temp_m_consume")
+            .expect("missing substring temporary caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_substring_character_temp_m_make_text")
+                .count(),
+            4,
+            "each substring source must be evaluated once:\n{}",
+            consume_ir
+        );
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            8,
+            "each intrinsic source and each substring base must be released:\n{}",
+            consume_ir
+        );
+    }
+
+    #[test]
+    fn resolves_inherited_bound_character_ownership_from_concrete_target() {
+        let (_, ir) = lower_and_verify(
+            "\
+module parent_owner_m
+  implicit none
+  type, abstract :: base_t
+  contains
+    procedure(value_i), deferred :: value
+  end type
+  abstract interface
+    function value_i(self) result(text)
+      import :: base_t
+      class(base_t), intent(in) :: self
+      character(:), allocatable :: text
+    end function
+  end interface
+end module
+module child_owner_m
+  use parent_owner_m, only: base_t
+  implicit none
+  type, extends(base_t) :: child_t
+  contains
+    procedure :: value => child_value
+  end type
+contains
+  integer function value_i()
+    value_i = 99
+  end function
+  function child_value(self) result(text)
+    class(child_t), intent(in) :: self
+    character(:), allocatable :: text
+    text = 'child'
+  end function
+end module
+program p
+  use child_owner_m, only: child_t
+  implicit none
+  type(child_t) :: child
+  character(8) :: sink
+  sink = child%value()
+end program
+",
+        );
+        let program_start = ir
+            .find("func @__prog_p")
+            .expect("missing inherited-binding caller IR");
+        let program_tail = &ir[program_start..];
+        let program_end = program_tail
+            .find("\n  func @")
+            .unwrap_or(program_tail.len());
+        let program_ir = &program_tail[..program_end];
+
+        assert!(
+            program_ir.contains("call @afs_modproc_child_owner_m_child_value"),
+            "the inherited binding must dispatch to its concrete target:\n{}",
+            program_ir
+        );
+        assert_eq!(
+            program_ir.matches("rt_call @__afs_deallocate").count(),
+            1,
+            "the concrete allocatable character result must be released despite the unrelated interface-name collision:\n{}",
+            program_ir
+        );
     }
 
     // ---- Calls ----

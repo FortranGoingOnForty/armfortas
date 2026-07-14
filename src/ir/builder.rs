@@ -21,6 +21,8 @@ pub struct FuncBuilder<'a> {
     /// helper instead of inlining the walk. See
     /// `derived_memory_helper_available_from_current_func`.
     local_modules: std::rc::Rc<std::collections::HashSet<String>>,
+    owned_string_descriptors: std::collections::HashSet<ValueId>,
+    owned_string_temps: std::collections::HashMap<ValueId, Vec<ValueId>>,
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -31,6 +33,8 @@ impl<'a> FuncBuilder<'a> {
             current_block: entry,
             layout,
             local_modules: std::rc::Rc::new(std::collections::HashSet::new()),
+            owned_string_descriptors: std::collections::HashSet::new(),
+            owned_string_temps: std::collections::HashMap::new(),
         }
     }
 
@@ -45,6 +49,28 @@ impl<'a> FuncBuilder<'a> {
     /// compilation unit and therefore has its memory helpers emitted here.
     pub fn owner_module_is_local(&self, module_lc: &str) -> bool {
         self.local_modules.contains(module_lc)
+    }
+
+    pub fn mark_owned_string_descriptor(&mut self, value: ValueId) {
+        self.owned_string_descriptors.insert(value);
+    }
+
+    pub fn take_owned_string_descriptor(&mut self, value: ValueId) -> bool {
+        self.owned_string_descriptors.remove(&value)
+    }
+
+    pub fn mark_owned_string_temp(&mut self, value: ValueId) {
+        self.owned_string_temps.insert(value, vec![value]);
+    }
+
+    pub fn mark_owned_string_temp_bases(&mut self, value: ValueId, bases: Vec<ValueId>) {
+        if !bases.is_empty() {
+            self.owned_string_temps.insert(value, bases);
+        }
+    }
+
+    pub fn take_owned_string_temp_bases(&mut self, value: ValueId) -> Vec<ValueId> {
+        self.owned_string_temps.remove(&value).unwrap_or_default()
     }
 
     /// Switch to emitting into a different block.

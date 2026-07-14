@@ -864,7 +864,7 @@ pub(crate) fn lower_expr_full(
                 ) {
                     return result;
                 }
-                let lhs = lower_expr_full(
+                let (lhs, lhs_char_len) = lower_operator_operand_once(
                     b,
                     locals,
                     left,
@@ -874,7 +874,7 @@ pub(crate) fn lower_expr_full(
                     contained_host_refs,
                     descriptor_params,
                 );
-                let rhs = lower_expr_full(
+                let (rhs, rhs_char_len) = lower_operator_operand_once(
                     b,
                     locals,
                     right,
@@ -896,7 +896,9 @@ pub(crate) fn lower_expr_full(
                     left,
                     right,
                     lhs,
+                    lhs_char_len,
                     rhs,
+                    rhs_char_len,
                 );
             }
             if matches!(
@@ -965,7 +967,7 @@ pub(crate) fn lower_expr_full(
                     descriptor_params,
                 );
             }
-            let mut lhs = lower_expr_full(
+            let (mut lhs, lhs_char_len) = lower_operator_operand_once(
                 b,
                 locals,
                 left,
@@ -975,7 +977,7 @@ pub(crate) fn lower_expr_full(
                 contained_host_refs,
                 descriptor_params,
             );
-            let mut rhs = lower_expr_full(
+            let (mut rhs, rhs_char_len) = lower_operator_operand_once(
                 b,
                 locals,
                 right,
@@ -1024,7 +1026,9 @@ pub(crate) fn lower_expr_full(
                     left,
                     right,
                     lhs,
+                    lhs_char_len,
                     rhs,
+                    rhs_char_len,
                 );
             }
 
@@ -2300,11 +2304,20 @@ pub(crate) fn lower_expr_full(
                             contained_host_refs,
                             descriptor_params,
                         );
-                        return b.call(
+                        let result = b.call(
                             FuncRef::External("afs_selected_char_kind".into()),
                             vec![ptr, len],
                             IrType::Int(IntWidth::I32),
                         );
+                        deallocate_owned_string_expr_temp(
+                            b,
+                            locals,
+                            arg_expr,
+                            st,
+                            type_layouts,
+                            ptr,
+                        );
+                        return result;
                     }
                 }
                 if !has_named_interface && key == "same_type_as" {
@@ -2599,40 +2612,47 @@ pub(crate) fn lower_expr_full(
                         }
                     }
                 }
-                let indirect_hidden_result = if procptr_target.is_some() {
+                let indirect_hidden_abi = if procptr_target.is_some() {
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_hidden_result_abi(st, k)
-                    })
-                    .and_then(|hidden_abi| {
-                        let bytes = hidden_result_temp_bytes_for_callee(
-                            st,
-                            type_layouts,
-                            &abi_lookup_keys,
-                            hidden_abi,
-                        )?;
-                        let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
-                            let fw = if bytes == 16 {
-                                FloatWidth::F64
-                            } else {
-                                FloatWidth::F32
-                            };
-                            IrType::Array(Box::new(IrType::Float(fw)), 2)
-                        } else {
-                            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
-                        };
-                        let desc = b.alloca(alloca_ty);
-                        let zero_i32 = b.const_i32(0);
-                        let size = b.const_i64(bytes as i64);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![desc, zero_i32, size],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
-                        Some(desc)
                     })
                 } else {
                     None
                 };
+                let indirect_hidden_result = indirect_hidden_abi.and_then(|hidden_abi| {
+                    let bytes = hidden_result_temp_bytes_for_callee(
+                        st,
+                        type_layouts,
+                        &abi_lookup_keys,
+                        hidden_abi,
+                    )?;
+                    let alloca_ty = if hidden_abi == HiddenResultAbi::ComplexBuffer {
+                        let fw = if bytes == 16 {
+                            FloatWidth::F64
+                        } else {
+                            FloatWidth::F32
+                        };
+                        IrType::Array(Box::new(IrType::Float(fw)), 2)
+                    } else {
+                        IrType::Array(Box::new(IrType::Int(IntWidth::I8)), bytes)
+                    };
+                    let desc = b.alloca(alloca_ty);
+                    let zero_i32 = b.const_i32(0);
+                    let size = b.const_i64(bytes as i64);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![desc, zero_i32, size],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    Some(desc)
+                });
+                if indirect_hidden_abi == Some(HiddenResultAbi::StringDescriptor)
+                    && procedure_lookup_returns_owned_character_temp(st, &abi_lookup_keys)
+                {
+                    if let Some(desc) = indirect_hidden_result {
+                        b.mark_owned_string_descriptor(desc);
+                    }
+                }
                 let callee_value_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_value_arg_mask(st, k)
@@ -2648,6 +2668,10 @@ pub(crate) fn lower_expr_full(
                 let callee_bind_c_char_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_bind_c_char_arg_mask(st, k)
+                    });
+                let callee_char_len_star_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_char_len_star_mask(st, k)
                     });
                 let callee_pointer_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
@@ -2668,6 +2692,8 @@ pub(crate) fn lower_expr_full(
                     Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
                 let mut arg_presence: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                 let mut call_arg_array_temps = Vec::new();
+                let mut call_arg_character_lens = vec![None; arg_slots.len()];
+                let mut call_arg_character_temps = Vec::new();
                 if let Some(desc) = indirect_hidden_result {
                     ref_arg_vals.push(desc);
                 }
@@ -2685,6 +2711,10 @@ pub(crate) fn lower_expr_full(
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
                     let wants_bind_c_char = callee_bind_c_char_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
+                    let expects_char_len_star = callee_char_len_star_args
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
@@ -2721,9 +2751,11 @@ pub(crate) fn lower_expr_full(
                                 // decision tree for one arm/non-conditional arg.
                                 let mut materialize = |b: &mut FuncBuilder,
                                                        e: &crate::ast::expr::SpannedExpr|
-                                 -> ValueId {
-                                    let value = if is_value && wants_bind_c_char {
-                                        lower_bind_c_char_value_arg(
+                                 -> super::stmt::MaterializedCallArg {
+                                    let mut character_len = None;
+                                    let mut owned_character_bases = Vec::new();
+                                    let value = if wants_bind_c_char {
+                                        let actual = lower_bind_c_char_call_arg(
                                             b,
                                             locals,
                                             e,
@@ -2732,7 +2764,11 @@ pub(crate) fn lower_expr_full(
                                             internal_funcs,
                                             contained_host_refs,
                                             descriptor_params,
-                                        )
+                                            is_value,
+                                        );
+                                        character_len = actual.character_len;
+                                        owned_character_bases = actual.owned_character_bases;
+                                        actual.value
                                     } else if is_value {
                                         let raw = lower_expr_full(
                                             b,
@@ -2746,7 +2782,7 @@ pub(crate) fn lower_expr_full(
                                         );
                                         coerce_value_call_arg(b, st, abi_primary_key, i, raw)
                                     } else if wants_descriptor {
-                                        lower_arg_descriptor_full(
+                                        let desc = lower_arg_descriptor_full(
                                             b,
                                             locals,
                                             e,
@@ -2756,20 +2792,12 @@ pub(crate) fn lower_expr_full(
                                             contained_host_refs,
                                             descriptor_params,
                                             wants_polymorphic_descriptor,
-                                        )
+                                        );
+                                        owned_character_bases
+                                            .extend(b.take_owned_string_temp_bases(desc));
+                                        desc
                                     } else if wants_string_descriptor {
                                         lower_arg_string_descriptor(b, locals, e, st, type_layouts)
-                                    } else if wants_bind_c_char {
-                                        lower_bind_c_char_arg_raw(
-                                            b,
-                                            locals,
-                                            e,
-                                            st,
-                                            type_layouts,
-                                            internal_funcs,
-                                            contained_host_refs,
-                                            descriptor_params,
-                                        )
                                     } else if wants_pointer {
                                         lower_pointer_dummy_actual(
                                             b,
@@ -2796,6 +2824,21 @@ pub(crate) fn lower_expr_full(
                                                 )
                                             },
                                         )
+                                    } else if let Some(actual) =
+                                        lower_materialized_character_actual(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                    {
+                                        character_len = Some(actual.len);
+                                        owned_character_bases = actual.owned_bases;
+                                        actual.address
                                     } else {
                                         lower_arg_by_ref_for_dummy_full(
                                             b,
@@ -2816,7 +2859,7 @@ pub(crate) fn lower_expr_full(
                                         is_optional && !is_value,
                                         value,
                                     );
-                                    optional_arg_absent_if_unallocated_allocatable(
+                                    let value = optional_arg_absent_if_unallocated_allocatable(
                                         b,
                                         locals,
                                         e,
@@ -2828,7 +2871,25 @@ pub(crate) fn lower_expr_full(
                                             && !wants_bind_c_char
                                             && !wants_pointer,
                                         value,
-                                    )
+                                    );
+                                    if expects_char_len_star && character_len.is_none() {
+                                        character_len = actual_char_arg_runtime_len(
+                                            b,
+                                            locals,
+                                            None,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        );
+                                    }
+                                    super::stmt::MaterializedCallArg {
+                                        value,
+                                        character_len,
+                                        owned_character_bases,
+                                    }
                                 };
                                 let lowered = super::stmt::lower_call_arg_maybe_conditional(
                                     b,
@@ -2844,6 +2905,9 @@ pub(crate) fn lower_expr_full(
                                     is_value,
                                     &mut materialize,
                                 );
+                                call_arg_character_lens[i] = lowered.character_len;
+                                call_arg_character_temps
+                                    .extend(lowered.owned_character_bases.iter().copied());
                                 if wants_descriptor
                                     && !matches!(
                                         arg_expr.node,
@@ -2862,15 +2926,18 @@ pub(crate) fn lower_expr_full(
                                 }
                                 lowered
                             }
-                            _ => super::stmt::LoweredCallArg {
-                                value: b.const_i32(0),
-                                present: b.const_bool(true),
-                            },
+                            _ => {
+                                let value = b.const_i32(0);
+                                let present = b.const_bool(true);
+                                super::stmt::LoweredCallArg::plain(value, present)
+                            }
                         },
-                        None => super::stmt::LoweredCallArg {
-                            value: missing_optional_call_arg(b, st, abi_primary_key, i, is_value),
-                            present: b.const_bool(false),
-                        },
+                        None => {
+                            let value =
+                                missing_optional_call_arg(b, st, abi_primary_key, i, is_value);
+                            let present = b.const_bool(false);
+                            super::stmt::LoweredCallArg::plain(value, present)
+                        }
                     };
                     ref_arg_vals.push(lowered.value);
                     arg_presence.push(lowered.present);
@@ -2894,11 +2961,6 @@ pub(crate) fn lower_expr_full(
                     &arg_presence,
                     &mut ref_arg_vals,
                 );
-                let callee_char_len_star_args =
-                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
-                        callee_char_len_star_mask(st, k)
-                    });
-
                 if let Some(cls_flags) = &callee_char_len_star_args {
                     for (i, flag) in cls_flags.iter().enumerate() {
                         if !*flag || i >= arg_slots.len() {
@@ -2906,20 +2968,22 @@ pub(crate) fn lower_expr_full(
                         }
                         if let Some(arg) = &arg_slots[i] {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                                ref_arg_vals.push(
-                                    actual_char_arg_runtime_len(
-                                        b,
-                                        locals,
-                                        None,
-                                        e,
-                                        st,
-                                        type_layouts,
-                                        internal_funcs,
-                                        contained_host_refs,
-                                        descriptor_params,
-                                    )
-                                    .unwrap_or_else(|| b.const_i64(0)),
-                                );
+                                ref_arg_vals.push(call_arg_character_lens[i].unwrap_or_else(
+                                    || {
+                                        actual_char_arg_runtime_len(
+                                            b,
+                                            locals,
+                                            None,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                        .unwrap_or_else(|| b.const_i64(0))
+                                    },
+                                ));
                             } else {
                                 ref_arg_vals.push(b.const_i64(0));
                             }
@@ -3004,6 +3068,7 @@ pub(crate) fn lower_expr_full(
                 };
                 let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
                 deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
+                deallocate_owned_string_bases(b, &call_arg_character_temps);
                 if let Some(desc) = indirect_hidden_result {
                     return desc;
                 }
@@ -3079,10 +3144,58 @@ pub(crate) fn lower_expr_full(
                                 ) {
                                     let abi_lookup_keys =
                                         procedure_abi_lookup_keys(st, &[&signature_key]);
-                                    let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
-                                        callee_return_ir_type(st, k)
-                                    })
-                                    .unwrap_or(IrType::Int(IntWidth::I32));
+                                    let hidden_abi =
+                                        first_procedure_lookup(&abi_lookup_keys, |key| {
+                                            callee_hidden_result_abi(st, key)
+                                        });
+                                    let hidden_result = hidden_abi.and_then(|abi| {
+                                        let bytes = hidden_result_temp_bytes_for_callee(
+                                            st,
+                                            type_layouts,
+                                            &abi_lookup_keys,
+                                            abi,
+                                        )?;
+                                        let alloca_ty = if abi == HiddenResultAbi::ComplexBuffer {
+                                            let width = if bytes == 16 {
+                                                FloatWidth::F64
+                                            } else {
+                                                FloatWidth::F32
+                                            };
+                                            IrType::Array(Box::new(IrType::Float(width)), 2)
+                                        } else {
+                                            IrType::Array(
+                                                Box::new(IrType::Int(IntWidth::I8)),
+                                                bytes,
+                                            )
+                                        };
+                                        let result = b.alloca(alloca_ty);
+                                        let zero = b.const_i32(0);
+                                        let size = b.const_i64(bytes as i64);
+                                        b.call(
+                                            FuncRef::External("memset".into()),
+                                            vec![result, zero, size],
+                                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                                        );
+                                        Some(result)
+                                    });
+                                    if hidden_abi == Some(HiddenResultAbi::StringDescriptor)
+                                        && procedure_lookup_returns_owned_character_temp(
+                                            st,
+                                            &abi_lookup_keys,
+                                        )
+                                    {
+                                        if let Some(result) = hidden_result {
+                                            b.mark_owned_string_descriptor(result);
+                                        }
+                                    }
+                                    let ret_ty = if hidden_result.is_some() {
+                                        IrType::Void
+                                    } else {
+                                        first_procedure_lookup(&abi_lookup_keys, |key| {
+                                            callee_return_ir_type(st, key)
+                                        })
+                                        .unwrap_or(IrType::Int(IntWidth::I32))
+                                    };
                                     // Honor the abstract-interface descriptor
                                     // mask when forwarding actuals.  When an
                                     // actual is a descriptor-backed array
@@ -3139,10 +3252,16 @@ pub(crate) fn lower_expr_full(
                                         st,
                                         formal_skip,
                                     );
-                                    let mut arg_vals: Vec<ValueId> =
-                                        Vec::with_capacity(arg_slots.len());
+                                    let mut arg_vals: Vec<ValueId> = Vec::with_capacity(
+                                        arg_slots.len() + hidden_result.is_some() as usize,
+                                    );
                                     let mut arg_presence = Vec::with_capacity(arg_slots.len());
                                     let mut call_arg_array_temps = Vec::new();
+                                    let mut call_arg_character_lens = vec![None; arg_slots.len()];
+                                    let mut call_arg_character_temps = Vec::new();
+                                    if let Some(result) = hidden_result {
+                                        arg_vals.push(result);
+                                    }
                                     for (i, slot) in arg_slots.iter().enumerate() {
                                         let mask_says_descriptor = callee_descriptor_args
                                             .as_ref()
@@ -3153,6 +3272,10 @@ pub(crate) fn lower_expr_full(
                                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                                             .unwrap_or(false);
                                         let wants_bind_c_char = callee_bind_c_char_args
+                                            .as_ref()
+                                            .map(|mask| mask.get(i).copied().unwrap_or(false))
+                                            .unwrap_or(false);
+                                        let expects_char_len_star = callee_char_len_star_args
                                             .as_ref()
                                             .map(|mask| mask.get(i).copied().unwrap_or(false))
                                             .unwrap_or(false);
@@ -3175,8 +3298,8 @@ pub(crate) fn lower_expr_full(
                                             arg_presence.push(b.const_bool(true));
                                             continue;
                                         }
-                                        if is_value {
-                                            let lowered = lower_value_call_slot_with_presence(
+                                        let lowered = if is_value {
+                                            lower_value_call_slot_with_presence(
                                                 b,
                                                 locals,
                                                 st,
@@ -3188,81 +3311,184 @@ pub(crate) fn lower_expr_full(
                                                 abi_primary_key,
                                                 i,
                                                 wants_bind_c_char,
-                                            );
-                                            arg_vals.push(lowered.value);
-                                            arg_presence.push(lowered.present);
-                                            continue;
-                                        }
-                                        arg_presence.push(match slot {
-                                            Some(arg) => match &arg.value {
-                                                crate::ast::expr::SectionSubscript::Element(e) => {
-                                                    call_actual_presence(b, locals, e)
+                                            )
+                                        } else {
+                                            match slot {
+                                                Some(arg) => match &arg.value {
+                                                    crate::ast::expr::SectionSubscript::Element(
+                                                        arg_expr,
+                                                    ) => {
+                                                        let mut materialize =
+                                                            |b: &mut FuncBuilder,
+                                                             e: &crate::ast::expr::SpannedExpr|
+                                                             -> super::stmt::MaterializedCallArg {
+                                                                let actual_uses_descriptor =
+                                                                    callee_descriptor_args.is_none()
+                                                                        && actual_is_descriptor_backed(
+                                                                            locals,
+                                                                            e,
+                                                                            st,
+                                                                            type_layouts,
+                                                                        );
+                                                                let wants_descriptor =
+                                                                    mask_says_descriptor
+                                                                        || actual_uses_descriptor;
+                                                                let mut character_len = None;
+                                                                let mut owned_character_bases =
+                                                                    Vec::new();
+                                                                let value = if wants_bind_c_char {
+                                                                    let actual =
+                                                                        lower_bind_c_char_call_arg(
+                                                                            b,
+                                                                            locals,
+                                                                            e,
+                                                                            st,
+                                                                            type_layouts,
+                                                                            internal_funcs,
+                                                                            contained_host_refs,
+                                                                            descriptor_params,
+                                                                            false,
+                                                                        );
+                                                                    character_len =
+                                                                        actual.character_len;
+                                                                    owned_character_bases = actual
+                                                                        .owned_character_bases;
+                                                                    actual.value
+                                                                } else if wants_descriptor {
+                                                                    let desc = lower_arg_descriptor_full(
+                                                                        b,
+                                                                        locals,
+                                                                        e,
+                                                                        st,
+                                                                        type_layouts,
+                                                                        internal_funcs,
+                                                                        contained_host_refs,
+                                                                        descriptor_params,
+                                                                        false,
+                                                                    );
+                                                                    owned_character_bases.extend(
+                                                                        b.take_owned_string_temp_bases(desc),
+                                                                    );
+                                                                    desc
+                                                                } else if let Some(actual) =
+                                                                    lower_materialized_character_actual(
+                                                                        b,
+                                                                        locals,
+                                                                        e,
+                                                                        st,
+                                                                        type_layouts,
+                                                                        internal_funcs,
+                                                                        contained_host_refs,
+                                                                        descriptor_params,
+                                                                    )
+                                                                {
+                                                                    character_len = Some(actual.len);
+                                                                    owned_character_bases =
+                                                                        actual.owned_bases;
+                                                                    actual.address
+                                                                } else {
+                                                                    lower_arg_by_ref_full(
+                                                                        b,
+                                                                        locals,
+                                                                        e,
+                                                                        st,
+                                                                        type_layouts,
+                                                                        internal_funcs,
+                                                                        contained_host_refs,
+                                                                        descriptor_params,
+                                                                    )
+                                                                };
+                                                                if expects_char_len_star
+                                                                    && character_len.is_none()
+                                                                {
+                                                                    character_len =
+                                                                        actual_char_arg_runtime_len(
+                                                                            b,
+                                                                            locals,
+                                                                            None,
+                                                                            e,
+                                                                            st,
+                                                                            type_layouts,
+                                                                            internal_funcs,
+                                                                            contained_host_refs,
+                                                                            descriptor_params,
+                                                                        );
+                                                                }
+                                                                super::stmt::MaterializedCallArg {
+                                                                    value,
+                                                                    character_len,
+                                                                    owned_character_bases,
+                                                                }
+                                                            };
+                                                        let lowered = super::stmt::lower_call_arg_maybe_conditional(
+                                                            b,
+                                                            locals,
+                                                            st,
+                                                            type_layouts,
+                                                            internal_funcs,
+                                                            contained_host_refs,
+                                                            descriptor_params,
+                                                            arg_expr,
+                                                            abi_primary_key,
+                                                            i,
+                                                            false,
+                                                            &mut materialize,
+                                                        );
+                                                        let wants_descriptor = mask_says_descriptor
+                                                            || (callee_descriptor_args.is_none()
+                                                                && actual_is_descriptor_backed(
+                                                                    locals,
+                                                                    arg_expr,
+                                                                    st,
+                                                                    type_layouts,
+                                                                ));
+                                                        if wants_descriptor
+                                                            && !matches!(
+                                                                arg_expr.node,
+                                                                Expr::ConditionalExpr { .. }
+                                                                    | Expr::NilArgument
+                                                            )
+                                                        {
+                                                            track_call_arg_array_temp_descriptor(
+                                                                b,
+                                                                &mut call_arg_array_temps,
+                                                                locals,
+                                                                arg_expr,
+                                                                st,
+                                                                type_layouts,
+                                                                lowered.value,
+                                                            );
+                                                        }
+                                                        lowered
+                                                    }
+                                                    _ => {
+                                                        let value = b.const_i32(0);
+                                                        let present = b.const_bool(true);
+                                                        super::stmt::LoweredCallArg::plain(
+                                                            value, present,
+                                                        )
+                                                    }
+                                                },
+                                                None => {
+                                                    let value = missing_optional_call_arg(
+                                                        b,
+                                                        st,
+                                                        abi_primary_key,
+                                                        i,
+                                                        false,
+                                                    );
+                                                    let present = b.const_bool(false);
+                                                    super::stmt::LoweredCallArg::plain(
+                                                        value, present,
+                                                    )
                                                 }
-                                                _ => b.const_bool(true),
-                                            },
-                                            None => b.const_bool(false),
-                                        });
-                                        let Some(arg) = slot else {
-                                            arg_vals.push(missing_optional_call_arg(
-                                                b,
-                                                st,
-                                                abi_primary_key,
-                                                i,
-                                                false,
-                                            ));
-                                            continue;
+                                            }
                                         };
-                                        if let crate::ast::expr::SectionSubscript::Element(e) =
-                                            &arg.value
-                                        {
-                                            // If abstract-interface descriptor metadata is absent,
-                                            // inspect the actual and preserve descriptor-backed arrays.
-                                            let actual_uses_descriptor = callee_descriptor_args
-                                                .is_none()
-                                                && actual_is_descriptor_backed(
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                );
-                                            let wants_descriptor =
-                                                mask_says_descriptor || actual_uses_descriptor;
-                                            let value = if wants_descriptor {
-                                                let desc = lower_arg_descriptor_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                    false,
-                                                );
-                                                track_call_arg_array_temp_descriptor(
-                                                    b,
-                                                    &mut call_arg_array_temps,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    desc,
-                                                );
-                                                desc
-                                            } else {
-                                                lower_arg_by_ref_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                            };
-                                            arg_vals.push(value);
-                                        }
+                                        call_arg_character_lens[i] = lowered.character_len;
+                                        call_arg_character_temps
+                                            .extend(lowered.owned_character_bases.iter().copied());
+                                        arg_vals.push(lowered.value);
+                                        arg_presence.push(lowered.present);
                                     }
                                     append_optional_value_presence_args(
                                         b,
@@ -3276,23 +3502,26 @@ pub(crate) fn lower_expr_full(
                                             if !*flag || i >= arg_slots.len() {
                                                 continue;
                                             }
-                                            let len = arg_slots[i]
-                                                .as_ref()
-                                                .and_then(|arg| match &arg.value {
-                                                    crate::ast::expr::SectionSubscript::Element(
-                                                        e,
-                                                    ) => actual_char_arg_runtime_len(
-                                                        b,
-                                                        locals,
-                                                        None,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    ),
-                                                    _ => None,
+                                            let len = call_arg_character_lens[i]
+                                                .or_else(|| {
+                                                    arg_slots[i].as_ref().and_then(|arg| {
+                                                        match &arg.value {
+                                                            crate::ast::expr::SectionSubscript::Element(e) => {
+                                                                actual_char_arg_runtime_len(
+                                                                    b,
+                                                                    locals,
+                                                                    None,
+                                                                    e,
+                                                                    st,
+                                                                    type_layouts,
+                                                                    internal_funcs,
+                                                                    contained_host_refs,
+                                                                    descriptor_params,
+                                                                )
+                                                            }
+                                                            _ => None,
+                                                        }
+                                                    })
                                                 })
                                                 .unwrap_or_else(|| b.const_i64(0));
                                             arg_vals.push(len);
@@ -3305,7 +3534,8 @@ pub(crate) fn lower_expr_full(
                                         b,
                                         &call_arg_array_temps,
                                     );
-                                    return call_result;
+                                    deallocate_owned_string_bases(b, &call_arg_character_temps);
+                                    return hidden_result.unwrap_or(call_result);
                                 }
                             }
                             let bp = bp_opt.unwrap_or_else(|| {
@@ -3314,20 +3544,8 @@ pub(crate) fn lower_expr_full(
                             let target = bp.target_name.clone();
                             let target_key = abi_key_for_link_name(st, &target)
                                 .unwrap_or_else(|| bp.abi_name.clone());
-                            let call_name = target.clone();
-                            let nopass = bp.nopass;
-                            let arg_slots = reorder_args_by_keyword_slots_with_formal_skip(
-                                args,
-                                &target_key,
-                                st,
-                                if nopass { 0 } else { 1 },
-                            );
                             let abi_lookup_keys =
-                                procedure_abi_lookup_keys(st, &[call_name.as_str(), &target_key]);
-                            let abi_primary_key = abi_lookup_keys
-                                .first()
-                                .map(String::as_str)
-                                .unwrap_or(target_key.as_str());
+                                procedure_abi_lookup_keys(st, &[target.as_str(), &target_key]);
                             if let Some(hidden_abi) =
                                 first_procedure_lookup(&abi_lookup_keys, |k| {
                                     callee_hidden_result_abi(st, k)
@@ -3380,336 +3598,40 @@ pub(crate) fn lower_expr_full(
                                     return desc;
                                 }
                             }
-                            let callee_value_args = first_procedure_lookup(&abi_lookup_keys, |k| {
-                                callee_value_arg_mask(st, k)
-                            });
-                            let callee_descriptor_args =
-                                first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    descriptor_params
-                                        .and_then(|m| cached_param_mask_for_lookup(st, m, k))
-                                });
-                            let callee_string_descriptor_args =
-                                first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_string_descriptor_arg_mask(st, k)
-                                });
-                            let callee_bind_c_char_args =
-                                first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_bind_c_char_arg_mask(st, k)
-                                });
-                            let callee_pointer_args =
-                                first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_pointer_arg_mask(st, k)
-                                });
-                            let callee_allocatable_args =
-                                first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_allocatable_arg_mask(st, k)
-                                });
-                            let opt_flags = first_procedure_lookup(&abi_lookup_keys, |k| {
-                                callee_optional_arg_mask(st, k)
-                            });
-                            let callee_char_len_star_args =
-                                first_procedure_lookup(&abi_lookup_keys, |k| {
-                                    callee_char_len_star_mask(st, k)
-                                });
-
-                            let mut call_args = Vec::with_capacity(arg_slots.len() + 1);
-                            let mut arg_presence = Vec::with_capacity(arg_slots.len());
-                            let mut call_arg_array_temps = Vec::new();
-                            for (i, slot) in arg_slots.iter().enumerate() {
-                                if !nopass && i == 0 {
-                                    let wants_bind_c_char = callee_bind_c_char_args
-                                        .as_ref()
-                                        .map(|mask| mask.first().copied().unwrap_or(false))
-                                        .unwrap_or(false);
-                                    let wants_descriptor = callee_descriptor_args
-                                        .as_ref()
-                                        .map(|mask| mask.first().copied().unwrap_or(false))
-                                        .unwrap_or(false)
-                                        && !wants_bind_c_char;
-                                    call_args.push(if wants_descriptor {
-                                        lower_arg_descriptor_full(
-                                            b,
-                                            locals,
-                                            base,
-                                            st,
-                                            type_layouts,
-                                            internal_funcs,
-                                            contained_host_refs,
-                                            descriptor_params,
-                                            false,
-                                        )
-                                    } else {
-                                        obj_addr
-                                    });
-                                    arg_presence.push(b.const_bool(true));
-                                    continue;
-                                }
-                                let is_value = callee_value_args
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let wants_descriptor = callee_descriptor_args
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let wants_string_descriptor = callee_string_descriptor_args
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let wants_bind_c_char = callee_bind_c_char_args
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let wants_descriptor = wants_descriptor && !wants_bind_c_char;
-                                let wants_string_descriptor =
-                                    wants_string_descriptor && !wants_bind_c_char;
-                                let wants_pointer = callee_pointer_args
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let dummy_is_allocatable = callee_allocatable_args
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let is_optional = opt_flags
-                                    .as_ref()
-                                    .map(|mask| mask.get(i).copied().unwrap_or(false))
-                                    .unwrap_or(false);
-                                if is_value {
-                                    let lowered = lower_value_call_slot_with_presence(
-                                        b,
-                                        locals,
-                                        st,
-                                        type_layouts,
-                                        internal_funcs,
-                                        contained_host_refs,
-                                        descriptor_params,
-                                        slot.as_ref(),
-                                        abi_primary_key,
-                                        i,
-                                        wants_bind_c_char,
-                                    );
-                                    call_args.push(lowered.value);
-                                    arg_presence.push(lowered.present);
-                                    continue;
-                                }
-                                arg_presence.push(match slot {
-                                    Some(arg) => match &arg.value {
-                                        crate::ast::expr::SectionSubscript::Element(e) => {
-                                            call_actual_presence(b, locals, e)
-                                        }
-                                        _ => b.const_bool(true),
-                                    },
-                                    None => b.const_bool(false),
-                                });
-                                let value = match slot {
-                                    Some(arg) => match &arg.value {
-                                        crate::ast::expr::SectionSubscript::Element(e) => {
-                                            let value = if is_value && wants_bind_c_char {
-                                                lower_bind_c_char_value_arg(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                            } else if is_value {
-                                                let raw = lower_expr_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                );
-                                                coerce_value_call_arg(
-                                                    b,
-                                                    st,
-                                                    abi_primary_key,
-                                                    i,
-                                                    raw,
-                                                )
-                                            } else if wants_descriptor {
-                                                let desc = lower_arg_descriptor_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                    false,
-                                                );
-                                                track_call_arg_array_temp_descriptor(
-                                                    b,
-                                                    &mut call_arg_array_temps,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    desc,
-                                                );
-                                                desc
-                                            } else if wants_string_descriptor {
-                                                lower_arg_string_descriptor(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                )
-                                            } else if wants_bind_c_char {
-                                                lower_bind_c_char_arg_raw(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                            } else if wants_pointer {
-                                                lower_pointer_dummy_actual(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                                .unwrap_or_else(|| {
-                                                    lower_arg_by_ref_full(
-                                                        b,
-                                                        locals,
-                                                        e,
-                                                        st,
-                                                        type_layouts,
-                                                        internal_funcs,
-                                                        contained_host_refs,
-                                                        descriptor_params,
-                                                    )
-                                                })
-                                            } else {
-                                                lower_arg_by_ref_full(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                            };
-                                            let value =
-                                                optional_arg_absent_if_forwarded_by_ref_dummy(
-                                                    b,
-                                                    locals,
-                                                    e,
-                                                    is_optional && !is_value,
-                                                    value,
-                                                );
-                                            optional_arg_absent_if_unallocated_allocatable(
-                                                b,
-                                                locals,
-                                                e,
-                                                st,
-                                                type_layouts,
-                                                is_optional
-                                                    && !is_value
-                                                    && !dummy_is_allocatable
-                                                    && !wants_bind_c_char
-                                                    && !wants_pointer,
-                                                value,
-                                            )
-                                        }
-                                        _ => b.const_i32(0),
-                                    },
-                                    None => missing_optional_call_arg(
-                                        b,
-                                        st,
-                                        abi_primary_key,
-                                        i,
-                                        is_value,
-                                    ),
-                                };
-                                call_args.push(value);
-                            }
-                            if let Some(opt_flags) = &opt_flags {
-                                for flag in opt_flags.iter().skip(call_args.len()) {
-                                    if *flag {
-                                        call_args.push(b.const_i64(0));
-                                    }
-                                }
-                            }
-                            append_optional_value_presence_args(
-                                b,
-                                opt_flags.as_deref(),
-                                callee_value_args.as_deref(),
-                                &arg_presence,
-                                &mut call_args,
-                            );
-                            if let Some(cls_flags) = &callee_char_len_star_args {
-                                for (i, flag) in cls_flags.iter().enumerate() {
-                                    if !*flag || i >= arg_slots.len() {
-                                        continue;
-                                    }
-                                    if let Some(arg) = &arg_slots[i] {
-                                        if let crate::ast::expr::SectionSubscript::Element(e) =
-                                            &arg.value
-                                        {
-                                            call_args.push(
-                                                actual_char_arg_runtime_len(
-                                                    b,
-                                                    locals,
-                                                    None,
-                                                    e,
-                                                    st,
-                                                    type_layouts,
-                                                    internal_funcs,
-                                                    contained_host_refs,
-                                                    descriptor_params,
-                                                )
-                                                .unwrap_or_else(|| b.const_i64(0)),
-                                            );
-                                        } else {
-                                            call_args.push(b.const_i64(0));
-                                        }
-                                    } else {
-                                        call_args.push(b.const_i64(0));
-                                    }
-                                }
-                            }
-
                             let ret_ty = first_procedure_lookup(&abi_lookup_keys, |k| {
                                 callee_return_ir_type(st, k)
                             })
                             .unwrap_or(IrType::Int(IntWidth::I32));
-                            let call_result =
-                                b.call(FuncRef::External(call_name), call_args, ret_ty);
-                            deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
-                            if let Some(tl) = type_layouts {
-                                if let Some(type_name) =
-                                    callee_return_stabilized_derived_type_name(st, &target_key)
-                                {
-                                    return stabilize_derived_call_result(
-                                        b,
-                                        tl,
-                                        &type_name,
-                                        call_result,
-                                    );
-                                }
-                            }
-                            return call_result;
+                            let pass_desc_addr = lower_arg_descriptor_full(
+                                b,
+                                locals,
+                                base,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                                false,
+                            );
+                            return emit_resolved_bound_proc_call(
+                                b,
+                                locals,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                None,
+                                descriptor_params,
+                                None,
+                                obj_addr,
+                                Some(pass_desc_addr),
+                                FuncRef::External(target),
+                                bp,
+                                args,
+                                None,
+                                ret_ty,
+                            )
+                            .unwrap_or_else(|| b.const_i32(0));
                         }
                     }
                     reject_unsupported_polymorphic_component_method_base(
