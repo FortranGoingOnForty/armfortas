@@ -7843,14 +7843,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             ctx.locals.retain(|k, _| pre_block_keys.contains(k));
         }
 
-        Stmt::Associate { assocs, body, .. } => {
+        Stmt::Associate { name, assocs, body } => {
             // Associate names are scoped — they only exist within the body.
-            let added_keys: Vec<String> =
-                assocs.iter().map(|(name, _)| name.to_lowercase()).collect();
+            let mut saved = Vec::with_capacity(assocs.len());
 
-            for (name, expr) in assocs {
+            for (assoc_name, expr) in assocs {
+                let key = assoc_name.to_lowercase();
+                saved.push((key.clone(), ctx.locals.get(&key).cloned()));
                 if let Some(info) = associate_alias_local_info(b, ctx, expr) {
-                    ctx.locals.insert(name.to_lowercase(), info);
+                    ctx.locals.insert(key, info);
                     continue;
                 }
                 let val = super::expr::lower_expr_ctx(b, ctx, expr);
@@ -7861,7 +7862,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 let addr = b.alloca(ty.clone());
                 b.store(val, addr);
                 ctx.locals.insert(
-                    name.to_lowercase(),
+                    key,
                     LocalInfo {
                         addr,
                         ty,
@@ -7880,11 +7881,27 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     },
                 );
             }
-            lower_stmts(b, ctx, body);
 
-            // Remove associate names from scope.
-            for key in &added_keys {
-                ctx.locals.remove(key);
+            if name.is_some() {
+                let bb_after = b.create_block("associate_after");
+                ctx.push_construct_exit(name.clone(), bb_after);
+                lower_stmts(b, ctx, body);
+                ctx.pop_construct_exit(name);
+
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_after, vec![]);
+                }
+                b.set_block(bb_after);
+            } else {
+                lower_stmts(b, ctx, body);
+            }
+
+            for (key, original) in saved.into_iter().rev() {
+                if let Some(info) = original {
+                    ctx.locals.insert(key, info);
+                } else {
+                    ctx.locals.remove(&key);
+                }
             }
         }
 

@@ -61695,6 +61695,37 @@ end program
     }
 
     #[test]
+    fn lower_named_associate_exit_skips_remaining_body_case_insensitively() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: target, after
+  target = 0
+  after = 0
+OuterScope: associate (alias => target)
+  alias = 1
+  exit oUtErScOpE
+  alias = 9917
+end associate OUTERSCOPE
+  after = 23
+end program
+",
+        );
+
+        assert!(
+            !ir.contains("const_int 9917"),
+            "named ASSOCIATE tail must be unreachable:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("const_int 23"),
+            "lowering must continue after the ASSOCIATE:\n{}",
+            ir
+        );
+    }
+
+    #[test]
     fn lower_select_case() {
         let (_, ir) = lower_and_verify(
             "\
