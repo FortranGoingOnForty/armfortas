@@ -15,7 +15,10 @@ use crate::ir::inst::*;
 use crate::ir::types::*;
 
 use super::core::*;
-use super::ctx::{BlockScopeGuard, BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo, LowerCtx};
+use super::ctx::{
+    BlockCleanupScope, BlockScopeGuard, BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo,
+    LowerCtx,
+};
 use super::helpers::coerce_to_type;
 
 fn is_unlimited_polymorphic_local(info: &LocalInfo) -> bool {
@@ -225,6 +228,31 @@ pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[Span
             continue; // dead code — but keep looping so we can find the next label
         }
         lower_stmt(b, ctx, stmt);
+    }
+}
+
+fn goto_exits_active_block(ctx: &LowerCtx<'_>, label: u64) -> bool {
+    ctx.block_cleanups
+        .last()
+        .is_some_and(|scope| !scope.labels.contains(&label))
+}
+
+fn emit_block_cleanups_for_goto(b: &mut FuncBuilder, ctx: &LowerCtx<'_>, label: u64) {
+    for scope in ctx.block_cleanups.iter().rev() {
+        if scope.labels.contains(&label) {
+            break;
+        }
+        insert_implicit_dealloc(
+            b,
+            &scope.owned_locals,
+            &ctx.locals,
+            ctx.type_layouts,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            None,
+            true,
+        );
     }
 }
 
@@ -7793,9 +7821,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let bb_cleanup = b.create_block("block_cleanup");
             let bb_after = b.create_block("block_after");
 
+            let block_only: HashMap<String, LocalInfo> = block_keys
+                .iter()
+                .filter(|k| ctx.locals.contains_key(*k))
+                .filter_map(|k| ctx.locals.get(k).map(|v| (k.clone(), v.clone())))
+                .collect();
+            ctx.block_cleanups.push(BlockCleanupScope {
+                labels: collect_statement_labels(body),
+                owned_locals: block_only,
+            });
+
             ctx.push_construct_exit(name.clone(), bb_cleanup);
             lower_stmts(b, ctx, body);
             ctx.pop_construct_exit(name);
+            let block_cleanup = ctx
+                .block_cleanups
+                .pop()
+                .expect("BLOCK cleanup scope must remain active while lowering its body");
 
             if b.func().block(b.current_block()).terminator.is_none() {
                 b.branch(bb_cleanup, vec![]);
@@ -7803,29 +7845,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             b.set_block(bb_cleanup);
             // F2018 §7.5.6.3 / §9.7.3.2: at END BLOCK, finalize derived-type
-            // locals that have FINAL subroutines and deallocate
-            // block-scoped allocatables.  Only do this for keys that were
-            // newly introduced by the block (not shadowed outer locals).
-            if b.func().block(b.current_block()).terminator.is_none() {
-                let block_only: HashMap<String, LocalInfo> = block_keys
-                    .iter()
-                    .filter(|k| ctx.locals.contains_key(*k))
-                    .filter(|k| !saved.iter().any(|(sk, so)| sk == *k && so.is_some()))
-                    .filter_map(|k| ctx.locals.get(k).map(|v| (k.clone(), v.clone())))
-                    .collect();
-                if !block_only.is_empty() {
-                    insert_implicit_dealloc(
-                        b,
-                        &block_only,
-                        &ctx.locals,
-                        ctx.type_layouts,
-                        ctx.st,
-                        ctx.internal_funcs,
-                        Some(ctx.contained_host_refs),
-                        None,
-                        true,
-                    );
-                }
+            // locals that have FINAL subroutines and deallocate block-scoped
+            // allocatables. Shadowing declarations own distinct storage and
+            // therefore require the same cleanup as uniquely named locals.
+            if b.func().block(b.current_block()).terminator.is_none()
+                && !block_cleanup.owned_locals.is_empty()
+            {
+                insert_implicit_dealloc(
+                    b,
+                    &block_cleanup.owned_locals,
+                    &ctx.locals,
+                    ctx.type_layouts,
+                    ctx.st,
+                    ctx.internal_funcs,
+                    Some(ctx.contained_host_refs),
+                    None,
+                    true,
+                );
             }
             if b.func().block(b.current_block()).terminator.is_none() {
                 b.branch(bb_after, vec![]);
@@ -7919,7 +7955,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
         Stmt::Goto { label } => {
             if let Some(&target_bb) = ctx.label_blocks.get(label) {
-                b.branch(target_bb, vec![]);
+                emit_block_cleanups_for_goto(b, ctx, *label);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(target_bb, vec![]);
+                }
             }
         }
 
@@ -7952,7 +7991,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 let key_val = b.const_i32(key);
                 let matches = b.icmp(CmpOp::Eq, sel_i32, key_val);
                 let next_check = b.create_block("computed_goto_next");
-                b.cond_branch(matches, target_bb, vec![], next_check, vec![]);
+                if goto_exits_active_block(ctx, *label) {
+                    let cleanup = b.create_block("computed_goto_cleanup");
+                    b.cond_branch(matches, cleanup, vec![], next_check, vec![]);
+                    b.set_block(cleanup);
+                    emit_block_cleanups_for_goto(b, ctx, *label);
+                    if b.func().block(b.current_block()).terminator.is_none() {
+                        b.branch(target_bb, vec![]);
+                    }
+                } else {
+                    b.cond_branch(matches, target_bb, vec![], next_check, vec![]);
+                }
                 b.set_block(next_check);
             }
             // Falling out of the loop, current block is the post-chain

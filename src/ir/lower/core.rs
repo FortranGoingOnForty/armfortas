@@ -28331,7 +28331,95 @@ pub(super) fn lower_type_spec_with_param_consts(
     }
 }
 
-/// Lower a list of statements.
+fn visit_statement_labels(stmts: &[SpannedStmt], visit: &mut impl FnMut(u64)) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Labeled { label, stmt: inner } => {
+                visit(*label);
+                // Recurse into the inner statement (e.g., a DO or IF block with labels inside).
+                visit_statement_labels(std::slice::from_ref(inner.as_ref()), visit);
+            }
+            Stmt::Continue { label: Some(lbl) } => {
+                visit(*lbl);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                visit_statement_labels(then_body, visit);
+                for (_, body) in else_ifs {
+                    visit_statement_labels(body, visit);
+                }
+                if let Some(body) = else_body {
+                    visit_statement_labels(body, visit);
+                }
+            }
+            Stmt::IfStmt { action, .. } => {
+                visit_statement_labels(std::slice::from_ref(action.as_ref()), visit);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    visit_statement_labels(&case.body, visit);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
+                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
+                            visit_statement_labels(body, visit);
+                        }
+                    }
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    match guard {
+                        crate::ast::stmt::RankGuard::Rank { body, .. }
+                        | crate::ast::stmt::RankGuard::RankStar { body }
+                        | crate::ast::stmt::RankGuard::RankDefault { body } => {
+                            visit_statement_labels(body, visit);
+                        }
+                    }
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                visit_statement_labels(body, visit);
+                for (_, else_body) in elsewhere {
+                    visit_statement_labels(else_body, visit);
+                }
+            }
+            Stmt::WhereStmt { stmt, .. } | Stmt::ForallStmt { stmt, .. } => {
+                visit_statement_labels(std::slice::from_ref(stmt.as_ref()), visit);
+            }
+            Stmt::ForallConstruct { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. } => {
+                visit_statement_labels(body, visit);
+            }
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. } => {
+                visit_statement_labels(body, visit);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn collect_statement_labels(stmts: &[SpannedStmt]) -> HashSet<u64> {
+    let mut labels = HashSet::new();
+    visit_statement_labels(stmts, &mut |label| {
+        labels.insert(label);
+    });
+    labels
+}
+
 /// Pre-scan a body of statements and create one IR basic block per
 /// Fortran statement label. Must be called before `lower_stmts` so
 /// that both forward and backward `GOTO` targets can branch to an
@@ -28341,75 +28429,10 @@ pub(super) fn collect_label_blocks(
     stmts: &[SpannedStmt],
     out: &mut HashMap<u64, BlockId>,
 ) {
-    for stmt in stmts {
-        match &stmt.node {
-            Stmt::Labeled { label, stmt: inner } => {
-                let bb = b.create_block(&format!("label_{}", label));
-                out.entry(*label).or_insert(bb);
-                // Recurse into the inner statement (e.g., a DO or IF block with labels inside).
-                collect_label_blocks(b, std::slice::from_ref(inner.as_ref()), out);
-            }
-            Stmt::Continue { label: Some(lbl) } => {
-                let bb = b.create_block(&format!("label_{}", lbl));
-                out.entry(*lbl).or_insert(bb);
-            }
-            Stmt::IfConstruct {
-                then_body,
-                else_ifs,
-                else_body,
-                ..
-            } => {
-                collect_label_blocks(b, then_body, out);
-                for (_, body) in else_ifs {
-                    collect_label_blocks(b, body, out);
-                }
-                if let Some(body) = else_body {
-                    collect_label_blocks(b, body, out);
-                }
-            }
-            Stmt::IfStmt { action, .. } => {
-                collect_label_blocks(b, std::slice::from_ref(action.as_ref()), out);
-            }
-            Stmt::SelectCase { cases, .. } => {
-                for case in cases {
-                    collect_label_blocks(b, &case.body, out);
-                }
-            }
-            Stmt::SelectType { guards, .. } => {
-                for guard in guards {
-                    match guard {
-                        crate::ast::stmt::TypeGuard::TypeIs { body, .. }
-                        | crate::ast::stmt::TypeGuard::ClassIs { body, .. }
-                        | crate::ast::stmt::TypeGuard::ClassDefault { body } => {
-                            collect_label_blocks(b, body, out);
-                        }
-                    }
-                }
-            }
-            Stmt::WhereConstruct {
-                body, elsewhere, ..
-            } => {
-                collect_label_blocks(b, body, out);
-                for (_, else_body) in elsewhere {
-                    collect_label_blocks(b, else_body, out);
-                }
-            }
-            Stmt::WhereStmt { stmt, .. } | Stmt::ForallStmt { stmt, .. } => {
-                collect_label_blocks(b, std::slice::from_ref(stmt.as_ref()), out);
-            }
-            Stmt::ForallConstruct { body, .. }
-            | Stmt::Block { body, .. }
-            | Stmt::Associate { body, .. } => {
-                collect_label_blocks(b, body, out);
-            }
-            Stmt::DoLoop { body, .. }
-            | Stmt::DoWhile { body, .. }
-            | Stmt::DoConcurrent { body, .. } => {
-                collect_label_blocks(b, body, out);
-            }
-            _ => {}
-        }
-    }
+    visit_statement_labels(stmts, &mut |label| {
+        let bb = b.create_block(&format!("label_{}", label));
+        out.entry(label).or_insert(bb);
+    });
 }
 
 pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
@@ -61721,6 +61744,52 @@ end program
         assert!(
             ir.contains("const_int 23"),
             "lowering must continue after the ASSOCIATE:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_select_rank_collects_direct_and_computed_goto_labels() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: scalar
+
+  scalar = 1
+  call jump_to_label(scalar, 1)
+contains
+  subroutine jump_to_label(value, mode)
+    integer, intent(in) :: value(..)
+    integer, intent(in) :: mode
+    integer :: result
+
+    select rank (value)
+    rank (0)
+      if (mode == 1) then
+        go to 700
+      else
+        go to (700), 1
+      end if
+      result = 9917
+700   continue
+      result = 23
+    rank default
+      result = -1
+    end select
+  end subroutine jump_to_label
+end program
+",
+        );
+
+        assert!(
+            ir.contains("label_700"),
+            "SELECT RANK guard label must have an IR block:\n{}",
+            ir
+        );
+        assert!(
+            ir.matches("label_700").count() >= 3,
+            "direct and computed GOTO edges must target the guard label:\n{}",
             ir
         );
     }
