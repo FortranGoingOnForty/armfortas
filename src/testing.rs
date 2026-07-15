@@ -19,7 +19,7 @@ use crate::codegen::mir::{
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
+use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Token};
 use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
@@ -406,7 +406,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     let input = request.input.clone();
     let source_form = detect_source_form(&input.to_string_lossy());
 
-    let source = fs::read_to_string(&input).map_err(|e| CaptureFailure {
+    let source = fs::read(&input).map_err(|e| CaptureFailure {
         input: input.clone(),
         opt_level: request.opt_level,
         stage: FailureStage::Preprocess,
@@ -420,47 +420,57 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         ..crate::preprocess::PreprocConfig::default()
     };
     let pp_result =
-        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| CaptureFailure {
+        crate::preprocess::preprocess_bytes(&source, &pp_config).map_err(|e| CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,
             stage: FailureStage::Preprocess,
             detail: e.to_string(),
             stages: stages.clone(),
         })?;
-    let preprocessed = pp_result.text;
+    let preprocessed = pp_result.text.clone();
     if wants(Stage::Preprocess) {
-        stages.insert(Stage::Preprocess, CapturedStage::Text(preprocessed.clone()));
+        stages.insert(
+            Stage::Preprocess,
+            CapturedStage::Text(String::from_utf8_lossy(&pp_result.bytes()).into_owned()),
+        );
     }
 
-    let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| CaptureFailure {
-        input: input.clone(),
-        opt_level: request.opt_level,
-        stage: FailureStage::Lexer,
-        detail: format!(
-            "{}:{}: lexer error: {}",
-            input.display(),
-            e.span.start.line,
-            e.msg
-        ),
-        stages: stages.clone(),
+    let tokens = tokenize_source_view(&preprocessed, 0, source_form).map_err(|e| {
+        let resolved = pp_result.resolve_span(e.span);
+        CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Lexer,
+            detail: format!(
+                "{}:{}:{}: lexer error: {}",
+                resolved.filename,
+                resolved.display_span.start.line,
+                resolved.display_span.start.col,
+                e.msg
+            ),
+            stages: stages.clone(),
+        }
     })?;
     if wants(Stage::Tokens) {
         stages.insert(Stage::Tokens, CapturedStage::Text(format_tokens(&tokens)));
     }
 
-    let mut parser = Parser::new(&tokens);
-    let units = parser.parse_file().map_err(|e| CaptureFailure {
-        input: input.clone(),
-        opt_level: request.opt_level,
-        stage: FailureStage::Parser,
-        detail: format!(
-            "{}:{}:{}: parse error: {}",
-            input.display(),
-            e.span.start.line,
-            e.span.start.col,
-            e.msg
-        ),
-        stages: stages.clone(),
+    let mut parser = Parser::new_source_view(&tokens);
+    let units = parser.parse_file().map_err(|e| {
+        let resolved = pp_result.resolve_span(e.span);
+        CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Parser,
+            detail: format!(
+                "{}:{}:{}: parse error: {}",
+                resolved.filename,
+                resolved.display_span.start.line,
+                resolved.display_span.start.col,
+                e.msg
+            ),
+            stages: stages.clone(),
+        }
     })?;
     if wants(Stage::Ast) {
         stages.insert(Stage::Ast, CapturedStage::Text(format!("{:#?}", units)));
@@ -471,12 +481,21 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         &[],
         crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
     )
-    .map_err(|e| CaptureFailure {
-        input: input.clone(),
-        opt_level: request.opt_level,
-        stage: FailureStage::Sema,
-        detail: format!("{}:{}: {}", input.display(), e.span.start.line, e.msg),
-        stages: stages.clone(),
+    .map_err(|e| {
+        let resolved = pp_result.resolve_span(e.span);
+        CaptureFailure {
+            input: input.clone(),
+            opt_level: request.opt_level,
+            stage: FailureStage::Sema,
+            detail: format!(
+                "{}:{}:{}: {}",
+                resolved.filename,
+                resolved.display_span.start.line,
+                resolved.display_span.start.col,
+                e.msg
+            ),
+            stages: stages.clone(),
+        }
     })?;
     let st = rr.st;
     let type_layouts = rr.type_layouts;
@@ -496,7 +515,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             input: input.clone(),
             opt_level: request.opt_level,
             stage: FailureStage::Sema,
-            detail: format_diagnostics(&input, &sema_errors),
+            detail: format_diagnostics(&pp_result, &sema_errors),
             stages,
         });
     }
@@ -852,15 +871,19 @@ fn format_sema_snapshot(
     out
 }
 
-fn format_diagnostics(path: &Path, diags: &[&validate::Diagnostic]) -> String {
+fn format_diagnostics(
+    preprocessed: &crate::preprocess::PreprocOutput,
+    diags: &[&validate::Diagnostic],
+) -> String {
     diags
         .iter()
         .map(|diag| {
+            let resolved = preprocessed.resolve_span(diag.span);
             format!(
                 "{}:{}:{}: {}",
-                path.display(),
-                diag.span.start.line,
-                diag.span.start.col,
+                resolved.filename,
+                resolved.display_span.start.line,
+                resolved.display_span.start.col,
                 diag.msg
             )
         })

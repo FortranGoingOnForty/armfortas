@@ -6151,7 +6151,7 @@ fn eval_const_char_bytes_with_context(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<Vec<u8>> {
     match &e.node {
-        Expr::StringLiteral { value, .. } => Some(value.as_bytes().to_vec()),
+        Expr::StringLiteral { value, .. } => Some(value.as_bytes().into_owned()),
         Expr::Name { name } => param_chars.get(&name.to_lowercase()).cloned().or_else(|| {
             let st = st?;
             let key = name.to_lowercase();
@@ -6163,7 +6163,7 @@ fn eval_const_char_bytes_with_context(
             }
             sym.const_char_value
                 .as_ref()
-                .map(|value| value.as_bytes().to_vec())
+                .map(|value| crate::source_bytes::from_source_view(value))
         }),
         Expr::ComponentAccess { base, component } => {
             let Expr::Name { name } = &base.node else {
@@ -6191,7 +6191,7 @@ fn eval_const_char_bytes_with_context(
                 else {
                     return None;
                 };
-                Some(value.as_bytes().to_vec())
+                Some(crate::source_bytes::from_source_view(value))
             })
         }
         Expr::ParenExpr { inner } => eval_const_char_bytes_with_context(
@@ -6653,7 +6653,7 @@ pub(super) fn install_param_char_component_defaults(
         };
         let key =
             crate::sema::type_layout::derived_param_field_lookup_key(&entity.name, &field.name);
-        out.insert(key, value.as_bytes().to_vec());
+        out.insert(key, crate::source_bytes::from_source_view(value));
     }
 }
 
@@ -7083,7 +7083,7 @@ pub(super) fn apply_field_default_init_const_bytes(
                 return false;
             }
             bytes[field_offset..end].fill(b' ');
-            let value_bytes = value.as_bytes();
+            let value_bytes = crate::source_bytes::from_source_view(value);
             let copy_len = value_bytes.len().min(field.size);
             bytes[field_offset..field_offset + copy_len].copy_from_slice(&value_bytes[..copy_len]);
             true
@@ -10378,7 +10378,7 @@ pub(super) fn char_addr_and_len(
             }
         }
         Expr::StringLiteral { value, .. } => {
-            let ptr = b.const_string(value.as_bytes());
+            let ptr = b.const_string(value.as_bytes().as_ref());
             Some((ptr, value.len() as i64))
         }
         _ => None,
@@ -10530,7 +10530,7 @@ pub(super) fn char_addr_and_runtime_len(
             Some((join_ptr, join_len))
         }
         Expr::StringLiteral { value, .. } => {
-            let ptr = b.const_string(value.as_bytes());
+            let ptr = b.const_string(value.as_bytes().as_ref());
             let len = b.const_i64(value.len() as i64);
             Some((ptr, len))
         }
@@ -10558,7 +10558,7 @@ pub(super) fn char_addr_and_substring_bound_len(
             }
         }
         Expr::StringLiteral { value, .. } => {
-            let ptr = b.const_string(value.as_bytes());
+            let ptr = b.const_string(value.as_bytes().as_ref());
             let len = b.const_i64(value.len() as i64);
             Some((ptr, len))
         }
@@ -25931,7 +25931,7 @@ pub(super) fn lower_string_expr_full(
 ) -> (ValueId, ValueId) {
     match &expr.node {
         Expr::StringLiteral { value, .. } => {
-            let ptr = b.const_string(value.as_bytes());
+            let ptr = b.const_string(value.as_bytes().as_ref());
             let len = b.const_i64(value.len() as i64);
             (ptr, len)
         }
@@ -33620,10 +33620,13 @@ pub(super) fn null_char_slot_arg(b: &mut FuncBuilder) -> ValueId {
 }
 
 fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
-    let ptr = b.const_string(value.as_bytes());
+    let ptr = b.const_string(&crate::source_bytes::from_source_view(value));
     let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     b.store(ptr, slot);
-    (slot, b.const_i64(value.len() as i64))
+    (
+        slot,
+        b.const_i64(crate::source_bytes::source_byte_len(value) as i64),
+    )
 }
 
 fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
@@ -36882,7 +36885,7 @@ pub(super) fn lower_parameter_derived_component_const(
             ))
         }
         crate::sema::type_layout::FieldDefaultInit::Character(value) => {
-            Some(b.const_string(value.as_bytes()))
+            Some(b.const_string(&crate::source_bytes::from_source_view(value)))
         }
         _ => None,
     }
@@ -55748,9 +55751,9 @@ pub(super) fn apply_field_default_init_runtime(
 ) {
     match default_init {
         crate::sema::type_layout::FieldDefaultInit::Character(value) => {
-            let src_ptr = b.const_string(value.as_bytes());
+            let src_ptr = b.const_string(&crate::source_bytes::from_source_view(value));
             let dest_len = b.const_i64(field.size as i64);
-            let src_len = b.const_i64(value.len() as i64);
+            let src_len = b.const_i64(crate::source_bytes::source_byte_len(value) as i64);
             b.call(
                 FuncRef::External("afs_assign_char_fixed".into()),
                 vec![field_ptr, dest_len, src_ptr, src_len],
@@ -59781,19 +59784,21 @@ pub(super) fn lower_char_arg_by_ref(
             }
         }
         Expr::StringLiteral { value, .. } => {
-            let src = b.const_string(value.as_bytes());
+            let value_bytes = value.as_bytes();
+            let value_len = value_bytes.len();
+            let src = b.const_string(value_bytes.as_ref());
             let buf = b.alloca(IrType::Array(
                 Box::new(IrType::Int(IntWidth::I8)),
-                (value.len() + 1) as u64,
+                (value_len + 1) as u64,
             ));
             let zero = b.const_i32(0);
-            let total = b.const_i64((value.len() + 1) as i64);
+            let total = b.const_i64((value_len + 1) as i64);
             b.call(
                 FuncRef::External("memset".into()),
                 vec![buf, zero, total],
                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            let len = b.const_i64(value.len() as i64);
+            let len = b.const_i64(value_len as i64);
             b.call(
                 FuncRef::External("memcpy".into()),
                 vec![buf, src, len],

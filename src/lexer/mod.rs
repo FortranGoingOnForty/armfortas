@@ -465,6 +465,48 @@ pub fn tokenize(src: &str, file_id: u32, form: SourceForm) -> Result<Vec<Token>,
     }
 }
 
+pub(crate) fn tokenize_source_view(
+    src: &str,
+    file_id: u32,
+    form: SourceForm,
+) -> Result<Vec<Token>, LexError> {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
+    let result = match form {
+        SourceForm::FreeForm => Lexer::tokenize(src, file_id),
+        SourceForm::FixedForm => fixed::tokenize_fixed_source_view(src, file_id),
+    };
+    result.map_err(|error| display_source_view_error(src, error))
+}
+
+fn display_source_view_error(src: &str, mut error: LexError) -> LexError {
+    if !error.msg.starts_with("unexpected character") {
+        return error;
+    }
+    let Some(line) = src
+        .lines()
+        .nth(error.span.start.line.saturating_sub(1) as usize)
+    else {
+        return error;
+    };
+    let offset = error.span.start.col.saturating_sub(1) as usize;
+    if offset > line.len() || !line.is_char_boundary(offset) {
+        return error;
+    }
+    let suffix = &line[offset..];
+    let context = error
+        .msg
+        .split_once(':')
+        .map_or("unexpected character", |v| v.0);
+    error.msg = if let Some(byte) = crate::source_bytes::leading_invalid_byte(suffix) {
+        format!("{context}: invalid source byte 0x{byte:02x}")
+    } else if let Some(ch) = crate::source_bytes::leading_display_char(suffix) {
+        format!("{context}: '{ch}'")
+    } else {
+        error.msg
+    };
+    error
+}
+
 // ---- Free-form lexer ----
 
 /// Fortran free-form lexer.
@@ -693,7 +735,7 @@ impl<'a> Lexer<'a> {
         if ch == b'!' {
             let mut text = String::new();
             while !self.at_end() && self.peek() != b'\n' {
-                text.push(self.advance() as char);
+                text.push(self.advance_utf8_char());
             }
             return Ok(Token {
                 kind: TokenKind::Comment,

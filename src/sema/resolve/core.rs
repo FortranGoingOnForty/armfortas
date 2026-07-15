@@ -1655,7 +1655,7 @@ fn eval_const_char_expr_with_params(
 ) -> Option<String> {
     use crate::ast::expr::Expr;
     match &expr.node {
-        Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::StringLiteral { value, .. } => Some(value.source_view().into_owned()),
         Expr::Name { name } => const_char_params.get(&name.to_lowercase()).cloned(),
         Expr::ParenExpr { inner } => {
             eval_const_char_expr_with_params(inner, const_params, const_char_params)
@@ -1733,7 +1733,7 @@ fn eval_const_char_expr_in_scope(
 ) -> Option<String> {
     use crate::ast::expr::Expr;
     match &expr.node {
-        Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::StringLiteral { value, .. } => Some(value.source_view().into_owned()),
         Expr::Name { name } => {
             let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
             if sym.attrs.parameter {

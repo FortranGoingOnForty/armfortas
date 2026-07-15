@@ -787,7 +787,10 @@ fn eval_const_int_expr(
                         return None;
                     };
                     if let Expr::StringLiteral { value, .. } = &e.node {
-                        let name = value.trim_end_matches(' ');
+                        let bytes = value.as_bytes();
+                        let name = std::str::from_utf8(bytes.as_ref())
+                            .ok()?
+                            .trim_end_matches(' ');
                         Some(
                             if name.eq_ignore_ascii_case("default")
                                 || name.eq_ignore_ascii_case("ascii")
@@ -970,7 +973,7 @@ fn eval_const_field_char_expr(
     use crate::ast::expr::Expr;
 
     match &expr.node {
-        Expr::StringLiteral { value, .. } => Some(value.clone()),
+        Expr::StringLiteral { value, .. } => Some(value.source_view().into_owned()),
         Expr::Name { name } => const_char_params.get(&name.to_lowercase()).cloned(),
         Expr::ComponentAccess { base, component } => {
             let Expr::Name { name } = &base.node else {

@@ -10,13 +10,13 @@ pub mod diag;
 pub mod elf_crt;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{detect_source_form, tokenize, SourceForm};
+use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
 use crate::parser::Parser;
 use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
@@ -1333,7 +1333,185 @@ pub fn execute(opts: &Options) -> Result<(), String> {
     }
 }
 
+fn source_form_for_input(opts: &Options, input: &Path) -> SourceForm {
+    match opts.source_form_override {
+        Some(SourceFormOverride::Free) => SourceForm::FreeForm,
+        Some(SourceFormOverride::Fixed) => SourceForm::FixedForm,
+        None => detect_source_form(&input.to_string_lossy()),
+    }
+}
+
+fn preproc_config_for_input(
+    opts: &Options,
+    input: &Path,
+    source_form: SourceForm,
+) -> crate::preprocess::PreprocConfig {
+    let mut config = crate::preprocess::PreprocConfig {
+        filename: input.to_str().unwrap_or("<input>").to_string(),
+        fixed_form: matches!(source_form, SourceForm::FixedForm),
+        cpp_compat: opts.cpp_compat,
+        // Share `-I` paths with the preprocessor so `#include "foo.inc"`
+        // can find headers after searching relative to the current file.
+        include_paths: opts.module_search_paths.clone(),
+        ..crate::preprocess::PreprocConfig::for_target(&opts.target)
+    };
+    for (name, value) in &opts.preprocessor_defines {
+        config
+            .defines
+            .insert(name.clone(), crate::preprocess::MacroDef::object(value));
+    }
+    config
+}
+
 /// Compile a Fortran source file through the full pipeline.
+fn render_preprocessed_diagnostic(
+    preprocessed: &crate::preprocess::PreprocOutput,
+    span: Span,
+    level: diag::Level,
+    message: &str,
+) {
+    let resolved = preprocessed.resolve_span(span);
+    let span_len = if resolved.source_span.end.line == resolved.source_span.start.line
+        && resolved.source_span.end.col > resolved.source_span.start.col
+    {
+        (resolved.source_span.end.col - resolved.source_span.start.col) as usize
+    } else {
+        1
+    };
+    diag::render_mapped(
+        resolved.filename,
+        resolved.source,
+        resolved.display_span,
+        resolved.source_span,
+        level,
+        message,
+        span_len,
+    );
+}
+
+fn write_stdout_bytes(bytes: &[u8]) -> Result<(), String> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    std::io::Write::write_all(&mut stdout, bytes)
+        .map_err(|e| format!("cannot write standard output: {}", e))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => normalized.push(component.as_os_str()),
+            },
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn path_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn path_anchor_len(components: &[Component<'_>]) -> Option<usize> {
+    match components {
+        [Component::Prefix(_), Component::RootDir, ..] => Some(2),
+        [Component::RootDir, ..] => Some(1),
+        _ => None,
+    }
+}
+
+fn relative_path_with_shared_parent(input: &Path, cwd: &Path) -> Option<PathBuf> {
+    let input_components = input.components().collect::<Vec<_>>();
+    let cwd_components = cwd.components().collect::<Vec<_>>();
+    let input_anchor_len = path_anchor_len(&input_components)?;
+    let cwd_anchor_len = path_anchor_len(&cwd_components)?;
+    if input_anchor_len != cwd_anchor_len
+        || input_components[..input_anchor_len]
+            .iter()
+            .copied()
+            .zip(cwd_components[..cwd_anchor_len].iter().copied())
+            .any(|(left, right)| !path_components_equal(left, right))
+    {
+        return None;
+    }
+
+    let mut common = input_anchor_len;
+    while common < input_components.len()
+        && common < cwd_components.len()
+        && path_components_equal(input_components[common], cwd_components[common])
+    {
+        common += 1;
+    }
+
+    // Do not encode unrelated absolute hierarchies merely because they share
+    // a filesystem root. A meaningful common parent keeps build/source sibling
+    // layouts reproducible while unrelated roots fall back to the basename.
+    if common == input_anchor_len && common < cwd_components.len() {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in &cwd_components[common..] {
+        relative.push("..");
+    }
+    for component in &input_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+fn module_source_provenance_from_absolute(input: &Path, cwd: &Path) -> String {
+    let cwd = normalize_path_lexically(cwd);
+    let input = normalize_path_lexically(input);
+
+    relative_path_with_shared_parent(&input, &cwd)
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| {
+            relative
+                .iter()
+                .map(|component| component.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .or_else(|| {
+            input
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "source".to_string())
+}
+
+fn module_source_provenance(input: &Path) -> String {
+    let fallback = || {
+        input
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "source".to_string())
+    };
+    let Ok(input) = std::path::absolute(input) else {
+        return fallback();
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return fallback();
+    };
+    module_source_provenance_from_absolute(&input, &cwd)
+}
+
 pub fn compile(opts: &Options) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
@@ -1356,26 +1534,18 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!(" reading: {}", opts.input.display());
     }
     let phase = phases.start("read");
-    // Fortran source files in the wild are not always valid UTF-8 — Latin-1
-    // and stray bytes appear in comments or string literals.  gfortran/flang
-    // both accept non-UTF-8 sources; mirror that by reading raw bytes and
-    // decoding lossily so invalid sequences become U+FFFD instead of an I/O
-    // failure.
+    // Keep exact bytes for preprocessing and a marker-free display view for
+    // source-limit diagnostics emitted before preprocessing.
     let raw = fs::read(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
-    let source = match String::from_utf8(raw) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
+    let source_provenance = module_source_provenance(&opts.input);
+    let source =
+        crate::source_bytes::display_source_view(&crate::source_bytes::to_source_view(&raw));
     phase.end(&mut phases);
     let file_str = opts.input.display().to_string();
 
     // 2. Preprocess.
-    let source_form = match opts.source_form_override {
-        Some(SourceFormOverride::Free) => SourceForm::FreeForm,
-        Some(SourceFormOverride::Fixed) => SourceForm::FixedForm,
-        None => detect_source_form(&opts.input.to_string_lossy()),
-    };
+    let source_form = source_form_for_input(opts, &opts.input);
     if opts.std == Some(crate::sema::validate::FortranStandard::F77)
         && matches!(source_form, SourceForm::FreeForm)
     {
@@ -1430,37 +1600,23 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     let phase = phases.start("preprocess");
-    let mut pp_config = crate::preprocess::PreprocConfig {
-        filename: opts.input.to_str().unwrap_or("<input>").to_string(),
-        fixed_form: matches!(source_form, SourceForm::FixedForm),
-        cpp_compat: opts.cpp_compat,
-        // Share `-I` paths with the preprocessor so `#include "foo.inc"`
-        // can find headers (e.g. stdlib's `include/macros.inc`).  The
-        // resolver searches relative-to-current-file first, then this
-        // list — both gfortran and flang do the same.
-        include_paths: opts.module_search_paths.clone(),
-        ..crate::preprocess::PreprocConfig::for_target(&opts.target)
-    };
-    for (name, value) in &opts.preprocessor_defines {
-        pp_config
-            .defines
-            .insert(name.clone(), crate::preprocess::MacroDef::object(value));
-    }
+    let pp_config = preproc_config_for_input(opts, &opts.input, source_form);
     let pp_result =
-        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
+        crate::preprocess::preprocess_bytes(&raw, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
-    let included_files = pp_result.included_files;
-    let preprocessed = pp_result.text;
+    let included_files = &pp_result.included_files;
+    let preprocessed = pp_result.text.as_str();
 
     if opts.preprocess_only {
+        let preprocessed_bytes = pp_result.bytes();
         if opts.output.is_none() {
-            print!("{}", preprocessed);
+            write_stdout_bytes(&preprocessed_bytes)?;
         } else {
             let out = opts.output_path();
             if out.as_os_str() == "-" {
-                print!("{}", preprocessed);
+                write_stdout_bytes(&preprocessed_bytes)?;
             } else {
-                fs::write(&out, &preprocessed)
+                fs::write(&out, &preprocessed_bytes)
                     .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
             }
             if opts.verbose {
@@ -1478,17 +1634,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 3. Lex.
     let phase = phases.start("lex");
-    let tokens = match tokenize(&preprocessed, 0, source_form) {
+    let tokens = match tokenize_source_view(preprocessed, 0, source_form) {
         Ok(tokens) => tokens,
         Err(e) => {
             phase.end(&mut phases);
-            diag::render(
-                &file_str,
-                &source,
+            render_preprocessed_diagnostic(
+                &pp_result,
                 e.span,
                 diag::Level::Error,
                 &format!("lexer error: {}", e.msg),
-                1,
             );
             phases.report();
             return Err(format!(
@@ -1513,24 +1667,16 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 4. Parse.
     let phase = phases.start("parse");
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new_source_view(&tokens);
     let mut units = match parser.parse_file() {
         Ok(units) => units,
         Err(e) => {
             phase.end(&mut phases);
-            let span_len =
-                if e.span.end.line == e.span.start.line && e.span.end.col > e.span.start.col {
-                    (e.span.end.col - e.span.start.col) as usize
-                } else {
-                    1
-                };
-            diag::render(
-                &file_str,
-                &source,
+            render_preprocessed_diagnostic(
+                &pp_result,
                 e.span,
                 diag::Level::Error,
                 &format!("parse error: {}", e.msg),
-                span_len,
             );
             phases.report();
             return Err(format!(
@@ -1556,16 +1702,19 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 5. Semantic analysis.
     let phase = phases.start("sema");
     let target_layout = crate::target::TargetLayout::of(&opts.target);
-    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths, target_layout)
-        .map_err(|e| {
-            format!(
-                "{}:{}:{}: {}",
-                opts.input.display(),
-                e.span.start.line,
-                e.span.start.col,
-                e.msg
-            )
-        })?;
+    let resolve_result =
+        match resolve::resolve_file(&units, &opts.module_search_paths, target_layout) {
+            Ok(result) => result,
+            Err(e) => {
+                phase.end(&mut phases);
+                render_preprocessed_diagnostic(&pp_result, e.span, diag::Level::Error, &e.msg);
+                phases.report();
+                return Err(format!(
+                    "aborting due to errors in {}",
+                    opts.input.display()
+                ));
+            }
+        };
     let mut st = resolve_result.st;
     if opts.force_implicit_none {
         st.force_implicit_none_all_units();
@@ -1593,15 +1742,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             validate::DiagKind::Error => diag::Level::Error,
             validate::DiagKind::Warning => diag::Level::Warning,
         };
-        // span_len is best-effort: end.col >= start.col on the same
-        // line gives a nice underline, otherwise default to 1.
-        let span_len = if d.span.end.line == d.span.start.line && d.span.end.col > d.span.start.col
-        {
-            (d.span.end.col - d.span.start.col) as usize
-        } else {
-            1
-        };
-        diag::render(&file_str, &source, d.span, level, &d.msg, span_len);
+        render_preprocessed_diagnostic(&pp_result, d.span, level, &d.msg);
         match d.kind {
             validate::DiagKind::Error => had_error = true,
             validate::DiagKind::Warning if opts.warn_as_error => had_error = true,
@@ -1731,7 +1872,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
-        write_dependency_file(opts, &out, &included_files)?;
+        write_dependency_file(opts, &out, included_files)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -1816,8 +1957,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
                 let amod_text = crate::sema::amod::write_amod(
                     name,
-                    opts.input.to_str().unwrap_or(""),
-                    &source,
+                    &source_provenance,
+                    &raw,
                     &st,
                     mod_scope_id,
                     &module_globals,
@@ -1867,8 +2008,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                     })?;
             let interface_text = crate::sema::amod::write_amod(
                 name,
-                opts.input.to_str().unwrap_or(""),
-                &source,
+                &source_provenance,
+                &raw,
                 &st,
                 submodule_scope_id,
                 &module_globals,
@@ -1887,7 +2028,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
                 crate::sema::amod::SMOD_VERSION,
                 env!("CARGO_PKG_VERSION"),
-                opts.input.to_str().unwrap_or(""),
+                source_provenance,
                 parent_spec,
                 name_key,
                 interface_name,
@@ -1961,7 +2102,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             }
         }
         if opts.emit_obj {
-            write_dependency_file(opts, &obj_path, &included_files)?;
+            write_dependency_file(opts, &obj_path, included_files)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
@@ -2010,7 +2151,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     if opts.emit_obj {
-        write_dependency_file(opts, &obj_path, &included_files)?;
+        write_dependency_file(opts, &obj_path, included_files)?;
         phases.report();
         return Ok(());
     }
@@ -2447,7 +2588,11 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
     // Scan dependencies (sources only).
     let file_deps: Vec<dep_scan::FileDeps> = source_inputs
         .iter()
-        .map(|p| dep_scan::scan_file(p))
+        .map(|p| {
+            let source_form = source_form_for_input(opts, p);
+            let pp_config = preproc_config_for_input(opts, p, source_form);
+            dep_scan::scan_file(p, &pp_config)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Topological sort.
@@ -2689,6 +2834,64 @@ fn find_workspace_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn normalizes_module_source_provenance() {
+        let cwd = std::env::temp_dir().join("armfortas-provenance-root");
+
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                &normalize_path_lexically(&cwd.join("./src/../parent.f90")),
+                &cwd,
+            ),
+            "parent.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(&cwd.join("src/child.f90"), &cwd),
+            "src/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(&cwd.join("../outside/child.f90"), &cwd),
+            "../outside/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(Path::new("/unrelated/child.f90"), &cwd),
+            "child.f90"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_windows_module_source_provenance() {
+        let cwd = Path::new(r"C:\work\project\build");
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                Path::new(r"c:\work\project\src\child.f90"),
+                cwd,
+            ),
+            "../src/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(Path::new(r"D:\src\child.f90"), cwd),
+            "child.f90"
+        );
+
+        let unc_cwd = Path::new(r"\\server\share\project\build");
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                Path::new(r"\\SERVER\SHARE\project\src\child.f90"),
+                unc_cwd,
+            ),
+            "../src/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                Path::new(r"\\server\other\project\src\child.f90"),
+                unc_cwd,
+            ),
+            "child.f90"
+        );
+    }
 
     #[test]
     fn parses_os_optimization_flag() {

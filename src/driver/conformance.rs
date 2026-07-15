@@ -61,22 +61,24 @@ pub fn find_over_cap_statement(source: &str, form: SourceForm) -> Option<(Span, 
     let lines: Vec<&str> = source.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
         let line_no = idx as u32 + 1;
+        let is_gap = match form {
+            SourceForm::FreeForm => is_free_form_continuation_gap(line),
+            SourceForm::FixedForm => is_fixed_form_continuation_gap(line),
+        };
+        if is_gap {
+            continue;
+        }
         if stmt_chars == 0 {
             stmt_start = line_no;
         }
         stmt_chars += line.chars().count();
         let continued = match form {
             SourceForm::FreeForm => line_continues(line, &mut in_string),
-            SourceForm::FixedForm => lines.get(idx + 1).is_some_and(|next| {
-                let mut chars = next.chars();
-                let c6 = chars.nth(5);
-                // Continuation line: nonblank, non-'0' in column 6 of a
-                // non-comment line.
-                !matches!(
-                    next.chars().next(),
-                    Some('c') | Some('C') | Some('*') | Some('!')
-                ) && matches!(c6, Some(ch) if ch != ' ' && ch != '0')
-            }),
+            SourceForm::FixedForm => lines
+                .iter()
+                .skip(idx + 1)
+                .find(|next| !is_fixed_form_continuation_gap(next))
+                .is_some_and(|next| crate::lexer::fixed::is_continuation_line(next)),
         };
         if !continued {
             if stmt_chars > STMT_HARD_CAP {
@@ -171,6 +173,9 @@ pub fn check_source_limits(
         }
 
         // ---- statement accounting ----
+        if is_free_form_continuation_gap(line) {
+            continue;
+        }
         if stmt_chars == 0 {
             stmt_start = line_no;
         }
@@ -205,6 +210,19 @@ pub fn check_source_limits(
         }
     }
     warnings
+}
+
+fn is_free_form_continuation_gap(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.is_empty() || trimmed.starts_with('!')
+}
+
+fn is_fixed_form_continuation_gap(line: &str) -> bool {
+    line.trim().is_empty()
+        || matches!(
+            line.chars().next(),
+            Some('c') | Some('C') | Some('*') | Some('!')
+        )
 }
 
 /// Free-form continuation test: the line's last significant character
@@ -248,6 +266,21 @@ fn line_continues(line: &str, in_string: &mut Option<char>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn continued_sum_with_comment_gap(limit: usize) -> String {
+        let chunk = "+1".repeat(limit / 4 + 1);
+        format!("x = 0 {chunk} &\n! legal continuation gap\n\n  & {chunk}\n")
+    }
+
+    fn fixed_form_sum_with_comment_gap(limit: usize) -> String {
+        let chunk = "+1".repeat(limit / 4 + 1);
+        format!("      x = 0 {chunk}\nC legal continuation gap\n\n     + {chunk}\n")
+    }
+
+    fn tab_form_sum_with_comment_gap(limit: usize) -> String {
+        let chunk = "+1".repeat(limit / 4 + 1);
+        format!("\tx = 0 {chunk}\nC legal continuation gap\n\n\t1{chunk}\n")
+    }
 
     #[test]
     fn hard_cap_finds_oversized_statements_in_both_forms() {
@@ -301,6 +334,38 @@ y = 2
             SourceForm::FreeForm
         )
         .is_none());
+    }
+
+    #[test]
+    fn comment_gaps_do_not_bypass_the_hard_cap() {
+        let src = continued_sum_with_comment_gap(STMT_HARD_CAP);
+        let (span, chars) = find_over_cap_statement(&src, SourceForm::FreeForm)
+            .expect("comment and blank gaps must not split a continued statement");
+        assert_eq!(span.start.line, 1);
+        assert!(chars > STMT_HARD_CAP);
+        let source_chars: usize = src.lines().map(|line| line.chars().count()).sum();
+        let statement_chars: usize = src
+            .lines()
+            .filter(|line| !is_free_form_continuation_gap(line))
+            .map(|line| line.chars().count())
+            .sum();
+        assert_eq!(chars, statement_chars);
+        assert!(
+            source_chars > chars,
+            "comment text must not count as statement text"
+        );
+
+        let src = fixed_form_sum_with_comment_gap(STMT_HARD_CAP);
+        let (span, chars) = find_over_cap_statement(&src, SourceForm::FixedForm)
+            .expect("fixed-form comment and blank gaps must preserve continuation");
+        assert_eq!(span.start.line, 1);
+        assert!(chars > STMT_HARD_CAP);
+
+        let src = tab_form_sum_with_comment_gap(STMT_HARD_CAP);
+        let (span, chars) = find_over_cap_statement(&src, SourceForm::FixedForm)
+            .expect("tab-form continuation must use the fixed-form lexer contract");
+        assert_eq!(span.start.line, 1);
+        assert!(chars > STMT_HARD_CAP);
     }
 
     fn check(src: &str, std: FortranStandard) -> Vec<LimitWarning> {
@@ -386,6 +451,26 @@ y = 2
         assert!(check(&src, FortranStandard::F2018)
             .iter()
             .all(|w| !w.msg.contains("statement")));
+    }
+
+    #[test]
+    fn comment_gaps_do_not_bypass_the_f2023_statement_limit() {
+        let src = continued_sum_with_comment_gap(STMT_LIMIT);
+        let warnings: Vec<_> = check(&src, FortranStandard::F2023)
+            .into_iter()
+            .filter(|warning| warning.msg.contains("statement"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].span.start.line, 1);
+    }
+
+    #[test]
+    fn comment_gap_lines_still_obey_the_physical_line_limit() {
+        let src = format!("x = 1 &\n!{}\n  & + 1\n", "x".repeat(10_000));
+        let warnings = check(&src, FortranStandard::F2023);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].span.start.line, 2);
+        assert!(warnings[0].msg.contains("line is 10001 characters long"));
     }
 
     #[test]

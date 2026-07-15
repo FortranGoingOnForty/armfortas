@@ -1919,6 +1919,21 @@ mod tests {
     }
 
     #[test]
+    fn public_string_literal_preserves_reserved_unicode_scalars() {
+        use crate::ast::expr::Expr;
+        assert_eq!(
+            literal_type(&Expr::StringLiteral {
+                value: "\u{f0000}\u{f01ff}".into(),
+                kind: None,
+            }),
+            FortranType::Character {
+                kind: 1,
+                len: CharLen::Known(8),
+            }
+        );
+    }
+
+    #[test]
     fn literal_type_logical() {
         use crate::ast::expr::Expr;
         assert_eq!(

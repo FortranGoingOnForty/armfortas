@@ -601,7 +601,7 @@ pub(crate) fn lower_expr_full(
             }
         }
         Expr::LogicalLiteral { value, .. } => b.const_bool(*value),
-        Expr::StringLiteral { value, .. } => b.const_string(value.as_bytes()),
+        Expr::StringLiteral { value, .. } => b.const_string(value.as_bytes().as_ref()),
         Expr::BozLiteral { text, base } => {
             // BOZ literals: strip prefix letter and quotes, parse digit string.
             let radix = match base {
@@ -2288,9 +2288,9 @@ pub(crate) fn lower_expr_full(
                     if let Some(arg_expr) = arg_expr {
                         if let crate::ast::expr::Expr::StringLiteral { value, .. } = &arg_expr.node
                         {
-                            return b.const_i32(
-                                super::const_scalar::selected_char_kind_value(value) as i32,
-                            );
+                            return b.const_i32(super::const_scalar::selected_char_kind_value(
+                                value.to_string_lossy().as_ref(),
+                            ) as i32);
                         }
                         // Non-literal NAME: evaluate at runtime (was an
                         // undefined-symbol link error).

@@ -398,6 +398,11 @@ impl<'a> Parser<'a> {
         let span = prefix_span
             .map(|prefix| span_from_to(prefix, tok.span))
             .unwrap_or(tok.span);
+        let value = if self.source_view {
+            crate::ast::expr::StringLiteralValue::from_source_view(value)
+        } else {
+            value.into()
+        };
         Ok(Spanned::new(Expr::StringLiteral { value, kind }, span))
     }
 
@@ -915,6 +920,27 @@ mod tests {
             }
             other => panic!("expected string literal, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn public_parser_preserves_reserved_unicode_literal_bytes() {
+        let expression = parse_expression("'\u{f0000}\u{f01ff}'");
+        let Expr::StringLiteral { value, .. } = expression.node else {
+            panic!("expected string literal");
+        };
+        assert_eq!(value.as_bytes().as_ref(), "\u{f0000}\u{f01ff}".as_bytes());
+    }
+
+    #[test]
+    fn source_view_parser_restores_non_utf8_literal_bytes() {
+        let view = crate::source_bytes::to_source_view(b"'A\xffB'");
+        let tokens = Lexer::tokenize(&view, 0).unwrap();
+        let mut parser = Parser::new_source_view(&tokens);
+        let expression = parser.parse_expr().unwrap();
+        let Expr::StringLiteral { value, .. } = expression.node else {
+            panic!("expected string literal");
+        };
+        assert_eq!(value.as_bytes().as_ref(), b"A\xffB");
     }
     #[test]
     fn logical_true() {

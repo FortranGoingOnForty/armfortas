@@ -56,26 +56,26 @@ pub fn emit_function(mf: &MachineFunction) -> String {
                 ConstPoolEntry::Bytes(b) => {
                     writeln!(out, ".p2align 3").unwrap();
                     writeln!(out, "{}:", label).unwrap();
-                    write!(out, "    .ascii \"").unwrap();
-                    for &byte in b {
-                        match byte {
-                            b'\\' => write!(out, "\\\\").unwrap(),
-                            b'"' => write!(out, "\\\"").unwrap(),
-                            b'\n' => write!(out, "\\n").unwrap(),
-                            b'\t' => write!(out, "\\t").unwrap(),
-                            b if b.is_ascii_graphic() || b == b' ' => {
-                                write!(out, "{}", b as char).unwrap();
-                            }
-                            b => write!(out, "\\x{:02x}", b).unwrap(),
-                        }
-                    }
-                    writeln!(out, "\"").unwrap();
+                    emit_const_pool_bytes(&mut out, b);
                 }
             }
         }
     }
 
     out
+}
+
+fn emit_const_pool_bytes(out: &mut String, bytes: &[u8]) {
+    for chunk in bytes.chunks(16) {
+        write!(out, "    .byte ").unwrap();
+        for (index, byte) in chunk.iter().enumerate() {
+            if index > 0 {
+                write!(out, ",").unwrap();
+            }
+            write!(out, "{}", byte).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
 }
 
 /// Format `OP sp, sp, #N` (or `add x29, sp, #N`), falling back
@@ -1412,6 +1412,19 @@ mod tests {
         let asm = emit_simple(|b| b.ret_void());
         assert!(asm.contains(".globl _test"), "missing .globl: {}", asm);
         assert!(asm.contains("_test:"), "missing function label: {}", asm);
+    }
+
+    #[test]
+    fn emit_byte_constant_pool_without_ambiguous_escapes() {
+        let asm = emit_simple(|b| {
+            b.const_string(b"A\xffB");
+            b.ret_void();
+        });
+        assert!(
+            asm.contains("    .byte 65,255,66"),
+            "byte constant was not emitted unambiguously: {asm}"
+        );
+        assert!(!asm.contains("\\xffB"), "ambiguous hex escape: {asm}");
     }
 
     /// Verify that functions with frame sizes > 4095 use x16 scratch

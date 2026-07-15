@@ -14,6 +14,7 @@ pub mod parser;
 pub mod preprocess;
 pub mod runtime;
 pub mod sema;
+pub(crate) mod source_bytes;
 pub mod target;
 pub mod testing;
 
