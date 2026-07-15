@@ -430,14 +430,19 @@ impl Unit {
         if let Some(token) = self.read_tokens.pop_front() {
             return Ok(Some(token));
         }
-        // Read a new line and tokenize.
-        let line = self.read_line()?;
-        let tokens = tokenize_list_directed_record(&line);
-        if tokens.is_empty() {
-            return Ok(None); // EOF or blank line
+
+        loop {
+            let line = self.read_line()?;
+            if line.is_empty() {
+                return Ok(None);
+            }
+            let tokens = tokenize_list_directed_record(&line);
+            if tokens.is_empty() {
+                continue;
+            }
+            self.read_tokens = tokens;
+            return Ok(self.read_tokens.pop_front());
         }
-        self.read_tokens = tokens;
-        Ok(self.read_tokens.pop_front())
     }
 
     fn flush(&mut self) -> io::Result<()> {
