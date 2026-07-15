@@ -172,6 +172,38 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn combined_compile_rejects_duplicate_module_definitions() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("first.f90"),
+        "module shared_name\nend module shared_name\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("second.f90"),
+        "module ShArEd_NaMe\nend module ShArEd_NaMe\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "first.f90", "second.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(!result.status.success(), "duplicate modules were accepted");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("duplicate module definition 'shared_name'")
+            && stderr.contains("first.f90")
+            && stderr.contains("second.f90"),
+        "unexpected duplicate-module diagnostic:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_compile_preserves_target_and_preprocessor_options() {
     let compiler = find_compiler();
     let dir = unique_dir();

@@ -74,8 +74,19 @@ pub fn resolve_file(
     crate::sema::intrinsic_modules::register_intrinsic_modules(&mut st);
 
     // First pass: create module scopes so USE can find them.
+    let mut module_definitions = HashMap::new();
     for unit in units {
         if let ProgramUnit::Module { name, .. } = &unit.node {
+            let key = name.to_ascii_lowercase();
+            if let Some(first_span) = module_definitions.insert(key, unit.span) {
+                return Err(SemaError {
+                    span: unit.span,
+                    msg: format!(
+                        "duplicate module program unit '{}' (first defined at {}:{})",
+                        name, first_span.start.line, first_span.start.col
+                    ),
+                });
+            }
             st.push_scope(ScopeKind::Module(name.clone()));
             st.pop_scope();
         }
@@ -3237,6 +3248,16 @@ end program
             .use_associations
             .iter()
             .any(|association| association.source_scope == source_scope));
+    }
+
+    #[test]
+    fn duplicate_module_units_are_rejected_case_insensitively() {
+        let err = resolve_error("module shared_name\nend module\nmodule ShArEd_NaMe\nend module\n");
+        assert!(
+            err.msg
+                .contains("duplicate module program unit 'ShArEd_NaMe'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -164,10 +164,22 @@ pub fn scan_file(
 /// Errors on circular dependencies.
 pub fn resolve_compilation_order(files: &[FileDeps]) -> Result<Vec<usize>, String> {
     // Build: module_name → file_index that defines it.
-    let mut module_to_file: HashMap<&str, usize> = HashMap::new();
+    let mut module_to_file: HashMap<String, usize> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
         for def in &f.defines {
-            module_to_file.insert(def.as_str(), i);
+            let key = def.to_ascii_lowercase();
+            if let Some(&first) = module_to_file.get(&key) {
+                if first != i {
+                    return Err(format!(
+                        "duplicate module definition '{}': '{}' and '{}' both define it",
+                        key,
+                        files[first].path.display(),
+                        f.path.display()
+                    ));
+                }
+            } else {
+                module_to_file.insert(key, i);
+            }
         }
     }
 
@@ -178,7 +190,7 @@ pub fn resolve_compilation_order(files: &[FileDeps]) -> Result<Vec<usize>, Strin
 
     for (i, f) in files.iter().enumerate() {
         for used in &f.uses {
-            if let Some(&j) = module_to_file.get(used.as_str()) {
+            if let Some(&j) = module_to_file.get(&used.to_ascii_lowercase()) {
                 if i != j {
                     dependents[j].push(i);
                     in_degree[i] += 1;
@@ -467,5 +479,28 @@ mod tests {
         let pos_a = order.iter().position(|&i| i == 3).unwrap();
         assert!(pos_d < pos_a);
         assert_eq!(order.len(), 4);
+    }
+
+    #[test]
+    fn topo_sort_rejects_duplicate_module_definitions() {
+        let files = vec![
+            FileDeps {
+                path: "first.f90".into(),
+                defines: vec!["shared_name".into()],
+                uses: vec![],
+                submodule_of: None,
+            },
+            FileDeps {
+                path: "second.f90".into(),
+                defines: vec!["SHARED_NAME".into()],
+                uses: vec![],
+                submodule_of: None,
+            },
+        ];
+
+        let err = resolve_compilation_order(&files).unwrap_err();
+        assert!(err.contains("duplicate module definition 'shared_name'"));
+        assert!(err.contains("first.f90"));
+        assert!(err.contains("second.f90"));
     }
 }
