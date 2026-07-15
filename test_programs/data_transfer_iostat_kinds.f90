@@ -10,6 +10,8 @@ program data_transfer_iostat_kinds
     integer(4) :: spacer
     integer(8) :: ios8
     integer(8) :: guard8
+    integer(16) :: ios16
+    integer(16) :: guard16
   end type status_box
 
   type(status_box) :: status
@@ -27,6 +29,9 @@ program data_transfer_iostat_kinds
   call reset_status(status)
   write(unit, *, iostat=status%ios8) 33
   call check_kind8(status, 3)
+  call reset_status(status)
+  write(unit, *, iostat=status%ios16) 44
+  call check_kind16(status, 13)
 
   rewind(unit)
   call reset_status(status)
@@ -41,6 +46,10 @@ program data_transfer_iostat_kinds
   read(unit, *, iostat=status%ios8) value
   call check_kind8(status, 6)
   if (value /= 33) error stop 6
+  call reset_status(status)
+  read(unit, *, iostat=status%ios16) value
+  call check_kind16(status, 14)
+  if (value /= 44) error stop 14
   close(unit)
 
   call reset_status(status)
@@ -52,6 +61,9 @@ program data_transfer_iostat_kinds
   call reset_status(status)
   write(buffer, *, iostat=status%ios8) 66
   call check_kind8(status, 9)
+  call reset_status(status)
+  write(buffer, *, iostat=status%ios16) 77
+  call check_kind16(status, 15)
 
   buffer = '77'
   call reset_status(status)
@@ -68,6 +80,11 @@ program data_transfer_iostat_kinds
   read(buffer, *, iostat=status%ios8) value
   call check_kind8(status, 12)
   if (value /= 99) error stop 12
+  buffer = '111'
+  call reset_status(status)
+  read(buffer, *, iostat=status%ios16) value
+  call check_kind16(status, 16)
+  if (value /= 111) error stop 16
 
   print *, 'ok'
 
@@ -83,6 +100,8 @@ contains
     value%spacer = 4444
     value%ios8 = 4294967296_8
     value%guard8 = 88
+    value%ios16 = 1234567890123456789_16
+    value%guard16 = 1616_16
   end subroutine reset_status
 
   subroutine check_kind1(value, tag)
@@ -92,7 +111,8 @@ contains
     if (value%ios1 /= 0 .or. value%guard1 /= 11 .or. &
         value%ios2 /= 777 .or. value%guard2 /= 22 .or. &
         value%spacer /= 4444 .or. value%ios8 /= 4294967296_8 .or. &
-        value%guard8 /= 88) then
+        value%guard8 /= 88 .or. value%ios16 /= 1234567890123456789_16 .or. &
+        value%guard16 /= 1616_16) then
       print *, 'kind 1 status corruption', tag
       error stop 101
     end if
@@ -105,7 +125,8 @@ contains
     if (value%ios1 /= 77 .or. value%guard1 /= 11 .or. &
         value%ios2 /= 0 .or. value%guard2 /= 22 .or. &
         value%spacer /= 4444 .or. value%ios8 /= 4294967296_8 .or. &
-        value%guard8 /= 88) then
+        value%guard8 /= 88 .or. value%ios16 /= 1234567890123456789_16 .or. &
+        value%guard16 /= 1616_16) then
       print *, 'kind 2 status corruption', tag
       error stop 102
     end if
@@ -117,10 +138,24 @@ contains
 
     if (value%ios1 /= 77 .or. value%guard1 /= 11 .or. &
         value%ios2 /= 777 .or. value%guard2 /= 22 .or. &
-        value%spacer /= 4444 .or. value%ios8 /= 0 .or. value%guard8 /= 88) then
+        value%spacer /= 4444 .or. value%ios8 /= 0 .or. value%guard8 /= 88 .or. &
+        value%ios16 /= 1234567890123456789_16 .or. value%guard16 /= 1616_16) then
       print *, 'kind 8 status corruption', tag
       error stop 108
     end if
   end subroutine check_kind8
+
+  subroutine check_kind16(value, tag)
+    type(status_box), intent(in) :: value
+    integer, intent(in) :: tag
+
+    if (value%ios1 /= 77 .or. value%guard1 /= 11 .or. &
+        value%ios2 /= 777 .or. value%guard2 /= 22 .or. &
+        value%spacer /= 4444 .or. value%ios8 /= 4294967296_8 .or. &
+        value%guard8 /= 88 .or. value%ios16 /= 0 .or. value%guard16 /= 1616_16) then
+      print *, 'kind 16 status corruption', tag
+      error stop 116
+    end if
+  end subroutine check_kind16
 
 end program data_transfer_iostat_kinds

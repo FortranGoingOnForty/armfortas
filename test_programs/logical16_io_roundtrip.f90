@@ -21,7 +21,7 @@ program logical16_io_roundtrip
   character(len=:), allocatable :: deferred_record
   integer :: unit, ios
   logical(16) :: source(2), internal_list(2), internal_fmt(2)
-  logical(16) :: external_list(2), external_fmt(2), sectioned(4)
+  logical(16) :: external_list(2), external_fmt(2), external_unformatted(2), sectioned(4)
   logical(16) :: matrix(3, 3), rank2_values(4)
   type(guarded_flag) :: guarded
 
@@ -128,6 +128,33 @@ program logical16_io_roundtrip
   if (ios /= 0) error stop 24
   if (.not. rank2_values(1) .or. rank2_values(2) .or. rank2_values(3) .or. &
       .not. rank2_values(4)) error stop 25
+
+  open(newunit=unit, file=path, status='replace', action='readwrite', form='unformatted')
+  ios = 77
+  write(unit, iostat=ios) source
+  if (ios /= 0) error stop 26
+  guarded%before = 333_16
+  guarded%value = .true.
+  guarded%after = 444_16
+  ios = 77
+  write(unit, iostat=ios) guarded%value
+  if (ios /= 0) error stop 27
+  rewind(unit)
+
+  external_unformatted = [.false., .true.]
+  ios = 77
+  read(unit, iostat=ios) external_unformatted
+  if (ios /= 0 .or. .not. external_unformatted(1) .or. external_unformatted(2)) &
+    error stop 28
+
+  guarded%before = 333_16
+  guarded%value = .false.
+  guarded%after = 444_16
+  ios = 77
+  read(unit, iostat=ios) guarded%value
+  if (ios /= 0 .or. .not. guarded%value) error stop 29
+  if (guarded%before /= 333_16 .or. guarded%after /= 444_16) error stop 30
+  close(unit, status='delete')
 
   print *, 'ok'
 end program logical16_io_roundtrip
