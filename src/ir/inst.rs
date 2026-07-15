@@ -817,6 +817,17 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         {
             true
         }
+        InstKind::IntExtend(value, IntWidth::I128, _)
+            if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
+        {
+            func.value_type(*value).is_some_and(|ty| {
+                matches!(
+                    ty,
+                    IrType::Bool
+                        | IrType::Int(IntWidth::I8 | IntWidth::I16 | IntWidth::I32 | IntWidth::I64)
+                )
+            })
+        }
         InstKind::ICmp(..) if uses_i128 => true,
         InstKind::Select(..) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
         InstKind::Call(callee, args) if inst_ty_has_i128 || uses_i128 => {
@@ -955,6 +966,26 @@ mod tests {
         assert!(
             module.i128_backend_o0_supported(),
             "runtime PrintInt with integer(16) should stay inside the supported O0 backend surface"
+        );
+    }
+
+    #[test]
+    fn narrow_integer_extensions_to_i128_are_supported_by_backend_gate() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut func = Function::new("main".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let signed = b.const_int(-1, IntWidth::I16);
+            let unsigned = b.const_bool(true);
+            b.int_extend(signed, IntWidth::I128, true);
+            b.int_extend(unsigned, IntWidth::I128, false);
+            b.ret_void();
+        }
+        module.add_function(func);
+
+        assert!(
+            module.i128_backend_o0_supported(),
+            "narrow signed and unsigned extensions should stay inside the supported O0 backend surface"
         );
     }
 
