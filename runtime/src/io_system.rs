@@ -4258,8 +4258,9 @@ enum FmtSink {
         desc: *mut u8,
     },
     /// Internal write whose target is a whole character array: each
-    /// formatted record goes into one element (truncated or blank-
-    /// padded to the element length). Elements after the last record
+    /// formatted record goes into one element (blank-padded to the
+    /// element length). Records longer than an element are rejected.
+    /// Elements after the last record
     /// written are left unchanged (F2023 12.6.4.8.3 leaves them
     /// undefined). Overflowing the array or targeting an unallocated
     /// one is an error — loud when no IOSTAT= is present.
@@ -4809,6 +4810,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     );
                                     std::process::exit(2);
                                 }
+                            } else if output.len() > buf_len {
+                                io_status = IOSTAT_EOR;
+                                io_msg = Some("end of record");
                             } else {
                                 write_to_buffer(
                                     buf,
@@ -4894,6 +4898,12 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                         );
                                         std::process::exit(2);
                                     }
+                                } else if records
+                                    .iter()
+                                    .any(|record| record.len() > elem_len as usize)
+                                {
+                                    io_status = IOSTAT_EOR;
+                                    io_msg = Some("end of record");
                                 } else {
                                     for (i, rec) in records.iter().enumerate() {
                                         write_to_buffer(
