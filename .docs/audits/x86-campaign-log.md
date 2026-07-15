@@ -102,6 +102,31 @@ Verification for the CI follow-up:
 - `cargo test -p armfortas --release --test compile_scaling_defop -- --nocapture`: passed.
 - `cargo test -p afs-as --test perf_sanity -- --nocapture`: passed locally with the macOS-only performance checks skip-gated on Linux.
 
+### Follow-on audit remediation checkpoint, 2026-07-15
+
+The ordered 162-finding campaign resumed at `AR15.md`. AR15 through AR27
+have merged on trunk in PRs #115 through #127. All ten ordered I/O-transfer
+findings in `AR28.md` are implemented on `remediate-28-io-transfers` and the
+branch is ready for hosted CI. `AR29.md` remains the next file and does not
+start until this branch merges.
+
+The I/O-transfer closeout covered kind-correct status storeback, logical and
+kind-16 transfers, list-directed and formatted input state, first-error and
+IOMSG propagation, internal-record bounds, NAMELIST EOF handling, stream
+positioning state, BACKSPACE/ENDFILE lowering, and the access-mode rules found
+by independent review. The review also drove statement-wide READ SIZE
+accumulation, sequential POS rejection, and NAMELIST WRITE IOMSG coverage.
+
+Verification for this checkpoint:
+
+- 1,647 compiler library tests and 236 runtime library tests passed.
+- The 810-program end-to-end matrix passed at `-O0`, `-O1`, `-O2`, `-O3`,
+  `-Os`, and `-Ofast`: 808 passed and the same two expected XFAILs remained
+  at every level.
+- Focused ARM64 assembler and kind-16 integration matrices passed.
+- The CI Clippy policy, formatting check, diff hygiene, and release workspace
+  build passed.
+
 The repo-root `verify-*` directories and `verify-audit-scratch/**` are
 preserved intentionally for audit traceability until the branch PR lands
 and CI confirms the committed state.
