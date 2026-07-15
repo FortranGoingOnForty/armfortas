@@ -1353,6 +1353,97 @@ pub extern "C" fn afs_list_write_end(
 
 // ---- Public C API: List-directed READ ----
 
+fn parse_logical_token(token: &str) -> Option<bool> {
+    let token = token.trim();
+    let token = token
+        .strip_prefix('.')
+        .and_then(|value| value.strip_suffix('.'))
+        .unwrap_or(token);
+
+    if token.eq_ignore_ascii_case("t") || token.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if token.eq_ignore_ascii_case("f") || token.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn store_logical_token(token: &str, val: *mut i32, iostat: *mut i32) -> bool {
+    let Some(value) = parse_logical_token(token) else {
+        return false;
+    };
+    write_i32_ptr(val, i32::from(value));
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+    true
+}
+
+fn store_formatted_logical_result(
+    result: Result<(FormatDesc, Vec<u8>), i32>,
+    val: *mut i32,
+    iostat: *mut i32,
+) {
+    match result {
+        Ok((FormatDesc::Logical { .. }, field)) => {
+            let field_text = String::from_utf8_lossy(&field);
+            if !store_logical_token(&field_text, val, iostat) {
+                set_read_status_or_exit(iostat, 1);
+            }
+        }
+        Ok(_) => set_read_status_or_exit(iostat, 1),
+        Err(code) => set_read_status_or_exit(iostat, code),
+    }
+}
+
+/// Read a logical value (list-directed or unformatted) from a unit.
+#[no_mangle]
+pub extern "C" fn afs_read_logical(unit: i32, val: *mut i32, iostat: *mut i32) {
+    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(u) = state.get_unit(unit) {
+        if let Some(bytes) = u.read_buffer_take(4) {
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&bytes);
+            write_i32_ptr(val, i32::from_ne_bytes(raw));
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
+            }
+            return;
+        }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut raw = [0u8; 4];
+            if read_stream_unformatted_exact(u, &mut raw, iostat) == Some(true) {
+                write_i32_ptr(val, i32::from_ne_bytes(raw));
+            }
+            return;
+        }
+        match u.next_read_token() {
+            Ok(Some(token)) if store_logical_token(&token, val, iostat) => {}
+            Ok(Some(token)) => {
+                set_read_iostat_or_exit(
+                    iostat,
+                    1,
+                    &format!("cannot parse logical from '{}'", token),
+                );
+            }
+            Ok(None) => {
+                set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file");
+            }
+            Err(e) => {
+                set_read_iostat_or_exit(iostat, 1, &e.to_string());
+            }
+        }
+    }
+}
+
 /// Read an i8 value (list-directed) from a unit.
 #[no_mangle]
 pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
@@ -3190,6 +3281,26 @@ pub extern "C" fn afs_read_internal_int(
             unsafe {
                 *iostat = -1;
             }
+        }
+    }
+}
+
+/// Read a list-directed logical value from a character buffer.
+#[no_mangle]
+pub extern "C" fn afs_read_internal_logical(
+    buf: *const u8,
+    buf_len: i64,
+    pos: *mut i64,
+    val: *mut i32,
+    iostat: *mut i32,
+) {
+    match next_internal_token(buf, buf_len, pos) {
+        Some(token) if store_logical_token(&token, val, iostat) => {}
+        Some(token) => {
+            set_read_iostat_or_exit(iostat, 1, &format!("cannot parse logical from '{}'", token));
+        }
+        None => {
+            set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record");
         }
     }
 }
@@ -5299,6 +5410,20 @@ pub extern "C" fn afs_fmt_read_int(
 }
 
 #[no_mangle]
+pub extern "C" fn afs_fmt_read_logical(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut i32,
+    iostat: *mut i32,
+) {
+    let result = formatted_read_record_for_unit(unit, data_index)
+        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index));
+    store_formatted_logical_result(result, val, iostat);
+}
+
+#[no_mangle]
 pub extern "C" fn afs_fmt_read_int64(
     unit: i32,
     fmt_str: *const u8,
@@ -5491,6 +5616,20 @@ pub extern "C" fn afs_fmt_read_int_internal(
 }
 
 #[no_mangle]
+pub extern "C" fn afs_fmt_read_logical_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut i32,
+    iostat: *mut i32,
+) {
+    let result = parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index);
+    store_formatted_logical_result(result, val, iostat);
+}
+
+#[no_mangle]
 pub extern "C" fn afs_fmt_read_int64_internal(
     buf: *const u8,
     buf_len: i64,
@@ -5616,6 +5755,45 @@ pub extern "C" fn afs_fmt_read_real_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_input_accepts_supported_spellings() {
+        for token in ["T", "true", ".TRUE.", " .t. "] {
+            assert_eq!(parse_logical_token(token), Some(true), "token={token:?}");
+        }
+        for token in ["F", "false", ".FALSE.", " .f. "] {
+            assert_eq!(parse_logical_token(token), Some(false), "token={token:?}");
+        }
+        for token in ["", ".", "1", ".MAYBE."] {
+            assert_eq!(parse_logical_token(token), None, "token={token:?}");
+        }
+    }
+
+    #[test]
+    fn internal_logical_read_consumes_each_token() {
+        let buf = b"T, .FALSE.";
+        let mut pos = 0i64;
+        let mut first = 0i32;
+        let mut second = 1i32;
+        let mut iostat = -99i32;
+
+        afs_read_internal_logical(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut pos,
+            &mut first,
+            &mut iostat,
+        );
+        assert_eq!((first, iostat), (1, 0));
+        afs_read_internal_logical(
+            buf.as_ptr(),
+            buf.len() as i64,
+            &mut pos,
+            &mut second,
+            &mut iostat,
+        );
+        assert_eq!((second, iostat), (0, 0));
+    }
 
     #[test]
     fn normalize_real_input_accepts_implicit_signed_exponents() {

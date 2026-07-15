@@ -30624,11 +30624,11 @@ fn lower_derived_field_scalar_read(
         let real_ptr = field_ptr;
         let lane_bytes = b.const_i64(ir_scalar_byte_size(&lane_ty, ctx.layout));
         let imag_ptr = b.gep(field_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
-        let _ = lower_read_into_addr(b, mode, &lane_ty, real_ptr);
-        let _ = lower_read_into_addr(b, mode, &lane_ty, imag_ptr);
+        let _ = lower_read_into_addr(b, mode, &lane_ty, real_ptr, false);
+        let _ = lower_read_into_addr(b, mode, &lane_ty, imag_ptr, false);
         return;
     }
-    let _ = lower_read_into_addr(b, mode, &ty, field_ptr);
+    let _ = lower_read_into_addr(b, mode, &ty, field_ptr, field_logical_kind(field).is_some());
 }
 
 pub(super) fn descriptor_element_size_bytes(
@@ -33960,10 +33960,10 @@ pub(super) fn lower_list_read_items(
         if lower_list_char_read_item(b, ctx, item, unit, iostat) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
 }
 
@@ -33992,10 +33992,10 @@ pub(super) fn lower_internal_read_items(
         if lower_internal_char_read_item(b, ctx, item, buf_ptr, buf_len, pos, iostat) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
 }
 
@@ -34114,12 +34114,105 @@ pub(super) fn lower_read_status_branches(
     }
 }
 
-pub(super) fn lower_read_into_addr(
+fn lower_read_logical_into_addr(
     b: &mut FuncBuilder,
     mode: ReadMode,
     ty: &IrType,
     addr: ValueId,
 ) -> bool {
+    if !matches!(ty, IrType::Bool | IrType::Int(_)) {
+        return false;
+    }
+
+    let current = b.load_typed(addr, ty.clone());
+    let truth = match ty {
+        IrType::Bool => current,
+        IrType::Int(_) => {
+            let zero = zero_value_for_ir_type(b, ty);
+            b.icmp(CmpOp::Ne, current, zero)
+        }
+        _ => unreachable!(),
+    };
+    let initial = b.int_extend(truth, IntWidth::I32, false);
+    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(initial, tmp);
+
+    match mode {
+        ReadMode::Unit { unit, iostat } => {
+            b.call(
+                FuncRef::External("afs_read_logical".into()),
+                vec![unit, tmp, iostat],
+                IrType::Void,
+            );
+        }
+        ReadMode::Internal {
+            buf_ptr,
+            buf_len,
+            pos,
+            iostat,
+        } => {
+            b.call(
+                FuncRef::External("afs_read_internal_logical".into()),
+                vec![buf_ptr, buf_len, pos, tmp, iostat],
+                IrType::Void,
+            );
+        }
+        ReadMode::FormattedUnit {
+            unit,
+            fmt_ptr,
+            fmt_len,
+            item_idx,
+            iostat,
+        } => {
+            let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+            b.call(
+                FuncRef::External("afs_fmt_read_logical".into()),
+                vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                IrType::Void,
+            );
+            bump_formatted_read_index(b, item_idx);
+        }
+        ReadMode::FormattedInternal {
+            buf_ptr,
+            buf_len,
+            fmt_ptr,
+            fmt_len,
+            item_idx,
+            iostat,
+        } => {
+            let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+            b.call(
+                FuncRef::External("afs_fmt_read_logical_internal".into()),
+                vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                IrType::Void,
+            );
+            bump_formatted_read_index(b, item_idx);
+        }
+    }
+
+    let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let truth = b.icmp(CmpOp::Ne, raw, zero);
+    let stored = match ty {
+        IrType::Bool => truth,
+        IrType::Int(width) => b.int_extend(truth, *width, false),
+        _ => unreachable!(),
+    };
+    b.store(stored, addr);
+    true
+}
+
+pub(super) fn lower_read_into_addr(
+    b: &mut FuncBuilder,
+    mode: ReadMode,
+    ty: &IrType,
+    addr: ValueId,
+    logical: bool,
+) -> bool {
+    if logical || matches!(ty, IrType::Bool) {
+        return lower_read_logical_into_addr(b, mode, ty, addr);
+    }
+
     match ty {
         IrType::Int(IntWidth::I128) => {
             match mode {
@@ -34522,8 +34615,8 @@ pub(super) fn lower_read_into_addr(
             let imag_off = b.const_i64(lane_bytes);
             let real_addr = b.gep(addr, vec![real_off], IrType::Int(IntWidth::I8));
             let imag_addr = b.gep(addr, vec![imag_off], IrType::Int(IntWidth::I8));
-            let _ = lower_read_into_addr(b, mode, &lane_ty, real_addr);
-            let _ = lower_read_into_addr(b, mode, &lane_ty, imag_addr);
+            let _ = lower_read_into_addr(b, mode, &lane_ty, real_addr, false);
+            let _ = lower_read_into_addr(b, mode, &lane_ty, imag_addr, false);
             true
         }
         _ => false,
@@ -34699,7 +34792,7 @@ pub(super) fn lower_read_target_addr(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
-) -> Option<(ValueId, IrType)> {
+) -> Option<(ValueId, IrType, bool)> {
     match &item.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
@@ -34712,7 +34805,7 @@ pub(super) fn lower_read_target_addr(
             } else {
                 info.addr
             };
-            Some((addr, info.ty.clone()))
+            Some((addr, info.ty.clone(), info.logical_kind.is_some()))
         }
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
@@ -34739,7 +34832,7 @@ pub(super) fn lower_read_target_addr(
             );
             let base = array_base_addr(b, info);
             let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-            Some((elem_ptr, info.ty.clone()))
+            Some((elem_ptr, info.ty.clone(), info.logical_kind.is_some()))
         }
         Expr::ComponentAccess { base, component } => {
             let (base_addr, type_name) =
@@ -34753,7 +34846,8 @@ pub(super) fn lower_read_target_addr(
             }
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
-            Some((field_ptr, type_info_to_ir_type(&field.type_info)))
+            let logical = field_logical_kind(field).is_some();
+            Some((field_ptr, type_info_to_ir_type(&field.type_info), logical))
         }
         _ => None,
     }
@@ -34863,10 +34957,10 @@ pub(super) fn lower_formatted_internal_read_items(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
 }
 
@@ -34943,10 +35037,10 @@ pub(super) fn lower_formatted_read_items_with_runtime_advance(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
 }
 
@@ -36618,7 +36712,7 @@ pub(super) fn lower_1d_slice_read(
     let byte_off = b.imul(zero_based, step);
     let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, p, len)) != Some(true) {
-        let _ = lower_read_into_addr(b, mode, &info.ty, p);
+        let _ = lower_read_into_addr(b, mode, &info.ty, p, info.logical_kind.is_some());
     }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
@@ -36759,7 +36853,7 @@ pub(super) fn lower_section_read_nd(
             if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len))
                 != Some(true)
             {
-                let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+                let _ = lower_read_into_addr(b, mode, &info.ty, ptr, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -37398,7 +37492,7 @@ pub(super) fn lower_alloc_section_read(
             if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len))
                 != Some(true)
             {
-                let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+                let _ = lower_read_into_addr(b, mode, &info.ty, ptr, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -38219,7 +38313,7 @@ pub(super) fn lower_whole_array_read(
     } else if let Some(layout) = derived_layout.as_ref() {
         lower_derived_layout_read(b, ctx, layout, ptr, mode, span);
     } else {
-        let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+        let _ = lower_read_into_addr(b, mode, &info.ty, ptr, info.logical_kind.is_some());
     }
     let one = b.const_i64(1);
     let next = b.iadd(i_val, one);
