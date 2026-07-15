@@ -190,6 +190,12 @@ enum UnitStream {
     FileRaw(File),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListReadToken {
+    Null,
+    Value(String),
+}
+
 struct Unit {
     _number: i32,
     stream: UnitStream,
@@ -201,7 +207,7 @@ struct Unit {
     /// Record length for direct access (in bytes). None for sequential/stream.
     recl: Option<i64>,
     /// Buffered tokens from the current input record for list-directed READ.
-    read_tokens: VecDeque<String>,
+    read_tokens: VecDeque<ListReadToken>,
     /// Cached formatted input record for the current READ statement.
     formatted_read_record: Option<Vec<u8>>,
     /// Cursor within a cached formatted input record for ADVANCE='NO' reads.
@@ -232,6 +238,25 @@ struct Unit {
     /// cleared by `afs_list_read_end`. The cursor tracks how many
     /// bytes the per-item helpers have consumed so far.
     pending_read: Option<(Vec<u8>, usize)>,
+}
+
+fn tokenize_list_directed_record(line: &str) -> VecDeque<ListReadToken> {
+    let mut tokens = VecDeque::new();
+    let mut fields = line.split(',').peekable();
+
+    while let Some(field) = fields.next() {
+        let before = tokens.len();
+        tokens.extend(
+            field
+                .split_whitespace()
+                .map(|value| ListReadToken::Value(value.to_string())),
+        );
+        if tokens.len() == before && fields.peek().is_some() {
+            tokens.push_back(ListReadToken::Null);
+        }
+    }
+
+    tokens
 }
 
 impl Unit {
@@ -361,25 +386,16 @@ impl Unit {
 
     /// Get the next token for list-directed READ.
     /// Reads a new line if the token buffer is empty.
-    fn next_read_token(&mut self) -> io::Result<Option<String>> {
+    fn next_read_token(&mut self) -> io::Result<Option<ListReadToken>> {
         // Consume from buffer first.
         if let Some(token) = self.read_tokens.pop_front() {
             return Ok(Some(token));
         }
         // Read a new line and tokenize.
         let line = self.read_line()?;
-        let trimmed = line.trim().to_string();
-        if trimmed.is_empty() {
-            return Ok(None); // EOF or blank line
-        }
-        // Split on whitespace and commas.
-        let tokens: VecDeque<String> = trimmed
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
+        let tokens = tokenize_list_directed_record(&line);
         if tokens.is_empty() {
-            return Ok(None);
+            return Ok(None); // EOF or blank line
         }
         self.read_tokens = tokens;
         Ok(self.read_tokens.pop_front())
@@ -1353,6 +1369,14 @@ pub extern "C" fn afs_list_write_end(
 
 // ---- Public C API: List-directed READ ----
 
+fn set_read_success(iostat: *mut i32) {
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = 0;
+        }
+    }
+}
+
 fn parse_logical_token(token: &str) -> Option<bool> {
     let token = token.trim();
     let token = token
@@ -1426,14 +1450,15 @@ pub extern "C" fn afs_read_logical(unit: i32, val: *mut i32, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) if store_logical_token(&token, val, iostat) => {}
-            Ok(Some(token)) => {
+            Ok(Some(ListReadToken::Value(token))) if store_logical_token(&token, val, iostat) => {}
+            Ok(Some(ListReadToken::Value(token))) => {
                 set_read_iostat_or_exit(
                     iostat,
                     1,
                     &format!("cannot parse logical from '{}'", token),
                 );
             }
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file");
             }
@@ -1469,7 +1494,7 @@ pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => match token.parse::<i8>() {
+            Ok(Some(ListReadToken::Value(token))) => match token.parse::<i8>() {
                 Ok(v) => {
                     write_i8_ptr(val, v);
                     if !iostat.is_null() {
@@ -1489,6 +1514,7 @@ pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
                     }
                 }
             },
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -1540,7 +1566,7 @@ pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => match token.parse::<i16>() {
+            Ok(Some(ListReadToken::Value(token))) => match token.parse::<i16>() {
                 Ok(v) => {
                     write_i16_ptr(val, v);
                     if !iostat.is_null() {
@@ -1560,6 +1586,7 @@ pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
                     }
                 }
             },
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -1612,7 +1639,7 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => match token.parse::<i32>() {
+            Ok(Some(ListReadToken::Value(token))) => match token.parse::<i32>() {
                 Ok(v) => {
                     write_i32_ptr(val, v);
                     if !iostat.is_null() {
@@ -1632,6 +1659,7 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
                     }
                 }
             },
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -1683,7 +1711,7 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => match token.parse::<i64>() {
+            Ok(Some(ListReadToken::Value(token))) => match token.parse::<i64>() {
                 Ok(v) => {
                     write_i64_ptr(val, v);
                     if !iostat.is_null() {
@@ -1703,6 +1731,7 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
                     }
                 }
             },
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -1748,7 +1777,7 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => match token.parse::<i128>() {
+            Ok(Some(ListReadToken::Value(token))) => match token.parse::<i128>() {
                 Ok(v) => {
                     write_i128_ptr(val, v);
                     if !iostat.is_null() {
@@ -1768,6 +1797,7 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
                     }
                 }
             },
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -1813,7 +1843,7 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => {
+            Ok(Some(ListReadToken::Value(token))) => {
                 let normalized = normalize_fortran_real_input(&token, false);
                 match normalized.parse::<f32>() {
                     Ok(v) => {
@@ -1836,6 +1866,7 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
                     }
                 }
             }
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -1884,7 +1915,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
             return;
         }
         match u.next_read_token() {
-            Ok(Some(token)) => {
+            Ok(Some(ListReadToken::Value(token))) => {
                 let normalized = normalize_fortran_real_input(&token, false);
                 match normalized.parse::<f64>() {
                     Ok(v) => {
@@ -1907,6 +1938,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                     }
                 }
             }
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
             Ok(None) => {
                 if !iostat.is_null() {
                     unsafe {
@@ -2088,7 +2120,7 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
     }
 
     match u.next_read_token() {
-        Ok(Some(token)) => {
+        Ok(Some(ListReadToken::Value(token))) => {
             crate::string::afs_assign_char_fixed(
                 dest,
                 dest_len,
@@ -2101,6 +2133,7 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
                 }
             }
         }
+        Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
         Ok(None) => {
             crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
             set_read_status_or_exit(iostat, IOSTAT_END);
@@ -3218,7 +3251,7 @@ pub extern "C" fn afs_write_internal_string(
     write_to_buffer(buf, buf_len as usize, start, &data, pos);
 }
 
-fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<String> {
+fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<ListReadToken> {
     if buf.is_null() || buf_len <= 0 {
         return None;
     }
@@ -3230,7 +3263,7 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<St
         0
     };
 
-    while idx < slice.len() && (slice[idx].is_ascii_whitespace() || slice[idx] == b',') {
+    while idx < slice.len() && slice[idx].is_ascii_whitespace() {
         idx += 1;
     }
 
@@ -3243,8 +3276,26 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<St
         return None;
     }
 
+    if slice[idx] == b',' {
+        idx += 1;
+        if !pos.is_null() {
+            unsafe {
+                *pos = idx as i64;
+            }
+        }
+        return Some(ListReadToken::Null);
+    }
+
     let start = idx;
     while idx < slice.len() && !slice[idx].is_ascii_whitespace() && slice[idx] != b',' {
+        idx += 1;
+    }
+    let end = idx;
+
+    while idx < slice.len() && slice[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx < slice.len() && slice[idx] == b',' {
         idx += 1;
     }
 
@@ -3254,7 +3305,9 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<St
         }
     }
 
-    Some(String::from_utf8_lossy(&slice[start..idx]).into_owned())
+    Some(ListReadToken::Value(
+        String::from_utf8_lossy(&slice[start..end]).into_owned(),
+    ))
 }
 
 /// Read an integer from a character buffer (internal I/O).
@@ -3266,8 +3319,8 @@ pub extern "C" fn afs_read_internal_int(
     val: *mut i32,
     iostat: *mut i32,
 ) {
-    if let Some(token) = next_internal_token(buf, buf_len, pos) {
-        match token.replace(',', "").parse::<i32>() {
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => match token.replace(',', "").parse::<i32>() {
             Ok(v) => {
                 write_i32_ptr(val, v);
                 if !iostat.is_null() {
@@ -3283,11 +3336,13 @@ pub extern "C" fn afs_read_internal_int(
                     }
                 }
             }
-        }
-    } else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = -1;
+        },
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = -1;
+                }
             }
         }
     }
@@ -3303,10 +3358,11 @@ pub extern "C" fn afs_read_internal_logical(
     iostat: *mut i32,
 ) {
     match next_internal_token(buf, buf_len, pos) {
-        Some(token) if store_logical_token(&token, val, iostat) => {}
-        Some(token) => {
+        Some(ListReadToken::Value(token)) if store_logical_token(&token, val, iostat) => {}
+        Some(ListReadToken::Value(token)) => {
             set_read_iostat_or_exit(iostat, 1, &format!("cannot parse logical from '{}'", token));
         }
+        Some(ListReadToken::Null) => set_read_success(iostat),
         None => {
             set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record");
         }
@@ -3333,20 +3389,27 @@ pub extern "C" fn afs_read_internal_string(
     }
 
     let dest_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
-    dest_slice.fill(b' ');
 
-    if let Some(token) = next_internal_token(buf, buf_len, pos) {
-        let bytes = token.as_bytes();
-        let n = bytes.len().min(dest_slice.len());
-        dest_slice[..n].copy_from_slice(&bytes[..n]);
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 0;
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => {
+            dest_slice.fill(b' ');
+            let bytes = token.as_bytes();
+            let n = bytes.len().min(dest_slice.len());
+            dest_slice[..n].copy_from_slice(&bytes[..n]);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
             }
         }
-    } else if !iostat.is_null() {
-        unsafe {
-            *iostat = -1;
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => {
+            dest_slice.fill(b' ');
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = -1;
+                }
+            }
         }
     }
 }
@@ -3360,8 +3423,8 @@ pub extern "C" fn afs_read_internal_int64(
     val: *mut i64,
     iostat: *mut i32,
 ) {
-    if let Some(token) = next_internal_token(buf, buf_len, pos) {
-        match token.replace(',', "").parse::<i64>() {
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => match token.replace(',', "").parse::<i64>() {
             Ok(v) => {
                 write_i64_ptr(val, v);
                 if !iostat.is_null() {
@@ -3377,11 +3440,13 @@ pub extern "C" fn afs_read_internal_int64(
                     }
                 }
             }
-        }
-    } else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = -1;
+        },
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = -1;
+                }
             }
         }
     }
@@ -3396,8 +3461,8 @@ pub extern "C" fn afs_read_internal_int128(
     val: *mut i128,
     iostat: *mut i32,
 ) {
-    if let Some(token) = next_internal_token(buf, buf_len, pos) {
-        match token.replace(',', "").parse::<i128>() {
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => match token.replace(',', "").parse::<i128>() {
             Ok(v) => {
                 write_i128_ptr(val, v);
                 if !iostat.is_null() {
@@ -3413,11 +3478,13 @@ pub extern "C" fn afs_read_internal_int128(
                     }
                 }
             }
-        }
-    } else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = -1;
+        },
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = -1;
+                }
             }
         }
     }
@@ -3432,29 +3499,33 @@ pub extern "C" fn afs_read_internal_real(
     val: *mut f64,
     iostat: *mut i32,
 ) {
-    if let Some(token) = next_internal_token(buf, buf_len, pos) {
-        let normalized = normalize_fortran_real_input(&token, true);
-        match normalized.parse::<f64>() {
-            Ok(v) => {
-                write_f64_ptr(val, v);
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 0;
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => {
+            let normalized = normalize_fortran_real_input(&token, true);
+            match normalized.parse::<f64>() {
+                Ok(v) => {
+                    write_f64_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
                     }
                 }
-            }
-            Err(_) => {
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 1;
+                Err(_) => {
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 1;
+                        }
                     }
                 }
             }
         }
-    } else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = -1;
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = -1;
+                }
             }
         }
     }
@@ -5763,6 +5834,50 @@ pub extern "C" fn afs_fmt_read_real_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_directed_tokenizer_preserves_null_positions() {
+        let tokens: Vec<_> = tokenize_list_directed_record("  , 42, , 7 8,  \n")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ListReadToken::Null,
+                ListReadToken::Value("42".into()),
+                ListReadToken::Null,
+                ListReadToken::Value("7".into()),
+                ListReadToken::Value("8".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn internal_list_cursor_preserves_null_positions() {
+        let buf = b",42, ,7";
+        let mut pos = 0i64;
+
+        assert_eq!(
+            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            Some(ListReadToken::Null)
+        );
+        assert_eq!(
+            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            Some(ListReadToken::Value("42".into()))
+        );
+        assert_eq!(
+            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            Some(ListReadToken::Null)
+        );
+        assert_eq!(
+            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            Some(ListReadToken::Value("7".into()))
+        );
+        assert_eq!(
+            next_internal_token(buf.as_ptr(), buf.len() as i64, &mut pos),
+            None
+        );
+    }
 
     #[test]
     fn logical_input_accepts_supported_spellings() {

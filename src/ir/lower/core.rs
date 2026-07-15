@@ -34477,6 +34477,9 @@ pub(super) fn lower_read_into_addr(
                     ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    let current = b.load_typed(addr, IrType::Int(*width));
+                    let initial = b.int_extend(current, IntWidth::I32, true);
+                    b.store(initial, tmp);
                     b.call(
                         FuncRef::External("afs_read_internal_int".into()),
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
@@ -34679,6 +34682,9 @@ pub(super) fn lower_read_into_addr(
                     ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+                    let current = b.load_typed(addr, IrType::Float(FloatWidth::F32));
+                    let initial = b.float_extend(current, FloatWidth::F64);
+                    b.store(initial, tmp);
                     b.call(
                         FuncRef::External("afs_read_internal_real".into()),
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
