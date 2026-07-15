@@ -1115,15 +1115,20 @@ fn lower_positioning_statement(
         .unwrap_or_else(|| b.const_i32(6));
     let unit = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
     let null = b.const_i64(0);
-    let iostat_ptr = if let Some(spec) = iostat_spec {
-        lower_arg_by_ref_ctx(b, ctx, &spec.value)
+    let (iostat_ptr, iostat_storeback) = if let Some(spec) = iostat_spec {
+        let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+        let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
+        let status = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, status);
+        (status, Some((dest_addr, dest_ty)))
     } else if err_label.is_some() {
         let status = b.alloca(IrType::Int(IntWidth::I32));
         let zero = b.const_i32(0);
         b.store(zero, status);
-        status
+        (status, None)
     } else {
-        null
+        (null, None)
     };
     let (iomsg_ptr, iomsg_len) = iomsg_spec
         .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
@@ -1134,6 +1139,11 @@ fn lower_positioning_statement(
         vec![unit, iostat_ptr, iomsg_ptr, iomsg_len],
         IrType::Void,
     );
+    if let Some((dest_addr, dest_ty)) = iostat_storeback {
+        let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+        let coerced = coerce_to_type(b, status, &dest_ty);
+        b.store(coerced, dest_addr);
+    }
     lower_read_err_branch(b, ctx, err_label, iostat_ptr);
 }
 
@@ -1599,7 +1609,7 @@ fn lower_format_expr(
     lower_string_expr_ctx(b, ctx, expr)
 }
 
-fn inquire_integer_storeback_type(
+fn integer_storeback_type(
     b: &FuncBuilder,
     ctx: &LowerCtx<'_>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -1626,9 +1636,9 @@ fn lower_external_io_pos_seek(
     controls: &[IoControl],
     unit: ValueId,
     iostat_ptr: ValueId,
-) {
+) -> bool {
     let Some(pos_ctrl) = io_control_by_keyword(controls, "pos") else {
-        return;
+        return false;
     };
     let raw_pos = super::expr::lower_expr_ctx(b, ctx, &pos_ctrl.value);
     let pos = coerce_to_type(b, raw_pos, &IrType::Int(IntWidth::I64));
@@ -1638,6 +1648,43 @@ fn lower_external_io_pos_seek(
         vec![unit_i32, pos, iostat_ptr],
         IrType::Void,
     );
+    true
+}
+
+fn lower_external_read_pos_seek(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    controls: &[IoControl],
+    unit: ValueId,
+    iostat_ptr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> Option<BlockId> {
+    if !lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr) {
+        return None;
+    }
+
+    let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    let failure_bb = b.create_block("read_pos_failed");
+    let transfer_bb = b.create_block("read_pos_ok");
+    let done_bb = b.create_block("read_pos_done");
+    b.cond_branch(failed, failure_bb, vec![], transfer_bb, vec![]);
+
+    b.set_block(failure_bb);
+    lower_read_assign_iomsg(b, iostat_ptr, iomsg_ptr, iomsg_len);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(transfer_bb);
+    Some(done_bb)
+}
+
+fn finish_external_read_positioning(b: &mut FuncBuilder, done: Option<BlockId>) {
+    if let Some(done_bb) = done {
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+    }
 }
 
 /// Make a conditional-argument arm value match the merge slot type.
@@ -8838,8 +8885,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
 
             let user_iostat = explicit_iostat_addr.is_some();
-            let needs_hidden_iostat =
-                end_label.is_some() || err_label.is_some() || iomsg_ctrl.is_some();
+            let needs_hidden_iostat = end_label.is_some()
+                || err_label.is_some()
+                || iomsg_ctrl.is_some()
+                || io_control_by_keyword(controls, "pos").is_some();
             let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
             let iostat_addr = match explicit_iostat_addr {
                 Some(addr) => addr,
@@ -8950,7 +8999,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(5) // default stdin
             };
-            lower_external_io_pos_seek(b, ctx, controls, unit, iostat_addr);
+            let positioning_done = lower_external_read_pos_seek(
+                b,
+                ctx,
+                controls,
+                unit,
+                iostat_addr,
+                read_iomsg_ptr,
+                read_iomsg_len,
+            );
             let defined_iotype = match fmt_control {
                 Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
                     Some("LISTDIRECTED")
@@ -8968,6 +9025,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 iomsg_arg_ptr,
                 read_iomsg_len,
             ) {
+                finish_external_read_positioning(b, positioning_done);
                 lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
             }
@@ -9011,6 +9069,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             }
+            finish_external_read_positioning(b, positioning_done);
             lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
             lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
@@ -9077,7 +9136,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let recl_spec = spec_by_keyword("recl");
             let (recl_addr, recl_storeback) = if let Some(spec) = recl_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
-                let dest_ty = inquire_integer_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
                 let current = b.load(dest_addr);
                 let widened = coerce_to_type(b, current, &IrType::Int(IntWidth::I64));
@@ -9090,7 +9149,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                let dest_ty = inquire_integer_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
@@ -9104,7 +9163,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (pos_addr, pos_storeback) = if let Some(spec) = pos_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                let dest_ty = inquire_integer_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)

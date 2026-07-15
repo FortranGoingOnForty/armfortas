@@ -59,5 +59,17 @@ program read_defined_io_first_error
   if (trim(message) /= 'first defined read failed') error stop 3
   close(unit)
 
+  open(newunit=unit, status='scratch', access='stream', form='formatted', action='readwrite')
+  write(unit, '(A)') 'ignored'
+  first%value = 7
+  read_calls = 0
+  ios = 77
+  message = 'sentinel'
+  read(unit, *, pos=0, iostat=ios, iomsg=message) first
+  if (ios == 0 .or. read_calls /= 0) error stop 4
+  if (first%value /= 7) error stop 5
+  if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 6
+  close(unit)
+
   print *, 'ok'
 end program read_defined_io_first_error

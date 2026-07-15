@@ -2,7 +2,7 @@
 ! IR_CHECK: call @afs_backspace_ex(
 ! IR_CHECK: call @afs_endfile_ex(
 program backspace_endfile_statements
-  use, intrinsic :: iso_fortran_env, only : iostat_end
+  use, intrinsic :: iso_fortran_env, only : int8, int16, int32, int64, iostat_end
   implicit none
 
   character(len=*), parameter :: path = 'backspace_endfile.tmp'
@@ -10,6 +10,10 @@ program backspace_endfile_statements
   character(len=16) :: text
   character(len=64) :: message
   integer :: unit, ios, value
+  integer(int8) :: status1(5)
+  integer(int16) :: status2(4)
+  integer(int32) :: status4(3)
+  integer(int64) :: status8(3)
 
   open(newunit=unit, file=path, status='replace', action='write')
   write(unit, '(A)') 'first'
@@ -80,6 +84,22 @@ program backspace_endfile_statements
   if (ios == 0) error stop 16
   if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 17
   close(unit, status='delete')
+
+  status1 = [11_int8, 99_int8, 22_int8, 33_int8, 44_int8]
+  backspace(unit=997, iostat=status1(2))
+  if (any(status1 /= [11_int8, 1_int8, 22_int8, 33_int8, 44_int8])) error stop 18
+
+  status2 = [111_int16, 999_int16, 222_int16, 333_int16]
+  endfile(unit=996, iostat=status2(2))
+  if (any(status2 /= [111_int16, 1_int16, 222_int16, 333_int16])) error stop 19
+
+  status4 = [1111_int32, 9999_int32, 2222_int32]
+  backspace(unit=995, iostat=status4(2))
+  if (any(status4 /= [1111_int32, 1_int32, 2222_int32])) error stop 20
+
+  status8 = [11111_int64, 99999_int64, 22222_int64]
+  endfile(unit=994, iostat=status8(2))
+  if (any(status8 /= [11111_int64, 1_int64, 22222_int64])) error stop 21
 
   print *, 'ok'
 end program backspace_endfile_statements

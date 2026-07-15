@@ -33919,6 +33919,7 @@ pub(super) fn try_lower_defined_io_read_items(
         tmp
     });
     let done = b.create_block("defined_read_done");
+    lower_read_status_continue_or_exit(b, statement_iostat, done);
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
             b,
