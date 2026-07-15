@@ -4492,8 +4492,7 @@ pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
             };
             match result {
                 Ok(()) => {
-                    // Clear stale read tokens only after repositioning succeeds.
-                    u.read_tokens.clear();
+                    u.reset_read_state_after_positioning();
                     0
                 }
                 Err(e) => e.raw_os_error().unwrap_or(1),

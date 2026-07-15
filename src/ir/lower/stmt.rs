@@ -9188,16 +9188,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
             let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
 
-            let size_addr = controls
-                .iter()
-                .find(|c| {
-                    c.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("size"))
-                        .unwrap_or(false)
-                })
-                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
-                .unwrap_or_else(|| b.const_i64(0));
+            let size_ctrl = io_control_by_keyword(controls, "size");
+            let (size_addr, size_storeback) = lower_runtime_iostat(b, ctx, size_ctrl, false);
             let null_iomsg_data = {
                 let z = b.const_i64(0);
                 b.int_to_ptr(z, IrType::Int(IntWidth::I8))
@@ -9222,6 +9214,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if lowered_namelist {
                 finish_external_read_positioning(b, namelist_positioning_done);
                 lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
                 lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                 lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
@@ -9267,6 +9260,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         );
                     }
                     lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                    lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
                     lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                     lower_read_status_branches(
                         b,
@@ -9316,6 +9310,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 dtio_iomsg,
             ) {
                 finish_external_read_positioning(b, positioning_done);
+                lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
                 lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                 lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
@@ -9362,6 +9357,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
             finish_external_read_positioning(b, positioning_done);
             lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+            lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
             lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
             lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
@@ -9396,11 +9392,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             let unit_spec = unit_spec.or(positional_unit_spec);
 
-            let lower_ref_spec = |b: &mut FuncBuilder, needle: &str| -> ValueId {
-                spec_by_keyword(needle)
-                    .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
-                    .unwrap_or(null)
-            };
             let lower_string_spec = |b: &mut FuncBuilder, needle: &str| -> (ValueId, ValueId) {
                 if let Some(spec) = spec_by_keyword(needle) {
                     lower_string_expr_ctx(b, ctx, &spec.value)
@@ -9409,9 +9400,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
             };
 
-            let exist_addr = lower_ref_spec(b, "exist");
-            let opened_addr = lower_ref_spec(b, "opened");
-            let iostat_addr = lower_ref_spec(b, "iostat");
             let (name_ptr, name_len) = lower_string_spec(b, "name");
             let (access_ptr, access_len) = lower_string_spec(b, "access");
             let (form_ptr, form_len) = lower_string_spec(b, "form");
@@ -9425,6 +9413,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (formatted_ptr, formatted_len) = lower_string_spec(b, "formatted");
             let (unformatted_ptr, unformatted_len) = lower_string_spec(b, "unformatted");
             let (leading_zero_ptr, leading_zero_len) = lower_string_spec(b, "leading_zero");
+            let (exist_addr, exist_storeback) =
+                lower_runtime_iostat(b, ctx, spec_by_keyword("exist"), false);
+            let (opened_addr, opened_storeback) =
+                lower_runtime_iostat(b, ctx, spec_by_keyword("opened"), false);
+            let (iostat_addr, iostat_storeback) =
+                lower_runtime_iostat(b, ctx, spec_by_keyword("iostat"), false);
             let recl_spec = spec_by_keyword("recl");
             let (recl_addr, recl_storeback) = if let Some(spec) = recl_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
@@ -9554,6 +9548,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     IrType::Void,
                 );
             }
+            lower_runtime_iostat_storeback(b, exist_addr, &exist_storeback);
+            lower_runtime_iostat_storeback(b, opened_addr, &opened_storeback);
+            lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
             if let Some((dest_addr, dest_ty)) = recl_storeback {
                 let recl_val = b.load(recl_addr);
                 let coerced = coerce_to_type(b, recl_val, &dest_ty);
