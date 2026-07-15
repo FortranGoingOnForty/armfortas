@@ -3338,6 +3338,9 @@ fn write_internal_list_to_buffer(
     pos: *mut i64,
 ) {
     note_fixed_internal_list_overflow(buf, buf_len, start, data.len());
+    if buf.is_null() {
+        return;
+    }
     write_to_buffer(buf, buf_len, start, data, pos);
 }
 
@@ -3348,16 +3351,14 @@ fn write_internal_list_directed_integer<T: std::fmt::Display>(
     width: usize,
     pos: *mut i64,
 ) {
-    if buf.is_null() || buf_len <= 0 {
-        return;
-    }
+    let buf_len = buf_len.max(0) as usize;
     let s = list_directed_integer_field(val, width);
     let start = if !pos.is_null() {
         (unsafe { *pos }) as usize
     } else {
         0
     };
-    write_internal_list_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_to_buffer(buf, buf_len, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted i8 to a character buffer (internal I/O).
@@ -3398,16 +3399,14 @@ pub extern "C" fn afs_write_internal_int128(buf: *mut u8, buf_len: i64, val: i12
 /// Write a formatted real to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_real64(buf: *mut u8, buf_len: i64, val: f64, pos: *mut i64) {
-    if buf.is_null() || buf_len <= 0 {
-        return;
-    }
+    let buf_len = buf_len.max(0) as usize;
     let s = format!(" {}", val);
     let start = if !pos.is_null() {
         (unsafe { *pos }) as usize
     } else {
         0
     };
-    write_internal_list_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_to_buffer(buf, buf_len, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted string to a character buffer (internal I/O).
@@ -3419,9 +3418,7 @@ pub extern "C" fn afs_write_internal_string(
     src_len: i64,
     pos: *mut i64,
 ) {
-    if buf.is_null() || buf_len <= 0 {
-        return;
-    }
+    let buf_len = buf_len.max(0) as usize;
     let start = if !pos.is_null() {
         (unsafe { *pos }) as usize
     } else {
@@ -3432,7 +3429,7 @@ pub extern "C" fn afs_write_internal_string(
         let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
         data.extend_from_slice(slice);
     }
-    write_internal_list_to_buffer(buf, buf_len as usize, start, &data, pos);
+    write_internal_list_to_buffer(buf, buf_len, start, &data, pos);
 }
 
 fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<ListReadToken> {
@@ -7179,6 +7176,30 @@ mod tests {
         assert_eq!(iostat, IOSTAT_EOR);
         assert_eq!(&iomsg[..13], b"end of record");
         assert!(iomsg[13..].iter().all(|byte| *byte == b' '));
+    }
+
+    #[test]
+    fn fixed_internal_list_zero_length_items_overflow() {
+        let mut buf = [];
+        let mut iostat = 77;
+        let mut pos = 0;
+
+        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, &mut iostat, std::ptr::null_mut(), 0);
+        afs_write_internal_int(buf.as_mut_ptr(), 0, 1, &mut pos);
+        afs_lst_end_internal_fixed();
+        assert_eq!(iostat, IOSTAT_EOR);
+
+        iostat = 77;
+        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, &mut iostat, std::ptr::null_mut(), 0);
+        afs_write_internal_real64(buf.as_mut_ptr(), 0, 1.0, &mut pos);
+        afs_lst_end_internal_fixed();
+        assert_eq!(iostat, IOSTAT_EOR);
+
+        iostat = 77;
+        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, &mut iostat, std::ptr::null_mut(), 0);
+        afs_write_internal_string(buf.as_mut_ptr(), 0, b"a".as_ptr(), 1, &mut pos);
+        afs_lst_end_internal_fixed();
+        assert_eq!(iostat, IOSTAT_EOR);
     }
 
     #[test]

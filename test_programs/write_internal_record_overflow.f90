@@ -8,6 +8,7 @@ program write_internal_record_overflow
 
   character(len=3) :: buffer
   character(len=3) :: records(2)
+  character(len=0) :: empty
   character(len=64) :: message
   integer :: ios
 
@@ -58,6 +59,12 @@ program write_internal_record_overflow
   if (ios /= 0) error stop 16
   if (buffer /= ' a ') error stop 17
   if (len_trim(message) /= 0) error stop 18
+
+  message = 'sentinel'
+  ios = 77
+  write(empty, *, iostat=ios, iomsg=message) 'a'
+  if (ios /= iostat_eor) error stop 19
+  if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 20
 
   print *, 'ok'
 end program write_internal_record_overflow
