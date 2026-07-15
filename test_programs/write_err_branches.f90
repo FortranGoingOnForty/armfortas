@@ -37,7 +37,7 @@ program write_err_branches
   character(len=3) :: buffer
   character(len=32) :: line, message
   integer :: unit, read_status, value
-  type(box) :: object
+  type(box) :: object, second_object
   namelist /group/ value
 
   open(newunit=unit, file=path, status='replace', action='write')
@@ -99,12 +99,21 @@ program write_err_branches
   if (defined_write_calls /= 1) error stop 13
   close(unit)
 
+  second_object%value = 8
+  defined_write_calls = 0
+  open(newunit=unit, status='scratch', action='readwrite', form='formatted')
+  write(unit, *, err=800) object, second_object
+  error stop 14
+800 continue
+  if (defined_write_calls /= 1) error stop 15
+  close(unit)
+
   open(newunit=unit, file=path, status='old', action='read')
   line = ''
   read(unit, '(A)', iostat=read_status) line
-  if (read_status /= 0 .or. trim(line) /= 'kept') error stop 14
+  if (read_status /= 0 .or. trim(line) /= 'kept') error stop 16
   read(unit, '(A)', iostat=read_status) line
-  if (read_status >= 0) error stop 15
+  if (read_status >= 0) error stop 17
   close(unit, status='delete')
 
   print *, 'ok'

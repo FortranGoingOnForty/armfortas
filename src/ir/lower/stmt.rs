@@ -4487,12 +4487,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("leading_zero"))
                     .unwrap_or(false)
             });
-            let has_pos = io_control_by_keyword(controls, "pos").is_some();
-            let needs_hidden_iostat = has_pos || err_label.is_some();
+            let needs_hidden_iostat = true;
             let (iostat_ptr, iostat_storeback) =
                 lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
-            let iostat_arg_ptr =
-                (iostat_ctrl.is_some() || needs_hidden_iostat).then_some(iostat_ptr);
             let (dtio_iomsg, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
@@ -4719,7 +4716,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 items,
                 unit,
                 defined_iotype,
-                iostat_arg_ptr,
+                iostat_ptr,
                 dtio_iomsg,
             ) {
                 finish_external_write_positioning(b, positioning_done);

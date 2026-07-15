@@ -34098,7 +34098,7 @@ pub(super) fn try_lower_defined_io_write_items(
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
     formatted_iotype: Option<&str>,
-    iostat: Option<ValueId>,
+    iostat: ValueId,
     iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
     if items.is_empty() {
@@ -34117,6 +34117,8 @@ pub(super) fn try_lower_defined_io_write_items(
         return false;
     };
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let done = b.create_block("defined_write_done");
+    lower_io_status_continue_or_exit(b, iostat, done);
 
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
@@ -34126,11 +34128,14 @@ pub(super) fn try_lower_defined_io_write_items(
             item,
             unit,
             formatted_iotype,
-            iostat,
+            Some(iostat),
             iomsg_arg,
             iomsg_len,
         );
+        lower_io_status_continue_or_exit(b, iostat, done);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
     true
 }
 
@@ -34168,7 +34173,7 @@ pub(super) fn try_lower_defined_io_read_items(
         tmp
     });
     let done = b.create_block("defined_read_done");
-    lower_read_status_continue_or_exit(b, statement_iostat, done);
+    lower_io_status_continue_or_exit(b, statement_iostat, done);
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
             b,
@@ -34181,7 +34186,7 @@ pub(super) fn try_lower_defined_io_read_items(
             iomsg_arg,
             iomsg_len,
         );
-        lower_read_status_continue_or_exit(b, statement_iostat, done);
+        lower_io_status_continue_or_exit(b, statement_iostat, done);
     }
     b.branch(done, vec![]);
     b.set_block(done);
@@ -34338,7 +34343,7 @@ impl ReadMode {
     }
 }
 
-fn lower_read_status_continue_or_exit(b: &mut FuncBuilder, iostat: ValueId, error_exit: BlockId) {
+fn lower_io_status_continue_or_exit(b: &mut FuncBuilder, iostat: ValueId, error_exit: BlockId) {
     if !matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
         return;
     }
@@ -34346,13 +34351,13 @@ fn lower_read_status_continue_or_exit(b: &mut FuncBuilder, iostat: ValueId, erro
     let status = b.load_typed(iostat, IrType::Int(IntWidth::I32));
     let zero = b.const_i32(0);
     let failed = b.icmp(CmpOp::Ne, status, zero);
-    let continue_bb = b.create_block("read_transfer_ok");
+    let continue_bb = b.create_block("io_transfer_ok");
     b.cond_branch(failed, error_exit, vec![], continue_bb, vec![]);
     b.set_block(continue_bb);
 }
 
 fn lower_read_continue_or_exit(b: &mut FuncBuilder, mode: ReadMode) {
-    lower_read_status_continue_or_exit(b, mode.iostat(), mode.error_exit());
+    lower_io_status_continue_or_exit(b, mode.iostat(), mode.error_exit());
 }
 
 fn finish_read_item(b: &mut FuncBuilder, mode: ReadMode) {
