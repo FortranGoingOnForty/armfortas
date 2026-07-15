@@ -1937,10 +1937,8 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
 /// existing per-helper raw-byte path.
 #[no_mangle]
 pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
-    if !iostat.is_null() {
-        unsafe {
-            *iostat = 0;
-        }
+    if !iostat.is_null() && unsafe { *iostat != 0 } {
+        return;
     }
     if !iomsg.is_null() && iomsg_len > 0 {
         let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
@@ -2216,6 +2214,16 @@ fn read_status_message(status: i32) -> &'static str {
         IOSTAT_EOR => "end of record",
         _ => "input/output error",
     }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_read_assign_iomsg(status: i32, iomsg: *mut u8, iomsg_len: i64) {
+    let message = if status == 0 {
+        ""
+    } else {
+        read_status_message(status)
+    };
+    assign_iomsg(iomsg, iomsg_len, message);
 }
 
 fn set_read_status_or_exit(iostat: *mut i32, status: i32) {

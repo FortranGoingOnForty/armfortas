@@ -33911,6 +33911,14 @@ pub(super) fn try_lower_defined_io_read_items(
         return false;
     };
 
+    let owns_iostat = iostat.is_none();
+    let statement_iostat = iostat.unwrap_or_else(|| {
+        let tmp = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, tmp);
+        tmp
+    });
+    let done = b.create_block("defined_read_done");
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
             b,
@@ -33919,10 +33927,16 @@ pub(super) fn try_lower_defined_io_read_items(
             item,
             unit,
             formatted_iotype,
-            iostat,
+            Some(statement_iostat),
             iomsg_arg,
             iomsg_len,
         );
+        lower_read_status_continue_or_exit(b, statement_iostat, done);
+    }
+    b.branch(done, vec![]);
+    b.set_block(done);
+    if owns_iostat {
+        lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
     }
     true
 }
@@ -33948,7 +33962,13 @@ pub(super) fn lower_list_read_items(
         return;
     }
 
-    let mode = ReadMode::Unit { unit, iostat };
+    let done = b.create_block("list_read_done");
+    let mode = ReadMode::Unit {
+        unit,
+        iostat,
+        error_exit: done,
+    };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_array_read_item(b, ctx, item, mode) {
@@ -33957,7 +33977,7 @@ pub(super) fn lower_list_read_items(
         if lower_derived_unit_read_item(b, ctx, item, mode) {
             continue;
         }
-        if lower_list_char_read_item(b, ctx, item, unit, iostat) {
+        if lower_list_char_read_item(b, ctx, item, mode) {
             continue;
         }
         let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
@@ -33965,6 +33985,8 @@ pub(super) fn lower_list_read_items(
         };
         let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 pub(super) fn lower_internal_read_items(
@@ -33978,18 +34000,21 @@ pub(super) fn lower_internal_read_items(
     let zero = b.const_i64(0);
     let pos = b.alloca(IrType::Int(IntWidth::I64));
     b.store(zero, pos);
+    let done = b.create_block("internal_read_done");
     let mode = ReadMode::Internal {
         buf_ptr,
         buf_len,
         pos,
         iostat,
+        error_exit: done,
     };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
-        if lower_internal_char_read_item(b, ctx, item, buf_ptr, buf_len, pos, iostat) {
+        if lower_internal_char_read_item(b, ctx, item, mode) {
             continue;
         }
         let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
@@ -33997,6 +34022,8 @@ pub(super) fn lower_internal_read_items(
         };
         let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 #[derive(Clone, Copy)]
@@ -34004,12 +34031,14 @@ pub(in crate::ir::lower) enum ReadMode {
     Unit {
         unit: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
     Internal {
         buf_ptr: ValueId,
         buf_len: ValueId,
         pos: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
     FormattedUnit {
         unit: ValueId,
@@ -34017,6 +34046,7 @@ pub(in crate::ir::lower) enum ReadMode {
         fmt_len: ValueId,
         item_idx: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
     FormattedInternal {
         buf_ptr: ValueId,
@@ -34025,7 +34055,85 @@ pub(in crate::ir::lower) enum ReadMode {
         fmt_len: ValueId,
         item_idx: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
+}
+
+impl ReadMode {
+    fn iostat(self) -> ValueId {
+        match self {
+            Self::Unit { iostat, .. }
+            | Self::Internal { iostat, .. }
+            | Self::FormattedUnit { iostat, .. }
+            | Self::FormattedInternal { iostat, .. } => iostat,
+        }
+    }
+
+    fn error_exit(self) -> BlockId {
+        match self {
+            Self::Unit { error_exit, .. }
+            | Self::Internal { error_exit, .. }
+            | Self::FormattedUnit { error_exit, .. }
+            | Self::FormattedInternal { error_exit, .. } => error_exit,
+        }
+    }
+
+    fn formatted_item_idx(self) -> Option<ValueId> {
+        match self {
+            Self::FormattedUnit { item_idx, .. } | Self::FormattedInternal { item_idx, .. } => {
+                Some(item_idx)
+            }
+            Self::Unit { .. } | Self::Internal { .. } => None,
+        }
+    }
+}
+
+fn lower_read_status_continue_or_exit(b: &mut FuncBuilder, iostat: ValueId, error_exit: BlockId) {
+    if !matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
+        return;
+    }
+
+    let status = b.load_typed(iostat, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    let continue_bb = b.create_block("read_transfer_ok");
+    b.cond_branch(failed, error_exit, vec![], continue_bb, vec![]);
+    b.set_block(continue_bb);
+}
+
+fn lower_read_continue_or_exit(b: &mut FuncBuilder, mode: ReadMode) {
+    lower_read_status_continue_or_exit(b, mode.iostat(), mode.error_exit());
+}
+
+fn finish_read_item(b: &mut FuncBuilder, mode: ReadMode) {
+    lower_read_continue_or_exit(b, mode);
+    if let Some(item_idx) = mode.formatted_item_idx() {
+        bump_formatted_read_index(b, item_idx);
+    }
+}
+
+pub(super) fn lower_read_reset_status(b: &mut FuncBuilder, iostat: ValueId) {
+    if matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
+        let zero = b.const_i32(0);
+        b.store(zero, iostat);
+    }
+}
+
+pub(super) fn lower_read_assign_iomsg(
+    b: &mut FuncBuilder,
+    iostat: ValueId,
+    iomsg: ValueId,
+    iomsg_len: ValueId,
+) {
+    if !matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
+        return;
+    }
+    let status = b.load_typed(iostat, IrType::Int(IntWidth::I32));
+    b.call(
+        FuncRef::External("afs_read_assign_iomsg".into()),
+        vec![status, iomsg, iomsg_len],
+        IrType::Void,
+    );
 }
 
 pub(super) fn lower_read_err_branch(
@@ -34138,7 +34246,7 @@ fn lower_read_logical_into_addr(
     b.store(initial, tmp);
 
     match mode {
-        ReadMode::Unit { unit, iostat } => {
+        ReadMode::Unit { unit, iostat, .. } => {
             b.call(
                 FuncRef::External("afs_read_logical".into()),
                 vec![unit, tmp, iostat],
@@ -34150,6 +34258,7 @@ fn lower_read_logical_into_addr(
             buf_len,
             pos,
             iostat,
+            ..
         } => {
             b.call(
                 FuncRef::External("afs_read_internal_logical".into()),
@@ -34163,6 +34272,7 @@ fn lower_read_logical_into_addr(
             fmt_len,
             item_idx,
             iostat,
+            ..
         } => {
             let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
             b.call(
@@ -34170,7 +34280,6 @@ fn lower_read_logical_into_addr(
                 vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                 IrType::Void,
             );
-            bump_formatted_read_index(b, item_idx);
         }
         ReadMode::FormattedInternal {
             buf_ptr,
@@ -34179,6 +34288,7 @@ fn lower_read_logical_into_addr(
             fmt_len,
             item_idx,
             iostat,
+            ..
         } => {
             let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
             b.call(
@@ -34186,10 +34296,10 @@ fn lower_read_logical_into_addr(
                 vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                 IrType::Void,
             );
-            bump_formatted_read_index(b, item_idx);
         }
     }
 
+    finish_read_item(b, mode);
     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
     let zero = b.const_i32(0);
     let truth = b.icmp(CmpOp::Ne, raw, zero);
@@ -34216,7 +34326,7 @@ pub(super) fn lower_read_into_addr(
     match ty {
         IrType::Int(IntWidth::I128) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_int128".into()),
                         vec![unit, addr, iostat],
@@ -34228,6 +34338,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_int128".into()),
@@ -34241,6 +34352,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34248,7 +34360,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34257,6 +34368,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34272,14 +34384,14 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Int(IntWidth::I64) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_int64".into()),
                         vec![unit, addr, iostat],
@@ -34291,6 +34403,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_int64".into()),
@@ -34304,6 +34417,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34311,7 +34425,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34320,6 +34433,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34335,14 +34449,14 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Int(width @ (IntWidth::I8 | IntWidth::I16)) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     let func = match width {
                         IntWidth::I8 => "afs_read_int8",
                         IntWidth::I16 => "afs_read_int16",
@@ -34353,12 +34467,14 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, addr, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                 }
                 ReadMode::Internal {
                     buf_ptr,
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     b.call(
@@ -34366,6 +34482,7 @@ pub(super) fn lower_read_into_addr(
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
                     let narrowed = b.int_trunc(raw, *width);
                     b.store(narrowed, addr);
@@ -34376,6 +34493,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34384,7 +34502,7 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
                     let narrowed = b.int_trunc(raw, *width);
                     b.store(narrowed, addr);
@@ -34396,6 +34514,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34404,7 +34523,7 @@ pub(super) fn lower_read_into_addr(
                         vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
                     let narrowed = b.int_trunc(raw, *width);
                     b.store(narrowed, addr);
@@ -34414,7 +34533,7 @@ pub(super) fn lower_read_into_addr(
         }
         IrType::Int(_) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_int".into()),
                         vec![unit, addr, iostat],
@@ -34426,6 +34545,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_int".into()),
@@ -34439,6 +34559,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34446,7 +34567,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34455,6 +34575,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34470,14 +34591,14 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Float(FloatWidth::F64) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_real64".into()),
                         vec![unit, addr, iostat],
@@ -34489,6 +34610,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_real".into()),
@@ -34502,6 +34624,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34509,7 +34632,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34518,6 +34640,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34533,25 +34656,27 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Float(FloatWidth::F32) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_real".into()),
                         vec![unit, addr, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                 }
                 ReadMode::Internal {
                     buf_ptr,
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     b.call(
@@ -34559,6 +34684,7 @@ pub(super) fn lower_read_into_addr(
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                     let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
                     let narrow = b.float_trunc(wide, FloatWidth::F32);
                     b.store(narrow, addr);
@@ -34569,6 +34695,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34577,7 +34704,7 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
                     let narrow = b.float_trunc(wide, FloatWidth::F32);
                     b.store(narrow, addr);
@@ -34589,6 +34716,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34597,7 +34725,7 @@ pub(super) fn lower_read_into_addr(
                         vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
                     let narrow = b.float_trunc(wide, FloatWidth::F32);
                     b.store(narrow, addr);
@@ -34630,13 +34758,14 @@ fn lower_read_fixed_char_into_addr(
     len: i64,
 ) -> bool {
     match mode {
-        ReadMode::Unit { unit, iostat } => {
+        ReadMode::Unit { unit, iostat, .. } => {
             let len_v = b.const_i64(len);
             b.call(
                 FuncRef::External("afs_read_string".into()),
                 vec![unit, addr, len_v, iostat],
                 IrType::Void,
             );
+            finish_read_item(b, mode);
             true
         }
         _ => false,
@@ -34857,8 +34986,7 @@ pub(super) fn lower_list_char_read_item(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
-    unit: ValueId,
-    iostat: ValueId,
+    mode: ReadMode,
 ) -> bool {
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
@@ -34872,6 +35000,9 @@ pub(super) fn lower_list_char_read_item(
         lower_string_expr_ctx(b, ctx, item)
     };
 
+    let ReadMode::Unit { unit, iostat, .. } = mode else {
+        return false;
+    };
     b.call(
         FuncRef::External("afs_read_string".into()),
         vec![unit, dest_ptr, dest_len, iostat],
@@ -34885,6 +35016,7 @@ pub(super) fn lower_list_char_read_item(
         Some(ctx.type_layouts),
         dest_ptr,
     );
+    finish_read_item(b, mode);
     true
 }
 
@@ -34892,10 +35024,7 @@ pub(super) fn lower_internal_char_read_item(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
-    buf_ptr: ValueId,
-    buf_len: ValueId,
-    pos: ValueId,
-    iostat: ValueId,
+    mode: ReadMode,
 ) -> bool {
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
@@ -34909,6 +35038,16 @@ pub(super) fn lower_internal_char_read_item(
         lower_string_expr_ctx(b, ctx, item)
     };
 
+    let ReadMode::Internal {
+        buf_ptr,
+        buf_len,
+        pos,
+        iostat,
+        ..
+    } = mode
+    else {
+        return false;
+    };
     b.call(
         FuncRef::External("afs_read_internal_string".into()),
         vec![buf_ptr, buf_len, pos, dest_ptr, dest_len, iostat],
@@ -34922,6 +35061,7 @@ pub(super) fn lower_internal_char_read_item(
         Some(ctx.type_layouts),
         dest_ptr,
     );
+    finish_read_item(b, mode);
     true
 }
 
@@ -34939,6 +35079,7 @@ pub(super) fn lower_formatted_internal_read_items(
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
+    let done = b.create_block("formatted_internal_read_done");
     let mode = ReadMode::FormattedInternal {
         buf_ptr,
         buf_len,
@@ -34946,7 +35087,9 @@ pub(super) fn lower_formatted_internal_read_items(
         fmt_len,
         item_idx,
         iostat,
+        error_exit: done,
     };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_formatted_char_read_item(
@@ -34962,6 +35105,8 @@ pub(super) fn lower_formatted_internal_read_items(
         };
         let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 pub(super) fn lower_formatted_read_items(
@@ -35010,13 +35155,16 @@ pub(super) fn lower_formatted_read_items_with_runtime_advance(
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
+    let done = b.create_block("formatted_read_done");
     let mode = ReadMode::FormattedUnit {
         unit,
         fmt_ptr,
         fmt_len,
         item_idx,
         iostat,
+        error_exit: done,
     };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_formatted_char_read_item_with_runtime_advance(
@@ -35042,6 +35190,8 @@ pub(super) fn lower_formatted_read_items_with_runtime_advance(
         };
         let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 pub(super) fn lower_formatted_char_read_item(
@@ -35175,7 +35325,7 @@ pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
         dest_ptr,
     );
 
-    bump_formatted_read_index(b, item_idx);
+    finish_read_item(b, mode);
     true
 }
 

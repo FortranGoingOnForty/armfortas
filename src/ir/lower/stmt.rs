@@ -8775,6 +8775,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
             };
 
+            let iomsg_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iomsg"))
+                    .unwrap_or(false)
+            });
+
             let explicit_iostat_addr = controls
                 .iter()
                 .find(|c| {
@@ -8786,7 +8793,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
 
             let user_iostat = explicit_iostat_addr.is_some();
-            let needs_hidden_iostat = end_label.is_some() || err_label.is_some();
+            let needs_hidden_iostat =
+                end_label.is_some() || err_label.is_some() || iomsg_ctrl.is_some();
             let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
             let iostat_addr = match explicit_iostat_addr {
                 Some(addr) => addr,
@@ -8810,12 +8818,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 })
                 .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
                 .unwrap_or_else(|| b.const_i64(0));
-            let iomsg_ctrl = controls.iter().find(|c| {
-                c.keyword
-                    .as_deref()
-                    .map(|k| k.eq_ignore_ascii_case("iomsg"))
-                    .unwrap_or(false)
-            });
             let null_iomsg_data = {
                 let z = b.const_i64(0);
                 b.int_to_ptr(z, IrType::Int(IntWidth::I8))
@@ -8840,6 +8842,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             ) {
                 return;
             }
+
+            lower_read_reset_status(b, iostat_addr);
 
             if let Some(ctrl) = controls.first() {
                 // Whole-char-array internal READ produced silent garbage
@@ -8878,6 +8882,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             fmt_ptr,
                         );
                     }
+                    lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
                     lower_read_status_branches(
                         b,
                         ctx,
@@ -8961,6 +8966,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             }
+            lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
             lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
 
