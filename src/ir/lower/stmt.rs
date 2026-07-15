@@ -1554,7 +1554,7 @@ fn lower_format_expr(
     lower_string_expr_ctx(b, ctx, expr)
 }
 
-fn inquire_size_storeback_type(
+fn inquire_integer_storeback_type(
     b: &FuncBuilder,
     ctx: &LowerCtx<'_>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -9023,12 +9023,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (formatted_ptr, formatted_len) = lower_string_spec(b, "formatted");
             let (unformatted_ptr, unformatted_len) = lower_string_spec(b, "unformatted");
             let (leading_zero_ptr, leading_zero_len) = lower_string_spec(b, "leading_zero");
-            let recl_addr = lower_ref_spec(b, "recl");
+            let recl_spec = spec_by_keyword("recl");
+            let (recl_addr, recl_storeback) = if let Some(spec) = recl_spec {
+                let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+                let dest_ty = inquire_integer_storeback_type(b, ctx, &spec.value, dest_addr);
+                let temp = b.alloca(IrType::Int(IntWidth::I64));
+                let current = b.load(dest_addr);
+                let widened = coerce_to_type(b, current, &IrType::Int(IntWidth::I64));
+                b.store(widened, temp);
+                (temp, Some((dest_addr, dest_ty)))
+            } else {
+                (null, None)
+            };
             let size_spec = spec_by_keyword("size");
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = inquire_integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
@@ -9042,7 +9053,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (pos_addr, pos_storeback) = if let Some(spec) = pos_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = inquire_integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
@@ -9140,6 +9151,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ],
                     IrType::Void,
                 );
+            }
+            if let Some((dest_addr, dest_ty)) = recl_storeback {
+                let recl_val = b.load(recl_addr);
+                let coerced = coerce_to_type(b, recl_val, &dest_ty);
+                b.store(coerced, dest_addr);
             }
             if let Some((dest_addr, dest_ty)) = size_storeback {
                 let size_val = b.load(size_addr);
