@@ -1520,9 +1520,11 @@ fn lower_namelist_read_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_addr: ValueId,
-) -> bool {
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> (bool, Option<BlockId>) {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
-        return false;
+        return (false, None);
     };
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
         lower_stmt_error(nml_ctrl.value.span, "NML= must name a NAMELIST group");
@@ -1546,18 +1548,19 @@ fn lower_namelist_read_stmt(
                 ],
                 IrType::Void,
             );
-            return true;
+            return (true, None);
         }
     }
 
     let unit = lower_namelist_unit(b, ctx, controls, 5);
-    lower_external_io_pos_seek(b, ctx, controls, unit, iostat_addr);
+    let positioning_done =
+        lower_external_read_pos_seek(b, ctx, controls, unit, iostat_addr, iomsg_ptr, iomsg_len);
     b.call(
         FuncRef::External("afs_read_namelist".into()),
         vec![unit, group_ptr, group_len, entries, n_entries, iostat_addr],
         IrType::Void,
     );
-    true
+    (true, positioning_done)
 }
 
 fn lower_namelist_write_stmt(
@@ -9208,7 +9211,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 (None, null_iomsg_data, zero_iomsg_len)
             };
 
-            if lower_namelist_read_stmt(b, ctx, controls, iostat_addr) {
+            let (lowered_namelist, namelist_positioning_done) = lower_namelist_read_stmt(
+                b,
+                ctx,
+                controls,
+                iostat_addr,
+                read_iomsg_ptr,
+                read_iomsg_len,
+            );
+            if lowered_namelist {
+                finish_external_read_positioning(b, namelist_positioning_done);
+                lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
                 lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                 lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
