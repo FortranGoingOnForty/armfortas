@@ -28,5 +28,20 @@ program backspace_unformatted_stream_rejected
   if (ios >= 0) error stop 5
   close(unit)
 
+  open(newunit=unit, status='scratch', access='stream', form='formatted', &
+       action='readwrite')
+  write(unit, '(A)') 'line'
+  inquire(unit=unit, pos=before)
+  ios = 77
+  message = 'sentinel'
+  backspace(unit=unit, iostat=ios, iomsg=message, err=200)
+  error stop 6
+200 continue
+  if (ios == 0) error stop 7
+  if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 8
+  inquire(unit=unit, pos=after)
+  if (after /= before) error stop 9
+  close(unit)
+
   print *, 'ok'
 end program backspace_unformatted_stream_rejected

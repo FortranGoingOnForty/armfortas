@@ -3877,15 +3877,34 @@ fn finish_positioning_result(
 }
 
 impl Unit {
+    fn rewind(&mut self) -> io::Result<()> {
+        if self.access == Access::Direct {
+            return Err(invalid_positioning_error(
+                "REWIND is not valid for direct access",
+            ));
+        }
+
+        match &mut self.stream {
+            UnitStream::FileRead(reader) => reader.seek(SeekFrom::Start(0)).map(|_| ()),
+            UnitStream::FileWrite(writer) => writer
+                .flush()
+                .and_then(|()| writer.seek(SeekFrom::Start(0)).map(|_| ())),
+            UnitStream::FileRaw(file) => file.seek(SeekFrom::Start(0)).map(|_| ()),
+            _ => Err(invalid_positioning_error("unit does not support REWIND")),
+        }?;
+        self.reset_read_state_after_positioning();
+        Ok(())
+    }
+
     fn backspace(&mut self) -> io::Result<()> {
         if self.access == Access::Direct {
             return Err(invalid_positioning_error(
                 "BACKSPACE is not valid for direct access",
             ));
         }
-        if self.access == Access::Stream && self.form == Form::Unformatted {
+        if self.access == Access::Stream {
             return Err(invalid_positioning_error(
-                "BACKSPACE is not valid for unformatted stream access",
+                "BACKSPACE is not valid for stream access",
             ));
         }
 
@@ -4476,35 +4495,14 @@ pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
 /// Rewind a unit to the beginning.
 #[no_mangle]
 pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let status = match state.get_unit(unit) {
-        Some(u) => {
-            let result = match &mut u.stream {
-                UnitStream::FileRead(r) => r.seek(SeekFrom::Start(0)).map(|_| ()),
-                UnitStream::FileWrite(w) => w
-                    .flush()
-                    .and_then(|()| w.seek(SeekFrom::Start(0)).map(|_| ())),
-                UnitStream::FileRaw(f) => f.seek(SeekFrom::Start(0)).map(|_| ()),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "unit does not support REWIND",
-                )),
-            };
-            match result {
-                Ok(()) => {
-                    u.reset_read_state_after_positioning();
-                    0
-                }
-                Err(e) => e.raw_os_error().unwrap_or(1),
-            }
-        }
-        None => 1,
+    let result = {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .get_unit(unit)
+            .ok_or_else(|| invalid_positioning_error("unit is not connected"))
+            .and_then(Unit::rewind)
     };
-    if !iostat.is_null() {
-        unsafe {
-            *iostat = status;
-        }
-    }
+    finish_positioning_result("REWIND", result, iostat, std::ptr::null_mut(), 0);
 }
 
 // ---- Program lifecycle integration ----
@@ -6343,7 +6341,7 @@ mod tests {
     }
 
     #[test]
-    fn backspace_rejects_unformatted_stream_without_repositioning() {
+    fn positioning_rejects_invalid_access_without_repositioning() {
         let path = format!(
             "/tmp/afs_backspace_unformatted_stream_{}.dat",
             std::process::id()
@@ -6385,8 +6383,26 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
-            "BACKSPACE is not valid for unformatted stream access"
+            "BACKSPACE is not valid for stream access"
         );
+        let after = match &mut unit.stream {
+            UnitStream::FileRaw(file) => file.stream_position().unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(after, before);
+
+        unit.form = Form::Formatted;
+        let error = unit.backspace().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "BACKSPACE is not valid for stream access"
+        );
+
+        unit.access = Access::Direct;
+        let error = unit.rewind().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "REWIND is not valid for direct access");
         let after = match &mut unit.stream {
             UnitStream::FileRaw(file) => file.stream_position().unwrap(),
             _ => unreachable!(),
