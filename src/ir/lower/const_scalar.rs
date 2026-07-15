@@ -285,7 +285,9 @@ pub(super) fn eval_const_scalar(
                             return None;
                         };
                         if let Expr::StringLiteral { value, .. } = &e.node {
-                            Some(ConstScalar::Int(selected_char_kind_value(value)))
+                            Some(ConstScalar::Int(selected_char_kind_value(
+                                value.to_string_lossy().as_ref(),
+                            )))
                         } else {
                             None
                         }

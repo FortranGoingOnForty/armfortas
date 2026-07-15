@@ -132,7 +132,10 @@ fn hex_decode_bytes(value: &str) -> Option<Vec<u8>> {
 fn encode_nested_field_default_init(init: &crate::sema::type_layout::FieldDefaultInit) -> String {
     use crate::sema::type_layout::FieldDefaultInit;
     match init {
-        FieldDefaultInit::Character(value) => format!("C{}", hex_encode_bytes(value.as_bytes())),
+        FieldDefaultInit::Character(value) => format!(
+            "C{}",
+            hex_encode_bytes(&crate::source_bytes::from_source_view(value))
+        ),
         FieldDefaultInit::Integer(value) => format!("I{}", value),
         FieldDefaultInit::Logical(value) => format!("L{}", if *value { '1' } else { '0' }),
         FieldDefaultInit::Real(value) => format!("R{:016x}", value.to_bits()),
@@ -182,7 +185,7 @@ fn decode_nested_field_default_init(
 ) -> Option<crate::sema::type_layout::FieldDefaultInit> {
     use crate::sema::type_layout::FieldDefaultInit;
     if let Some(value) = encoded.strip_prefix('C') {
-        let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
+        let decoded = crate::source_bytes::to_source_view(&hex_decode_bytes(value)?);
         return Some(FieldDefaultInit::Character(decoded));
     }
     if let Some(value) = encoded.strip_prefix('I') {
@@ -716,7 +719,7 @@ fn emit_parameter(
     let const_char_hex = sym
         .const_char_value
         .as_ref()
-        .map(|value| hex_encode_bytes(value.as_bytes()));
+        .map(|value| hex_encode_bytes(&crate::source_bytes::from_source_view(value)));
     let const_int = sym
         .const_value
         .map(i128::from)
@@ -1293,7 +1296,10 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
         fn render_field_default_init(init: &crate::sema::type_layout::FieldDefaultInit) -> String {
             match init {
                 crate::sema::type_layout::FieldDefaultInit::Character(value) => {
-                    format!(" @init=charhex:{}", hex_encode_bytes(value.as_bytes()))
+                    format!(
+                        " @init=charhex:{}",
+                        hex_encode_bytes(&crate::source_bytes::from_source_view(value))
+                    )
                 }
                 crate::sema::type_layout::FieldDefaultInit::Integer(value) => {
                     format!(" @init=int:{}", value)
@@ -2045,8 +2051,8 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
                 i += 2;
             } else if parts[i] == "@charhex" {
                 if let Some(hex) = parts.get(i + 1) {
-                    const_char_value =
-                        hex_decode_bytes(hex).and_then(|bytes| String::from_utf8(bytes).ok());
+                    const_char_value = hex_decode_bytes(hex)
+                        .map(|bytes| crate::source_bytes::to_source_view(&bytes));
                 }
                 i += 2;
             } else if parts[i] == "@deferred_char" {
@@ -2361,7 +2367,7 @@ fn parse_type(
                 .map(FieldDefaultInit::Real);
         }
         if let Some(value) = payload.strip_prefix("charhex:") {
-            let decoded = String::from_utf8(hex_decode_bytes(value)?).ok()?;
+            let decoded = crate::source_bytes::to_source_view(&hex_decode_bytes(value)?);
             return Some(FieldDefaultInit::Character(decoded));
         }
         if let Some(value) = payload.strip_prefix("exprhex:") {

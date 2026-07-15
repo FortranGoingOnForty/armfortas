@@ -3,6 +3,116 @@
 //! Represents all Fortran expression forms: literals, names, operators,
 //! function calls, array constructors, component access, and more.
 
+use std::borrow::Cow;
+use std::fmt;
+
+/// Character literal contents with explicit source-byte provenance.
+#[derive(Clone)]
+pub struct StringLiteralValue {
+    text: String,
+    source_view: bool,
+}
+
+impl StringLiteralValue {
+    pub(crate) fn from_source_view(text: String) -> Self {
+        Self {
+            text,
+            source_view: true,
+        }
+    }
+
+    pub fn as_bytes(&self) -> Cow<'_, [u8]> {
+        if self.source_view {
+            Cow::Owned(crate::source_bytes::from_source_view(&self.text))
+        } else {
+            Cow::Borrowed(self.text.as_bytes())
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        if self.source_view {
+            crate::source_bytes::source_byte_len(&self.text)
+        } else {
+            self.text.len()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        if self.source_view {
+            Cow::Owned(crate::source_bytes::display_source_view(&self.text))
+        } else {
+            Cow::Borrowed(&self.text)
+        }
+    }
+
+    pub fn eq_ignore_ascii_case(&self, other: &str) -> bool {
+        self.as_bytes()
+            .as_ref()
+            .eq_ignore_ascii_case(other.as_bytes())
+    }
+
+    pub(crate) fn source_view(&self) -> Cow<'_, str> {
+        if self.source_view {
+            Cow::Borrowed(&self.text)
+        } else {
+            Cow::Owned(crate::source_bytes::escape_utf8(&self.text))
+        }
+    }
+}
+
+impl From<String> for StringLiteralValue {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            source_view: false,
+        }
+    }
+}
+
+impl From<&str> for StringLiteralValue {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
+impl fmt::Debug for StringLiteralValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_string_lossy().fmt(f)
+    }
+}
+
+impl fmt::Display for StringLiteralValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_string_lossy().fmt(f)
+    }
+}
+
+impl PartialEq for StringLiteralValue {
+    fn eq(&self, other: &Self) -> bool {
+        if self.source_view == other.source_view {
+            self.text == other.text
+        } else {
+            self.as_bytes() == other.as_bytes()
+        }
+    }
+}
+
+impl PartialEq<str> for StringLiteralValue {
+    fn eq(&self, other: &str) -> bool {
+        self.as_bytes().as_ref() == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for StringLiteralValue {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
 /// A Fortran expression.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
@@ -13,7 +123,10 @@ pub enum Expr {
     /// Real literal: `3.14`, `1.0d0`, `6.022e23`, `1.0_8`, `.5`, `5.`
     RealLiteral { text: String, kind: Option<String> },
     /// String literal: `'hello'`, `"hello"`, `'it''s'`
-    StringLiteral { value: String, kind: Option<String> },
+    StringLiteral {
+        value: StringLiteralValue,
+        kind: Option<String>,
+    },
     /// Logical literal: `.true.`, `.false.`, `.true._4`
     LogicalLiteral { value: bool, kind: Option<String> },
     /// Complex literal: `(1.0, 2.0)`

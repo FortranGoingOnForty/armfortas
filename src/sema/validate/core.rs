@@ -740,7 +740,9 @@ fn eval_const_int_expr_checked(
             };
             let value = match name.to_ascii_lowercase().as_str() {
                 "selected_char_kind" => match &first.node {
-                    Expr::StringLiteral { value, .. } => selected_character_kind(value),
+                    Expr::StringLiteral { value, .. } => {
+                        selected_character_kind(value.to_string_lossy().as_ref())
+                    }
                     _ => return Ok(None),
                 },
                 "kind" => match validation_expr_type_info(ctx, first) {

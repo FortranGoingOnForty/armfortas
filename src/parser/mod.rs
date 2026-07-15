@@ -38,6 +38,7 @@ pub struct Parser<'a> {
     pos: usize,
     expr_depth: usize,
     slash_array_ctor_depth: usize,
+    source_view: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -47,6 +48,17 @@ impl<'a> Parser<'a> {
             pos: 0,
             expr_depth: 0,
             slash_array_ctor_depth: 0,
+            source_view: false,
+        }
+    }
+
+    pub(crate) fn new_source_view(tokens: &'a [Token]) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            expr_depth: 0,
+            slash_array_ctor_depth: 0,
+            source_view: true,
         }
     }
 
