@@ -1,4 +1,4 @@
-! STDERR_CHECK: Fortran runtime error:
+! STDERR_CHECK: Fortran runtime error: unit not open for writing
 ! EXIT_CODE: 2
 program write_list_error_loud
   implicit none

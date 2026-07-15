@@ -1,4 +1,4 @@
-! STDERR_CHECK: Fortran runtime error: WRITE failed with IOSTAT=91
+! STDERR_CHECK: Fortran runtime error: defined write failed
 ! EXIT_CODE: 2
 module write_defined_unhandled_error_support
   implicit none

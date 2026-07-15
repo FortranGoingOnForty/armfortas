@@ -33857,7 +33857,7 @@ fn resolve_defined_io_item_specific(
     })
 }
 
-fn scratch_char_slot_arg(b: &mut FuncBuilder) -> (ValueId, ValueId) {
+pub(super) fn scratch_char_buffer_arg(b: &mut FuncBuilder) -> (ValueId, ValueId, ValueId) {
     const SCRATCH_LEN: u64 = 256;
 
     let storage = b.alloca(IrType::Array(
@@ -33876,6 +33876,11 @@ fn scratch_char_slot_arg(b: &mut FuncBuilder) -> (ValueId, ValueId) {
 
     let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     b.store(data, slot);
+    (slot, data, len)
+}
+
+fn scratch_char_slot_arg(b: &mut FuncBuilder) -> (ValueId, ValueId) {
+    let (slot, _, len) = scratch_char_buffer_arg(b);
     (slot, len)
 }
 

@@ -2357,8 +2357,14 @@ pub extern "C" fn afs_read_unhandled_iostat(status: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn afs_write_unhandled_iostat(status: i32) {
-    eprintln!("Fortran runtime error: WRITE failed with IOSTAT={status}");
+pub extern "C" fn afs_write_unhandled_iostat(status: i32, iomsg: *const u8, iomsg_len: i64) {
+    let message = unsafe_str(iomsg, iomsg_len);
+    let message = message.trim();
+    if message.is_empty() {
+        eprintln!("Fortran runtime error: WRITE failed with IOSTAT={status}");
+    } else {
+        eprintln!("Fortran runtime error: {message}");
+    }
     std::process::exit(2);
 }
 
@@ -3313,7 +3319,10 @@ pub extern "C" fn afs_lst_end_internal_fixed() {
         }
 
         let (status, message) = if context.unavailable {
-            (1, "internal file is not allocated")
+            (
+                1,
+                "internal WRITE to an unallocated or zero-size character array",
+            )
         } else if context.overflowed {
             (IOSTAT_EOR, "end of record")
         } else {
@@ -5125,7 +5134,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         Ok(output) => {
                             if output.contains(&b'\n') {
                                 io_status = 1;
-                                io_msg = Some("write exceeds internal file size");
+                                io_msg = Some(
+                                    "internal WRITE of more than one record into a character scalar",
+                                );
                                 if c.iostat.is_null() {
                                     eprintln!(
                                         "ERROR: internal WRITE of more than one record into a character scalar"
@@ -5162,7 +5173,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         Ok(output) => {
                             if output.contains(&b'\n') {
                                 io_status = 1;
-                                io_msg = Some("write exceeds internal file size");
+                                io_msg = Some(
+                                    "internal WRITE of more than one record into a character scalar",
+                                );
                                 if c.iostat.is_null() {
                                     eprintln!(
                                         "ERROR: internal WRITE of more than one record into a character scalar"
@@ -5199,7 +5212,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         Ok(output) => {
                             if buf.is_null() || elem_len <= 0 || nelems <= 0 {
                                 io_status = 1;
-                                io_msg = Some("internal file is not allocated");
+                                io_msg = Some(
+                                    "internal WRITE to an unallocated or zero-size character array",
+                                );
                                 if c.iostat.is_null() {
                                     eprintln!(
                                         "ERROR: internal WRITE to an unallocated or zero-size character array"
@@ -7383,7 +7398,7 @@ mod tests {
     fn fixed_internal_list_rejects_zero_record_array() {
         let mut buf = *b"???";
         let mut iostat = 77;
-        let mut iomsg = [b'?'; 32];
+        let mut iomsg = [b'?'; 80];
         let mut pos = 0;
 
         afs_lst_begin_internal_fixed(
@@ -7405,7 +7420,10 @@ mod tests {
 
         assert_eq!(buf, *b"???");
         assert_eq!(iostat, 1);
-        assert_eq!(&iomsg[..30], b"internal file is not allocated");
+        assert_eq!(
+            std::str::from_utf8(&iomsg).unwrap().trim_end(),
+            "internal WRITE to an unallocated or zero-size character array"
+        );
     }
 
     #[test]
