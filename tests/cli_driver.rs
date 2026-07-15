@@ -29761,6 +29761,25 @@ fn free_form_continuation_diagnostic_uses_physical_line() {
 }
 
 #[test]
+fn line_directive_diagnostic_uses_reported_location() {
+    let source = write_program("#line 700 \"virtual.f90\"\nx = 1 + &\n  @\n", "F90");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("virtual.f90:701:3: error:"),
+        "#line diagnostic used physical coordinates: {stderr}"
+    );
+    assert!(
+        stderr.contains("701 |   @"),
+        "#line diagnostic did not retain the physical snippet: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
 fn fixed_form_continuation_diagnostic_uses_physical_line() {
     let source = write_program(
         "      PROGRAM P\n      INTEGER I\n      I = 1\n     1@\n      END\n",

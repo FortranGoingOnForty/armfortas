@@ -576,6 +576,36 @@ pub(crate) fn preprocess_for_dependency_scan(
     pp.process(source, &config.filename)
 }
 
+#[derive(Debug, Clone)]
+struct ReportedLocation {
+    filename: Arc<str>,
+    line: u32,
+}
+
+impl ReportedLocation {
+    fn advance(&mut self, physical_lines: usize) {
+        self.line = self.line.saturating_add(physical_lines as u32);
+    }
+
+    fn at_physical_offset(&self, physical_lines: u32) -> Self {
+        Self {
+            filename: self.filename.clone(),
+            line: self.line.saturating_add(physical_lines),
+        }
+    }
+}
+
+struct ProcessEnd {
+    next: ReportedLocation,
+    last: Option<ReportedLocation>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroContext {
+    Source,
+    Condition,
+}
+
 /// Condition stack state for nested #if/#ifdef blocks.
 #[derive(Debug, Clone, Copy)]
 enum CondState {
@@ -606,8 +636,6 @@ struct Preprocessor {
     emit_warnings: bool,
     /// Whether source stripping is currently inside a C-style block comment.
     in_c_block_comment: bool,
-    /// #line overrides for source map reporting.
-    line_override: Option<(u32, String)>,
     included_files: Vec<PathBuf>,
 }
 
@@ -620,7 +648,6 @@ impl Preprocessor {
             cpp_compat: config.cpp_compat,
             emit_warnings,
             in_c_block_comment: false,
-            line_override: None,
             cond_stack: Vec::new(),
             skip_depth: 0,
             include_depth: 0,
@@ -629,29 +656,33 @@ impl Preprocessor {
     }
 
     fn make_source_origin(
-        &self,
         source: &Arc<SourceFile>,
         source_line: u32,
         source_col: u32,
+        reported: &ReportedLocation,
     ) -> SourceOrigin {
-        let (filename, line) = match &self.line_override {
-            Some((override_line, override_file)) if !override_file.is_empty() => {
-                (Arc::from(override_file.as_str()), *override_line)
-            }
-            Some((override_line, _)) => (source.filename.clone(), *override_line),
-            None => (source.filename.clone(), source_line),
-        };
         SourceOrigin {
             source: source.clone(),
             source_line,
             source_col,
-            filename,
-            line,
+            filename: reported.filename.clone(),
+            line: reported.line,
         }
     }
 
     fn is_emitting(&self) -> bool {
         self.skip_depth == 0
+    }
+
+    fn set_location_macros(&mut self, location: &ReportedLocation) {
+        self.defines.insert(
+            "__LINE__".into(),
+            MacroDef::object(&location.line.to_string()),
+        );
+        self.defines.insert(
+            "__FILE__".into(),
+            MacroDef::object(&format!("\"{}\"", location.filename)),
+        );
     }
 
     fn process(&mut self, source: &str, filename: &str) -> Result<PreprocOutput, PreprocError> {
@@ -661,19 +692,21 @@ impl Preprocessor {
             filename: Arc::from(filename),
             text: source.into(),
         });
-        self.process_into(root_source.clone(), &mut output, &mut source_map)?;
+        let process_end = self.process_into(root_source.clone(), &mut output, &mut source_map)?;
 
         // Check for unterminated conditionals (only at top level).
         if self.include_depth == 0 && !self.cond_stack.is_empty() {
+            let location = process_end.last.as_ref().unwrap_or(&process_end.next);
             return Err(PreprocError {
-                filename: filename.into(),
-                line: source.lines().count() as u32,
+                filename: location.filename.to_string(),
+                line: location.line,
                 msg: format!(
                     "unterminated #if/#ifdef ({} level(s) still open)",
                     self.cond_stack.len()
                 ),
             });
         }
+        let final_reported = process_end.next;
 
         let mut eof_origin = None;
         for (index, line) in output.lines().enumerate() {
@@ -689,8 +722,8 @@ impl Preprocessor {
                 source: root_source.clone(),
                 source_line: eof_line,
                 source_col: 1,
-                filename: root_source.filename.clone(),
-                line: eof_line,
+                filename: final_reported.filename,
+                line: final_reported.line,
             }
         });
 
@@ -707,13 +740,13 @@ impl Preprocessor {
         source: Arc<SourceFile>,
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
-    ) -> Result<(), PreprocError> {
+    ) -> Result<ProcessEnd, PreprocError> {
         let filename = source.filename.as_ref();
-        // Set dynamic macros.
-        self.defines.insert(
-            "__FILE__".into(),
-            MacroDef::object(&format!("\"{}\"", filename)),
-        );
+        let mut reported = ReportedLocation {
+            filename: source.filename.clone(),
+            line: 1,
+        };
+        let mut last_reported = None;
 
         let now = current_datetime();
         self.defines.insert(
@@ -730,25 +763,33 @@ impl Preprocessor {
         let raw_lines: Vec<&str> = source.text.lines().collect();
         let mut i = 0;
         while i < raw_lines.len() {
+            let physical_start = i;
             let orig_line_num = (i + 1) as u32; // 1-based, tracks original source line
-            let mut logical_line =
-                MappedText::empty(self.make_source_origin(&source, orig_line_num, 1));
+            let reported_start = reported.clone();
+            let mut logical_line = MappedText::empty(Self::make_source_origin(
+                &source,
+                orig_line_num,
+                1,
+                &reported_start,
+            ));
 
             // Join backslash-continued lines (C-style).
             while i < raw_lines.len() && raw_lines[i].ends_with('\\') {
                 let line_num = (i + 1) as u32;
+                let piece_reported = reported_start.at_physical_offset(line_num - orig_line_num);
                 let piece = MappedText::source_line(
                     &raw_lines[i][..raw_lines[i].len() - 1],
-                    self.make_source_origin(&source, line_num, 1),
+                    Self::make_source_origin(&source, line_num, 1, &piece_reported),
                 );
                 logical_line.append(&piece);
                 i += 1;
             }
             if i < raw_lines.len() {
                 let line_num = (i + 1) as u32;
+                let piece_reported = reported_start.at_physical_offset(line_num - orig_line_num);
                 let piece = MappedText::source_line(
                     raw_lines[i],
-                    self.make_source_origin(&source, line_num, 1),
+                    Self::make_source_origin(&source, line_num, 1, &piece_reported),
                 );
                 logical_line.append(&piece);
                 i += 1;
@@ -782,9 +823,12 @@ impl Preprocessor {
                         logical_line.truncate(amp_pos);
                         let leading = raw_next.len() - next.len();
                         let content_start = leading + usize::from(next.starts_with('&'));
+                        let physical_line = (i + 1) as u32;
+                        let piece_reported =
+                            reported_start.at_physical_offset(physical_line - orig_line_num);
                         let next_line = MappedText::source_line(
                             raw_next,
-                            self.make_source_origin(&source, (i + 1) as u32, 1),
+                            Self::make_source_origin(&source, physical_line, 1, &piece_reported),
                         );
                         let next_piece = next_line.slice(content_start..raw_next.len());
                         let base = logical_line.text.len();
@@ -801,11 +845,10 @@ impl Preprocessor {
                 }
             }
 
-            // Update __LINE__ to the original starting line of this logical line.
-            self.defines.insert(
-                "__LINE__".into(),
-                MacroDef::object(&orig_line_num.to_string()),
-            );
+            let physical_lines = i - physical_start;
+            last_reported =
+                Some(reported_start.at_physical_offset(physical_lines.saturating_sub(1) as u32));
+            self.set_location_macros(&reported_start);
 
             let trimmed = logical_line.text.trim_start();
             if self.cpp_compat || self.in_c_block_comment || trimmed.starts_with("/*") {
@@ -825,6 +868,7 @@ impl Preprocessor {
                     }
                     output.push('\n');
                     source_map.push(logical_line.into_source_loc());
+                    reported.advance(physical_lines);
                     continue;
                 }
             }
@@ -833,9 +877,20 @@ impl Preprocessor {
 
             // Preprocessor directives: # in column 1 (or after whitespace in free-form).
             if trimmed.starts_with('#') {
-                self.process_directive(trimmed, filename, orig_line_num, output, source_map)?;
+                let directive_start = logical_line.text.len() - trimmed.len();
+                let directive_line = logical_line.slice(directive_start..logical_line.text.len());
+                let reset_location = self.process_directive(
+                    &directive_line,
+                    filename,
+                    output,
+                    source_map,
+                    &mut reported,
+                )?;
                 output.push('\n');
                 source_map.push(logical_line.into_source_loc());
+                if !reset_location {
+                    reported.advance(physical_lines);
+                }
                 continue;
             }
 
@@ -848,57 +903,98 @@ impl Preprocessor {
             };
             output.push('\n');
             source_map.push(emitted.into_source_loc());
+            reported.advance(physical_lines);
         }
 
-        Ok(())
+        Ok(ProcessEnd {
+            next: reported,
+            last: last_reported,
+        })
     }
 
     fn process_directive(
         &mut self,
-        line: &str,
-        filename: &str,
-        line_num: u32,
+        line: &MappedText,
+        source_filename: &str,
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
-    ) -> Result<(), PreprocError> {
-        let rest = strip_c_directive_comments(line[1..].trim_start()); // skip '#' and whitespace
-        let (directive, args) = split_first_word(&rest);
+        reported: &mut ReportedLocation,
+    ) -> Result<bool, PreprocError> {
+        let diagnostic_filename = reported.filename.clone();
+        let diagnostic_line = reported.line;
+        let line = strip_c_directive_comments(line);
+        let bytes = line.text.as_bytes();
+        let mut directive_start = 1; // skip '#'
+        while directive_start < bytes.len() && bytes[directive_start].is_ascii_whitespace() {
+            directive_start += 1;
+        }
+        let mut directive_end = directive_start;
+        while directive_end < bytes.len() && !bytes[directive_end].is_ascii_whitespace() {
+            directive_end += 1;
+        }
+        let directive = &line.text[directive_start..directive_end];
+        let mut args_start = directive_end;
+        while args_start < bytes.len() && bytes[args_start].is_ascii_whitespace() {
+            args_start += 1;
+        }
+        let args = line.slice(args_start..line.text.len());
+        let args_text = args.text.as_str();
 
         // Conditionals must be processed even when skipping.
         match directive {
-            "ifdef" => return self.do_ifdef(args, false),
-            "ifndef" => return self.do_ifdef(args, true),
-            "if" => return self.do_if(args, filename, line_num),
-            "elif" => return self.do_elif(args, filename, line_num),
-            "else" => return self.do_else(filename, line_num),
-            "endif" => return self.do_endif(filename, line_num),
+            "ifdef" => self.do_ifdef(args_text, false)?,
+            "ifndef" => self.do_ifdef(args_text, true)?,
+            "if" => self.do_if(&args, &diagnostic_filename, diagnostic_line)?,
+            "elif" => self.do_elif(&args, &diagnostic_filename, diagnostic_line)?,
+            "else" => self.do_else(&diagnostic_filename, diagnostic_line)?,
+            "endif" => self.do_endif(&diagnostic_filename, diagnostic_line)?,
             _ => {}
+        }
+        if matches!(
+            directive,
+            "ifdef" | "ifndef" | "if" | "elif" | "else" | "endif"
+        ) {
+            return Ok(false);
         }
 
         // All other directives are only processed when emitting.
         if !self.is_emitting() {
-            return Ok(());
+            return Ok(false);
         }
 
         match directive {
-            "define" => self.do_define(args),
-            "undef" => self.do_undef(args),
-            "include" => self.do_include(args, filename, line_num, output, source_map),
-            "error" => Err(PreprocError {
-                filename: filename.into(),
-                line: line_num,
-                msg: format!("#error {}", args),
-            }),
+            "define" => self.do_define(args_text)?,
+            "undef" => self.do_undef(args_text)?,
+            "include" => self.do_include(
+                args_text,
+                source_filename,
+                &diagnostic_filename,
+                diagnostic_line,
+                output,
+                source_map,
+            )?,
+            "error" => {
+                return Err(PreprocError {
+                    filename: diagnostic_filename.to_string(),
+                    line: diagnostic_line,
+                    msg: format!("#error {}", args_text),
+                });
+            }
             "warning" => {
                 if self.emit_warnings {
-                    eprintln!("{}:{}: warning: #warning {}", filename, line_num, args);
+                    eprintln!(
+                        "{}:{}: warning: #warning {}",
+                        diagnostic_filename, diagnostic_line, args_text
+                    );
                 }
-                Ok(())
             }
-            "line" => self.do_line(args, filename, line_num),
-            "" => Ok(()), // bare # is allowed (null directive)
-            _ => Ok(()),  // unknown directives are ignored (like #pragma)
+            "line" => {
+                return Ok(self.do_line(args_text, reported));
+            }
+            "" => {} // bare # is allowed (null directive)
+            _ => {}  // unknown directives are ignored (like #pragma)
         }
+        Ok(false)
     }
 
     // ---- Conditional directive helpers (maintain skip_depth counter) ----
@@ -948,7 +1044,12 @@ impl Preprocessor {
         Ok(())
     }
 
-    fn do_if(&mut self, args: &str, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn do_if(
+        &mut self,
+        args: &MappedText,
+        filename: &str,
+        line_num: u32,
+    ) -> Result<(), PreprocError> {
         if !self.is_emitting() {
             self.push_cond(CondState::ParentSkipping);
             return Ok(());
@@ -962,7 +1063,12 @@ impl Preprocessor {
         Ok(())
     }
 
-    fn do_elif(&mut self, args: &str, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn do_elif(
+        &mut self,
+        args: &MappedText,
+        filename: &str,
+        line_num: u32,
+    ) -> Result<(), PreprocError> {
         match self.cond_stack.last().copied() {
             None => Err(PreprocError {
                 filename: filename.into(),
@@ -1068,19 +1174,21 @@ impl Preprocessor {
 
     // ---- #line ----
 
-    fn do_line(&mut self, args: &str, _filename: &str, _line_num: u32) -> Result<(), PreprocError> {
+    fn do_line(&self, args: &str, reported: &mut ReportedLocation) -> bool {
         let args = args.trim();
         let (line_str, rest) = split_first_word(args);
         if let Ok(line_num) = line_str.parse::<u32>() {
-            let filename = if !rest.is_empty() {
-                // Strip quotes from filename.
-                rest.trim_matches('"').to_string()
-            } else {
-                String::new()
-            };
-            self.line_override = Some((line_num, filename));
+            reported.line = line_num;
+            let rest = rest.trim();
+            if let Some(quoted) = rest.strip_prefix('"') {
+                if let Some(end) = quoted.find('"') {
+                    reported.filename = Arc::from(&quoted[..end]);
+                }
+            }
+            true
+        } else {
+            false
         }
-        Ok(())
     }
 
     // ---- #include ----
@@ -1088,62 +1196,64 @@ impl Preprocessor {
     fn do_include(
         &mut self,
         args: &str,
-        filename: &str,
-        line_num: u32,
+        source_filename: &str,
+        diagnostic_filename: &str,
+        diagnostic_line: u32,
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
     ) -> Result<(), PreprocError> {
         let args = args.trim();
         let (path_str, search_system) = if let Some(rest) = args.strip_prefix('"') {
             let end = rest.find('"').ok_or_else(|| PreprocError {
-                filename: filename.into(),
-                line: line_num,
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
                 msg: "unterminated #include string".into(),
             })?;
             (&rest[..end], false)
         } else if let Some(rest) = args.strip_prefix('<') {
             let end = rest.find('>').ok_or_else(|| PreprocError {
-                filename: filename.into(),
-                line: line_num,
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
                 msg: "unterminated #include <path>".into(),
             })?;
             (&rest[..end], true)
         } else {
             return Err(PreprocError {
-                filename: filename.into(),
-                line: line_num,
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
                 msg: format!("expected \"file\" or <file> after #include, got: {}", args),
             });
         };
 
         if self.include_depth >= 64 {
             return Err(PreprocError {
-                filename: filename.into(),
-                line: line_num,
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
                 msg: "include depth limit exceeded (possible recursion)".into(),
             });
         }
 
         // Search for the file.
         let resolved = self
-            .resolve_include(path_str, filename, search_system)
+            .resolve_include(path_str, source_filename, search_system)
             .ok_or_else(|| PreprocError {
-                filename: filename.into(),
-                line: line_num,
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
                 msg: format!("cannot find include file: {}", path_str),
             })?;
 
         let content = std::fs::read_to_string(&resolved).map_err(|e| PreprocError {
-            filename: filename.into(),
-            line: line_num,
+            filename: diagnostic_filename.into(),
+            line: diagnostic_line,
             msg: format!("reading {}: {}", resolved.display(), e),
         })?;
         if !self.included_files.contains(&resolved) {
             self.included_files.push(resolved.clone());
         }
 
-        // Save __FILE__ so it's restored after the include returns.
+        // Built-ins are dynamically scoped to the included source.
         let saved_file = self.defines.get("__FILE__").cloned();
+        let saved_line = self.defines.get("__LINE__").cloned();
 
         self.include_depth += 1;
         let inc_filename = resolved.to_string_lossy().into_owned();
@@ -1151,13 +1261,12 @@ impl Preprocessor {
             filename: Arc::from(inc_filename),
             text: content,
         });
-        self.process_into(included_source, output, source_map)?;
+        let include_result = self.process_into(included_source, output, source_map);
         self.include_depth -= 1;
 
-        // Restore __FILE__ to the parent's filename.
-        if let Some(saved) = saved_file {
-            self.defines.insert("__FILE__".into(), saved);
-        }
+        restore_macro(&mut self.defines, "__FILE__", saved_file);
+        restore_macro(&mut self.defines, "__LINE__", saved_line);
+        include_result?;
         Ok(())
     }
 
@@ -1187,7 +1296,7 @@ impl Preprocessor {
 
     fn eval_condition(
         &self,
-        expr: &str,
+        expr: &MappedText,
         filename: &str,
         line_num: u32,
     ) -> Result<bool, PreprocError> {
@@ -1207,25 +1316,26 @@ impl Preprocessor {
     /// ordinary source lines, but apply condition-specific semantics:
     /// `defined` is resolved during the walk and any remaining identifiers
     /// are rewritten to `0` at the end.
-    fn expand_condition_macros(&self, expr: &str) -> String {
+    fn expand_condition_macros(&self, expr: &MappedText) -> String {
         let expanding = std::collections::HashSet::new();
-        let expanded = self.expand_condition_macros_inner(expr, &expanding);
-        replace_undefined_idents(&expanded)
+        let expanded = self.expand_mapped_macros_inner(expr, &expanding, MacroContext::Condition);
+        replace_undefined_idents(&expanded.text)
     }
 
     // ---- Macro expansion in source lines ----
 
     fn expand_mapped_macros(&self, line: &MappedText) -> MappedText {
         let expanding = std::collections::HashSet::new();
-        self.expand_mapped_macros_inner(line, &expanding)
+        self.expand_mapped_macros_inner(line, &expanding, MacroContext::Source)
     }
 
     fn expand_mapped_macros_inner(
         &self,
         line: &MappedText,
         expanding: &std::collections::HashSet<String>,
+        context: MacroContext,
     ) -> MappedText {
-        if self.defines.is_empty() {
+        if self.defines.is_empty() && context == MacroContext::Source {
             return line.clone();
         }
 
@@ -1234,7 +1344,7 @@ impl Preprocessor {
         let mut i = 0;
 
         while i < bytes.len() {
-            if bytes[i] == b'!' {
+            if context == MacroContext::Source && bytes[i] == b'!' {
                 result.append_slice(line, i..line.text.len());
                 break;
             }
@@ -1266,8 +1376,32 @@ impl Preprocessor {
                 }
                 let ident = &line.text[start..i];
 
+                if context == MacroContext::Condition && ident == "defined" {
+                    let (name, new_i) = parse_defined_operand(&line.text, i);
+                    let invocation = line.origin_at(start);
+                    let replacement = if self.defines.contains_key(name) {
+                        "1"
+                    } else {
+                        "0"
+                    };
+                    result.append(&MappedText::anchored(replacement, invocation));
+                    i = new_i;
+                    continue;
+                }
+
                 if expanding.contains(ident) {
                     result.append_slice(line, start..i);
+                    continue;
+                }
+
+                if ident == "__LINE__" || ident == "__FILE__" {
+                    let invocation = line.origin_at(start);
+                    let replacement = if ident == "__LINE__" {
+                        invocation.line.to_string()
+                    } else {
+                        format!("\"{}\"", invocation.filename)
+                    };
+                    result.append(&MappedText::anchored(&replacement, invocation));
                     continue;
                 }
 
@@ -1275,14 +1409,16 @@ impl Preprocessor {
                     let invocation = line.origin_at(start);
                     if def.is_function {
                         if i < bytes.len() && bytes[i] == b'(' {
-                            if let Some((expanded, new_i)) = self
-                                .expand_mapped_function_macro(def, line, i, invocation, expanding)
-                            {
+                            if let Some((expanded, new_i)) = self.expand_mapped_function_macro(
+                                def, line, i, invocation, expanding, context,
+                            ) {
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
-                                result.append(
-                                    &self.expand_mapped_macros_inner(&expanded, &next_expanding),
-                                );
+                                result.append(&self.expand_mapped_macros_inner(
+                                    &expanded,
+                                    &next_expanding,
+                                    context,
+                                ));
                                 i = new_i;
                                 continue;
                             }
@@ -1292,7 +1428,11 @@ impl Preprocessor {
                         let mut next_expanding = expanding.clone();
                         next_expanding.insert(ident.to_string());
                         let body = MappedText::anchored(&def.body, invocation);
-                        result.append(&self.expand_mapped_macros_inner(&body, &next_expanding));
+                        result.append(&self.expand_mapped_macros_inner(
+                            &body,
+                            &next_expanding,
+                            context,
+                        ));
                     }
                 } else {
                     result.append_slice(line, start..i);
@@ -1315,6 +1455,7 @@ impl Preprocessor {
         paren_start: usize,
         invocation: SourceOrigin,
         expanding: &std::collections::HashSet<String>,
+        context: MacroContext,
     ) -> Option<(MappedText, usize)> {
         let bytes = line.text.as_bytes();
         let mut i = paren_start + 1;
@@ -1378,7 +1519,7 @@ impl Preprocessor {
             .collect();
         let expanded_args: Vec<MappedText> = args
             .iter()
-            .map(|arg| self.expand_mapped_macros_inner(arg, expanding))
+            .map(|arg| self.expand_mapped_macros_inner(arg, expanding, context))
             .collect();
 
         let mut param_map: HashMap<&str, usize> = HashMap::new();
@@ -1483,257 +1624,6 @@ impl Preprocessor {
 
         Some((body, i))
     }
-
-    fn expand_condition_macros_inner(
-        &self,
-        line: &str,
-        expanding: &std::collections::HashSet<String>,
-    ) -> String {
-        if self.defines.is_empty() {
-            return line.to_string();
-        }
-
-        let mut result = String::with_capacity(line.len());
-        let bytes = line.as_bytes();
-        let mut i = 0;
-
-        while i < bytes.len() {
-            // Try to match an identifier.
-            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-                let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let ident = &line[start..i];
-
-                if ident == "defined" {
-                    let (name, new_i) = parse_defined_operand(line, i);
-                    result.push_str(if self.defines.contains_key(name) {
-                        "1"
-                    } else {
-                        "0"
-                    });
-                    i = new_i;
-                    continue;
-                }
-
-                // Skip if this macro is currently being expanded (blue paint).
-                if expanding.contains(ident) {
-                    result.push_str(ident);
-                    continue;
-                }
-
-                if let Some(def) = self.defines.get(ident) {
-                    if def.is_function {
-                        if i < bytes.len() && bytes[i] == b'(' {
-                            if let Some((expanded, new_i)) =
-                                self.expand_condition_function_macro(def, line, i, expanding)
-                            {
-                                // Re-expand the result with this macro marked as expanding.
-                                let mut next_expanding = expanding.clone();
-                                next_expanding.insert(ident.to_string());
-                                result.push_str(
-                                    &self.expand_condition_macros_inner(&expanded, &next_expanding),
-                                );
-                                i = new_i;
-                                continue;
-                            }
-                        }
-                        result.push_str(ident);
-                    } else {
-                        // Re-expand object macro body with this macro marked as expanding.
-                        let mut next_expanding = expanding.clone();
-                        next_expanding.insert(ident.to_string());
-                        result.push_str(
-                            &self.expand_condition_macros_inner(&def.body, &next_expanding),
-                        );
-                    }
-                } else {
-                    result.push_str(ident);
-                }
-                continue;
-            }
-
-            push_utf8_char(&mut result, bytes, &mut i);
-        }
-
-        result
-    }
-
-    fn expand_condition_function_macro(
-        &self,
-        def: &MacroDef,
-        line: &str,
-        paren_start: usize,
-        expanding: &std::collections::HashSet<String>,
-    ) -> Option<(String, usize)> {
-        let bytes = line.as_bytes();
-        let mut i = paren_start + 1; // skip '('
-        let mut args: Vec<String> = Vec::new();
-        let mut current_arg = String::new();
-        let mut depth = 1;
-        let mut quote = None;
-
-        while i < bytes.len() && depth > 0 {
-            if let Some(delimiter) = quote {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    current_arg.push('\\');
-                    i += 1;
-                    push_utf8_char(&mut current_arg, bytes, &mut i);
-                    continue;
-                }
-                if bytes[i] == delimiter {
-                    current_arg.push(delimiter as char);
-                    if i + 1 < bytes.len() && bytes[i + 1] == delimiter {
-                        current_arg.push(delimiter as char);
-                        i += 2;
-                        continue;
-                    }
-                    quote = None;
-                    i += 1;
-                    continue;
-                }
-                push_utf8_char(&mut current_arg, bytes, &mut i);
-                continue;
-            }
-
-            match bytes[i] {
-                delimiter @ (b'\'' | b'"') => {
-                    quote = Some(delimiter);
-                    current_arg.push(delimiter as char);
-                    i += 1;
-                }
-                b'(' => {
-                    depth += 1;
-                    current_arg.push('(');
-                    i += 1;
-                }
-                b')' => {
-                    depth -= 1;
-                    if depth > 0 {
-                        current_arg.push(')');
-                    }
-                    i += 1;
-                }
-                b',' if depth == 1 => {
-                    args.push(current_arg.trim().to_string());
-                    current_arg = String::new();
-                    i += 1;
-                }
-                _ => push_utf8_char(&mut current_arg, bytes, &mut i),
-            }
-        }
-
-        if depth != 0 {
-            return None;
-        }
-        args.push(current_arg.trim().to_string());
-        let expanded_args: Vec<String> = args
-            .iter()
-            .map(|arg| self.expand_condition_macros_inner(arg, expanding))
-            .collect();
-
-        // Build parameter lookup table.
-        let mut param_map: HashMap<&str, usize> = HashMap::new();
-        for (pi, param) in def.params.iter().enumerate() {
-            param_map.insert(param.as_str(), pi);
-        }
-
-        let va_args_raw = if def.is_variadic {
-            let va_start = def.params.len();
-            args.get(va_start..).unwrap_or(&[]).join(", ")
-        } else {
-            String::new()
-        };
-        let va_args_expanded = if def.is_variadic {
-            let va_start = def.params.len();
-            expanded_args.get(va_start..).unwrap_or(&[]).join(", ")
-        } else {
-            String::new()
-        };
-
-        // Single-pass word-boundary-aware substitution over the body.
-        let body_bytes = def.body.as_bytes();
-        let mut body = String::new();
-        let mut bi = 0;
-
-        while bi < body_bytes.len() {
-            // Stringification: # followed by identifier (whitespace between # and name is allowed).
-            if body_bytes[bi] == b'#' && bi + 1 < body_bytes.len() && body_bytes[bi + 1] != b'#' {
-                let mut id_start = bi + 1;
-                // Skip whitespace between # and the parameter name.
-                while id_start < body_bytes.len() && body_bytes[id_start] == b' ' {
-                    id_start += 1;
-                }
-                let mut id_end = id_start;
-                while id_end < body_bytes.len()
-                    && (body_bytes[id_end].is_ascii_alphanumeric() || body_bytes[id_end] == b'_')
-                {
-                    id_end += 1;
-                }
-                if id_end > id_start {
-                    let id = std::str::from_utf8(&body_bytes[id_start..id_end]).unwrap_or("");
-                    if let Some(&pi) = param_map.get(id) {
-                        body.push_str(&format!(
-                            "\"{}\"",
-                            args.get(pi).map(|s| s.as_str()).unwrap_or("")
-                        ));
-                        bi = id_end;
-                        continue;
-                    }
-                }
-            }
-
-            // Token pasting: ##
-            if bi + 1 < body_bytes.len() && body_bytes[bi] == b'#' && body_bytes[bi + 1] == b'#' {
-                // Trim trailing whitespace from what we've built, skip ## and leading whitespace.
-                let trimmed = body.trim_end().to_string();
-                body = trimmed;
-                bi += 2;
-                while bi < body_bytes.len() && body_bytes[bi] == b' ' {
-                    bi += 1;
-                }
-                continue;
-            }
-
-            // Identifier: check if it's a parameter name.
-            if body_bytes[bi].is_ascii_alphabetic() || body_bytes[bi] == b'_' {
-                let id_start = bi;
-                while bi < body_bytes.len()
-                    && (body_bytes[bi].is_ascii_alphanumeric() || body_bytes[bi] == b'_')
-                {
-                    bi += 1;
-                }
-                let id = std::str::from_utf8(&body_bytes[id_start..bi]).unwrap_or("");
-
-                let is_pasted = macro_param_is_pasted_left(body_bytes, id_start)
-                    || macro_param_is_pasted_right(body_bytes, bi);
-
-                if id == "__VA_ARGS__" && def.is_variadic {
-                    body.push_str(if is_pasted {
-                        &va_args_raw
-                    } else {
-                        &va_args_expanded
-                    });
-                } else if let Some(&pi) = param_map.get(id) {
-                    let replacement = if is_pasted {
-                        args.get(pi)
-                    } else {
-                        expanded_args.get(pi)
-                    };
-                    body.push_str(replacement.map(|s| s.as_str()).unwrap_or(""));
-                } else {
-                    body.push_str(id);
-                }
-                continue;
-            }
-
-            body.push(body_bytes[bi] as char);
-            bi += 1;
-        }
-
-        Some((body, i))
-    }
 }
 
 fn trim_text_range(text: &str, range: Range<usize>) -> Range<usize> {
@@ -1742,6 +1632,14 @@ fn trim_text_range(text: &str, range: Range<usize>) -> Range<usize> {
     let start = range.start + slice.len() - trimmed_start.len();
     let trimmed = trimmed_start.trim_end();
     start..start + trimmed.len()
+}
+
+fn restore_macro(defines: &mut HashMap<String, MacroDef>, name: &str, saved: Option<MacroDef>) {
+    if let Some(saved) = saved {
+        defines.insert(name.into(), saved);
+    } else {
+        defines.remove(name);
+    }
 }
 
 fn join_mapped_args(args: &[MappedText], fallback: SourceOrigin) -> MappedText {
@@ -2169,52 +2067,55 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
-fn strip_c_directive_comments(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let mut result = String::with_capacity(line.len());
+fn strip_c_directive_comments(line: &MappedText) -> MappedText {
+    let bytes = line.text.as_bytes();
+    let mut result = MappedText::empty(line.fallback.clone());
     let mut i = 0;
+    let mut copy_start = 0;
 
     while i < bytes.len() {
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
-            result.push(quote as char);
             i += 1;
             while i < bytes.len() {
-                result.push(bytes[i] as char);
                 if bytes[i] == quote {
                     if i + 1 < bytes.len() && bytes[i + 1] == quote {
-                        result.push(bytes[i + 1] as char);
                         i += 2;
                         continue;
                     }
                     i += 1;
                     break;
                 }
-                i += 1;
+                i += line.text[i..].chars().next().unwrap().len_utf8();
             }
             continue;
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            result.push(' ');
+            result.append_slice(line, copy_start..i);
+            result.push_text(" ", line.origin_at(i), SourceRunKind::Anchor);
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
+                i += line.text[i..].chars().next().unwrap().len_utf8();
             }
             if i + 1 < bytes.len() {
                 i += 2;
+            } else {
+                i = bytes.len();
             }
+            copy_start = i;
             continue;
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            break;
+            result.append_slice(line, copy_start..i);
+            return result;
         }
 
-        result.push(bytes[i] as char);
-        i += 1;
+        i += line.text[i..].chars().next().unwrap().len_utf8();
     }
 
+    result.append_slice(line, copy_start..line.text.len());
     result
 }
 
@@ -2274,23 +2175,6 @@ fn strip_c_block_comments_from_mapped_line(line: &MappedText, in_block: &mut boo
     }
 
     result
-}
-
-fn push_utf8_char(result: &mut String, bytes: &[u8], i: &mut usize) {
-    if bytes[*i].is_ascii() {
-        result.push(bytes[*i] as char);
-        *i += 1;
-        return;
-    }
-    if let Ok(rest) = std::str::from_utf8(&bytes[*i..]) {
-        if let Some(ch) = rest.chars().next() {
-            result.push(ch);
-            *i += ch.len_utf8();
-            return;
-        }
-    }
-    result.push(bytes[*i] as char);
-    *i += 1;
 }
 
 /// Get current date and time strings for __DATE__ and __TIME__.
@@ -3604,10 +3488,11 @@ deep
     #[test]
     fn line_directive_updates_source_map() {
         let config = PreprocConfig::default();
-        let result = preprocess("a\n#line 100 \"other.f90\"\nb\n", &config).unwrap();
+        let result = preprocess("a\n#line 100 \"other.f90\"\nb\nc\n", &config).unwrap();
         // Line 3 (b) should have source map entry pointing to other.f90:100.
         assert_eq!(result.source_map[2].line, 100);
         assert_eq!(result.source_map[2].filename, "other.f90");
+        assert_eq!(result.source_map[3].line, 101);
     }
 
     #[test]
@@ -3615,6 +3500,163 @@ deep
         let config = PreprocConfig::default();
         let result = preprocess("a\n#line 50\nb\n", &config).unwrap();
         assert_eq!(result.source_map[2].line, 50);
+    }
+
+    #[test]
+    fn line_directive_updates_location_builtins() {
+        let result = preprocess(
+            "#line 100 \"virtual.f90\"\na = __LINE__\nb = __LINE__\nf = __FILE__\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert!(result.text.contains("a = 100"), "got: {:?}", result.text);
+        assert!(result.text.contains("b = 101"), "got: {:?}", result.text);
+        assert!(
+            result.text.contains("f = \"virtual.f90\""),
+            "got: {:?}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn location_builtins_use_their_physical_continuation_lines() {
+        let result = preprocess(
+            "#line 10 \"virtual.f90\"\na = &\n  __LINE__\nb = \\\n__LINE__\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert!(result.text.contains("a = 11"), "got: {:?}", result.text);
+        assert!(result.text.contains("b = 13"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn condition_location_builtin_uses_its_continuation_line() {
+        let result = preprocess(
+            "#line 10 \"virtual.f90\"\n#if \\\n__LINE__ == 11\ndirect\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert!(lines(&result.text).contains(&"direct"));
+    }
+
+    #[test]
+    fn condition_macro_body_uses_its_invocation_line() {
+        let result = preprocess(
+            "#define HERE __LINE__\n#line 20 \"virtual.f90\"\n#if \\\nHERE == 21\nbody\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert!(lines(&result.text).contains(&"body"));
+    }
+
+    #[test]
+    fn condition_macro_argument_keeps_its_source_line() {
+        let result = preprocess(
+            "#define ID(x) x\n#line 30 \"virtual.f90\"\n#if \\\nID(__LINE__) == 31\nargument\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert!(lines(&result.text).contains(&"argument"));
+    }
+
+    #[test]
+    fn line_directive_without_filename_preserves_the_reported_file() {
+        let result = preprocess(
+            "#line 100 \"virtual.f90\"\n#line 200\nx = __LINE__\nf = __FILE__\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.source_map[2].filename, "virtual.f90");
+        assert_eq!(result.source_map[2].line, 200);
+        assert!(result.text.contains("x = 200"), "got: {:?}", result.text);
+        assert!(
+            result.text.contains("f = \"virtual.f90\""),
+            "got: {:?}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn line_directive_applies_to_preprocessor_errors() {
+        let error = preprocess(
+            "#line 9 \"virtual.f90\"\n#error nope\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.filename, "virtual.f90");
+        assert_eq!(error.line, 9);
+    }
+
+    #[test]
+    fn malformed_line_directive_advances_the_reported_line() {
+        let result = preprocess(
+            "#line 100 \"virtual.f90\"\n#line invalid\nx = __LINE__\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.source_map[2].filename, "virtual.f90");
+        assert_eq!(result.source_map[2].line, 101);
+        assert!(result.text.contains("x = 101"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn unterminated_conditional_uses_the_last_consumed_location() {
+        let error = preprocess(
+            "#if 1\n#line 100 \"virtual.f90\"\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.filename, "<input>");
+        assert_eq!(error.line, 2);
+    }
+
+    #[test]
+    fn include_locations_are_scoped_and_parent_locations_resume() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-line-scope-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        let mut include = std::fs::File::create(&include_path).unwrap();
+        writeln!(include, "inside_line = __LINE__").unwrap();
+        writeln!(include, "inside_file = __FILE__").unwrap();
+        writeln!(include, "#line 70 \"include.virtual\"").unwrap();
+        writeln!(include, "inside_after = __LINE__").unwrap();
+        writeln!(include, "inside_after_file = __FILE__").unwrap();
+        drop(include);
+
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let source = format!(
+            "#line 40 \"parent.virtual\"\nparent_before = __LINE__\n#include \"{}\"\nparent_after = __LINE__\nparent_file = __FILE__\n",
+            include_name
+        );
+        let result = preprocess(&source, &config).unwrap();
+
+        assert!(result.text.contains("parent_before = 40"));
+        assert!(result.text.contains("inside_line = 1"));
+        assert!(result
+            .text
+            .contains(&format!("inside_file = \"{}\"", include_path.display())));
+        assert!(result.text.contains("inside_after = 70"));
+        assert!(result
+            .text
+            .contains("inside_after_file = \"include.virtual\""));
+        assert!(result.text.contains("parent_after = 42"));
+        assert!(result.text.contains("parent_file = \"parent.virtual\""));
+
+        let _ = std::fs::remove_file(include_path);
     }
 
     // ---- Stringify with space ----
