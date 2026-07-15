@@ -1609,6 +1609,29 @@ fn lower_format_expr(
     lower_string_expr_ctx(b, ctx, expr)
 }
 
+fn lower_fixed_internal_list_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+    iostat_ptr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) {
+    b.call(
+        FuncRef::External("afs_lst_begin_internal_fixed".into()),
+        vec![buf_ptr, buf_len, iostat_ptr, iomsg_ptr, iomsg_len],
+        IrType::Void,
+    );
+    lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
+    b.call(
+        FuncRef::External("afs_lst_end_internal_fixed".into()),
+        vec![],
+        IrType::Void,
+    );
+}
+
 fn integer_storeback_type(
     b: &FuncBuilder,
     ctx: &LowerCtx<'_>,
@@ -4359,7 +4382,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 // wrote nothing through a zero-length buffer view).
                 if let Some((base, elem_len, nelems)) = internal_io_array_target(b, ctx, ctrl) {
                     if is_list_directed {
-                        lower_internal_write_items(b, ctx, items, base, elem_len);
+                        lower_fixed_internal_list_write(
+                            b, ctx, items, base, elem_len, iostat_ptr, iomsg_ptr, iomsg_len,
+                        );
                         return;
                     }
                     let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
@@ -4394,7 +4419,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
-                        lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
+                        lower_fixed_internal_list_write(
+                            b, ctx, items, buf_ptr, buf_len, iostat_ptr, iomsg_ptr, iomsg_len,
+                        );
                     } else {
                         let (fmt_ptr, fmt_len) =
                             lower_format_expr(b, ctx, &fmt_control.unwrap().value);

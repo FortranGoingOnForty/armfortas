@@ -3244,6 +3244,111 @@ fn namelist_assign_value(
 
 // ---- Internal I/O (read/write to character variables) ----
 
+struct FixedInternalListContext {
+    buf: *mut u8,
+    buf_len: usize,
+    original: Vec<u8>,
+    overflowed: bool,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+}
+
+unsafe impl Send for FixedInternalListContext {}
+
+thread_local! {
+    static FIXED_INTERNAL_LIST_CTX: RefCell<Vec<FixedInternalListContext>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_begin_internal_fixed(
+    buf: *mut u8,
+    buf_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let buf_len = buf_len.max(0) as usize;
+    let original = if buf.is_null() || buf_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(buf, buf_len) }.to_vec()
+    };
+    FIXED_INTERNAL_LIST_CTX.with(|ctx| {
+        ctx.borrow_mut().push(FixedInternalListContext {
+            buf,
+            buf_len,
+            original,
+            overflowed: false,
+            iostat,
+            iomsg,
+            iomsg_len,
+        });
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_end_internal_fixed() {
+    FIXED_INTERNAL_LIST_CTX.with(|ctx| {
+        let Some(context) = ctx.borrow_mut().pop() else {
+            return;
+        };
+
+        if context.overflowed && !context.buf.is_null() && !context.original.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    context.original.as_ptr(),
+                    context.buf,
+                    context.original.len(),
+                );
+            }
+        }
+
+        let (status, message) = if context.overflowed {
+            (IOSTAT_EOR, "end of record")
+        } else {
+            (0, "")
+        };
+        assign_iomsg(context.iomsg, context.iomsg_len, message);
+        if !context.iostat.is_null() {
+            unsafe {
+                *context.iostat = status;
+            }
+        } else if context.overflowed {
+            eprintln!("ERROR: list-directed internal WRITE exceeded its record");
+            std::process::exit(2);
+        }
+    });
+}
+
+fn note_fixed_internal_list_overflow(buf: *mut u8, buf_len: usize, start: usize, data_len: usize) {
+    if start <= buf_len && data_len <= buf_len - start {
+        return;
+    }
+    FIXED_INTERNAL_LIST_CTX.with(|ctx| {
+        if let Some(context) = ctx
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|context| context.buf == buf && context.buf_len == buf_len)
+        {
+            context.overflowed = true;
+        }
+    });
+}
+
+fn write_internal_list_to_buffer(
+    buf: *mut u8,
+    buf_len: usize,
+    start: usize,
+    data: &[u8],
+    pos: *mut i64,
+) {
+    note_fixed_internal_list_overflow(buf, buf_len, start, data.len());
+    write_to_buffer(buf, buf_len, start, data, pos);
+}
+
 fn write_internal_list_directed_integer<T: std::fmt::Display>(
     buf: *mut u8,
     buf_len: i64,
@@ -3260,7 +3365,7 @@ fn write_internal_list_directed_integer<T: std::fmt::Display>(
     } else {
         0
     };
-    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted i8 to a character buffer (internal I/O).
@@ -3310,7 +3415,7 @@ pub extern "C" fn afs_write_internal_real64(buf: *mut u8, buf_len: i64, val: f64
     } else {
         0
     };
-    write_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
+    write_internal_list_to_buffer(buf, buf_len as usize, start, s.as_bytes(), pos);
 }
 
 /// Write a formatted string to a character buffer (internal I/O).
@@ -3335,7 +3440,7 @@ pub extern "C" fn afs_write_internal_string(
         let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
         data.extend_from_slice(slice);
     }
-    write_to_buffer(buf, buf_len as usize, start, &data, pos);
+    write_internal_list_to_buffer(buf, buf_len as usize, start, &data, pos);
 }
 
 fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<ListReadToken> {
@@ -7052,6 +7157,82 @@ mod tests {
         assert_eq!(write_pos as usize, expected.len());
         assert_eq!(&buf[..expected.len()], expected.as_bytes());
         assert_eq!(buf[expected.len()], b' ');
+    }
+
+    #[test]
+    fn fixed_internal_list_overflow_restores_target() {
+        let mut buf = *b"???";
+        let mut iostat = 77;
+        let mut iomsg = [b'?'; 32];
+        let mut pos = 0;
+        let value = b"abcdef";
+
+        afs_lst_begin_internal_fixed(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            &mut iostat,
+            iomsg.as_mut_ptr(),
+            iomsg.len() as i64,
+        );
+        afs_write_internal_string(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            value.as_ptr(),
+            value.len() as i64,
+            &mut pos,
+        );
+        afs_lst_end_internal_fixed();
+
+        assert_eq!(buf, *b"???");
+        assert_eq!(iostat, IOSTAT_EOR);
+        assert_eq!(&iomsg[..13], b"end of record");
+        assert!(iomsg[13..].iter().all(|byte| *byte == b' '));
+    }
+
+    #[test]
+    fn fixed_internal_list_contexts_are_nested() {
+        let mut outer = *b"????";
+        let mut inner = *b"!!";
+        let mut outer_iostat = 77;
+        let mut inner_iostat = 77;
+        let mut outer_pos = 0;
+        let mut inner_pos = 0;
+
+        afs_lst_begin_internal_fixed(
+            outer.as_mut_ptr(),
+            outer.len() as i64,
+            &mut outer_iostat,
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_lst_begin_internal_fixed(
+            inner.as_mut_ptr(),
+            inner.len() as i64,
+            &mut inner_iostat,
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_write_internal_string(
+            inner.as_mut_ptr(),
+            inner.len() as i64,
+            b"abc".as_ptr(),
+            3,
+            &mut inner_pos,
+        );
+        afs_lst_end_internal_fixed();
+        afs_write_internal_string(
+            outer.as_mut_ptr(),
+            outer.len() as i64,
+            b"x".as_ptr(),
+            1,
+            &mut outer_pos,
+        );
+        afs_lst_end_internal_fixed();
+
+        assert_eq!(inner, *b"!!");
+        assert_eq!(inner_iostat, IOSTAT_EOR);
+        assert_eq!(outer, *b" x  ");
+        assert_eq!(outer_iostat, 0);
     }
 
     #[test]
