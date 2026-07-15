@@ -30337,7 +30337,24 @@ fn unsupported_derived_io_field(
     )
 }
 
-fn lower_write_emit_logical(b: &mut FuncBuilder, unit: ValueId, ty: &IrType, val: ValueId) {
+fn logical_transfer_width_for_ir_type(ty: &IrType) -> i32 {
+    match ty {
+        IrType::Bool | IrType::Int(IntWidth::I32) => 4,
+        IrType::Int(IntWidth::I8) => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I64) => 8,
+        IrType::Int(IntWidth::I128) => 16,
+        _ => 4,
+    }
+}
+
+fn lower_write_emit_logical(
+    b: &mut FuncBuilder,
+    unit: ValueId,
+    ty: &IrType,
+    val: ValueId,
+    kind: u8,
+) {
     let truth = match ty {
         IrType::Bool => val,
         IrType::Int(_) => {
@@ -30347,9 +30364,10 @@ fn lower_write_emit_logical(b: &mut FuncBuilder, unit: ValueId, ty: &IrType, val
         _ => coerce_to_type(b, val, &IrType::Bool),
     };
     let int_val = b.int_extend(truth, IntWidth::I32, false);
+    let kind_bytes = b.const_i32(i32::from(kind));
     b.call(
-        FuncRef::External("afs_write_logical".into()),
-        vec![unit, int_val],
+        FuncRef::External("afs_write_logical_kind".into()),
+        vec![unit, int_val, kind_bytes],
         IrType::Void,
     );
 }
@@ -30492,8 +30510,11 @@ fn lower_derived_field_scalar_write(
         return;
     }
     let val = b.load_typed(field_ptr, ty.clone());
-    if field_logical_kind(field).is_some() {
-        lower_write_emit_logical(b, unit, &ty, val);
+    if matches!(
+        field.type_info,
+        crate::sema::symtab::TypeInfo::Logical { .. }
+    ) {
+        lower_write_emit_logical(b, unit, &ty, val, field_logical_kind(field).unwrap_or(4));
         return;
     }
     b.call(
@@ -34248,9 +34269,10 @@ fn lower_read_logical_into_addr(
 
     match mode {
         ReadMode::Unit { unit, iostat, .. } => {
+            let kind_bytes = b.const_i32(logical_transfer_width_for_ir_type(ty));
             b.call(
-                FuncRef::External("afs_read_logical".into()),
-                vec![unit, tmp, iostat],
+                FuncRef::External("afs_read_logical_kind".into()),
+                vec![unit, tmp, iostat, kind_bytes],
                 IrType::Void,
             );
         }

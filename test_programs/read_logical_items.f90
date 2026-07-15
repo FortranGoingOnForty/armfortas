@@ -1,4 +1,6 @@
 ! CHECK: ok
+! IR_CHECK: call @afs_write_logical_kind(
+! IR_CHECK: call @afs_read_logical_kind(
 program read_logical_items
   implicit none
 
@@ -19,6 +21,14 @@ program read_logical_items
   integer(2) :: guard2
   logical(8) :: wide
   integer(8) :: guard8
+  logical(1) :: raw1
+  logical(2) :: raw2
+  logical(4) :: raw4
+  logical(8) :: raw8
+  integer(1) :: raw_guard1
+  integer(2) :: raw_guard2
+  integer(4) :: raw_guard4
+  integer(8) :: raw_guard8
   type(flag_record) :: value
 
   internal_list = .false.
@@ -81,6 +91,47 @@ program read_logical_items
   read(unit, *, iostat=ios) value
   if (ios /= 0 .or. value%narrow .or. .not. value%ordinary) error stop 10
   if (value%guard /= 44) error stop 11
+  close(unit)
+
+  raw1 = .true.
+  raw2 = .false.
+  raw4 = .true.
+  raw8 = .false.
+  raw_guard1 = 11
+  raw_guard2 = 22
+  raw_guard4 = 44
+  raw_guard8 = 88
+  open(newunit=unit, status='scratch', form='unformatted', action='readwrite')
+  write(unit) raw1, raw_guard1, raw2, raw_guard2, raw4, raw_guard4, raw8, raw_guard8
+  rewind(unit)
+  raw1 = .false.
+  raw2 = .true.
+  raw4 = .false.
+  raw8 = .true.
+  raw_guard1 = 0
+  raw_guard2 = 0
+  raw_guard4 = 0
+  raw_guard8 = 0
+  ios = 77
+  read(unit, iostat=ios) raw1, raw_guard1, raw2, raw_guard2, raw4, raw_guard4, raw8, raw_guard8
+  if (ios /= 0 .or. .not. raw1 .or. raw2 .or. .not. raw4 .or. raw8) error stop 12
+  if (raw_guard1 /= 11 .or. raw_guard2 /= 22 .or. raw_guard4 /= 44 .or. &
+      raw_guard8 /= 88) error stop 13
+  close(unit)
+
+  value%narrow = .true.
+  value%guard = 55
+  value%ordinary = .false.
+  open(newunit=unit, status='scratch', form='unformatted', action='readwrite')
+  write(unit) value
+  rewind(unit)
+  value%narrow = .false.
+  value%guard = 0
+  value%ordinary = .true.
+  ios = 77
+  read(unit, iostat=ios) value
+  if (ios /= 0 .or. .not. value%narrow .or. value%ordinary) error stop 14
+  if (value%guard /= 55) error stop 15
   close(unit)
 
   print *, 'ok'

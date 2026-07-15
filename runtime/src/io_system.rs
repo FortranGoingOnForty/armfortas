@@ -1224,18 +1224,47 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
     }
 }
 
-/// Write a logical value (list-directed).
+fn logical_transfer_width(kind_bytes: i32) -> Option<usize> {
+    match kind_bytes {
+        1 | 2 | 4 | 8 | 16 => Some(kind_bytes as usize),
+        _ => None,
+    }
+}
+
+fn write_unformatted_logical(u: &mut Unit, val: i32, width: usize) {
+    let truth = val != 0;
+    match width {
+        1 => u.list_write_raw_or_buffer(&(truth as i8).to_ne_bytes()),
+        2 => u.list_write_raw_or_buffer(&(truth as i16).to_ne_bytes()),
+        4 => u.list_write_raw_or_buffer(&(truth as i32).to_ne_bytes()),
+        8 => u.list_write_raw_or_buffer(&(truth as i64).to_ne_bytes()),
+        16 => u.list_write_raw_or_buffer(&(truth as i128).to_ne_bytes()),
+        _ => unreachable!("validated logical transfer width"),
+    }
+}
+
+/// Write a logical value using its declared storage width.
 #[no_mangle]
-pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
+pub extern "C" fn afs_write_logical_kind(unit: i32, val: i32, kind_bytes: i32) {
+    let Some(width) = logical_transfer_width(kind_bytes) else {
+        eprintln!("WRITE: invalid logical kind width {kind_bytes}");
+        std::process::exit(1);
+    };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.list_write_raw_or_buffer(&val.to_ne_bytes());
+            write_unformatted_logical(u, val, width);
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(if val != 0 { " T" } else { " F" });
         }
     }
+}
+
+/// Write a default-kind logical value (list-directed or unformatted).
+#[no_mangle]
+pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
+    afs_write_logical_kind(unit, val, 4);
 }
 
 /// End a write statement (newline).
@@ -1468,29 +1497,32 @@ fn store_formatted_logical_result(
     }
 }
 
-/// Read a logical value (list-directed or unformatted) from a unit.
+/// Read a logical value using its declared storage width.
 #[no_mangle]
-pub extern "C" fn afs_read_logical(unit: i32, val: *mut i32, iostat: *mut i32) {
+pub extern "C" fn afs_read_logical_kind(
+    unit: i32,
+    val: *mut i32,
+    iostat: *mut i32,
+    kind_bytes: i32,
+) {
+    let Some(width) = logical_transfer_width(kind_bytes) else {
+        set_read_iostat_or_exit(iostat, 1, "invalid logical kind width");
+        return;
+    };
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
-        if let Some(bytes) = u.read_buffer_take(4) {
-            let mut raw = [0u8; 4];
-            raw.copy_from_slice(&bytes);
-            write_i32_ptr(val, i32::from_ne_bytes(raw));
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 0;
-                }
-            }
+        if let Some(bytes) = u.read_buffer_take(width) {
+            write_i32_ptr(val, i32::from(bytes.iter().any(|byte| *byte != 0)));
+            set_read_success(iostat);
             return;
         }
         if report_short_pending_read_record(u, iostat) {
             return;
         }
         if u.form == Form::Unformatted && u.access == Access::Stream {
-            let mut raw = [0u8; 4];
+            let mut raw = vec![0u8; width];
             if read_stream_unformatted_exact(u, &mut raw, iostat) == Some(true) {
-                write_i32_ptr(val, i32::from_ne_bytes(raw));
+                write_i32_ptr(val, i32::from(raw.iter().any(|byte| *byte != 0)));
             }
             return;
         }
@@ -1512,6 +1544,12 @@ pub extern "C" fn afs_read_logical(unit: i32, val: *mut i32, iostat: *mut i32) {
             }
         }
     }
+}
+
+/// Read a default-kind logical value (list-directed or unformatted).
+#[no_mangle]
+pub extern "C" fn afs_read_logical(unit: i32, val: *mut i32, iostat: *mut i32) {
+    afs_read_logical_kind(unit, val, iostat, 4);
 }
 
 /// Read an i8 value (list-directed) from a unit.
