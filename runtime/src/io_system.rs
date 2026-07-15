@@ -2793,41 +2793,44 @@ pub extern "C" fn afs_read_namelist(
 ) {
     let gname = unsafe_str(group_name, group_name_len).to_lowercase();
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    let status = if let Some(u) = state.get_unit(unit) {
         // Read lines until we find &groupname.
         let mut all_lines = String::new();
-        loop {
+        'find_group: loop {
             match u.read_line() {
+                Ok(line) if line.is_empty() => break 'find_group IOSTAT_END,
                 Ok(line) => {
                     let trimmed = line.trim().to_lowercase();
                     if trimmed.starts_with('&') && trimmed[1..].starts_with(&gname) {
                         all_lines.push_str(&line);
                         // Keep reading until we find '/'.
+                        let mut reached_eof = false;
                         while !all_lines.contains('/') {
                             match u.read_line() {
+                                Ok(cont) if cont.is_empty() => {
+                                    reached_eof = true;
+                                    break;
+                                }
                                 Ok(cont) => all_lines.push_str(&cont),
-                                Err(_) => break,
+                                Err(_) => {
+                                    reached_eof = true;
+                                    break;
+                                }
                             }
                         }
-                        break;
+                        let _ = namelist_assign_from_text(&all_lines, &gname, entries, n_entries);
+                        break 'find_group if reached_eof { IOSTAT_END } else { 0 };
                     }
                 }
-                Err(_) => {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = IOSTAT_END;
-                        }
-                    }
-                    return;
-                }
+                Err(_) => break 'find_group IOSTAT_END,
             }
         }
-
-        let _ = namelist_assign_from_text(&all_lines, &gname, entries, n_entries);
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 0;
-            }
+    } else {
+        1
+    };
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = status;
         }
     }
 }
