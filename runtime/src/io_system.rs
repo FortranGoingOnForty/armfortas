@@ -2853,25 +2853,25 @@ pub extern "C" fn afs_read_namelist(
                     if trimmed.starts_with('&') && trimmed[1..].starts_with(&gname) {
                         all_lines.push_str(&line);
                         // Keep reading until we find '/'.
-                        let mut reached_eof = false;
+                        let mut terminal_status = 0;
                         while !all_lines.contains('/') {
                             match u.read_line() {
                                 Ok(cont) if cont.is_empty() => {
-                                    reached_eof = true;
+                                    terminal_status = IOSTAT_END;
                                     break;
                                 }
                                 Ok(cont) => all_lines.push_str(&cont),
-                                Err(_) => {
-                                    reached_eof = true;
+                                Err(error) => {
+                                    terminal_status = error.raw_os_error().unwrap_or(1);
                                     break;
                                 }
                             }
                         }
                         let _ = namelist_assign_from_text(&all_lines, &gname, entries, n_entries);
-                        break 'find_group if reached_eof { IOSTAT_END } else { 0 };
+                        break 'find_group terminal_status;
                     }
                 }
-                Err(_) => break 'find_group IOSTAT_END,
+                Err(error) => break 'find_group error.raw_os_error().unwrap_or(1),
             }
         }
     } else {
