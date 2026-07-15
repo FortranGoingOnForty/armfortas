@@ -22,6 +22,7 @@ program logical16_io_roundtrip
   integer :: unit, ios
   logical(16) :: source(2), internal_list(2), internal_fmt(2)
   logical(16) :: external_list(2), external_fmt(2), sectioned(4)
+  logical(16) :: matrix(3, 3), rank2_values(4)
   type(guarded_flag) :: guarded
 
   source = [.true., .false.]
@@ -103,6 +104,30 @@ program logical16_io_roundtrip
   ios = 77
   read(deferred_record, *, iostat=ios) internal_list
   if (ios /= 0 .or. .not. internal_list(1) .or. internal_list(2)) error stop 19
+
+  matrix = .false.
+  matrix(1, 1) = .true.
+  matrix(3, 3) = .true.
+  record = ''
+  ios = 77
+  write(record, *, iostat=ios) matrix(1:3:2, 1:3:2)
+  if (ios /= 0) error stop 20
+  rank2_values = .true.
+  ios = 77
+  read(record, *, iostat=ios) rank2_values
+  if (ios /= 0) error stop 21
+  if (.not. rank2_values(1) .or. rank2_values(2) .or. rank2_values(3) .or. &
+      .not. rank2_values(4)) error stop 22
+
+  ios = 77
+  write(deferred_record, *, iostat=ios) matrix(1:3:2, 1:3:2)
+  if (ios /= 0) error stop 23
+  rank2_values = .true.
+  ios = 77
+  read(deferred_record, *, iostat=ios) rank2_values
+  if (ios /= 0) error stop 24
+  if (.not. rank2_values(1) .or. rank2_values(2) .or. rank2_values(3) .or. &
+      .not. rank2_values(4)) error stop 25
 
   print *, 'ok'
 end program logical16_io_roundtrip

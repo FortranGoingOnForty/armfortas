@@ -33653,6 +33653,9 @@ fn lower_internal_list_write_array_expr(
     if !internal_list_write_scalar_supported(&elem_ty, logical) {
         lower_stmt_error(item.span, "unsupported internal output array item");
     }
+    let rank = actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .unwrap_or(1)
+        .max(1);
 
     let n = b.call(
         FuncRef::External("afs_array_size".into()),
@@ -33675,7 +33678,7 @@ fn lower_internal_list_write_array_expr(
 
     b.set_block(bb_body);
     let i_val = b.load(i_addr);
-    let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
+    let elem = load_array_desc_elem_rank(b, desc, &elem_ty, i_val, rank);
     let emitted = lower_internal_list_write_scalar(b, &elem_ty, elem, logical, sink);
     debug_assert!(emitted);
     let one = b.const_i64(1);
