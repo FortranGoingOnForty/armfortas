@@ -71,5 +71,16 @@ program read_defined_io_first_error
   if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 6
   close(unit)
 
+  open(newunit=unit, status='scratch', action='readwrite')
+  write(unit, '(A)') 'ignored'
+  rewind(unit)
+  first%value = 7
+  read_calls = 0
+  ios = 77
+  read(unit, *, iostat=ios) first
+  if (ios /= 91 .or. read_calls /= 1) error stop 7
+  if (first%value /= 7) error stop 8
+  close(unit)
+
   print *, 'ok'
 end program read_defined_io_first_error

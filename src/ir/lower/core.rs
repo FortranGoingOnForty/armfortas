@@ -33646,9 +33646,26 @@ fn resolve_defined_io_item_specific(
     })
 }
 
-pub(super) fn null_char_slot_arg(b: &mut FuncBuilder) -> ValueId {
+fn scratch_char_slot_arg(b: &mut FuncBuilder) -> (ValueId, ValueId) {
+    const SCRATCH_LEN: u64 = 256;
+
+    let storage = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        SCRATCH_LEN,
+    ));
     let zero = b.const_i64(0);
-    b.int_to_ptr(zero, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    let data = b.gep(storage, vec![zero], IrType::Int(IntWidth::I8));
+    let blank = b.const_i32(b' ' as i32);
+    let len = b.const_i64(SCRATCH_LEN as i64);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![data, blank, len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(data, slot);
+    (slot, len)
 }
 
 fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
@@ -33871,8 +33888,7 @@ pub(super) fn try_lower_defined_io_write_items(
     unit: ValueId,
     formatted_iotype: Option<&str>,
     iostat: Option<ValueId>,
-    iomsg_arg: ValueId,
-    iomsg_len: ValueId,
+    iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -33889,6 +33905,7 @@ pub(super) fn try_lower_defined_io_write_items(
     else {
         return false;
     };
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
 
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
@@ -33913,8 +33930,7 @@ pub(super) fn try_lower_defined_io_read_items(
     unit: ValueId,
     formatted_iotype: Option<&str>,
     iostat: Option<ValueId>,
-    iomsg_arg: ValueId,
-    iomsg_len: ValueId,
+    iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -33931,6 +33947,7 @@ pub(super) fn try_lower_defined_io_read_items(
     else {
         return false;
     };
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
 
     let owns_iostat = iostat.is_none();
     let statement_iostat = iostat.unwrap_or_else(|| {
