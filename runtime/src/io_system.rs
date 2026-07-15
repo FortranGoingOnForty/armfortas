@@ -220,6 +220,10 @@ struct Unit {
     /// character. Adjacent character items concatenate without another
     /// separator; any non-character item breaks the run.
     last_list_output_char: bool,
+    /// True between `afs_list_write_begin` and `afs_list_write_end`.
+    list_write_active: bool,
+    /// First error raised while emitting the current list-directed WRITE.
+    list_write_error: Option<String>,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
     scratch: bool,
     /// Connection-level LEADING_ZERO= mode (F2023). Seeds the format
@@ -264,17 +268,44 @@ impl Unit {
         self.form == Form::Unformatted
     }
 
-    /// Append raw bytes to the in-flight unformatted record buffer if
-    /// one is open, otherwise write directly to the stream. Returns
-    /// `true` when bytes were buffered.
-    fn raw_or_buffer(&mut self, bytes: &[u8]) -> bool {
-        if let Some(buf) = self.pending_record.as_mut() {
-            buf.extend_from_slice(bytes);
-            true
-        } else {
-            let _ = self.write_raw(bytes);
-            false
+    fn remember_list_write_result(&mut self, result: io::Result<()>) {
+        if self.list_write_active && self.list_write_error.is_none() {
+            if let Err(err) = result {
+                self.list_write_error = Some(err.to_string());
+            }
         }
+    }
+
+    /// Append raw bytes to the in-flight unformatted record buffer if
+    /// one is open, otherwise write directly to the stream.
+    fn list_write_raw_or_buffer(&mut self, bytes: &[u8]) {
+        if self.list_write_active && self.list_write_error.is_some() {
+            return;
+        }
+        let result = if let Some(buf) = self.pending_record.as_mut() {
+            buf.extend_from_slice(bytes);
+            Ok(())
+        } else {
+            self.write_raw(bytes)
+        };
+        self.remember_list_write_result(result);
+    }
+
+    fn list_write_bytes(&mut self, data: &[u8]) {
+        if self.list_write_active && self.list_write_error.is_some() {
+            return;
+        }
+        let result = self.write_bytes(data);
+        self.remember_list_write_result(result);
+    }
+
+    fn list_write_str(&mut self, value: &str) {
+        self.list_write_bytes(value.as_bytes());
+    }
+
+    fn list_write_flush(&mut self) {
+        let result = self.flush();
+        self.remember_list_write_result(result);
     }
 
     /// Consume `n` bytes from the in-flight unformatted read record
@@ -493,6 +524,8 @@ impl IoState {
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
+                list_write_active: false,
+                list_write_error: None,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -515,6 +548,8 @@ impl IoState {
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
+                list_write_active: false,
+                list_write_error: None,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -537,6 +572,8 @@ impl IoState {
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
+                list_write_active: false,
+                list_write_error: None,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
@@ -884,6 +921,8 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     formatted_read_cursor: 0,
                     terminal_nonadvancing_open_record: false,
                     last_list_output_char: false,
+                    list_write_active: false,
+                    list_write_error: None,
                     scratch: is_scratch,
                     leading_zero: leading_zero_mode,
                     pending_record: None,
@@ -1028,10 +1067,10 @@ pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT8_WIDTH));
+            u.list_write_str(&list_directed_integer_field(val, LIST_INT8_WIDTH));
         }
     }
 }
@@ -1042,10 +1081,10 @@ pub extern "C" fn afs_write_int16(unit: i32, val: i16) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT16_WIDTH));
+            u.list_write_str(&list_directed_integer_field(val, LIST_INT16_WIDTH));
         }
     }
 }
@@ -1056,10 +1095,10 @@ pub extern "C" fn afs_write_int(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT32_WIDTH));
+            u.list_write_str(&list_directed_integer_field(val, LIST_INT32_WIDTH));
         }
     }
 }
@@ -1070,10 +1109,10 @@ pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT64_WIDTH));
+            u.list_write_str(&list_directed_integer_field(val, LIST_INT64_WIDTH));
         }
     }
 }
@@ -1084,10 +1123,10 @@ pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&list_directed_integer_field(val, LIST_INT128_WIDTH));
+            u.list_write_str(&list_directed_integer_field(val, LIST_INT128_WIDTH));
         }
     }
 }
@@ -1098,10 +1137,10 @@ pub extern "C" fn afs_write_real(unit: i32, val: f32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&format!("  {:14.7E}", val));
+            u.list_write_str(&format!("  {:14.7E}", val));
         }
     }
 }
@@ -1112,10 +1151,10 @@ pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&format!("  {:22.15E}", val));
+            u.list_write_str(&format!("  {:22.15E}", val));
         }
     }
 }
@@ -1128,11 +1167,11 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&re.to_ne_bytes());
-            u.raw_or_buffer(&im.to_ne_bytes());
+            u.list_write_raw_or_buffer(&re.to_ne_bytes());
+            u.list_write_raw_or_buffer(&im.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
+            u.list_write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
         }
     }
 }
@@ -1145,11 +1184,11 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&re.to_ne_bytes());
-            u.raw_or_buffer(&im.to_ne_bytes());
+            u.list_write_raw_or_buffer(&re.to_ne_bytes());
+            u.list_write_raw_or_buffer(&im.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
+            u.list_write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
         }
     }
 }
@@ -1162,15 +1201,15 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
         if u.is_unformatted() {
             if !ptr.is_null() && len > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                u.raw_or_buffer(slice);
+                u.list_write_raw_or_buffer(slice);
             }
         } else {
             if !u.last_list_output_char {
-                let _ = u.write_str(" ");
+                u.list_write_str(" ");
             }
             if !ptr.is_null() && len > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-                let _ = u.write_bytes(slice);
+                u.list_write_bytes(slice);
             }
             u.last_list_output_char = true;
         }
@@ -1183,10 +1222,10 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         if u.is_unformatted() {
-            u.raw_or_buffer(&val.to_ne_bytes());
+            u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
-            let _ = u.write_str(if val != 0 { " T" } else { " F" });
+            u.list_write_str(if val != 0 { " T" } else { " F" });
         }
     }
 }
@@ -1200,11 +1239,11 @@ pub extern "C" fn afs_write_newline(unit: i32) {
             // Sequential unformatted: a pending record buffer means
             // afs_list_write_end was not called — flush nothing here.
             // Stream unformatted has no record terminator.
-            let _ = u.flush();
+            u.list_write_flush();
             return;
         }
-        let _ = u.write_str("\n");
-        let _ = u.flush();
+        u.list_write_str("\n");
+        u.list_write_flush();
         u.last_list_output_char = false;
     }
 }
@@ -1218,7 +1257,7 @@ pub extern "C" fn afs_write_newline_if(unit: i32, advance: i32) {
     if advance == 0 {
         let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(u) = state.get_unit(unit) {
-            let _ = u.flush();
+            u.list_write_flush();
         }
         return;
     }
@@ -1300,6 +1339,8 @@ pub extern "C" fn afs_list_write_begin(
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
         u.last_list_output_char = false;
+        u.list_write_active = true;
+        u.list_write_error = None;
         if u.form == Form::Unformatted && u.access == Access::Sequential {
             u.pending_record = Some(Vec::new());
         }
@@ -1334,21 +1375,17 @@ pub extern "C" fn afs_list_write_end(
         }
         return;
     };
-    let mut err: Option<String> = None;
     if let Some(buf) = u.pending_record.take() {
         let len_bytes = (buf.len() as u32).to_ne_bytes();
-        let r1 = u.write_raw(&len_bytes);
-        let r2 = if !buf.is_empty() {
-            u.write_raw(&buf)
-        } else {
-            Ok(())
-        };
-        let r3 = u.write_raw(&len_bytes);
-        if let Err(e) = r1.or(r2).or(r3) {
-            err = Some(e.to_string());
+        u.list_write_raw_or_buffer(&len_bytes);
+        if !buf.is_empty() {
+            u.list_write_raw_or_buffer(&buf);
         }
+        u.list_write_raw_or_buffer(&len_bytes);
     }
-    let _ = u.flush();
+    u.list_write_flush();
+    let err = u.list_write_error.take();
+    u.list_write_active = false;
     if let Some(msg) = err {
         if !iostat.is_null() {
             unsafe {
