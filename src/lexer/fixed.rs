@@ -58,22 +58,18 @@ pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
                 }
 
                 // Tokenize the body with the whitespace-insensitive scanner.
-                let body_tokens = tokenize_body(body, *fid, *start_line)?;
+                let body_tokens = tokenize_body(body, *fid)?;
                 tokens.extend(body_tokens);
+
+                let newline_pos = body.end;
 
                 tokens.push(Token {
                     kind: TokenKind::Newline,
                     text: "\n".into(),
                     span: Span {
                         file_id: *fid,
-                        start: Position {
-                            line: *start_line,
-                            col: 1,
-                        },
-                        end: Position {
-                            line: *start_line,
-                            col: 1,
-                        },
+                        start: newline_pos,
+                        end: newline_pos,
                     },
                 });
             }
@@ -113,46 +109,136 @@ fn unexpected_char_message(text: &str, pos: usize, context: &str) -> String {
 
 // ---- Whitespace-insensitive body tokenizer ----
 
+#[derive(Debug)]
+struct MappedFixedText {
+    text: String,
+    positions: Vec<Position>,
+    end: Position,
+}
+
+impl MappedFixedText {
+    fn from_piece(text: String, line: u32, col: u32) -> Self {
+        let positions = (0..text.len())
+            .map(|offset| Position {
+                line,
+                col: col + offset as u32,
+            })
+            .collect();
+        let end = Position {
+            line,
+            col: col + text.len() as u32,
+        };
+        Self {
+            text,
+            positions,
+            end,
+        }
+    }
+
+    fn identity(text: &str) -> Self {
+        Self::from_piece(text.to_string(), 1, 1)
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.text.push_str(&other.text);
+        self.positions.append(&mut other.positions);
+        self.end = other.end;
+    }
+
+    fn span(&self, file_id: u32, start: usize, end: usize) -> Span {
+        let start_pos = self.positions.get(start).copied().unwrap_or_else(|| {
+            self.positions
+                .last()
+                .map(|position| Position {
+                    line: position.line,
+                    col: position.col + 1,
+                })
+                .unwrap_or(self.end)
+        });
+        let end_pos = self
+            .positions
+            .get(
+                end.saturating_sub(1)
+                    .min(self.positions.len().saturating_sub(1)),
+            )
+            .map(|position| Position {
+                line: position.line,
+                col: position.col + 1,
+            })
+            .unwrap_or(start_pos);
+        Span {
+            file_id,
+            start: start_pos,
+            end: end_pos,
+        }
+    }
+}
+
+fn remap_fixed_token(token: &mut Token, text: &MappedFixedText, start: usize, consumed: usize) {
+    token.span = text.span(token.span.file_id, start, start + consumed);
+}
+
+fn remap_fixed_error(mut error: LexError, text: &MappedFixedText, start: usize) -> LexError {
+    error.span = text.span(error.span.file_id, start, start + 1);
+    error
+}
+
+fn push_mapped_char(
+    source: &MappedFixedText,
+    index: usize,
+    text: &mut String,
+    positions: &mut Vec<Position>,
+) -> usize {
+    let ch = source.text[index..].chars().next().unwrap();
+    let end = index + ch.len_utf8();
+    text.push(ch);
+    positions.extend_from_slice(&source.positions[index..end]);
+    end
+}
+
+fn advance_chars(text: &str, start: usize, count: usize) -> Option<usize> {
+    let mut end = start;
+    let mut chars = text[start..].chars();
+    for _ in 0..count {
+        end += chars.next()?.len_utf8();
+    }
+    Some(end)
+}
+
 /// Tokenize a fixed-form statement body with whitespace insensitivity.
 ///
 /// Three-phase approach:
 /// 1. Protect Hollerith constants (nH...) by converting to string literals before stripping
 /// 2. Strip all whitespace outside string literals
 /// 3. Tokenize with keyword-splitting: longest keyword prefix match at letter runs
-fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexError> {
+fn tokenize_body(body: &MappedFixedText, file_id: u32) -> Result<Vec<Token>, LexError> {
     // Phase 1: Convert Hollerith constants to string literals (preserves their spaces).
-    let hollerith_protected = protect_hollerith(body);
+    let hollerith_protected = protect_hollerith_mapped(body);
     // Phase 2: Strip whitespace outside string literals.
-    let stripped = strip_whitespace_outside_strings(&hollerith_protected);
-    let bytes = stripped.as_bytes();
+    let stripped = strip_whitespace_outside_strings_mapped(&hollerith_protected);
+    let bytes = stripped.text.as_bytes();
     let mut tokens = Vec::new();
     let mut pos = 0;
 
     while pos < bytes.len() {
-        let col = (pos as u32) + 7;
-        let start = Position { line, col };
+        let line = 1;
         let ch = bytes[pos];
 
         // Comment (! to end).
         if ch == b'!' {
             tokens.push(Token {
                 kind: TokenKind::Comment,
-                text: stripped[pos..].to_string(),
-                span: Span {
-                    file_id,
-                    start,
-                    end: Position {
-                        line,
-                        col: col + (bytes.len() - pos) as u32,
-                    },
-                },
+                text: stripped.text[pos..].to_string(),
+                span: stripped.span(file_id, pos, bytes.len()),
             });
             break;
         }
 
         // String literal.
         if ch == b'\'' || ch == b'"' {
-            let (tok, consumed) = lex_fixed_string(&stripped, pos, file_id, line)?;
+            let (mut tok, consumed) = lex_fixed_string(&stripped.text, pos, file_id, line)
+                .map_err(|error| remap_fixed_error(error, &stripped, pos))?;
+            remap_fixed_token(&mut tok, &stripped, pos, consumed);
             tokens.push(tok);
             pos += consumed;
             continue;
@@ -161,11 +247,14 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
         // Dot-operator or real starting with dot.
         if ch == b'.' {
             if pos + 1 < bytes.len() && bytes[pos + 1].is_ascii_digit() {
-                let (tok, consumed) = lex_fixed_number(&stripped, pos, file_id, line);
+                let (mut tok, consumed) = lex_fixed_number(&stripped.text, pos, file_id, line);
+                remap_fixed_token(&mut tok, &stripped, pos, consumed);
                 tokens.push(tok);
                 pos += consumed;
             } else {
-                let (tok, consumed) = lex_fixed_dot_op(&stripped, pos, file_id, line)?;
+                let (mut tok, consumed) = lex_fixed_dot_op(&stripped.text, pos, file_id, line)
+                    .map_err(|error| remap_fixed_error(error, &stripped, pos))?;
+                remap_fixed_token(&mut tok, &stripped, pos, consumed);
                 tokens.push(tok);
                 pos += consumed;
             }
@@ -174,7 +263,8 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
 
         // Number (integer or real).
         if ch.is_ascii_digit() {
-            let (tok, consumed) = lex_fixed_number(&stripped, pos, file_id, line);
+            let (mut tok, consumed) = lex_fixed_number(&stripped.text, pos, file_id, line);
+            remap_fixed_token(&mut tok, &stripped, pos, consumed);
             tokens.push(tok);
             pos += consumed;
             continue;
@@ -185,7 +275,9 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
             && pos + 1 < bytes.len()
             && matches!(bytes[pos + 1], b'\'' | b'"')
         {
-            let (tok, consumed) = lex_fixed_boz(&stripped, pos, file_id, line)?;
+            let (mut tok, consumed) = lex_fixed_boz(&stripped.text, pos, file_id, line)
+                .map_err(|error| remap_fixed_error(error, &stripped, pos))?;
+            remap_fixed_token(&mut tok, &stripped, pos, consumed);
             tokens.push(tok);
             pos += consumed;
             continue;
@@ -193,15 +285,18 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
 
         // Letter — keyword or identifier with fixed-form prefix splitting.
         if ch.is_ascii_alphabetic() || ch == b'_' {
-            let (tok, consumed) =
-                lex_fixed_ident_or_keyword(&stripped, pos, file_id, line, &tokens);
+            let (mut tok, consumed) =
+                lex_fixed_ident_or_keyword(&stripped.text, pos, file_id, line, &tokens);
+            remap_fixed_token(&mut tok, &stripped, pos, consumed);
             tokens.push(tok);
             pos += consumed;
             continue;
         }
 
         // Operators and punctuation.
-        let (tok, consumed) = lex_fixed_punct(&stripped, pos, file_id, line)?;
+        let (mut tok, consumed) = lex_fixed_punct(&stripped.text, pos, file_id, line)
+            .map_err(|error| remap_fixed_error(error, &stripped, pos))?;
+        remap_fixed_token(&mut tok, &stripped, pos, consumed);
         tokens.push(tok);
         pos += consumed;
     }
@@ -212,8 +307,13 @@ fn tokenize_body(body: &str, file_id: u32, line: u32) -> Result<Vec<Token>, LexE
 /// Convert Hollerith constants (nH...) to quoted string literals BEFORE whitespace stripping.
 /// This preserves spaces inside Hollerith content: `6H HELLO` → `' HELLO'`.
 fn protect_hollerith(body: &str) -> String {
-    let bytes = body.as_bytes();
-    let mut result = String::with_capacity(body.len());
+    protect_hollerith_mapped(&MappedFixedText::identity(body)).text
+}
+
+fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
+    let bytes = body.text.as_bytes();
+    let mut result = String::with_capacity(body.text.len());
+    let mut positions = Vec::with_capacity(body.positions.len());
     let mut i = 0;
 
     while i < bytes.len() {
@@ -221,19 +321,22 @@ fn protect_hollerith(body: &str) -> String {
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             result.push(bytes[i] as char);
+            positions.push(body.positions[i]);
             i += 1;
             while i < bytes.len() {
-                result.push(bytes[i] as char);
                 if bytes[i] == quote {
+                    result.push(bytes[i] as char);
+                    positions.push(body.positions[i]);
                     i += 1;
                     if i < bytes.len() && bytes[i] == quote {
                         result.push(bytes[i] as char);
+                        positions.push(body.positions[i]);
                         i += 1;
                     } else {
                         break;
                     }
                 } else {
-                    i += 1;
+                    i = push_mapped_char(body, i, &mut result, &mut positions);
                 }
             }
             continue;
@@ -249,62 +352,87 @@ fn protect_hollerith(body: &str) -> String {
                     i += 1;
                 }
                 if i < bytes.len() && (bytes[i] == b'H' || bytes[i] == b'h') {
-                    if let Ok(count) = body[digit_start..i].parse::<usize>() {
+                    if let Ok(count) = body.text[digit_start..i].parse::<usize>() {
+                        let marker_position = body.positions[i];
                         i += 1; // skip H
-                        if i + count <= bytes.len() {
+                        if let Some(content_end) = advance_chars(&body.text, i, count) {
                             // Replace nH... with '...'
                             result.push('\'');
-                            result.push_str(&body[i..i + count]);
+                            positions.push(body.positions[digit_start]);
+                            result.push_str(&body.text[i..content_end]);
+                            positions.extend_from_slice(&body.positions[i..content_end]);
                             result.push('\'');
-                            i += count;
+                            positions.push(
+                                count
+                                    .checked_sub(1)
+                                    .and_then(|_| body.positions.get(content_end - 1))
+                                    .copied()
+                                    .unwrap_or(marker_position),
+                            );
+                            i = content_end;
                             continue;
                         }
                     }
                 }
                 // Not Hollerith — put the digits back.
-                result.push_str(&body[digit_start..i]);
+                result.push_str(&body.text[digit_start..i]);
+                positions.extend_from_slice(&body.positions[digit_start..i]);
                 continue;
             }
         }
 
-        result.push(bytes[i] as char);
-        i += 1;
+        i = push_mapped_char(body, i, &mut result, &mut positions);
     }
-    result
+    MappedFixedText {
+        text: result,
+        positions,
+        end: body.end,
+    }
 }
 
 /// Strip whitespace from body text, preserving content inside string literals.
 fn strip_whitespace_outside_strings(body: &str) -> String {
-    let mut result = String::with_capacity(body.len());
-    let bytes = body.as_bytes();
+    strip_whitespace_outside_strings_mapped(&MappedFixedText::identity(body)).text
+}
+
+fn strip_whitespace_outside_strings_mapped(body: &MappedFixedText) -> MappedFixedText {
+    let mut result = String::with_capacity(body.text.len());
+    let mut positions = Vec::with_capacity(body.positions.len());
+    let bytes = body.text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             result.push(quote as char);
+            positions.push(body.positions[i]);
             i += 1;
             while i < bytes.len() {
-                result.push(bytes[i] as char);
                 if bytes[i] == quote {
+                    result.push(bytes[i] as char);
+                    positions.push(body.positions[i]);
                     i += 1;
                     if i < bytes.len() && bytes[i] == quote {
                         result.push(bytes[i] as char);
+                        positions.push(body.positions[i]);
                         i += 1;
                     } else {
                         break;
                     }
                 } else {
-                    i += 1;
+                    i = push_mapped_char(body, i, &mut result, &mut positions);
                 }
             }
         } else if bytes[i] == b' ' || bytes[i] == b'\t' {
             i += 1;
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            i = push_mapped_char(body, i, &mut result, &mut positions);
         }
     }
-    result
+    MappedFixedText {
+        text: result,
+        positions,
+        end: body.end,
+    }
 }
 
 /// Lex a string literal in whitespace-stripped body.
@@ -322,18 +450,20 @@ fn lex_fixed_string(
 
     let mut closed = false;
     while end < bytes.len() {
-        tok_text.push(bytes[end] as char);
         if bytes[end] == quote {
+            tok_text.push(quote as char);
             end += 1;
             if end < bytes.len() && bytes[end] == quote {
-                tok_text.push(bytes[end] as char);
+                tok_text.push(quote as char);
                 end += 1;
             } else {
                 closed = true;
                 break;
             }
         } else {
-            end += 1;
+            let ch = text[end..].chars().next().unwrap();
+            tok_text.push(ch);
+            end += ch.len_utf8();
         }
     }
 
@@ -895,7 +1025,7 @@ enum FixedLine {
     },
     Statement {
         label: Option<String>,
-        body: String,
+        body: MappedFixedText,
         start_line: u32,
         file_id: u32,
     },
@@ -957,11 +1087,11 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
         }
 
         // Extract columns from this line.
-        let (label, body) = extract_fixed_columns(line);
+        let (label, body, body_col) = extract_fixed_columns(line);
 
         // Collect continuation lines.
         let start_line = line_num;
-        let mut full_body = body;
+        let mut full_body = MappedFixedText::from_piece(body, line_num, body_col);
         i += 1;
 
         while i < lines.len() {
@@ -1004,8 +1134,12 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
 
             // Check column 6 for continuation marker.
             if is_continuation_line(next) {
-                let (_, cont_body) = extract_fixed_columns(next);
-                full_body.push_str(&cont_body);
+                let (_, cont_body, cont_col) = extract_fixed_columns(next);
+                full_body.append(MappedFixedText::from_piece(
+                    cont_body,
+                    (i + 1) as u32,
+                    cont_col,
+                ));
                 i += 1;
             } else {
                 break;
@@ -1049,7 +1183,7 @@ pub(crate) fn is_continuation_line(line: &str) -> bool {
 
 /// Extract label (columns 1-5) and body (columns 7-72) from a fixed-form line.
 /// Handles tab-form extension.
-fn extract_fixed_columns(line: &str) -> (String, String) {
+fn extract_fixed_columns(line: &str) -> (String, String, u32) {
     let bytes = line.as_bytes();
 
     // Tab-form: if first character is a tab, everything after is body (or continuation).
@@ -1062,7 +1196,7 @@ fn extract_fixed_columns(line: &str) -> (String, String) {
                 } else {
                     String::new()
                 };
-                return (String::new(), body);
+                return (String::new(), body, 3);
             }
         }
         // Tab followed by anything else: body starts at position after tab.
@@ -1071,7 +1205,7 @@ fn extract_fixed_columns(line: &str) -> (String, String) {
         } else {
             String::new()
         };
-        return (String::new(), body);
+        return (String::new(), body, 2);
     }
 
     // Standard fixed-form: columns 1-5 label, column 6 continuation marker, 7-72 body.
@@ -1089,7 +1223,7 @@ fn extract_fixed_columns(line: &str) -> (String, String) {
         String::new()
     };
 
-    (label, body)
+    (label, body, 7)
 }
 
 // ---- Hollerith constants ----
@@ -1220,6 +1354,40 @@ mod tests {
         assert_eq!(int_count, 2);
     }
 
+    #[test]
+    fn continuation_token_span_uses_physical_line() {
+        let src = "      X = 1\n     1+ 2\n";
+        let plus = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::Plus)
+            .unwrap();
+        assert_eq!(plus.span.start, Position { line: 2, col: 7 });
+    }
+
+    #[test]
+    fn continuation_lexer_error_uses_physical_line() {
+        let src = "      X = 1\n     1@\n";
+        let err = tokenize_fixed(src, 0).unwrap_err();
+        assert_eq!(err.span.start, Position { line: 2, col: 7 });
+    }
+
+    #[test]
+    fn empty_continuation_newline_uses_physical_line() {
+        let src = "      X = 1\n     1\n";
+        let newline = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::Newline)
+            .unwrap();
+        assert_eq!(newline.span.start, Position { line: 2, col: 7 });
+    }
+
+    #[test]
+    fn fixed_span_preserves_columns_removed_as_whitespace() {
+        let src = "      X   = @\n";
+        let err = tokenize_fixed(src, 0).unwrap_err();
+        assert_eq!(err.span.start, Position { line: 1, col: 13 });
+    }
+
     // ---- Tab-form extension ----
 
     #[test]
@@ -1240,6 +1408,13 @@ mod tests {
             .filter(|k| **k == TokenKind::IntegerLiteral)
             .count();
         assert_eq!(int_count, 2, "got: {:?}", kinds);
+    }
+
+    #[test]
+    fn tab_form_continuation_span_uses_physical_line() {
+        let src = "\tX = 1\n\t1@\n";
+        let err = tokenize_fixed(src, 0).unwrap_err();
+        assert_eq!(err.span.start, Position { line: 2, col: 3 });
     }
 
     // ---- Simple programs ----
@@ -1687,6 +1862,16 @@ C     Hello World
         assert_eq!(protect_hollerith("=0H+"), "=''+");
     }
 
+    #[test]
+    fn hollerith_zero_length_span_covers_marker() {
+        let token = fixed_toks("      X=0H\n")
+            .into_iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .unwrap();
+        assert_eq!(token.span.start, Position { line: 1, col: 9 });
+        assert_eq!(token.span.end, Position { line: 1, col: 11 });
+    }
+
     // ---- String in fixed-form ----
 
     #[test]
@@ -1699,6 +1884,16 @@ C     Hello World
             "got: {:?}",
             texts
         );
+    }
+
+    #[test]
+    fn utf8_string_preserves_text_and_span_mapping() {
+        let token = fixed_toks("      X = 'caf\u{e9}'\n")
+            .into_iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .unwrap();
+        assert_eq!(token.text, "'caf\u{e9}'");
+        assert_eq!(token.span.start, Position { line: 1, col: 11 });
     }
 
     #[test]
