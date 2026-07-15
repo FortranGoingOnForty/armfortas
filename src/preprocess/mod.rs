@@ -6,7 +6,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::lexer::{Position, Span};
 
 /// Configuration for the preprocessor.
 #[derive(Debug, Clone)]
@@ -119,6 +123,7 @@ impl MacroDef {
 
 /// Preprocessor output.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PreprocOutput {
     /// The preprocessed text.
     pub text: String,
@@ -126,13 +131,418 @@ pub struct PreprocOutput {
     pub source_map: Vec<SourceLoc>,
     /// Resolved include files in first-seen order, including nested includes.
     pub included_files: Vec<PathBuf>,
+    eof_origin: SourceOrigin,
 }
 
-/// A source location before preprocessing.
-#[derive(Debug, Clone)]
+/// A reported source line before preprocessing.
+///
+/// This is an output record; its private provenance data intentionally keeps
+/// callers from constructing locations that cannot resolve diagnostics.
+#[derive(Clone)]
+#[non_exhaustive]
 pub struct SourceLoc {
     pub filename: String,
     pub line: u32,
+    source: Arc<SourceFile>,
+    source_line: u32,
+    source_col: u32,
+    runs: Vec<SourceRun>,
+}
+
+struct SourceFile {
+    filename: Arc<str>,
+    text: String,
+}
+
+impl fmt::Debug for SourceFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceFile")
+            .field("filename", &self.filename)
+            .field("text_len", &self.text.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for SourceLoc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceLoc")
+            .field("filename", &self.filename)
+            .field("line", &self.line)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceOrigin {
+    source: Arc<SourceFile>,
+    source_line: u32,
+    source_col: u32,
+    filename: Arc<str>,
+    line: u32,
+}
+
+impl SourceOrigin {
+    fn advanced(&self, bytes: usize) -> Self {
+        let mut origin = self.clone();
+        origin.source_col = origin.source_col.saturating_add(bytes as u32);
+        origin
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceRunKind {
+    Linear,
+    Anchor,
+}
+
+#[derive(Debug, Clone)]
+struct SourceRun {
+    output: Range<usize>,
+    origin: SourceOrigin,
+    kind: SourceRunKind,
+}
+
+#[derive(Debug, Clone)]
+struct MappedText {
+    text: String,
+    runs: Vec<SourceRun>,
+    fallback: SourceOrigin,
+}
+
+impl MappedText {
+    fn empty(fallback: SourceOrigin) -> Self {
+        Self {
+            text: String::new(),
+            runs: Vec::new(),
+            fallback,
+        }
+    }
+
+    fn source_line(text: &str, origin: SourceOrigin) -> Self {
+        let mut mapped = Self::empty(origin.clone());
+        mapped.push_text(text, origin, SourceRunKind::Linear);
+        mapped
+    }
+
+    fn anchored(text: &str, origin: SourceOrigin) -> Self {
+        let mut mapped = Self::empty(origin.clone());
+        mapped.push_text(text, origin, SourceRunKind::Anchor);
+        mapped
+    }
+
+    fn append(&mut self, other: &Self) {
+        self.append_slice(other, 0..other.text.len());
+    }
+
+    fn append_slice(&mut self, other: &Self, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        let base = self.text.len();
+        self.text.push_str(&other.text[range.clone()]);
+        let first = other
+            .runs
+            .partition_point(|run| run.output.end <= range.start);
+        for run in &other.runs[first..] {
+            if run.output.start >= range.end {
+                break;
+            }
+            let start = run.output.start.max(range.start);
+            let end = run.output.end.min(range.end);
+            if start >= end {
+                continue;
+            }
+            let origin = match run.kind {
+                SourceRunKind::Linear => run.origin.advanced(start - run.output.start),
+                SourceRunKind::Anchor => run.origin.clone(),
+            };
+            self.push_run(SourceRun {
+                output: base + start - range.start..base + end - range.start,
+                origin,
+                kind: run.kind,
+            });
+        }
+    }
+
+    fn push_text(&mut self, text: &str, origin: SourceOrigin, kind: SourceRunKind) {
+        if text.is_empty() {
+            return;
+        }
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.push_run(SourceRun {
+            output: start..self.text.len(),
+            origin,
+            kind,
+        });
+    }
+
+    fn push_run(&mut self, run: SourceRun) {
+        if let Some(previous) = self.runs.last_mut() {
+            let previous_len = previous.output.len();
+            let contiguous_origin = match run.kind {
+                SourceRunKind::Linear => {
+                    previous
+                        .origin
+                        .source_col
+                        .saturating_add(previous_len as u32)
+                        == run.origin.source_col
+                }
+                SourceRunKind::Anchor => previous.origin.source_col == run.origin.source_col,
+            };
+            if previous.output.end == run.output.start
+                && previous.kind == run.kind
+                && Arc::ptr_eq(&previous.origin.source, &run.origin.source)
+                && previous.origin.source_line == run.origin.source_line
+                && previous.origin.filename == run.origin.filename
+                && previous.origin.line == run.origin.line
+                && contiguous_origin
+            {
+                previous.output.end = run.output.end;
+                return;
+            }
+        }
+        self.runs.push(run);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.text.truncate(len);
+        let keep = self.runs.partition_point(|run| run.output.start < len);
+        self.runs.truncate(keep);
+        if let Some(last) = self.runs.last_mut() {
+            last.output.end = last.output.end.min(len);
+        }
+    }
+
+    fn slice(&self, range: Range<usize>) -> Self {
+        let fallback = self.origin_at(range.start);
+        let mut mapped = Self::empty(fallback);
+        mapped.append_slice(self, range);
+        mapped
+    }
+
+    fn origin_at(&self, offset: usize) -> SourceOrigin {
+        let run = source_run_at_or_before(&self.runs, offset);
+        let Some(run) = run else {
+            return self.fallback.clone();
+        };
+        match run.kind {
+            SourceRunKind::Linear => run.origin.advanced(
+                offset
+                    .saturating_sub(run.output.start)
+                    .min(run.output.len()),
+            ),
+            SourceRunKind::Anchor => run.origin.clone(),
+        }
+    }
+
+    fn into_source_loc(self) -> SourceLoc {
+        SourceLoc {
+            filename: self.fallback.filename.to_string(),
+            line: self.fallback.line,
+            source: self.fallback.source,
+            source_line: self.fallback.source_line,
+            source_col: self.fallback.source_col,
+            runs: self.runs,
+        }
+    }
+}
+
+struct ResolvedPoint<'a> {
+    filename: &'a str,
+    source: &'a SourceFile,
+    line: u32,
+    col: u32,
+    source_line: u32,
+    source_col: u32,
+}
+
+impl SourceLoc {
+    fn origin_at(&self, offset: usize) -> SourceOrigin {
+        if let Some(run) = source_run_at_or_before(&self.runs, offset) {
+            return match run.kind {
+                SourceRunKind::Linear => run.origin.advanced(
+                    offset
+                        .saturating_sub(run.output.start)
+                        .min(run.output.len()),
+                ),
+                SourceRunKind::Anchor => run.origin.clone(),
+            };
+        }
+        SourceOrigin {
+            source: self.source.clone(),
+            source_line: self.source_line,
+            source_col: self.source_col.saturating_add(offset as u32),
+            filename: Arc::from(self.filename.as_str()),
+            line: self.line,
+        }
+    }
+
+    fn resolve(&self, col: u32) -> ResolvedPoint<'_> {
+        let offset = col.saturating_sub(1) as usize;
+        let run = source_run_at_or_before(&self.runs, offset);
+        if let Some(run) = run {
+            let delta = match run.kind {
+                SourceRunKind::Linear => offset
+                    .saturating_sub(run.output.start)
+                    .min(run.output.len()),
+                SourceRunKind::Anchor => 0,
+            };
+            return ResolvedPoint {
+                filename: &run.origin.filename,
+                source: &run.origin.source,
+                line: run.origin.line,
+                col: run.origin.source_col.saturating_add(delta as u32),
+                source_line: run.origin.source_line,
+                source_col: run.origin.source_col.saturating_add(delta as u32),
+            };
+        }
+        ResolvedPoint {
+            filename: &self.filename,
+            source: &self.source,
+            line: self.line,
+            col: self.source_col.saturating_add(offset as u32),
+            source_line: self.source_line,
+            source_col: self.source_col.saturating_add(offset as u32),
+        }
+    }
+
+    fn resolve_end(&self, col: u32) -> ResolvedPoint<'_> {
+        let exclusive = col.saturating_sub(1) as usize;
+        let Some(last_byte) = exclusive.checked_sub(1) else {
+            return self.resolve(col);
+        };
+        let run = source_run_at_or_before(&self.runs, last_byte);
+        if let Some(run) = run {
+            let delta = match run.kind {
+                SourceRunKind::Linear => {
+                    last_byte
+                        .saturating_sub(run.output.start)
+                        .min(run.output.len().saturating_sub(1))
+                        + 1
+                }
+                SourceRunKind::Anchor => 1,
+            };
+            return ResolvedPoint {
+                filename: &run.origin.filename,
+                source: &run.origin.source,
+                line: run.origin.line,
+                col: run.origin.source_col.saturating_add(delta as u32),
+                source_line: run.origin.source_line,
+                source_col: run.origin.source_col.saturating_add(delta as u32),
+            };
+        }
+        ResolvedPoint {
+            filename: &self.filename,
+            source: &self.source,
+            line: self.line,
+            col: self.source_col.saturating_add(exclusive as u32),
+            source_line: self.source_line,
+            source_col: self.source_col.saturating_add(exclusive as u32),
+        }
+    }
+}
+
+fn source_run_at_or_before(runs: &[SourceRun], offset: usize) -> Option<&SourceRun> {
+    let next = runs.partition_point(|run| run.output.end <= offset);
+    runs.get(next)
+        .filter(|run| run.output.contains(&offset))
+        .or_else(|| next.checked_sub(1).and_then(|index| runs.get(index)))
+}
+
+pub(crate) struct ResolvedSpan<'a> {
+    pub filename: &'a str,
+    pub source: &'a str,
+    pub display_span: Span,
+    pub source_span: Span,
+}
+
+impl PreprocOutput {
+    pub(crate) fn resolve_span(&self, span: Span) -> ResolvedSpan<'_> {
+        let location = span
+            .start
+            .line
+            .checked_sub(1)
+            .and_then(|line| self.source_map.get(line as usize));
+
+        let Some(location) = location else {
+            let start = ResolvedPoint {
+                filename: &self.eof_origin.filename,
+                source: &self.eof_origin.source,
+                line: self.eof_origin.line,
+                col: self.eof_origin.source_col,
+                source_line: self.eof_origin.source_line,
+                source_col: self.eof_origin.source_col,
+            };
+            return resolved_span_from_points(span.file_id, start, None);
+        };
+
+        let start = location.resolve(span.start.col);
+        let end = if span.end.line == span.start.line && span.end.col > span.start.col {
+            Some(location.resolve_end(span.end.col))
+        } else {
+            None
+        };
+        resolved_span_from_points(span.file_id, start, end)
+    }
+}
+
+fn resolved_span_from_points<'a>(
+    file_id: u32,
+    start: ResolvedPoint<'a>,
+    end: Option<ResolvedPoint<'a>>,
+) -> ResolvedSpan<'a> {
+    let same_origin = end.as_ref().is_some_and(|end| {
+        std::ptr::eq(start.source, end.source)
+            && start.filename == end.filename
+            && start.line == end.line
+            && start.source_line == end.source_line
+    });
+    let display_end = if same_origin {
+        let end = end.as_ref().unwrap();
+        Position {
+            line: end.line,
+            col: end.col.max(start.col.saturating_add(1)),
+        }
+    } else {
+        Position {
+            line: start.line,
+            col: start.col.saturating_add(1),
+        }
+    };
+    let source_end = if same_origin {
+        let end = end.as_ref().unwrap();
+        Position {
+            line: end.source_line,
+            col: end.source_col.max(start.source_col.saturating_add(1)),
+        }
+    } else {
+        Position {
+            line: start.source_line,
+            col: start.source_col.saturating_add(1),
+        }
+    };
+
+    ResolvedSpan {
+        filename: start.filename,
+        source: &start.source.text,
+        display_span: Span {
+            file_id,
+            start: Position {
+                line: start.line,
+                col: start.col,
+            },
+            end: display_end,
+        },
+        source_span: Span {
+            file_id,
+            start: Position {
+                line: start.source_line,
+                col: start.source_col,
+            },
+            end: source_end,
+        },
+    }
 }
 
 /// Preprocessor error.
@@ -179,12 +589,6 @@ enum CondState {
     ParentSkipping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MacroExpandMode {
-    SourceLine,
-    ConditionExpr,
-}
-
 struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     include_paths: Vec<PathBuf>,
@@ -224,22 +628,25 @@ impl Preprocessor {
         }
     }
 
-    fn make_source_loc(&self, filename: &str, line: u32) -> SourceLoc {
-        if let Some((override_line, ref override_file)) = self.line_override {
-            let fname = if override_file.is_empty() {
-                filename
-            } else {
-                override_file.as_str()
-            };
-            SourceLoc {
-                filename: fname.into(),
-                line: override_line,
+    fn make_source_origin(
+        &self,
+        source: &Arc<SourceFile>,
+        source_line: u32,
+        source_col: u32,
+    ) -> SourceOrigin {
+        let (filename, line) = match &self.line_override {
+            Some((override_line, override_file)) if !override_file.is_empty() => {
+                (Arc::from(override_file.as_str()), *override_line)
             }
-        } else {
-            SourceLoc {
-                filename: filename.into(),
-                line,
-            }
+            Some((override_line, _)) => (source.filename.clone(), *override_line),
+            None => (source.filename.clone(), source_line),
+        };
+        SourceOrigin {
+            source: source.clone(),
+            source_line,
+            source_col,
+            filename,
+            line,
         }
     }
 
@@ -250,7 +657,11 @@ impl Preprocessor {
     fn process(&mut self, source: &str, filename: &str) -> Result<PreprocOutput, PreprocError> {
         let mut output = String::new();
         let mut source_map = Vec::new();
-        self.process_into(source, filename, &mut output, &mut source_map)?;
+        let root_source = Arc::new(SourceFile {
+            filename: Arc::from(filename),
+            text: source.into(),
+        });
+        self.process_into(root_source.clone(), &mut output, &mut source_map)?;
 
         // Check for unterminated conditionals (only at top level).
         if self.include_depth == 0 && !self.cond_stack.is_empty() {
@@ -264,20 +675,40 @@ impl Preprocessor {
             });
         }
 
+        let mut eof_origin = None;
+        for (index, line) in output.lines().enumerate() {
+            if !line.trim().is_empty() {
+                eof_origin = source_map
+                    .get(index)
+                    .map(|location| location.origin_at(line.len()));
+            }
+        }
+        let eof_origin = eof_origin.unwrap_or_else(|| {
+            let eof_line = root_source.text.lines().count() as u32 + 1;
+            SourceOrigin {
+                source: root_source.clone(),
+                source_line: eof_line,
+                source_col: 1,
+                filename: root_source.filename.clone(),
+                line: eof_line,
+            }
+        });
+
         Ok(PreprocOutput {
             text: output,
             source_map,
             included_files: self.included_files.clone(),
+            eof_origin,
         })
     }
 
     fn process_into(
         &mut self,
-        source: &str,
-        filename: &str,
+        source: Arc<SourceFile>,
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
     ) -> Result<(), PreprocError> {
+        let filename = source.filename.as_ref();
         // Set dynamic macros.
         self.defines.insert(
             "__FILE__".into(),
@@ -296,19 +727,30 @@ impl Preprocessor {
 
         // Process lines with inline backslash continuation joining,
         // tracking original line numbers so __LINE__ and source_map are correct.
-        let raw_lines: Vec<&str> = source.lines().collect();
+        let raw_lines: Vec<&str> = source.text.lines().collect();
         let mut i = 0;
         while i < raw_lines.len() {
             let orig_line_num = (i + 1) as u32; // 1-based, tracks original source line
-            let mut logical_line = String::new();
+            let mut logical_line =
+                MappedText::empty(self.make_source_origin(&source, orig_line_num, 1));
 
             // Join backslash-continued lines (C-style).
             while i < raw_lines.len() && raw_lines[i].ends_with('\\') {
-                logical_line.push_str(&raw_lines[i][..raw_lines[i].len() - 1]);
+                let line_num = (i + 1) as u32;
+                let piece = MappedText::source_line(
+                    &raw_lines[i][..raw_lines[i].len() - 1],
+                    self.make_source_origin(&source, line_num, 1),
+                );
+                logical_line.append(&piece);
                 i += 1;
             }
             if i < raw_lines.len() {
-                logical_line.push_str(raw_lines[i]);
+                let line_num = (i + 1) as u32;
+                let piece = MappedText::source_line(
+                    raw_lines[i],
+                    self.make_source_origin(&source, line_num, 1),
+                );
+                logical_line.append(&piece);
                 i += 1;
             }
 
@@ -317,14 +759,15 @@ impl Preprocessor {
             // continues on the next line.
             // Skip for preprocessor directives (#if, #define, etc.) where ! and &
             // have C semantics, not Fortran semantics.
-            if !self.fixed_form && !logical_line.trim_start().starts_with('#') {
+            if !self.fixed_form && !logical_line.text.trim_start().starts_with('#') {
                 // Incremental: scan only the newly appended piece per
                 // join, carrying string state — the full-line rescan
                 // was O(N^2) on many-continuation statements.
-                let mut scan = scan_trailing_ampersand(&logical_line, 0, None);
+                let mut scan = scan_trailing_ampersand(&logical_line.text, 0, None);
                 while let Some(amp_pos) = scan.amp {
                     if i < raw_lines.len() {
-                        let next = raw_lines[i].trim_start();
+                        let raw_next = raw_lines[i];
+                        let next = raw_next.trim_start();
                         if next.starts_with('#') {
                             break;
                         }
@@ -337,11 +780,21 @@ impl Preprocessor {
                             continue;
                         }
                         logical_line.truncate(amp_pos);
-                        let next = next.strip_prefix('&').unwrap_or(next);
-                        let base = logical_line.len();
-                        logical_line.push_str(next);
+                        let leading = raw_next.len() - next.len();
+                        let content_start = leading + usize::from(next.starts_with('&'));
+                        let next_line = MappedText::source_line(
+                            raw_next,
+                            self.make_source_origin(&source, (i + 1) as u32, 1),
+                        );
+                        let next_piece = next_line.slice(content_start..raw_next.len());
+                        let base = logical_line.text.len();
+                        logical_line.append(&next_piece);
                         i += 1;
-                        scan = scan_trailing_ampersand(&logical_line[base..], base, scan.in_string);
+                        scan = scan_trailing_ampersand(
+                            &logical_line.text[base..],
+                            base,
+                            scan.in_string,
+                        );
                     } else {
                         break;
                     }
@@ -354,42 +807,47 @@ impl Preprocessor {
                 MacroDef::object(&orig_line_num.to_string()),
             );
 
-            let trimmed = logical_line.trim_start();
+            let trimmed = logical_line.text.trim_start();
             if self.cpp_compat || self.in_c_block_comment || trimmed.starts_with("/*") {
-                logical_line =
-                    strip_c_block_comments_from_line(&logical_line, &mut self.in_c_block_comment);
+                logical_line = strip_c_block_comments_from_mapped_line(
+                    &logical_line,
+                    &mut self.in_c_block_comment,
+                );
             }
 
             // Fixed-form: C, c, or * in column 1 is a comment line.
             if self.fixed_form {
-                let first = logical_line.as_bytes().first().copied().unwrap_or(0);
+                let first = logical_line.text.as_bytes().first().copied().unwrap_or(0);
                 if first == b'C' || first == b'c' || first == b'*' {
                     // Comment line — emit as-is without expansion.
                     if self.is_emitting() {
-                        output.push_str(&logical_line);
+                        output.push_str(&logical_line.text);
                     }
                     output.push('\n');
-                    source_map.push(self.make_source_loc(filename, orig_line_num));
+                    source_map.push(logical_line.into_source_loc());
                     continue;
                 }
             }
 
-            let trimmed = logical_line.trim_start();
+            let trimmed = logical_line.text.trim_start();
 
             // Preprocessor directives: # in column 1 (or after whitespace in free-form).
             if trimmed.starts_with('#') {
                 self.process_directive(trimmed, filename, orig_line_num, output, source_map)?;
                 output.push('\n');
-                source_map.push(self.make_source_loc(filename, orig_line_num));
+                source_map.push(logical_line.into_source_loc());
                 continue;
             }
 
-            if self.is_emitting() {
-                let expanded = self.expand_macros(&logical_line);
-                output.push_str(&expanded);
-            }
+            let emitted = if self.is_emitting() {
+                let expanded = self.expand_mapped_macros(&logical_line);
+                output.push_str(&expanded.text);
+                expanded
+            } else {
+                MappedText::empty(logical_line.fallback.clone())
+            };
             output.push('\n');
-            source_map.push(self.make_source_loc(filename, orig_line_num));
+            source_map.push(emitted.into_source_loc());
         }
 
         Ok(())
@@ -689,7 +1147,11 @@ impl Preprocessor {
 
         self.include_depth += 1;
         let inc_filename = resolved.to_string_lossy().into_owned();
-        self.process_into(&content, &inc_filename, output, source_map)?;
+        let included_source = Arc::new(SourceFile {
+            filename: Arc::from(inc_filename),
+            text: content,
+        });
+        self.process_into(included_source, output, source_map)?;
         self.include_depth -= 1;
 
         // Restore __FILE__ to the parent's filename.
@@ -747,22 +1209,285 @@ impl Preprocessor {
     /// are rewritten to `0` at the end.
     fn expand_condition_macros(&self, expr: &str) -> String {
         let expanding = std::collections::HashSet::new();
-        let expanded = self.expand_macros_inner(expr, &expanding, MacroExpandMode::ConditionExpr);
+        let expanded = self.expand_condition_macros_inner(expr, &expanding);
         replace_undefined_idents(&expanded)
     }
 
     // ---- Macro expansion in source lines ----
 
-    fn expand_macros(&self, line: &str) -> String {
+    fn expand_mapped_macros(&self, line: &MappedText) -> MappedText {
         let expanding = std::collections::HashSet::new();
-        self.expand_macros_inner(line, &expanding, MacroExpandMode::SourceLine)
+        self.expand_mapped_macros_inner(line, &expanding)
     }
 
-    fn expand_macros_inner(
+    fn expand_mapped_macros_inner(
+        &self,
+        line: &MappedText,
+        expanding: &std::collections::HashSet<String>,
+    ) -> MappedText {
+        if self.defines.is_empty() {
+            return line.clone();
+        }
+
+        let mut result = MappedText::empty(line.fallback.clone());
+        let bytes = line.text.as_bytes();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            if bytes[i] == b'!' {
+                result.append_slice(line, i..line.text.len());
+                break;
+            }
+
+            if bytes[i] == b'\'' || bytes[i] == b'"' {
+                let start = i;
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += line.text[i..].chars().next().unwrap().len_utf8();
+                    }
+                }
+                result.append_slice(line, start..i);
+                continue;
+            }
+
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let ident = &line.text[start..i];
+
+                if expanding.contains(ident) {
+                    result.append_slice(line, start..i);
+                    continue;
+                }
+
+                if let Some(def) = self.defines.get(ident) {
+                    let invocation = line.origin_at(start);
+                    if def.is_function {
+                        if i < bytes.len() && bytes[i] == b'(' {
+                            if let Some((expanded, new_i)) = self
+                                .expand_mapped_function_macro(def, line, i, invocation, expanding)
+                            {
+                                let mut next_expanding = expanding.clone();
+                                next_expanding.insert(ident.to_string());
+                                result.append(
+                                    &self.expand_mapped_macros_inner(&expanded, &next_expanding),
+                                );
+                                i = new_i;
+                                continue;
+                            }
+                        }
+                        result.append_slice(line, start..i);
+                    } else {
+                        let mut next_expanding = expanding.clone();
+                        next_expanding.insert(ident.to_string());
+                        let body = MappedText::anchored(&def.body, invocation);
+                        result.append(&self.expand_mapped_macros_inner(&body, &next_expanding));
+                    }
+                } else {
+                    result.append_slice(line, start..i);
+                }
+                continue;
+            }
+
+            let end = i + line.text[i..].chars().next().unwrap().len_utf8();
+            result.append_slice(line, i..end);
+            i = end;
+        }
+
+        result
+    }
+
+    fn expand_mapped_function_macro(
+        &self,
+        def: &MacroDef,
+        line: &MappedText,
+        paren_start: usize,
+        invocation: SourceOrigin,
+        expanding: &std::collections::HashSet<String>,
+    ) -> Option<(MappedText, usize)> {
+        let bytes = line.text.as_bytes();
+        let mut i = paren_start + 1;
+        let mut arg_start = i;
+        let mut arg_ranges = Vec::new();
+        let mut depth = 1;
+        let mut quote = None;
+
+        while i < bytes.len() && depth > 0 {
+            if let Some(delimiter) = quote {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    i += line.text[i..].chars().next().unwrap().len_utf8();
+                    continue;
+                }
+                if bytes[i] == delimiter {
+                    if i + 1 < bytes.len() && bytes[i + 1] == delimiter {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                    i += 1;
+                    continue;
+                }
+                i += line.text[i..].chars().next().unwrap().len_utf8();
+                continue;
+            }
+
+            match bytes[i] {
+                delimiter @ (b'\'' | b'"') => {
+                    quote = Some(delimiter);
+                    i += 1;
+                }
+                b'(' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        arg_ranges.push(trim_text_range(&line.text, arg_start..i));
+                    }
+                    i += 1;
+                }
+                b',' if depth == 1 => {
+                    arg_ranges.push(trim_text_range(&line.text, arg_start..i));
+                    i += 1;
+                    arg_start = i;
+                }
+                _ => i += line.text[i..].chars().next().unwrap().len_utf8(),
+            }
+        }
+
+        if depth != 0 {
+            return None;
+        }
+
+        let args: Vec<MappedText> = arg_ranges
+            .into_iter()
+            .map(|range| line.slice(range))
+            .collect();
+        let expanded_args: Vec<MappedText> = args
+            .iter()
+            .map(|arg| self.expand_mapped_macros_inner(arg, expanding))
+            .collect();
+
+        let mut param_map: HashMap<&str, usize> = HashMap::new();
+        for (pi, param) in def.params.iter().enumerate() {
+            param_map.insert(param.as_str(), pi);
+        }
+
+        let va_args_raw = if def.is_variadic {
+            join_mapped_args(
+                args.get(def.params.len()..).unwrap_or(&[]),
+                invocation.clone(),
+            )
+        } else {
+            MappedText::empty(invocation.clone())
+        };
+        let va_args_expanded = if def.is_variadic {
+            join_mapped_args(
+                expanded_args.get(def.params.len()..).unwrap_or(&[]),
+                invocation.clone(),
+            )
+        } else {
+            MappedText::empty(invocation.clone())
+        };
+
+        let body_bytes = def.body.as_bytes();
+        let mut body = MappedText::empty(invocation.clone());
+        let mut bi = 0;
+
+        while bi < body_bytes.len() {
+            if body_bytes[bi] == b'#' && bi + 1 < body_bytes.len() && body_bytes[bi + 1] != b'#' {
+                let mut id_start = bi + 1;
+                while id_start < body_bytes.len() && body_bytes[id_start] == b' ' {
+                    id_start += 1;
+                }
+                let mut id_end = id_start;
+                while id_end < body_bytes.len()
+                    && (body_bytes[id_end].is_ascii_alphanumeric() || body_bytes[id_end] == b'_')
+                {
+                    id_end += 1;
+                }
+                if id_end > id_start {
+                    let id = std::str::from_utf8(&body_bytes[id_start..id_end]).unwrap_or("");
+                    if let Some(&pi) = param_map.get(id) {
+                        let raw = args.get(pi).map(|arg| arg.text.as_str()).unwrap_or("");
+                        body.push_text(
+                            &format!("\"{}\"", raw),
+                            invocation.clone(),
+                            SourceRunKind::Anchor,
+                        );
+                        bi = id_end;
+                        continue;
+                    }
+                }
+            }
+
+            if bi + 1 < body_bytes.len() && body_bytes[bi] == b'#' && body_bytes[bi + 1] == b'#' {
+                let trimmed_len = body.text.trim_end().len();
+                body.truncate(trimmed_len);
+                bi += 2;
+                while bi < body_bytes.len() && body_bytes[bi] == b' ' {
+                    bi += 1;
+                }
+                continue;
+            }
+
+            if body_bytes[bi].is_ascii_alphabetic() || body_bytes[bi] == b'_' {
+                let id_start = bi;
+                while bi < body_bytes.len()
+                    && (body_bytes[bi].is_ascii_alphanumeric() || body_bytes[bi] == b'_')
+                {
+                    bi += 1;
+                }
+                let id = std::str::from_utf8(&body_bytes[id_start..bi]).unwrap_or("");
+                let is_pasted = macro_param_is_pasted_left(body_bytes, id_start)
+                    || macro_param_is_pasted_right(body_bytes, bi);
+
+                if id == "__VA_ARGS__" && def.is_variadic {
+                    body.append(if is_pasted {
+                        &va_args_raw
+                    } else {
+                        &va_args_expanded
+                    });
+                } else if let Some(&pi) = param_map.get(id) {
+                    let replacement = if is_pasted {
+                        args.get(pi)
+                    } else {
+                        expanded_args.get(pi)
+                    };
+                    if let Some(replacement) = replacement {
+                        body.append(replacement);
+                    }
+                } else {
+                    body.push_text(id, invocation.clone(), SourceRunKind::Anchor);
+                }
+                continue;
+            }
+
+            let ch = (body_bytes[bi] as char).to_string();
+            body.push_text(&ch, invocation.clone(), SourceRunKind::Anchor);
+            bi += 1;
+        }
+
+        Some((body, i))
+    }
+
+    fn expand_condition_macros_inner(
         &self,
         line: &str,
         expanding: &std::collections::HashSet<String>,
-        mode: MacroExpandMode,
     ) -> String {
         if self.defines.is_empty() {
             return line.to_string();
@@ -773,37 +1498,6 @@ impl Preprocessor {
         let mut i = 0;
 
         while i < bytes.len() {
-            // Skip Fortran comment (! to end of line) in source mode.
-            if mode == MacroExpandMode::SourceLine && bytes[i] == b'!' {
-                result.push_str(&line[i..]);
-                break;
-            }
-
-            // Skip string literals in source mode.
-            if mode == MacroExpandMode::SourceLine && (bytes[i] == b'\'' || bytes[i] == b'"') {
-                let quote = bytes[i];
-                result.push(quote as char);
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == quote {
-                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
-                            result.push(quote as char);
-                            result.push(quote as char);
-                            i += 2;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        push_utf8_char(&mut result, bytes, &mut i);
-                    }
-                }
-                if i < bytes.len() {
-                    result.push(quote as char);
-                    i += 1;
-                }
-                continue;
-            }
-
             // Try to match an identifier.
             if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
                 let start = i;
@@ -812,7 +1506,7 @@ impl Preprocessor {
                 }
                 let ident = &line[start..i];
 
-                if mode == MacroExpandMode::ConditionExpr && ident == "defined" {
+                if ident == "defined" {
                     let (name, new_i) = parse_defined_operand(line, i);
                     result.push_str(if self.defines.contains_key(name) {
                         "1"
@@ -833,16 +1527,14 @@ impl Preprocessor {
                     if def.is_function {
                         if i < bytes.len() && bytes[i] == b'(' {
                             if let Some((expanded, new_i)) =
-                                self.expand_function_macro(def, line, i, expanding, mode)
+                                self.expand_condition_function_macro(def, line, i, expanding)
                             {
                                 // Re-expand the result with this macro marked as expanding.
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
-                                result.push_str(&self.expand_macros_inner(
-                                    &expanded,
-                                    &next_expanding,
-                                    mode,
-                                ));
+                                result.push_str(
+                                    &self.expand_condition_macros_inner(&expanded, &next_expanding),
+                                );
                                 i = new_i;
                                 continue;
                             }
@@ -852,11 +1544,9 @@ impl Preprocessor {
                         // Re-expand object macro body with this macro marked as expanding.
                         let mut next_expanding = expanding.clone();
                         next_expanding.insert(ident.to_string());
-                        result.push_str(&self.expand_macros_inner(
-                            &def.body,
-                            &next_expanding,
-                            mode,
-                        ));
+                        result.push_str(
+                            &self.expand_condition_macros_inner(&def.body, &next_expanding),
+                        );
                     }
                 } else {
                     result.push_str(ident);
@@ -870,13 +1560,12 @@ impl Preprocessor {
         result
     }
 
-    fn expand_function_macro(
+    fn expand_condition_function_macro(
         &self,
         def: &MacroDef,
         line: &str,
         paren_start: usize,
         expanding: &std::collections::HashSet<String>,
-        mode: MacroExpandMode,
     ) -> Option<(String, usize)> {
         let bytes = line.as_bytes();
         let mut i = paren_start + 1; // skip '('
@@ -941,7 +1630,7 @@ impl Preprocessor {
         args.push(current_arg.trim().to_string());
         let expanded_args: Vec<String> = args
             .iter()
-            .map(|arg| self.expand_macros_inner(arg, expanding, mode))
+            .map(|arg| self.expand_condition_macros_inner(arg, expanding))
             .collect();
 
         // Build parameter lookup table.
@@ -1045,6 +1734,25 @@ impl Preprocessor {
 
         Some((body, i))
     }
+}
+
+fn trim_text_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let slice = &text[range.clone()];
+    let trimmed_start = slice.trim_start();
+    let start = range.start + slice.len() - trimmed_start.len();
+    let trimmed = trimmed_start.trim_end();
+    start..start + trimmed.len()
+}
+
+fn join_mapped_args(args: &[MappedText], fallback: SourceOrigin) -> MappedText {
+    let mut joined = MappedText::empty(fallback.clone());
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            joined.push_text(", ", fallback.clone(), SourceRunKind::Anchor);
+        }
+        joined.append(arg);
+    }
+    joined
 }
 
 fn macro_param_is_pasted_left(body: &[u8], start: usize) -> bool {
@@ -1510,9 +2218,9 @@ fn strip_c_directive_comments(line: &str) -> String {
     result
 }
 
-fn strip_c_block_comments_from_line(line: &str, in_block: &mut bool) -> String {
-    let bytes = line.as_bytes();
-    let mut result = String::with_capacity(line.len());
+fn strip_c_block_comments_from_mapped_line(line: &MappedText, in_block: &mut bool) -> MappedText {
+    let bytes = line.text.as_bytes();
+    let mut result = MappedText::empty(line.fallback.clone());
     let mut i = 0;
 
     while i < bytes.len() {
@@ -1530,43 +2238,39 @@ fn strip_c_block_comments_from_line(line: &str, in_block: &mut bool) -> String {
         }
 
         if bytes[i] == b'!' {
-            result.push_str(&line[i..]);
+            result.append_slice(line, i..line.text.len());
             break;
         }
 
         if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let start = i;
             let quote = bytes[i];
-            result.push(quote as char);
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == quote {
-                    result.push(quote as char);
                     if i + 1 < bytes.len() && bytes[i + 1] == quote {
-                        result.push(quote as char);
                         i += 2;
                         continue;
                     }
                     i += 1;
                     break;
                 }
-                push_utf8_char(&mut result, bytes, &mut i);
+                i += line.text[i..].chars().next().unwrap().len_utf8();
             }
+            result.append_slice(line, start..i);
             continue;
         }
 
-        if bytes[i] == b'!' {
-            result.push_str(&line[i..]);
-            break;
-        }
-
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            result.push(' ');
+            result.push_text(" ", line.origin_at(i), SourceRunKind::Anchor);
             *in_block = true;
             i += 2;
             continue;
         }
 
-        push_utf8_char(&mut result, bytes, &mut i);
+        let end = i + line.text[i..].chars().next().unwrap().len_utf8();
+        result.append_slice(line, i..end);
+        i = end;
     }
 
     result
@@ -2119,6 +2823,103 @@ end program
         assert_eq!(result.source_map.len(), 4);
         assert_eq!(result.source_map[0].line, 1);
         assert_eq!(result.source_map[2].line, 3);
+    }
+
+    fn diagnostic_span(line: u32, col: u32) -> Span {
+        Span {
+            file_id: 0,
+            start: Position { line, col },
+            end: Position { line, col: col + 1 },
+        }
+    }
+
+    #[test]
+    fn source_map_resolves_free_form_continuation_fragments() {
+        let config = PreprocConfig {
+            filename: "continuation.f90".into(),
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("x = 1 + &\n    @\n", &config).unwrap();
+        let generated_col = result.text.lines().next().unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(diagnostic_span(1, generated_col));
+
+        assert_eq!(resolved.filename, "continuation.f90");
+        assert_eq!(resolved.display_span.start, Position { line: 2, col: 5 });
+        assert_eq!(resolved.source_span.start, Position { line: 2, col: 5 });
+        assert_eq!(resolved.source.lines().nth(1), Some("    @"));
+    }
+
+    #[test]
+    fn source_map_preserves_columns_after_macro_expansion() {
+        let config = PreprocConfig {
+            filename: "macro.f90".into(),
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("#define LONG 123456\nx = LONG + @\n", &config).unwrap();
+        let generated_col = result.text.lines().nth(1).unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(diagnostic_span(2, generated_col));
+
+        assert_eq!(resolved.display_span.start, Position { line: 2, col: 12 });
+        assert_eq!(resolved.source_span.start, Position { line: 2, col: 12 });
+    }
+
+    #[test]
+    fn source_map_preserves_function_macro_argument_origins() {
+        let config = PreprocConfig {
+            filename: "macro-arg.f90".into(),
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("#define ID(x) x\nv = ID(   @ )\n", &config).unwrap();
+        let generated_col = result.text.lines().nth(1).unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(diagnostic_span(2, generated_col));
+
+        assert_eq!(resolved.display_span.start, Position { line: 2, col: 11 });
+        assert_eq!(resolved.source_span.start, Position { line: 2, col: 11 });
+    }
+
+    #[test]
+    fn source_map_anchors_macro_body_text_to_the_invocation() {
+        let config = PreprocConfig {
+            filename: "macro-body.f90".into(),
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("#define BAD @\nv = BAD\n", &config).unwrap();
+        let generated_col = result.text.lines().nth(1).unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(diagnostic_span(2, generated_col));
+
+        assert_eq!(resolved.display_span.start, Position { line: 2, col: 5 });
+        assert_eq!(resolved.source_span.start, Position { line: 2, col: 5 });
+    }
+
+    #[test]
+    fn source_map_resolves_exclusive_end_before_a_continuation_boundary() {
+        let result = preprocess("ab&\n  &cd\n", &PreprocConfig::default()).unwrap();
+        let resolved = result.resolve_span(Span {
+            file_id: 0,
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 3 },
+        });
+
+        assert_eq!(resolved.source_span.start, Position { line: 1, col: 1 });
+        assert_eq!(resolved.source_span.end, Position { line: 1, col: 3 });
+    }
+
+    #[test]
+    fn source_map_scales_across_many_continuation_fragments() {
+        let fragments = 2048;
+        let mut source = String::from("x = &\n");
+        for _ in 0..fragments {
+            source.push_str("  &a&\n");
+        }
+        source.push_str("  &@\n");
+
+        let result = preprocess(&source, &PreprocConfig::default()).unwrap();
+        let generated_col = result.text.lines().next().unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(diagnostic_span(1, generated_col));
+
+        assert_eq!(resolved.source_span.start.line, fragments + 2);
+        assert_eq!(resolved.source_span.start.col, 4);
+        assert!(result.source_map[0].runs.len() <= fragments as usize + 2);
     }
 
     // ---- Expression evaluator ----

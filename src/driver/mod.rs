@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{detect_source_form, tokenize, SourceForm};
+use crate::lexer::{detect_source_form, tokenize, SourceForm, Span};
 use crate::parser::Parser;
 use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
@@ -1364,6 +1364,31 @@ fn preproc_config_for_input(
 }
 
 /// Compile a Fortran source file through the full pipeline.
+fn render_preprocessed_diagnostic(
+    preprocessed: &crate::preprocess::PreprocOutput,
+    span: Span,
+    level: diag::Level,
+    message: &str,
+) {
+    let resolved = preprocessed.resolve_span(span);
+    let span_len = if resolved.source_span.end.line == resolved.source_span.start.line
+        && resolved.source_span.end.col > resolved.source_span.start.col
+    {
+        (resolved.source_span.end.col - resolved.source_span.start.col) as usize
+    } else {
+        1
+    };
+    diag::render_mapped(
+        resolved.filename,
+        resolved.source,
+        resolved.display_span,
+        resolved.source_span,
+        level,
+        message,
+        span_len,
+    );
+}
+
 pub fn compile(opts: &Options) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
@@ -1460,8 +1485,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let pp_result =
         crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
-    let included_files = pp_result.included_files;
-    let preprocessed = pp_result.text;
+    let included_files = &pp_result.included_files;
+    let preprocessed = pp_result.text.as_str();
 
     if opts.preprocess_only {
         if opts.output.is_none() {
@@ -1471,7 +1496,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if out.as_os_str() == "-" {
                 print!("{}", preprocessed);
             } else {
-                fs::write(&out, &preprocessed)
+                fs::write(&out, preprocessed)
                     .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
             }
             if opts.verbose {
@@ -1489,17 +1514,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 3. Lex.
     let phase = phases.start("lex");
-    let tokens = match tokenize(&preprocessed, 0, source_form) {
+    let tokens = match tokenize(preprocessed, 0, source_form) {
         Ok(tokens) => tokens,
         Err(e) => {
             phase.end(&mut phases);
-            diag::render(
-                &file_str,
-                &source,
+            render_preprocessed_diagnostic(
+                &pp_result,
                 e.span,
                 diag::Level::Error,
                 &format!("lexer error: {}", e.msg),
-                1,
             );
             phases.report();
             return Err(format!(
@@ -1529,19 +1552,11 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         Ok(units) => units,
         Err(e) => {
             phase.end(&mut phases);
-            let span_len =
-                if e.span.end.line == e.span.start.line && e.span.end.col > e.span.start.col {
-                    (e.span.end.col - e.span.start.col) as usize
-                } else {
-                    1
-                };
-            diag::render(
-                &file_str,
-                &source,
+            render_preprocessed_diagnostic(
+                &pp_result,
                 e.span,
                 diag::Level::Error,
                 &format!("parse error: {}", e.msg),
-                span_len,
             );
             phases.report();
             return Err(format!(
@@ -1567,16 +1582,19 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 5. Semantic analysis.
     let phase = phases.start("sema");
     let target_layout = crate::target::TargetLayout::of(&opts.target);
-    let resolve_result = resolve::resolve_file(&units, &opts.module_search_paths, target_layout)
-        .map_err(|e| {
-            format!(
-                "{}:{}:{}: {}",
-                opts.input.display(),
-                e.span.start.line,
-                e.span.start.col,
-                e.msg
-            )
-        })?;
+    let resolve_result =
+        match resolve::resolve_file(&units, &opts.module_search_paths, target_layout) {
+            Ok(result) => result,
+            Err(e) => {
+                phase.end(&mut phases);
+                render_preprocessed_diagnostic(&pp_result, e.span, diag::Level::Error, &e.msg);
+                phases.report();
+                return Err(format!(
+                    "aborting due to errors in {}",
+                    opts.input.display()
+                ));
+            }
+        };
     let mut st = resolve_result.st;
     if opts.force_implicit_none {
         st.force_implicit_none_all_units();
@@ -1604,15 +1622,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             validate::DiagKind::Error => diag::Level::Error,
             validate::DiagKind::Warning => diag::Level::Warning,
         };
-        // span_len is best-effort: end.col >= start.col on the same
-        // line gives a nice underline, otherwise default to 1.
-        let span_len = if d.span.end.line == d.span.start.line && d.span.end.col > d.span.start.col
-        {
-            (d.span.end.col - d.span.start.col) as usize
-        } else {
-            1
-        };
-        diag::render(&file_str, &source, d.span, level, &d.msg, span_len);
+        render_preprocessed_diagnostic(&pp_result, d.span, level, &d.msg);
         match d.kind {
             validate::DiagKind::Error => had_error = true,
             validate::DiagKind::Warning if opts.warn_as_error => had_error = true,
@@ -1742,7 +1752,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
-        write_dependency_file(opts, &out, &included_files)?;
+        write_dependency_file(opts, &out, included_files)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
         }
@@ -1972,7 +1982,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             }
         }
         if opts.emit_obj {
-            write_dependency_file(opts, &obj_path, &included_files)?;
+            write_dependency_file(opts, &obj_path, included_files)?;
             if opts.verbose {
                 eprintln!(" assembled: {}", obj_path.display());
             }
@@ -2021,7 +2031,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     }
 
     if opts.emit_obj {
-        write_dependency_file(opts, &obj_path, &included_files)?;
+        write_dependency_file(opts, &obj_path, included_files)?;
         phases.report();
         return Ok(());
     }

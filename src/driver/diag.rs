@@ -62,6 +62,20 @@ const ANSI_BOLD: &str = "\x1b[1m";
 /// line for the gutter view.  `span_len` controls how wide the caret
 /// underline is (defaults to a single `^` when zero).
 pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str, span_len: usize) {
+    render_mapped(file, source, span, span, level, message, span_len);
+}
+
+/// Render a diagnostic whose reported location differs from the physical
+/// source used for the snippet, as with includes, continuations, and `#line`.
+pub fn render_mapped(
+    file: &str,
+    source: &str,
+    display_span: Span,
+    source_span: Span,
+    level: Level,
+    message: &str,
+    span_len: usize,
+) {
     let color = use_color();
     let (col_start, reset) = if color {
         (level.color(), ANSI_RESET)
@@ -74,16 +88,18 @@ pub fn render(file: &str, source: &str, span: Span, level: Level, message: &str,
         "{bold}{file}:{line}:{col}:{reset} {col_start}{label}:{reset} {bold}{msg}{reset}",
         bold = bold,
         file = file,
-        line = span.start.line,
-        col = span.start.col,
+        line = display_span.start.line,
+        col = display_span.start.col,
         reset = reset,
         col_start = col_start,
         label = level.label(),
         msg = message,
     );
 
-    if let Some((gutter, line_text, caret_indent, caret_len)) = snippet_for(source, span, span_len)
+    if let Some((_, line_text, caret_indent, caret_len)) =
+        snippet_for(source, source_span, span_len)
     {
+        let gutter = display_span.start.line;
         let blue = if color { "\x1b[34m" } else { "" };
         let gutter_width = gutter.to_string().len().max(5);
         let caret_gutter = " ".repeat(gutter_width);

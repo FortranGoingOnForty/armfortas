@@ -43,6 +43,20 @@ fn write_program_in(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
+fn diagnostic_output(source: &std::path::Path, extra_args: &[&str]) -> std::process::Output {
+    let output = unique_path("diagnostic", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args(extra_args)
+        .arg(source)
+        .args(["-c", "-o"])
+        .arg(&output)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("compiler failed to start");
+    let _ = std::fs::remove_file(output);
+    result
+}
+
 fn run_binary_with_timeout(
     path: &std::path::Path,
     timeout: std::time::Duration,
@@ -29609,6 +29623,163 @@ fn diagnostic_renders_source_line_and_caret() {
     assert!(stderr.contains("^"), "missing caret marker: {}", stderr);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn included_lexer_diagnostic_uses_included_source() {
+    let dir = unique_dir("included_lexer_diagnostic");
+    let included = write_program_in(&dir, "bad.inc", "@\n");
+    let source = write_program_in(&dir, "main.F90", "#include \"bad.inc\"\n");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:1: error:", included.display())),
+        "diagnostic did not name the included source: {stderr}"
+    );
+    assert!(
+        stderr.contains("| @"),
+        "diagnostic did not show the included source line: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn included_parse_diagnostic_uses_included_source() {
+    let dir = unique_dir("included_parse_diagnostic");
+    let included = write_program_in(&dir, "bad.inc", "this is garbage\n");
+    let source = write_program_in(&dir, "main.F90", "#include \"bad.inc\"\n");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:1: error:", included.display())),
+        "parse diagnostic did not name the included source: {stderr}"
+    );
+    assert!(
+        stderr.contains("| this is garbage"),
+        "parse diagnostic did not show the included source line: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn included_eof_diagnostic_uses_included_source() {
+    let dir = unique_dir("included_eof_diagnostic");
+    let included = write_program_in(&dir, "bad.inc", "program p\n");
+    let source = write_program_in(&dir, "main.F90", "#include \"bad.inc\"\n");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:", included.display())),
+        "EOF diagnostic did not name the included source: {stderr}"
+    );
+    assert!(
+        stderr.contains("| program p"),
+        "EOF diagnostic did not show the included source line: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn included_resolver_diagnostic_uses_included_source() {
+    let dir = unique_dir("included_resolver_diagnostic");
+    let included = write_program_in(&dir, "bad.inc", "  use missing_diagnostic_module\n");
+    let source = write_program_in(
+        &dir,
+        "main.F90",
+        "program p\n#include \"bad.inc\"\nend program p\n",
+    );
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:", included.display())),
+        "resolver diagnostic did not name the included source: {stderr}"
+    );
+    assert!(
+        stderr.contains("|   use missing_diagnostic_module"),
+        "resolver diagnostic did not show the included source line: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn included_validation_diagnostic_uses_included_source() {
+    let dir = unique_dir("included_validation_diagnostic");
+    let included = write_program_in(&dir, "bad.inc", "  error stop 'oops'\n");
+    let source = write_program_in(
+        &dir,
+        "main.F90",
+        "program p\n#include \"bad.inc\"\nend program p\n",
+    );
+
+    let result = diagnostic_output(&source, &["--std=f95"]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:3: error:", included.display())),
+        "validation diagnostic did not name the included source: {stderr}"
+    );
+    assert!(
+        stderr.contains("|   error stop 'oops'"),
+        "validation diagnostic did not show the included source line: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn free_form_continuation_diagnostic_uses_physical_line() {
+    let source = write_program(
+        "program p\n  integer :: x\n  x = 1 + &\n    2\n  x = x + &\n    @\nend program p\n",
+        "F90",
+    );
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:6:5: error:", source.display())),
+        "continuation diagnostic used transformed coordinates: {stderr}"
+    );
+    assert!(
+        stderr.contains("|     @"),
+        "continuation diagnostic showed the wrong physical line: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
+fn fixed_form_continuation_diagnostic_uses_physical_line() {
+    let source = write_program(
+        "      PROGRAM P\n      INTEGER I\n      I = 1\n     1@\n      END\n",
+        "f",
+    );
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:4:7: error:", source.display())),
+        "fixed continuation diagnostic used the first statement line: {stderr}"
+    );
+    assert!(
+        stderr.contains("|      1@"),
+        "fixed continuation diagnostic showed the wrong physical line: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(source);
 }
 
 #[test]
