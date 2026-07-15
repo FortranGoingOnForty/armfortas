@@ -1092,6 +1092,51 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
     })
 }
 
+fn lower_positioning_statement(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[IoControl],
+    runtime_fn: &str,
+) {
+    let unit_spec = io_control_by_keyword(specs, "unit")
+        .or_else(|| specs.iter().find(|spec| spec.keyword.is_none()));
+    let iostat_spec = io_control_by_keyword(specs, "iostat");
+    let iomsg_spec = io_control_by_keyword(specs, "iomsg");
+    let err_label = io_control_by_keyword(specs, "err").and_then(|spec| {
+        if let Expr::IntegerLiteral { text, .. } = &spec.value.node {
+            text.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+
+    let unit = unit_spec
+        .map(|spec| super::expr::lower_expr_ctx(b, ctx, &spec.value))
+        .unwrap_or_else(|| b.const_i32(6));
+    let unit = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+    let null = b.const_i64(0);
+    let iostat_ptr = if let Some(spec) = iostat_spec {
+        lower_arg_by_ref_ctx(b, ctx, &spec.value)
+    } else if err_label.is_some() {
+        let status = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, status);
+        status
+    } else {
+        null
+    };
+    let (iomsg_ptr, iomsg_len) = iomsg_spec
+        .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
+        .unwrap_or((null, null));
+
+    b.call(
+        FuncRef::External(runtime_fn.into()),
+        vec![unit, iostat_ptr, iomsg_ptr, iomsg_len],
+        IrType::Void,
+    );
+    lower_read_err_branch(b, ctx, err_label, iostat_ptr);
+}
+
 fn namelist_i8_ptr(b: &mut FuncBuilder, value: ValueId) -> ValueId {
     if b.func()
         .value_type(value)
@@ -9201,6 +9246,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 vec![unit, null],
                 IrType::Void,
             );
+        }
+
+        Stmt::Backspace { specs } => {
+            lower_positioning_statement(b, ctx, specs, "afs_backspace_ex");
+        }
+
+        Stmt::Endfile { specs } => {
+            lower_positioning_statement(b, ctx, specs, "afs_endfile_ex");
         }
 
         Stmt::Nullify { items } => {

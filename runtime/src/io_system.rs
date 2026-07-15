@@ -3604,81 +3604,208 @@ fn write_to_buffer(buf: *mut u8, buf_len: usize, start: usize, data: &[u8], pos:
 
 // ---- BACKSPACE / ENDFILE ----
 
-/// Backspace one record on a sequential unit.
-/// For formatted: seek backwards past the previous newline.
-#[no_mangle]
-pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
-        match &mut u.stream {
-            UnitStream::FileRaw(f) => {
-                // Simple approach: seek backwards byte-by-byte to find newline.
-                let pos = f.stream_position().unwrap_or(0);
-                if pos <= 1 {
-                    let _ = f.seek(SeekFrom::Start(0));
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = 0;
-                        }
-                    }
-                    // Clear stale read tokens.
-                    u.read_tokens.clear();
-                    return;
-                }
-                // Skip the current newline at pos-1.
-                let mut search_pos = pos - 2;
-                loop {
-                    f.seek(SeekFrom::Start(search_pos)).ok();
-                    let mut byte = [0u8; 1];
-                    if f.read(&mut byte).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    if byte[0] == b'\n' {
-                        f.seek(SeekFrom::Start(search_pos + 1)).ok();
-                        break;
-                    }
-                    if search_pos == 0 {
-                        f.seek(SeekFrom::Start(0)).ok();
-                        break;
-                    }
-                    search_pos -= 1;
-                }
-                // Clear stale read tokens after repositioning.
-                u.read_tokens.clear();
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 0;
-                    }
-                }
+fn invalid_positioning_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn backspace_formatted_stream<S: Read + Seek>(stream: &mut S) -> io::Result<()> {
+    let position = stream.stream_position()?;
+    if position == 0 {
+        return Ok(());
+    }
+
+    let mut search_position = position - 1;
+    let mut byte = [0u8; 1];
+    stream.seek(SeekFrom::Start(search_position))?;
+    stream.read_exact(&mut byte)?;
+
+    if byte[0] == b'\n' {
+        if search_position == 0 {
+            stream.seek(SeekFrom::Start(0))?;
+            return Ok(());
+        }
+        search_position -= 1;
+    }
+
+    loop {
+        stream.seek(SeekFrom::Start(search_position))?;
+        stream.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            stream.seek(SeekFrom::Start(search_position + 1))?;
+            return Ok(());
+        }
+        if search_position == 0 {
+            stream.seek(SeekFrom::Start(0))?;
+            return Ok(());
+        }
+        search_position -= 1;
+    }
+}
+
+fn backspace_unformatted_stream<S: Read + Seek>(stream: &mut S) -> io::Result<()> {
+    let position = stream.stream_position()?;
+    if position == 0 {
+        return Ok(());
+    }
+    if position < 8 {
+        return Err(invalid_positioning_error(
+            "invalid sequential unformatted record",
+        ));
+    }
+
+    let mut marker = [0u8; 4];
+    stream.seek(SeekFrom::Start(position - 4))?;
+    stream.read_exact(&mut marker)?;
+    let record_len = u32::from_ne_bytes(marker) as u64;
+    let record_size = record_len
+        .checked_add(8)
+        .ok_or_else(|| invalid_positioning_error("unformatted record length overflow"))?;
+    let record_start = position
+        .checked_sub(record_size)
+        .ok_or_else(|| invalid_positioning_error("invalid sequential unformatted record"))?;
+
+    stream.seek(SeekFrom::Start(record_start))?;
+    stream.read_exact(&mut marker)?;
+    if u32::from_ne_bytes(marker) as u64 != record_len {
+        return Err(invalid_positioning_error(
+            "mismatched sequential unformatted record markers",
+        ));
+    }
+    stream.seek(SeekFrom::Start(record_start))?;
+    Ok(())
+}
+
+fn finish_positioning_result(
+    operation: &str,
+    result: io::Result<()>,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    match result {
+        Ok(()) => {
+            if !iostat.is_null() {
+                unsafe { *iostat = 0 };
             }
-            _ => {
-                // Sequential buffered files: backspace is not well-supported.
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 0;
-                    }
-                }
+            assign_iomsg(iomsg, iomsg_len, "");
+        }
+        Err(error) => {
+            let status = error.raw_os_error().unwrap_or(1);
+            let message = format!("{}: {}", operation, error);
+            assign_iomsg(iomsg, iomsg_len, &message);
+            if !iostat.is_null() {
+                unsafe { *iostat = status };
+            } else {
+                eprintln!("{}", message);
+                std::process::exit(1);
             }
         }
     }
 }
 
+impl Unit {
+    fn backspace(&mut self) -> io::Result<()> {
+        if self.access == Access::Direct {
+            return Err(invalid_positioning_error(
+                "BACKSPACE is not valid for direct access",
+            ));
+        }
+
+        let formatted = self.form == Form::Formatted;
+        match &mut self.stream {
+            UnitStream::FileRaw(file) => {
+                if formatted {
+                    backspace_formatted_stream(file)?;
+                } else {
+                    backspace_unformatted_stream(file)?;
+                }
+            }
+            UnitStream::FileRead(reader) => {
+                if formatted {
+                    backspace_formatted_stream(reader)?;
+                } else {
+                    backspace_unformatted_stream(reader)?;
+                }
+            }
+            UnitStream::FileWrite(writer) => {
+                writer.flush()?;
+                if formatted {
+                    backspace_formatted_stream(writer.get_mut())?;
+                } else {
+                    backspace_unformatted_stream(writer.get_mut())?;
+                }
+            }
+            _ => return Err(invalid_positioning_error("unit is not seekable")),
+        }
+        self.reset_read_state_after_positioning();
+        Ok(())
+    }
+
+    fn endfile(&mut self) -> io::Result<()> {
+        if self.access == Access::Direct {
+            return Err(invalid_positioning_error(
+                "ENDFILE is not valid for direct access",
+            ));
+        }
+        if self.action == Action::Read {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unit is not open for writing",
+            ));
+        }
+
+        match &mut self.stream {
+            UnitStream::FileRaw(file) => {
+                file.flush()?;
+                let position = file.stream_position()?;
+                file.set_len(position)?;
+            }
+            UnitStream::FileWrite(writer) => {
+                writer.flush()?;
+                let position = writer.stream_position()?;
+                writer.get_ref().set_len(position)?;
+            }
+            _ => return Err(invalid_positioning_error("unit is not seekable")),
+        }
+        self.reset_read_state_after_positioning();
+        Ok(())
+    }
+}
+
+/// Backspace one record on a sequential unit.
+#[no_mangle]
+pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
+    afs_backspace_ex(unit, iostat, std::ptr::null_mut(), 0);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_backspace_ex(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
+    let result = {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .get_unit(unit)
+            .ok_or_else(|| invalid_positioning_error("unit is not connected"))
+            .and_then(Unit::backspace)
+    };
+    finish_positioning_result("BACKSPACE", result, iostat, iomsg, iomsg_len);
+}
+
 /// Write an end-of-file marker and truncate.
 #[no_mangle]
 pub extern "C" fn afs_endfile(unit: i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
-        let _ = u.flush();
-        if let UnitStream::FileRaw(f) = &mut u.stream {
-            let pos = f.stream_position().unwrap_or(0);
-            let _ = f.set_len(pos); // truncate at current position
-        }
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 0;
-            }
-        }
-    }
+    afs_endfile_ex(unit, iostat, std::ptr::null_mut(), 0);
+}
+
+#[no_mangle]
+pub extern "C" fn afs_endfile_ex(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
+    let result = {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .get_unit(unit)
+            .ok_or_else(|| invalid_positioning_error("unit is not connected"))
+            .and_then(Unit::endfile)
+    };
+    finish_positioning_result("ENDFILE", result, iostat, iomsg, iomsg_len);
 }
 
 // ---- IOSTAT constants (iso_fortran_env) ----
