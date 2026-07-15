@@ -10160,7 +10160,8 @@ pub(super) fn descriptor_backed_runtime_char_array(info: &LocalInfo) -> bool {
 }
 
 pub(super) fn descriptor_backed_char_array(info: &LocalInfo) -> bool {
-    local_uses_array_descriptor(info)
+    local_declared_rank(info) > 0
+        && local_uses_array_descriptor(info)
         && (info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(info))
 }
 
@@ -32709,6 +32710,10 @@ pub(super) fn lower_write_items_adv(
             || (expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
                 && !expr_is_array_designator(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)))
             || generic_char_call;
+        let is_logical = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
 
         // Whole-array print: a plain Name reference whose local
         // has array dims. Iterate elements and call the per-element
@@ -32998,11 +33003,16 @@ pub(super) fn lower_write_items_adv(
                         );
                     } else {
                         let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
-                        b.call(
-                            FuncRef::External(writer.into()),
-                            vec![unit, elem],
-                            IrType::Void,
-                        );
+                        if is_logical {
+                            let kind = logical_transfer_width_for_ir_type(&elem_ty) as u8;
+                            lower_write_emit_logical(b, unit, &elem_ty, elem, kind);
+                        } else {
+                            b.call(
+                                FuncRef::External(writer.into()),
+                                vec![unit, elem],
+                                IrType::Void,
+                            );
+                        }
                     }
                     let one = b.const_i64(1);
                     let next = b.iadd(i_val, one);
@@ -33017,6 +33027,11 @@ pub(super) fn lower_write_items_adv(
                 .func()
                 .value_type(val)
                 .unwrap_or(IrType::Int(IntWidth::I32));
+            if is_logical {
+                let kind = logical_transfer_width_for_ir_type(&ty) as u8;
+                lower_write_emit_logical(b, unit, &ty, val, kind);
+                continue;
+            }
             let func_name = match &ty {
                 IrType::Ptr(ref inner) => {
                     // Complex expression result: ptr<[f32/f64 x 2]>
@@ -33431,138 +33446,90 @@ fn internal_write_item_is_char(ctx: &LowerCtx, item: &crate::ast::expr::SpannedE
     }
 }
 
-pub(super) fn lower_internal_write_items(
-    b: &mut FuncBuilder,
-    ctx: &mut LowerCtx,
-    items: &[crate::ast::expr::SpannedExpr],
-    buf_ptr: ValueId,
-    buf_len: ValueId,
-) {
-    let zero = b.const_i64(0);
-    let pos = b.alloca(IrType::Int(IntWidth::I64));
-    b.store(zero, pos);
-
-    for item in items {
-        let is_char = internal_write_item_is_char(ctx, item);
-
-        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
-            b.call(
-                FuncRef::External("afs_write_internal_string".into()),
-                vec![buf_ptr, buf_len, ptr, len, pos],
-                IrType::Void,
-            );
-            deallocate_owned_string_expr_temp(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-                ptr,
-            );
-            continue;
-        }
-
-        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
-        let ty = b
-            .func()
-            .value_type(val)
-            .unwrap_or(IrType::Int(IntWidth::I32));
-        match ty {
-            IrType::Int(IntWidth::I8) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int8".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I16) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int16".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I128) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int128".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I64) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int64".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I32) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(FloatWidth::F64) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_real64".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(_) => {
-                let widened = b.float_extend(val, FloatWidth::F64);
-                b.call(
-                    FuncRef::External("afs_write_internal_real64".into()),
-                    vec![buf_ptr, buf_len, widened, pos],
-                    IrType::Void,
-                );
-            }
-            _ => {}
-        }
-    }
+#[derive(Clone, Copy)]
+enum InternalListWriteSink {
+    Fixed {
+        buf_ptr: ValueId,
+        buf_len: ValueId,
+        pos: ValueId,
+    },
+    Alloc,
 }
 
-/// List-directed internal WRITE items into a deferred-length
-/// allocatable scalar target: the record is collected in the runtime
-/// (afs_lst_ia_*) and stored in one shot at end, so an unallocated
-/// target gets allocated to the record length instead of presenting
-/// a len-0 view to the fixed-buffer writers (which silently produced
-/// an empty string). Item classification and rendering match the
-/// fixed path exactly.
-pub(super) fn lower_internal_write_items_alloc(
-    b: &mut FuncBuilder,
-    ctx: &mut LowerCtx,
-    items: &[crate::ast::expr::SpannedExpr],
-) {
-    for item in items {
-        let is_char = internal_write_item_is_char(ctx, item);
+fn internal_list_write_scalar_supported(ty: &IrType, logical: bool) -> bool {
+    logical
+        || matches!(
+            ty,
+            IrType::Bool | IrType::Int(_) | IrType::Float(FloatWidth::F32 | FloatWidth::F64)
+        )
+}
 
-        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+fn lower_internal_list_write_scalar(
+    b: &mut FuncBuilder,
+    ty: &IrType,
+    val: ValueId,
+    logical: bool,
+    sink: InternalListWriteSink,
+) -> bool {
+    if logical || matches!(ty, IrType::Bool) {
+        let truth = match ty {
+            IrType::Bool => val,
+            IrType::Int(_) => {
+                let zero = zero_value_for_ir_type(b, ty);
+                b.icmp(CmpOp::Ne, val, zero)
+            }
+            _ => coerce_to_type(b, val, &IrType::Bool),
+        };
+        let int_val = b.int_extend(truth, IntWidth::I32, false);
+        match sink {
+            InternalListWriteSink::Fixed {
+                buf_ptr,
+                buf_len,
+                pos,
+            } => {
+                b.call(
+                    FuncRef::External("afs_write_internal_logical".into()),
+                    vec![buf_ptr, buf_len, int_val, pos],
+                    IrType::Void,
+                );
+            }
+            InternalListWriteSink::Alloc => {
+                b.call(
+                    FuncRef::External("afs_lst_ia_logical".into()),
+                    vec![int_val],
+                    IrType::Void,
+                );
+            }
+        }
+        return true;
+    }
+
+    match sink {
+        InternalListWriteSink::Fixed {
+            buf_ptr,
+            buf_len,
+            pos,
+        } => {
+            let func = match ty {
+                IrType::Int(IntWidth::I8) => "afs_write_internal_int8",
+                IrType::Int(IntWidth::I16) => "afs_write_internal_int16",
+                IrType::Int(IntWidth::I32) => "afs_write_internal_int",
+                IrType::Int(IntWidth::I64) => "afs_write_internal_int64",
+                IrType::Int(IntWidth::I128) => "afs_write_internal_int128",
+                IrType::Float(_) => "afs_write_internal_real64",
+                _ => return false,
+            };
+            let arg = match ty {
+                IrType::Float(FloatWidth::F32) => b.float_extend(val, FloatWidth::F64),
+                _ => val,
+            };
             b.call(
-                FuncRef::External("afs_lst_ia_string".into()),
-                vec![ptr, len],
+                FuncRef::External(func.into()),
+                vec![buf_ptr, buf_len, arg, pos],
                 IrType::Void,
             );
-            deallocate_owned_string_expr_temp(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-                ptr,
-            );
-            continue;
         }
-
-        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
-        let ty = b
-            .func()
-            .value_type(val)
-            .unwrap_or(IrType::Int(IntWidth::I32));
-        match ty {
+        InternalListWriteSink::Alloc => match ty {
             IrType::Int(IntWidth::I128) => {
                 b.call(
                     FuncRef::External("afs_lst_ia_int128".into()),
@@ -33585,23 +33552,191 @@ pub(super) fn lower_internal_write_items_alloc(
                     IrType::Void,
                 );
             }
-            IrType::Float(FloatWidth::F64) => {
-                b.call(
-                    FuncRef::External("afs_lst_ia_real".into()),
-                    vec![val],
-                    IrType::Void,
-                );
-            }
             IrType::Float(_) => {
-                let widened = b.float_extend(val, FloatWidth::F64);
+                let arg = match ty {
+                    IrType::Float(FloatWidth::F32) => b.float_extend(val, FloatWidth::F64),
+                    _ => val,
+                };
                 b.call(
                     FuncRef::External("afs_lst_ia_real".into()),
-                    vec![widened],
+                    vec![arg],
                     IrType::Void,
                 );
             }
-            _ => {}
+            _ => return false,
+        },
+    }
+    true
+}
+
+fn lower_internal_list_write_whole_array(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    sink: InternalListWriteSink,
+) -> bool {
+    let logical = info.logical_kind.is_some();
+    if info.char_kind != CharKind::None
+        || info.derived_type.is_some()
+        || is_complex_ty(&info.ty)
+        || !internal_list_write_scalar_supported(&info.ty, logical)
+    {
+        return false;
+    }
+
+    let base = array_base_addr(b, info);
+    let desc = local_uses_array_descriptor(info).then(|| array_descriptor_addr(b, info));
+    let n = array_total_elems_value(b, info);
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("internal_list_arr_check");
+    let bb_body = b.create_block("internal_list_arr_body");
+    let bb_exit = b.create_block("internal_list_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes = array_elem_size_value(b, info);
+    let ptr = if let Some(desc) = desc {
+        desc_element_byte_ptr_rank(b, desc, i_val, elem_bytes, local_declared_rank(info).max(1))
+    } else {
+        let byte_off = b.imul(i_val, elem_bytes);
+        b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
+    };
+    let elem = b.load_typed(ptr, info.ty.clone());
+    let emitted = lower_internal_list_write_scalar(b, &info.ty, elem, logical, sink);
+    debug_assert!(emitted);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
+}
+
+pub(super) fn lower_internal_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+) {
+    let zero = b.const_i64(0);
+    let pos = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, pos);
+
+    let sink = InternalListWriteSink::Fixed {
+        buf_ptr,
+        buf_len,
+        pos,
+    };
+
+    for item in items {
+        if let Expr::Name { name } = &item.node {
+            if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
+                if local_is_array_like(&info)
+                    && lower_internal_list_write_whole_array(b, &info, sink)
+                {
+                    continue;
+                }
+            }
         }
+
+        let is_char = internal_write_item_is_char(ctx, item);
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            b.call(
+                FuncRef::External("afs_write_internal_string".into()),
+                vec![buf_ptr, buf_len, ptr, len, pos],
+                IrType::Void,
+            );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
+            continue;
+        }
+
+        let is_logical = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
+        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
+        let ty = b
+            .func()
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
+        let _ = lower_internal_list_write_scalar(b, &ty, val, is_logical, sink);
+    }
+}
+
+/// List-directed internal WRITE items into a deferred-length
+/// allocatable scalar target: the record is collected in the runtime
+/// (afs_lst_ia_*) and stored in one shot at end, so an unallocated
+/// target gets allocated to the record length instead of presenting
+/// a len-0 view to the fixed-buffer writers (which silently produced
+/// an empty string). Item classification and rendering match the
+/// fixed path exactly.
+pub(super) fn lower_internal_write_items_alloc(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+) {
+    let sink = InternalListWriteSink::Alloc;
+
+    for item in items {
+        if let Expr::Name { name } = &item.node {
+            if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
+                if local_is_array_like(&info)
+                    && lower_internal_list_write_whole_array(b, &info, sink)
+                {
+                    continue;
+                }
+            }
+        }
+
+        let is_char = internal_write_item_is_char(ctx, item);
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            b.call(
+                FuncRef::External("afs_lst_ia_string".into()),
+                vec![ptr, len],
+                IrType::Void,
+            );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
+            continue;
+        }
+
+        let is_logical = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
+        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
+        let ty = b
+            .func()
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
+        let _ = lower_internal_list_write_scalar(b, &ty, val, is_logical, sink);
     }
 }
 
@@ -36810,11 +36945,15 @@ pub(super) fn lower_1d_slice_write(
         );
     } else {
         let elem = b.load_typed(p, info.ty.clone());
-        b.call(
-            FuncRef::External(writer.into()),
-            vec![unit, elem],
-            IrType::Void,
-        );
+        if let Some(kind) = info.logical_kind {
+            lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+        } else {
+            b.call(
+                FuncRef::External(writer.into()),
+                vec![unit, elem],
+                IrType::Void,
+            );
+        }
     }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
@@ -37952,11 +38091,15 @@ pub(super) fn lower_section_write_nd(
                 );
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                b.call(
-                    FuncRef::External(writer.into()),
-                    vec![unit, elem],
-                    IrType::Void,
-                );
+                if let Some(kind) = info.logical_kind {
+                    lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+                } else {
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                }
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -38171,11 +38314,15 @@ pub(super) fn lower_alloc_section_write_nd(
                 );
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                b.call(
-                    FuncRef::External(writer.into()),
-                    vec![unit, elem],
-                    IrType::Void,
-                );
+                if let Some(kind) = info.logical_kind {
+                    lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+                } else {
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                }
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -38321,11 +38468,15 @@ pub(super) fn lower_component_section_write(
                 );
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                b.call(
-                    FuncRef::External(writer.into()),
-                    vec![unit, elem],
-                    IrType::Void,
-                );
+                if let Some(kind) = info.logical_kind {
+                    lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+                } else {
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                }
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -38448,6 +38599,9 @@ pub(super) fn lower_whole_array_write(
             vec![unit, ptr],
             IrType::Void,
         );
+    } else if let Some(kind) = info.logical_kind {
+        let elem = b.load_typed(ptr, info.ty.clone());
+        lower_write_emit_logical(b, unit, &info.ty, elem, kind);
     } else if let Some(layout) = derived_layout.as_ref() {
         lower_derived_layout_write(b, ctx, layout, ptr, unit, span);
     } else {
@@ -62090,6 +62244,76 @@ end program
         );
         assert!(ir.contains("afs_write_internal_int8"));
         assert!(ir.contains("afs_write_internal_int16"));
+    }
+
+    #[test]
+    fn lower_internal_write_logical16_array_uses_logical_buffer_writer() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=32) :: buf
+  logical(16) :: values(2)
+  values = [.true., .false.]
+  write(buf, *) values
+end program
+",
+        );
+        assert!(ir.contains("internal_list_arr_check"));
+        assert!(ir.contains("afs_write_internal_logical"));
+        assert!(!ir.contains("afs_write_internal_int128"));
+    }
+
+    #[test]
+    fn lower_deferred_internal_write_logical16_array_uses_logical_collector() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=:), allocatable :: buf
+  logical(16) :: values(2)
+  values = [.true., .false.]
+  write(buf, *) values
+end program
+",
+        );
+        assert!(ir.contains("afs_lst_ia_begin"));
+        assert!(ir.contains("internal_list_arr_check"));
+        assert!(ir.contains("afs_lst_ia_logical"));
+        assert!(!ir.contains("afs_lst_ia_int128"));
+    }
+
+    #[test]
+    fn lower_deferred_character_scalar_internal_read_is_not_an_array_unit() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=:), allocatable :: record
+  logical(16) :: values(2)
+  record = 'T F'
+  read(record, *) values
+end program
+",
+        );
+        assert!(ir.contains("afs_read_internal_logical"));
+    }
+
+    #[test]
+    fn lower_external_write_logical16_arrays_and_sections_use_logical_writer() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  logical(16) :: values(3)
+  values = [.true., .false., .true.]
+  write(*, *) values
+  write(*, *) values(3:1:-1)
+end program
+",
+        );
+        assert!(ir.contains("afs_write_logical_kind"));
+        assert!(!ir.contains("afs_write_int128"));
     }
 
     #[test]
