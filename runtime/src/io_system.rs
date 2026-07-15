@@ -3424,6 +3424,19 @@ pub extern "C" fn afs_write_internal_int128(buf: *mut u8, buf_len: i64, val: i12
     write_internal_list_directed_integer(buf, buf_len, val, LIST_INT128_WIDTH, pos);
 }
 
+/// Write a list-directed logical value to a character buffer (internal I/O).
+#[no_mangle]
+pub extern "C" fn afs_write_internal_logical(buf: *mut u8, buf_len: i64, val: i32, pos: *mut i64) {
+    let buf_len = buf_len.max(0) as usize;
+    let data = if val != 0 { b" T" } else { b" F" };
+    let start = if !pos.is_null() {
+        unsafe { *pos as usize }
+    } else {
+        0
+    };
+    write_internal_list_to_buffer(buf, buf_len, start, data, pos);
+}
+
 /// Write a formatted real to a character buffer (internal I/O).
 #[no_mangle]
 pub extern "C" fn afs_write_internal_real64(buf: *mut u8, buf_len: i64, val: f64, pos: *mut i64) {
@@ -4870,6 +4883,16 @@ pub extern "C" fn afs_lst_ia_int128(val: i128) {
     LST_IA_CTX.with(|ctx| {
         if let Some(c) = ctx.borrow_mut().last_mut() {
             c.record.extend_from_slice(format!(" {}", val).as_bytes());
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn afs_lst_ia_logical(val: i32) {
+    LST_IA_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.record
+                .extend_from_slice(if val != 0 { b" T" } else { b" F" });
         }
     });
 }
@@ -7234,6 +7257,40 @@ mod tests {
         assert_eq!(write_pos as usize, expected.len());
         assert_eq!(&buf[..expected.len()], expected.as_bytes());
         assert_eq!(buf[expected.len()], b' ');
+    }
+
+    #[test]
+    fn internal_list_directed_logicals_use_letter_fields() {
+        let mut buf = [b'.'; 8];
+        let mut write_pos = 0i64;
+
+        afs_write_internal_logical(buf.as_mut_ptr(), buf.len() as i64, 1, &mut write_pos);
+        afs_write_internal_logical(buf.as_mut_ptr(), buf.len() as i64, 0, &mut write_pos);
+
+        assert_eq!(write_pos, 4);
+        assert_eq!(&buf[..4], b" T F");
+        assert_eq!(buf[4], b' ');
+    }
+
+    #[test]
+    fn deferred_internal_list_write_collects_logical_fields() {
+        use crate::descriptor::StringDescriptor;
+
+        let mut desc = StringDescriptor::zeroed();
+        let desc_ptr = &mut desc as *mut StringDescriptor as *mut u8;
+        let mut iostat = 77;
+
+        afs_lst_ia_begin(desc_ptr, &mut iostat, std::ptr::null_mut(), 0);
+        afs_lst_ia_logical(1);
+        afs_lst_ia_logical(0);
+        afs_lst_ia_end();
+
+        assert_eq!(iostat, 0);
+        assert_eq!(desc.len, 4);
+        let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        assert_eq!(bytes, b" T F");
+
+        crate::string::afs_dealloc_string(desc_ptr as *mut StringDescriptor);
     }
 
     #[test]
