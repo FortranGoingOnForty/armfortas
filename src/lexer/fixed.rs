@@ -779,10 +779,12 @@ fn split_fixed_keyword_prefix(
             continue;
         }
 
-        if suffix_first.is_ascii_digit()
-            && !matches!(prefix_lower.as_str(), "goto" | "call" | "print")
-        {
-            continue;
+        if suffix_first.is_ascii_digit() {
+            let permits_numeric_suffix = matches!(prefix_lower.as_str(), "goto" | "call")
+                || (prefix_lower == "print" && prior_tokens.is_empty());
+            if !permits_numeric_suffix {
+                continue;
+            }
         }
 
         return Some(prefix_len);
@@ -1714,6 +1716,19 @@ C     Hello World
     fn whitespace_stripped_print_keeps_numeric_format_label() {
         let texts = fixed_texts("      PRINT 100, I\n");
         assert_eq!(texts, vec!["PRINT", "100", ",", "I"], "got: {texts:?}");
+    }
+
+    #[test]
+    fn numeric_print_prefix_stays_in_procedure_names() {
+        let declaration = fixed_texts("      SUBROUTINE PRINT100()\n");
+        assert_eq!(
+            declaration,
+            vec!["SUBROUTINE", "PRINT100", "(", ")"],
+            "got: {declaration:?}"
+        );
+
+        let call = fixed_texts("      CALL PRINT100()\n");
+        assert_eq!(call, vec!["CALL", "PRINT100", "(", ")"], "got: {call:?}");
     }
 
     #[test]
