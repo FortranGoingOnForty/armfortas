@@ -1522,9 +1522,11 @@ fn lower_namelist_write_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_ptr: ValueId,
-) -> bool {
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> (bool, Option<BlockId>) {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
-        return false;
+        return (false, None);
     };
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
         lower_stmt_error(nml_ctrl.value.span, "NML= must name a NAMELIST group");
@@ -1541,13 +1543,14 @@ fn lower_namelist_write_stmt(
     let group_ptr = b.const_string(group_name.as_bytes());
     let group_len = b.const_i64(group_name.len() as i64);
     let unit = lower_namelist_unit(b, ctx, controls, 6);
-    lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
+    let positioning_done =
+        lower_external_write_pos_seek(b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len);
     b.call(
         FuncRef::External("afs_write_namelist".into()),
         vec![unit, group_ptr, group_len, entries, n_entries, iostat_ptr],
         IrType::Void,
     );
-    true
+    (true, positioning_done)
 }
 
 fn static_concrete_expr_type_layout<'a>(
@@ -1745,10 +1748,81 @@ fn lower_external_read_pos_seek(
     Some(done_bb)
 }
 
+fn lower_external_write_pos_seek(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    controls: &[IoControl],
+    unit: ValueId,
+    iostat_ptr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> Option<BlockId> {
+    if !lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr) {
+        return None;
+    }
+
+    let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    let failure_bb = b.create_block("write_pos_failed");
+    let transfer_bb = b.create_block("write_pos_ok");
+    let done_bb = b.create_block("write_pos_done");
+    b.cond_branch(failed, failure_bb, vec![], transfer_bb, vec![]);
+
+    b.set_block(failure_bb);
+    lower_read_assign_iomsg(b, iostat_ptr, iomsg_ptr, iomsg_len);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(transfer_bb);
+    Some(done_bb)
+}
+
 fn finish_external_read_positioning(b: &mut FuncBuilder, done: Option<BlockId>) {
     if let Some(done_bb) = done {
         b.branch(done_bb, vec![]);
         b.set_block(done_bb);
+    }
+}
+
+fn finish_external_write_positioning(b: &mut FuncBuilder, done: Option<BlockId>) {
+    if let Some(done_bb) = done {
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+    }
+}
+
+fn lower_write_status_branches(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    err_label: Option<u64>,
+    iostat_addr: ValueId,
+    user_iostat: bool,
+) {
+    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
+        return;
+    };
+
+    let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    if let Some((label, target_bb)) =
+        err_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
+    {
+        let ok_bb = b.create_block(&format!("write_ok_{label}"));
+        b.cond_branch(failed, target_bb, vec![], ok_bb, vec![]);
+        b.set_block(ok_bb);
+    } else if !user_iostat {
+        let fatal_bb = b.create_block("write_unhandled_err");
+        let ok_bb = b.create_block("write_ok");
+        b.cond_branch(failed, fatal_bb, vec![], ok_bb, vec![]);
+        b.set_block(fatal_bb);
+        b.call(
+            FuncRef::External("afs_write_unhandled_iostat".into()),
+            vec![status],
+            IrType::Void,
+        );
+        b.unreachable();
+        b.set_block(ok_bb);
     }
 }
 
@@ -4352,8 +4426,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("leading_zero"))
                     .unwrap_or(false)
             });
-            let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(b, ctx, iostat_ctrl, false);
-            let iostat_arg_ptr = iostat_ctrl.is_some().then_some(iostat_ptr);
+            let has_pos = io_control_by_keyword(controls, "pos").is_some();
+            let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(b, ctx, iostat_ctrl, has_pos);
+            let iostat_arg_ptr = (iostat_ctrl.is_some() || has_pos).then_some(iostat_ptr);
             let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
@@ -4362,8 +4437,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 (null_char_slot_arg(b), null_i8_ptr, zero_i64)
             };
 
-            if lower_namelist_write_stmt(b, ctx, controls, iostat_ptr) {
+            let (wrote_namelist, positioning_done) =
+                lower_namelist_write_stmt(b, ctx, controls, iostat_ptr, iomsg_ptr, iomsg_len);
+            if wrote_namelist {
+                finish_external_write_positioning(b, positioning_done);
                 lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
+                lower_write_status_branches(b, ctx, None, iostat_ptr, iostat_ctrl.is_some());
                 return;
             }
 
@@ -4518,7 +4597,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.const_i32(6)
             };
 
-            lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
+            let positioning_done = lower_external_write_pos_seek(
+                b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len,
+            );
 
             let defined_iotype = match fmt_control {
                 Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
@@ -4537,7 +4618,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 iomsg_arg_ptr,
                 iomsg_len,
             ) {
+                finish_external_write_positioning(b, positioning_done);
                 lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
+                lower_write_status_branches(b, ctx, None, iostat_ptr, iostat_ctrl.is_some());
                 return;
             }
 
@@ -4598,7 +4681,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             }
+            finish_external_write_positioning(b, positioning_done);
             lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
+            lower_write_status_branches(b, ctx, None, iostat_ptr, iostat_ctrl.is_some());
         }
 
         Stmt::Call { callee, args } => {

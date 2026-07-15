@@ -2351,6 +2351,12 @@ pub extern "C" fn afs_read_unhandled_iostat(status: i32) {
     std::process::exit(1);
 }
 
+#[no_mangle]
+pub extern "C" fn afs_write_unhandled_iostat(status: i32) {
+    eprintln!("Fortran runtime error: WRITE failed with IOSTAT={status}");
+    std::process::exit(2);
+}
+
 fn read_stream_unformatted_exact(u: &mut Unit, buf: &mut [u8], iostat: *mut i32) -> Option<bool> {
     if !(u.form == Form::Unformatted && u.access == Access::Stream) {
         return None;
