@@ -367,8 +367,22 @@ fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
                             // Replace nH... with '...'
                             result.push('\'');
                             positions.push(body.positions[digit_start]);
-                            result.push_str(&body.text[i..content_end]);
-                            positions.extend_from_slice(&body.positions[i..content_end]);
+                            let mut content_index = i;
+                            while content_index < content_end {
+                                if bytes[content_index] == b'\'' {
+                                    result.push_str("''");
+                                    positions.push(body.positions[content_index]);
+                                    positions.push(body.positions[content_index]);
+                                    content_index += 1;
+                                } else {
+                                    content_index = push_mapped_char(
+                                        body,
+                                        content_index,
+                                        &mut result,
+                                        &mut positions,
+                                    );
+                                }
+                            }
                             result.push('\'');
                             positions.push(
                                 count
@@ -1617,6 +1631,11 @@ C     Hello World
     }
 
     #[test]
+    fn hollerith_quote_is_escaped_in_protected_string() {
+        assert_eq!(protect_hollerith("8H O'CLOCK"), "' O''CLOCK'");
+    }
+
+    #[test]
     fn hollerith_not_after_letter() {
         // X3HABC — the 3H is preceded by a letter, so it's NOT a Hollerith.
         assert_eq!(protect_hollerith("X3HABC"), "X3HABC");
@@ -1932,6 +1951,17 @@ C     Hello World
             "space lost, got: {:?}",
             texts
         );
+    }
+
+    #[test]
+    fn hollerith_quote_preserves_literal_and_span() {
+        let token = fixed_toks("      X=8H O'CLOCK\n")
+            .into_iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .unwrap();
+        assert_eq!(token.text, "' O''CLOCK'");
+        assert_eq!(token.span.start, Position { line: 1, col: 9 });
+        assert_eq!(token.span.end, Position { line: 1, col: 19 });
     }
 
     #[test]
