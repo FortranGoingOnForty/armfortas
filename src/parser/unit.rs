@@ -1422,6 +1422,15 @@ mod tests {
     }
 
     #[test]
+    fn block_data_end_requires_complete_multiword_keyword() {
+        let err = parse_error("block data foo\nend block foo\n");
+        assert!(
+            err.msg.contains("expected 'data' after 'end block'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn closing_program_unit_names_match_case_insensitively() {
         let sources = [
             "program Alpha\nend program ALPHA\n",

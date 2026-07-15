@@ -1905,8 +1905,18 @@ impl<'a> Parser<'a> {
         } else if text == "end" {
             self.advance();
             if !self.eat_ident(&joined_keyword) {
+                let mut matched_parts = Vec::new();
                 for part in keyword.split_ascii_whitespace() {
-                    if !self.eat_ident(part) {
+                    if self.eat_ident(part) {
+                        matched_parts.push(part);
+                    } else {
+                        if !matched_parts.is_empty() {
+                            return Err(self.error(format!(
+                                "expected '{}' after 'end {}'",
+                                part,
+                                matched_parts.join(" ")
+                            )));
+                        }
                         break;
                     }
                 }
