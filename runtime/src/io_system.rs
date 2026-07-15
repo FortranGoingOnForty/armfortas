@@ -5657,7 +5657,8 @@ fn store_formatted_char_result(
     crate::string::afs_assign_char_fixed(dest, dest_len, field.as_ptr(), field.len() as i64);
     if !size_out.is_null() {
         unsafe {
-            *size_out = field.len().min(i32::MAX as usize) as i32;
+            let transferred = field.len().min(i32::MAX as usize) as i32;
+            *size_out = (*size_out).saturating_add(transferred);
         }
     }
     if !iostat.is_null() {
@@ -5670,16 +5671,11 @@ fn store_formatted_char_result(
 fn store_formatted_char_error(
     dest: *mut u8,
     dest_len: i64,
-    size_out: *mut i32,
+    _size_out: *mut i32,
     code: i32,
     iostat: *mut i32,
 ) {
     crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-    if !size_out.is_null() {
-        unsafe {
-            *size_out = 0;
-        }
-    }
     if code != 0 {
         set_read_status_or_exit(iostat, code);
     }
@@ -7880,8 +7876,8 @@ mod tests {
 
         let mut first = [b' '; 8];
         let mut second = [b' '; 8];
-        let mut first_size = -99i32;
-        let mut second_size = -99i32;
+        let mut first_size = 0i32;
+        let mut second_size = 0i32;
         let mut iostat = -99i32;
 
         afs_fmt_read_string_noadvance(
@@ -7930,8 +7926,8 @@ mod tests {
 
         let mut first = vec![b' '; 4096];
         let mut second = vec![b' '; 4096];
-        let mut first_size = -99i32;
-        let mut second_size = -99i32;
+        let mut first_size = 0i32;
+        let mut second_size = 0i32;
         let mut iostat = -99i32;
 
         afs_fmt_read_string_noadvance(
@@ -7979,9 +7975,9 @@ mod tests {
         );
 
         let mut ch = [b' '; 1];
-        let mut size = -99i32;
+        let mut size = 0i32;
         let mut iostat = -99i32;
-        for expected in [b'A', 0, b'B'] {
+        for (index, expected) in [b'A', 0, b'B'].into_iter().enumerate() {
             afs_fmt_read_string_noadvance(
                 90,
                 "(A1)".as_ptr(),
@@ -7992,7 +7988,7 @@ mod tests {
                 &mut iostat,
             );
             assert_eq!(iostat, 0);
-            assert_eq!(size, 1);
+            assert_eq!(size, (index + 1) as i32);
             assert_eq!(ch[0], expected);
         }
 
@@ -8008,7 +8004,7 @@ mod tests {
         afs_close(90, std::ptr::null_mut());
 
         assert_eq!(iostat, IOSTAT_EOR);
-        assert_eq!(size, 0);
+        assert_eq!(size, 3);
     }
 
     #[test]

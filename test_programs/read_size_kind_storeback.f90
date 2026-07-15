@@ -1,5 +1,6 @@
 ! CHECK: ok
 program read_size_kind_storeback
+  use, intrinsic :: iso_fortran_env, only: iostat_eor
   implicit none
 
   type :: size_results
@@ -17,7 +18,8 @@ program read_size_kind_storeback
 
   type(size_results) :: sizes
   character(len=2) :: text
-  integer :: unit, ios
+  character(len=4) :: first_part, second_part
+  integer :: unit, ios, count
 
   call reset_sizes(sizes)
   open(newunit=unit, status='scratch', action='readwrite', form='formatted')
@@ -33,6 +35,22 @@ program read_size_kind_storeback
   read(unit, '(A2)', advance='no', size=sizes%value8, iostat=ios) text
   rewind(unit)
   read(unit, '(A2)', advance='no', size=sizes%value16, iostat=ios) text
+
+  rewind(unit)
+  count = -1
+  first_part = ''
+  second_part = ''
+  read(unit, '(A2,A2)', advance='no', size=count, iostat=ios) first_part, second_part
+  if (ios /= 0 .or. count /= 4) error stop 6
+  if (first_part /= 'ab' .or. second_part /= 'cd') error stop 7
+
+  rewind(unit)
+  count = -1
+  first_part = ''
+  second_part = ''
+  read(unit, '(A4,A4)', advance='no', size=count, iostat=ios) first_part, second_part
+  if (ios /= iostat_eor .or. count /= 6) error stop 8
+  if (first_part /= 'abcd' .or. second_part /= 'ef') error stop 9
   close(unit)
 
   if (sizes%value1 /= 2 .or. sizes%guard1 /= 11) error stop 1
