@@ -1,4 +1,4 @@
-! STDERR_CHECK: Fortran runtime error: WRITE failed with IOSTAT=
+! STDERR_CHECK: Fortran runtime error: unit not open for writing
 ! EXIT_CODE: 2
 program write_namelist_unhandled_error
   implicit none

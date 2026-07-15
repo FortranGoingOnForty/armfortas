@@ -2726,12 +2726,17 @@ fn quote_namelist_char(s: &str) -> String {
     format!("'{}'", s.trim_end().replace('\'', "''"))
 }
 
-fn remember_io_status(status: &mut i32, result: io::Result<()>) {
+fn remember_io_status(
+    status: &mut i32,
+    error_message: &mut Option<String>,
+    result: io::Result<()>,
+) {
     if *status != 0 {
         return;
     }
     if let Err(e) = result {
         *status = e.raw_os_error().unwrap_or(1);
+        *error_message = Some(e.to_string());
     }
 }
 
@@ -2745,13 +2750,17 @@ pub extern "C" fn afs_write_namelist(
     entries: *const NamelistEntry,
     n_entries: i32,
     iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
 ) {
     let gname = unsafe_str(group_name, group_name_len);
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let mut status = 0;
+    let mut error_message = None;
     if let Some(u) = state.get_unit(unit) {
         remember_io_status(
             &mut status,
+            &mut error_message,
             u.write_str(&format!(" &{}", gname.to_uppercase())),
         );
 
@@ -2827,20 +2836,27 @@ pub extern "C" fn afs_write_namelist(
                 };
                 remember_io_status(
                     &mut status,
+                    &mut error_message,
                     u.write_str(&format!("{} {}={}", sep, name.to_uppercase(), val_str)),
                 );
             }
         }
-        remember_io_status(&mut status, u.write_str(" /\n"));
-        remember_io_status(&mut status, u.flush());
+        remember_io_status(&mut status, &mut error_message, u.write_str(" /\n"));
+        remember_io_status(&mut status, &mut error_message, u.flush());
     } else {
         status = 1;
+        error_message = Some("unit not open for writing".to_string());
     }
     if !iostat.is_null() {
         unsafe {
             *iostat = status;
         }
     }
+    assign_iomsg(
+        iomsg,
+        iomsg_len,
+        error_message.as_deref().unwrap_or_default(),
+    );
 }
 
 /// Read a NAMELIST group from a unit.
@@ -6974,6 +6990,46 @@ mod tests {
 
         afs_close_ex(785, "delete".as_ptr(), 6, &mut iostat);
         assert_eq!(iostat, 0, "expected stream close/delete to succeed");
+    }
+
+    #[test]
+    fn namelist_write_assigns_first_error_to_iomsg() {
+        let path = format!(
+            "/tmp/afs_namelist_write_iomsg_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        std::fs::write(&path, b"").unwrap();
+        afs_open_simple(
+            1793,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut iostat = -99;
+        let mut iomsg = [b'?'; 64];
+        afs_write_namelist(
+            1793,
+            "group".as_ptr(),
+            5,
+            std::ptr::null(),
+            0,
+            &mut iostat,
+            iomsg.as_mut_ptr(),
+            iomsg.len() as i64,
+        );
+
+        assert_ne!(iostat, 0);
+        assert_eq!(
+            std::str::from_utf8(&iomsg).unwrap().trim_end(),
+            "unit not open for writing"
+        );
+        afs_close_ex(1793, "delete".as_ptr(), 6, &mut iostat);
+        assert_eq!(iostat, 0);
     }
 
     #[test]

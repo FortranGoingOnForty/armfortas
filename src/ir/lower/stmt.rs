@@ -1593,7 +1593,9 @@ fn lower_namelist_write_stmt(
         lower_external_write_pos_seek(b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len);
     b.call(
         FuncRef::External("afs_write_namelist".into()),
-        vec![unit, group_ptr, group_len, entries, n_entries, iostat_ptr],
+        vec![
+            unit, group_ptr, group_len, entries, n_entries, iostat_ptr, iomsg_ptr, iomsg_len,
+        ],
         IrType::Void,
     );
     (true, positioning_done)
