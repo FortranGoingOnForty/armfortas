@@ -883,26 +883,56 @@ impl Preprocessor {
         let mut args: Vec<String> = Vec::new();
         let mut current_arg = String::new();
         let mut depth = 1;
+        let mut quote = None;
 
         while i < bytes.len() && depth > 0 {
+            if let Some(delimiter) = quote {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    current_arg.push('\\');
+                    i += 1;
+                    push_utf8_char(&mut current_arg, bytes, &mut i);
+                    continue;
+                }
+                if bytes[i] == delimiter {
+                    current_arg.push(delimiter as char);
+                    if i + 1 < bytes.len() && bytes[i + 1] == delimiter {
+                        current_arg.push(delimiter as char);
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                    i += 1;
+                    continue;
+                }
+                push_utf8_char(&mut current_arg, bytes, &mut i);
+                continue;
+            }
+
             match bytes[i] {
+                delimiter @ (b'\'' | b'"') => {
+                    quote = Some(delimiter);
+                    current_arg.push(delimiter as char);
+                    i += 1;
+                }
                 b'(' => {
                     depth += 1;
                     current_arg.push('(');
+                    i += 1;
                 }
                 b')' => {
                     depth -= 1;
                     if depth > 0 {
                         current_arg.push(')');
                     }
+                    i += 1;
                 }
                 b',' if depth == 1 => {
                     args.push(current_arg.trim().to_string());
                     current_arg = String::new();
+                    i += 1;
                 }
-                _ => current_arg.push(bytes[i] as char),
+                _ => push_utf8_char(&mut current_arg, bytes, &mut i),
             }
-            i += 1;
         }
 
         if depth != 0 {
@@ -1715,6 +1745,50 @@ mod tests {
     fn function_macro_nested_parens() {
         let out = pp("#define F(x) (x)\ny = F(a(b, c))\n");
         assert!(out.contains("y = (a(b, c))"));
+    }
+
+    #[test]
+    fn function_macro_keeps_comma_inside_double_quoted_argument() {
+        let out = pp("#define ID(x) x\nprint *, ID(\"a,b\")\n");
+        assert!(out.contains("print *, \"a,b\""), "got: {out:?}");
+    }
+
+    #[test]
+    fn function_macro_keeps_parenthesis_inside_single_quoted_argument() {
+        let out = pp("#define ID(x) x\nprint *, ID('a)b')\n");
+        assert!(out.contains("print *, 'a)b'"), "got: {out:?}");
+    }
+
+    #[test]
+    fn function_macro_honors_doubled_quotes_while_splitting_arguments() {
+        let out = pp("#define FIRST(a, b) a\nprint *, FIRST('it''s a,b', 9)\n");
+        assert!(out.contains("print *, 'it''s a,b'"), "got: {out:?}");
+    }
+
+    #[test]
+    fn function_macro_splits_after_quoted_argument() {
+        let out = pp("#define SECOND(a, b) b\nprint *, SECOND(\"a,b)\", 42)\n");
+        assert!(out.contains("print *, 42"), "got: {out:?}");
+    }
+
+    #[test]
+    fn function_macro_honors_backslash_escaped_quote_while_splitting_arguments() {
+        let out = pp(r#"#define FIRST(a, b) a
+print *, FIRST("a\",b", 9)
+"#);
+        assert!(out.contains(r#"print *, "a\",b""#), "got: {out:?}");
+    }
+
+    #[test]
+    fn function_macro_preserves_utf8_quoted_argument() {
+        let out = pp("#define ID(x) x\nprint *, ID(\"\u{03bb},)\")\n");
+        assert!(out.contains("print *, \"\u{03bb},)\""), "got: {out:?}");
+    }
+
+    #[test]
+    fn function_macro_leaves_unterminated_quoted_invocation_unexpanded() {
+        let out = pp("#define ID(x) x\nprint *, ID(\"a,b)\n");
+        assert!(out.contains("print *, ID(\"a,b)"), "got: {out:?}");
     }
 
     #[test]
