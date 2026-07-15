@@ -33296,7 +33296,7 @@ pub(super) fn internal_io_array_target(
         _ => return None,
     };
     let info = ctx.locals.get(&name.to_lowercase())?;
-    if descriptor_backed_runtime_char_array(info) {
+    if descriptor_backed_char_array(info) {
         let desc = array_descriptor_addr(b, info);
         let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
         let elem = descriptor_elem_size(b, desc);

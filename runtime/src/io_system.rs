@@ -3240,6 +3240,7 @@ struct FixedInternalListContext {
     buf: *mut u8,
     buf_len: usize,
     original: Vec<u8>,
+    unavailable: bool,
     overflowed: bool,
     iostat: *mut i32,
     iomsg: *mut u8,
@@ -3257,12 +3258,14 @@ thread_local! {
 pub extern "C" fn afs_lst_begin_internal_fixed(
     buf: *mut u8,
     buf_len: i64,
+    record_count: i64,
     iostat: *mut i32,
     iomsg: *mut u8,
     iomsg_len: i64,
 ) {
     let buf_len = buf_len.max(0) as usize;
-    let original = if buf.is_null() || buf_len == 0 {
+    let unavailable = buf.is_null() || record_count <= 0;
+    let original = if unavailable || buf_len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(buf, buf_len) }.to_vec()
@@ -3272,6 +3275,7 @@ pub extern "C" fn afs_lst_begin_internal_fixed(
             buf,
             buf_len,
             original,
+            unavailable,
             overflowed: false,
             iostat,
             iomsg,
@@ -3287,7 +3291,7 @@ pub extern "C" fn afs_lst_end_internal_fixed() {
             return;
         };
 
-        if context.overflowed && !context.buf.is_null() && !context.original.is_empty() {
+        if context.overflowed && !context.unavailable && !context.original.is_empty() {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     context.original.as_ptr(),
@@ -3297,7 +3301,9 @@ pub extern "C" fn afs_lst_end_internal_fixed() {
             }
         }
 
-        let (status, message) = if context.overflowed {
+        let (status, message) = if context.unavailable {
+            (1, "internal file is not allocated")
+        } else if context.overflowed {
             (IOSTAT_EOR, "end of record")
         } else {
             (0, "")
@@ -3307,17 +3313,23 @@ pub extern "C" fn afs_lst_end_internal_fixed() {
             unsafe {
                 *context.iostat = status;
             }
-        } else if context.overflowed {
-            eprintln!("ERROR: list-directed internal WRITE exceeded its record");
+        } else if context.unavailable || context.overflowed {
+            if context.unavailable {
+                eprintln!("ERROR: internal WRITE to an unallocated or zero-size character array");
+            } else {
+                eprintln!("ERROR: list-directed internal WRITE exceeded its record");
+            }
             std::process::exit(2);
         }
     });
 }
 
-fn note_fixed_internal_list_overflow(buf: *mut u8, buf_len: usize, start: usize, data_len: usize) {
-    if start <= buf_len && data_len <= buf_len - start {
-        return;
-    }
+fn fixed_internal_list_transfer_blocked(
+    buf: *mut u8,
+    buf_len: usize,
+    start: usize,
+    data_len: usize,
+) -> bool {
     FIXED_INTERNAL_LIST_CTX.with(|ctx| {
         if let Some(context) = ctx
             .borrow_mut()
@@ -3325,9 +3337,15 @@ fn note_fixed_internal_list_overflow(buf: *mut u8, buf_len: usize, start: usize,
             .rev()
             .find(|context| context.buf == buf && context.buf_len == buf_len)
         {
-            context.overflowed = true;
+            if context.unavailable {
+                return true;
+            }
+            if start > buf_len || data_len > buf_len - start {
+                context.overflowed = true;
+            }
         }
-    });
+        false
+    })
 }
 
 fn write_internal_list_to_buffer(
@@ -3337,8 +3355,7 @@ fn write_internal_list_to_buffer(
     data: &[u8],
     pos: *mut i64,
 ) {
-    note_fixed_internal_list_overflow(buf, buf_len, start, data.len());
-    if buf.is_null() {
+    if fixed_internal_list_transfer_blocked(buf, buf_len, start, data.len()) || buf.is_null() {
         return;
     }
     write_to_buffer(buf, buf_len, start, data, pos);
@@ -7159,6 +7176,7 @@ mod tests {
         afs_lst_begin_internal_fixed(
             buf.as_mut_ptr(),
             buf.len() as i64,
+            1,
             &mut iostat,
             iomsg.as_mut_ptr(),
             iomsg.len() as i64,
@@ -7184,22 +7202,51 @@ mod tests {
         let mut iostat = 77;
         let mut pos = 0;
 
-        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, &mut iostat, std::ptr::null_mut(), 0);
+        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, 1, &mut iostat, std::ptr::null_mut(), 0);
         afs_write_internal_int(buf.as_mut_ptr(), 0, 1, &mut pos);
         afs_lst_end_internal_fixed();
         assert_eq!(iostat, IOSTAT_EOR);
 
         iostat = 77;
-        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, &mut iostat, std::ptr::null_mut(), 0);
+        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, 1, &mut iostat, std::ptr::null_mut(), 0);
         afs_write_internal_real64(buf.as_mut_ptr(), 0, 1.0, &mut pos);
         afs_lst_end_internal_fixed();
         assert_eq!(iostat, IOSTAT_EOR);
 
         iostat = 77;
-        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, &mut iostat, std::ptr::null_mut(), 0);
+        afs_lst_begin_internal_fixed(buf.as_mut_ptr(), 0, 1, &mut iostat, std::ptr::null_mut(), 0);
         afs_write_internal_string(buf.as_mut_ptr(), 0, b"a".as_ptr(), 1, &mut pos);
         afs_lst_end_internal_fixed();
         assert_eq!(iostat, IOSTAT_EOR);
+    }
+
+    #[test]
+    fn fixed_internal_list_rejects_zero_record_array() {
+        let mut buf = *b"???";
+        let mut iostat = 77;
+        let mut iomsg = [b'?'; 32];
+        let mut pos = 0;
+
+        afs_lst_begin_internal_fixed(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            0,
+            &mut iostat,
+            iomsg.as_mut_ptr(),
+            iomsg.len() as i64,
+        );
+        afs_write_internal_string(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            b"a".as_ptr(),
+            1,
+            &mut pos,
+        );
+        afs_lst_end_internal_fixed();
+
+        assert_eq!(buf, *b"???");
+        assert_eq!(iostat, 1);
+        assert_eq!(&iomsg[..30], b"internal file is not allocated");
     }
 
     #[test]
@@ -7214,6 +7261,7 @@ mod tests {
         afs_lst_begin_internal_fixed(
             outer.as_mut_ptr(),
             outer.len() as i64,
+            1,
             &mut outer_iostat,
             std::ptr::null_mut(),
             0,
@@ -7221,6 +7269,7 @@ mod tests {
         afs_lst_begin_internal_fixed(
             inner.as_mut_ptr(),
             inner.len() as i64,
+            1,
             &mut inner_iostat,
             std::ptr::null_mut(),
             0,

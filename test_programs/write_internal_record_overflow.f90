@@ -9,6 +9,7 @@ program write_internal_record_overflow
   character(len=3) :: buffer
   character(len=3) :: records(2)
   character(len=0) :: empty
+  character(len=3), allocatable :: zero_records(:), missing_records(:)
   character(len=64) :: message
   integer :: ios
 
@@ -65,6 +66,21 @@ program write_internal_record_overflow
   write(empty, *, iostat=ios, iomsg=message) 'a'
   if (ios /= iostat_eor) error stop 19
   if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 20
+
+  allocate(zero_records(0))
+  message = 'sentinel'
+  ios = 77
+  write(zero_records, *, iostat=ios, iomsg=message) 'a'
+  if (ios == 0) error stop 21
+  if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 22
+  if (.not. allocated(zero_records) .or. size(zero_records) /= 0) error stop 23
+
+  message = 'sentinel'
+  ios = 77
+  write(missing_records, *, iostat=ios, iomsg=message) 'a'
+  if (ios == 0) error stop 24
+  if (len_trim(message) == 0 .or. trim(message) == 'sentinel') error stop 25
+  if (allocated(missing_records)) error stop 26
 
   print *, 'ok'
 end program write_internal_record_overflow

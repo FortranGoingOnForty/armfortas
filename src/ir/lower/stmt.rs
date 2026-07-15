@@ -1615,13 +1615,21 @@ fn lower_fixed_internal_list_write(
     items: &[crate::ast::expr::SpannedExpr],
     buf_ptr: ValueId,
     buf_len: ValueId,
+    record_count: ValueId,
     iostat_ptr: ValueId,
     iomsg_ptr: ValueId,
     iomsg_len: ValueId,
 ) {
     b.call(
         FuncRef::External("afs_lst_begin_internal_fixed".into()),
-        vec![buf_ptr, buf_len, iostat_ptr, iomsg_ptr, iomsg_len],
+        vec![
+            buf_ptr,
+            buf_len,
+            record_count,
+            iostat_ptr,
+            iomsg_ptr,
+            iomsg_len,
+        ],
         IrType::Void,
     );
     lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
@@ -4383,7 +4391,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 if let Some((base, elem_len, nelems)) = internal_io_array_target(b, ctx, ctrl) {
                     if is_list_directed {
                         lower_fixed_internal_list_write(
-                            b, ctx, items, base, elem_len, iostat_ptr, iomsg_ptr, iomsg_len,
+                            b, ctx, items, base, elem_len, nelems, iostat_ptr, iomsg_ptr, iomsg_len,
                         );
                         return;
                     }
@@ -4419,8 +4427,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
+                        let one_record = b.const_i64(1);
                         lower_fixed_internal_list_write(
-                            b, ctx, items, buf_ptr, buf_len, iostat_ptr, iomsg_ptr, iomsg_len,
+                            b, ctx, items, buf_ptr, buf_len, one_record, iostat_ptr, iomsg_ptr,
+                            iomsg_len,
                         );
                     } else {
                         let (fmt_ptr, fmt_len) =
