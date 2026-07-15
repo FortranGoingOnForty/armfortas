@@ -15,6 +15,7 @@
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use crate::ir::inst::*;
+use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, predecessors, terminator_targets};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -215,6 +216,9 @@ fn memory_effect(
                     continue;
                 }
                 saw_pointer_arg = true;
+                if call_arg_may_carry_indirect_pointer(alias_oracle, arg) {
+                    return MemoryEffect::Clobbered;
+                }
                 if alias_oracle.may_reach_through_call_arg(load_ptr, arg) {
                     return MemoryEffect::Clobbered;
                 }
@@ -227,6 +231,20 @@ fn memory_effect(
         }
         _ => MemoryEffect::Ignore,
     }
+}
+
+fn call_arg_may_carry_indirect_pointer(
+    alias_oracle: &alias::AliasOracle<'_>,
+    value: ValueId,
+) -> bool {
+    matches!(
+        alias_oracle.value_type(value),
+        Some(IrType::Ptr(inner))
+            if matches!(
+                inner.as_ref(),
+                IrType::Array(..) | IrType::Struct(_) | IrType::Ptr(_) | IrType::FuncPtr(_)
+            )
+    )
 }
 
 fn paths_to_load_are_clean(
@@ -870,6 +888,111 @@ mod tests {
         } else {
             panic!("unexpected terminator after GlobalLsf: {:?}", term);
         }
+    }
+
+    #[test]
+    fn does_not_forward_across_pointer_carried_by_aggregate() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+
+        let output_ty = IrType::Int(IntWidth::I32);
+        let output_ptr_ty = IrType::Ptr(Box::new(output_ty.clone()));
+        let output = f.next_value_id();
+        f.register_type(output, output_ptr_ty.clone());
+        f.block_mut(f.entry).insts.push(Inst {
+            id: output,
+            ty: output_ptr_ty.clone(),
+            span,
+            kind: InstKind::Alloca(output_ty.clone()),
+        });
+
+        let initial = f.next_value_id();
+        f.register_type(initial, output_ty.clone());
+        f.block_mut(f.entry).insts.push(Inst {
+            id: initial,
+            ty: output_ty.clone(),
+            span,
+            kind: InstKind::ConstInt(0, IntWidth::I32),
+        });
+        let store_initial = f.next_value_id();
+        f.register_type(store_initial, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store_initial,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(initial, output),
+        });
+
+        let aggregate_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 16);
+        let aggregate_ptr_ty = IrType::Ptr(Box::new(aggregate_ty.clone()));
+        let aggregate = f.next_value_id();
+        f.register_type(aggregate, aggregate_ptr_ty.clone());
+        f.block_mut(f.entry).insts.push(Inst {
+            id: aggregate,
+            ty: aggregate_ptr_ty,
+            span,
+            kind: InstKind::Alloca(aggregate_ty),
+        });
+
+        let field_index = f.next_value_id();
+        f.register_type(field_index, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: field_index,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::ConstInt(0, IntWidth::I64),
+        });
+        let field = f.next_value_id();
+        let field_ty = IrType::Ptr(Box::new(output_ptr_ty));
+        f.register_type(field, field_ty.clone());
+        f.block_mut(f.entry).insts.push(Inst {
+            id: field,
+            ty: field_ty,
+            span,
+            kind: InstKind::GetElementPtr(aggregate, vec![field_index]),
+        });
+        let store_pointer = f.next_value_id();
+        f.register_type(store_pointer, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store_pointer,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(output, field),
+        });
+
+        let call = f.next_value_id();
+        f.register_type(call, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: call,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Call(FuncRef::External("write_indirect".into()), vec![aggregate]),
+        });
+
+        let load = f.next_value_id();
+        f.register_type(load, output_ty.clone());
+        f.block_mut(f.entry).insts.push(Inst {
+            id: load,
+            ty: output_ty,
+            span,
+            kind: InstKind::Load(output),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(
+            !GlobalLsf.run(&mut m),
+            "aggregate call arguments can carry pointers to otherwise disjoint allocas"
+        );
+        assert!(matches!(
+            m.functions[0].block(m.functions[0].entry).terminator,
+            Some(Terminator::Return(Some(value))) if value == load
+        ));
     }
 
     #[test]
