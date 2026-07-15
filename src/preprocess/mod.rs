@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::lexer::{Position, Span};
 
@@ -131,6 +131,7 @@ pub struct PreprocOutput {
     pub source_map: Vec<SourceLoc>,
     /// Resolved include files in first-seen order, including nested includes.
     pub included_files: Vec<PathBuf>,
+    source_view: bool,
     eof_origin: SourceOrigin,
 }
 
@@ -143,6 +144,7 @@ pub struct PreprocOutput {
 pub struct SourceLoc {
     pub filename: String,
     pub line: u32,
+    text: String,
     source: Arc<SourceFile>,
     source_line: u32,
     source_col: u32,
@@ -152,6 +154,62 @@ pub struct SourceLoc {
 struct SourceFile {
     filename: Arc<str>,
     text: String,
+    display_text: OnceLock<String>,
+    line_starts: Vec<usize>,
+    source_view: bool,
+}
+
+impl SourceFile {
+    fn new(filename: Arc<str>, text: String, source_view: bool) -> Self {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        );
+        Self {
+            filename,
+            text,
+            display_text: OnceLock::new(),
+            line_starts,
+            source_view,
+        }
+    }
+
+    fn display_text(&self) -> &str {
+        if self.source_view {
+            self.display_text
+                .get_or_init(|| crate::source_bytes::display_source_view(&self.text))
+        } else {
+            &self.text
+        }
+    }
+
+    fn line(&self, line: u32) -> Option<&str> {
+        let index = line.checked_sub(1)? as usize;
+        let start = *self.line_starts.get(index)?;
+        let end = self
+            .line_starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        Some(self.text[start..end].trim_end_matches(['\r', '\n']))
+    }
+
+    fn display_col(&self, line: u32, source_col: u32) -> u32 {
+        let Some(line) = self.line(line) else {
+            return source_col;
+        };
+        let source_offset = source_col.saturating_sub(1) as usize;
+        let display_offset = if self.source_view {
+            crate::source_bytes::display_column(line, source_offset)
+        } else {
+            line.char_indices()
+                .take_while(|(offset, _)| *offset < source_offset)
+                .count()
+        };
+        display_offset.saturating_add(1).min(u32::MAX as usize) as u32
+    }
 }
 
 impl fmt::Debug for SourceFile {
@@ -182,10 +240,18 @@ struct SourceOrigin {
 }
 
 impl SourceOrigin {
-    fn advanced(&self, bytes: usize) -> Self {
+    fn advanced(&self, source_bytes: usize) -> Self {
         let mut origin = self.clone();
-        origin.source_col = origin.source_col.saturating_add(bytes as u32);
+        origin.source_col = origin.source_col.saturating_add(source_bytes as u32);
         origin
+    }
+}
+
+fn source_text_width(text: &str, range: Range<usize>, source_view: bool) -> usize {
+    if source_view {
+        crate::source_bytes::source_byte_range_len(text, range)
+    } else {
+        range.end.saturating_sub(range.start)
     }
 }
 
@@ -198,8 +264,19 @@ enum SourceRunKind {
 #[derive(Debug, Clone)]
 struct SourceRun {
     output: Range<usize>,
+    source_len: usize,
     origin: SourceOrigin,
     kind: SourceRunKind,
+}
+
+fn source_run_prefix_width(text: &str, run: &SourceRun, end: usize) -> usize {
+    let end = end.max(run.output.start).min(run.output.end);
+    let encoded_len = end - run.output.start;
+    if run.source_len == run.output.len() {
+        encoded_len
+    } else {
+        source_text_width(text, run.output.start..end, run.origin.source.source_view)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -253,11 +330,20 @@ impl MappedText {
                 continue;
             }
             let origin = match run.kind {
-                SourceRunKind::Linear => run.origin.advanced(start - run.output.start),
+                SourceRunKind::Linear => run.origin.advanced(source_text_width(
+                    &other.text,
+                    run.output.start..start,
+                    run.origin.source.source_view,
+                )),
                 SourceRunKind::Anchor => run.origin.clone(),
             };
             self.push_run(SourceRun {
                 output: base + start - range.start..base + end - range.start,
+                source_len: source_text_width(
+                    &other.text,
+                    start..end,
+                    run.origin.source.source_view,
+                ),
                 origin,
                 kind: run.kind,
             });
@@ -272,20 +358,24 @@ impl MappedText {
         self.text.push_str(text);
         self.push_run(SourceRun {
             output: start..self.text.len(),
+            source_len: source_text_width(
+                &self.text,
+                start..self.text.len(),
+                origin.source.source_view,
+            ),
             origin,
             kind,
         });
     }
 
     fn push_run(&mut self, run: SourceRun) {
-        if let Some(previous) = self.runs.last_mut() {
-            let previous_len = previous.output.len();
+        if let Some(previous) = self.runs.last() {
             let contiguous_origin = match run.kind {
                 SourceRunKind::Linear => {
                     previous
                         .origin
                         .source_col
-                        .saturating_add(previous_len as u32)
+                        .saturating_add(previous.source_len as u32)
                         == run.origin.source_col
                 }
                 SourceRunKind::Anchor => previous.origin.source_col == run.origin.source_col,
@@ -298,7 +388,12 @@ impl MappedText {
                 && previous.origin.line == run.origin.line
                 && contiguous_origin
             {
+                let previous = self
+                    .runs
+                    .last_mut()
+                    .expect("the previous source run disappeared");
                 previous.output.end = run.output.end;
+                previous.source_len += run.source_len;
                 return;
             }
         }
@@ -311,6 +406,11 @@ impl MappedText {
         self.runs.truncate(keep);
         if let Some(last) = self.runs.last_mut() {
             last.output.end = last.output.end.min(len);
+            last.source_len = source_text_width(
+                &self.text,
+                last.output.clone(),
+                last.origin.source.source_view,
+            );
         }
     }
 
@@ -327,11 +427,9 @@ impl MappedText {
             return self.fallback.clone();
         };
         match run.kind {
-            SourceRunKind::Linear => run.origin.advanced(
-                offset
-                    .saturating_sub(run.output.start)
-                    .min(run.output.len()),
-            ),
+            SourceRunKind::Linear => run
+                .origin
+                .advanced(source_run_prefix_width(&self.text, run, offset)),
             SourceRunKind::Anchor => run.origin.clone(),
         }
     }
@@ -340,6 +438,7 @@ impl MappedText {
         SourceLoc {
             filename: self.fallback.filename.to_string(),
             line: self.fallback.line,
+            text: self.text,
             source: self.fallback.source,
             source_line: self.fallback.source_line,
             source_col: self.fallback.source_col,
@@ -361,18 +460,18 @@ impl SourceLoc {
     fn origin_at(&self, offset: usize) -> SourceOrigin {
         if let Some(run) = source_run_at_or_before(&self.runs, offset) {
             return match run.kind {
-                SourceRunKind::Linear => run.origin.advanced(
-                    offset
-                        .saturating_sub(run.output.start)
-                        .min(run.output.len()),
-                ),
+                SourceRunKind::Linear => run
+                    .origin
+                    .advanced(source_run_prefix_width(&self.text, run, offset)),
                 SourceRunKind::Anchor => run.origin.clone(),
             };
         }
+        let offset = offset.min(self.text.len());
+        let delta = source_text_width(&self.text, 0..offset, self.source.source_view) as u32;
         SourceOrigin {
             source: self.source.clone(),
             source_line: self.source_line,
-            source_col: self.source_col.saturating_add(offset as u32),
+            source_col: self.source_col.saturating_add(delta),
             filename: Arc::from(self.filename.as_str()),
             line: self.line,
         }
@@ -383,9 +482,7 @@ impl SourceLoc {
         let run = source_run_at_or_before(&self.runs, offset);
         if let Some(run) = run {
             let delta = match run.kind {
-                SourceRunKind::Linear => offset
-                    .saturating_sub(run.output.start)
-                    .min(run.output.len()),
+                SourceRunKind::Linear => source_run_prefix_width(&self.text, run, offset),
                 SourceRunKind::Anchor => 0,
             };
             return ResolvedPoint {
@@ -397,13 +494,15 @@ impl SourceLoc {
                 source_col: run.origin.source_col.saturating_add(delta as u32),
             };
         }
+        let offset = offset.min(self.text.len());
+        let delta = source_text_width(&self.text, 0..offset, self.source.source_view) as u32;
         ResolvedPoint {
             filename: &self.filename,
             source: &self.source,
             line: self.line,
-            col: self.source_col.saturating_add(offset as u32),
+            col: self.source_col.saturating_add(delta),
             source_line: self.source_line,
-            source_col: self.source_col.saturating_add(offset as u32),
+            source_col: self.source_col.saturating_add(delta),
         }
     }
 
@@ -415,12 +514,7 @@ impl SourceLoc {
         let run = source_run_at_or_before(&self.runs, last_byte);
         if let Some(run) = run {
             let delta = match run.kind {
-                SourceRunKind::Linear => {
-                    last_byte
-                        .saturating_sub(run.output.start)
-                        .min(run.output.len().saturating_sub(1))
-                        + 1
-                }
+                SourceRunKind::Linear => source_run_prefix_width(&self.text, run, exclusive),
                 SourceRunKind::Anchor => 1,
             };
             return ResolvedPoint {
@@ -432,13 +526,15 @@ impl SourceLoc {
                 source_col: run.origin.source_col.saturating_add(delta as u32),
             };
         }
+        let exclusive = exclusive.min(self.text.len());
+        let delta = source_text_width(&self.text, 0..exclusive, self.source.source_view) as u32;
         ResolvedPoint {
             filename: &self.filename,
             source: &self.source,
             line: self.line,
-            col: self.source_col.saturating_add(exclusive as u32),
+            col: self.source_col.saturating_add(delta),
             source_line: self.source_line,
-            source_col: self.source_col.saturating_add(exclusive as u32),
+            source_col: self.source_col.saturating_add(delta),
         }
     }
 }
@@ -458,6 +554,14 @@ pub(crate) struct ResolvedSpan<'a> {
 }
 
 impl PreprocOutput {
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        if self.source_view {
+            crate::source_bytes::from_source_view(&self.text)
+        } else {
+            self.text.as_bytes().to_vec()
+        }
+    }
+
     pub(crate) fn resolve_span(&self, span: Span) -> ResolvedSpan<'_> {
         let location = span
             .start
@@ -510,22 +614,26 @@ fn resolved_span_from_points<'a>(
             col: start.col.saturating_add(1),
         }
     };
+    let source_start_col = start
+        .source
+        .display_col(start.source_line, start.source_col);
     let source_end = if same_origin {
         let end = end.as_ref().unwrap();
+        let end_col = end.source.display_col(end.source_line, end.source_col);
         Position {
             line: end.source_line,
-            col: end.source_col.max(start.source_col.saturating_add(1)),
+            col: end_col.max(source_start_col.saturating_add(1)),
         }
     } else {
         Position {
             line: start.source_line,
-            col: start.source_col.saturating_add(1),
+            col: source_start_col.saturating_add(1),
         }
     };
 
     ResolvedSpan {
         filename: start.filename,
-        source: &start.source.text,
+        source: start.source.display_text(),
         display_span: Span {
             file_id,
             start: Position {
@@ -538,7 +646,7 @@ fn resolved_span_from_points<'a>(
             file_id,
             start: Position {
                 line: start.source_line,
-                col: start.source_col,
+                col: source_start_col,
             },
             end: source_end,
         },
@@ -563,8 +671,17 @@ impl std::error::Error for PreprocError {}
 
 /// Preprocess Fortran source text with given configuration.
 pub fn preprocess(source: &str, config: &PreprocConfig) -> Result<PreprocOutput, PreprocError> {
-    let mut pp = Preprocessor::new(config, true);
+    let mut pp = Preprocessor::new(config, true, false);
     pp.process(source, &config.filename)
+}
+
+pub(crate) fn preprocess_bytes(
+    source: &[u8],
+    config: &PreprocConfig,
+) -> Result<PreprocOutput, PreprocError> {
+    let mut pp = Preprocessor::new(config, true, true);
+    let source = crate::source_bytes::to_source_view(source);
+    pp.process(&source, &config.filename)
 }
 
 /// Preprocess for dependency discovery without emitting user-facing warnings.
@@ -572,8 +689,17 @@ pub(crate) fn preprocess_for_dependency_scan(
     source: &str,
     config: &PreprocConfig,
 ) -> Result<PreprocOutput, PreprocError> {
-    let mut pp = Preprocessor::new(config, false);
+    let mut pp = Preprocessor::new(config, false, false);
     pp.process(source, &config.filename)
+}
+
+pub(crate) fn preprocess_bytes_for_dependency_scan(
+    source: &[u8],
+    config: &PreprocConfig,
+) -> Result<PreprocOutput, PreprocError> {
+    let mut pp = Preprocessor::new(config, false, true);
+    let source = crate::source_bytes::to_source_view(source);
+    pp.process(&source, &config.filename)
 }
 
 #[derive(Debug, Clone)]
@@ -634,19 +760,33 @@ struct Preprocessor {
     cpp_compat: bool,
     /// Whether active #warning directives should be printed.
     emit_warnings: bool,
+    /// Whether text uses the reversible source-byte representation.
+    source_view: bool,
     /// Whether source stripping is currently inside a C-style block comment.
     in_c_block_comment: bool,
     included_files: Vec<PathBuf>,
 }
 
 impl Preprocessor {
-    fn new(config: &PreprocConfig, emit_warnings: bool) -> Self {
+    fn new(config: &PreprocConfig, emit_warnings: bool, source_view: bool) -> Self {
+        let defines = config
+            .defines
+            .iter()
+            .map(|(name, definition)| {
+                let mut definition = definition.clone();
+                if source_view {
+                    definition.body = crate::source_bytes::escape_utf8(&definition.body);
+                }
+                (name.clone(), definition)
+            })
+            .collect();
         Self {
-            defines: config.defines.clone(),
+            defines,
             include_paths: config.include_paths.clone(),
             fixed_form: config.fixed_form,
             cpp_compat: config.cpp_compat,
             emit_warnings,
+            source_view,
             in_c_block_comment: false,
             cond_stack: Vec::new(),
             skip_depth: 0,
@@ -674,6 +814,22 @@ impl Preprocessor {
         self.skip_depth == 0
     }
 
+    fn encode_generated_text(&self, text: &str) -> String {
+        if self.source_view {
+            crate::source_bytes::escape_utf8(text)
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn display_source_text(&self, text: &str) -> String {
+        if self.source_view {
+            crate::source_bytes::display_source_view(text)
+        } else {
+            text.to_string()
+        }
+    }
+
     fn set_location_macros(&mut self, location: &ReportedLocation) {
         self.defines.insert(
             "__LINE__".into(),
@@ -681,17 +837,21 @@ impl Preprocessor {
         );
         self.defines.insert(
             "__FILE__".into(),
-            MacroDef::object(&format!("\"{}\"", location.filename)),
+            MacroDef::object(&format!(
+                "\"{}\"",
+                self.encode_generated_text(&location.filename)
+            )),
         );
     }
 
     fn process(&mut self, source: &str, filename: &str) -> Result<PreprocOutput, PreprocError> {
         let mut output = String::new();
         let mut source_map = Vec::new();
-        let root_source = Arc::new(SourceFile {
-            filename: Arc::from(filename),
-            text: source.into(),
-        });
+        let root_source = Arc::new(SourceFile::new(
+            Arc::from(filename),
+            source.into(),
+            self.source_view,
+        ));
         let process_end = self.process_into(root_source.clone(), &mut output, &mut source_map)?;
 
         // Check for unterminated conditionals (only at top level).
@@ -731,6 +891,7 @@ impl Preprocessor {
             text: output,
             source_map,
             included_files: self.included_files.clone(),
+            source_view: self.source_view,
             eof_origin,
         })
     }
@@ -977,14 +1138,16 @@ impl Preprocessor {
                 return Err(PreprocError {
                     filename: diagnostic_filename.to_string(),
                     line: diagnostic_line,
-                    msg: format!("#error {}", args_text),
+                    msg: format!("#error {}", self.display_source_text(args_text)),
                 });
             }
             "warning" => {
                 if self.emit_warnings {
                     eprintln!(
                         "{}:{}: warning: #warning {}",
-                        diagnostic_filename, diagnostic_line, args_text
+                        diagnostic_filename,
+                        diagnostic_line,
+                        self.display_source_text(args_text)
                     );
                 }
             }
@@ -1182,7 +1345,7 @@ impl Preprocessor {
             let rest = rest.trim();
             if let Some(quoted) = rest.strip_prefix('"') {
                 if let Some(end) = quoted.find('"') {
-                    reported.filename = Arc::from(&quoted[..end]);
+                    reported.filename = Arc::from(self.display_source_text(&quoted[..end]));
                 }
             }
             true
@@ -1221,9 +1384,13 @@ impl Preprocessor {
             return Err(PreprocError {
                 filename: diagnostic_filename.into(),
                 line: diagnostic_line,
-                msg: format!("expected \"file\" or <file> after #include, got: {}", args),
+                msg: format!(
+                    "expected \"file\" or <file> after #include, got: {}",
+                    self.display_source_text(args)
+                ),
             });
         };
+        let path = self.display_source_text(path_str);
 
         if self.include_depth >= 64 {
             return Err(PreprocError {
@@ -1235,18 +1402,27 @@ impl Preprocessor {
 
         // Search for the file.
         let resolved = self
-            .resolve_include(path_str, source_filename, search_system)
+            .resolve_include(&path, source_filename, search_system)
             .ok_or_else(|| PreprocError {
                 filename: diagnostic_filename.into(),
                 line: diagnostic_line,
-                msg: format!("cannot find include file: {}", path_str),
+                msg: format!("cannot find include file: {}", path),
             })?;
 
-        let content = std::fs::read_to_string(&resolved).map_err(|e| PreprocError {
-            filename: diagnostic_filename.into(),
-            line: diagnostic_line,
-            msg: format!("reading {}: {}", resolved.display(), e),
-        })?;
+        let content = if self.source_view {
+            let bytes = std::fs::read(&resolved).map_err(|e| PreprocError {
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
+                msg: format!("reading {}: {}", resolved.display(), e),
+            })?;
+            crate::source_bytes::to_source_view(&bytes)
+        } else {
+            std::fs::read_to_string(&resolved).map_err(|e| PreprocError {
+                filename: diagnostic_filename.into(),
+                line: diagnostic_line,
+                msg: format!("reading {}: {}", resolved.display(), e),
+            })?
+        };
         if !self.included_files.contains(&resolved) {
             self.included_files.push(resolved.clone());
         }
@@ -1257,10 +1433,11 @@ impl Preprocessor {
 
         self.include_depth += 1;
         let inc_filename = resolved.to_string_lossy().into_owned();
-        let included_source = Arc::new(SourceFile {
-            filename: Arc::from(inc_filename),
-            text: content,
-        });
+        let included_source = Arc::new(SourceFile::new(
+            Arc::from(inc_filename),
+            content,
+            self.source_view,
+        ));
         let include_result = self.process_into(included_source, output, source_map);
         self.include_depth -= 1;
 
@@ -1306,7 +1483,7 @@ impl Preprocessor {
         eval_expr(&expanded).map_err(|msg| PreprocError {
             filename: filename.into(),
             line: line_num,
-            msg: format!("in #if expression: {}", msg),
+            msg: format!("in #if expression: {}", self.display_source_text(&msg)),
         })
     }
 
@@ -1399,7 +1576,7 @@ impl Preprocessor {
                     let replacement = if ident == "__LINE__" {
                         invocation.line.to_string()
                     } else {
-                        format!("\"{}\"", invocation.filename)
+                        format!("\"{}\"", self.encode_generated_text(&invocation.filename))
                     };
                     result.append(&MappedText::anchored(&replacement, invocation));
                     continue;
@@ -1617,9 +1794,17 @@ impl Preprocessor {
                 continue;
             }
 
-            let ch = (body_bytes[bi] as char).to_string();
-            body.push_text(&ch, invocation.clone(), SourceRunKind::Anchor);
-            bi += 1;
+            let ch = def.body[bi..]
+                .chars()
+                .next()
+                .expect("macro body index must stay on a character boundary");
+            let end = bi + ch.len_utf8();
+            body.push_text(
+                &def.body[bi..end],
+                invocation.clone(),
+                SourceRunKind::Anchor,
+            );
+            bi = end;
         }
 
         Some((body, i))
@@ -1966,8 +2151,12 @@ fn replace_undefined_idents(expr: &str) -> String {
             result.push('0');
             continue;
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch = expr[i..]
+            .chars()
+            .next()
+            .expect("condition expression index must stay on a character boundary");
+        result.push(ch);
+        i += ch.len_utf8();
     }
     result
 }
@@ -2249,6 +2438,12 @@ mod tests {
         preprocess(src, &config).unwrap().text
     }
 
+    fn pp_bytes(src: &[u8]) -> Vec<u8> {
+        preprocess_bytes(src, &PreprocConfig::default())
+            .unwrap()
+            .bytes()
+    }
+
     fn pp_err(src: &str) -> PreprocError {
         let config = PreprocConfig::default();
         preprocess(src, &config).unwrap_err()
@@ -2264,6 +2459,45 @@ mod tests {
     fn define_and_expand_object_macro() {
         let out = pp("#define FOO 42\nx = FOO\n");
         assert!(out.contains("x = 42"));
+    }
+
+    #[test]
+    fn function_macro_body_preserves_non_utf8_bytes() {
+        let out = pp_bytes(b"#define PAYLOAD() 'A\xffB'\nx = PAYLOAD()\n");
+        assert!(out
+            .windows(b"x = 'A\xffB'".len())
+            .any(|bytes| bytes == b"x = 'A\xffB'"));
+    }
+
+    #[test]
+    fn function_macro_body_preserves_utf8_text() {
+        let out = pp("#define PAYLOAD() 'é'\nx = PAYLOAD()\n");
+        assert!(out.contains("x = 'é'"), "got: {out:?}");
+    }
+
+    #[test]
+    fn public_preprocess_preserves_reserved_unicode_scalars() {
+        let source = "x = '\u{f0000}\u{f01ff}' @\n";
+        let result = preprocess(source, &PreprocConfig::default()).unwrap();
+        assert_eq!(result.text, source);
+        assert_eq!(result.bytes(), source.as_bytes());
+        let col = source.find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(Span {
+            file_id: 0,
+            start: Position { line: 1, col },
+            end: Position {
+                line: 1,
+                col: col + 1,
+            },
+        });
+        assert_eq!(resolved.display_span.start.col, col);
+    }
+
+    #[test]
+    fn byte_preprocess_preserves_reserved_unicode_scalars() {
+        let source = "x = '\u{f0000}\u{f01ff}'\n";
+        let result = preprocess_bytes(source.as_bytes(), &PreprocConfig::default()).unwrap();
+        assert_eq!(result.bytes(), source.as_bytes());
     }
 
     #[test]
@@ -3493,6 +3727,35 @@ deep
         assert_eq!(result.source_map[2].line, 100);
         assert_eq!(result.source_map[2].filename, "other.f90");
         assert_eq!(result.source_map[3].line, 101);
+    }
+
+    #[test]
+    fn source_map_counts_non_utf8_markers_as_source_bytes() {
+        let source = b"x = 'A\xffB' @\n";
+        let result = preprocess_bytes(source, &PreprocConfig::default()).unwrap();
+        let generated_col = result.text.find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(Span {
+            file_id: 0,
+            start: Position {
+                line: 1,
+                col: generated_col,
+            },
+            end: Position {
+                line: 1,
+                col: generated_col + 1,
+            },
+        });
+        let expected_col = source.iter().position(|byte| *byte == b'@').unwrap() as u32 + 1;
+        assert_eq!(resolved.display_span.start.col, expected_col);
+        assert_eq!(resolved.display_span.end.col, expected_col + 1);
+        assert_eq!(resolved.source, "x = 'A\u{fffd}B' @\n");
+        assert_eq!(resolved.source_span.start.col, expected_col);
+    }
+
+    #[test]
+    fn preprocessor_error_displays_non_utf8_bytes_without_markers() {
+        let error = preprocess_bytes(b"#error A\xffB\n", &PreprocConfig::default()).unwrap_err();
+        assert_eq!(error.msg, "#error A\u{fffd}B");
     }
 
     #[test]

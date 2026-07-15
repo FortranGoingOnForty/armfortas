@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{detect_source_form, tokenize, SourceForm, Span};
+use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
 use crate::parser::Parser;
 use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
@@ -1389,6 +1389,13 @@ fn render_preprocessed_diagnostic(
     );
 }
 
+fn write_stdout_bytes(bytes: &[u8]) -> Result<(), String> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    std::io::Write::write_all(&mut stdout, bytes)
+        .map_err(|e| format!("cannot write standard output: {}", e))
+}
+
 pub fn compile(opts: &Options) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
@@ -1411,17 +1418,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         eprintln!(" reading: {}", opts.input.display());
     }
     let phase = phases.start("read");
-    // Fortran source files in the wild are not always valid UTF-8 — Latin-1
-    // and stray bytes appear in comments or string literals.  gfortran/flang
-    // both accept non-UTF-8 sources; mirror that by reading raw bytes and
-    // decoding lossily so invalid sequences become U+FFFD instead of an I/O
-    // failure.
+    // Keep exact bytes for preprocessing and a marker-free display view for
+    // source-limit diagnostics emitted before preprocessing.
     let raw = fs::read(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
-    let source = match String::from_utf8(raw) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
+    let source =
+        crate::source_bytes::display_source_view(&crate::source_bytes::to_source_view(&raw));
     phase.end(&mut phases);
     let file_str = opts.input.display().to_string();
 
@@ -1483,20 +1485,21 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let phase = phases.start("preprocess");
     let pp_config = preproc_config_for_input(opts, &opts.input, source_form);
     let pp_result =
-        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| format!("{}", e))?;
+        crate::preprocess::preprocess_bytes(&raw, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
     let included_files = &pp_result.included_files;
     let preprocessed = pp_result.text.as_str();
 
     if opts.preprocess_only {
+        let preprocessed_bytes = pp_result.bytes();
         if opts.output.is_none() {
-            print!("{}", preprocessed);
+            write_stdout_bytes(&preprocessed_bytes)?;
         } else {
             let out = opts.output_path();
             if out.as_os_str() == "-" {
-                print!("{}", preprocessed);
+                write_stdout_bytes(&preprocessed_bytes)?;
             } else {
-                fs::write(&out, preprocessed)
+                fs::write(&out, &preprocessed_bytes)
                     .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
             }
             if opts.verbose {
@@ -1514,7 +1517,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 3. Lex.
     let phase = phases.start("lex");
-    let tokens = match tokenize(preprocessed, 0, source_form) {
+    let tokens = match tokenize_source_view(preprocessed, 0, source_form) {
         Ok(tokens) => tokens,
         Err(e) => {
             phase.end(&mut phases);
@@ -1547,7 +1550,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 4. Parse.
     let phase = phases.start("parse");
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new_source_view(&tokens);
     let mut units = match parser.parse_file() {
         Ok(units) => units,
         Err(e) => {

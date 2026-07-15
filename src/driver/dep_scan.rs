@@ -34,9 +34,9 @@ pub fn scan_file(
     path: &Path,
     config: &crate::preprocess::PreprocConfig,
 ) -> Result<FileDeps, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
-    let content = crate::preprocess::preprocess_for_dependency_scan(&content, config)
+    let content =
+        std::fs::read(path).map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
+    let content = crate::preprocess::preprocess_bytes_for_dependency_scan(&content, config)
         .map_err(|e| e.to_string())?
         .text;
 

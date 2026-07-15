@@ -19,7 +19,7 @@ use crate::codegen::mir::{
 use crate::codegen::{emit, isel, linearscan};
 use crate::driver::OptLevel;
 use crate::ir::{lower, printer as ir_printer, verify};
-use crate::lexer::{detect_source_form, tokenize, SourceForm, Token};
+use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Token};
 use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
@@ -406,7 +406,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     let input = request.input.clone();
     let source_form = detect_source_form(&input.to_string_lossy());
 
-    let source = fs::read_to_string(&input).map_err(|e| CaptureFailure {
+    let source = fs::read(&input).map_err(|e| CaptureFailure {
         input: input.clone(),
         opt_level: request.opt_level,
         stage: FailureStage::Preprocess,
@@ -420,7 +420,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         ..crate::preprocess::PreprocConfig::default()
     };
     let pp_result =
-        crate::preprocess::preprocess(&source, &pp_config).map_err(|e| CaptureFailure {
+        crate::preprocess::preprocess_bytes(&source, &pp_config).map_err(|e| CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,
             stage: FailureStage::Preprocess,
@@ -429,10 +429,13 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         })?;
     let preprocessed = pp_result.text.clone();
     if wants(Stage::Preprocess) {
-        stages.insert(Stage::Preprocess, CapturedStage::Text(preprocessed.clone()));
+        stages.insert(
+            Stage::Preprocess,
+            CapturedStage::Text(String::from_utf8_lossy(&pp_result.bytes()).into_owned()),
+        );
     }
 
-    let tokens = tokenize(&preprocessed, 0, source_form).map_err(|e| {
+    let tokens = tokenize_source_view(&preprocessed, 0, source_form).map_err(|e| {
         let resolved = pp_result.resolve_span(e.span);
         CaptureFailure {
             input: input.clone(),
@@ -452,7 +455,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         stages.insert(Stage::Tokens, CapturedStage::Text(format_tokens(&tokens)));
     }
 
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new_source_view(&tokens);
     let units = parser.parse_file().map_err(|e| {
         let resolved = pp_result.resolve_span(e.span);
         CaptureFailure {

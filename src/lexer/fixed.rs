@@ -12,7 +12,15 @@ use super::{is_keyword, is_known_dot_op, LexError, Position, Span, Token, TokenK
 
 /// Tokenize fixed-form Fortran source.
 pub fn tokenize_fixed(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
-    let statements = preprocess_lines(src, file_id);
+    tokenize_fixed_impl(src, file_id, false)
+}
+
+pub(crate) fn tokenize_fixed_source_view(src: &str, file_id: u32) -> Result<Vec<Token>, LexError> {
+    tokenize_fixed_impl(src, file_id, true)
+}
+
+fn tokenize_fixed_impl(src: &str, file_id: u32, source_view: bool) -> Result<Vec<Token>, LexError> {
+    let statements = preprocess_lines(src, file_id, source_view);
     let mut tokens = Vec::new();
 
     for stmt in &statements {
@@ -1036,7 +1044,7 @@ enum FixedLine {
 
 /// Preprocess fixed-form lines: identify comments, extract labels, join
 /// continuations, strip columns 73+, handle tab-form.
-fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
+fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine> {
     let lines: Vec<&str> = src.lines().collect();
     let mut result = Vec::new();
     let mut i = 0;
@@ -1087,7 +1095,7 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
         }
 
         // Extract columns from this line.
-        let (label, body, body_col) = extract_fixed_columns(line);
+        let (label, body, body_col) = extract_fixed_columns(line, source_view);
 
         // Collect continuation lines.
         let start_line = line_num;
@@ -1103,7 +1111,9 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
             if next.trim().is_empty() {
                 // Peek ahead: is the line after this blank a continuation?
                 let lookahead = i + 1;
-                if lookahead < lines.len() && is_continuation_line(lines[lookahead]) {
+                if lookahead < lines.len()
+                    && is_continuation_line_impl(lines[lookahead], source_view)
+                {
                     i += 1;
                     continue;
                 }
@@ -1133,8 +1143,8 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
             }
 
             // Check column 6 for continuation marker.
-            if is_continuation_line(next) {
-                let (_, cont_body, cont_col) = extract_fixed_columns(next);
+            if is_continuation_line_impl(next, source_view) {
+                let (_, cont_body, cont_col) = extract_fixed_columns(next, source_view);
                 full_body.append(MappedFixedText::from_piece(
                     cont_body,
                     (i + 1) as u32,
@@ -1163,7 +1173,11 @@ fn preprocess_lines(src: &str, file_id: u32) -> Vec<FixedLine> {
 
 /// Check if a line is a continuation line (non-space, non-zero in column 6).
 pub(crate) fn is_continuation_line(line: &str) -> bool {
-    let bytes = line.as_bytes();
+    is_continuation_line_impl(line, false)
+}
+
+fn is_continuation_line_impl(line: &str, source_view: bool) -> bool {
+    let bytes = fixed_line_bytes(line, source_view);
 
     // Tab-form: tab followed by digit 1-9 is continuation.
     if bytes.first() == Some(&b'\t') {
@@ -1183,47 +1197,64 @@ pub(crate) fn is_continuation_line(line: &str) -> bool {
 
 /// Extract label (columns 1-5) and body (columns 7-72) from a fixed-form line.
 /// Handles tab-form extension.
-fn extract_fixed_columns(line: &str) -> (String, String, u32) {
-    let bytes = line.as_bytes();
+fn extract_fixed_columns(line: &str, source_view: bool) -> (String, String, u32) {
+    let bytes = fixed_line_bytes(line, source_view);
 
     // Tab-form: if first character is a tab, everything after is body (or continuation).
     if bytes.first() == Some(&b'\t') {
         // Tab followed by digit 1-9: continuation (body starts after the digit).
         if let Some(&d) = bytes.get(1) {
             if (b'1'..=b'9').contains(&d) {
-                let body = if bytes.len() > 2 {
-                    String::from_utf8_lossy(&bytes[2..]).to_string()
-                } else {
-                    String::new()
-                };
-                return (String::new(), body, 3);
+                let body = fixed_piece(bytes.get(2..).unwrap_or_default(), source_view);
+                let body_col = fixed_column(&bytes[..2], source_view);
+                return (String::new(), body, body_col);
             }
         }
         // Tab followed by anything else: body starts at position after tab.
-        let body = if bytes.len() > 1 {
-            String::from_utf8_lossy(&bytes[1..]).to_string()
-        } else {
-            String::new()
-        };
-        return (String::new(), body, 2);
+        let body = fixed_piece(bytes.get(1..).unwrap_or_default(), source_view);
+        let body_col = fixed_column(&bytes[..1], source_view);
+        return (String::new(), body, body_col);
     }
 
     // Standard fixed-form: columns 1-5 label, column 6 continuation marker, 7-72 body.
-    let label = if bytes.len() >= 5 {
-        String::from_utf8_lossy(&bytes[0..5]).to_string()
-    } else {
-        String::from_utf8_lossy(bytes).to_string()
-    };
+    let label_end = 5.min(bytes.len());
+    let label = fixed_piece(&bytes[..label_end], source_view);
 
     let body_start = 6.min(bytes.len());
     let body_end = 72.min(bytes.len()); // columns 73+ are ignored
     let body = if body_start < bytes.len() {
-        String::from_utf8_lossy(&bytes[body_start..body_end]).to_string()
+        fixed_piece(&bytes[body_start..body_end], source_view)
     } else {
         String::new()
     };
+    let body_col = fixed_column(&bytes[..body_start], source_view);
 
-    (label, body, 7)
+    (label, body, body_col)
+}
+
+fn fixed_line_bytes(line: &str, source_view: bool) -> std::borrow::Cow<'_, [u8]> {
+    if source_view {
+        std::borrow::Cow::Owned(crate::source_bytes::from_source_view(line))
+    } else {
+        std::borrow::Cow::Borrowed(line.as_bytes())
+    }
+}
+
+fn fixed_piece(bytes: &[u8], source_view: bool) -> String {
+    if source_view {
+        crate::source_bytes::to_source_view(bytes)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+fn fixed_column(prefix: &[u8], source_view: bool) -> u32 {
+    let width = if source_view {
+        crate::source_bytes::to_source_view(prefix).len()
+    } else {
+        prefix.len()
+    };
+    width.min(u32::MAX as usize) as u32 + 1
 }
 
 // ---- Hollerith constants ----
@@ -1256,6 +1287,45 @@ mod tests {
             })
             .map(|t| t.text)
             .collect()
+    }
+
+    #[test]
+    fn non_utf8_literal_can_close_in_column_72() {
+        let mut source = b"      PROGRAM P\n      PRINT *, '".to_vec();
+        source.extend(std::iter::repeat_n(b'A', 54));
+        source.extend_from_slice(&[0xff, b'\'', b'\n']);
+        source.extend_from_slice(b"      END\n");
+        let view = crate::source_bytes::to_source_view(&source);
+        let tokens = tokenize_fixed_source_view(&view, 0).unwrap();
+        let literal = tokens
+            .iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .expect("missing fixed-form string literal");
+
+        let mut expected = vec![b'\''];
+        expected.extend(std::iter::repeat_n(b'A', 54));
+        expected.extend_from_slice(&[0xff, b'\'']);
+        assert_eq!(
+            crate::source_bytes::from_source_view(&literal.text),
+            expected
+        );
+    }
+
+    #[test]
+    fn public_fixed_input_counts_reserved_scalars_by_utf8_bytes() {
+        let reserved = "\u{f0000}\u{f01ff}";
+        let mut source = "      PROGRAM P\n      PRINT *, '".to_string();
+        source.extend(std::iter::repeat_n('A', 47));
+        source.push_str(reserved);
+        source.push_str("'\n      END\n");
+        let tokens = tokenize_fixed(&source, 0).unwrap();
+        let literal = tokens
+            .iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .expect("missing fixed-form string literal");
+
+        assert!(literal.text.contains(reserved));
+        assert!(literal.text.ends_with('\''));
     }
 
     // ---- Comment detection ----

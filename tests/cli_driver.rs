@@ -37,9 +37,21 @@ fn write_program(text: &str, suffix: &str) -> PathBuf {
     path
 }
 
+fn write_program_bytes(bytes: &[u8], suffix: &str) -> PathBuf {
+    let path = unique_path("src", suffix);
+    std::fs::write(&path, bytes).expect("cannot write CLI test source");
+    path
+}
+
 fn write_program_in(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, text).expect("cannot write CLI test source");
+    path
+}
+
+fn write_program_bytes_in(dir: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("cannot write CLI test source");
     path
 }
 
@@ -55,6 +67,29 @@ fn diagnostic_output(source: &std::path::Path, extra_args: &[&str]) -> std::proc
         .expect("compiler failed to start");
     let _ = std::fs::remove_file(output);
     result
+}
+
+fn assert_diagnostic_caret(stderr: &str, source_fragment: &str, target: char) {
+    let lines: Vec<_> = stderr.lines().collect();
+    let source_index = lines
+        .iter()
+        .position(|line| line.contains(source_fragment))
+        .unwrap_or_else(|| panic!("missing diagnostic source line {source_fragment:?}:\n{stderr}"));
+    let source_line = lines[source_index]
+        .split_once('|')
+        .expect("diagnostic source line must have a gutter")
+        .1;
+    let caret_line = lines
+        .get(source_index + 1)
+        .expect("missing diagnostic caret line")
+        .split_once('|')
+        .expect("diagnostic caret line must have a gutter")
+        .1;
+    assert_eq!(
+        source_line.chars().position(|ch| ch == target),
+        caret_line.chars().position(|ch| ch == '^'),
+        "diagnostic caret is not under {target:?}:\n{stderr}"
+    );
 }
 
 fn run_binary_with_timeout(
@@ -14158,6 +14193,231 @@ fn dash_capital_e_without_o_writes_to_stdout() {
         "default -E output should not create a bare-stem file"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dash_capital_e_preserves_non_utf8_stdout_bytes() {
+    let source = b"program p\n  character(len=3), parameter :: payload = 'A\xffB'\nend program p\n";
+    let src = write_program_bytes(source, "F90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-E", src.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "-E preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, source);
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn dash_capital_e_preserves_non_utf8_output_file_bytes() {
+    let source = b"program p\n  character(len=3), parameter :: payload = 'A\xffB'\nend program p\n";
+    let src = write_program_bytes(source, "F90");
+    let out = unique_path("pp_bytes", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-E", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "-E preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("missing preprocessed output"),
+        source
+    );
+    let _ = std::fs::remove_file(out);
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn dash_capital_e_preserves_non_utf8_include_bytes() {
+    let dir = unique_dir("pp_include_bytes");
+    let included = b"! comment A\xffB\ncharacter(len=3), parameter :: payload = 'A\xffB'\n";
+    write_program_bytes_in(&dir, "payload.inc", included);
+    write_program_in(&dir, "main.F90", "#include \"payload.inc\"\n");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "main.F90"])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "-E preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        result
+            .stdout
+            .windows(included.len())
+            .any(|bytes| bytes == included),
+        "preprocessed include did not preserve its source bytes: {:?}",
+        result.stdout
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn nested_include_character_literal_preserves_non_utf8_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_include_character_literal_preserves_non_utf8_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("nested_include_bytes");
+    write_program_in(
+        &dir,
+        "main.F90",
+        "program p\n#include \"outer.inc\"\n  write(*, '(A)', advance='no') payload\nend program p\n",
+    );
+    write_program_in(&dir, "outer.inc", "#include \"payload.inc\"\n");
+    write_program_bytes_in(
+        &dir,
+        "payload.inc",
+        b"  character(len=3), parameter :: payload = 'A\xffB'\n",
+    );
+    let out = dir.join("nested_include_bytes");
+    let compile = Command::new(compiler("armfortas"))
+        .arg(dir.join("main.F90"))
+        .args(["-o"])
+        .arg(&out)
+        .output()
+        .expect("compile failed to start");
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed to start");
+    assert!(run.status.success(), "program failed: {:?}", run.status);
+    assert_eq!(run.stdout, b"A\xffB");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn module_character_parameter_preserves_non_utf8_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_character_parameter_preserves_non_utf8_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("module_character_bytes");
+    write_program_bytes_in(
+        &dir,
+        "payload_mod.f90",
+        b"module payload_mod\n  implicit none\n  character(len=3), parameter :: payload = 'A\xffB'\nend module payload_mod\n",
+    );
+    write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use payload_mod\n  write(*, '(A)', advance='no') payload\nend program p\n",
+    );
+    let out = dir.join("module_character_bytes");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["main.f90", "payload_mod.f90", "-o"])
+        .arg(&out)
+        .output()
+        .expect("compile failed to start");
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed to start");
+    assert!(run.status.success(), "program failed: {:?}", run.status);
+    assert_eq!(run.stdout, b"A\xffB");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn fixed_form_non_utf8_literal_can_close_in_column_72() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_non_utf8_literal_can_close_in_column_72 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let mut source = b"      PROGRAM P\n      PRINT *, '".to_vec();
+    source.extend(std::iter::repeat_n(b'A', 54));
+    source.extend_from_slice(&[0xff, b'\'', b'\n']);
+    source.extend_from_slice(b"      END\n");
+    let src = write_program_bytes(&source, "f");
+    let out = unique_path("fixed_non_utf8", "o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed to start");
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(out);
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn lexer_errors_report_invalid_source_bytes_without_internal_markers() {
+    let cases: &[(&str, &[u8])] = &[
+        ("f90", b"program p\n\xff\nend program p\n"),
+        ("f", b"      PROGRAM P\n      \xff\n      END\n"),
+    ];
+
+    for &(extension, source) in cases {
+        let path = write_program_bytes(source, extension);
+        let result = diagnostic_output(&path, &[]);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("invalid source byte 0xff"),
+            "missing explicit invalid-byte diagnostic for {extension}: {stderr}"
+        );
+        assert!(!stderr.contains('\u{f0000}'));
+        assert!(!stderr.contains('\u{f01ff}'));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn preprocessor_errors_display_invalid_bytes_without_internal_markers() {
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"#include \xff\n",
+            "expected \"file\" or <file> after #include, got: \u{fffd}",
+        ),
+        (
+            b"#if \xff\n#endif\n",
+            "unexpected token in #if expression: '\u{fffd}'",
+        ),
+    ];
+
+    for &(source, expected) in cases {
+        let path = write_program_bytes(source, "F90");
+        let result = diagnostic_output(&path, &[]);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "missing decoded preprocessor diagnostic {expected:?}: {stderr}"
+        );
+        assert!(!stderr.contains('\u{f0000}'));
+        assert!(!stderr.contains('\u{f01ff}'));
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[test]
@@ -29623,6 +29883,78 @@ fn diagnostic_renders_source_line_and_caret() {
     assert!(stderr.contains("^"), "missing caret marker: {}", stderr);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn diagnostic_after_non_utf8_comment_uses_original_location() {
+    let src = write_program_bytes(
+        b"program p\n! comment A\xffB\n  error stop 'oops'\nend program p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["--std=f95"]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:3:3: error:", src.display())),
+        "diagnostic location changed after non-UTF-8 source bytes: {stderr}"
+    );
+    assert!(
+        stderr.contains("|   error stop 'oops'"),
+        "diagnostic showed the wrong source line: {stderr}"
+    );
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn same_line_diagnostic_after_non_utf8_byte_uses_original_column() {
+    let src = write_program_bytes(b"program p\n  print *, 'A\xffB' @\nend program p\n", "f90");
+    let result = diagnostic_output(&src, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:2:18: error:", src.display())),
+        "diagnostic column counted the encoded source view: {stderr}"
+    );
+    assert_diagnostic_caret(&stderr, "print *, 'A\u{fffd}B' @", '@');
+    assert!(!stderr.contains('\u{f0000}'));
+    assert!(!stderr.contains('\u{f01ff}'));
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn diagnostic_caret_accounts_for_utf8_before_the_error() {
+    let src = write_program(
+        "program p\n  print *, 'caf\u{e9}' @\nend program p\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:2:20: error:", src.display())),
+        "diagnostic header did not retain the source byte column: {stderr}"
+    );
+    assert_diagnostic_caret(&stderr, "print *, 'caf\u{e9}' @", '@');
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
+fn included_same_line_diagnostic_after_non_utf8_byte_uses_original_column() {
+    let dir = unique_dir("included_non_utf8_diagnostic");
+    let included = write_program_bytes_in(&dir, "bad.inc", b"  print *, 'A\xffB' @\n");
+    let source = write_program_in(
+        &dir,
+        "main.F90",
+        "program p\n#include \"bad.inc\"\nend program p\n",
+    );
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:18: error:", included.display())),
+        "included diagnostic column counted the encoded source view: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
