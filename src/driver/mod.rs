@@ -10,7 +10,7 @@ pub mod diag;
 pub mod elf_crt;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1396,6 +1396,122 @@ fn write_stdout_bytes(bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("cannot write standard output: {}", e))
 }
 
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => normalized.push(component.as_os_str()),
+            },
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn path_components_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn path_anchor_len(components: &[Component<'_>]) -> Option<usize> {
+    match components {
+        [Component::Prefix(_), Component::RootDir, ..] => Some(2),
+        [Component::RootDir, ..] => Some(1),
+        _ => None,
+    }
+}
+
+fn relative_path_with_shared_parent(input: &Path, cwd: &Path) -> Option<PathBuf> {
+    let input_components = input.components().collect::<Vec<_>>();
+    let cwd_components = cwd.components().collect::<Vec<_>>();
+    let input_anchor_len = path_anchor_len(&input_components)?;
+    let cwd_anchor_len = path_anchor_len(&cwd_components)?;
+    if input_anchor_len != cwd_anchor_len
+        || input_components[..input_anchor_len]
+            .iter()
+            .copied()
+            .zip(cwd_components[..cwd_anchor_len].iter().copied())
+            .any(|(left, right)| !path_components_equal(left, right))
+    {
+        return None;
+    }
+
+    let mut common = input_anchor_len;
+    while common < input_components.len()
+        && common < cwd_components.len()
+        && path_components_equal(input_components[common], cwd_components[common])
+    {
+        common += 1;
+    }
+
+    // Do not encode unrelated absolute hierarchies merely because they share
+    // a filesystem root. A meaningful common parent keeps build/source sibling
+    // layouts reproducible while unrelated roots fall back to the basename.
+    if common == input_anchor_len && common < cwd_components.len() {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in &cwd_components[common..] {
+        relative.push("..");
+    }
+    for component in &input_components[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
+fn module_source_provenance_from_absolute(input: &Path, cwd: &Path) -> String {
+    let cwd = normalize_path_lexically(cwd);
+    let input = normalize_path_lexically(input);
+
+    relative_path_with_shared_parent(&input, &cwd)
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| {
+            relative
+                .iter()
+                .map(|component| component.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .or_else(|| {
+            input
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "source".to_string())
+}
+
+fn module_source_provenance(input: &Path) -> String {
+    let fallback = || {
+        input
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "source".to_string())
+    };
+    let Ok(input) = std::path::absolute(input) else {
+        return fallback();
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return fallback();
+    };
+    module_source_provenance_from_absolute(&input, &cwd)
+}
+
 pub fn compile(opts: &Options) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
@@ -1422,6 +1538,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // source-limit diagnostics emitted before preprocessing.
     let raw = fs::read(&opts.input)
         .map_err(|e| format!("cannot read '{}': {}", opts.input.display(), e))?;
+    let source_provenance = module_source_provenance(&opts.input);
     let source =
         crate::source_bytes::display_source_view(&crate::source_bytes::to_source_view(&raw));
     phase.end(&mut phases);
@@ -1840,8 +1957,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
                 let amod_text = crate::sema::amod::write_amod(
                     name,
-                    opts.input.to_str().unwrap_or(""),
-                    &source,
+                    &source_provenance,
+                    &raw,
                     &st,
                     mod_scope_id,
                     &module_globals,
@@ -1891,8 +2008,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                     })?;
             let interface_text = crate::sema::amod::write_amod(
                 name,
-                opts.input.to_str().unwrap_or(""),
-                &source,
+                &source_provenance,
+                &raw,
                 &st,
                 submodule_scope_id,
                 &module_globals,
@@ -1911,7 +2028,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
                 crate::sema::amod::SMOD_VERSION,
                 env!("CARGO_PKG_VERSION"),
-                opts.input.to_str().unwrap_or(""),
+                source_provenance,
                 parent_spec,
                 name_key,
                 interface_name,
@@ -2717,6 +2834,64 @@ fn find_workspace_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn normalizes_module_source_provenance() {
+        let cwd = std::env::temp_dir().join("armfortas-provenance-root");
+
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                &normalize_path_lexically(&cwd.join("./src/../parent.f90")),
+                &cwd,
+            ),
+            "parent.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(&cwd.join("src/child.f90"), &cwd),
+            "src/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(&cwd.join("../outside/child.f90"), &cwd),
+            "../outside/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(Path::new("/unrelated/child.f90"), &cwd),
+            "child.f90"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_windows_module_source_provenance() {
+        let cwd = Path::new(r"C:\work\project\build");
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                Path::new(r"c:\work\project\src\child.f90"),
+                cwd,
+            ),
+            "../src/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(Path::new(r"D:\src\child.f90"), cwd),
+            "child.f90"
+        );
+
+        let unc_cwd = Path::new(r"\\server\share\project\build");
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                Path::new(r"\\SERVER\SHARE\project\src\child.f90"),
+                unc_cwd,
+            ),
+            "../src/child.f90"
+        );
+        assert_eq!(
+            module_source_provenance_from_absolute(
+                Path::new(r"\\server\other\project\src\child.f90"),
+                unc_cwd,
+            ),
+            "child.f90"
+        );
+    }
 
     #[test]
     fn parses_os_optimization_flag() {

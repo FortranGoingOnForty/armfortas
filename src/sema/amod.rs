@@ -228,7 +228,7 @@ fn decode_nested_field_default_init(
 pub fn write_amod(
     module_name: &str,
     source_path: &str,
-    source_content: &str,
+    source_content: &[u8],
     st: &SymbolTable,
     mod_scope_id: ScopeId,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
@@ -278,7 +278,7 @@ pub fn write_amod(
         }
     }
     writeln!(out, "# source: {}", source_path).unwrap();
-    writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex(source_content)).unwrap();
+    writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex_bytes(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
     writeln!(out, "# compiler: armfortas 0.1.0").unwrap();
     writeln!(out).unwrap();
