@@ -1477,9 +1477,6 @@ fn lower_namelist_read_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_addr: ValueId,
-    end_label: Option<u64>,
-    err_label: Option<u64>,
-    user_iostat: bool,
 ) -> bool {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
         return false;
@@ -1506,7 +1503,6 @@ fn lower_namelist_read_stmt(
                 ],
                 IrType::Void,
             );
-            lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
             return true;
         }
     }
@@ -1518,7 +1514,6 @@ fn lower_namelist_read_stmt(
         vec![unit, group_ptr, group_len, entries, n_entries, iostat_addr],
         IrType::Void,
     );
-    lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
     true
 }
 
@@ -1658,6 +1653,45 @@ fn integer_storeback_type(
     match b.func().value_type(dest_addr) {
         Some(IrType::Ptr(inner)) => (*inner).clone(),
         _ => IrType::Int(IntWidth::I32),
+    }
+}
+
+type IostatStoreback = Option<(ValueId, IrType)>;
+
+fn lower_runtime_iostat(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    control: Option<&IoControl>,
+    required: bool,
+) -> (ValueId, IostatStoreback) {
+    if let Some(control) = control {
+        let dest_addr = lower_arg_by_ref_ctx(b, ctx, &control.value);
+        let dest_ty = integer_storeback_type(b, ctx, &control.value, dest_addr);
+        let runtime_addr = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, runtime_addr);
+        return (runtime_addr, Some((dest_addr, dest_ty)));
+    }
+
+    if required {
+        let runtime_addr = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, runtime_addr);
+        return (runtime_addr, None);
+    }
+
+    (b.const_i64(0), None)
+}
+
+fn lower_runtime_iostat_storeback(
+    b: &mut FuncBuilder,
+    runtime_addr: ValueId,
+    storeback: &IostatStoreback,
+) {
+    if let Some((dest_addr, dest_ty)) = storeback {
+        let status = b.load_typed(runtime_addr, IrType::Int(IntWidth::I32));
+        let coerced = coerce_to_type(b, status, dest_ty);
+        b.store(coerced, *dest_addr);
     }
 }
 
@@ -4318,8 +4352,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("leading_zero"))
                     .unwrap_or(false)
             });
-            let iostat_arg_ptr = iostat_ctrl.map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
-            let iostat_ptr = iostat_arg_ptr.unwrap_or(null_i8_ptr);
+            let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(b, ctx, iostat_ctrl, false);
+            let iostat_arg_ptr = iostat_ctrl.is_some().then_some(iostat_ptr);
             let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
@@ -4329,6 +4363,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             if lower_namelist_write_stmt(b, ctx, controls, iostat_ptr) {
+                lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                 return;
             }
 
@@ -4353,6 +4388,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             vec![],
                             IrType::Void,
                         );
+                        lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                         return;
                     }
                     let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
@@ -4380,6 +4416,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         Some(ctx.type_layouts),
                         fmt_ptr,
                     );
+                    lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                     return;
                 }
                 // Whole character array as the internal unit: formatted
@@ -4393,6 +4430,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         lower_fixed_internal_list_write(
                             b, ctx, items, base, elem_len, nelems, iostat_ptr, iomsg_ptr, iomsg_len,
                         );
+                        lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                         return;
                     }
                     let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
@@ -4423,6 +4461,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         Some(ctx.type_layouts),
                         fmt_ptr,
                     );
+                    lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                     return;
                 }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
@@ -4463,6 +4502,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             fmt_ptr,
                         );
                     }
+                    lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                     return;
                 }
             }
@@ -4497,6 +4537,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 iomsg_arg_ptr,
                 iomsg_len,
             ) {
+                lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
                 return;
             }
 
@@ -4557,6 +4598,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             }
+            lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
         }
 
         Stmt::Call { callee, args } => {
@@ -8911,32 +8953,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .unwrap_or(false)
             });
 
-            let explicit_iostat_addr = controls
-                .iter()
-                .find(|c| {
-                    c.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("iostat"))
-                        .unwrap_or(false)
-                })
-                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
-
-            let user_iostat = explicit_iostat_addr.is_some();
+            let iostat_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iostat"))
+                    .unwrap_or(false)
+            });
+            let user_iostat = iostat_ctrl.is_some();
             let needs_hidden_iostat = end_label.is_some()
                 || err_label.is_some()
                 || iomsg_ctrl.is_some()
                 || io_control_by_keyword(controls, "pos").is_some();
             let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
-            let iostat_addr = match explicit_iostat_addr {
-                Some(addr) => addr,
-                None if needs_hidden_iostat => {
-                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
-                    let zero = b.const_i32(0);
-                    b.store(zero, tmp);
-                    tmp
-                }
-                None => b.const_i64(0),
-            };
+            let (iostat_addr, iostat_storeback) =
+                lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
             let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
 
             let size_addr = controls
@@ -8962,15 +8992,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 (null_char_slot_arg(b), null_iomsg_data, zero_iomsg_len)
             };
 
-            if lower_namelist_read_stmt(
-                b,
-                ctx,
-                controls,
-                iostat_addr,
-                end_label,
-                err_label,
-                user_iostat,
-            ) {
+            if lower_namelist_read_stmt(b, ctx, controls, iostat_addr) {
+                lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
+                lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
             }
 
@@ -9014,6 +9038,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         );
                     }
                     lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                    lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                     lower_read_status_branches(
                         b,
                         ctx,
@@ -9063,6 +9088,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 read_iomsg_len,
             ) {
                 finish_external_read_positioning(b, positioning_done);
+                lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                 lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
             }
@@ -9108,6 +9134,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
             finish_external_read_positioning(b, positioning_done);
             lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+            lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
             lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
 
