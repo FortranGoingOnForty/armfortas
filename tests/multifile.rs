@@ -204,6 +204,64 @@ fn combined_compile_rejects_duplicate_module_definitions() {
 }
 
 #[test]
+fn combined_compile_accepts_prefixed_module_procedure_interfaces() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("first.f90"),
+        "module first_contract\n  interface\n    module pure function first_value()\n      integer :: first_value\n    end function first_value\n  end interface\nend module first_contract\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("second.f90"),
+        "module second_contract\n  interface\n    module pure function second_value()\n      integer :: second_value\n    end function second_value\n  end interface\nend module second_contract\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "first.f90", "second.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "prefixed module procedures were treated as module definitions:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_ignores_fixed_comment_and_hollerith_dependencies() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("producer.f"),
+        "      MODULE FIXED_SOURCE\nC COMMENT; USE COMMENT_DEP\n      CONTAINS\n      SUBROUTINE SHOW(I)\n      INTEGER I\n  100 FORMAT(11H;USE HOLLER,I2)\n      PRINT 100,I\n      END\n      END\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("consumers.f90"),
+        "module comment_dep\n  use fixed_source\nend module comment_dep\nmodule holler\n  use fixed_source\nend module holler\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "consumers.f90", "producer.f"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "fixed comments or Hollerith text created a false dependency cycle:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_compile_preserves_target_and_preprocessor_options() {
     let compiler = find_compiler();
     let dir = unique_dir();
