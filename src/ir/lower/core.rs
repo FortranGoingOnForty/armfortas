@@ -8225,6 +8225,79 @@ fn install_global_inline_const(
     true
 }
 
+fn install_parameter_inline_const(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    local_key: String,
+    symbol: &crate::sema::symtab::Symbol,
+) -> bool {
+    if !symbol.attrs.parameter || locals.contains_key(&local_key) {
+        return false;
+    }
+    let Some(value) = symbol.const_value else {
+        return false;
+    };
+
+    let is_char = matches!(
+        symbol.type_info,
+        Some(crate::sema::symtab::TypeInfo::Character { .. })
+    );
+    if is_char {
+        let ptr = b.const_string(&[value as u8]);
+        locals.insert(
+            local_key,
+            LocalInfo {
+                addr: ptr,
+                ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                dims: vec![],
+                allocatable: false,
+                descriptor_arg: false,
+                by_ref: false,
+                char_kind: CharKind::Fixed(1),
+                derived_type: None,
+                inline_const: None,
+                is_pointer: false,
+                runtime_dim_upper: vec![],
+                is_class: false,
+                logical_kind: None,
+                last_dim_assumed_size: false,
+            },
+        );
+        return true;
+    }
+
+    let ty = symbol
+        .type_info
+        .as_ref()
+        .map(type_info_to_ir_type)
+        .unwrap_or(IrType::Int(IntWidth::I32));
+    let addr = b.alloca(ty.clone());
+    let logical_kind = symbol.type_info.as_ref().and_then(|ty| match ty {
+        crate::sema::symtab::TypeInfo::Logical { kind } => Some(kind.unwrap_or(4)),
+        _ => None,
+    });
+    locals.insert(
+        local_key,
+        LocalInfo {
+            addr,
+            ty,
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: Some(ConstScalar::Int(value as i128)),
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind,
+            last_dim_assumed_size: false,
+        },
+    );
+    true
+}
+
 fn module_scope_name_for_symbol(
     st: &SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,
@@ -8586,6 +8659,14 @@ pub(super) fn install_globals_as_locals_in(
                 }
             }
         }
+        let visible_intrinsic_parameter = current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, &local_key))
+            .filter(|symbol| st.scope(symbol.scope).intrinsic_module);
+        if visible_intrinsic_parameter.is_some_and(|symbol| {
+            install_parameter_inline_const(b, locals, local_key.clone(), symbol)
+        }) {
+            continue;
+        }
         let resolved_global_key = resolve_exported_global_key(st, globals, &mod_key, &var_key)
             .unwrap_or_else(|| (mod_key.clone(), var_key.clone()));
         if let Some(info) = globals.get(&resolved_global_key) {
@@ -8622,9 +8703,6 @@ pub(super) fn install_globals_as_locals_in(
             // Not an IR global — check if it's an intrinsic module parameter constant
             // (iso_c_binding, iso_fortran_env). These are registered in the symbol
             // table but never emitted as IR globals; install them as inline_const locals.
-            if locals.contains_key(&local_key) {
-                continue;
-            }
             if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
                 if let Some(sym) = st
                     .scope(mod_scope_id)
@@ -8632,75 +8710,8 @@ pub(super) fn install_globals_as_locals_in(
                     .get(&var_key)
                     .or_else(|| st.lookup_in(mod_scope_id, &var_key))
                 {
-                    if sym.attrs.parameter {
-                        if let Some(cv) = sym.const_value {
-                            // Check if this is a character constant (e.g. c_null_char).
-                            let is_char = matches!(
-                                sym.type_info,
-                                Some(crate::sema::symtab::TypeInfo::Character { .. })
-                            );
-                            if is_char {
-                                // Emit a 1-byte global string constant with the ASCII value.
-                                let byte = [cv as u8];
-                                let ptr = b.const_string(&byte);
-                                let ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
-                                locals.insert(
-                                    local_key.clone(),
-                                    LocalInfo {
-                                        addr: ptr,
-                                        ty,
-                                        dims: vec![],
-                                        allocatable: false,
-                                        descriptor_arg: false,
-                                        by_ref: false,
-                                        char_kind: CharKind::Fixed(1),
-                                        derived_type: None,
-                                        inline_const: None,
-                                        is_pointer: false,
-                                        runtime_dim_upper: vec![],
-                                        is_class: false,
-                                        logical_kind: None,
-                                        last_dim_assumed_size: false,
-                                    },
-                                );
-                            } else {
-                                let ty = sym
-                                    .type_info
-                                    .as_ref()
-                                    .map(type_info_to_ir_type)
-                                    .unwrap_or(IrType::Int(IntWidth::I32));
-                                // Create a dummy alloca (never loaded from; inline_const
-                                // short-circuits at every use site via materialize_const_scalar).
-                                let addr = b.alloca(ty.clone());
-                                locals.insert(
-                                    local_key.clone(),
-                                    LocalInfo {
-                                        addr,
-                                        ty,
-                                        dims: vec![],
-                                        allocatable: false,
-                                        descriptor_arg: false,
-                                        by_ref: false,
-                                        char_kind: CharKind::None,
-                                        derived_type: None,
-                                        inline_const: Some(ConstScalar::Int(cv as i128)),
-                                        is_pointer: false,
-                                        runtime_dim_upper: vec![],
-                                        is_class: false,
-                                        logical_kind: sym.type_info.as_ref().and_then(
-                                            |ty| match ty {
-                                                crate::sema::symtab::TypeInfo::Logical { kind } => {
-                                                    Some(kind.unwrap_or(4))
-                                                }
-                                                _ => None,
-                                            },
-                                        ),
-                                        last_dim_assumed_size: false,
-                                    },
-                                );
-                            }
-                            installed_from.insert(local_key, resolved_global_key);
-                        }
+                    if install_parameter_inline_const(b, locals, local_key.clone(), sym) {
+                        installed_from.insert(local_key, resolved_global_key);
                     }
                 }
             }

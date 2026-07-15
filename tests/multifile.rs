@@ -172,6 +172,44 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn serialized_intrinsic_use_keeps_provider_nature() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=serialized_intrinsic_use_keeps_provider_nature count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let facade_f90 = dir.join("facade.f90");
+    let consumer_f90 = dir.join("consumer.f90");
+    let facade_o = dir.join("facade.o");
+    let consumer_o = dir.join("consumer.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &facade_f90,
+        "module facade\n  use, intrinsic :: iso_fortran_env\nend module facade\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_f90,
+        "module iso_fortran_env\n  integer, parameter :: int8 = 4\nend module iso_fortran_env\nprogram p\n  use facade, only: int8\n  if (int8 /= 1) error stop 27\n  print *, 'ok'\nend program p\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &facade_f90, &facade_o, None);
+    compile_file(&compiler, &consumer_f90, &consumer_o, Some(&dir));
+    link_files(&[&facade_o, &consumer_o], &binary);
+    let output = run_binary(&binary);
+    assert!(output.contains("ok"), "unexpected output:\n{output}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_compile_rejects_duplicate_module_definitions() {
     let compiler = find_compiler();
     let dir = unique_dir();
