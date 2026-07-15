@@ -55460,7 +55460,7 @@ fn use_renamed_derived_local_copies_pointer_function_result() {
 
     let amod = fs::read_to_string(dir.join("facade_m.amod")).expect("missing facade_m.amod");
     assert!(
-        amod.contains("@use_only json_object = toml_table from table_api"),
+        amod.contains("@use_only json_object = toml_table from non_intrinsic :: table_api"),
         "facade .amod should preserve the derived type rename:\n{}",
         amod
     );
