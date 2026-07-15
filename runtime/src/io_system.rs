@@ -4201,7 +4201,10 @@ pub extern "C" fn afs_io_finalize() {
 //   afs_fmt_push_int(val) / afs_fmt_push_int128(&val) / afs_fmt_push_real*(val) / ...
 //   afs_fmt_end()
 
-use crate::format::{parse_format, FormatDesc, FormatEngine, IoValue, LeadingZeroMode};
+use crate::format::{
+    parse_format, BlankInterpretation, DecimalSep, FormatDesc, FormatEngine, IoValue,
+    LeadingZeroMode,
+};
 use std::cell::RefCell;
 
 enum FmtSink {
@@ -4962,12 +4965,39 @@ fn read_formatted_field(desc: &FormatDesc, input: &[u8], cursor: &mut usize) -> 
     }
 }
 
-fn extract_nth_formatted_field(
+#[derive(Clone, Copy)]
+struct FormattedInputState {
+    blank_mode: BlankInterpretation,
+    scale_factor: i32,
+    decimal_sep: DecimalSep,
+}
+
+impl Default for FormattedInputState {
+    fn default() -> Self {
+        Self {
+            blank_mode: BlankInterpretation::Null,
+            scale_factor: 0,
+            decimal_sep: DecimalSep::Point,
+        }
+    }
+}
+
+fn update_formatted_input_state(desc: &FormatDesc, state: &mut FormattedInputState) {
+    match desc {
+        FormatDesc::BlankMode(mode) => state.blank_mode = *mode,
+        FormatDesc::ScaleFactor(scale) => state.scale_factor = *scale,
+        FormatDesc::DecimalMode(sep) => state.decimal_sep = *sep,
+        _ => {}
+    }
+}
+
+fn extract_nth_formatted_field_with_state(
     descs: &[FormatDesc],
     input: &[u8],
     cursor: &mut usize,
     remaining_data_index: &mut usize,
-) -> Option<(FormatDesc, Vec<u8>)> {
+    state: &mut FormattedInputState,
+) -> Option<(FormatDesc, Vec<u8>, FormattedInputState)> {
     for desc in descs {
         match desc {
             FormatDesc::Group {
@@ -4975,11 +5005,12 @@ fn extract_nth_formatted_field(
                 descriptors,
             } => {
                 for _ in 0..*repeat {
-                    if let Some(found) = extract_nth_formatted_field(
+                    if let Some(found) = extract_nth_formatted_field_with_state(
                         descriptors,
                         input,
                         cursor,
                         remaining_data_index,
+                        state,
                     ) {
                         return Some(found);
                     }
@@ -4989,11 +5020,12 @@ fn extract_nth_formatted_field(
                 let mut loop_guard = 0usize;
                 while *cursor < input.len() && loop_guard < input.len().saturating_add(1) {
                     let before = *cursor;
-                    if let Some(found) = extract_nth_formatted_field(
+                    if let Some(found) = extract_nth_formatted_field_with_state(
                         descriptors,
                         input,
                         cursor,
                         remaining_data_index,
+                        state,
                     ) {
                         return Some(found);
                     }
@@ -5006,10 +5038,11 @@ fn extract_nth_formatted_field(
             _ => {
                 if let Some(field) = read_formatted_field(desc, input, cursor) {
                     if *remaining_data_index == 0 {
-                        return Some((desc.clone(), field));
+                        return Some((desc.clone(), field, *state));
                     }
                     *remaining_data_index -= 1;
                 } else {
+                    update_formatted_input_state(desc, state);
                     advance_formatted_cursor(desc, input, cursor);
                 }
             }
@@ -5017,6 +5050,17 @@ fn extract_nth_formatted_field(
     }
 
     None
+}
+
+fn extract_nth_formatted_field(
+    descs: &[FormatDesc],
+    input: &[u8],
+    cursor: &mut usize,
+    remaining_data_index: &mut usize,
+) -> Option<(FormatDesc, Vec<u8>)> {
+    let mut state = FormattedInputState::default();
+    extract_nth_formatted_field_with_state(descs, input, cursor, remaining_data_index, &mut state)
+        .map(|(desc, field, _)| (desc, field))
 }
 
 fn read_nonadvancing_formatted_field(
@@ -5105,12 +5149,24 @@ fn parse_nth_formatted_record(
     fmt_len: i64,
     data_index: i64,
 ) -> Result<(FormatDesc, Vec<u8>), i32> {
+    parse_nth_formatted_record_with_state(input, fmt_str, fmt_len, data_index)
+        .map(|(desc, field, _)| (desc, field))
+}
+
+fn parse_nth_formatted_record_with_state(
+    input: &[u8],
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+) -> Result<(FormatDesc, Vec<u8>, FormattedInputState), i32> {
     let fmt = unsafe_str(fmt_str, fmt_len);
     let descs = parse_format(&fmt);
     let mut cursor = 0usize;
     let mut remaining = data_index.max(0) as usize;
+    let mut state = FormattedInputState::default();
 
-    extract_nth_formatted_field(&descs, input, &mut cursor, &mut remaining).ok_or(-1)
+    extract_nth_formatted_field_with_state(&descs, input, &mut cursor, &mut remaining, &mut state)
+        .ok_or(-1)
 }
 
 fn parse_nth_formatted_internal_field(
@@ -5126,6 +5182,21 @@ fn parse_nth_formatted_internal_field(
 
     let input = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
     parse_nth_formatted_record(input, fmt_str, fmt_len, data_index)
+}
+
+fn parse_nth_formatted_internal_field_with_state(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+) -> Result<(FormatDesc, Vec<u8>, FormattedInputState), i32> {
+    if buf.is_null() || buf_len <= 0 {
+        return Err(-1);
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    parse_nth_formatted_record_with_state(input, fmt_str, fmt_len, data_index)
 }
 
 fn trim_record_newline(mut line: Vec<u8>) -> Vec<u8> {
@@ -5259,6 +5330,68 @@ fn parse_formatted_integer_field(desc: &FormatDesc, field: &str) -> Option<i128>
     };
     let parsed = i128::from_str_radix(digits, radix).ok()?;
     Some(if negative { -parsed } else { parsed })
+}
+
+fn formatted_real_decimals(desc: &FormatDesc) -> Option<usize> {
+    match desc {
+        FormatDesc::RealF { decimals, .. }
+        | FormatDesc::RealE { decimals, .. }
+        | FormatDesc::RealEN { decimals, .. }
+        | FormatDesc::RealES { decimals, .. }
+        | FormatDesc::RealEX { decimals, .. }
+        | FormatDesc::RealD { decimals, .. }
+        | FormatDesc::RealG { decimals, .. } => Some(*decimals),
+        _ => None,
+    }
+}
+
+fn parse_formatted_real_field(
+    desc: &FormatDesc,
+    field: &[u8],
+    state: FormattedInputState,
+) -> Option<f64> {
+    let decimals = formatted_real_decimals(desc)?;
+    let field = String::from_utf8_lossy(field);
+    let mut numeric = match state.blank_mode {
+        BlankInterpretation::Null => field.chars().filter(|&ch| ch != ' ').collect::<String>(),
+        BlankInterpretation::Zero => field
+            .trim_start_matches(' ')
+            .chars()
+            .map(|ch| if ch == ' ' { '0' } else { ch })
+            .collect::<String>(),
+    };
+
+    match state.decimal_sep {
+        DecimalSep::Point => {
+            if numeric.contains(',') {
+                return None;
+            }
+        }
+        DecimalSep::Comma => {
+            if numeric.contains('.') {
+                return None;
+            }
+            numeric = numeric.replace(',', ".");
+        }
+    }
+
+    let has_decimal = numeric.contains('.');
+    let normalized = normalize_fortran_real_input(&numeric, false);
+    let has_exponent = normalized.bytes().any(|byte| matches!(byte, b'e' | b'E'));
+    let mut value = normalized.parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return Some(value);
+    }
+
+    if !has_decimal {
+        let decimal_power = i32::try_from(decimals).unwrap_or(i32::MAX).saturating_neg();
+        value *= 10f64.powi(decimal_power);
+    }
+    if !has_exponent {
+        value *= 10f64.powi(state.scale_factor.saturating_neg());
+    }
+
+    Some(value)
 }
 
 #[no_mangle]
@@ -5594,19 +5727,11 @@ pub extern "C" fn afs_fmt_read_real(
     iostat: *mut i32,
 ) {
     match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
+        .and_then(|line| parse_nth_formatted_record_with_state(&line, fmt_str, fmt_len, data_index))
     {
-        Ok((FormatDesc::RealF { .. }, field))
-        | Ok((FormatDesc::RealE { .. }, field))
-        | Ok((FormatDesc::RealEN { .. }, field))
-        | Ok((FormatDesc::RealES { .. }, field))
-        | Ok((FormatDesc::RealEX { .. }, field))
-        | Ok((FormatDesc::RealD { .. }, field))
-        | Ok((FormatDesc::RealG { .. }, field)) => {
-            let field_text = String::from_utf8_lossy(&field);
-            let normalized = normalize_fortran_real_input(&field_text, true);
-            match normalized.parse::<f64>() {
-                Ok(v) => {
+        Ok((desc, field, input_state)) if formatted_real_decimals(&desc).is_some() => {
+            match parse_formatted_real_field(&desc, &field, input_state) {
+                Some(v) => {
                     write_f64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
@@ -5614,7 +5739,7 @@ pub extern "C" fn afs_fmt_read_real(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     set_read_status_or_exit(iostat, 1);
                 }
             }
@@ -5798,18 +5923,11 @@ pub extern "C" fn afs_fmt_read_real_internal(
     val: *mut f64,
     iostat: *mut i32,
 ) {
-    match parse_nth_formatted_internal_field(buf, buf_len, fmt_str, fmt_len, data_index) {
-        Ok((FormatDesc::RealF { .. }, field))
-        | Ok((FormatDesc::RealE { .. }, field))
-        | Ok((FormatDesc::RealEN { .. }, field))
-        | Ok((FormatDesc::RealES { .. }, field))
-        | Ok((FormatDesc::RealEX { .. }, field))
-        | Ok((FormatDesc::RealD { .. }, field))
-        | Ok((FormatDesc::RealG { .. }, field)) => {
-            let field_text = String::from_utf8_lossy(&field);
-            let normalized = normalize_fortran_real_input(&field_text, true);
-            match normalized.parse::<f64>() {
-                Ok(v) => {
+    match parse_nth_formatted_internal_field_with_state(buf, buf_len, fmt_str, fmt_len, data_index)
+    {
+        Ok((desc, field, input_state)) if formatted_real_decimals(&desc).is_some() => {
+            match parse_formatted_real_field(&desc, &field, input_state) {
+                Some(v) => {
                     write_f64_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
@@ -5817,7 +5935,7 @@ pub extern "C" fn afs_fmt_read_real_internal(
                         }
                     }
                 }
-                Err(_) => {
+                None => {
                     set_read_status_or_exit(iostat, 1);
                 }
             }
@@ -5938,6 +6056,40 @@ mod tests {
         assert_eq!(normalize_fortran_real_input("1.0D+3", false), "1.0E+3");
         assert_eq!(normalize_fortran_real_input("-Inf", false), "-Inf");
         assert_eq!(normalize_fortran_real_input("NaN", false), "NaN");
+    }
+
+    #[test]
+    fn formatted_real_input_applies_descriptor_state() {
+        let read = |input: &[u8], fmt: &str, index: i64| {
+            let (desc, field, state) =
+                parse_nth_formatted_record_with_state(input, fmt.as_ptr(), fmt.len() as i64, index)
+                    .expect("formatted field");
+            parse_formatted_real_field(&desc, &field, state).expect("formatted real")
+        };
+
+        let cases = [
+            (b"00123".as_slice(), "(F5.2)", 0, 1.23),
+            (b"00123".as_slice(), "(1P,F5.2)", 0, 0.123),
+            (b"00123".as_slice(), "(-1P,F5.2)", 0, 12.3),
+            (b"1.23E2".as_slice(), "(1P,E6.2)", 0, 123.0),
+            (b"1.23".as_slice(), "(1P,F4.2)", 0, 0.123),
+            (b"00123E2".as_slice(), "(1P,E7.2)", 0, 123.0),
+            (b"1 2".as_slice(), "(BN,F3.0)", 0, 12.0),
+            (b"1 2".as_slice(), "(BZ,F3.0)", 0, 102.0),
+            (b" 12".as_slice(), "(BZ,F3.0)", 0, 12.0),
+            (b"12 ".as_slice(), "(BZ,F3.0)", 0, 120.0),
+            (b"1,25".as_slice(), "(DC,F4.2)", 0, 1.25),
+            (b"0012300123".as_slice(), "(2(1P,F5.2))", 1, 0.123),
+            (b"1,251.25".as_slice(), "(DC,F4.2,DP,F4.2)", 1, 1.25),
+        ];
+
+        for (input, fmt, index, expected) in cases {
+            let actual = read(input, fmt, index);
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "input={input:?} fmt={fmt:?} index={index} actual={actual} expected={expected}"
+            );
+        }
     }
 
     #[test]
