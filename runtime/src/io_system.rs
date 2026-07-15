@@ -1404,39 +1404,30 @@ pub extern "C" fn afs_list_write_end(
     iomsg_len: i64,
 ) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(u) = state.get_unit(unit) else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
+    let err = if let Some(u) = state.get_unit(unit) {
+        if let Some(buf) = u.pending_record.take() {
+            let len_bytes = (buf.len() as u32).to_ne_bytes();
+            u.list_write_raw_or_buffer(&len_bytes);
+            if !buf.is_empty() {
+                u.list_write_raw_or_buffer(&buf);
             }
+            u.list_write_raw_or_buffer(&len_bytes);
         }
-        return;
+        u.list_write_flush();
+        let err = u.list_write_error.take();
+        u.list_write_active = false;
+        err
+    } else {
+        Some("unit not connected".to_string())
     };
-    if let Some(buf) = u.pending_record.take() {
-        let len_bytes = (buf.len() as u32).to_ne_bytes();
-        u.list_write_raw_or_buffer(&len_bytes);
-        if !buf.is_empty() {
-            u.list_write_raw_or_buffer(&buf);
-        }
-        u.list_write_raw_or_buffer(&len_bytes);
-    }
-    u.list_write_flush();
-    let err = u.list_write_error.take();
-    u.list_write_active = false;
+    drop(state);
+
     if let Some(msg) = err {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
-            }
-        }
-        if !iomsg.is_null() && iomsg_len > 0 {
-            let buf = unsafe { std::slice::from_raw_parts_mut(iomsg, iomsg_len as usize) };
-            let bytes = msg.as_bytes();
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
-            for b in buf[n..].iter_mut() {
-                *b = b' ';
-            }
+        write_i32_ptr(iostat, 1);
+        assign_iomsg(iomsg, iomsg_len, &msg);
+        if iostat.is_null() {
+            eprintln!("Fortran runtime error: {msg}");
+            std::process::exit(2);
         }
     }
 }
