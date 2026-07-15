@@ -3865,6 +3865,11 @@ impl Unit {
                 "BACKSPACE is not valid for direct access",
             ));
         }
+        if self.access == Access::Stream && self.form == Form::Unformatted {
+            return Err(invalid_positioning_error(
+                "BACKSPACE is not valid for unformatted stream access",
+            ));
+        }
 
         let formatted = self.form == Form::Formatted;
         match &mut self.stream {
@@ -6293,6 +6298,61 @@ pub extern "C" fn afs_fmt_read_real_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backspace_rejects_unformatted_stream_without_repositioning() {
+        let path = format!(
+            "/tmp/afs_backspace_unformatted_stream_{}.dat",
+            std::process::id()
+        );
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        for value in [4i32, 42, 4] {
+            file.write_all(&value.to_ne_bytes()).unwrap();
+        }
+        let before = file.stream_position().unwrap();
+        let mut unit = Unit {
+            _number: 97,
+            stream: UnitStream::FileRaw(file),
+            filename: path.as_bytes().to_vec(),
+            _status: UnitStatus::Open,
+            access: Access::Stream,
+            form: Form::Unformatted,
+            action: Action::ReadWrite,
+            recl: None,
+            read_tokens: VecDeque::new(),
+            formatted_read_record: None,
+            formatted_read_cursor: 0,
+            terminal_nonadvancing_open_record: false,
+            last_list_output_char: false,
+            list_write_active: false,
+            list_write_error: None,
+            scratch: false,
+            leading_zero: LeadingZeroMode::Default,
+            pending_record: None,
+            pending_read: None,
+        };
+
+        let error = unit.backspace().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "BACKSPACE is not valid for unformatted stream access"
+        );
+        let after = match &mut unit.stream {
+            UnitStream::FileRaw(file) => file.stream_position().unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(after, before);
+
+        drop(unit);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn list_directed_tokenizer_preserves_null_positions() {
