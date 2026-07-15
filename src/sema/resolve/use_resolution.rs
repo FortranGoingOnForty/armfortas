@@ -6,7 +6,7 @@
 //! (the .amod loader that synthesises a module scope when a USE'd
 //! module wasn't seen in-file).
 
-use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl};
+use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl, UseNature};
 use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
 
@@ -44,15 +44,24 @@ pub(super) fn process_uses(
     for use_decl in uses {
         if let Decl::UseStmt {
             module,
-            nature: _,
+            nature,
             renames,
             only,
         } = &use_decl.node
         {
-            // If the module isn't defined in-file, try loading from .amod.
-            let mod_scope = st
-                .find_module_scope(module)
-                .or_else(|| load_external_module(st, module, module_search_paths, type_layouts));
+            // If a non-intrinsic module isn't defined in-file, try loading it
+            // from .amod. Intrinsic modules are compiler-provided only.
+            let mod_scope = match nature {
+                UseNature::Normal => st.find_module_scope(module).or_else(|| {
+                    load_external_module(st, module, module_search_paths, type_layouts)
+                }),
+                UseNature::Intrinsic => st.find_intrinsic_module_scope(module),
+                UseNature::NonIntrinsic => {
+                    st.find_non_intrinsic_module_scope(module).or_else(|| {
+                        load_external_module(st, module, module_search_paths, type_layouts)
+                    })
+                }
+            };
             if let Some(mod_scope) = mod_scope {
                 // Reject self-USE: a module cannot USE itself.
                 if mod_scope == st.current_scope() {
@@ -162,8 +171,23 @@ pub(super) fn process_uses(
                     }
                 }
             } else {
+                let msg = match nature {
+                    UseNature::Normal => format!(
+                        "module '{}' not found (searched -I paths and current directory for {}.amod)",
+                        module,
+                        module.to_lowercase()
+                    ),
+                    UseNature::Intrinsic => {
+                        format!("module '{}' is not an intrinsic module", module)
+                    }
+                    UseNature::NonIntrinsic => format!(
+                        "non-intrinsic module '{}' not found (searched -I paths and current directory for {}.amod)",
+                        module,
+                        module.to_lowercase()
+                    ),
+                };
                 return Err(SemaError {
-                    msg: format!("module '{}' not found (searched -I paths and current directory for {}.amod)", module, module.to_lowercase()),
+                    msg,
                     span: use_decl.span,
                 });
             }

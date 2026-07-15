@@ -19,7 +19,7 @@ use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
-use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec};
+use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature};
 use crate::ast::expr::{AcValue, Argument, Expr, SectionSubscript, SpannedExpr};
 use crate::ast::stmt::*;
 use crate::ast::unit::*;
@@ -4159,16 +4159,28 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
 fn validate_use_decl(ctx: &mut Ctx<'_>, decl: &SpannedDecl) {
     let Decl::UseStmt {
         module,
+        nature,
         renames,
         only,
-        ..
     } = &decl.node
     else {
         return;
     };
 
-    let Some(module_scope) = ctx.st.find_module_scope(module) else {
-        ctx.error(decl.span, format!("module '{}' not found", module));
+    let module_scope = match nature {
+        UseNature::Normal => ctx.st.find_module_scope(module),
+        UseNature::Intrinsic => ctx.st.find_intrinsic_module_scope(module),
+        UseNature::NonIntrinsic => ctx.st.find_non_intrinsic_module_scope(module),
+    };
+    let Some(module_scope) = module_scope else {
+        let msg = match nature {
+            UseNature::Normal => format!("module '{}' not found", module),
+            UseNature::Intrinsic => format!("module '{}' is not an intrinsic module", module),
+            UseNature::NonIntrinsic => {
+                format!("non-intrinsic module '{}' not found", module)
+            }
+        };
+        ctx.error(decl.span, msg);
         return;
     };
     if module_scope == ctx.scope_id {

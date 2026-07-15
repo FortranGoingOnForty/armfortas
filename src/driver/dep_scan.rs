@@ -105,10 +105,12 @@ pub fn scan_file(
 
         // USE <name> [, ...]
         if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
+            let mut nature = None;
             let mut rest = if let Some(after_comma) = trimmed.strip_prefix("use,") {
                 // USE, intrinsic :: name
-                if let Some(idx) = trimmed.find("::") {
-                    trimmed[idx + 2..].trim()
+                if let Some((qualifier, module_name)) = after_comma.split_once("::") {
+                    nature = Some(qualifier.trim());
+                    module_name.trim()
                 } else {
                     after_comma
                 }
@@ -127,8 +129,15 @@ pub fn scan_file(
             {
                 let clean = name.trim();
                 if !clean.is_empty() && clean != "only" {
-                    // Skip intrinsic modules — they don't need .amod files.
-                    if !is_intrinsic_module(clean) {
+                    let explicit_intrinsic = nature == Some("intrinsic");
+                    let explicit_non_intrinsic = nature == Some("non_intrinsic");
+                    // Explicit INTRINSIC never needs a source edge. An
+                    // explicit NON_INTRINSIC clause can deliberately select a
+                    // source module whose name matches an intrinsic module.
+                    if !explicit_intrinsic
+                        && (explicit_non_intrinsic
+                            || !crate::sema::intrinsic_modules::is_intrinsic_module(clean))
+                    {
                         uses.push(clean.to_string());
                     }
                 }
@@ -148,17 +157,6 @@ pub fn scan_file(
         uses,
         submodule_of,
     })
-}
-
-fn is_intrinsic_module(name: &str) -> bool {
-    matches!(
-        name,
-        "iso_c_binding"
-            | "iso_fortran_env"
-            | "ieee_arithmetic"
-            | "ieee_exceptions"
-            | "ieee_features"
-    )
 }
 
 /// Determine compilation order for a set of source files.
@@ -251,6 +249,23 @@ mod tests {
         assert_eq!(deps.defines, vec!["mymod"]);
         assert_eq!(deps.uses, vec!["other_mod"]);
         assert_eq!(deps.submodule_of, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_honors_use_module_nature() {
+        let dir = std::env::temp_dir().join("dep_scan_use_nature");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("consumer.f90");
+        std::fs::write(
+            &f,
+            "module consumer\n  use, intrinsic :: user_module\n  use, non_intrinsic :: iso_fortran_env\nend module\n",
+        )
+        .unwrap();
+
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
+        assert_eq!(deps.uses, vec!["iso_fortran_env"]);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

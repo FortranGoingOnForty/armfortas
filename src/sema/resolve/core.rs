@@ -70,7 +70,7 @@ pub fn resolve_file(
     let mut st = SymbolTable::new();
     let mut layouts = crate::sema::type_layout::TypeLayoutRegistry::new();
 
-    // Register intrinsic modules (iso_c_binding, iso_fortran_env) so USE can find them.
+    // Register intrinsic modules so USE can find them.
     crate::sema::intrinsic_modules::register_intrinsic_modules(&mut st);
 
     // First pass: create module scopes so USE can find them.
@@ -386,7 +386,7 @@ pub(super) fn resolve_unit(
         } => {
             reject_imports_in_disallowed_scope(imports, "a module", unit.span)?;
             // Find the pre-created module scope and enter it.
-            if let Some(mod_id) = st.find_module_scope(name) {
+            if let Some(mod_id) = st.find_non_intrinsic_module_scope(name) {
                 let saved = st.enter_scope(mod_id);
 
                 process_uses(st, uses, module_search_paths, layouts)?;
@@ -3104,6 +3104,16 @@ mod tests {
         resolve_file(&units, &[], crate::target::TargetLayout::LP64).unwrap()
     }
 
+    fn resolve_error(src: &str) -> SemaError {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        match resolve_file(&units, &[], crate::target::TargetLayout::LP64) {
+            Ok(_) => panic!("expected semantic resolution to fail"),
+            Err(err) => err,
+        }
+    }
+
     // ---- Integration tests ----
 
     #[test]
@@ -3178,6 +3188,55 @@ end program
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(!prog_scope.use_associations.is_empty());
+    }
+
+    #[test]
+    fn intrinsic_use_rejects_non_intrinsic_module() {
+        let err = resolve_error(
+            "module user_module\nend module\nprogram p\n  use, intrinsic :: user_module\nend program\n",
+        );
+        assert!(
+            err.msg.contains("not an intrinsic module"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_intrinsic_use_rejects_intrinsic_module() {
+        let err =
+            resolve_error("program p\n  use, non_intrinsic :: iso_fortran_env\nend program\n");
+        assert!(
+            err.msg
+                .contains("non-intrinsic module 'iso_fortran_env' not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_intrinsic_use_selects_same_named_source_module() {
+        let st = resolve_source(
+            "module iso_fortran_env\n  integer :: shadow_value\nend module\nprogram p\n  use, non_intrinsic :: iso_fortran_env, only: shadow_value\nend program\n",
+        );
+        let intrinsic_scope = st.find_intrinsic_module_scope("iso_fortran_env").unwrap();
+        let source_scope = st
+            .find_non_intrinsic_module_scope("iso_fortran_env")
+            .unwrap();
+        assert_ne!(intrinsic_scope, source_scope);
+        assert!(!st
+            .scope(intrinsic_scope)
+            .symbols
+            .contains_key("shadow_value"));
+        assert!(st.scope(source_scope).symbols.contains_key("shadow_value"));
+
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap();
+        assert!(program_scope
+            .use_associations
+            .iter()
+            .any(|association| association.source_scope == source_scope));
     }
 
     #[test]
