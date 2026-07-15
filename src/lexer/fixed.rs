@@ -759,7 +759,8 @@ fn split_fixed_keyword_prefix(
     run: &str,
     prior_tokens: &[Token],
 ) -> Option<usize> {
-    if !allow_fixed_keyword_split(prior_tokens) || run.len() <= 4 {
+    let at_action_start = at_fixed_action_statement_start(prior_tokens);
+    if (!allow_fixed_keyword_split(prior_tokens) && !at_action_start) || run.len() <= 4 {
         return None;
     }
 
@@ -781,7 +782,7 @@ fn split_fixed_keyword_prefix(
 
         if suffix_first.is_ascii_digit() {
             let permits_numeric_suffix = matches!(prefix_lower.as_str(), "goto" | "call")
-                || (prefix_lower == "print" && prior_tokens.is_empty());
+                || (prefix_lower == "print" && at_action_start);
             if !permits_numeric_suffix {
                 continue;
             }
@@ -791,6 +792,38 @@ fn split_fixed_keyword_prefix(
     }
 
     None
+}
+
+fn at_fixed_action_statement_start(prior_tokens: &[Token]) -> bool {
+    if prior_tokens.is_empty() {
+        return true;
+    }
+    if prior_tokens.len() < 3
+        || prior_tokens[0].kind != TokenKind::Identifier
+        || !prior_tokens[0].text.eq_ignore_ascii_case("if")
+        || prior_tokens[1].kind != TokenKind::LParen
+        || prior_tokens.last().map(|token| &token.kind) != Some(&TokenKind::RParen)
+    {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for (index, token) in prior_tokens.iter().enumerate().skip(1) {
+        match token.kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+                if depth == 0 {
+                    return index + 1 == prior_tokens.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
@@ -1716,6 +1749,16 @@ C     Hello World
     fn whitespace_stripped_print_keeps_numeric_format_label() {
         let texts = fixed_texts("      PRINT 100, I\n");
         assert_eq!(texts, vec!["PRINT", "100", ",", "I"], "got: {texts:?}");
+    }
+
+    #[test]
+    fn logical_if_print_keeps_numeric_format_label() {
+        let texts = fixed_texts("      IF (I.GT.0) PRINT 100, I\n");
+        assert_eq!(
+            texts,
+            vec!["IF", "(", "I", ".GT.", "0", ")", "PRINT", "100", ",", "I"],
+            "got: {texts:?}"
+        );
     }
 
     #[test]

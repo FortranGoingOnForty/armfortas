@@ -1,0 +1,7 @@
+! CHECK: I= 7
+      PROGRAM FIXEDLOGICALIFPRINT
+      INTEGER I
+      I = 7
+      IF (I.GT.0) PRINT 100, I
+  100 FORMAT('I=',I2)
+      END
