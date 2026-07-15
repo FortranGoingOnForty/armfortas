@@ -176,14 +176,10 @@ pub fn scan_file(
                     let clean = name.trim();
                     if !clean.is_empty() && clean != "only" {
                         let explicit_intrinsic = nature == Some("intrinsic");
-                        let explicit_non_intrinsic = nature == Some("non_intrinsic");
-                        // Explicit INTRINSIC never needs a source edge. An
-                        // explicit NON_INTRINSIC clause can deliberately select a
-                        // source module whose name matches an intrinsic module.
-                        if !explicit_intrinsic
-                            && (explicit_non_intrinsic
-                                || !crate::sema::intrinsic_modules::is_intrinsic_module(clean))
-                        {
+                        // Only an explicit INTRINSIC clause rules out a source
+                        // dependency. Normal USE can select an authored module
+                        // whose name also belongs to an intrinsic module.
+                        if !explicit_intrinsic {
                             uses.push(clean.to_string());
                         }
                     }

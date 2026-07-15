@@ -49,12 +49,13 @@ pub(super) fn process_uses(
             only,
         } = &use_decl.node
         {
-            // If a non-intrinsic module isn't defined in-file, try loading it
-            // from .amod. Intrinsic modules are compiler-provided only.
+            // A normal USE prefers an authored module, including one loaded
+            // from .amod, before falling back to a same-named intrinsic.
             let mod_scope = match nature {
-                UseNature::Normal => st.find_module_scope(module).or_else(|| {
-                    load_external_module(st, module, module_search_paths, type_layouts)
-                }),
+                UseNature::Normal => st
+                    .find_non_intrinsic_module_scope(module)
+                    .or_else(|| load_external_module(st, module, module_search_paths, type_layouts))
+                    .or_else(|| st.find_intrinsic_module_scope(module)),
                 UseNature::Intrinsic => st.find_intrinsic_module_scope(module),
                 UseNature::NonIntrinsic => {
                     st.find_non_intrinsic_module_scope(module).or_else(|| {

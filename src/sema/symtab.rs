@@ -1969,7 +1969,8 @@ impl SymbolTable {
 
     /// Find a module scope by name (for USE resolution within the same file).
     pub fn find_module_scope(&self, name: &str) -> Option<ScopeId> {
-        self.find_module_scope_with_nature(name, None)
+        self.find_non_intrinsic_module_scope(name)
+            .or_else(|| self.find_intrinsic_module_scope(name))
     }
 
     pub fn find_intrinsic_module_scope(&self, name: &str) -> Option<ScopeId> {

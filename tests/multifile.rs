@@ -354,6 +354,38 @@ fn combined_compile_orders_semicolon_separated_uses() {
 }
 
 #[test]
+fn combined_compile_orders_unqualified_same_named_intrinsic_module() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("consumer.f90"),
+        "program consumer\n  use iso_fortran_env, only: shadow_value\n  if (shadow_value /= 41) error stop\nend program consumer\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("provider.f90"),
+        "module iso_fortran_env\n  integer, parameter :: shadow_value = 41\nend module iso_fortran_env\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "consumer.f90", "provider.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "unqualified same-named module dependency was not ordered:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for object in ["consumer.o", "provider.o"] {
+        assert!(dir.join(object).is_file(), "missing {object}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_link_keeps_equal_basename_sources_distinct() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

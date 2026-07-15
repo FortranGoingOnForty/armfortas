@@ -3251,6 +3251,25 @@ end program
     }
 
     #[test]
+    fn normal_use_prefers_same_named_source_module() {
+        let st = resolve_source(
+            "module iso_fortran_env\n  integer :: shadow_value\nend module\nprogram p\n  use iso_fortran_env, only: shadow_value\nend program\n",
+        );
+        let source_scope = st
+            .find_non_intrinsic_module_scope("iso_fortran_env")
+            .unwrap();
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap();
+        assert!(program_scope
+            .use_associations
+            .iter()
+            .any(|association| association.source_scope == source_scope));
+    }
+
+    #[test]
     fn duplicate_module_units_are_rejected_case_insensitively() {
         let err = resolve_error("module shared_name\nend module\nmodule ShArEd_NaMe\nend module\n");
         assert!(

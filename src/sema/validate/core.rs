@@ -3211,14 +3211,14 @@ fn block_use_associations_for_name(
     for use_decl in uses {
         let Decl::UseStmt {
             module,
+            nature,
             renames,
             only,
-            ..
         } = &use_decl.node
         else {
             continue;
         };
-        let Some(source_scope) = st.find_module_scope(module) else {
+        let Some(source_scope) = find_use_module_scope(st, module, *nature) else {
             continue;
         };
         let original_name = if let Some(items) = only {
@@ -3332,14 +3332,14 @@ fn collect_block_use_binding_names(
     for use_decl in uses {
         let Decl::UseStmt {
             module,
+            nature,
             renames,
             only,
-            ..
         } = &use_decl.node
         else {
             continue;
         };
-        let Some(source_scope) = st.find_module_scope(module) else {
+        let Some(source_scope) = find_use_module_scope(st, module, *nature) else {
             continue;
         };
         if let Some(items) = only {
@@ -4156,6 +4156,14 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
 
 // ---- Declaration validation ----
 
+fn find_use_module_scope(st: &SymbolTable, module: &str, nature: UseNature) -> Option<ScopeId> {
+    match nature {
+        UseNature::Normal => st.find_module_scope(module),
+        UseNature::Intrinsic => st.find_intrinsic_module_scope(module),
+        UseNature::NonIntrinsic => st.find_non_intrinsic_module_scope(module),
+    }
+}
+
 fn validate_use_decl(ctx: &mut Ctx<'_>, decl: &SpannedDecl) {
     let Decl::UseStmt {
         module,
@@ -4167,11 +4175,7 @@ fn validate_use_decl(ctx: &mut Ctx<'_>, decl: &SpannedDecl) {
         return;
     };
 
-    let module_scope = match nature {
-        UseNature::Normal => ctx.st.find_module_scope(module),
-        UseNature::Intrinsic => ctx.st.find_intrinsic_module_scope(module),
-        UseNature::NonIntrinsic => ctx.st.find_non_intrinsic_module_scope(module),
-    };
+    let module_scope = find_use_module_scope(ctx.st, module, *nature);
     let Some(module_scope) = module_scope else {
         let msg = match nature {
             UseNature::Normal => format!("module '{}' not found", module),
@@ -9809,6 +9813,35 @@ end program
             1,
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn block_use_respects_module_nature() {
+        let errs = errors_from(
+            "\
+module iso_fortran_env
+  integer, parameter :: shadow_value = 7
+end module
+program p
+  block
+    use, intrinsic :: iso_fortran_env, only: int8
+    integer(int8) :: intrinsic_value
+    intrinsic_value = 1
+  end block
+  block
+    use, non_intrinsic :: iso_fortran_env, only: shadow_value
+    integer :: source_value
+    source_value = shadow_value
+  end block
+  block
+    use iso_fortran_env, only: shadow_value
+    integer :: normal_value
+    normal_value = shadow_value
+  end block
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
