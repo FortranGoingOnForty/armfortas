@@ -33687,6 +33687,7 @@ fn lower_internal_list_write_array_expr(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, item, ctx.st, desc);
     true
 }
 
@@ -62378,6 +62379,27 @@ end program
         assert!(ir.contains("afs_lst_ia_logical"));
         assert!(!ir.contains("afs_write_internal_int128"));
         assert!(!ir.contains("afs_lst_ia_int128"));
+    }
+
+    #[test]
+    fn lower_internal_write_array_expr_releases_owned_descriptor() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=64) :: fixed
+  character(len=:), allocatable :: deferred
+  integer :: values(4)
+  values = [1, 2, 3, 4]
+  write(fixed, *) values + 1
+  write(deferred, *) values * 2
+end program
+",
+        );
+        assert!(ir.contains("internal_list_arr_expr_check"));
+        assert!(ir.contains("afs_write_internal_int"));
+        assert!(ir.contains("afs_lst_ia_int"));
+        assert!(ir.contains("afs_deallocate_array"));
     }
 
     #[test]
