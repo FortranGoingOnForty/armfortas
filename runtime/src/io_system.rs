@@ -268,6 +268,14 @@ impl Unit {
         self.form == Form::Unformatted
     }
 
+    fn reset_read_state_after_positioning(&mut self) {
+        self.read_tokens.clear();
+        self.formatted_read_record = None;
+        self.formatted_read_cursor = 0;
+        self.terminal_nonadvancing_open_record = false;
+        self.pending_read = None;
+    }
+
     fn remember_list_write_result(&mut self, result: io::Result<()>) {
         if self.list_write_active && self.list_write_error.is_none() {
             if let Err(err) = result {
@@ -2617,6 +2625,7 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
         match &mut u.stream {
             UnitStream::FileRaw(f) => match f.seek(SeekFrom::Start(offset)) {
                 Ok(_) => {
+                    u.reset_read_state_after_positioning();
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
