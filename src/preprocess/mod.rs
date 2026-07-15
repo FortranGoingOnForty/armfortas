@@ -1074,219 +1074,234 @@ fn eval_expr(expr: &str) -> Result<bool, String> {
     if trimmed.is_empty() {
         return Err("empty expression".into());
     }
-    let val = eval_or(trimmed)?;
-    Ok(val != 0)
+    Ok(ConditionExprParser::new(trimmed).parse()? != 0)
 }
 
-fn eval_or(expr: &str) -> Result<i64, String> {
-    // Split on || (lowest precedence).
-    if let Some(pos) = find_op(expr, "||") {
-        let left = eval_or(&expr[..pos])?;
-        let right = eval_or(&expr[pos + 2..])?;
-        return Ok(if left != 0 || right != 0 { 1 } else { 0 });
+struct ConditionExprParser<'a> {
+    input: &'a str,
+    pos: usize,
+}
+
+impl<'a> ConditionExprParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, pos: 0 }
     }
-    eval_and(expr)
-}
 
-fn eval_and(expr: &str) -> Result<i64, String> {
-    if let Some(pos) = find_op(expr, "&&") {
-        let left = eval_and(&expr[..pos])?;
-        let right = eval_and(&expr[pos + 2..])?;
-        return Ok(if left != 0 && right != 0 { 1 } else { 0 });
-    }
-    eval_comparison(expr)
-}
-
-fn eval_comparison(expr: &str) -> Result<i64, String> {
-    // Scan right-to-left for left-associative evaluation.
-    for (op, op_len) in [
-        ("==", 2),
-        ("!=", 2),
-        (">=", 2),
-        ("<=", 2),
-        (">", 1),
-        ("<", 1),
-    ] {
-        if let Some(pos) = find_op_right(expr, op) {
-            let left = eval_comparison(&expr[..pos])?;
-            let right = eval_additive(&expr[pos + op_len..])?;
-            let result = match op {
-                "==" => left == right,
-                "!=" => left != right,
-                ">=" => left >= right,
-                "<=" => left <= right,
-                ">" => left > right,
-                "<" => left < right,
-                _ => unreachable!(),
-            };
-            return Ok(if result { 1 } else { 0 });
+    fn parse(mut self) -> Result<i64, String> {
+        let value = self.parse_logical_or()?;
+        self.skip_whitespace();
+        if self.pos != self.input.len() {
+            return Err(self.unexpected_token());
         }
+        Ok(value)
     }
-    eval_additive(expr)
-}
 
-fn eval_additive(expr: &str) -> Result<i64, String> {
-    // Scan right-to-left for left-associative + and -.
-    // But be careful: don't match unary minus (no left operand).
-    if let Some(pos) = find_op_right(expr, "+") {
-        let left = eval_additive(&expr[..pos])?;
-        let right = eval_multiplicative(&expr[pos + 1..])?;
-        return Ok(left + right);
-    }
-    // For minus, only match if there's a non-empty left side (not unary).
-    if let Some(pos) = find_op_right(expr, "-") {
-        if pos > 0 && !expr[..pos].trim().is_empty() {
-            let left = eval_additive(&expr[..pos])?;
-            let right = eval_multiplicative(&expr[pos + 1..])?;
-            return Ok(left - right);
+    fn parse_logical_or(&mut self) -> Result<i64, String> {
+        let mut left = self.parse_logical_and()?;
+        while self.consume("||") {
+            let right = self.parse_logical_and()?;
+            left = i64::from(left != 0 || right != 0);
         }
+        Ok(left)
     }
-    eval_multiplicative(expr)
-}
 
-fn eval_multiplicative(expr: &str) -> Result<i64, String> {
-    if let Some(pos) = find_op_right(expr, "*") {
-        let left = eval_multiplicative(&expr[..pos])?;
-        let right = eval_unary(&expr[pos + 1..])?;
-        return Ok(left * right);
-    }
-    if let Some(pos) = find_op_right(expr, "/") {
-        let left = eval_multiplicative(&expr[..pos])?;
-        let right = eval_unary(&expr[pos + 1..])?;
-        if right == 0 {
-            return Err("division by zero in #if expression".into());
+    fn parse_logical_and(&mut self) -> Result<i64, String> {
+        let mut left = self.parse_equality()?;
+        while self.consume("&&") {
+            let right = self.parse_equality()?;
+            left = i64::from(left != 0 && right != 0);
         }
-        return Ok(left / right);
-    }
-    if let Some(pos) = find_op_right(expr, "%") {
-        let left = eval_multiplicative(&expr[..pos])?;
-        let right = eval_unary(&expr[pos + 1..])?;
-        if right == 0 {
-            return Err("modulo by zero in #if expression".into());
-        }
-        return Ok(left % right);
-    }
-    eval_unary(expr)
-}
-
-fn eval_unary(expr: &str) -> Result<i64, String> {
-    let trimmed = expr.trim();
-    if let Some(rest) = trimmed.strip_prefix('!') {
-        let val = eval_unary(rest)?;
-        return Ok(if val == 0 { 1 } else { 0 });
-    }
-    if let Some(rest) = trimmed.strip_prefix('-') {
-        let val = eval_unary(rest)?;
-        return Ok(-val);
-    }
-    if let Some(rest) = trimmed.strip_prefix('+') {
-        return eval_unary(rest);
-    }
-    eval_primary(trimmed)
-}
-
-fn eval_primary(expr: &str) -> Result<i64, String> {
-    let trimmed = expr.trim();
-
-    if trimmed.is_empty() {
-        return Err("unexpected end of expression".into());
+        Ok(left)
     }
 
-    // Parenthesized expression.
-    if trimmed.starts_with('(') {
-        let close =
-            find_matching_paren(trimmed).ok_or("unmatched parenthesis in #if expression")?;
-        return eval_or(&trimmed[1..close]);
-    }
-
-    // Integer literal.
-    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        return i64::from_str_radix(&trimmed[2..], 16)
-            .map_err(|e| format!("invalid hex in #if: {}", e));
-    }
-    if let Ok(val) = trimmed.parse::<i64>() {
-        return Ok(val);
-    }
-
-    // Identifier — should have been expanded already. Treat as 0.
-    if trimmed.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return Ok(0);
-    }
-
-    Err(format!("unexpected token in #if expression: '{}'", trimmed))
-}
-
-/// Find an operator at the top level (not inside parentheses).
-fn find_op(expr: &str, op: &str) -> Option<usize> {
-    let bytes = expr.as_bytes();
-    let op_bytes = op.as_bytes();
-    let mut depth = 0i32;
-    let mut i = 0;
-    while i + op_bytes.len() <= bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ => {
-                if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
-                    // Make sure we don't match inside a longer operator.
-                    return Some(i);
-                }
+    fn parse_equality(&mut self) -> Result<i64, String> {
+        let mut left = self.parse_relational()?;
+        loop {
+            if self.consume("==") {
+                let right = self.parse_relational()?;
+                left = i64::from(left == right);
+            } else if self.consume("!=") {
+                let right = self.parse_relational()?;
+                left = i64::from(left != right);
+            } else {
+                return Ok(left);
             }
         }
-        i += 1;
     }
-    None
-}
 
-/// Find the rightmost occurrence of an operator at the top level (not inside parentheses).
-/// Used for left-associative binary operators.
-fn find_op_right(expr: &str, op: &str) -> Option<usize> {
-    let bytes = expr.as_bytes();
-    let op_bytes = op.as_bytes();
-    let mut depth = 0i32;
-    let mut last_match = None;
-    let mut i = 0;
-    while i + op_bytes.len() <= bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ => {
-                if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
-                    // Don't match multi-char operators as part of longer ones.
-                    // e.g., don't match ">" inside ">=" or "!" inside "!=".
-                    let after = i + op_bytes.len();
-                    let is_part_of_longer = match op {
-                        ">" => after < bytes.len() && bytes[after] == b'=',
-                        "<" => after < bytes.len() && bytes[after] == b'=',
-                        "!" => after < bytes.len() && bytes[after] == b'=',
-                        _ => false,
-                    };
-                    if !is_part_of_longer {
-                        last_match = Some(i);
-                    }
-                }
+    fn parse_relational(&mut self) -> Result<i64, String> {
+        let mut left = self.parse_additive()?;
+        loop {
+            if self.consume("<=") {
+                let right = self.parse_additive()?;
+                left = i64::from(left <= right);
+            } else if self.consume(">=") {
+                let right = self.parse_additive()?;
+                left = i64::from(left >= right);
+            } else if self.consume("<") {
+                let right = self.parse_additive()?;
+                left = i64::from(left < right);
+            } else if self.consume(">") {
+                let right = self.parse_additive()?;
+                left = i64::from(left > right);
+            } else {
+                return Ok(left);
             }
         }
-        i += 1;
     }
-    last_match
-}
 
-fn find_matching_paren(s: &str) -> Option<usize> {
-    let mut depth = 0;
-    for (i, ch) in s.chars().enumerate() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
+    fn parse_additive(&mut self) -> Result<i64, String> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            if self.consume("+") {
+                left = left.wrapping_add(self.parse_multiplicative()?);
+            } else if self.consume("-") {
+                left = left.wrapping_sub(self.parse_multiplicative()?);
+            } else {
+                return Ok(left);
             }
-            _ => {}
         }
     }
-    None
+
+    fn parse_multiplicative(&mut self) -> Result<i64, String> {
+        let mut left = self.parse_unary()?;
+        loop {
+            if self.consume("*") {
+                left = left.wrapping_mul(self.parse_unary()?);
+            } else if self.consume("/") {
+                let right = self.parse_unary()?;
+                if right == 0 {
+                    return Err("division by zero in #if expression".into());
+                }
+                left = if left == i64::MIN && right == -1 {
+                    i64::MIN
+                } else {
+                    left / right
+                };
+            } else if self.consume("%") {
+                let right = self.parse_unary()?;
+                if right == 0 {
+                    return Err("modulo by zero in #if expression".into());
+                }
+                left = if left == i64::MIN && right == -1 {
+                    0
+                } else {
+                    left % right
+                };
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_unary(&mut self) -> Result<i64, String> {
+        if self.consume("!") {
+            return Ok(i64::from(self.parse_unary()? == 0));
+        }
+        if self.consume("-") {
+            return Ok(self.parse_unary()?.wrapping_neg());
+        }
+        if self.consume("+") {
+            return self.parse_unary();
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<i64, String> {
+        self.skip_whitespace();
+        if self.consume("(") {
+            let value = self.parse_logical_or()?;
+            if !self.consume(")") {
+                return Err("unmatched parenthesis in #if expression".into());
+            }
+            return Ok(value);
+        }
+
+        let bytes = self.input.as_bytes();
+        if self.pos >= bytes.len() {
+            return Err("unexpected end of expression".into());
+        }
+
+        if bytes[self.pos].is_ascii_digit() {
+            let start = self.pos;
+            if bytes[self.pos] == b'0'
+                && bytes
+                    .get(self.pos + 1)
+                    .is_some_and(|next| matches!(next, b'x' | b'X'))
+            {
+                self.pos += 2;
+                let digits = self.pos;
+                while self
+                    .input
+                    .as_bytes()
+                    .get(self.pos)
+                    .is_some_and(u8::is_ascii_hexdigit)
+                {
+                    self.pos += 1;
+                }
+                if self.pos == digits {
+                    return Err("invalid hex in #if: missing digits".into());
+                }
+                return i64::from_str_radix(&self.input[digits..self.pos], 16)
+                    .map_err(|err| format!("invalid hex in #if: {}", err));
+            }
+
+            while self
+                .input
+                .as_bytes()
+                .get(self.pos)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.pos += 1;
+            }
+            return self.input[start..self.pos]
+                .parse::<i64>()
+                .map_err(|err| format!("invalid integer in #if: {}", err));
+        }
+
+        if bytes[self.pos].is_ascii_alphabetic() || bytes[self.pos] == b'_' {
+            self.pos += 1;
+            while self
+                .input
+                .as_bytes()
+                .get(self.pos)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                self.pos += 1;
+            }
+            return Ok(0);
+        }
+
+        Err(self.unexpected_token())
+    }
+
+    fn consume(&mut self, token: &str) -> bool {
+        self.skip_whitespace();
+        if self.input[self.pos..].starts_with(token) {
+            self.pos += token.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .input
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn unexpected_token(&self) -> String {
+        format!(
+            "unexpected token in #if expression: '{}'",
+            self.input[self.pos..].trim()
+        )
+    }
 }
 
 /// Replace remaining identifiers with "0" in a #if expression.
@@ -2130,12 +2145,101 @@ end program
     }
 
     #[test]
+    fn eval_mixed_arithmetic_is_left_associative() {
+        assert!(eval_expr("10 + 5 - 2 == 13").unwrap());
+        assert!(eval_expr("48 / 4 * 2 % 5 == 4").unwrap());
+        assert!(eval_expr("1 - -2 == 3").unwrap());
+    }
+
+    #[test]
+    fn eval_relational_operators_bind_before_equality() {
+        assert!(eval_expr("1 == 2 < 3").unwrap());
+        assert!(!eval_expr("3 < 4 == 0").unwrap());
+    }
+
+    #[test]
+    fn eval_integer_overflow_wraps_without_panicking() {
+        assert_eq!(
+            ConditionExprParser::new("9223372036854775807 + 1")
+                .parse()
+                .unwrap(),
+            i64::MIN
+        );
+        assert_eq!(
+            ConditionExprParser::new("-9223372036854775807 - 2")
+                .parse()
+                .unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            ConditionExprParser::new("3037000500 * 3037000500")
+                .parse()
+                .unwrap(),
+            -9_223_372_036_709_301_616
+        );
+        assert_eq!(
+            ConditionExprParser::new("(-9223372036854775807 - 1) / -1")
+                .parse()
+                .unwrap(),
+            i64::MIN
+        );
+        assert_eq!(
+            ConditionExprParser::new("(-9223372036854775807 - 1) % -1")
+                .parse()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ConditionExprParser::new("-(-9223372036854775807 - 1)")
+                .parse()
+                .unwrap(),
+            i64::MIN
+        );
+    }
+
+    #[test]
+    fn eval_reports_arithmetic_and_syntax_errors() {
+        assert_eq!(
+            ConditionExprParser::new("1 / 0").parse().unwrap_err(),
+            "division by zero in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 % 0").parse().unwrap_err(),
+            "modulo by zero in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("(1 + 2").parse().unwrap_err(),
+            "unmatched parenthesis in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 + 2 trailing")
+                .parse()
+                .unwrap_err(),
+            "unexpected token in #if expression: 'trailing'"
+        );
+    }
+
+    #[test]
     fn if_with_arithmetic() {
         let out = pp_with(
             "#if MAX + 1 > 512\nbig\n#else\nsmall\n#endif\n",
             &[("MAX", "1024")],
         );
         assert!(lines(&out).contains(&"big"));
+    }
+
+    #[test]
+    fn if_with_mixed_arithmetic_selects_the_true_branch() {
+        let out = pp(
+            "#if 10 + 5 - 2 == 13\nselected\n#else\n#error arithmetic precedence broken\n#endif\n",
+        );
+        assert!(lines(&out).contains(&"selected"));
+    }
+
+    #[test]
+    fn if_overflow_remains_evaluable() {
+        let out = pp("#if 9223372036854775807 + 1\nselected\n#endif\n");
+        assert!(lines(&out).contains(&"selected"));
     }
 
     #[test]
