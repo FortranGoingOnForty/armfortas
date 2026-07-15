@@ -7,6 +7,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::lexer::{SourceForm, Token, TokenKind};
+
 /// Information extracted from a single source file.
 #[derive(Debug)]
 pub struct FileDeps {
@@ -28,8 +30,111 @@ pub struct FileDeps {
     pub submodule_of: Option<(String, String)>,
 }
 
+fn is_identifier(token: &Token, expected: &str) -> bool {
+    matches!(&token.kind, TokenKind::Identifier) && token.text.eq_ignore_ascii_case(expected)
+}
+
+fn identifier(token: &Token) -> Option<&str> {
+    if matches!(&token.kind, TokenKind::Identifier) {
+        Some(&token.text)
+    } else {
+        None
+    }
+}
+
+fn statement_tokens(tokens: &[Token]) -> &[Token] {
+    let end = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Comment))
+        .unwrap_or(tokens.len());
+    let tokens = &tokens[..end];
+    if tokens
+        .first()
+        .is_some_and(|token| matches!(&token.kind, TokenKind::IntegerLiteral))
+    {
+        &tokens[1..]
+    } else {
+        tokens
+    }
+}
+
+fn module_definition(statement: &[Token]) -> Option<String> {
+    let [keyword, name] = statement else {
+        return None;
+    };
+    if !is_identifier(keyword, "module") {
+        return None;
+    }
+    Some(identifier(name)?.to_ascii_lowercase())
+}
+
+fn submodule_definition(statement: &[Token]) -> Option<(String, String, String)> {
+    if !statement
+        .first()
+        .is_some_and(|token| is_identifier(token, "submodule"))
+        || !statement
+            .get(1)
+            .is_some_and(|token| matches!(&token.kind, TokenKind::LParen))
+    {
+        return None;
+    }
+    let close = statement[2..]
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::RParen))?
+        + 2;
+    let parent = &statement[2..close];
+    let ancestor = identifier(parent.first()?)?.to_ascii_lowercase();
+    let parent_ref = match parent {
+        [_] => ancestor.clone(),
+        [_, colon, nested]
+            if matches!(&colon.kind, TokenKind::Colon)
+                && matches!(&nested.kind, TokenKind::Identifier) =>
+        {
+            format!("{ancestor}:{}", nested.text.to_ascii_lowercase())
+        }
+        _ => return None,
+    };
+    let name = identifier(statement.get(close + 1)?)?.to_ascii_lowercase();
+    Some((format!("{ancestor}:{name}"), ancestor, parent_ref))
+}
+
+fn use_dependency(statement: &[Token]) -> Option<String> {
+    if !statement
+        .first()
+        .is_some_and(|token| is_identifier(token, "use"))
+    {
+        return None;
+    }
+
+    let mut index = 1;
+    let mut explicit_intrinsic = false;
+    if statement
+        .get(index)
+        .is_some_and(|token| matches!(&token.kind, TokenKind::Comma))
+    {
+        index += 1;
+        explicit_intrinsic = identifier(statement.get(index)?)?.eq_ignore_ascii_case("intrinsic");
+        index += 1;
+        if !statement
+            .get(index)
+            .is_some_and(|token| matches!(&token.kind, TokenKind::ColonColon))
+        {
+            return None;
+        }
+        index += 1;
+    } else if statement
+        .get(index)
+        .is_some_and(|token| matches!(&token.kind, TokenKind::ColonColon))
+    {
+        index += 1;
+    }
+
+    let module = identifier(statement.get(index)?)?;
+    (!explicit_intrinsic).then(|| module.to_ascii_lowercase())
+}
+
 /// Preprocess and scan a source file for MODULE and USE statements.
-/// Uses a simple line-by-line keyword scan — no lexer or parser needed.
+/// Uses the source-form lexer to delimit statements without invoking the parser.
 pub fn scan_file(
     path: &Path,
     config: &crate::preprocess::PreprocConfig,
@@ -39,100 +144,47 @@ pub fn scan_file(
     let content = crate::preprocess::preprocess_bytes_for_dependency_scan(&content, config)
         .map_err(|e| e.to_string())?
         .text;
+    let source_form = if config.fixed_form {
+        SourceForm::FixedForm
+    } else {
+        SourceForm::FreeForm
+    };
+    let tokens = crate::lexer::tokenize_source_view(&content, 0, source_form)
+        .map_err(|error| format!("cannot scan '{}': {}", path.display(), error))?;
 
     let mut defines = Vec::new();
     let mut uses = Vec::new();
     let mut submodule_of: Option<(String, String)> = None;
 
-    for line in content.lines() {
-        let trimmed = line.trim().to_lowercase();
-        // Skip comments and empty lines.
-        if trimmed.starts_with('!') || trimmed.is_empty() {
+    for raw_statement in tokens.split(|token| {
+        matches!(
+            &token.kind,
+            TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof
+        )
+    }) {
+        let statement = statement_tokens(raw_statement);
+        if statement.is_empty() {
             continue;
         }
 
-        // SUBMODULE (<parent-spec>) <name> — F2008. The parent spec is
-        // either a bare ancestor module name (`(a) c`) or an
-        // `ancestor:parent` pair for a nested submodule (`(a:b) c`). The
-        // submodule must compile after its parent (so the parent `.amod`
-        // exists), so record the parent reference as a USE edge and the
-        // submodule's own `ancestor:name` identifier as a definition.
-        if let Some(rest) = trimmed.strip_prefix("submodule") {
-            let rest = rest.trim_start();
-            if let Some(open) = rest.strip_prefix('(') {
-                if let Some(close_idx) = open.find(')') {
-                    let parent_spec = open[..close_idx].trim();
-                    let after = open[close_idx + 1..].trim();
-                    let name = after
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .find(|s| !s.is_empty());
-                    if let (false, Some(name)) = (parent_spec.is_empty(), name) {
-                        // ancestor = first component of the parent spec.
-                        let ancestor = parent_spec.split(':').next().unwrap_or(parent_spec).trim();
-                        // Parent reference to depend on: the full parent
-                        // spec (module name, or `ancestor:parent` for a
-                        // nested submodule — both appear in some file's
-                        // `defines`).
-                        let parent_ref = parent_spec.to_string();
-                        uses.push(parent_ref.clone());
-                        // This submodule's own identifier, so nested
-                        // children (`submodule (ancestor:name) g`) resolve.
-                        defines.push(format!("{ancestor}:{name}"));
-                        submodule_of = Some((ancestor.to_string(), parent_ref));
-                    }
-                }
-            }
+        // SUBMODULE (<parent-spec>) <name> depends on its parent and defines
+        // an ancestor-qualified name for any nested child submodules.
+        if let Some((definition, ancestor, parent_ref)) = submodule_definition(statement) {
+            uses.push(parent_ref.clone());
+            defines.push(definition);
+            submodule_of = Some((ancestor, parent_ref));
             continue;
         }
 
-        // MODULE <name> — but not "module procedure" or "module function"
-        if let Some(rest) = trimmed.strip_prefix("module ") {
-            let rest = rest.trim();
-            if rest.starts_with("procedure")
-                || rest.starts_with("function")
-                || rest.starts_with("subroutine")
-            {
-                continue;
-            }
-            // Extract the module name (first identifier after "module").
-            if let Some(name) = rest.split_whitespace().next() {
-                let clean = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                if !clean.is_empty() {
-                    defines.push(clean.to_string());
-                }
-            }
+        // A module program-unit statement has exactly MODULE <name>. Requiring
+        // that complete shape excludes MODULE PROCEDURE and prefixed module
+        // functions/subroutines.
+        if let Some(name) = module_definition(statement) {
+            defines.push(name);
         }
 
-        // USE <name> [, ...]
-        if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
-            let mut rest = if let Some(after_comma) = trimmed.strip_prefix("use,") {
-                // USE, intrinsic :: name
-                if let Some(idx) = trimmed.find("::") {
-                    trimmed[idx + 2..].trim()
-                } else {
-                    after_comma
-                }
-            } else if let Some(after_use) = trimmed.strip_prefix("use ") {
-                after_use.trim()
-            } else {
-                unreachable!()
-            };
-            // Strip leading :: (USE :: module_name syntax).
-            if rest.starts_with("::") {
-                rest = rest[2..].trim();
-            }
-            if let Some(name) = rest
-                .split(|c: char| c == ',' || c == ':' || c.is_whitespace())
-                .next()
-            {
-                let clean = name.trim();
-                if !clean.is_empty() && clean != "only" {
-                    // Skip intrinsic modules — they don't need .amod files.
-                    if !is_intrinsic_module(clean) {
-                        uses.push(clean.to_string());
-                    }
-                }
-            }
+        if let Some(module) = use_dependency(statement) {
+            uses.push(module);
         }
     }
 
@@ -150,26 +202,27 @@ pub fn scan_file(
     })
 }
 
-fn is_intrinsic_module(name: &str) -> bool {
-    matches!(
-        name,
-        "iso_c_binding"
-            | "iso_fortran_env"
-            | "ieee_arithmetic"
-            | "ieee_exceptions"
-            | "ieee_features"
-    )
-}
-
 /// Determine compilation order for a set of source files.
 /// Returns the files in topological order (dependencies first).
 /// Errors on circular dependencies.
 pub fn resolve_compilation_order(files: &[FileDeps]) -> Result<Vec<usize>, String> {
     // Build: module_name → file_index that defines it.
-    let mut module_to_file: HashMap<&str, usize> = HashMap::new();
+    let mut module_to_file: HashMap<String, usize> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
         for def in &f.defines {
-            module_to_file.insert(def.as_str(), i);
+            let key = def.to_ascii_lowercase();
+            if let Some(&first) = module_to_file.get(&key) {
+                if first != i {
+                    return Err(format!(
+                        "duplicate module definition '{}': '{}' and '{}' both define it",
+                        key,
+                        files[first].path.display(),
+                        f.path.display()
+                    ));
+                }
+            } else {
+                module_to_file.insert(key, i);
+            }
         }
     }
 
@@ -180,7 +233,7 @@ pub fn resolve_compilation_order(files: &[FileDeps]) -> Result<Vec<usize>, Strin
 
     for (i, f) in files.iter().enumerate() {
         for used in &f.uses {
-            if let Some(&j) = module_to_file.get(used.as_str()) {
+            if let Some(&j) = module_to_file.get(&used.to_ascii_lowercase()) {
                 if i != j {
                     dependents[j].push(i);
                     in_degree[i] += 1;
@@ -251,6 +304,84 @@ mod tests {
         assert_eq!(deps.defines, vec!["mymod"]);
         assert_eq!(deps.uses, vec!["other_mod"]);
         assert_eq!(deps.submodule_of, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_honors_use_module_nature() {
+        let dir = std::env::temp_dir().join("dep_scan_use_nature");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("consumer.f90");
+        std::fs::write(
+            &f,
+            "module consumer\n  use, intrinsic :: user_module\n  use, non_intrinsic :: iso_fortran_env\nend module\n",
+        )
+        .unwrap();
+
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
+        assert_eq!(deps.uses, vec!["iso_fortran_env"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_finds_semicolon_separated_uses_outside_literals_and_comments() {
+        let dir = std::env::temp_dir().join("dep_scan_semicolon_uses");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("consumer.f90");
+        std::fs::write(
+            &f,
+            "module consumer; use first; character(len=*), parameter :: marker = 'don''t; use fake'; use second !; use ignored\nprint *, \"semi; ! use fake_too\"; use third\nend module\n",
+        )
+        .unwrap();
+
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
+        assert_eq!(deps.defines, vec!["consumer"]);
+        assert_eq!(deps.uses, vec!["first", "second", "third"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_ignores_semicolons_in_fixed_comments_and_hollerith_text() {
+        let dir = std::env::temp_dir().join("dep_scan_fixed_semicolons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("producer.f");
+        std::fs::write(
+            &f,
+            "      MODULE A\nC COMMENT; USE COMMENT_DEP\n      CONTAINS\n      SUBROUTINE SHOW(I)\n  100 FORMAT(6H;USE B,I2)\n      END\n      END\n",
+        )
+        .unwrap();
+        let config = crate::preprocess::PreprocConfig {
+            fixed_form: true,
+            ..Default::default()
+        };
+
+        let deps = scan_file(&f, &config).unwrap();
+        assert_eq!(deps.defines, vec!["a"]);
+        assert!(
+            deps.uses.is_empty(),
+            "unexpected dependencies: {:?}",
+            deps.uses
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_ignores_prefixed_module_procedures() {
+        let dir = std::env::temp_dir().join("dep_scan_prefixed_module_procedures");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("contracts.f90");
+        std::fs::write(
+            &f,
+            "module contracts\ninterface\n  module pure function value()\n    integer :: value\n  end function value\nend interface\nend module contracts\n",
+        )
+        .unwrap();
+
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
+        assert_eq!(deps.defines, vec!["contracts"]);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -452,5 +583,28 @@ mod tests {
         let pos_a = order.iter().position(|&i| i == 3).unwrap();
         assert!(pos_d < pos_a);
         assert_eq!(order.len(), 4);
+    }
+
+    #[test]
+    fn topo_sort_rejects_duplicate_module_definitions() {
+        let files = vec![
+            FileDeps {
+                path: "first.f90".into(),
+                defines: vec!["shared_name".into()],
+                uses: vec![],
+                submodule_of: None,
+            },
+            FileDeps {
+                path: "second.f90".into(),
+                defines: vec!["SHARED_NAME".into()],
+                uses: vec![],
+                submodule_of: None,
+            },
+        ];
+
+        let err = resolve_compilation_order(&files).unwrap_err();
+        assert!(err.contains("duplicate module definition 'shared_name'"));
+        assert!(err.contains("first.f90"));
+        assert!(err.contains("second.f90"));
     }
 }

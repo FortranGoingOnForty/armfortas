@@ -135,6 +135,7 @@ impl SymbolTable {
             id: 0,
             parent: None,
             kind: ScopeKind::Global,
+            intrinsic_module: false,
             symbols: HashMap::new(),
             implicit_rules: ImplicitRules::default_fortran(),
             has_explicit_implicit_stmt: false,
@@ -305,6 +306,7 @@ impl SymbolTable {
             id,
             parent: Some(self.current),
             kind,
+            intrinsic_module: false,
             symbols: HashMap::new(),
             implicit_rules: parent_implicit, // inherit from parent, may be overridden
             has_explicit_implicit_stmt: false,
@@ -317,6 +319,13 @@ impl SymbolTable {
         };
         self.scopes.push(scope);
         self.current = id;
+        id
+    }
+
+    /// Create a built-in intrinsic module scope.
+    pub fn push_intrinsic_module_scope(&mut self, name: &str) -> ScopeId {
+        let id = self.push_scope(ScopeKind::Module(name.into()));
+        self.scopes[id].intrinsic_module = true;
         id
     }
 
@@ -1960,9 +1969,28 @@ impl SymbolTable {
 
     /// Find a module scope by name (for USE resolution within the same file).
     pub fn find_module_scope(&self, name: &str) -> Option<ScopeId> {
+        self.find_non_intrinsic_module_scope(name)
+            .or_else(|| self.find_intrinsic_module_scope(name))
+    }
+
+    pub fn find_intrinsic_module_scope(&self, name: &str) -> Option<ScopeId> {
+        self.find_module_scope_with_nature(name, Some(true))
+    }
+
+    pub fn find_non_intrinsic_module_scope(&self, name: &str) -> Option<ScopeId> {
+        self.find_module_scope_with_nature(name, Some(false))
+    }
+
+    fn find_module_scope_with_nature(
+        &self,
+        name: &str,
+        intrinsic: Option<bool>,
+    ) -> Option<ScopeId> {
         self.scopes.iter().find_map(|s| {
             if let ScopeKind::Module(ref n) = s.kind {
-                if n.eq_ignore_ascii_case(name) {
+                if n.eq_ignore_ascii_case(name)
+                    && intrinsic.is_none_or(|expected| s.intrinsic_module == expected)
+                {
                     Some(s.id)
                 } else {
                     None
@@ -2059,6 +2087,7 @@ pub struct Scope {
     pub id: ScopeId,
     pub parent: Option<ScopeId>,
     pub kind: ScopeKind,
+    pub(crate) intrinsic_module: bool,
     pub symbols: HashMap<String, Symbol>,
     pub implicit_rules: ImplicitRules,
     pub has_explicit_implicit_stmt: bool,

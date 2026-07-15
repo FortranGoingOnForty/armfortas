@@ -180,7 +180,7 @@ impl<'a> Parser<'a> {
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
         let mut contains = self.parse_contains_section()?;
         contains.extend(ifaces); // Interface blocks resolved by sema, ignored by lowering.
-        self.consume_end("program")?;
+        self.consume_named_end("program", name.as_deref())?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -223,7 +223,7 @@ impl<'a> Parser<'a> {
         // position forever.
         self.skip_newlines();
         if self.peek() != &TokenKind::Eof {
-            let _ = self.consume_end("program");
+            self.consume_named_end("program", None)?;
         }
 
         let span = span_from_to(start, self.prev_span());
@@ -249,7 +249,7 @@ impl<'a> Parser<'a> {
         let (uses, imports, implicit, decls, _body, ifaces) = self.parse_unit_body(&["module"])?;
         let mut contains = self.parse_contains_section()?;
         contains.extend(ifaces);
-        self.consume_end("module")?;
+        self.consume_named_end("module", Some(&name))?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -287,7 +287,7 @@ impl<'a> Parser<'a> {
         // submodule — e.g. stdlib_quadrature_simps's
         // `interface simps38_weights` — are silently dropped).
         contains.extend(ifaces);
-        self.consume_end("submodule")?;
+        self.consume_named_end("submodule", Some(&name))?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -328,7 +328,7 @@ impl<'a> Parser<'a> {
             self.parse_unit_body(&["subroutine"])?;
         let mut contains = self.parse_contains_section()?;
         contains.extend(ifaces);
-        self.consume_end("subroutine")?;
+        self.consume_named_end("subroutine", Some(&name))?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -386,7 +386,7 @@ impl<'a> Parser<'a> {
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["function"])?;
         let mut contains = self.parse_contains_section()?;
         contains.extend(ifaces);
-        self.consume_end("function")?;
+        self.consume_named_end("function", Some(&name))?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -432,7 +432,7 @@ impl<'a> Parser<'a> {
             self.parse_unit_body(&["procedure"])?;
         let mut contains = self.parse_contains_section()?;
         contains.extend(ifaces);
-        self.consume_end("procedure")?;
+        self.consume_named_end("procedure", Some(&name))?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -464,16 +464,7 @@ impl<'a> Parser<'a> {
 
         let (uses, _imports, _implicit, decls, _body, _ifaces) =
             self.parse_unit_body(&["blockdata", "block"])?;
-        // End block data.
-        self.skip_newlines();
-        let text = self.peek_text().to_lowercase();
-        if text == "endblockdata" {
-            self.advance();
-        } else if text == "end" {
-            self.advance();
-            self.eat_ident("block");
-            self.eat_ident("data");
-        }
+        self.consume_named_end("block data", name.as_deref())?;
 
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(
@@ -1382,6 +1373,12 @@ mod tests {
         units.into_iter().next().unwrap()
     }
 
+    fn parse_error(src: &str) -> ParseError {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.parse_file().unwrap_err()
+    }
+
     // ---- PROGRAM ----
 
     #[test]
@@ -1421,6 +1418,70 @@ mod tests {
             assert_eq!(body.len(), 1);
         } else {
             panic!("not Program");
+        }
+    }
+
+    #[test]
+    fn block_data_end_requires_complete_multiword_keyword() {
+        let err = parse_error("block data foo\nend block foo\n");
+        assert!(
+            err.msg.contains("expected 'data' after 'end block'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn closing_program_unit_names_match_case_insensitively() {
+        let sources = [
+            "program Alpha\nend program ALPHA\n",
+            "module Alpha\nend module ALPHA\n",
+            "submodule(parent) Alpha\nend submodule ALPHA\n",
+            "subroutine Alpha()\nend subroutine ALPHA\n",
+            "function Alpha()\nend function ALPHA\n",
+            "module procedure Alpha\nend procedure ALPHA\n",
+            "block data Alpha\nend block data ALPHA\n",
+        ];
+
+        for source in sources {
+            parse_unit(source);
+        }
+    }
+
+    #[test]
+    fn closing_program_unit_names_must_match() {
+        let sources = [
+            "program alpha\nend program beta\n",
+            "module alpha\nend module beta\n",
+            "submodule(parent) alpha\nend submodule beta\n",
+            "subroutine alpha()\nend subroutine beta\n",
+            "function alpha()\nend function beta\n",
+            "module procedure alpha\nend procedure beta\n",
+            "block data alpha\nend block data beta\n",
+        ];
+
+        for source in sources {
+            let err = parse_error(source);
+            assert!(
+                err.msg.contains("does not match opening name 'alpha'"),
+                "unexpected error for {source:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_name_requires_an_opening_name() {
+        let sources = [
+            "program\nend program alpha\n",
+            "value = 1\nend program alpha\n",
+            "block data\nend block data alpha\n",
+        ];
+
+        for source in sources {
+            let err = parse_error(source);
+            assert!(
+                err.msg.contains("name 'alpha' has no opening name"),
+                "unexpected error for {source:?}: {err}"
+            );
         }
     }
 

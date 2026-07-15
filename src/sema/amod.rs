@@ -17,12 +17,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 
+use crate::ast::decl::UseNature;
 use crate::ir::inst::{FuncRef, Function, InstKind, Module as IrModule};
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::TypeLayoutRegistry;
 
-const AMOD_VERSION: u32 = 7;
+const AMOD_VERSION: u32 = 8;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -224,6 +225,22 @@ fn decode_nested_field_default_init(
 // Writer
 // =====================================================================
 
+fn resolved_module_nature(scope: &Scope) -> UseNature {
+    if scope.intrinsic_module {
+        UseNature::Intrinsic
+    } else {
+        UseNature::NonIntrinsic
+    }
+}
+
+fn format_module_reference(module_name: &str, nature: UseNature) -> String {
+    match nature {
+        UseNature::Normal => module_name.to_string(),
+        UseNature::Intrinsic => format!("intrinsic :: {module_name}"),
+        UseNature::NonIntrinsic => format!("non_intrinsic :: {module_name}"),
+    }
+}
+
 /// Serialize a module's public interface to the current `.amod` text format.
 pub fn write_amod(
     module_name: &str,
@@ -284,7 +301,7 @@ pub fn write_amod(
     writeln!(out).unwrap();
 
     // ---- Dependencies ----
-    let mut deps: Vec<String> = scope
+    let mut deps: Vec<AmodModuleDependency> = scope
         .use_associations
         .iter()
         .filter_map(|ua| {
@@ -293,15 +310,23 @@ pub fn write_amod(
             }
             let src_scope = st.scope(ua.source_scope);
             if let ScopeKind::Module(ref n) = src_scope.kind {
-                Some(n.to_lowercase())
+                Some(AmodModuleDependency {
+                    module_name: n.to_lowercase(),
+                    nature: resolved_module_nature(src_scope),
+                })
             } else {
                 None
             }
         })
         .collect();
-    deps.sort();
+    deps.sort_by(|left, right| left.module_name.cmp(&right.module_name));
     for dep in &deps {
-        writeln!(out, "@uses {}", dep).unwrap();
+        writeln!(
+            out,
+            "@uses {}",
+            format_module_reference(&dep.module_name, dep.nature)
+        )
+        .unwrap();
     }
     if !deps.is_empty() {
         writeln!(out).unwrap();
@@ -310,7 +335,7 @@ pub fn write_amod(
     // ONLY-qualified edges must retain their exact local and provider names.
     // Reconstructing them as bare USE edges leaks every public provider symbol
     // through a separately compiled facade.
-    let mut only_out: Vec<(String, String, String)> = scope
+    let mut only_out: Vec<(String, String, String, UseNature)> = scope
         .use_associations
         .iter()
         .filter_map(|ua| {
@@ -323,16 +348,25 @@ pub fn write_amod(
                     ua.local_name.clone(),
                     ua.original_name.clone(),
                     n.to_lowercase(),
+                    resolved_module_nature(src_scope),
                 ))
             } else {
                 None
             }
         })
         .collect();
-    only_out.sort();
+    only_out
+        .sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
     only_out.dedup();
-    for (local, original, src) in &only_out {
-        writeln!(out, "@use_only {} = {} from {}", local, original, src).unwrap();
+    for (local, original, src, nature) in &only_out {
+        writeln!(
+            out,
+            "@use_only {} = {} from {}",
+            local,
+            original,
+            format_module_reference(src, *nature)
+        )
+        .unwrap();
     }
     if !only_out.is_empty() {
         writeln!(out).unwrap();
@@ -345,7 +379,7 @@ pub fn write_amod(
     // and intrinsic dispatch; without preserving the rename, the .amod
     // can't reconstruct the kind constant and `integer(block_kind) ::
     // dummy` falls back to the default kind.
-    let mut renames_out: Vec<(String, String, String)> = scope
+    let mut renames_out: Vec<(String, String, String, UseNature)> = scope
         .use_associations
         .iter()
         .filter_map(|ua| {
@@ -358,15 +392,24 @@ pub fn write_amod(
                     ua.local_name.clone(),
                     ua.original_name.clone(),
                     n.to_lowercase(),
+                    resolved_module_nature(src_scope),
                 ))
             } else {
                 None
             }
         })
         .collect();
-    renames_out.sort();
-    for (local, original, src) in &renames_out {
-        writeln!(out, "@use_rename {} = {} from {}", local, original, src).unwrap();
+    renames_out
+        .sort_by(|left, right| (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2)));
+    for (local, original, src, nature) in &renames_out {
+        writeln!(
+            out,
+            "@use_rename {} = {} from {}",
+            local,
+            original,
+            format_module_reference(src, *nature)
+        )
+        .unwrap();
     }
     if !renames_out.is_empty() {
         writeln!(out).unwrap();
@@ -1590,6 +1633,13 @@ pub struct UseRename {
     pub local: String,
     pub original: String,
     pub source_module: String,
+    pub source_nature: UseNature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmodModuleDependency {
+    pub module_name: String,
+    pub nature: UseNature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1606,7 +1656,7 @@ pub struct ModuleInterface {
     pub submodule_ancestor: Option<String>,
     pub submodule_parent: Option<String>,
     pub host_association: AmodHostAssociation,
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<AmodModuleDependency>,
     pub only_imports: Vec<UseRename>,
     pub renames: Vec<UseRename>,
     pub variables: Vec<AmodVar>,
@@ -1789,14 +1839,42 @@ fn parse_use_binding(rest: &str, directive: &str, path: &Path) -> Result<UseRena
     let (local, original) = lhs.split_once(" = ").ok_or_else(&malformed)?;
     let local = local.trim();
     let original = original.trim();
-    let source_module = source_module.trim();
-    if local.is_empty() || original.is_empty() || source_module.is_empty() {
+    let source = parse_module_reference(source_module.trim(), directive, path)?;
+    if local.is_empty() || original.is_empty() {
         return Err(malformed());
     }
     Ok(UseRename {
         local: local.to_string(),
         original: original.to_string(),
-        source_module: source_module.to_string(),
+        source_module: source.module_name,
+        source_nature: source.nature,
+    })
+}
+
+fn parse_module_reference(
+    value: &str,
+    directive: &str,
+    path: &Path,
+) -> Result<AmodModuleDependency, String> {
+    let malformed = || {
+        format!(
+            "{}: corrupt .amod file (malformed {} module reference); rebuild the provider module",
+            path.display(),
+            directive
+        )
+    };
+    let (nature, module_name) = match value.split_once(" :: ") {
+        Some(("intrinsic", module_name)) => (UseNature::Intrinsic, module_name.trim()),
+        Some(("non_intrinsic", module_name)) => (UseNature::NonIntrinsic, module_name.trim()),
+        Some(_) => return Err(malformed()),
+        None => (UseNature::Normal, value.trim()),
+    };
+    if module_name.is_empty() {
+        return Err(malformed());
+    }
+    Ok(AmodModuleDependency {
+        module_name: module_name.to_string(),
+        nature,
     })
 }
 
@@ -1880,7 +1958,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
         }
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
-            dependencies.push(dep.trim().to_string());
+            dependencies.push(parse_module_reference(dep.trim(), "@uses", path)?);
         } else if trimmed == "@use_only" {
             only_imports.push(parse_use_binding("", "@use_only", path)?);
         } else if let Some(rest) = trimmed.strip_prefix("@use_only ") {
@@ -3021,7 +3099,13 @@ mod tests {
 "#;
         let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
         assert_eq!(iface.module_name, "physics");
-        assert_eq!(iface.dependencies, vec!["iso_c_binding"]);
+        assert_eq!(
+            iface.dependencies,
+            vec![AmodModuleDependency {
+                module_name: "iso_c_binding".into(),
+                nature: UseNature::Normal,
+            }]
+        );
         assert!(iface.only_imports.is_empty());
         assert_eq!(iface.variables.len(), 2); // call_count + gravity
         assert!(iface.variables.iter().any(|v| v.name == "call_count"
@@ -3066,17 +3150,35 @@ mod tests {
 
     #[test]
     fn only_qualified_dependencies_round_trip_exact_bindings() {
-        let amod_text = r#"#!amod 7
+        let amod_text = r#"#!amod 8
 # module: facade
 # source: facade.f90
 
-@uses bare_dep
-@use_only visible = visible from filtered_dep
-@use_only alias = remote from filtered_dep
+@uses intrinsic :: intrinsic_dep
+@uses non_intrinsic :: authored_dep
+@uses legacy_dep
+@use_only visible = visible from intrinsic :: filtered_dep
+@use_only alias = remote from non_intrinsic :: filtered_dep
 @use_rename local_name = remote_name from bare_dep
 "#;
         let iface = parse_amod(amod_text, Path::new("test.amod")).unwrap();
-        assert_eq!(iface.dependencies, vec!["bare_dep"]);
+        assert_eq!(
+            iface.dependencies,
+            vec![
+                AmodModuleDependency {
+                    module_name: "intrinsic_dep".into(),
+                    nature: UseNature::Intrinsic,
+                },
+                AmodModuleDependency {
+                    module_name: "authored_dep".into(),
+                    nature: UseNature::NonIntrinsic,
+                },
+                AmodModuleDependency {
+                    module_name: "legacy_dep".into(),
+                    nature: UseNature::Normal,
+                },
+            ]
+        );
         assert_eq!(
             iface.only_imports,
             vec![
@@ -3084,11 +3186,13 @@ mod tests {
                     local: "visible".into(),
                     original: "visible".into(),
                     source_module: "filtered_dep".into(),
+                    source_nature: UseNature::Intrinsic,
                 },
                 UseRename {
                     local: "alias".into(),
                     original: "remote".into(),
                     source_module: "filtered_dep".into(),
+                    source_nature: UseNature::NonIntrinsic,
                 },
             ]
         );
@@ -3098,6 +3202,7 @@ mod tests {
                 local: "local_name".into(),
                 original: "remote_name".into(),
                 source_module: "bare_dep".into(),
+                source_nature: UseNature::Normal,
             }]
         );
     }
@@ -3260,7 +3365,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 7
+            r#"#!amod 8
 # module: cache_test
 # source: cache_test.f90
 
@@ -3292,7 +3397,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 7
+            r#"#!amod 8
 # module: cached_parent
 # source: cached_parent.f90
 
@@ -3305,7 +3410,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 7
+            r#"#!amod 8
 # module: supplied_parent
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
@@ -3337,7 +3442,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 7
+            r#"#!amod 8
 # module: child
 # ancestor-module: root
 # parent-submodule: middle
@@ -3436,7 +3541,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 7)")
+            err.contains("incompatible .amod version 6 (compiler requires 8)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

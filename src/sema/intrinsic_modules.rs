@@ -1,4 +1,4 @@
-//! Built-in intrinsic modules (iso_c_binding, iso_fortran_env).
+//! Built-in intrinsic modules.
 //!
 //! These modules are constructed programmatically rather than parsed
 //! from source. When `USE iso_c_binding` is encountered, the symbol
@@ -6,6 +6,18 @@
 
 use super::symtab::*;
 use crate::lexer::Span;
+
+const ISO_C_BINDING: &str = "iso_c_binding";
+const ISO_FORTRAN_ENV: &str = "iso_fortran_env";
+const IEEE_MODULES: [&str; 3] = ["ieee_arithmetic", "ieee_exceptions", "ieee_features"];
+
+pub fn is_intrinsic_module(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ISO_C_BINDING)
+        || name.eq_ignore_ascii_case(ISO_FORTRAN_ENV)
+        || IEEE_MODULES
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
 
 /// Register all intrinsic module scopes in the symbol table.
 /// Called once during semantic analysis initialization.
@@ -102,7 +114,7 @@ fn insert_proc(st: &mut SymbolTable, mod_id: ScopeId, name: &str) {
 
 /// Populate the iso_c_binding module scope.
 fn register_iso_c_binding(st: &mut SymbolTable) {
-    let m = st.push_scope(ScopeKind::Module("iso_c_binding".into()));
+    let m = st.push_intrinsic_module_scope(ISO_C_BINDING);
 
     // ---- Integer kind parameters (ARM64 macOS LP64) ----
     // Each constant's VALUE is the kind number (e.g., c_int = 4 means kind=4 = 4 bytes).
@@ -220,7 +232,7 @@ fn register_iso_c_binding(st: &mut SymbolTable) {
 
 /// Populate the iso_fortran_env module scope.
 fn register_iso_fortran_env(st: &mut SymbolTable) {
-    let m = st.push_scope(ScopeKind::Module("iso_fortran_env".into()));
+    let m = st.push_intrinsic_module_scope(ISO_FORTRAN_ENV);
 
     let ik4 = TypeInfo::Integer { kind: Some(4) };
 
@@ -286,8 +298,8 @@ fn register_iso_fortran_env(st: &mut SymbolTable) {
 /// (`src/ir/lower/intrinsic.rs`, `intrinsic_sub.rs`) and the runtime
 /// (`runtime/src/ieee.rs`); see the l09 support matrix there.
 fn register_ieee_modules(st: &mut SymbolTable) {
-    for name in ["ieee_arithmetic", "ieee_exceptions", "ieee_features"] {
-        let m = st.push_scope(ScopeKind::Module(name.into()));
+    for name in IEEE_MODULES {
+        let m = st.push_intrinsic_module_scope(name);
         // Populate with commonly-referenced symbols so USE ONLY
         // doesn't fail on standard names.
         match name {

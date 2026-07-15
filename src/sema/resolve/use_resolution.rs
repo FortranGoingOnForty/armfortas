@@ -6,7 +6,7 @@
 //! (the .amod loader that synthesises a module scope when a USE'd
 //! module wasn't seen in-file).
 
-use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl};
+use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl, UseNature};
 use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
 
@@ -35,6 +35,25 @@ fn add_use_association(
     Ok(())
 }
 
+fn resolve_module_scope(
+    st: &mut SymbolTable,
+    module: &str,
+    nature: UseNature,
+    search_paths: &[std::path::PathBuf],
+    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
+) -> Option<ScopeId> {
+    match nature {
+        UseNature::Normal => st
+            .find_non_intrinsic_module_scope(module)
+            .or_else(|| load_external_module(st, module, search_paths, type_layouts))
+            .or_else(|| st.find_intrinsic_module_scope(module)),
+        UseNature::Intrinsic => st.find_intrinsic_module_scope(module),
+        UseNature::NonIntrinsic => st
+            .find_non_intrinsic_module_scope(module)
+            .or_else(|| load_external_module(st, module, search_paths, type_layouts)),
+    }
+}
+
 pub(super) fn process_uses(
     st: &mut SymbolTable,
     uses: &[SpannedDecl],
@@ -44,15 +63,13 @@ pub(super) fn process_uses(
     for use_decl in uses {
         if let Decl::UseStmt {
             module,
-            nature: _,
+            nature,
             renames,
             only,
         } = &use_decl.node
         {
-            // If the module isn't defined in-file, try loading from .amod.
-            let mod_scope = st
-                .find_module_scope(module)
-                .or_else(|| load_external_module(st, module, module_search_paths, type_layouts));
+            let mod_scope =
+                resolve_module_scope(st, module, *nature, module_search_paths, type_layouts);
             if let Some(mod_scope) = mod_scope {
                 // Reject self-USE: a module cannot USE itself.
                 if mod_scope == st.current_scope() {
@@ -162,8 +179,23 @@ pub(super) fn process_uses(
                     }
                 }
             } else {
+                let msg = match nature {
+                    UseNature::Normal => format!(
+                        "module '{}' not found (searched -I paths and current directory for {}.amod)",
+                        module,
+                        module.to_lowercase()
+                    ),
+                    UseNature::Intrinsic => {
+                        format!("module '{}' is not an intrinsic module", module)
+                    }
+                    UseNature::NonIntrinsic => format!(
+                        "non-intrinsic module '{}' not found (searched -I paths and current directory for {}.amod)",
+                        module,
+                        module.to_lowercase()
+                    ),
+                };
                 return Err(SemaError {
-                    msg: format!("module '{}' not found (searched -I paths and current directory for {}.amod)", module, module.to_lowercase()),
+                    msg,
                     span: use_decl.span,
                 });
             }
@@ -597,9 +629,8 @@ fn install_external_interface(
     // the dep's symbols. Without this, `USE amod_middle` where
     // middle does `use amod_base` never sees amod_base's symbols.
     for dep in &iface.dependencies {
-        let dep_scope = st
-            .find_module_scope(dep)
-            .or_else(|| load_external_module(st, dep, search_paths, type_layouts));
+        let dep_scope =
+            resolve_module_scope(st, &dep.module_name, dep.nature, search_paths, type_layouts);
         if let Some(dep_scope) = dep_scope {
             st.enter_scope(scope_id);
             st.add_use_association(crate::sema::symtab::UseAssociation {
@@ -636,9 +667,13 @@ fn install_external_interface(
     // Replay ONLY-qualified dependency edges exactly. A facade that imported
     // one provider name must not become a bare re-export after .amod loading.
     for import in &iface.only_imports {
-        let src_scope = st.find_module_scope(&import.source_module).or_else(|| {
-            load_external_module(st, &import.source_module, search_paths, type_layouts)
-        });
+        let src_scope = resolve_module_scope(
+            st,
+            &import.source_module,
+            import.source_nature,
+            search_paths,
+            type_layouts,
+        );
         let Some(src_scope) = src_scope else {
             continue;
         };
@@ -654,9 +689,13 @@ fn install_external_interface(
 
     // Replay renames from bare USE edges (`@use_rename a = b from m`).
     for rename in &iface.renames {
-        let src_scope = st.find_module_scope(&rename.source_module).or_else(|| {
-            load_external_module(st, &rename.source_module, search_paths, type_layouts)
-        });
+        let src_scope = resolve_module_scope(
+            st,
+            &rename.source_module,
+            rename.source_nature,
+            search_paths,
+            type_layouts,
+        );
         let Some(src_scope) = src_scope else {
             continue;
         };

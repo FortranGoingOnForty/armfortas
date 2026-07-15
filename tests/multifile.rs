@@ -172,6 +172,134 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn serialized_intrinsic_use_keeps_provider_nature() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=serialized_intrinsic_use_keeps_provider_nature count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let facade_f90 = dir.join("facade.f90");
+    let consumer_f90 = dir.join("consumer.f90");
+    let facade_o = dir.join("facade.o");
+    let consumer_o = dir.join("consumer.o");
+    let binary = dir.join("test_bin");
+
+    std::fs::write(
+        &facade_f90,
+        "module facade\n  use, intrinsic :: iso_fortran_env\nend module facade\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_f90,
+        "module iso_fortran_env\n  integer, parameter :: int8 = 4\nend module iso_fortran_env\nprogram p\n  use facade, only: int8\n  if (int8 /= 1) error stop 27\n  print *, 'ok'\nend program p\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &facade_f90, &facade_o, None);
+    compile_file(&compiler, &consumer_f90, &consumer_o, Some(&dir));
+    link_files(&[&facade_o, &consumer_o], &binary);
+    let output = run_binary(&binary);
+    assert!(output.contains("ok"), "unexpected output:\n{output}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_rejects_duplicate_module_definitions() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("first.f90"),
+        "module shared_name\nend module shared_name\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("second.f90"),
+        "module ShArEd_NaMe\nend module ShArEd_NaMe\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "first.f90", "second.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(!result.status.success(), "duplicate modules were accepted");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("duplicate module definition 'shared_name'")
+            && stderr.contains("first.f90")
+            && stderr.contains("second.f90"),
+        "unexpected duplicate-module diagnostic:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_accepts_prefixed_module_procedure_interfaces() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("first.f90"),
+        "module first_contract\n  interface\n    module pure function first_value()\n      integer :: first_value\n    end function first_value\n  end interface\nend module first_contract\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("second.f90"),
+        "module second_contract\n  interface\n    module pure function second_value()\n      integer :: second_value\n    end function second_value\n  end interface\nend module second_contract\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "first.f90", "second.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "prefixed module procedures were treated as module definitions:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_ignores_fixed_comment_and_hollerith_dependencies() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("producer.f"),
+        "      MODULE FIXED_SOURCE\nC COMMENT; USE COMMENT_DEP\n      CONTAINS\n      SUBROUTINE SHOW(I)\n      INTEGER I\n  100 FORMAT(11H;USE HOLLER,I2)\n      PRINT 100,I\n      END\n      END\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("consumers.f90"),
+        "module comment_dep\n  use fixed_source\nend module comment_dep\nmodule holler\n  use fixed_source\nend module holler\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "consumers.f90", "producer.f"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "fixed comments or Hollerith text created a false dependency cycle:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_compile_preserves_target_and_preprocessor_options() {
     let compiler = find_compiler();
     let dir = unique_dir();
@@ -280,6 +408,75 @@ fn combined_compile_orders_dependencies_from_preprocessor_includes() {
     );
     assert!(dir.join("a.o").is_file());
     assert!(dir.join("b.o").is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_orders_semicolon_separated_uses() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("consumer.f90"),
+        "module consumer; use first_provider; use second_provider; end module consumer\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("first.f90"),
+        "module first_provider\nend module first_provider\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("second.f90"),
+        "module second_provider\nend module second_provider\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "consumer.f90", "second.f90", "first.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "semicolon USE dependencies were not ordered:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for object in ["consumer.o", "first.o", "second.o"] {
+        assert!(dir.join(object).is_file(), "missing {object}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn combined_compile_orders_unqualified_same_named_intrinsic_module() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("consumer.f90"),
+        "program consumer\n  use iso_fortran_env, only: shadow_value\n  if (shadow_value /= 41) error stop\nend program consumer\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("provider.f90"),
+        "module iso_fortran_env\n  integer, parameter :: shadow_value = 41\nend module iso_fortran_env\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "consumer.f90", "provider.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "unqualified same-named module dependency was not ordered:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for object in ["consumer.o", "provider.o"] {
+        assert!(dir.join(object).is_file(), "missing {object}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

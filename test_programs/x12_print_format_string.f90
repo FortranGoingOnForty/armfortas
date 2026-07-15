@@ -3,7 +3,7 @@
 ! field and always emitted list-directed output, so `print '(a,i0)',
 ! 'x=', 9` wrote ` x= 9` and `print '("lit",i3)', 7` dropped the literal
 ! entirely. PRINT fmt now routes through the same formatted machinery as
-! WRITE(*, fmt). Numeric FORMAT labels remain unsupported (so untouched).
+! WRITE(*, fmt). Numeric FORMAT labels are covered separately.
 ! The CHECK lines below would not match the old list-directed spacing. x12.
 !
 ! CHECK: x=9

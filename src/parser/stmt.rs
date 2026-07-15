@@ -1844,20 +1844,8 @@ impl<'a> Parser<'a> {
     // ---- Helpers ----
 
     pub(crate) fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
-        self.skip_newlines();
-        let text = self.peek_text().to_lowercase();
-        let combined = format!("end{}", keyword);
-        if text == combined {
-            self.advance();
-        } else if text == "end" {
-            self.advance();
-            self.eat_ident(keyword);
-        } else {
-            return Err(self.error(format!(
-                "expected 'end {}' or 'end{}', got '{}'",
-                keyword, keyword, text
-            )));
-        }
+        self.consume_end_prefix(keyword)?;
+
         // Skip optional construct name after end, but only on the same line.
         // For END INTERFACE, Fortran also permits a trailing generic-spec such
         // as `operator(+)` or `assignment(=)`.
@@ -1873,6 +1861,71 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(&TokenKind::RParen)?;
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn consume_named_end(
+        &mut self,
+        keyword: &str,
+        expected_name: Option<&str>,
+    ) -> Result<(), ParseError> {
+        self.consume_end_prefix(keyword)?;
+
+        if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
+            let actual = self.peek_text();
+            match expected_name {
+                Some(expected) if actual.eq_ignore_ascii_case(expected) => {
+                    self.advance();
+                }
+                Some(expected) => {
+                    return Err(self.error(format!(
+                        "closing {} name '{}' does not match opening name '{}'",
+                        keyword, actual, expected
+                    )));
+                }
+                None => {
+                    return Err(self.error(format!(
+                        "closing {} name '{}' has no opening name",
+                        keyword, actual
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn consume_end_prefix(&mut self, keyword: &str) -> Result<(), ParseError> {
+        self.skip_newlines();
+        let text = self.peek_text().to_lowercase();
+        let joined_keyword: String = keyword.split_ascii_whitespace().collect();
+        let combined = format!("end{}", joined_keyword);
+        if text == combined {
+            self.advance();
+        } else if text == "end" {
+            self.advance();
+            if !self.eat_ident(&joined_keyword) {
+                let mut matched_parts = Vec::new();
+                for part in keyword.split_ascii_whitespace() {
+                    if self.eat_ident(part) {
+                        matched_parts.push(part);
+                    } else {
+                        if !matched_parts.is_empty() {
+                            return Err(self.error(format!(
+                                "expected '{}' after 'end {}'",
+                                part,
+                                matched_parts.join(" ")
+                            )));
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            return Err(self.error(format!(
+                "expected 'end {}' or 'end{}', got '{}'",
+                keyword, joined_keyword, text
+            )));
         }
         Ok(())
     }

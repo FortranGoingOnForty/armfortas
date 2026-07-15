@@ -367,8 +367,22 @@ fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
                             // Replace nH... with '...'
                             result.push('\'');
                             positions.push(body.positions[digit_start]);
-                            result.push_str(&body.text[i..content_end]);
-                            positions.extend_from_slice(&body.positions[i..content_end]);
+                            let mut content_index = i;
+                            while content_index < content_end {
+                                if bytes[content_index] == b'\'' {
+                                    result.push_str("''");
+                                    positions.push(body.positions[content_index]);
+                                    positions.push(body.positions[content_index]);
+                                    content_index += 1;
+                                } else {
+                                    content_index = push_mapped_char(
+                                        body,
+                                        content_index,
+                                        &mut result,
+                                        &mut positions,
+                                    );
+                                }
+                            }
                             result.push('\'');
                             positions.push(
                                 count
@@ -745,7 +759,8 @@ fn split_fixed_keyword_prefix(
     run: &str,
     prior_tokens: &[Token],
 ) -> Option<usize> {
-    if !allow_fixed_keyword_split(prior_tokens) || run.len() <= 4 {
+    let at_action_start = at_fixed_action_statement_start(prior_tokens);
+    if (!allow_fixed_keyword_split(prior_tokens) && !at_action_start) || run.len() <= 4 {
         return None;
     }
 
@@ -765,14 +780,50 @@ fn split_fixed_keyword_prefix(
             continue;
         }
 
-        if suffix_first.is_ascii_digit() && !matches!(prefix_lower.as_str(), "goto" | "call") {
-            continue;
+        if suffix_first.is_ascii_digit() {
+            let permits_numeric_suffix = matches!(prefix_lower.as_str(), "goto" | "call")
+                || (prefix_lower == "print" && at_action_start);
+            if !permits_numeric_suffix {
+                continue;
+            }
         }
 
         return Some(prefix_len);
     }
 
     None
+}
+
+fn at_fixed_action_statement_start(prior_tokens: &[Token]) -> bool {
+    if prior_tokens.is_empty() {
+        return true;
+    }
+    if prior_tokens.len() < 3
+        || prior_tokens[0].kind != TokenKind::Identifier
+        || !prior_tokens[0].text.eq_ignore_ascii_case("if")
+        || prior_tokens[1].kind != TokenKind::LParen
+        || prior_tokens.last().map(|token| &token.kind) != Some(&TokenKind::RParen)
+    {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for (index, token) in prior_tokens.iter().enumerate().skip(1) {
+        match token.kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+                if depth == 0 {
+                    return index + 1 == prior_tokens.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
@@ -1615,6 +1666,11 @@ C     Hello World
     }
 
     #[test]
+    fn hollerith_quote_is_escaped_in_protected_string() {
+        assert_eq!(protect_hollerith("8H O'CLOCK"), "' O''CLOCK'");
+    }
+
+    #[test]
     fn hollerith_not_after_letter() {
         // X3HABC — the 3H is preceded by a letter, so it's NOT a Hollerith.
         assert_eq!(protect_hollerith("X3HABC"), "X3HABC");
@@ -1687,6 +1743,35 @@ C     Hello World
     fn whitespace_stripped_program_name() {
         let texts = fixed_texts("      PROGRAMHELLO\n");
         assert_eq!(texts, vec!["PROGRAM", "HELLO"], "got: {:?}", texts);
+    }
+
+    #[test]
+    fn whitespace_stripped_print_keeps_numeric_format_label() {
+        let texts = fixed_texts("      PRINT 100, I\n");
+        assert_eq!(texts, vec!["PRINT", "100", ",", "I"], "got: {texts:?}");
+    }
+
+    #[test]
+    fn logical_if_print_keeps_numeric_format_label() {
+        let texts = fixed_texts("      IF (I.GT.0) PRINT 100, I\n");
+        assert_eq!(
+            texts,
+            vec!["IF", "(", "I", ".GT.", "0", ")", "PRINT", "100", ",", "I"],
+            "got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_print_prefix_stays_in_procedure_names() {
+        let declaration = fixed_texts("      SUBROUTINE PRINT100()\n");
+        assert_eq!(
+            declaration,
+            vec!["SUBROUTINE", "PRINT100", "(", ")"],
+            "got: {declaration:?}"
+        );
+
+        let call = fixed_texts("      CALL PRINT100()\n");
+        assert_eq!(call, vec!["CALL", "PRINT100", "(", ")"], "got: {call:?}");
     }
 
     #[test]
@@ -1924,6 +2009,17 @@ C     Hello World
             "space lost, got: {:?}",
             texts
         );
+    }
+
+    #[test]
+    fn hollerith_quote_preserves_literal_and_span() {
+        let token = fixed_toks("      X=8H O'CLOCK\n")
+            .into_iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .unwrap();
+        assert_eq!(token.text, "' O''CLOCK'");
+        assert_eq!(token.span.start, Position { line: 1, col: 9 });
+        assert_eq!(token.span.end, Position { line: 1, col: 19 });
     }
 
     #[test]
