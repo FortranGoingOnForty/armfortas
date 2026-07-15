@@ -298,6 +298,48 @@ end function large
 }
 
 #[test]
+fn optimized_logical16_storeback_preserves_value_pair() {
+    let asm = compile_arm64_asm(
+        include_str!("../test_programs/logical16_io_roundtrip.f90"),
+        "-O1",
+    );
+    let lines: Vec<_> = asm.lines().map(str::trim).collect();
+    let mut checked_storebacks = 0;
+
+    for (store_index, line) in lines.iter().enumerate() {
+        if !line.starts_with("stp x16, x17, [") {
+            continue;
+        }
+        let Some(reload_index) = lines[..store_index]
+            .iter()
+            .rposition(|line| line.starts_with("ldr x16, [") || line.starts_with("ldp x16, x17,"))
+        else {
+            continue;
+        };
+        if !lines[reload_index..store_index]
+            .iter()
+            .any(|line| line.starts_with("ldr x17, [") || line.starts_with("ldp x16, x17,"))
+        {
+            continue;
+        }
+
+        checked_storebacks += 1;
+        assert!(
+            !lines[reload_index + 1..store_index]
+                .iter()
+                .any(|line| line.starts_with("movz x16,") || line.starts_with("movk x16,")),
+            "large-offset address synthesis overwrote a live i128 value:\n{}",
+            lines[reload_index..=store_index].join("\n")
+        );
+    }
+
+    assert!(
+        checked_storebacks > 0,
+        "fixture did not exercise optimized i128 storeback:\n{asm}"
+    );
+}
+
+#[test]
 fn complex_value_call_arguments_use_hfa_register_pairs() {
     let c4 = compile_arm64_asm(
         r#"

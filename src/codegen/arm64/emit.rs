@@ -106,6 +106,29 @@ fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     format!("{}\n    {} {}, {}, x16", mov, op, dest, base)
 }
 
+/// Format general GP immediate arithmetic through registers reserved from
+/// allocation, so late expansion cannot overwrite live x16/x17 values.
+fn fmt_gp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
+    let (op, magnitude) = if n >= 0 {
+        (op, n as u64)
+    } else {
+        let inverse = match op {
+            "add" => "sub",
+            "sub" => "add",
+            _ => panic!("unsupported immediate arithmetic opcode: {op}"),
+        };
+        (inverse, n.unsigned_abs())
+    };
+
+    if magnitude <= 4095 {
+        return format!("{} {}, {}, #{}", op, dest, base, magnitude);
+    }
+
+    let scratch = address_scratch(&[dest, base]);
+    let imm = fmt_u64_imm(scratch, magnitude);
+    format!("{}\n    {} {}, {}, {}", imm, op, dest, base, scratch)
+}
+
 fn fmt_stack_alloc(frame_size: i64) -> String {
     // Apple Silicon uses large guard pages, so jumping the stack pointer
     // down by a huge frame in one shot can skip the guard and fault on the
@@ -220,15 +243,17 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::FrameSlot(off) => *off as i64,
                 MachineOperand::Imm(-1) => {
                     // Sentinel: prologue FP setup → frame_size - 16
-                    mf.frame.size.saturating_sub(16) as i64
+                    return fmt_sp_imm(
+                        "add",
+                        &dest,
+                        &base,
+                        mf.frame.size.saturating_sub(16) as i64,
+                    );
                 }
                 MachineOperand::Imm(v) => *v,
                 _ => return format!("add {}, {}, {}", dest, base, op_str(&inst.operands[2])),
             };
-            // Both `add x29, sp, #N` (FP setup) and `add Xd, Xn, #N`
-            // need the > 4095 fallback. Use the same scratch
-            // synthesis since x16 is safe in the prologue.
-            fmt_sp_imm("add", &dest, &base, imm)
+            fmt_gp_imm("add", &dest, &base, imm)
         }
         ArmOpcode::SubReg => format!(
             "sub {}, {}, {}",
@@ -249,17 +274,22 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[2])
         ),
         ArmOpcode::SubImm => {
+            let dest = op_str(&inst.operands[0]);
+            let base = op_str(&inst.operands[1]);
             let imm: i64 = match &inst.operands[2] {
                 MachineOperand::Imm(-1) => {
                     // Sentinel: epilogue SP restore → frame_size - 16
-                    mf.frame.size.saturating_sub(16) as i64
+                    return fmt_sp_imm(
+                        "sub",
+                        &dest,
+                        &base,
+                        mf.frame.size.saturating_sub(16) as i64,
+                    );
                 }
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
-            let dest = op_str(&inst.operands[0]);
-            let base = op_str(&inst.operands[1]);
-            fmt_sp_imm("sub", &dest, &base, imm)
+            fmt_gp_imm("sub", &dest, &base, imm)
         }
         ArmOpcode::Mul => format!(
             "mul {}, {}, {}",
@@ -1759,6 +1789,44 @@ mod tests {
     #[test]
     fn address_scratch_avoids_live_gp_aliases() {
         assert_eq!(address_scratch(&["w8", "x9", "w10"]), "x11");
+    }
+
+    #[test]
+    fn emit_large_sub_imm_preserves_ip_registers() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::SubImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(10_632),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz x9, #10632\n    sub x8, x29, x9"
+        );
+    }
+
+    #[test]
+    fn emit_large_add_imm_avoids_operand_aliases() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::AddImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                MachineOperand::Imm(65_537),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz x10, #1\n    movk x10, #1, lsl #16\n    add x9, x8, x10"
+        );
     }
 
     #[test]
