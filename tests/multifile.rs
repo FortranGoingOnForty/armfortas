@@ -317,6 +317,43 @@ fn combined_compile_orders_dependencies_from_preprocessor_includes() {
 }
 
 #[test]
+fn combined_compile_orders_semicolon_separated_uses() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("consumer.f90"),
+        "module consumer; use first_provider; use second_provider; end module consumer\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("first.f90"),
+        "module first_provider\nend module first_provider\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("second.f90"),
+        "module second_provider\nend module second_provider\n",
+    )
+    .unwrap();
+
+    let result = Command::new(&compiler)
+        .current_dir(&dir)
+        .args(["-c", "consumer.f90", "second.f90", "first.f90"])
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        result.status.success(),
+        "semicolon USE dependencies were not ordered:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for object in ["consumer.o", "first.o", "second.o"] {
+        assert!(dir.join(object).is_file(), "missing {object}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn combined_link_keeps_equal_basename_sources_distinct() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

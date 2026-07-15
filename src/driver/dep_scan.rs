@@ -28,8 +28,53 @@ pub struct FileDeps {
     pub submodule_of: Option<(String, String)>,
 }
 
+struct FortranStatements<'a> {
+    remaining: Option<&'a str>,
+}
+
+impl<'a> Iterator for FortranStatements<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = self.remaining.take()?;
+        let mut quote = None;
+        let mut chars = line.char_indices().peekable();
+
+        while let Some((index, ch)) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                ';' => {
+                    self.remaining = Some(&line[index + 1..]);
+                    return Some(&line[..index]);
+                }
+                '!' => return Some(&line[..index]),
+                _ => {}
+            }
+        }
+
+        Some(line)
+    }
+}
+
+fn fortran_statements(line: &str) -> FortranStatements<'_> {
+    FortranStatements {
+        remaining: Some(line),
+    }
+}
+
 /// Preprocess and scan a source file for MODULE and USE statements.
-/// Uses a simple line-by-line keyword scan — no lexer or parser needed.
+/// Uses a lightweight statement keyword scan — no lexer or parser needed.
 pub fn scan_file(
     path: &Path,
     config: &crate::preprocess::PreprocConfig,
@@ -45,100 +90,102 @@ pub fn scan_file(
     let mut submodule_of: Option<(String, String)> = None;
 
     for line in content.lines() {
-        let trimmed = line.trim().to_lowercase();
-        // Skip comments and empty lines.
-        if trimmed.starts_with('!') || trimmed.is_empty() {
-            continue;
-        }
+        for statement in fortran_statements(line) {
+            let trimmed = statement.trim().to_lowercase();
+            if trimmed.is_empty() {
+                continue;
+            }
 
-        // SUBMODULE (<parent-spec>) <name> — F2008. The parent spec is
-        // either a bare ancestor module name (`(a) c`) or an
-        // `ancestor:parent` pair for a nested submodule (`(a:b) c`). The
-        // submodule must compile after its parent (so the parent `.amod`
-        // exists), so record the parent reference as a USE edge and the
-        // submodule's own `ancestor:name` identifier as a definition.
-        if let Some(rest) = trimmed.strip_prefix("submodule") {
-            let rest = rest.trim_start();
-            if let Some(open) = rest.strip_prefix('(') {
-                if let Some(close_idx) = open.find(')') {
-                    let parent_spec = open[..close_idx].trim();
-                    let after = open[close_idx + 1..].trim();
-                    let name = after
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .find(|s| !s.is_empty());
-                    if let (false, Some(name)) = (parent_spec.is_empty(), name) {
-                        // ancestor = first component of the parent spec.
-                        let ancestor = parent_spec.split(':').next().unwrap_or(parent_spec).trim();
-                        // Parent reference to depend on: the full parent
-                        // spec (module name, or `ancestor:parent` for a
-                        // nested submodule — both appear in some file's
-                        // `defines`).
-                        let parent_ref = parent_spec.to_string();
-                        uses.push(parent_ref.clone());
-                        // This submodule's own identifier, so nested
-                        // children (`submodule (ancestor:name) g`) resolve.
-                        defines.push(format!("{ancestor}:{name}"));
-                        submodule_of = Some((ancestor.to_string(), parent_ref));
+            // SUBMODULE (<parent-spec>) <name> — F2008. The parent spec is
+            // either a bare ancestor module name (`(a) c`) or an
+            // `ancestor:parent` pair for a nested submodule (`(a:b) c`). The
+            // submodule must compile after its parent (so the parent `.amod`
+            // exists), so record the parent reference as a USE edge and the
+            // submodule's own `ancestor:name` identifier as a definition.
+            if let Some(rest) = trimmed.strip_prefix("submodule") {
+                let rest = rest.trim_start();
+                if let Some(open) = rest.strip_prefix('(') {
+                    if let Some(close_idx) = open.find(')') {
+                        let parent_spec = open[..close_idx].trim();
+                        let after = open[close_idx + 1..].trim();
+                        let name = after
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .find(|s| !s.is_empty());
+                        if let (false, Some(name)) = (parent_spec.is_empty(), name) {
+                            // ancestor = first component of the parent spec.
+                            let ancestor =
+                                parent_spec.split(':').next().unwrap_or(parent_spec).trim();
+                            // Parent reference to depend on: the full parent
+                            // spec (module name, or `ancestor:parent` for a
+                            // nested submodule — both appear in some file's
+                            // `defines`).
+                            let parent_ref = parent_spec.to_string();
+                            uses.push(parent_ref.clone());
+                            // This submodule's own identifier, so nested
+                            // children (`submodule (ancestor:name) g`) resolve.
+                            defines.push(format!("{ancestor}:{name}"));
+                            submodule_of = Some((ancestor.to_string(), parent_ref));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // MODULE <name> — but not "module procedure" or "module function"
+            if let Some(rest) = trimmed.strip_prefix("module ") {
+                let rest = rest.trim();
+                if rest.starts_with("procedure")
+                    || rest.starts_with("function")
+                    || rest.starts_with("subroutine")
+                {
+                    continue;
+                }
+                // Extract the module name (first identifier after "module").
+                if let Some(name) = rest.split_whitespace().next() {
+                    let clean = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if !clean.is_empty() {
+                        defines.push(clean.to_string());
                     }
                 }
             }
-            continue;
-        }
 
-        // MODULE <name> — but not "module procedure" or "module function"
-        if let Some(rest) = trimmed.strip_prefix("module ") {
-            let rest = rest.trim();
-            if rest.starts_with("procedure")
-                || rest.starts_with("function")
-                || rest.starts_with("subroutine")
-            {
-                continue;
-            }
-            // Extract the module name (first identifier after "module").
-            if let Some(name) = rest.split_whitespace().next() {
-                let clean = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                if !clean.is_empty() {
-                    defines.push(clean.to_string());
-                }
-            }
-        }
-
-        // USE <name> [, ...]
-        if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
-            let mut nature = None;
-            let mut rest = if let Some(after_comma) = trimmed.strip_prefix("use,") {
-                // USE, intrinsic :: name
-                if let Some((qualifier, module_name)) = after_comma.split_once("::") {
-                    nature = Some(qualifier.trim());
-                    module_name.trim()
+            // USE <name> [, ...]
+            if trimmed.starts_with("use ") || trimmed.starts_with("use,") {
+                let mut nature = None;
+                let mut rest = if let Some(after_comma) = trimmed.strip_prefix("use,") {
+                    // USE, intrinsic :: name
+                    if let Some((qualifier, module_name)) = after_comma.split_once("::") {
+                        nature = Some(qualifier.trim());
+                        module_name.trim()
+                    } else {
+                        after_comma
+                    }
+                } else if let Some(after_use) = trimmed.strip_prefix("use ") {
+                    after_use.trim()
                 } else {
-                    after_comma
+                    unreachable!()
+                };
+                // Strip leading :: (USE :: module_name syntax).
+                if rest.starts_with("::") {
+                    rest = rest[2..].trim();
                 }
-            } else if let Some(after_use) = trimmed.strip_prefix("use ") {
-                after_use.trim()
-            } else {
-                unreachable!()
-            };
-            // Strip leading :: (USE :: module_name syntax).
-            if rest.starts_with("::") {
-                rest = rest[2..].trim();
-            }
-            if let Some(name) = rest
-                .split(|c: char| c == ',' || c == ':' || c.is_whitespace())
-                .next()
-            {
-                let clean = name.trim();
-                if !clean.is_empty() && clean != "only" {
-                    let explicit_intrinsic = nature == Some("intrinsic");
-                    let explicit_non_intrinsic = nature == Some("non_intrinsic");
-                    // Explicit INTRINSIC never needs a source edge. An
-                    // explicit NON_INTRINSIC clause can deliberately select a
-                    // source module whose name matches an intrinsic module.
-                    if !explicit_intrinsic
-                        && (explicit_non_intrinsic
-                            || !crate::sema::intrinsic_modules::is_intrinsic_module(clean))
-                    {
-                        uses.push(clean.to_string());
+                if let Some(name) = rest
+                    .split(|c: char| c == ',' || c == ':' || c.is_whitespace())
+                    .next()
+                {
+                    let clean = name.trim();
+                    if !clean.is_empty() && clean != "only" {
+                        let explicit_intrinsic = nature == Some("intrinsic");
+                        let explicit_non_intrinsic = nature == Some("non_intrinsic");
+                        // Explicit INTRINSIC never needs a source edge. An
+                        // explicit NON_INTRINSIC clause can deliberately select a
+                        // source module whose name matches an intrinsic module.
+                        if !explicit_intrinsic
+                            && (explicit_non_intrinsic
+                                || !crate::sema::intrinsic_modules::is_intrinsic_module(clean))
+                        {
+                            uses.push(clean.to_string());
+                        }
                     }
                 }
             }
@@ -277,6 +324,24 @@ mod tests {
 
         let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
         assert_eq!(deps.uses, vec!["iso_fortran_env"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_finds_semicolon_separated_uses_outside_literals_and_comments() {
+        let dir = std::env::temp_dir().join("dep_scan_semicolon_uses");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("consumer.f90");
+        std::fs::write(
+            &f,
+            "module consumer; use first; character(len=*), parameter :: marker = 'don''t; use fake'; use second !; use ignored\nprint *, \"semi; ! use fake_too\"; use third\nend module\n",
+        )
+        .unwrap();
+
+        let deps = scan_file(&f, &crate::preprocess::PreprocConfig::default()).unwrap();
+        assert_eq!(deps.defines, vec!["consumer"]);
+        assert_eq!(deps.uses, vec!["first", "second", "third"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
