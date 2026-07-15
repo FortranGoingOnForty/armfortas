@@ -1,0 +1,7 @@
+! CHECK: I= 7
+      PROGRAM FIXEDPRINTLABEL
+      INTEGER I
+      I = 7
+      PRINT 100, I
+  100 FORMAT('I=',I2)
+      END

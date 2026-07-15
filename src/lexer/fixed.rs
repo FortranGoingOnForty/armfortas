@@ -765,7 +765,9 @@ fn split_fixed_keyword_prefix(
             continue;
         }
 
-        if suffix_first.is_ascii_digit() && !matches!(prefix_lower.as_str(), "goto" | "call") {
+        if suffix_first.is_ascii_digit()
+            && !matches!(prefix_lower.as_str(), "goto" | "call" | "print")
+        {
             continue;
         }
 
@@ -1687,6 +1689,12 @@ C     Hello World
     fn whitespace_stripped_program_name() {
         let texts = fixed_texts("      PROGRAMHELLO\n");
         assert_eq!(texts, vec!["PROGRAM", "HELLO"], "got: {:?}", texts);
+    }
+
+    #[test]
+    fn whitespace_stripped_print_keeps_numeric_format_label() {
+        let texts = fixed_texts("      PRINT 100, I\n");
+        assert_eq!(texts, vec!["PRINT", "100", ",", "I"], "got: {texts:?}");
     }
 
     #[test]
