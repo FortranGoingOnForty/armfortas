@@ -87,5 +87,22 @@ program logical16_io_roundtrip
   if (ios /= 0 .or. .not. guarded%value) error stop 14
   if (guarded%before /= 111_16 .or. guarded%after /= 222_16) error stop 15
 
+  record = ''
+  ios = 77
+  write(record, *, iostat=ios) sectioned(1:4:2)
+  if (ios /= 0) error stop 16
+  internal_list = [.true., .false.]
+  ios = 77
+  read(record, *, iostat=ios) internal_list
+  if (ios /= 0 .or. .not. internal_list(1) .or. internal_list(2)) error stop 17
+
+  ios = 77
+  write(deferred_record, *, iostat=ios) sectioned(1:4:2)
+  if (ios /= 0) error stop 18
+  internal_list = [.false., .true.]
+  ios = 77
+  read(deferred_record, *, iostat=ios) internal_list
+  if (ios /= 0 .or. .not. internal_list(1) .or. internal_list(2)) error stop 19
+
   print *, 'ok'
 end program logical16_io_roundtrip

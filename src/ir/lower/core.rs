@@ -33621,6 +33621,72 @@ fn lower_internal_list_write_whole_array(
     true
 }
 
+fn lower_internal_list_write_array_expr(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    logical: bool,
+    sink: InternalListWriteSink,
+) -> bool {
+    if !matches!(
+        item.node,
+        Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::ParenExpr { .. }
+            | Expr::FunctionCall { .. }
+    ) {
+        return false;
+    }
+
+    let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+    if !internal_list_write_scalar_supported(&elem_ty, logical) {
+        lower_stmt_error(item.span, "unsupported internal output array item");
+    }
+
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("internal_list_arr_expr_check");
+    let bb_body = b.create_block("internal_list_arr_expr_body");
+    let bb_exit = b.create_block("internal_list_arr_expr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
+    let emitted = lower_internal_list_write_scalar(b, &elem_ty, elem, logical, sink);
+    debug_assert!(emitted);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
+}
+
 pub(super) fn lower_internal_write_items(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -33673,6 +33739,9 @@ pub(super) fn lower_internal_write_items(
             operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
             Some(crate::sema::symtab::TypeInfo::Logical { .. })
         );
+        if lower_internal_list_write_array_expr(b, ctx, item, is_logical, sink) {
+            continue;
+        }
         let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
         let ty = b
             .func()
@@ -33731,6 +33800,9 @@ pub(super) fn lower_internal_write_items_alloc(
             operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
             Some(crate::sema::symtab::TypeInfo::Logical { .. })
         );
+        if lower_internal_list_write_array_expr(b, ctx, item, is_logical, sink) {
+            continue;
+        }
         let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
         let ty = b
             .func()
@@ -62280,6 +62352,28 @@ end program
         assert!(ir.contains("afs_lst_ia_begin"));
         assert!(ir.contains("internal_list_arr_check"));
         assert!(ir.contains("afs_lst_ia_logical"));
+        assert!(!ir.contains("afs_lst_ia_int128"));
+    }
+
+    #[test]
+    fn lower_internal_write_logical16_sections_iterate_descriptor_elements() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=32) :: fixed
+  character(len=:), allocatable :: deferred
+  logical(16) :: values(4)
+  values = [.true., .false., .true., .false.]
+  write(fixed, *) values(1:4:2)
+  write(deferred, *) values(1:4:2)
+end program
+",
+        );
+        assert!(ir.contains("internal_list_arr_expr_check"));
+        assert!(ir.contains("afs_write_internal_logical"));
+        assert!(ir.contains("afs_lst_ia_logical"));
+        assert!(!ir.contains("afs_write_internal_int128"));
         assert!(!ir.contains("afs_lst_ia_int128"));
     }
 
