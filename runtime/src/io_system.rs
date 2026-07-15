@@ -4460,22 +4460,13 @@ fn write_unit_properties(
 #[no_mangle]
 pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
-        match u.flush() {
-            Ok(()) => {
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = 0;
-                    }
-                }
-            }
-            Err(e) => {
-                if !iostat.is_null() {
-                    unsafe {
-                        *iostat = e.raw_os_error().unwrap_or(1);
-                    }
-                }
-            }
+    let status = match state.get_unit(unit) {
+        Some(u) => u.flush().err().map_or(0, |e| e.raw_os_error().unwrap_or(1)),
+        None => 1,
+    };
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = status;
         }
     }
 }
@@ -4486,26 +4477,33 @@ pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
 #[no_mangle]
 pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
-        match &mut u.stream {
-            UnitStream::FileRead(r) => {
-                let _ = r.seek(SeekFrom::Start(0));
+    let status = match state.get_unit(unit) {
+        Some(u) => {
+            let result = match &mut u.stream {
+                UnitStream::FileRead(r) => r.seek(SeekFrom::Start(0)).map(|_| ()),
+                UnitStream::FileWrite(w) => w
+                    .flush()
+                    .and_then(|()| w.seek(SeekFrom::Start(0)).map(|_| ())),
+                UnitStream::FileRaw(f) => f.seek(SeekFrom::Start(0)).map(|_| ()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unit does not support REWIND",
+                )),
+            };
+            match result {
+                Ok(()) => {
+                    // Clear stale read tokens only after repositioning succeeds.
+                    u.read_tokens.clear();
+                    0
+                }
+                Err(e) => e.raw_os_error().unwrap_or(1),
             }
-            UnitStream::FileWrite(w) => {
-                let _ = w.flush();
-                let _ = w.seek(SeekFrom::Start(0));
-            }
-            UnitStream::FileRaw(f) => {
-                let _ = f.seek(SeekFrom::Start(0));
-            }
-            _ => {}
         }
-        // Clear stale read tokens so subsequent reads come from file start.
-        u.read_tokens.clear();
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 0;
-            }
+        None => 1,
+    };
+    if !iostat.is_null() {
+        unsafe {
+            *iostat = status;
         }
     }
 }
@@ -6326,6 +6324,24 @@ pub extern "C" fn afs_fmt_read_real_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_reports_an_unconnected_unit() {
+        let mut status = 0;
+
+        afs_flush(i32::MAX, &mut status);
+
+        assert_ne!(status, 0);
+    }
+
+    #[test]
+    fn rewind_reports_an_unconnected_unit() {
+        let mut status = 0;
+
+        afs_rewind(i32::MAX, &mut status);
+
+        assert_ne!(status, 0);
+    }
 
     #[test]
     fn backspace_rejects_unformatted_stream_without_repositioning() {
