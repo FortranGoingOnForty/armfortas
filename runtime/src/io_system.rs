@@ -2668,6 +2668,14 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
     let offset = (pos - 1) as u64;
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(u) = state.get_unit(unit) {
+        if u.access != Access::Stream {
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 1;
+                }
+            }
+            return;
+        }
         match &mut u.stream {
             UnitStream::FileRaw(f) => match f.seek(SeekFrom::Start(offset)) {
                 Ok(_) => {
