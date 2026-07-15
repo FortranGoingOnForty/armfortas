@@ -2866,10 +2866,11 @@ pub extern "C" fn afs_read_namelist(
     } else {
         1
     };
-    if !iostat.is_null() {
-        unsafe {
-            *iostat = status;
-        }
+    drop(state);
+    if status == 0 {
+        write_i32_ptr(iostat, 0);
+    } else {
+        set_read_status_or_exit(iostat, status);
     }
 }
 
@@ -2887,10 +2888,10 @@ pub extern "C" fn afs_read_namelist_internal(
     let gname = unsafe_str(group_name, group_name_len).to_lowercase();
     let text = unsafe_str(buf, buf_len);
     let found = namelist_assign_from_text(&text, &gname, entries, n_entries);
-    if !iostat.is_null() {
-        unsafe {
-            *iostat = if found { 0 } else { IOSTAT_END };
-        }
+    if found {
+        write_i32_ptr(iostat, 0);
+    } else {
+        set_read_status_or_exit(iostat, IOSTAT_END);
     }
 }
 

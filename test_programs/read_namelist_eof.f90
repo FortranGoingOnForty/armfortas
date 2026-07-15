@@ -6,6 +6,7 @@ program read_namelist_eof
   character(len=*), parameter :: empty_path = 'read_namelist_empty.tmp'
   character(len=*), parameter :: missing_path = 'read_namelist_missing.tmp'
   character(len=*), parameter :: incomplete_path = 'read_namelist_incomplete.tmp'
+  character(len=16) :: internal_record
   integer :: unit, ios, value
   namelist /wanted/ value
 
@@ -37,6 +38,12 @@ program read_namelist_eof
   read(unit, nml=wanted, iostat=ios)
   close(unit, status='delete')
   if (ios /= iostat_end .or. value /= 42) error stop 3
+
+  internal_record = ''
+  value = 10
+  ios = 77
+  read(internal_record, nml=wanted, iostat=ios)
+  if (ios /= iostat_end .or. value /= 10) error stop 4
 
   print *, 'ok'
 end program read_namelist_eof
