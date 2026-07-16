@@ -5424,6 +5424,7 @@ fn extract_nth_formatted_field_with_state(
             FormatDesc::Group {
                 repeat,
                 descriptors,
+                ..
             } => {
                 for _ in 0..*repeat {
                     if let Some(found) = extract_nth_formatted_field_with_state(
@@ -5514,6 +5515,7 @@ fn extract_nth_nonadvancing_formatted_field(
             FormatDesc::Group {
                 repeat,
                 descriptors,
+                ..
             } => {
                 for _ in 0..*repeat {
                     if let Some(found) = extract_nth_nonadvancing_formatted_field(
