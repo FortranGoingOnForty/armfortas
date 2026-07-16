@@ -204,8 +204,11 @@ pub extern "C" fn afs_date_and_time(
 // it — so std's argv comes back EMPTY on ELF targets and
 // command_argument_count() returned -1. The entry wrappers therefore
 // forward main's (argc, argv) into afs_program_init, which stores
-// them here; std::env::args stays as the fallback (macOS reads argv
+// them here; std::env::args_os stays as the fallback (macOS reads argv
 // via _NSGetArgv and never needed the handoff).
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 static STORED_ARGC: AtomicI32 = AtomicI32::new(-1);
@@ -218,9 +221,20 @@ pub(crate) fn store_args(argc: i32, argv: *const *const u8) {
     }
 }
 
-/// The program's arguments as owned strings, from the stored argv
-/// when the entry wrapper provided one, else from std.
-fn program_args() -> Vec<String> {
+fn os_string_into_bytes(value: OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        value.into_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// The program's arguments as owned bytes, from the stored argv when
+/// the entry wrapper provided one, else from std.
+fn program_args() -> Vec<Vec<u8>> {
     let argc = STORED_ARGC.load(Ordering::Acquire);
     let argv = STORED_ARGV.load(Ordering::Acquire);
     if argc >= 0 && !argv.is_null() {
@@ -231,11 +245,11 @@ fn program_args() -> Vec<String> {
                 break;
             }
             let cstr = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) };
-            out.push(cstr.to_string_lossy().into_owned());
+            out.push(cstr.to_bytes().to_vec());
         }
         return out;
     }
-    std::env::args().collect()
+    std::env::args_os().map(os_string_into_bytes).collect()
 }
 
 /// COMMAND_ARGUMENT_COUNT: returns argc - 1.
@@ -253,7 +267,7 @@ pub extern "C" fn afs_get_command_argument(
     length: *mut i32,
     status: *mut i32,
 ) {
-    let args: Vec<String> = program_args();
+    let args = program_args();
     if number < 0 || number as usize >= args.len() {
         if !status.is_null() {
             unsafe {
@@ -268,8 +282,7 @@ pub extern "C" fn afs_get_command_argument(
         return;
     }
 
-    let arg = &args[number as usize];
-    let bytes = arg.as_bytes();
+    let bytes = &args[number as usize];
 
     if !length.is_null() {
         unsafe {
@@ -302,8 +315,7 @@ pub extern "C" fn afs_get_command(
     length: *mut i32,
     status: *mut i32,
 ) {
-    let full: String = program_args().join(" ");
-    let bytes = full.as_bytes();
+    let bytes = program_args().join(&b" "[..]);
 
     if !length.is_null() {
         unsafe {
@@ -326,6 +338,16 @@ pub extern "C" fn afs_get_command(
     }
 }
 
+#[cfg(unix)]
+fn environment_value(name: &[u8]) -> Option<Vec<u8>> {
+    std::env::var_os(std::ffi::OsStr::from_bytes(name)).map(OsStringExt::into_vec)
+}
+
+#[cfg(not(unix))]
+fn environment_value(name: &[u8]) -> Option<Vec<u8>> {
+    std::env::var_os(String::from_utf8_lossy(name).as_ref()).map(os_string_into_bytes)
+}
+
 /// GET_ENVIRONMENT_VARIABLE: retrieve an environment variable by name.
 #[no_mangle]
 pub extern "C" fn afs_get_environment_variable(
@@ -338,7 +360,11 @@ pub extern "C" fn afs_get_environment_variable(
 ) {
     let var_name = if !name.is_null() && name_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
-        String::from_utf8_lossy(slice).trim().to_string()
+        let end = slice
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |index| index + 1);
+        &slice[..end]
     } else {
         if !status.is_null() {
             unsafe {
@@ -348,9 +374,8 @@ pub extern "C" fn afs_get_environment_variable(
         return;
     };
 
-    match std::env::var(&var_name) {
-        Ok(val) => {
-            let bytes = val.as_bytes();
+    match environment_value(var_name) {
+        Some(bytes) => {
             if !length.is_null() {
                 unsafe {
                     *length = bytes.len() as i32;
@@ -371,7 +396,7 @@ pub extern "C" fn afs_get_environment_variable(
                 }
             }
         }
-        Err(_) => {
+        None => {
             if !length.is_null() {
                 unsafe {
                     *length = 0;

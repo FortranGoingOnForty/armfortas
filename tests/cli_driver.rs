@@ -38953,6 +38953,58 @@ fn get_environment_variable_literal_name_populates_value_and_status() {
     let _ = std::fs::remove_file(&src);
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_command_and_environment_preserve_non_utf8_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=unix_command_and_environment_preserve_non_utf8_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=1) :: arg, env\n  character(len=2) :: name\n  character(len=1024) :: command\n  integer :: arg_len, arg_status, env_len, env_status, command_len, command_status\n  arg = '?'\n  env = '?'\n  name(1:1) = 'X'\n  name(2:2) = achar(254)\n  call get_command_argument(1, arg, arg_len, arg_status)\n  call get_command(command, command_len, command_status)\n  call get_environment_variable(name, env, env_len, env_status)\n  if (arg_len /= 1 .or. arg_status /= 0 .or. iachar(arg) /= 255) error stop 1\n  if (command_len < 2 .or. command_status /= 0) error stop 2\n  if (iachar(command(command_len:command_len)) /= 255) error stop 3\n  if (env_len /= 1 .or. env_status /= 0 .or. iachar(env) /= 255) error stop 4\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("unix_non_utf8_command_environment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("non-UTF-8 command/environment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "non-UTF-8 command/environment program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .arg(OsString::from_vec(vec![0xff]))
+        .env(
+            OsString::from_vec(b"X\xfe".to_vec()),
+            OsString::from_vec(vec![0xff]),
+        )
+        .output()
+        .expect("non-UTF-8 command/environment run failed");
+    assert!(
+        run.status.success(),
+        "non-UTF-8 command/environment program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected non-UTF-8 command/environment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
 #[test]
 fn get_environment_variable_status_keyword_preserves_length_hole() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
