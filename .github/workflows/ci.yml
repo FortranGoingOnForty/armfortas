@@ -379,6 +379,7 @@ jobs:
             export CARGO_TARGET_DIR="$PWD/.cargo-target"
             cargo build --workspace
             cargo test -p armfortas --lib
+            cargo test -p armfortas-rt system::tests::cpu_time_matches_freebsd_clock_scale -- --exact
             # --exact: the bare substring also matches the _o1.._ofast
             # matrix fns, which x09's gate opening turned into six real
             # concurrent sweeps — more than this small VM can run

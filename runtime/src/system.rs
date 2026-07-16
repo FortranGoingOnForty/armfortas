@@ -1,5 +1,23 @@
 //! Fortran system intrinsics: clock, timing, command-line, environment.
 
+#[cfg(target_os = "freebsd")]
+type ProcessClockT = i32;
+#[cfg(not(target_os = "freebsd"))]
+type ProcessClockT = i64;
+
+#[cfg(target_os = "freebsd")]
+const PROCESS_CLOCKS_PER_SECOND: ProcessClockT = 128;
+#[cfg(not(target_os = "freebsd"))]
+const PROCESS_CLOCKS_PER_SECOND: ProcessClockT = 1_000_000;
+
+extern "C" {
+    fn clock() -> ProcessClockT;
+}
+
+fn process_clock_seconds(ticks: ProcessClockT) -> f64 {
+    ticks as f64 / PROCESS_CLOCKS_PER_SECOND as f64
+}
+
 /// SYSTEM_CLOCK: returns monotonic clock count, rate, and max
 /// (kind-8 resolution; see afs_system_clock_k).
 #[no_mangle]
@@ -59,13 +77,9 @@ pub extern "C" fn afs_cpu_time(time: *mut f64) {
     if time.is_null() {
         return;
     }
-    extern "C" {
-        fn clock() -> i64;
-    }
-    const CLOCKS_PER_SEC: i64 = 1_000_000; // POSIX value on macOS
     let ticks = unsafe { clock() };
     unsafe {
-        *time = ticks as f64 / CLOCKS_PER_SEC as f64;
+        *time = process_clock_seconds(ticks);
     }
 }
 
@@ -671,6 +685,39 @@ mod tests {
         let mut t = 0.0f64;
         afs_cpu_time(&mut t);
         assert!(t >= 0.0);
+    }
+
+    #[test]
+    fn cpu_time_converts_one_second_of_native_ticks() {
+        assert_eq!(process_clock_seconds(PROCESS_CLOCKS_PER_SECOND), 1.0);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn cpu_time_matches_freebsd_clock_scale() {
+        extern "C" {
+            fn clock() -> i32;
+        }
+
+        let before = loop {
+            let ticks = unsafe { clock() };
+            assert!(ticks >= 0, "clock() failed");
+            if ticks > 0 {
+                break ticks;
+            }
+            std::hint::spin_loop();
+        };
+        let mut actual = -1.0f64;
+        afs_cpu_time(&mut actual);
+        let after = unsafe { clock() };
+        assert!(after >= before, "clock() moved backwards or failed");
+
+        let lower = before as f64 / 128.0;
+        let upper = after as f64 / 128.0;
+        assert!(
+            (lower..=upper).contains(&actual),
+            "CPU_TIME {actual} was outside native clock range {lower}..={upper}"
+        );
     }
 
     #[test]
