@@ -106,8 +106,9 @@ fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     format!("{}\n    {} {}, {}, x16", mov, op, dest, base)
 }
 
-/// Format general GP immediate arithmetic through registers reserved from
-/// allocation, so late expansion cannot overwrite live x16/x17 values.
+/// Format general GP immediate arithmetic without an implicit scratch register.
+/// Late expansion cannot see physical-register liveness, so it must only clobber
+/// the explicit destination.
 fn fmt_gp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     let (op, magnitude) = if n >= 0 {
         (op, n as u64)
@@ -124,9 +125,31 @@ fn fmt_gp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
         return format!("{} {}, {}, #{}", op, dest, base, magnitude);
     }
 
-    let scratch = address_scratch(&[dest, base]);
-    let imm = fmt_u64_imm(scratch, magnitude);
-    format!("{}\n    {} {}, {}, {}", imm, op, dest, base, scratch)
+    if !gp_regs_alias(dest, base) && dest != "sp" {
+        let imm = fmt_u64_imm(dest, magnitude);
+        return format!("{}\n    {} {}, {}, {}", imm, op, dest, base, dest);
+    }
+
+    assert!(
+        magnitude <= u32::MAX as u64,
+        "immediate arithmetic offset exceeds the frame-size domain"
+    );
+    let mut lines = Vec::new();
+    let mut remaining = magnitude;
+    let mut current_base = base;
+    while remaining >= 4096 {
+        let chunk = (remaining >> 12).min(4095);
+        lines.push(format!(
+            "{} {}, {}, #{}, lsl #12",
+            op, dest, current_base, chunk
+        ));
+        current_base = dest;
+        remaining -= chunk << 12;
+    }
+    if remaining > 0 {
+        lines.push(format!("{} {}, {}, #{}", op, dest, current_base, remaining));
+    }
+    lines.join("\n    ")
 }
 
 fn fmt_stack_alloc(frame_size: i64) -> String {
@@ -1792,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_large_sub_imm_preserves_ip_registers() {
+    fn emit_large_sub_imm_uses_destination_scratch() {
         let mf = MachineFunction::new("test".into());
         let inst = MachineInst {
             opcode: ArmOpcode::SubImm,
@@ -1806,12 +1829,12 @@ mod tests {
 
         assert_eq!(
             emit_inst(&inst, &mf),
-            "movz x9, #10632\n    sub x8, x29, x9"
+            "movz x8, #10632\n    sub x8, x29, x8"
         );
     }
 
     #[test]
-    fn emit_large_add_imm_avoids_operand_aliases() {
+    fn emit_large_add_imm_uses_destination_scratch() {
         let mf = MachineFunction::new("test".into());
         let inst = MachineInst {
             opcode: ArmOpcode::AddImm,
@@ -1825,7 +1848,26 @@ mod tests {
 
         assert_eq!(
             emit_inst(&inst, &mf),
-            "movz x10, #1\n    movk x10, #1, lsl #16\n    add x9, x8, x10"
+            "movz x9, #1\n    movk x9, #1, lsl #16\n    add x9, x8, x9"
+        );
+    }
+
+    #[test]
+    fn emit_large_aliasing_imm_uses_only_explicit_operands() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::SubImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::Imm(10_632),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "sub x12, x12, #2, lsl #12\n    sub x12, x12, #2440"
         );
     }
 
