@@ -106,6 +106,52 @@ fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     format!("{}\n    {} {}, {}, x16", mov, op, dest, base)
 }
 
+/// Format general GP immediate arithmetic without an implicit scratch register.
+/// Late expansion cannot see physical-register liveness, so it must only clobber
+/// the explicit destination.
+fn fmt_gp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
+    let (op, magnitude) = if n >= 0 {
+        (op, n as u64)
+    } else {
+        let inverse = match op {
+            "add" => "sub",
+            "sub" => "add",
+            _ => panic!("unsupported immediate arithmetic opcode: {op}"),
+        };
+        (inverse, n.unsigned_abs())
+    };
+
+    if magnitude <= 4095 {
+        return format!("{} {}, {}, #{}", op, dest, base, magnitude);
+    }
+
+    if !gp_regs_alias(dest, base) && dest != "sp" {
+        let imm = fmt_u64_imm(dest, magnitude);
+        return format!("{}\n    {} {}, {}, {}", imm, op, dest, base, dest);
+    }
+
+    assert!(
+        magnitude <= u32::MAX as u64,
+        "immediate arithmetic offset exceeds the frame-size domain"
+    );
+    let mut lines = Vec::new();
+    let mut remaining = magnitude;
+    let mut current_base = base;
+    while remaining >= 4096 {
+        let chunk = (remaining >> 12).min(4095);
+        lines.push(format!(
+            "{} {}, {}, #{}, lsl #12",
+            op, dest, current_base, chunk
+        ));
+        current_base = dest;
+        remaining -= chunk << 12;
+    }
+    if remaining > 0 {
+        lines.push(format!("{} {}, {}, #{}", op, dest, current_base, remaining));
+    }
+    lines.join("\n    ")
+}
+
 fn fmt_stack_alloc(frame_size: i64) -> String {
     // Apple Silicon uses large guard pages, so jumping the stack pointer
     // down by a huge frame in one shot can skip the guard and fault on the
@@ -132,11 +178,15 @@ fn fmt_u64_imm(reg: &str, value: u64) -> String {
     let mut parts = Vec::new();
     for shift in [0u32, 16, 32, 48] {
         let chunk = ((value >> shift) & 0xFFFF) as u16;
-        if chunk == 0 && !parts.is_empty() {
+        if chunk == 0 {
             continue;
         }
         if parts.is_empty() {
-            parts.push(format!("movz {}, #{}", reg, chunk));
+            if shift == 0 {
+                parts.push(format!("movz {}, #{}", reg, chunk));
+            } else {
+                parts.push(format!("movz {}, #{}, lsl #{}", reg, chunk, shift));
+            }
         } else {
             parts.push(format!("movk {}, #{}, lsl #{}", reg, chunk, shift));
         }
@@ -146,6 +196,15 @@ fn fmt_u64_imm(reg: &str, value: u64) -> String {
     } else {
         parts.join("\n    ")
     }
+}
+
+fn fmt_mov_imm(reg: &str, value: i64) -> String {
+    let bits = if reg.starts_with('w') {
+        (value as u64) & u32::MAX as u64
+    } else {
+        value as u64
+    };
+    fmt_u64_imm(reg, bits)
 }
 
 fn fmt_addr_with_offset(dest: &str, base: &str, offset: i64, scratch: &str) -> String {
@@ -220,15 +279,17 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 MachineOperand::FrameSlot(off) => *off as i64,
                 MachineOperand::Imm(-1) => {
                     // Sentinel: prologue FP setup → frame_size - 16
-                    mf.frame.size.saturating_sub(16) as i64
+                    return fmt_sp_imm(
+                        "add",
+                        &dest,
+                        &base,
+                        mf.frame.size.saturating_sub(16) as i64,
+                    );
                 }
                 MachineOperand::Imm(v) => *v,
                 _ => return format!("add {}, {}, {}", dest, base, op_str(&inst.operands[2])),
             };
-            // Both `add x29, sp, #N` (FP setup) and `add Xd, Xn, #N`
-            // need the > 4095 fallback. Use the same scratch
-            // synthesis since x16 is safe in the prologue.
-            fmt_sp_imm("add", &dest, &base, imm)
+            fmt_gp_imm("add", &dest, &base, imm)
         }
         ArmOpcode::SubReg => format!(
             "sub {}, {}, {}",
@@ -249,17 +310,22 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             op_str(&inst.operands[2])
         ),
         ArmOpcode::SubImm => {
+            let dest = op_str(&inst.operands[0]);
+            let base = op_str(&inst.operands[1]);
             let imm: i64 = match &inst.operands[2] {
                 MachineOperand::Imm(-1) => {
                     // Sentinel: epilogue SP restore → frame_size - 16
-                    mf.frame.size.saturating_sub(16) as i64
+                    return fmt_sp_imm(
+                        "sub",
+                        &dest,
+                        &base,
+                        mf.frame.size.saturating_sub(16) as i64,
+                    );
                 }
                 MachineOperand::Imm(v) => *v,
                 _ => 0,
             };
-            let dest = op_str(&inst.operands[0]);
-            let base = op_str(&inst.operands[1]);
-            fmt_sp_imm("sub", &dest, &base, imm)
+            fmt_gp_imm("sub", &dest, &base, imm)
         }
         ArmOpcode::Mul => format!(
             "mul {}, {}, {}",
@@ -498,6 +564,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             fp_reg_str(&inst.operands[1], false)
         ),
 
+        ArmOpcode::MovImm => match inst.operands.as_slice() {
+            [dest @ MachineOperand::PhysReg(PhysReg::Gp(_) | PhysReg::Gp32(_)), MachineOperand::Imm(value)] => {
+                fmt_mov_imm(&op_str(dest), *value)
+            }
+            operands => panic!("malformed ARM64 MovImm operands: {operands:?}"),
+        },
         ArmOpcode::Movz => {
             let imm = if let MachineOperand::Imm(v) = &inst.operands[1] {
                 *v
@@ -1759,6 +1831,115 @@ mod tests {
     #[test]
     fn address_scratch_avoids_live_gp_aliases() {
         assert_eq!(address_scratch(&["w8", "x9", "w10"]), "x11");
+    }
+
+    #[test]
+    fn emit_large_sub_imm_uses_destination_scratch() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::SubImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(10_632),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz x8, #10632\n    sub x8, x29, x8"
+        );
+    }
+
+    #[test]
+    fn emit_large_add_imm_uses_destination_scratch() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::AddImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                MachineOperand::Imm(65_537),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz x9, #1\n    movk x9, #1, lsl #16\n    add x9, x8, x9"
+        );
+    }
+
+    #[test]
+    fn emit_large_aliasing_imm_uses_only_explicit_operands() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::SubImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::Imm(10_632),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "sub x12, x12, #2, lsl #12\n    sub x12, x12, #2440"
+        );
+    }
+
+    #[test]
+    fn emit_full_width_immediate_keeps_one_destination() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp32(26)),
+                MachineOperand::Imm(u32::MAX as i64),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz w26, #65535\n    movk w26, #65535, lsl #16"
+        );
+    }
+
+    #[test]
+    fn emit_sparse_immediate_skips_zero_low_chunks() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::Imm(0x0001_0001_0000_0000),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz x12, #1, lsl #32\n    movk x12, #1, lsl #48"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed ARM64 MovImm operands")]
+    fn emit_full_width_immediate_rejects_malformed_mir() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::Shift(16),
+            ],
+            def: None,
+        };
+
+        emit_inst(&inst, &mf);
     }
 
     #[test]

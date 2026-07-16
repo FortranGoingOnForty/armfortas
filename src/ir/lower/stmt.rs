@@ -1092,6 +1092,104 @@ fn io_control_by_keyword<'a>(controls: &'a [IoControl], needle: &str) -> Option<
     })
 }
 
+fn lower_positioning_statement(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[IoControl],
+    runtime_fn: &str,
+) {
+    let unit_spec = io_control_by_keyword(specs, "unit")
+        .or_else(|| specs.iter().find(|spec| spec.keyword.is_none()));
+    let iostat_spec = io_control_by_keyword(specs, "iostat");
+    let iomsg_spec = io_control_by_keyword(specs, "iomsg");
+    let err_label = io_control_by_keyword(specs, "err").and_then(|spec| {
+        if let Expr::IntegerLiteral { text, .. } = &spec.value.node {
+            text.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+
+    let unit = unit_spec
+        .map(|spec| super::expr::lower_expr_ctx(b, ctx, &spec.value))
+        .unwrap_or_else(|| b.const_i32(6));
+    let unit = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+    let null = b.const_i64(0);
+    let (iostat_ptr, iostat_storeback) = if let Some(spec) = iostat_spec {
+        let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+        let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
+        let status = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, status);
+        (status, Some((dest_addr, dest_ty)))
+    } else if err_label.is_some() {
+        let status = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, status);
+        (status, None)
+    } else {
+        (null, None)
+    };
+    let (iomsg_ptr, iomsg_len) = iomsg_spec
+        .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
+        .unwrap_or((null, null));
+
+    b.call(
+        FuncRef::External(runtime_fn.into()),
+        vec![unit, iostat_ptr, iomsg_ptr, iomsg_len],
+        IrType::Void,
+    );
+    if let Some((dest_addr, dest_ty)) = iostat_storeback {
+        let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+        let coerced = coerce_to_type(b, status, &dest_ty);
+        b.store(coerced, dest_addr);
+    }
+    lower_read_err_branch(b, ctx, err_label, iostat_ptr);
+}
+
+fn lower_flush_or_rewind_statement(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    specs: &[IoControl],
+    runtime_fn: &str,
+) {
+    let unit_spec = io_control_by_keyword(specs, "unit")
+        .or_else(|| specs.iter().find(|spec| spec.keyword.is_none()));
+    let iostat_spec = io_control_by_keyword(specs, "iostat");
+    let iomsg_spec = io_control_by_keyword(specs, "iomsg");
+    let err_label = io_control_by_keyword(specs, "err").and_then(|spec| {
+        if let Expr::IntegerLiteral { text, .. } = &spec.value.node {
+            text.parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+
+    let unit = unit_spec
+        .map(|spec| super::expr::lower_expr_ctx(b, ctx, &spec.value))
+        .unwrap_or_else(|| b.const_i32(6));
+    let unit = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+    let null = b.const_i64(0);
+    let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(
+        b,
+        ctx,
+        iostat_spec,
+        err_label.is_some() || iomsg_spec.is_some(),
+    );
+    let (iomsg_ptr, iomsg_len) = iomsg_spec
+        .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
+        .unwrap_or((null, null));
+
+    b.call(
+        FuncRef::External(runtime_fn.into()),
+        vec![unit, iostat_ptr],
+        IrType::Void,
+    );
+    lower_read_assign_iomsg(b, iostat_ptr, iomsg_ptr, iomsg_len);
+    lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
+    lower_read_err_branch(b, ctx, err_label, iostat_ptr);
+}
+
 fn namelist_i8_ptr(b: &mut FuncBuilder, value: ValueId) -> ValueId {
     if b.func()
         .value_type(value)
@@ -1422,12 +1520,11 @@ fn lower_namelist_read_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_addr: ValueId,
-    end_label: Option<u64>,
-    err_label: Option<u64>,
-    user_iostat: bool,
-) -> bool {
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> (bool, Option<BlockId>) {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
-        return false;
+        return (false, None);
     };
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
         lower_stmt_error(nml_ctrl.value.span, "NML= must name a NAMELIST group");
@@ -1451,20 +1548,19 @@ fn lower_namelist_read_stmt(
                 ],
                 IrType::Void,
             );
-            lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
-            return true;
+            return (true, None);
         }
     }
 
     let unit = lower_namelist_unit(b, ctx, controls, 5);
-    lower_external_io_pos_seek(b, ctx, controls, unit, iostat_addr);
+    let positioning_done =
+        lower_external_read_pos_seek(b, ctx, controls, unit, iostat_addr, iomsg_ptr, iomsg_len);
     b.call(
         FuncRef::External("afs_read_namelist".into()),
         vec![unit, group_ptr, group_len, entries, n_entries, iostat_addr],
         IrType::Void,
     );
-    lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
-    true
+    (true, positioning_done)
 }
 
 fn lower_namelist_write_stmt(
@@ -1472,9 +1568,11 @@ fn lower_namelist_write_stmt(
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     iostat_ptr: ValueId,
-) -> bool {
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> (bool, Option<BlockId>) {
     let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
-        return false;
+        return (false, None);
     };
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
         lower_stmt_error(nml_ctrl.value.span, "NML= must name a NAMELIST group");
@@ -1491,13 +1589,16 @@ fn lower_namelist_write_stmt(
     let group_ptr = b.const_string(group_name.as_bytes());
     let group_len = b.const_i64(group_name.len() as i64);
     let unit = lower_namelist_unit(b, ctx, controls, 6);
-    lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
+    let positioning_done =
+        lower_external_write_pos_seek(b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len);
     b.call(
         FuncRef::External("afs_write_namelist".into()),
-        vec![unit, group_ptr, group_len, entries, n_entries, iostat_ptr],
+        vec![
+            unit, group_ptr, group_len, entries, n_entries, iostat_ptr, iomsg_ptr, iomsg_len,
+        ],
         IrType::Void,
     );
-    true
+    (true, positioning_done)
 }
 
 fn static_concrete_expr_type_layout<'a>(
@@ -1554,7 +1655,38 @@ fn lower_format_expr(
     lower_string_expr_ctx(b, ctx, expr)
 }
 
-fn inquire_size_storeback_type(
+fn lower_fixed_internal_list_write(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+    record_count: ValueId,
+    iostat_ptr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) {
+    b.call(
+        FuncRef::External("afs_lst_begin_internal_fixed".into()),
+        vec![
+            buf_ptr,
+            buf_len,
+            record_count,
+            iostat_ptr,
+            iomsg_ptr,
+            iomsg_len,
+        ],
+        IrType::Void,
+    );
+    lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
+    b.call(
+        FuncRef::External("afs_lst_end_internal_fixed".into()),
+        vec![],
+        IrType::Void,
+    );
+}
+
+fn integer_storeback_type(
     b: &FuncBuilder,
     ctx: &LowerCtx<'_>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -1575,15 +1707,54 @@ fn inquire_size_storeback_type(
     }
 }
 
+type IostatStoreback = Option<(ValueId, IrType)>;
+
+fn lower_runtime_iostat(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    control: Option<&IoControl>,
+    required: bool,
+) -> (ValueId, IostatStoreback) {
+    if let Some(control) = control {
+        let dest_addr = lower_arg_by_ref_ctx(b, ctx, &control.value);
+        let dest_ty = integer_storeback_type(b, ctx, &control.value, dest_addr);
+        let runtime_addr = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, runtime_addr);
+        return (runtime_addr, Some((dest_addr, dest_ty)));
+    }
+
+    if required {
+        let runtime_addr = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, runtime_addr);
+        return (runtime_addr, None);
+    }
+
+    (b.const_i64(0), None)
+}
+
+fn lower_runtime_iostat_storeback(
+    b: &mut FuncBuilder,
+    runtime_addr: ValueId,
+    storeback: &IostatStoreback,
+) {
+    if let Some((dest_addr, dest_ty)) = storeback {
+        let status = b.load_typed(runtime_addr, IrType::Int(IntWidth::I32));
+        let coerced = coerce_to_type(b, status, dest_ty);
+        b.store(coerced, *dest_addr);
+    }
+}
+
 fn lower_external_io_pos_seek(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     controls: &[IoControl],
     unit: ValueId,
     iostat_ptr: ValueId,
-) {
+) -> bool {
     let Some(pos_ctrl) = io_control_by_keyword(controls, "pos") else {
-        return;
+        return false;
     };
     let raw_pos = super::expr::lower_expr_ctx(b, ctx, &pos_ctrl.value);
     let pos = coerce_to_type(b, raw_pos, &IrType::Int(IntWidth::I64));
@@ -1592,6 +1763,138 @@ fn lower_external_io_pos_seek(
         FuncRef::External("afs_seek_stream".into()),
         vec![unit_i32, pos, iostat_ptr],
         IrType::Void,
+    );
+    true
+}
+
+fn lower_external_read_pos_seek(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    controls: &[IoControl],
+    unit: ValueId,
+    iostat_ptr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> Option<BlockId> {
+    if !lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr) {
+        return None;
+    }
+
+    let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    let failure_bb = b.create_block("read_pos_failed");
+    let transfer_bb = b.create_block("read_pos_ok");
+    let done_bb = b.create_block("read_pos_done");
+    b.cond_branch(failed, failure_bb, vec![], transfer_bb, vec![]);
+
+    b.set_block(failure_bb);
+    lower_read_assign_iomsg(b, iostat_ptr, iomsg_ptr, iomsg_len);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(transfer_bb);
+    Some(done_bb)
+}
+
+fn lower_external_write_pos_seek(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    controls: &[IoControl],
+    unit: ValueId,
+    iostat_ptr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+) -> Option<BlockId> {
+    if !lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr) {
+        return None;
+    }
+
+    let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    let failure_bb = b.create_block("write_pos_failed");
+    let transfer_bb = b.create_block("write_pos_ok");
+    let done_bb = b.create_block("write_pos_done");
+    b.cond_branch(failed, failure_bb, vec![], transfer_bb, vec![]);
+
+    b.set_block(failure_bb);
+    lower_read_assign_iomsg(b, iostat_ptr, iomsg_ptr, iomsg_len);
+    b.branch(done_bb, vec![]);
+
+    b.set_block(transfer_bb);
+    Some(done_bb)
+}
+
+fn finish_external_read_positioning(b: &mut FuncBuilder, done: Option<BlockId>) {
+    if let Some(done_bb) = done {
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+    }
+}
+
+fn finish_external_write_positioning(b: &mut FuncBuilder, done: Option<BlockId>) {
+    if let Some(done_bb) = done {
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+    }
+}
+
+fn lower_write_status_branches(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    err_label: Option<u64>,
+    iostat_addr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+    user_iostat: bool,
+) {
+    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
+        return;
+    };
+
+    let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    if let Some((label, target_bb)) =
+        err_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
+    {
+        let ok_bb = b.create_block(&format!("write_ok_{label}"));
+        b.cond_branch(failed, target_bb, vec![], ok_bb, vec![]);
+        b.set_block(ok_bb);
+    } else if !user_iostat {
+        let fatal_bb = b.create_block("write_unhandled_err");
+        let ok_bb = b.create_block("write_ok");
+        b.cond_branch(failed, fatal_bb, vec![], ok_bb, vec![]);
+        b.set_block(fatal_bb);
+        b.call(
+            FuncRef::External("afs_write_unhandled_iostat".into()),
+            vec![status, iomsg_ptr, iomsg_len],
+            IrType::Void,
+        );
+        b.unreachable();
+        b.set_block(ok_bb);
+    }
+}
+
+fn lower_write_status_completion(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    err_label: Option<u64>,
+    iostat_addr: ValueId,
+    iomsg_ptr: ValueId,
+    iomsg_len: ValueId,
+    storeback: &IostatStoreback,
+    user_iostat: bool,
+) {
+    lower_runtime_iostat_storeback(b, iostat_addr, storeback);
+    lower_write_status_branches(
+        b,
+        ctx,
+        err_label,
+        iostat_addr,
+        iomsg_ptr,
+        iomsg_len,
+        user_iostat,
     );
 }
 
@@ -4094,6 +4397,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Write { controls, items } => {
+            let err_label = io_control_by_keyword(controls, "err")
+                .and_then(|control| format_label_literal(&control.value));
+
             // Check for format specifier (second positional control).
             // * means list-directed; a string literal means formatted.
             let fmt_control = controls
@@ -4171,9 +4477,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // pattern around `write(unit, fmt_, iostat=ios) d(i, :)` and
             // unconditionally error_stops every example_savetxt /
             // example_loadtxt without proper iostat plumbing.
-            let null_i64 = b.const_i64(0);
-            let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
-            let zero_i64 = b.const_i64(0);
             let iostat_ctrl = controls.iter().find(|c| {
                 c.keyword
                     .as_deref()
@@ -4195,17 +4498,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("leading_zero"))
                     .unwrap_or(false)
             });
-            let iostat_arg_ptr = iostat_ctrl.map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
-            let iostat_ptr = iostat_arg_ptr.unwrap_or(null_i8_ptr);
-            let (iomsg_arg_ptr, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
+            let needs_hidden_iostat = true;
+            let (iostat_ptr, iostat_storeback) =
+                lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
+            let (dtio_iomsg, iomsg_ptr, iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
-                (arg_ptr, ptr, len)
+                (Some((arg_ptr, len)), ptr, len)
             } else {
-                (null_char_slot_arg(b), null_i8_ptr, zero_i64)
+                let (arg_ptr, ptr, len) = scratch_char_buffer_arg(b);
+                (Some((arg_ptr, len)), ptr, len)
             };
 
-            if lower_namelist_write_stmt(b, ctx, controls, iostat_ptr) {
+            let (wrote_namelist, positioning_done) =
+                lower_namelist_write_stmt(b, ctx, controls, iostat_ptr, iomsg_ptr, iomsg_len);
+            if wrote_namelist {
+                finish_external_write_positioning(b, positioning_done);
+                lower_write_status_completion(
+                    b,
+                    ctx,
+                    err_label,
+                    iostat_ptr,
+                    iomsg_ptr,
+                    iomsg_len,
+                    &iostat_storeback,
+                    iostat_ctrl.is_some(),
+                );
                 return;
             }
 
@@ -4229,6 +4547,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             FuncRef::External("afs_lst_ia_end".into()),
                             vec![],
                             IrType::Void,
+                        );
+                        lower_write_status_completion(
+                            b,
+                            ctx,
+                            err_label,
+                            iostat_ptr,
+                            iomsg_ptr,
+                            iomsg_len,
+                            &iostat_storeback,
+                            iostat_ctrl.is_some(),
                         );
                         return;
                     }
@@ -4257,6 +4585,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         Some(ctx.type_layouts),
                         fmt_ptr,
                     );
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        err_label,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        iostat_ctrl.is_some(),
+                    );
                     return;
                 }
                 // Whole character array as the internal unit: formatted
@@ -4267,7 +4605,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 // wrote nothing through a zero-length buffer view).
                 if let Some((base, elem_len, nelems)) = internal_io_array_target(b, ctx, ctrl) {
                     if is_list_directed {
-                        lower_internal_write_items(b, ctx, items, base, elem_len);
+                        lower_fixed_internal_list_write(
+                            b, ctx, items, base, elem_len, nelems, iostat_ptr, iomsg_ptr, iomsg_len,
+                        );
+                        lower_write_status_completion(
+                            b,
+                            ctx,
+                            err_label,
+                            iostat_ptr,
+                            iomsg_ptr,
+                            iomsg_len,
+                            &iostat_storeback,
+                            iostat_ctrl.is_some(),
+                        );
                         return;
                     }
                     let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &fmt_control.unwrap().value);
@@ -4298,11 +4648,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         Some(ctx.type_layouts),
                         fmt_ptr,
                     );
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        err_label,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        iostat_ctrl.is_some(),
+                    );
                     return;
                 }
                 if let Some((buf_ptr, buf_len)) = internal_io_buffer(b, ctx, ctrl) {
                     if is_list_directed {
-                        lower_internal_write_items(b, ctx, items, buf_ptr, buf_len);
+                        let one_record = b.const_i64(1);
+                        lower_fixed_internal_list_write(
+                            b, ctx, items, buf_ptr, buf_len, one_record, iostat_ptr, iomsg_ptr,
+                            iomsg_len,
+                        );
                     } else {
                         let (fmt_ptr, fmt_len) =
                             lower_format_expr(b, ctx, &fmt_control.unwrap().value);
@@ -4334,6 +4698,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             fmt_ptr,
                         );
                     }
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        err_label,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        iostat_ctrl.is_some(),
+                    );
                     return;
                 }
             }
@@ -4349,7 +4723,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.const_i32(6)
             };
 
-            lower_external_io_pos_seek(b, ctx, controls, unit, iostat_ptr);
+            let positioning_done = lower_external_write_pos_seek(
+                b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len,
+            );
 
             let defined_iotype = match fmt_control {
                 Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
@@ -4364,10 +4740,20 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 items,
                 unit,
                 defined_iotype,
-                iostat_arg_ptr,
-                iomsg_arg_ptr,
-                iomsg_len,
+                iostat_ptr,
+                dtio_iomsg,
             ) {
+                finish_external_write_positioning(b, positioning_done);
+                lower_write_status_completion(
+                    b,
+                    ctx,
+                    err_label,
+                    iostat_ptr,
+                    iomsg_ptr,
+                    iomsg_len,
+                    &iostat_storeback,
+                    iostat_ctrl.is_some(),
+                );
                 return;
             }
 
@@ -4428,6 +4814,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             }
+            finish_external_write_positioning(b, positioning_done);
+            lower_write_status_completion(
+                b,
+                ctx,
+                err_label,
+                iostat_ptr,
+                iomsg_ptr,
+                iomsg_len,
+                &iostat_storeback,
+                iostat_ctrl.is_some(),
+            );
         }
 
         Stmt::Call { callee, args } => {
@@ -8435,15 +8832,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let null_i8_ptr = b.int_to_ptr(null, IrType::Int(IntWidth::I8));
             let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
             let recl_i64 = coerce_to_type(b, recl_val, &IrType::Int(IntWidth::I64));
-            let open_iostat_ptr = match (iostat_spec, err_label) {
-                (Some(spec), _) => lower_arg_by_ref_ctx(b, ctx, &spec.value),
-                (None, Some(_)) => {
-                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
-                    let zero = b.const_i32(0);
-                    b.store(zero, tmp);
-                    tmp
-                }
-                (None, None) => null,
+            let (open_iostat_ptr, open_iostat_storeback) =
+                lower_runtime_iostat(b, ctx, iostat_spec, err_label.is_some());
+            let (newunit_ptr, newunit_storeback) = if let Some(spec) = newunit_spec {
+                let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
+                let runtime_addr = b.alloca(IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                b.store(zero, runtime_addr);
+                (runtime_addr, Some((dest_addr, dest_ty)))
+            } else {
+                (null, None)
             };
             let (open_iomsg_ptr, open_iomsg_len) = iomsg_spec
                 .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
@@ -8603,9 +9002,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .func()
                     .value_type(open_iomsg_ptr)
                     .unwrap_or(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                let newunit_ptr = newunit_spec
-                    .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
-                    .unwrap_or(null);
                 let iostat_ptr_ty = b
                     .func()
                     .value_type(open_iostat_ptr)
@@ -8639,6 +9035,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.call(FuncRef::External("afs_open".into()), vec![cb], IrType::Void);
             }
             deallocate_owned_string_bases(b, &open_string_temps);
+            lower_runtime_iostat_storeback(b, open_iostat_ptr, &open_iostat_storeback);
+            lower_runtime_iostat_storeback(b, newunit_ptr, &newunit_storeback);
             lower_read_err_branch(b, ctx, err_label, open_iostat_ptr);
         }
 
@@ -8664,6 +9062,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     .map(|k| k.eq_ignore_ascii_case("status"))
                     .unwrap_or(false)
             });
+            let iomsg_spec = io_control_by_keyword(specs, "iomsg");
+            let err_label = io_control_by_keyword(specs, "err").and_then(|spec| {
+                if let Expr::IntegerLiteral { text, .. } = &spec.value.node {
+                    text.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            });
             let unit = if let Some(s) = unit_spec {
                 super::expr::lower_expr_ctx(b, ctx, &s.value)
             } else {
@@ -8671,19 +9077,28 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             let null = b.const_i64(0);
             let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
-            let iostat_ptr = iostat_spec
-                .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
-                .unwrap_or(null);
+            let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(
+                b,
+                ctx,
+                iostat_spec,
+                err_label.is_some() || iomsg_spec.is_some(),
+            );
             let (status_ptr, status_len) = status_spec
                 .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
                 .unwrap_or_else(|| (null, null));
+            let (iomsg_ptr, iomsg_len) = iomsg_spec
+                .map(|spec| lower_string_expr_ctx(b, ctx, &spec.value))
+                .unwrap_or((null, null));
             b.call(
                 FuncRef::External("afs_close_ex".into()),
                 vec![unit_i32, status_ptr, status_len, iostat_ptr],
                 IrType::Void,
             );
+            lower_read_assign_iomsg(b, iostat_ptr, iomsg_ptr, iomsg_len);
+            lower_runtime_iostat_storeback(b, iostat_ptr, &iostat_storeback);
             let status_temps = b.take_owned_string_temp_bases(status_ptr);
             deallocate_owned_string_bases(b, &status_temps);
+            lower_read_err_branch(b, ctx, err_label, iostat_ptr);
         }
 
         Stmt::Read { controls, items } => {
@@ -8775,71 +9190,62 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(ctrl) => matches!(&ctrl.value.node, Expr::Name { name } if name == "*"),
             };
 
-            let explicit_iostat_addr = controls
-                .iter()
-                .find(|c| {
-                    c.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("iostat"))
-                        .unwrap_or(false)
-                })
-                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value));
-
-            let user_iostat = explicit_iostat_addr.is_some();
-            let needs_hidden_iostat = end_label.is_some() || err_label.is_some();
-            let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
-            let iostat_addr = match explicit_iostat_addr {
-                Some(addr) => addr,
-                None if needs_hidden_iostat => {
-                    let tmp = b.alloca(IrType::Int(IntWidth::I32));
-                    let zero = b.const_i32(0);
-                    b.store(zero, tmp);
-                    tmp
-                }
-                None => b.const_i64(0),
-            };
-            let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
-
-            let size_addr = controls
-                .iter()
-                .find(|c| {
-                    c.keyword
-                        .as_deref()
-                        .map(|k| k.eq_ignore_ascii_case("size"))
-                        .unwrap_or(false)
-                })
-                .map(|c| lower_arg_by_ref_ctx(b, ctx, &c.value))
-                .unwrap_or_else(|| b.const_i64(0));
             let iomsg_ctrl = controls.iter().find(|c| {
                 c.keyword
                     .as_deref()
                     .map(|k| k.eq_ignore_ascii_case("iomsg"))
                     .unwrap_or(false)
             });
+
+            let iostat_ctrl = controls.iter().find(|c| {
+                c.keyword
+                    .as_deref()
+                    .map(|k| k.eq_ignore_ascii_case("iostat"))
+                    .unwrap_or(false)
+            });
+            let user_iostat = iostat_ctrl.is_some();
+            let needs_hidden_iostat = end_label.is_some()
+                || err_label.is_some()
+                || iomsg_ctrl.is_some()
+                || io_control_by_keyword(controls, "pos").is_some();
+            let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
+            let (iostat_addr, iostat_storeback) =
+                lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
+            let dtio_iostat_addr = has_dtio_iostat_addr.then_some(iostat_addr);
+
+            let size_ctrl = io_control_by_keyword(controls, "size");
+            let (size_addr, size_storeback) = lower_runtime_iostat(b, ctx, size_ctrl, false);
             let null_iomsg_data = {
                 let z = b.const_i64(0);
                 b.int_to_ptr(z, IrType::Int(IntWidth::I8))
             };
             let zero_iomsg_len = b.const_i64(0);
-            let (iomsg_arg_ptr, read_iomsg_ptr, read_iomsg_len) = if let Some(c) = iomsg_ctrl {
+            let (dtio_iomsg, read_iomsg_ptr, read_iomsg_len) = if let Some(c) = iomsg_ctrl {
                 let arg_ptr = lower_arg_by_ref_ctx(b, ctx, &c.value);
                 let (ptr, len) = lower_string_expr_ctx(b, ctx, &c.value);
-                (arg_ptr, ptr, len)
+                (Some((arg_ptr, len)), ptr, len)
             } else {
-                (null_char_slot_arg(b), null_iomsg_data, zero_iomsg_len)
+                (None, null_iomsg_data, zero_iomsg_len)
             };
 
-            if lower_namelist_read_stmt(
+            let (lowered_namelist, namelist_positioning_done) = lower_namelist_read_stmt(
                 b,
                 ctx,
                 controls,
                 iostat_addr,
-                end_label,
-                err_label,
-                user_iostat,
-            ) {
+                read_iomsg_ptr,
+                read_iomsg_len,
+            );
+            if lowered_namelist {
+                finish_external_read_positioning(b, namelist_positioning_done);
+                lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+                lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
+                lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
             }
+
+            lower_read_reset_status(b, iostat_addr);
 
             if let Some(ctrl) = controls.first() {
                 // Whole-char-array internal READ produced silent garbage
@@ -8878,6 +9284,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             fmt_ptr,
                         );
                     }
+                    lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                    lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+                    lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                     lower_read_status_branches(
                         b,
                         ctx,
@@ -8900,7 +9309,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(5) // default stdin
             };
-            lower_external_io_pos_seek(b, ctx, controls, unit, iostat_addr);
+            let positioning_done = lower_external_read_pos_seek(
+                b,
+                ctx,
+                controls,
+                unit,
+                iostat_addr,
+                read_iomsg_ptr,
+                read_iomsg_len,
+            );
             let defined_iotype = match fmt_control {
                 Some(ctrl) if matches!(&ctrl.value.node, Expr::Name { name } if name == "*") => {
                     Some("LISTDIRECTED")
@@ -8915,9 +9332,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 unit,
                 defined_iotype,
                 dtio_iostat_addr,
-                iomsg_arg_ptr,
-                read_iomsg_len,
+                dtio_iomsg,
             ) {
+                finish_external_read_positioning(b, positioning_done);
+                lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+                lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
                 lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
                 return;
             }
@@ -8961,6 +9380,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             }
+            finish_external_read_positioning(b, positioning_done);
+            lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+            lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+            lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
             lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
 
@@ -8994,11 +9417,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             let unit_spec = unit_spec.or(positional_unit_spec);
 
-            let lower_ref_spec = |b: &mut FuncBuilder, needle: &str| -> ValueId {
-                spec_by_keyword(needle)
-                    .map(|spec| lower_arg_by_ref_ctx(b, ctx, &spec.value))
-                    .unwrap_or(null)
-            };
             let lower_string_spec = |b: &mut FuncBuilder, needle: &str| -> (ValueId, ValueId) {
                 if let Some(spec) = spec_by_keyword(needle) {
                     lower_string_expr_ctx(b, ctx, &spec.value)
@@ -9007,9 +9425,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 }
             };
 
-            let exist_addr = lower_ref_spec(b, "exist");
-            let opened_addr = lower_ref_spec(b, "opened");
-            let iostat_addr = lower_ref_spec(b, "iostat");
             let (name_ptr, name_len) = lower_string_spec(b, "name");
             let (access_ptr, access_len) = lower_string_spec(b, "access");
             let (form_ptr, form_len) = lower_string_spec(b, "form");
@@ -9023,12 +9438,29 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (formatted_ptr, formatted_len) = lower_string_spec(b, "formatted");
             let (unformatted_ptr, unformatted_len) = lower_string_spec(b, "unformatted");
             let (leading_zero_ptr, leading_zero_len) = lower_string_spec(b, "leading_zero");
-            let recl_addr = lower_ref_spec(b, "recl");
+            let (exist_addr, exist_storeback) =
+                lower_runtime_iostat(b, ctx, spec_by_keyword("exist"), false);
+            let (opened_addr, opened_storeback) =
+                lower_runtime_iostat(b, ctx, spec_by_keyword("opened"), false);
+            let (iostat_addr, iostat_storeback) =
+                lower_runtime_iostat(b, ctx, spec_by_keyword("iostat"), false);
+            let recl_spec = spec_by_keyword("recl");
+            let (recl_addr, recl_storeback) = if let Some(spec) = recl_spec {
+                let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
+                let temp = b.alloca(IrType::Int(IntWidth::I64));
+                let current = b.load(dest_addr);
+                let widened = coerce_to_type(b, current, &IrType::Int(IntWidth::I64));
+                b.store(widened, temp);
+                (temp, Some((dest_addr, dest_ty)))
+            } else {
+                (null, None)
+            };
             let size_spec = spec_by_keyword("size");
             let (size_addr, size_storeback) = if let Some(spec) = size_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
@@ -9042,7 +9474,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let (pos_addr, pos_storeback) = if let Some(spec) = pos_spec {
                 let dest_addr = lower_arg_by_ref_ctx(b, ctx, &spec.value);
                 let temp = b.alloca(IrType::Int(IntWidth::I64));
-                let dest_ty = inquire_size_storeback_type(b, ctx, &spec.value, dest_addr);
+                let dest_ty = integer_storeback_type(b, ctx, &spec.value, dest_addr);
                 (temp, Some((dest_addr, dest_ty)))
             } else {
                 (null, None)
@@ -9141,6 +9573,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     IrType::Void,
                 );
             }
+            lower_runtime_iostat_storeback(b, exist_addr, &exist_storeback);
+            lower_runtime_iostat_storeback(b, opened_addr, &opened_storeback);
+            lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
+            if let Some((dest_addr, dest_ty)) = recl_storeback {
+                let recl_val = b.load(recl_addr);
+                let coerced = coerce_to_type(b, recl_val, &dest_ty);
+                b.store(coerced, dest_addr);
+            }
             if let Some((dest_addr, dest_ty)) = size_storeback {
                 let size_val = b.load(size_addr);
                 let coerced = coerce_to_type(b, size_val, &dest_ty);
@@ -9154,31 +9594,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Flush { specs } => {
-            let unit = if let Some(s) = specs.first() {
-                super::expr::lower_expr_ctx(b, ctx, &s.value)
-            } else {
-                b.const_i32(6)
-            };
-            let null = b.const_i64(0);
-            b.call(
-                FuncRef::External("afs_flush".into()),
-                vec![unit, null],
-                IrType::Void,
-            );
+            lower_flush_or_rewind_statement(b, ctx, specs, "afs_flush");
         }
 
         Stmt::Rewind { specs } => {
-            let unit = if let Some(s) = specs.first() {
-                super::expr::lower_expr_ctx(b, ctx, &s.value)
-            } else {
-                b.const_i32(6)
-            };
-            let null = b.const_i64(0);
-            b.call(
-                FuncRef::External("afs_rewind".into()),
-                vec![unit, null],
-                IrType::Void,
-            );
+            lower_flush_or_rewind_statement(b, ctx, specs, "afs_rewind");
+        }
+
+        Stmt::Backspace { specs } => {
+            lower_positioning_statement(b, ctx, specs, "afs_backspace_ex");
+        }
+
+        Stmt::Endfile { specs } => {
+            lower_positioning_statement(b, ctx, specs, "afs_endfile_ex");
         }
 
         Stmt::Nullify { items } => {

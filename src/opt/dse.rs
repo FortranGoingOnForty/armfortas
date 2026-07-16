@@ -92,17 +92,22 @@ fn find_dead_stores(
                 // pointer into an allocation can walk to any offset
                 // within it, so `gep %a,[0]` passed as an arg must
                 // invalidate a pending store to `gep %a,[1]` even
-                // though their precise offsets differ.  Currently the
-                // Fortran programs we compile don't expose a
-                // triggering DSE pattern, but the code is structurally
-                // identical to the other LSF passes so we fix it
-                // defensively.
+                // though their precise offsets differ. Aggregate-like
+                // pointees may also carry pointers to otherwise unrelated
+                // allocations, requiring a full pending-store barrier.
                 let pointer_args: Vec<ValueId> = args
                     .iter()
                     .copied()
                     .filter(|arg| alias_oracle.value_is_pointer(*arg))
                     .collect();
                 if !pointer_args.is_empty() {
+                    if pointer_args
+                        .iter()
+                        .any(|arg| call_arg_may_carry_indirect_pointer(alias_oracle, *arg))
+                    {
+                        pending.clear();
+                        continue;
+                    }
                     pending.retain(|_, entry| {
                         pointer_args
                             .iter()
@@ -121,6 +126,20 @@ fn find_dead_stores(
     // they stay live. Cross-block DSE requires a separate dataflow analysis.
 
     dead
+}
+
+fn call_arg_may_carry_indirect_pointer(
+    alias_oracle: &alias::AliasOracle<'_>,
+    value: ValueId,
+) -> bool {
+    matches!(
+        alias_oracle.value_type(value),
+        Some(IrType::Ptr(inner))
+            if matches!(
+                inner.as_ref(),
+                IrType::Array(..) | IrType::Struct(_) | IrType::Ptr(_) | IrType::FuncPtr(_)
+            )
+    )
 }
 
 fn remove_dead_stores(block: &mut BasicBlock, dead: &HashSet<usize>) -> bool {
@@ -271,6 +290,55 @@ mod tests {
                 .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn aggregate_call_arg_preserves_store_reachable_through_wrapped_pointer() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+        let payload = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let wrapper_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 16);
+        let wrapper = push(
+            &mut f,
+            InstKind::Alloca(wrapper_ty.clone()),
+            IrType::Ptr(Box::new(wrapper_ty)),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let wrapper_slot = push(
+            &mut f,
+            InstKind::GetElementPtr(wrapper, vec![zero]),
+            IrType::Ptr(Box::new(ptr_ty())),
+        );
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, payload), IrType::Void);
+        push(&mut f, InstKind::Store(payload, wrapper_slot), IrType::Void);
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("observe_indirect".into()), vec![wrapper]),
+            IrType::Void,
+        );
+        push(&mut f, InstKind::Store(v2, payload), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(
+            !Dse.run(&mut m),
+            "DSE must preserve a store observable through a pointer carried by an aggregate"
+        );
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            3
         );
     }
 

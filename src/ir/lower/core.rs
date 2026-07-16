@@ -10160,7 +10160,8 @@ pub(super) fn descriptor_backed_runtime_char_array(info: &LocalInfo) -> bool {
 }
 
 pub(super) fn descriptor_backed_char_array(info: &LocalInfo) -> bool {
-    local_uses_array_descriptor(info)
+    local_declared_rank(info) > 0
+        && local_uses_array_descriptor(info)
         && (info.char_kind != CharKind::None || descriptor_backed_runtime_char_array(info))
 }
 
@@ -30337,7 +30338,24 @@ fn unsupported_derived_io_field(
     )
 }
 
-fn lower_write_emit_logical(b: &mut FuncBuilder, unit: ValueId, ty: &IrType, val: ValueId) {
+fn logical_transfer_width_for_ir_type(ty: &IrType) -> i32 {
+    match ty {
+        IrType::Bool | IrType::Int(IntWidth::I32) => 4,
+        IrType::Int(IntWidth::I8) => 1,
+        IrType::Int(IntWidth::I16) => 2,
+        IrType::Int(IntWidth::I64) => 8,
+        IrType::Int(IntWidth::I128) => 16,
+        _ => 4,
+    }
+}
+
+fn lower_write_emit_logical(
+    b: &mut FuncBuilder,
+    unit: ValueId,
+    ty: &IrType,
+    val: ValueId,
+    kind: u8,
+) {
     let truth = match ty {
         IrType::Bool => val,
         IrType::Int(_) => {
@@ -30347,9 +30365,10 @@ fn lower_write_emit_logical(b: &mut FuncBuilder, unit: ValueId, ty: &IrType, val
         _ => coerce_to_type(b, val, &IrType::Bool),
     };
     let int_val = b.int_extend(truth, IntWidth::I32, false);
+    let kind_bytes = b.const_i32(i32::from(kind));
     b.call(
-        FuncRef::External("afs_write_logical".into()),
-        vec![unit, int_val],
+        FuncRef::External("afs_write_logical_kind".into()),
+        vec![unit, int_val, kind_bytes],
         IrType::Void,
     );
 }
@@ -30492,8 +30511,11 @@ fn lower_derived_field_scalar_write(
         return;
     }
     let val = b.load_typed(field_ptr, ty.clone());
-    if field_logical_kind(field).is_some() {
-        lower_write_emit_logical(b, unit, &ty, val);
+    if matches!(
+        field.type_info,
+        crate::sema::symtab::TypeInfo::Logical { .. }
+    ) {
+        lower_write_emit_logical(b, unit, &ty, val, field_logical_kind(field).unwrap_or(4));
         return;
     }
     b.call(
@@ -30624,11 +30646,11 @@ fn lower_derived_field_scalar_read(
         let real_ptr = field_ptr;
         let lane_bytes = b.const_i64(ir_scalar_byte_size(&lane_ty, ctx.layout));
         let imag_ptr = b.gep(field_ptr, vec![lane_bytes], IrType::Int(IntWidth::I8));
-        let _ = lower_read_into_addr(b, mode, &lane_ty, real_ptr);
-        let _ = lower_read_into_addr(b, mode, &lane_ty, imag_ptr);
+        let _ = lower_read_into_addr(b, mode, &lane_ty, real_ptr, false);
+        let _ = lower_read_into_addr(b, mode, &lane_ty, imag_ptr, false);
         return;
     }
-    let _ = lower_read_into_addr(b, mode, &ty, field_ptr);
+    let _ = lower_read_into_addr(b, mode, &ty, field_ptr, field_logical_kind(field).is_some());
 }
 
 pub(super) fn descriptor_element_size_bytes(
@@ -32688,6 +32710,10 @@ pub(super) fn lower_write_items_adv(
             || (expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts))
                 && !expr_is_array_designator(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)))
             || generic_char_call;
+        let is_logical = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
 
         // Whole-array print: a plain Name reference whose local
         // has array dims. Iterate elements and call the per-element
@@ -32977,11 +33003,16 @@ pub(super) fn lower_write_items_adv(
                         );
                     } else {
                         let elem = load_rank1_array_desc_elem(b, desc, &elem_ty, i_val);
-                        b.call(
-                            FuncRef::External(writer.into()),
-                            vec![unit, elem],
-                            IrType::Void,
-                        );
+                        if is_logical {
+                            let kind = logical_transfer_width_for_ir_type(&elem_ty) as u8;
+                            lower_write_emit_logical(b, unit, &elem_ty, elem, kind);
+                        } else {
+                            b.call(
+                                FuncRef::External(writer.into()),
+                                vec![unit, elem],
+                                IrType::Void,
+                            );
+                        }
                     }
                     let one = b.const_i64(1);
                     let next = b.iadd(i_val, one);
@@ -32996,6 +33027,11 @@ pub(super) fn lower_write_items_adv(
                 .func()
                 .value_type(val)
                 .unwrap_or(IrType::Int(IntWidth::I32));
+            if is_logical {
+                let kind = logical_transfer_width_for_ir_type(&ty) as u8;
+                lower_write_emit_logical(b, unit, &ty, val, kind);
+                continue;
+            }
             let func_name = match &ty {
                 IrType::Ptr(ref inner) => {
                     // Complex expression result: ptr<[f32/f64 x 2]>
@@ -33275,7 +33311,7 @@ pub(super) fn internal_io_array_target(
         _ => return None,
     };
     let info = ctx.locals.get(&name.to_lowercase())?;
-    if descriptor_backed_runtime_char_array(info) {
+    if descriptor_backed_char_array(info) {
         let desc = array_descriptor_addr(b, info);
         let base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
         let elem = descriptor_elem_size(b, desc);
@@ -33410,138 +33446,90 @@ fn internal_write_item_is_char(ctx: &LowerCtx, item: &crate::ast::expr::SpannedE
     }
 }
 
-pub(super) fn lower_internal_write_items(
-    b: &mut FuncBuilder,
-    ctx: &mut LowerCtx,
-    items: &[crate::ast::expr::SpannedExpr],
-    buf_ptr: ValueId,
-    buf_len: ValueId,
-) {
-    let zero = b.const_i64(0);
-    let pos = b.alloca(IrType::Int(IntWidth::I64));
-    b.store(zero, pos);
-
-    for item in items {
-        let is_char = internal_write_item_is_char(ctx, item);
-
-        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
-            b.call(
-                FuncRef::External("afs_write_internal_string".into()),
-                vec![buf_ptr, buf_len, ptr, len, pos],
-                IrType::Void,
-            );
-            deallocate_owned_string_expr_temp(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-                ptr,
-            );
-            continue;
-        }
-
-        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
-        let ty = b
-            .func()
-            .value_type(val)
-            .unwrap_or(IrType::Int(IntWidth::I32));
-        match ty {
-            IrType::Int(IntWidth::I8) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int8".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I16) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int16".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I128) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int128".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I64) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int64".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I32) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_int".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(FloatWidth::F64) => {
-                b.call(
-                    FuncRef::External("afs_write_internal_real64".into()),
-                    vec![buf_ptr, buf_len, val, pos],
-                    IrType::Void,
-                );
-            }
-            IrType::Float(_) => {
-                let widened = b.float_extend(val, FloatWidth::F64);
-                b.call(
-                    FuncRef::External("afs_write_internal_real64".into()),
-                    vec![buf_ptr, buf_len, widened, pos],
-                    IrType::Void,
-                );
-            }
-            _ => {}
-        }
-    }
+#[derive(Clone, Copy)]
+enum InternalListWriteSink {
+    Fixed {
+        buf_ptr: ValueId,
+        buf_len: ValueId,
+        pos: ValueId,
+    },
+    Alloc,
 }
 
-/// List-directed internal WRITE items into a deferred-length
-/// allocatable scalar target: the record is collected in the runtime
-/// (afs_lst_ia_*) and stored in one shot at end, so an unallocated
-/// target gets allocated to the record length instead of presenting
-/// a len-0 view to the fixed-buffer writers (which silently produced
-/// an empty string). Item classification and rendering match the
-/// fixed path exactly.
-pub(super) fn lower_internal_write_items_alloc(
-    b: &mut FuncBuilder,
-    ctx: &mut LowerCtx,
-    items: &[crate::ast::expr::SpannedExpr],
-) {
-    for item in items {
-        let is_char = internal_write_item_is_char(ctx, item);
+fn internal_list_write_scalar_supported(ty: &IrType, logical: bool) -> bool {
+    logical
+        || matches!(
+            ty,
+            IrType::Bool | IrType::Int(_) | IrType::Float(FloatWidth::F32 | FloatWidth::F64)
+        )
+}
 
-        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
-            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+fn lower_internal_list_write_scalar(
+    b: &mut FuncBuilder,
+    ty: &IrType,
+    val: ValueId,
+    logical: bool,
+    sink: InternalListWriteSink,
+) -> bool {
+    if logical || matches!(ty, IrType::Bool) {
+        let truth = match ty {
+            IrType::Bool => val,
+            IrType::Int(_) => {
+                let zero = zero_value_for_ir_type(b, ty);
+                b.icmp(CmpOp::Ne, val, zero)
+            }
+            _ => coerce_to_type(b, val, &IrType::Bool),
+        };
+        let int_val = b.int_extend(truth, IntWidth::I32, false);
+        match sink {
+            InternalListWriteSink::Fixed {
+                buf_ptr,
+                buf_len,
+                pos,
+            } => {
+                b.call(
+                    FuncRef::External("afs_write_internal_logical".into()),
+                    vec![buf_ptr, buf_len, int_val, pos],
+                    IrType::Void,
+                );
+            }
+            InternalListWriteSink::Alloc => {
+                b.call(
+                    FuncRef::External("afs_lst_ia_logical".into()),
+                    vec![int_val],
+                    IrType::Void,
+                );
+            }
+        }
+        return true;
+    }
+
+    match sink {
+        InternalListWriteSink::Fixed {
+            buf_ptr,
+            buf_len,
+            pos,
+        } => {
+            let func = match ty {
+                IrType::Int(IntWidth::I8) => "afs_write_internal_int8",
+                IrType::Int(IntWidth::I16) => "afs_write_internal_int16",
+                IrType::Int(IntWidth::I32) => "afs_write_internal_int",
+                IrType::Int(IntWidth::I64) => "afs_write_internal_int64",
+                IrType::Int(IntWidth::I128) => "afs_write_internal_int128",
+                IrType::Float(_) => "afs_write_internal_real64",
+                _ => return false,
+            };
+            let arg = match ty {
+                IrType::Float(FloatWidth::F32) => b.float_extend(val, FloatWidth::F64),
+                _ => val,
+            };
             b.call(
-                FuncRef::External("afs_lst_ia_string".into()),
-                vec![ptr, len],
+                FuncRef::External(func.into()),
+                vec![buf_ptr, buf_len, arg, pos],
                 IrType::Void,
             );
-            deallocate_owned_string_expr_temp(
-                b,
-                &ctx.locals,
-                item,
-                ctx.st,
-                Some(ctx.type_layouts),
-                ptr,
-            );
-            continue;
         }
-
-        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
-        let ty = b
-            .func()
-            .value_type(val)
-            .unwrap_or(IrType::Int(IntWidth::I32));
-        match ty {
+        InternalListWriteSink::Alloc => match ty {
             IrType::Int(IntWidth::I128) => {
                 b.call(
                     FuncRef::External("afs_lst_ia_int128".into()),
@@ -33564,23 +33552,267 @@ pub(super) fn lower_internal_write_items_alloc(
                     IrType::Void,
                 );
             }
-            IrType::Float(FloatWidth::F64) => {
-                b.call(
-                    FuncRef::External("afs_lst_ia_real".into()),
-                    vec![val],
-                    IrType::Void,
-                );
-            }
             IrType::Float(_) => {
-                let widened = b.float_extend(val, FloatWidth::F64);
+                let arg = match ty {
+                    IrType::Float(FloatWidth::F32) => b.float_extend(val, FloatWidth::F64),
+                    _ => val,
+                };
                 b.call(
                     FuncRef::External("afs_lst_ia_real".into()),
-                    vec![widened],
+                    vec![arg],
                     IrType::Void,
                 );
             }
-            _ => {}
+            _ => return false,
+        },
+    }
+    true
+}
+
+fn lower_internal_list_write_whole_array(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    sink: InternalListWriteSink,
+) -> bool {
+    let logical = info.logical_kind.is_some();
+    if info.char_kind != CharKind::None
+        || info.derived_type.is_some()
+        || is_complex_ty(&info.ty)
+        || !internal_list_write_scalar_supported(&info.ty, logical)
+    {
+        return false;
+    }
+
+    let base = array_base_addr(b, info);
+    let desc = local_uses_array_descriptor(info).then(|| array_descriptor_addr(b, info));
+    let n = array_total_elems_value(b, info);
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("internal_list_arr_check");
+    let bb_body = b.create_block("internal_list_arr_body");
+    let bb_exit = b.create_block("internal_list_arr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem_bytes = array_elem_size_value(b, info);
+    let ptr = if let Some(desc) = desc {
+        desc_element_byte_ptr_rank(b, desc, i_val, elem_bytes, local_declared_rank(info).max(1))
+    } else {
+        let byte_off = b.imul(i_val, elem_bytes);
+        b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8))
+    };
+    let elem = b.load_typed(ptr, info.ty.clone());
+    let emitted = lower_internal_list_write_scalar(b, &info.ty, elem, logical, sink);
+    debug_assert!(emitted);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    true
+}
+
+fn lower_internal_list_write_array_expr(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    logical: bool,
+    sink: InternalListWriteSink,
+) -> bool {
+    if !matches!(
+        item.node,
+        Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::ParenExpr { .. }
+            | Expr::FunctionCall { .. }
+    ) {
+        return false;
+    }
+
+    let Some((desc, elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+    if !internal_list_write_scalar_supported(&elem_ty, logical) {
+        lower_stmt_error(item.span, "unsupported internal output array item");
+    }
+    let rank = actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .unwrap_or(1)
+        .max(1);
+
+    let n = b.call(
+        FuncRef::External("afs_array_size".into()),
+        vec![desc],
+        IrType::Int(IntWidth::I64),
+    );
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("internal_list_arr_expr_check");
+    let bb_body = b.create_block("internal_list_arr_expr_body");
+    let bb_exit = b.create_block("internal_list_arr_expr_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let i_val = b.load(i_addr);
+    let elem = load_array_desc_elem_rank(b, desc, &elem_ty, i_val, rank);
+    let emitted = lower_internal_list_write_scalar(b, &elem_ty, elem, logical, sink);
+    debug_assert!(emitted);
+    let one = b.const_i64(1);
+    let next = b.iadd(i_val, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, item, ctx.st, desc);
+    true
+}
+
+pub(super) fn lower_internal_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    buf_ptr: ValueId,
+    buf_len: ValueId,
+) {
+    let zero = b.const_i64(0);
+    let pos = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero, pos);
+
+    let sink = InternalListWriteSink::Fixed {
+        buf_ptr,
+        buf_len,
+        pos,
+    };
+
+    for item in items {
+        if let Expr::Name { name } = &item.node {
+            if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
+                if local_is_array_like(&info)
+                    && lower_internal_list_write_whole_array(b, &info, sink)
+                {
+                    continue;
+                }
+            }
         }
+
+        let is_char = internal_write_item_is_char(ctx, item);
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            b.call(
+                FuncRef::External("afs_write_internal_string".into()),
+                vec![buf_ptr, buf_len, ptr, len, pos],
+                IrType::Void,
+            );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
+            continue;
+        }
+
+        let is_logical = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
+        if lower_internal_list_write_array_expr(b, ctx, item, is_logical, sink) {
+            continue;
+        }
+        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
+        let ty = b
+            .func()
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
+        let _ = lower_internal_list_write_scalar(b, &ty, val, is_logical, sink);
+    }
+}
+
+/// List-directed internal WRITE items into a deferred-length
+/// allocatable scalar target: the record is collected in the runtime
+/// (afs_lst_ia_*) and stored in one shot at end, so an unallocated
+/// target gets allocated to the record length instead of presenting
+/// a len-0 view to the fixed-buffer writers (which silently produced
+/// an empty string). Item classification and rendering match the
+/// fixed path exactly.
+pub(super) fn lower_internal_write_items_alloc(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+) {
+    let sink = InternalListWriteSink::Alloc;
+
+    for item in items {
+        if let Expr::Name { name } = &item.node {
+            if let Some(info) = ctx.locals.get(&name.to_lowercase()).cloned() {
+                if local_is_array_like(&info)
+                    && lower_internal_list_write_whole_array(b, &info, sink)
+                {
+                    continue;
+                }
+            }
+        }
+
+        let is_char = internal_write_item_is_char(ctx, item);
+
+        if is_char || matches!(item.node, Expr::StringLiteral { .. }) {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            b.call(
+                FuncRef::External("afs_lst_ia_string".into()),
+                vec![ptr, len],
+                IrType::Void,
+            );
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
+            continue;
+        }
+
+        let is_logical = matches!(
+            operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts)),
+            Some(crate::sema::symtab::TypeInfo::Logical { .. })
+        );
+        if lower_internal_list_write_array_expr(b, ctx, item, is_logical, sink) {
+            continue;
+        }
+        let val = super::expr::lower_expr_ctx_tl(b, ctx, item);
+        let ty = b
+            .func()
+            .value_type(val)
+            .unwrap_or(IrType::Int(IntWidth::I32));
+        let _ = lower_internal_list_write_scalar(b, &ty, val, is_logical, sink);
     }
 }
 
@@ -33625,9 +33857,31 @@ fn resolve_defined_io_item_specific(
     })
 }
 
-pub(super) fn null_char_slot_arg(b: &mut FuncBuilder) -> ValueId {
+pub(super) fn scratch_char_buffer_arg(b: &mut FuncBuilder) -> (ValueId, ValueId, ValueId) {
+    const SCRATCH_LEN: u64 = 256;
+
+    let storage = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        SCRATCH_LEN,
+    ));
     let zero = b.const_i64(0);
-    b.int_to_ptr(zero, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
+    let data = b.gep(storage, vec![zero], IrType::Int(IntWidth::I8));
+    let blank = b.const_i32(b' ' as i32);
+    let len = b.const_i64(SCRATCH_LEN as i64);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![data, blank, len],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+
+    let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.store(data, slot);
+    (slot, data, len)
+}
+
+fn scratch_char_slot_arg(b: &mut FuncBuilder) -> (ValueId, ValueId) {
+    let (slot, _, len) = scratch_char_buffer_arg(b);
+    (slot, len)
 }
 
 fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
@@ -33849,9 +34103,8 @@ pub(super) fn try_lower_defined_io_write_items(
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
     formatted_iotype: Option<&str>,
-    iostat: Option<ValueId>,
-    iomsg_arg: ValueId,
-    iomsg_len: ValueId,
+    iostat: ValueId,
+    iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -33868,6 +34121,9 @@ pub(super) fn try_lower_defined_io_write_items(
     else {
         return false;
     };
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let done = b.create_block("defined_write_done");
+    lower_io_status_continue_or_exit(b, iostat, done);
 
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
@@ -33877,11 +34133,14 @@ pub(super) fn try_lower_defined_io_write_items(
             item,
             unit,
             formatted_iotype,
-            iostat,
+            Some(iostat),
             iomsg_arg,
             iomsg_len,
         );
+        lower_io_status_continue_or_exit(b, iostat, done);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
     true
 }
 
@@ -33892,8 +34151,7 @@ pub(super) fn try_lower_defined_io_read_items(
     unit: ValueId,
     formatted_iotype: Option<&str>,
     iostat: Option<ValueId>,
-    iomsg_arg: ValueId,
-    iomsg_len: ValueId,
+    iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -33910,7 +34168,17 @@ pub(super) fn try_lower_defined_io_read_items(
     else {
         return false;
     };
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
 
+    let owns_iostat = iostat.is_none();
+    let statement_iostat = iostat.unwrap_or_else(|| {
+        let tmp = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, tmp);
+        tmp
+    });
+    let done = b.create_block("defined_read_done");
+    lower_io_status_continue_or_exit(b, statement_iostat, done);
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         emit_defined_io_call(
             b,
@@ -33919,10 +34187,16 @@ pub(super) fn try_lower_defined_io_read_items(
             item,
             unit,
             formatted_iotype,
-            iostat,
+            Some(statement_iostat),
             iomsg_arg,
             iomsg_len,
         );
+        lower_io_status_continue_or_exit(b, statement_iostat, done);
+    }
+    b.branch(done, vec![]);
+    b.set_block(done);
+    if owns_iostat {
+        lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
     }
     true
 }
@@ -33948,7 +34222,13 @@ pub(super) fn lower_list_read_items(
         return;
     }
 
-    let mode = ReadMode::Unit { unit, iostat };
+    let done = b.create_block("list_read_done");
+    let mode = ReadMode::Unit {
+        unit,
+        iostat,
+        error_exit: done,
+    };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_array_read_item(b, ctx, item, mode) {
@@ -33957,14 +34237,16 @@ pub(super) fn lower_list_read_items(
         if lower_derived_unit_read_item(b, ctx, item, mode) {
             continue;
         }
-        if lower_list_char_read_item(b, ctx, item, unit, iostat) {
+        if lower_list_char_read_item(b, ctx, item, mode) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 pub(super) fn lower_internal_read_items(
@@ -33978,25 +34260,30 @@ pub(super) fn lower_internal_read_items(
     let zero = b.const_i64(0);
     let pos = b.alloca(IrType::Int(IntWidth::I64));
     b.store(zero, pos);
+    let done = b.create_block("internal_read_done");
     let mode = ReadMode::Internal {
         buf_ptr,
         buf_len,
         pos,
         iostat,
+        error_exit: done,
     };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
-        if lower_internal_char_read_item(b, ctx, item, buf_ptr, buf_len, pos, iostat) {
+        if lower_internal_char_read_item(b, ctx, item, mode) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 #[derive(Clone, Copy)]
@@ -34004,12 +34291,14 @@ pub(in crate::ir::lower) enum ReadMode {
     Unit {
         unit: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
     Internal {
         buf_ptr: ValueId,
         buf_len: ValueId,
         pos: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
     FormattedUnit {
         unit: ValueId,
@@ -34017,6 +34306,7 @@ pub(in crate::ir::lower) enum ReadMode {
         fmt_len: ValueId,
         item_idx: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
     FormattedInternal {
         buf_ptr: ValueId,
@@ -34025,7 +34315,85 @@ pub(in crate::ir::lower) enum ReadMode {
         fmt_len: ValueId,
         item_idx: ValueId,
         iostat: ValueId,
+        error_exit: BlockId,
     },
+}
+
+impl ReadMode {
+    fn iostat(self) -> ValueId {
+        match self {
+            Self::Unit { iostat, .. }
+            | Self::Internal { iostat, .. }
+            | Self::FormattedUnit { iostat, .. }
+            | Self::FormattedInternal { iostat, .. } => iostat,
+        }
+    }
+
+    fn error_exit(self) -> BlockId {
+        match self {
+            Self::Unit { error_exit, .. }
+            | Self::Internal { error_exit, .. }
+            | Self::FormattedUnit { error_exit, .. }
+            | Self::FormattedInternal { error_exit, .. } => error_exit,
+        }
+    }
+
+    fn formatted_item_idx(self) -> Option<ValueId> {
+        match self {
+            Self::FormattedUnit { item_idx, .. } | Self::FormattedInternal { item_idx, .. } => {
+                Some(item_idx)
+            }
+            Self::Unit { .. } | Self::Internal { .. } => None,
+        }
+    }
+}
+
+fn lower_io_status_continue_or_exit(b: &mut FuncBuilder, iostat: ValueId, error_exit: BlockId) {
+    if !matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
+        return;
+    }
+
+    let status = b.load_typed(iostat, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let failed = b.icmp(CmpOp::Ne, status, zero);
+    let continue_bb = b.create_block("io_transfer_ok");
+    b.cond_branch(failed, error_exit, vec![], continue_bb, vec![]);
+    b.set_block(continue_bb);
+}
+
+fn lower_read_continue_or_exit(b: &mut FuncBuilder, mode: ReadMode) {
+    lower_io_status_continue_or_exit(b, mode.iostat(), mode.error_exit());
+}
+
+fn finish_read_item(b: &mut FuncBuilder, mode: ReadMode) {
+    lower_read_continue_or_exit(b, mode);
+    if let Some(item_idx) = mode.formatted_item_idx() {
+        bump_formatted_read_index(b, item_idx);
+    }
+}
+
+pub(super) fn lower_read_reset_status(b: &mut FuncBuilder, iostat: ValueId) {
+    if matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
+        let zero = b.const_i32(0);
+        b.store(zero, iostat);
+    }
+}
+
+pub(super) fn lower_read_assign_iomsg(
+    b: &mut FuncBuilder,
+    iostat: ValueId,
+    iomsg: ValueId,
+    iomsg_len: ValueId,
+) {
+    if !matches!(b.func().value_type(iostat), Some(IrType::Ptr(_))) {
+        return;
+    }
+    let status = b.load_typed(iostat, IrType::Int(IntWidth::I32));
+    b.call(
+        FuncRef::External("afs_read_assign_iomsg".into()),
+        vec![status, iomsg, iomsg_len],
+        IrType::Void,
+    );
 }
 
 pub(super) fn lower_read_err_branch(
@@ -34114,16 +34482,112 @@ pub(super) fn lower_read_status_branches(
     }
 }
 
-pub(super) fn lower_read_into_addr(
+fn lower_read_logical_into_addr(
     b: &mut FuncBuilder,
     mode: ReadMode,
     ty: &IrType,
     addr: ValueId,
 ) -> bool {
+    if !matches!(ty, IrType::Bool | IrType::Int(_)) {
+        return false;
+    }
+
+    let current = b.load_typed(addr, ty.clone());
+    let truth = match ty {
+        IrType::Bool => current,
+        IrType::Int(_) => {
+            let zero = zero_value_for_ir_type(b, ty);
+            b.icmp(CmpOp::Ne, current, zero)
+        }
+        _ => unreachable!(),
+    };
+    let initial = b.int_extend(truth, IntWidth::I32, false);
+    let tmp = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(initial, tmp);
+
+    match mode {
+        ReadMode::Unit { unit, iostat, .. } => {
+            let kind_bytes = b.const_i32(logical_transfer_width_for_ir_type(ty));
+            b.call(
+                FuncRef::External("afs_read_logical_kind".into()),
+                vec![unit, tmp, iostat, kind_bytes],
+                IrType::Void,
+            );
+        }
+        ReadMode::Internal {
+            buf_ptr,
+            buf_len,
+            pos,
+            iostat,
+            ..
+        } => {
+            b.call(
+                FuncRef::External("afs_read_internal_logical".into()),
+                vec![buf_ptr, buf_len, pos, tmp, iostat],
+                IrType::Void,
+            );
+        }
+        ReadMode::FormattedUnit {
+            unit,
+            fmt_ptr,
+            fmt_len,
+            item_idx,
+            iostat,
+            ..
+        } => {
+            let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+            b.call(
+                FuncRef::External("afs_fmt_read_logical".into()),
+                vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                IrType::Void,
+            );
+        }
+        ReadMode::FormattedInternal {
+            buf_ptr,
+            buf_len,
+            fmt_ptr,
+            fmt_len,
+            item_idx,
+            iostat,
+            ..
+        } => {
+            let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
+            b.call(
+                FuncRef::External("afs_fmt_read_logical_internal".into()),
+                vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                IrType::Void,
+            );
+        }
+    }
+
+    finish_read_item(b, mode);
+    let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let truth = b.icmp(CmpOp::Ne, raw, zero);
+    let stored = match ty {
+        IrType::Bool => truth,
+        IrType::Int(width) => b.int_extend(truth, *width, false),
+        _ => unreachable!(),
+    };
+    b.store(stored, addr);
+    true
+}
+
+pub(super) fn lower_read_into_addr(
+    b: &mut FuncBuilder,
+    mode: ReadMode,
+    ty: &IrType,
+    addr: ValueId,
+    logical: bool,
+) -> bool {
+    if logical || matches!(ty, IrType::Bool) {
+        return lower_read_logical_into_addr(b, mode, ty, addr);
+    }
+
     match ty {
         IrType::Int(IntWidth::I128) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_int128".into()),
                         vec![unit, addr, iostat],
@@ -34135,6 +34599,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_int128".into()),
@@ -34148,6 +34613,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34155,7 +34621,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34164,6 +34629,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34179,14 +34645,14 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Int(IntWidth::I64) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_int64".into()),
                         vec![unit, addr, iostat],
@@ -34198,6 +34664,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_int64".into()),
@@ -34211,6 +34678,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34218,7 +34686,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34227,6 +34694,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34242,14 +34710,14 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Int(width @ (IntWidth::I8 | IntWidth::I16)) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     let func = match width {
                         IntWidth::I8 => "afs_read_int8",
                         IntWidth::I16 => "afs_read_int16",
@@ -34260,19 +34728,25 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, addr, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                 }
                 ReadMode::Internal {
                     buf_ptr,
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
+                    let current = b.load_typed(addr, IrType::Int(*width));
+                    let initial = b.int_extend(current, IntWidth::I32, true);
+                    b.store(initial, tmp);
                     b.call(
                         FuncRef::External("afs_read_internal_int".into()),
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
                     let narrowed = b.int_trunc(raw, *width);
                     b.store(narrowed, addr);
@@ -34283,6 +34757,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34291,7 +34766,7 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
                     let narrowed = b.int_trunc(raw, *width);
                     b.store(narrowed, addr);
@@ -34303,6 +34778,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Int(IntWidth::I32));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34311,7 +34787,7 @@ pub(super) fn lower_read_into_addr(
                         vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let raw = b.load_typed(tmp, IrType::Int(IntWidth::I32));
                     let narrowed = b.int_trunc(raw, *width);
                     b.store(narrowed, addr);
@@ -34321,7 +34797,7 @@ pub(super) fn lower_read_into_addr(
         }
         IrType::Int(_) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_int".into()),
                         vec![unit, addr, iostat],
@@ -34333,6 +34809,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_int".into()),
@@ -34346,6 +34823,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34353,7 +34831,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34362,6 +34839,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34377,14 +34855,14 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Float(FloatWidth::F64) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_real64".into()),
                         vec![unit, addr, iostat],
@@ -34396,6 +34874,7 @@ pub(super) fn lower_read_into_addr(
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     b.call(
                         FuncRef::External("afs_read_internal_real".into()),
@@ -34409,6 +34888,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34416,7 +34896,6 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34425,6 +34904,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
@@ -34440,32 +34920,38 @@ pub(super) fn lower_read_into_addr(
                         ],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
                 }
             }
+            finish_read_item(b, mode);
             true
         }
         IrType::Float(FloatWidth::F32) => {
             match mode {
-                ReadMode::Unit { unit, iostat } => {
+                ReadMode::Unit { unit, iostat, .. } => {
                     b.call(
                         FuncRef::External("afs_read_real".into()),
                         vec![unit, addr, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                 }
                 ReadMode::Internal {
                     buf_ptr,
                     buf_len,
                     pos,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
+                    let current = b.load_typed(addr, IrType::Float(FloatWidth::F32));
+                    let initial = b.float_extend(current, FloatWidth::F64);
+                    b.store(initial, tmp);
                     b.call(
                         FuncRef::External("afs_read_internal_real".into()),
                         vec![buf_ptr, buf_len, pos, tmp, iostat],
                         IrType::Void,
                     );
+                    finish_read_item(b, mode);
                     let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
                     let narrow = b.float_trunc(wide, FloatWidth::F32);
                     b.store(narrow, addr);
@@ -34476,6 +34962,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34484,7 +34971,7 @@ pub(super) fn lower_read_into_addr(
                         vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
                     let narrow = b.float_trunc(wide, FloatWidth::F32);
                     b.store(narrow, addr);
@@ -34496,6 +34983,7 @@ pub(super) fn lower_read_into_addr(
                     fmt_len,
                     item_idx,
                     iostat,
+                    ..
                 } => {
                     let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
@@ -34504,7 +34992,7 @@ pub(super) fn lower_read_into_addr(
                         vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
                         IrType::Void,
                     );
-                    bump_formatted_read_index(b, item_idx);
+                    finish_read_item(b, mode);
                     let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
                     let narrow = b.float_trunc(wide, FloatWidth::F32);
                     b.store(narrow, addr);
@@ -34522,8 +35010,8 @@ pub(super) fn lower_read_into_addr(
             let imag_off = b.const_i64(lane_bytes);
             let real_addr = b.gep(addr, vec![real_off], IrType::Int(IntWidth::I8));
             let imag_addr = b.gep(addr, vec![imag_off], IrType::Int(IntWidth::I8));
-            let _ = lower_read_into_addr(b, mode, &lane_ty, real_addr);
-            let _ = lower_read_into_addr(b, mode, &lane_ty, imag_addr);
+            let _ = lower_read_into_addr(b, mode, &lane_ty, real_addr, false);
+            let _ = lower_read_into_addr(b, mode, &lane_ty, imag_addr, false);
             true
         }
         _ => false,
@@ -34537,13 +35025,14 @@ fn lower_read_fixed_char_into_addr(
     len: i64,
 ) -> bool {
     match mode {
-        ReadMode::Unit { unit, iostat } => {
+        ReadMode::Unit { unit, iostat, .. } => {
             let len_v = b.const_i64(len);
             b.call(
                 FuncRef::External("afs_read_string".into()),
                 vec![unit, addr, len_v, iostat],
                 IrType::Void,
             );
+            finish_read_item(b, mode);
             true
         }
         _ => false,
@@ -34699,7 +35188,7 @@ pub(super) fn lower_read_target_addr(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
-) -> Option<(ValueId, IrType)> {
+) -> Option<(ValueId, IrType, bool)> {
     match &item.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
@@ -34712,7 +35201,7 @@ pub(super) fn lower_read_target_addr(
             } else {
                 info.addr
             };
-            Some((addr, info.ty.clone()))
+            Some((addr, info.ty.clone(), info.logical_kind.is_some()))
         }
         Expr::FunctionCall { callee, args } => {
             let Expr::Name { name } = &callee.node else {
@@ -34739,7 +35228,7 @@ pub(super) fn lower_read_target_addr(
             );
             let base = array_base_addr(b, info);
             let elem_ptr = b.gep(base, vec![idx64], info.ty.clone());
-            Some((elem_ptr, info.ty.clone()))
+            Some((elem_ptr, info.ty.clone(), info.logical_kind.is_some()))
         }
         Expr::ComponentAccess { base, component } => {
             let (base_addr, type_name) =
@@ -34753,7 +35242,8 @@ pub(super) fn lower_read_target_addr(
             }
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
-            Some((field_ptr, type_info_to_ir_type(&field.type_info)))
+            let logical = field_logical_kind(field).is_some();
+            Some((field_ptr, type_info_to_ir_type(&field.type_info), logical))
         }
         _ => None,
     }
@@ -34763,8 +35253,7 @@ pub(super) fn lower_list_char_read_item(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
-    unit: ValueId,
-    iostat: ValueId,
+    mode: ReadMode,
 ) -> bool {
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
@@ -34778,6 +35267,9 @@ pub(super) fn lower_list_char_read_item(
         lower_string_expr_ctx(b, ctx, item)
     };
 
+    let ReadMode::Unit { unit, iostat, .. } = mode else {
+        return false;
+    };
     b.call(
         FuncRef::External("afs_read_string".into()),
         vec![unit, dest_ptr, dest_len, iostat],
@@ -34791,6 +35283,7 @@ pub(super) fn lower_list_char_read_item(
         Some(ctx.type_layouts),
         dest_ptr,
     );
+    finish_read_item(b, mode);
     true
 }
 
@@ -34798,10 +35291,7 @@ pub(super) fn lower_internal_char_read_item(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     item: &crate::ast::expr::SpannedExpr,
-    buf_ptr: ValueId,
-    buf_len: ValueId,
-    pos: ValueId,
-    iostat: ValueId,
+    mode: ReadMode,
 ) -> bool {
     if !expr_is_character_expr(b, &ctx.locals, item, ctx.st, Some(ctx.type_layouts)) {
         return false;
@@ -34815,6 +35305,16 @@ pub(super) fn lower_internal_char_read_item(
         lower_string_expr_ctx(b, ctx, item)
     };
 
+    let ReadMode::Internal {
+        buf_ptr,
+        buf_len,
+        pos,
+        iostat,
+        ..
+    } = mode
+    else {
+        return false;
+    };
     b.call(
         FuncRef::External("afs_read_internal_string".into()),
         vec![buf_ptr, buf_len, pos, dest_ptr, dest_len, iostat],
@@ -34828,6 +35328,7 @@ pub(super) fn lower_internal_char_read_item(
         Some(ctx.type_layouts),
         dest_ptr,
     );
+    finish_read_item(b, mode);
     true
 }
 
@@ -34845,6 +35346,7 @@ pub(super) fn lower_formatted_internal_read_items(
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
+    let done = b.create_block("formatted_internal_read_done");
     let mode = ReadMode::FormattedInternal {
         buf_ptr,
         buf_len,
@@ -34852,7 +35354,9 @@ pub(super) fn lower_formatted_internal_read_items(
         fmt_len,
         item_idx,
         iostat,
+        error_exit: done,
     };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_formatted_char_read_item(
@@ -34863,11 +35367,13 @@ pub(super) fn lower_formatted_internal_read_items(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 pub(super) fn lower_formatted_read_items(
@@ -34916,13 +35422,16 @@ pub(super) fn lower_formatted_read_items_with_runtime_advance(
     let item_idx = b.alloca(IrType::Int(IntWidth::I64));
     let zero = b.const_i64(0);
     b.store(zero, item_idx);
+    let done = b.create_block("formatted_read_done");
     let mode = ReadMode::FormattedUnit {
         unit,
         fmt_ptr,
         fmt_len,
         item_idx,
         iostat,
+        error_exit: done,
     };
+    lower_read_continue_or_exit(b, mode);
 
     for item in items {
         if lower_formatted_char_read_item_with_runtime_advance(
@@ -34943,11 +35452,13 @@ pub(super) fn lower_formatted_read_items_with_runtime_advance(
         if lower_array_read_item(b, ctx, item, mode) {
             continue;
         }
-        let Some((addr, ty)) = lower_read_target_addr(b, ctx, item) else {
+        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
             continue;
         };
-        let _ = lower_read_into_addr(b, mode, &ty, addr);
+        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
 }
 
 pub(super) fn lower_formatted_char_read_item(
@@ -35081,7 +35592,7 @@ pub(super) fn lower_formatted_char_read_item_with_runtime_advance(
         dest_ptr,
     );
 
-    bump_formatted_read_index(b, item_idx);
+    finish_read_item(b, mode);
     true
 }
 
@@ -36520,11 +37031,15 @@ pub(super) fn lower_1d_slice_write(
         );
     } else {
         let elem = b.load_typed(p, info.ty.clone());
-        b.call(
-            FuncRef::External(writer.into()),
-            vec![unit, elem],
-            IrType::Void,
-        );
+        if let Some(kind) = info.logical_kind {
+            lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+        } else {
+            b.call(
+                FuncRef::External(writer.into()),
+                vec![unit, elem],
+                IrType::Void,
+            );
+        }
     }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
@@ -36618,7 +37133,7 @@ pub(super) fn lower_1d_slice_read(
     let byte_off = b.imul(zero_based, step);
     let p = b.gep(base, vec![byte_off], IrType::Int(IntWidth::I8));
     if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, p, len)) != Some(true) {
-        let _ = lower_read_into_addr(b, mode, &info.ty, p);
+        let _ = lower_read_into_addr(b, mode, &info.ty, p, info.logical_kind.is_some());
     }
     let next = b.iadd(i_val, stride_val);
     b.store(next, i_addr);
@@ -36759,7 +37274,7 @@ pub(super) fn lower_section_read_nd(
             if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len))
                 != Some(true)
             {
-                let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+                let _ = lower_read_into_addr(b, mode, &info.ty, ptr, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -37398,7 +37913,7 @@ pub(super) fn lower_alloc_section_read(
             if char_fixed_len.map(|len| lower_read_fixed_char_into_addr(b, mode, ptr, len))
                 != Some(true)
             {
-                let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+                let _ = lower_read_into_addr(b, mode, &info.ty, ptr, info.logical_kind.is_some());
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -37662,11 +38177,15 @@ pub(super) fn lower_section_write_nd(
                 );
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                b.call(
-                    FuncRef::External(writer.into()),
-                    vec![unit, elem],
-                    IrType::Void,
-                );
+                if let Some(kind) = info.logical_kind {
+                    lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+                } else {
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                }
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -37881,11 +38400,15 @@ pub(super) fn lower_alloc_section_write_nd(
                 );
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                b.call(
-                    FuncRef::External(writer.into()),
-                    vec![unit, elem],
-                    IrType::Void,
-                );
+                if let Some(kind) = info.logical_kind {
+                    lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+                } else {
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                }
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -38031,11 +38554,15 @@ pub(super) fn lower_component_section_write(
                 );
             } else {
                 let elem = b.load_typed(p, info.ty.clone());
-                b.call(
-                    FuncRef::External(writer.into()),
-                    vec![unit, elem],
-                    IrType::Void,
-                );
+                if let Some(kind) = info.logical_kind {
+                    lower_write_emit_logical(b, unit, &info.ty, elem, kind);
+                } else {
+                    b.call(
+                        FuncRef::External(writer.into()),
+                        vec![unit, elem],
+                        IrType::Void,
+                    );
+                }
             }
             b.branch(incrs[0], vec![]);
         } else {
@@ -38158,6 +38685,9 @@ pub(super) fn lower_whole_array_write(
             vec![unit, ptr],
             IrType::Void,
         );
+    } else if let Some(kind) = info.logical_kind {
+        let elem = b.load_typed(ptr, info.ty.clone());
+        lower_write_emit_logical(b, unit, &info.ty, elem, kind);
     } else if let Some(layout) = derived_layout.as_ref() {
         lower_derived_layout_write(b, ctx, layout, ptr, unit, span);
     } else {
@@ -38219,7 +38749,7 @@ pub(super) fn lower_whole_array_read(
     } else if let Some(layout) = derived_layout.as_ref() {
         lower_derived_layout_read(b, ctx, layout, ptr, mode, span);
     } else {
-        let _ = lower_read_into_addr(b, mode, &info.ty, ptr);
+        let _ = lower_read_into_addr(b, mode, &info.ty, ptr, info.logical_kind.is_some());
     }
     let one = b.const_i64(1);
     let next = b.iadd(i_val, one);
@@ -61800,6 +62330,119 @@ end program
         );
         assert!(ir.contains("afs_write_internal_int8"));
         assert!(ir.contains("afs_write_internal_int16"));
+    }
+
+    #[test]
+    fn lower_internal_write_logical16_array_uses_logical_buffer_writer() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=32) :: buf
+  logical(16) :: values(2)
+  values = [.true., .false.]
+  write(buf, *) values
+end program
+",
+        );
+        assert!(ir.contains("internal_list_arr_check"));
+        assert!(ir.contains("afs_write_internal_logical"));
+        assert!(!ir.contains("afs_write_internal_int128"));
+    }
+
+    #[test]
+    fn lower_deferred_internal_write_logical16_array_uses_logical_collector() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=:), allocatable :: buf
+  logical(16) :: values(2)
+  values = [.true., .false.]
+  write(buf, *) values
+end program
+",
+        );
+        assert!(ir.contains("afs_lst_ia_begin"));
+        assert!(ir.contains("internal_list_arr_check"));
+        assert!(ir.contains("afs_lst_ia_logical"));
+        assert!(!ir.contains("afs_lst_ia_int128"));
+    }
+
+    #[test]
+    fn lower_internal_write_logical16_sections_iterate_descriptor_elements() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=32) :: fixed
+  character(len=:), allocatable :: deferred
+  logical(16) :: values(4)
+  values = [.true., .false., .true., .false.]
+  write(fixed, *) values(1:4:2)
+  write(deferred, *) values(1:4:2)
+end program
+",
+        );
+        assert!(ir.contains("internal_list_arr_expr_check"));
+        assert!(ir.contains("afs_write_internal_logical"));
+        assert!(ir.contains("afs_lst_ia_logical"));
+        assert!(!ir.contains("afs_write_internal_int128"));
+        assert!(!ir.contains("afs_lst_ia_int128"));
+    }
+
+    #[test]
+    fn lower_internal_write_array_expr_releases_owned_descriptor() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=64) :: fixed
+  character(len=:), allocatable :: deferred
+  integer :: values(4)
+  values = [1, 2, 3, 4]
+  write(fixed, *) values + 1
+  write(deferred, *) values * 2
+end program
+",
+        );
+        assert!(ir.contains("internal_list_arr_expr_check"));
+        assert!(ir.contains("afs_write_internal_int"));
+        assert!(ir.contains("afs_lst_ia_int"));
+        assert!(ir.contains("afs_deallocate_array"));
+    }
+
+    #[test]
+    fn lower_deferred_character_scalar_internal_read_is_not_an_array_unit() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  character(len=:), allocatable :: record
+  logical(16) :: values(2)
+  record = 'T F'
+  read(record, *) values
+end program
+",
+        );
+        assert!(ir.contains("afs_read_internal_logical"));
+    }
+
+    #[test]
+    fn lower_external_write_logical16_arrays_and_sections_use_logical_writer() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  logical(16) :: values(3)
+  values = [.true., .false., .true.]
+  write(*, *) values
+  write(*, *) values(3:1:-1)
+end program
+",
+        );
+        assert!(ir.contains("afs_write_logical_kind"));
+        assert!(!ir.contains("afs_write_int128"));
     }
 
     #[test]

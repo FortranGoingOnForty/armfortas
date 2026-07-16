@@ -867,6 +867,82 @@ fn select_inst(
                 );
                 return;
             }
+            InstKind::IntExtend(value, IntWidth::I128, signed) => {
+                let dest_slot = ctx.lookup_wide_slot(inst.id);
+                let src = ctx.lookup_vreg(*value);
+                let src_ty = func
+                    .value_type(*value)
+                    .unwrap_or_else(|| panic!("isel: missing type for i128 extension source"));
+
+                if *signed {
+                    let opcode = match src_ty {
+                        IrType::Int(IntWidth::I8) => ArmOpcode::Sxtb,
+                        IrType::Int(IntWidth::I16) => ArmOpcode::Sxth,
+                        IrType::Bool | IrType::Int(IntWidth::I32) => ArmOpcode::Sxtw,
+                        IrType::Int(IntWidth::I64) => ArmOpcode::MovReg,
+                        _ => panic!("isel: unsupported i128 extension source {src_ty:?}"),
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode,
+                        operands: vec![
+                            MachineOperand::PhysReg(PhysReg::Gp(16)),
+                            MachineOperand::VReg(src),
+                        ],
+                        def: None,
+                    });
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::AsrReg,
+                        operands: vec![
+                            MachineOperand::PhysReg(PhysReg::Gp(17)),
+                            MachineOperand::PhysReg(PhysReg::Gp(16)),
+                            MachineOperand::Imm(63),
+                        ],
+                        def: None,
+                    });
+                } else {
+                    let dest = match src_ty {
+                        IrType::Bool
+                        | IrType::Int(IntWidth::I8 | IntWidth::I16 | IntWidth::I32) => {
+                            PhysReg::Gp32(16)
+                        }
+                        IrType::Int(IntWidth::I64) => PhysReg::Gp(16),
+                        _ => panic!("isel: unsupported i128 extension source {src_ty:?}"),
+                    };
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::MovReg,
+                        operands: vec![MachineOperand::PhysReg(dest), MachineOperand::VReg(src)],
+                        def: None,
+                    });
+                    if matches!(src_ty, IrType::Int(IntWidth::I8 | IntWidth::I16)) {
+                        let mask = if matches!(src_ty, IrType::Int(IntWidth::I8)) {
+                            u8::MAX as u64
+                        } else {
+                            u16::MAX as u64
+                        };
+                        emit_const_u64_phys(mf, mb, PhysReg::Gp(17), mask);
+                        mf.block_mut(mb).insts.push(MachineInst {
+                            opcode: ArmOpcode::AndReg,
+                            operands: vec![
+                                MachineOperand::PhysReg(PhysReg::Gp(16)),
+                                MachineOperand::PhysReg(PhysReg::Gp(16)),
+                                MachineOperand::PhysReg(PhysReg::Gp(17)),
+                            ],
+                            def: None,
+                        });
+                    }
+                    emit_const_u64_phys(mf, mb, PhysReg::Gp(17), 0);
+                }
+
+                emit_store_phys_i128_pair(
+                    mf,
+                    mb,
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    dest_slot as i64,
+                    PhysReg::Gp(16),
+                    PhysReg::Gp(17),
+                );
+                return;
+            }
             InstKind::Load(addr) => {
                 let dest_slot = ctx.lookup_wide_slot(inst.id);
                 if let Some(&offset) = ctx.alloca_offsets.get(addr) {
@@ -3252,8 +3328,8 @@ fn emit_i128_neg(mf: &mut MachineFunction, mb: MBlockId, lo: PhysReg, hi: PhysRe
     });
 }
 
-/// Emit a constant integer using movz/movk sequence.
-/// Respects width: 32-bit values mask to 32 bits and only emit shifts 0/16.
+/// Keep multi-instruction constant materialization atomic until after register
+/// allocation so a spilled value cannot change physical registers mid-chain.
 fn emit_const_int(
     mf: &mut MachineFunction,
     mb: MBlockId,
@@ -3272,8 +3348,6 @@ fn emit_const_int(
     } else {
         val as u64
     };
-    let max_shift = if is_32 { 2 } else { 4 }; // 2 chunks for 32-bit, 4 for 64-bit
-
     if uval == 0 {
         let zr = if is_32 { PhysReg::Wzr } else { PhysReg::Xzr };
         mf.block_mut(mb).insts.push(MachineInst {
@@ -3284,38 +3358,31 @@ fn emit_const_int(
         return;
     }
 
-    // MOVZ for the first non-zero 16-bit chunk, MOVK for the rest.
-    let mut first = true;
-    for i in 0..max_shift {
-        let shift = i * 16;
-        let chunk = ((uval >> shift) & 0xFFFF) as u16;
-        if chunk != 0 || (first && i == max_shift - 1) {
-            let opcode = if first {
-                ArmOpcode::Movz
-            } else {
-                ArmOpcode::Movk
-            };
+    let chunk_count = if is_32 { 2 } else { 4 };
+    let mut nonzero_chunks = (0..chunk_count).filter_map(|index| {
+        let chunk = ((uval >> (index * 16)) & 0xffff) as u16;
+        (chunk != 0).then_some((index, chunk))
+    });
+    if let Some((index, chunk)) = nonzero_chunks.next() {
+        if nonzero_chunks.next().is_none() {
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode,
+                opcode: ArmOpcode::Movz,
                 operands: vec![
                     MachineOperand::VReg(dest),
                     MachineOperand::Imm(chunk as i64),
-                    MachineOperand::Shift(shift as u8),
+                    MachineOperand::Shift((index * 16) as u8),
                 ],
                 def: Some(dest),
             });
-            first = false;
+            return;
         }
     }
 
-    if first {
-        let zr = if is_32 { PhysReg::Wzr } else { PhysReg::Xzr };
-        mf.block_mut(mb).insts.push(MachineInst {
-            opcode: ArmOpcode::MovReg,
-            operands: vec![MachineOperand::VReg(dest), MachineOperand::PhysReg(zr)],
-            def: Some(dest),
-        });
-    }
+    mf.block_mut(mb).insts.push(MachineInst {
+        opcode: ArmOpcode::MovImm,
+        operands: vec![MachineOperand::VReg(dest), MachineOperand::Imm(uval as i64)],
+        def: Some(dest),
+    });
 }
 
 /// Emit a register-register binary op.
@@ -3954,7 +4021,6 @@ mod tests {
             b.ret_void();
         });
         let insts = &mf.blocks[0].insts;
-        // Should have: prologue (STP, MOV), MOVZ #42, epilogue (LDP, RET).
         assert!(insts.iter().any(|i| i.opcode == ArmOpcode::Movz));
     }
 
@@ -4051,6 +4117,30 @@ mod tests {
             2,
             "wide i128 selects should lower with one CSEL per limb"
         );
+    }
+
+    #[test]
+    fn select_i128_extensions_materialize_low_and_high_limbs() {
+        let mf = select_simple(|b| {
+            let unsigned = b.const_int(255, IntWidth::I16);
+            let signed = b.const_i32(-1);
+            b.int_extend(unsigned, IntWidth::I128, false);
+            b.int_extend(signed, IntWidth::I128, true);
+            b.ret_void();
+        });
+        let insts = &mf.blocks[0].insts;
+
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::AndReg));
+        assert!(insts.iter().any(|inst| inst.opcode == ArmOpcode::Sxtw));
+        assert!(insts.iter().any(|inst| {
+            inst.opcode == ArmOpcode::AsrReg
+                && inst.operands
+                    == vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(17)),
+                        MachineOperand::PhysReg(PhysReg::Gp(16)),
+                        MachineOperand::Imm(63),
+                    ]
+        }));
     }
 
     #[test]

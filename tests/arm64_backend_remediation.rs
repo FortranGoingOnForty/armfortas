@@ -298,6 +298,105 @@ end function large
 }
 
 #[test]
+fn optimized_logical16_storeback_preserves_value_pair() {
+    let asm = compile_arm64_asm(
+        include_str!("../test_programs/logical16_io_roundtrip.f90"),
+        "-O1",
+    );
+    let lines: Vec<_> = asm.lines().map(str::trim).collect();
+    let mut checked_storebacks = 0;
+
+    for (store_index, line) in lines.iter().enumerate() {
+        if !line.starts_with("stp x16, x17, [") {
+            continue;
+        }
+        let Some(reload_index) = lines[..store_index]
+            .iter()
+            .rposition(|line| line.starts_with("ldr x16, [") || line.starts_with("ldp x16, x17,"))
+        else {
+            continue;
+        };
+        if !lines[reload_index..store_index]
+            .iter()
+            .any(|line| line.starts_with("ldr x17, [") || line.starts_with("ldp x16, x17,"))
+        {
+            continue;
+        }
+
+        checked_storebacks += 1;
+        assert!(
+            !lines[reload_index + 1..store_index]
+                .iter()
+                .any(|line| line.starts_with("movz x16,") || line.starts_with("movk x16,")),
+            "large-offset address synthesis overwrote a live i128 value:\n{}",
+            lines[reload_index..=store_index].join("\n")
+        );
+    }
+
+    assert!(
+        checked_storebacks > 0,
+        "fixture did not exercise optimized i128 storeback:\n{asm}"
+    );
+}
+
+#[test]
+fn optimized_spilled_constant_keeps_all_chunks_in_one_register() {
+    let asm = compile_arm64_asm(
+        include_str!("../test_programs/list_read_blank_records.f90"),
+        "-O1",
+    );
+    let lines: Vec<_> = asm.lines().map(str::trim).collect();
+    let label = lines
+        .iter()
+        .position(|line| line.contains("_label_100_") && line.ends_with(':'))
+        .unwrap_or_else(|| panic!("EOF label was not emitted:\n{asm}"));
+    let block_end = lines[label + 1..]
+        .iter()
+        .position(|line| line.ends_with(':'))
+        .map(|offset| label + 1 + offset)
+        .unwrap_or(lines.len());
+    let block = &lines[label + 1..block_end];
+    let movz = block
+        .iter()
+        .position(|line| line.starts_with("movz w") && line.ends_with("#65535"))
+        .unwrap_or_else(|| panic!("EOF constant low chunk was not emitted:\n{asm}"));
+    let movk = block
+        .iter()
+        .position(|line| line.starts_with("movk w") && line.ends_with("#65535, lsl #16"))
+        .unwrap_or_else(|| panic!("EOF constant high chunk was not emitted:\n{asm}"));
+    let movz_reg = block[movz]
+        .split_ascii_whitespace()
+        .nth(1)
+        .expect("MOVZ destination")
+        .trim_end_matches(',');
+    let movk_reg = block[movk]
+        .split_ascii_whitespace()
+        .nth(1)
+        .expect("MOVK destination")
+        .trim_end_matches(',');
+
+    assert_eq!(
+        movz_reg,
+        movk_reg,
+        "constant chunks changed physical registers:\n{}",
+        block[..=movk].join("\n")
+    );
+    assert_eq!(
+        movk,
+        movz + 1,
+        "constant materialization was split by spill code:\n{}",
+        block[..=movk].join("\n")
+    );
+    assert!(
+        block[movk + 1..]
+            .iter()
+            .any(|line| line.starts_with(&format!("str {movk_reg},"))),
+        "fixture no longer spills the materialized constant:\n{}",
+        block.join("\n")
+    );
+}
+
+#[test]
 fn complex_value_call_arguments_use_hfa_register_pairs() {
     let c4 = compile_arm64_asm(
         r#"

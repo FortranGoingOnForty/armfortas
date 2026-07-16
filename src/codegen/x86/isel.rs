@@ -482,6 +482,73 @@ fn select_inst(
                 emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
                 return mb;
             }
+            InstKind::IntExtend(value, IntWidth::I128, signed) => {
+                let dest = ctx.lookup_wide_slot(inst.id);
+                let src = ctx.lookup_vreg(*value);
+                let src_ty = func
+                    .value_type(*value)
+                    .unwrap_or_else(|| panic!("isel: missing type for i128 extension source"));
+                let (opcode, size) = match (&src_ty, *signed) {
+                    (IrType::Int(IntWidth::I8), false) => {
+                        (X86Opcode::Movzx { src: OpSize::B }, OpSize::L)
+                    }
+                    (IrType::Int(IntWidth::I16), false) => {
+                        (X86Opcode::Movzx { src: OpSize::W }, OpSize::L)
+                    }
+                    (IrType::Bool | IrType::Int(IntWidth::I32), false) => {
+                        (X86Opcode::MovRR, OpSize::L)
+                    }
+                    (IrType::Int(IntWidth::I64), false) => (X86Opcode::MovRR, OpSize::Q),
+                    (IrType::Int(IntWidth::I8), true) => {
+                        (X86Opcode::Movsx { src: OpSize::B }, OpSize::Q)
+                    }
+                    (IrType::Int(IntWidth::I16), true) => {
+                        (X86Opcode::Movsx { src: OpSize::W }, OpSize::Q)
+                    }
+                    (IrType::Bool | IrType::Int(IntWidth::I32), true) => {
+                        (X86Opcode::Movsx { src: OpSize::L }, OpSize::Q)
+                    }
+                    (IrType::Int(IntWidth::I64), true) => (X86Opcode::MovRR, OpSize::Q),
+                    _ => panic!("isel: unsupported i128 extension source {src_ty:?}"),
+                };
+                push(
+                    mf,
+                    mb,
+                    opcode,
+                    size,
+                    vec![X86Operand::VReg(src)],
+                    Some(X86Operand::Reg(Rax)),
+                );
+                if *signed {
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::MovRR,
+                        OpSize::Q,
+                        vec![X86Operand::Reg(Rax)],
+                        Some(X86Operand::Reg(Rdx)),
+                    );
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::Sar,
+                        OpSize::Q,
+                        vec![X86Operand::Reg(Rdx), X86Operand::Imm(63)],
+                        Some(X86Operand::Reg(Rdx)),
+                    );
+                } else {
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::MovRI,
+                        OpSize::Q,
+                        vec![X86Operand::Imm(0)],
+                        Some(X86Operand::Reg(Rdx)),
+                    );
+                }
+                emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
+                return mb;
+            }
             InstKind::Load(addr) => {
                 let dest = ctx.lookup_wide_slot(inst.id);
                 match ctx.addr_operand(*addr) {
@@ -3738,6 +3805,36 @@ mod tests {
             assert_eq!(arg_move.opcode, expected);
             assert_eq!(arg_move.size, OpSize::L);
         }
+    }
+
+    #[test]
+    fn i128_extensions_materialize_low_and_high_limbs() {
+        let mf = select_simple(|b| {
+            let unsigned = b.const_int(255, IntWidth::I16);
+            let signed = b.const_i32(-1);
+            b.int_extend(unsigned, IntWidth::I128, false);
+            b.int_extend(signed, IntWidth::I128, true);
+            b.ret_void();
+        });
+        let insts = all_insts(&mf);
+
+        assert!(insts.iter().any(|inst| {
+            inst.opcode == X86Opcode::Movzx { src: OpSize::W }
+                && inst.def == Some(X86Operand::Reg(X86Reg::Rax))
+        }));
+        assert!(insts.iter().any(|inst| {
+            inst.opcode == X86Opcode::MovRI
+                && inst.operands == vec![X86Operand::Imm(0)]
+                && inst.def == Some(X86Operand::Reg(X86Reg::Rdx))
+        }));
+        assert!(insts.iter().any(|inst| {
+            inst.opcode == X86Opcode::Movsx { src: OpSize::L }
+                && inst.def == Some(X86Operand::Reg(X86Reg::Rax))
+        }));
+        assert!(insts.iter().any(|inst| {
+            inst.opcode == X86Opcode::Sar
+                && inst.operands == vec![X86Operand::Reg(X86Reg::Rdx), X86Operand::Imm(63)]
+        }));
     }
 
     // ---- The FP condition table, row by row (sprint deliverable 4).

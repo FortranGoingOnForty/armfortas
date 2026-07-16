@@ -219,6 +219,7 @@ pub enum ArmOpcode {
     FcvtDS, // float↔double
 
     // ---- Move ----
+    MovImm,  // pseudo: materialize a full-width integer after register allocation
     Movz,    // MOVZ Xd, #imm16, LSL #shift
     Movk,    // MOVK Xd, #imm16, LSL #shift
     Movn,    // MOVN Xd, #imm16, LSL #shift
