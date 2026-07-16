@@ -1625,7 +1625,8 @@ fn to_engineering(v: f64) -> (f64, i32) {
     if v == 0.0 {
         return (0.0, 0);
     }
-    let exp = (v.abs().log10().floor() as i32) / 3 * 3;
+    let decimal_exp = v.abs().log10().floor() as i32;
+    let exp = decimal_exp.div_euclid(3) * 3;
     let mantissa = v / 10f64.powi(exp);
     (mantissa, exp)
 }
@@ -2413,6 +2414,24 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(value)]);
         assert_eq!(out.trim().parse::<f64>().unwrap(), value);
+    }
+
+    #[test]
+    fn format_en_subunit_values_use_engineering_exponents() {
+        let mut engine = FormatEngine::new(parse_format("(EN14.3)"));
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Real(0.1),
+                IoValue::Real(0.01),
+                IoValue::Real(0.001),
+                IoValue::Real(0.0001),
+                IoValue::Real(-0.01),
+            ])
+            .unwrap();
+        assert_eq!(
+            out,
+            "   100.000E-03\n    10.000E-03\n     1.000E-03\n   100.000E-06\n   -10.000E-03"
+        );
     }
 
     #[test]
