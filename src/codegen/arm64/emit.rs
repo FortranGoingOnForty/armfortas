@@ -178,11 +178,15 @@ fn fmt_u64_imm(reg: &str, value: u64) -> String {
     let mut parts = Vec::new();
     for shift in [0u32, 16, 32, 48] {
         let chunk = ((value >> shift) & 0xFFFF) as u16;
-        if chunk == 0 && !parts.is_empty() {
+        if chunk == 0 {
             continue;
         }
         if parts.is_empty() {
-            parts.push(format!("movz {}, #{}", reg, chunk));
+            if shift == 0 {
+                parts.push(format!("movz {}, #{}", reg, chunk));
+            } else {
+                parts.push(format!("movz {}, #{}, lsl #{}", reg, chunk, shift));
+            }
         } else {
             parts.push(format!("movk {}, #{}, lsl #{}", reg, chunk, shift));
         }
@@ -192,6 +196,15 @@ fn fmt_u64_imm(reg: &str, value: u64) -> String {
     } else {
         parts.join("\n    ")
     }
+}
+
+fn fmt_mov_imm(reg: &str, value: i64) -> String {
+    let bits = if reg.starts_with('w') {
+        (value as u64) & u32::MAX as u64
+    } else {
+        value as u64
+    };
+    fmt_u64_imm(reg, bits)
 }
 
 fn fmt_addr_with_offset(dest: &str, base: &str, offset: i64, scratch: &str) -> String {
@@ -551,6 +564,12 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
             fp_reg_str(&inst.operands[1], false)
         ),
 
+        ArmOpcode::MovImm => match inst.operands.as_slice() {
+            [dest @ MachineOperand::PhysReg(PhysReg::Gp(_) | PhysReg::Gp32(_)), MachineOperand::Imm(value)] => {
+                fmt_mov_imm(&op_str(dest), *value)
+            }
+            operands => panic!("malformed ARM64 MovImm operands: {operands:?}"),
+        },
         ArmOpcode::Movz => {
             let imm = if let MachineOperand::Imm(v) = &inst.operands[1] {
                 *v
@@ -1869,6 +1888,58 @@ mod tests {
             emit_inst(&inst, &mf),
             "sub x12, x12, #2, lsl #12\n    sub x12, x12, #2440"
         );
+    }
+
+    #[test]
+    fn emit_full_width_immediate_keeps_one_destination() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp32(26)),
+                MachineOperand::Imm(u32::MAX as i64),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz w26, #65535\n    movk w26, #65535, lsl #16"
+        );
+    }
+
+    #[test]
+    fn emit_sparse_immediate_skips_zero_low_chunks() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::Imm(0x0001_0001_0000_0000),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "movz x12, #1, lsl #32\n    movk x12, #1, lsl #48"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed ARM64 MovImm operands")]
+    fn emit_full_width_immediate_rejects_malformed_mir() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::MovImm,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::Shift(16),
+            ],
+            def: None,
+        };
+
+        emit_inst(&inst, &mf);
     }
 
     #[test]
