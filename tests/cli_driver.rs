@@ -39006,6 +39006,52 @@ fn unix_command_and_environment_preserve_non_utf8_bytes() {
 }
 
 #[test]
+fn command_environment_intrinsics_report_truncation_and_blank_missing_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=command_environment_intrinsics_report_truncation_and_blank_missing_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=2) :: arg, command, env, missing_arg, missing_env\n  integer :: arg_len, arg_status, command_len, command_status, env_len, env_status\n  integer :: missing_arg_len, missing_arg_status, missing_env_len, missing_env_status\n  arg = '??'\n  command = '??'\n  env = '??'\n  missing_arg = '??'\n  missing_env = '??'\n  call get_command_argument(1, arg, arg_len, arg_status)\n  call get_command(command, command_len, command_status)\n  call get_environment_variable('AFS_TRUNCATION_VALUE', env, env_len, env_status)\n  call get_command_argument(99, missing_arg, missing_arg_len, missing_arg_status)\n  call get_environment_variable('AFS_MISSING_VALUE_73A19', missing_env, missing_env_len, missing_env_status)\n  if (arg_len /= 6 .or. arg_status /= -1 .or. arg /= 'ab') error stop 1\n  if (command_len <= 2 .or. command_status /= -1) error stop 2\n  if (env_len /= 6 .or. env_status /= -1 .or. env /= 'ab') error stop 3\n  if (missing_arg_len /= 0 .or. missing_arg_status <= 0 .or. missing_arg /= '  ') error stop 4\n  if (missing_env_len /= 0 .or. missing_env_status <= 0 .or. missing_env /= '  ') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("command_environment_status", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("command/environment status compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "command/environment status program should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .arg("abcdef")
+        .env("AFS_TRUNCATION_VALUE", "abcdef")
+        .env_remove("AFS_MISSING_VALUE_73A19")
+        .output()
+        .expect("command/environment status run failed");
+    assert!(
+        run.status.success(),
+        "command/environment status program should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected command/environment status output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn get_environment_variable_status_keyword_preserves_length_hole() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

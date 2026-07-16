@@ -252,6 +252,31 @@ fn program_args() -> Vec<Vec<u8>> {
     std::env::args_os().map(os_string_into_bytes).collect()
 }
 
+fn store_optional_i32(target: *mut i32, value: i32) {
+    if !target.is_null() {
+        unsafe {
+            *target = value;
+        }
+    }
+}
+
+fn write_character_result(target: *mut u8, target_len: i64, bytes: &[u8]) -> bool {
+    if target.is_null() {
+        return false;
+    }
+    let capacity = usize::try_from(target_len).unwrap_or(0);
+    let copied = bytes.len().min(capacity);
+    unsafe {
+        if copied > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, copied);
+        }
+        if copied < capacity {
+            std::ptr::write_bytes(target.add(copied), b' ', capacity - copied);
+        }
+    }
+    bytes.len() > capacity
+}
+
 /// COMMAND_ARGUMENT_COUNT: returns argc - 1.
 #[no_mangle]
 pub extern "C" fn afs_command_argument_count() -> i32 {
@@ -269,42 +294,16 @@ pub extern "C" fn afs_get_command_argument(
 ) {
     let args = program_args();
     if number < 0 || number as usize >= args.len() {
-        if !status.is_null() {
-            unsafe {
-                *status = 1;
-            }
-        }
-        if !length.is_null() {
-            unsafe {
-                *length = 0;
-            }
-        }
+        store_optional_i32(length, 0);
+        write_character_result(value, value_len, &[]);
+        store_optional_i32(status, 1);
         return;
     }
 
     let bytes = &args[number as usize];
-
-    if !length.is_null() {
-        unsafe {
-            *length = bytes.len() as i32;
-        }
-    }
-
-    if !value.is_null() && value_len > 0 {
-        let n = bytes.len().min(value_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), value, n);
-            if n < value_len as usize {
-                std::ptr::write_bytes(value.add(n), b' ', value_len as usize - n);
-            }
-        }
-    }
-
-    if !status.is_null() {
-        unsafe {
-            *status = 0;
-        }
-    }
+    store_optional_i32(length, bytes.len() as i32);
+    let truncated = write_character_result(value, value_len, bytes);
+    store_optional_i32(status, if truncated { -1 } else { 0 });
 }
 
 /// GET_COMMAND: retrieve the full command line.
@@ -316,26 +315,9 @@ pub extern "C" fn afs_get_command(
     status: *mut i32,
 ) {
     let bytes = program_args().join(&b" "[..]);
-
-    if !length.is_null() {
-        unsafe {
-            *length = bytes.len() as i32;
-        }
-    }
-    if !command.is_null() && cmd_len > 0 {
-        let n = bytes.len().min(cmd_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), command, n);
-            if n < cmd_len as usize {
-                std::ptr::write_bytes(command.add(n), b' ', cmd_len as usize - n);
-            }
-        }
-    }
-    if !status.is_null() {
-        unsafe {
-            *status = 0;
-        }
-    }
+    store_optional_i32(length, bytes.len() as i32);
+    let truncated = write_character_result(command, cmd_len, &bytes);
+    store_optional_i32(status, if truncated { -1 } else { 0 });
 }
 
 #[cfg(unix)]
@@ -366,47 +348,22 @@ pub extern "C" fn afs_get_environment_variable(
             .map_or(0, |index| index + 1);
         &slice[..end]
     } else {
-        if !status.is_null() {
-            unsafe {
-                *status = 1;
-            }
-        }
+        store_optional_i32(length, 0);
+        write_character_result(value, value_len, &[]);
+        store_optional_i32(status, 1);
         return;
     };
 
     match environment_value(var_name) {
         Some(bytes) => {
-            if !length.is_null() {
-                unsafe {
-                    *length = bytes.len() as i32;
-                }
-            }
-            if !value.is_null() && value_len > 0 {
-                let n = bytes.len().min(value_len as usize);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), value, n);
-                    if n < value_len as usize {
-                        std::ptr::write_bytes(value.add(n), b' ', value_len as usize - n);
-                    }
-                }
-            }
-            if !status.is_null() {
-                unsafe {
-                    *status = 0;
-                }
-            }
+            store_optional_i32(length, bytes.len() as i32);
+            let truncated = write_character_result(value, value_len, &bytes);
+            store_optional_i32(status, if truncated { -1 } else { 0 });
         }
         None => {
-            if !length.is_null() {
-                unsafe {
-                    *length = 0;
-                }
-            }
-            if !status.is_null() {
-                unsafe {
-                    *status = 1;
-                }
-            }
+            store_optional_i32(length, 0);
+            write_character_result(value, value_len, &[]);
+            store_optional_i32(status, 1);
         }
     }
 }
@@ -749,6 +706,23 @@ mod tests {
     fn command_argument_count_nonneg() {
         let c = afs_command_argument_count();
         assert!(c >= 0);
+    }
+
+    #[test]
+    fn character_result_copies_pads_and_reports_truncation() {
+        let mut target = [b'?'; 4];
+        assert!(!write_character_result(
+            target.as_mut_ptr(),
+            target.len() as i64,
+            b"ab"
+        ));
+        assert_eq!(&target, b"ab  ");
+
+        assert!(write_character_result(target.as_mut_ptr(), 2, b"abcd"));
+        assert_eq!(&target[..2], b"ab");
+
+        assert!(write_character_result(target.as_mut_ptr(), 0, b"abcd"));
+        assert!(!write_character_result(std::ptr::null_mut(), 0, b"abcd"));
     }
 
     #[test]
