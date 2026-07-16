@@ -706,6 +706,19 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
     let iomsg_len = cb.iomsg_len;
     let missing_filename = fname.is_empty();
 
+    if is_scratch && !cb.filename.is_null() {
+        let message = "OPEN: FILE= must not be specified with STATUS='SCRATCH'";
+        assign_iomsg(iomsg, iomsg_len, message);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+            return;
+        }
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
     if access_str.trim() == "direct" {
         let message = "OPEN: ACCESS='DIRECT' is not implemented";
         assign_iomsg(iomsg, iomsg_len, message);
@@ -5411,6 +5424,7 @@ fn extract_nth_formatted_field_with_state(
             FormatDesc::Group {
                 repeat,
                 descriptors,
+                ..
             } => {
                 for _ in 0..*repeat {
                     if let Some(found) = extract_nth_formatted_field_with_state(
@@ -5501,6 +5515,7 @@ fn extract_nth_nonadvancing_formatted_field(
             FormatDesc::Group {
                 repeat,
                 descriptors,
+                ..
             } => {
                 for _ in 0..*repeat {
                     if let Some(found) = extract_nth_nonadvancing_formatted_field(
@@ -6696,6 +6711,71 @@ mod tests {
 
         afs_open(&cb);
         assert_ne!(iostat, 0, "STATUS='old' read must fail for missing files");
+    }
+
+    #[test]
+    fn scratch_status_rejects_file_without_touching_path() {
+        let path = format!(
+            "/tmp/afs_open_scratch_file_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        std::fs::write(&path, b"keep\n").expect("create scratch FILE sentinel");
+
+        let mut iostat = -99i32;
+        let mut iomsg = [b'?'; 128];
+        let cb = OpenControlBlock {
+            unit: 792,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "scratch".as_ptr(),
+            status_len: 7,
+            action: std::ptr::null(),
+            action_len: 0,
+            access: std::ptr::null(),
+            access_len: 0,
+            form: std::ptr::null(),
+            form_len: 0,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: iomsg.as_mut_ptr(),
+            iomsg_len: iomsg.len() as i64,
+        };
+
+        afs_open(&cb);
+
+        assert_ne!(iostat, 0, "STATUS='SCRATCH' with FILE= must fail");
+        let msg = String::from_utf8_lossy(&iomsg);
+        assert!(
+            msg.contains("OPEN:"),
+            "expected OPEN context in iomsg: {msg:?}"
+        );
+        assert!(
+            msg.contains("FILE="),
+            "expected FILE context in iomsg: {msg:?}"
+        );
+        assert!(
+            msg.contains("STATUS='SCRATCH'"),
+            "expected STATUS context in iomsg: {msg:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read scratch FILE sentinel"),
+            b"keep\n",
+            "rejected OPEN must not alter the named file"
+        );
+        let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !state.units.contains_key(&792),
+            "rejected OPEN must not connect the unit"
+        );
+        drop(state);
+
+        std::fs::remove_file(path).expect("remove scratch FILE sentinel");
     }
 
     #[test]

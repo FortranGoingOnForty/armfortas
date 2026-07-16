@@ -110,6 +110,9 @@ pub enum FormatDesc {
     Group {
         repeat: usize,
         descriptors: Vec<FormatDesc>,
+        /// Explicit parentheses establish a format reversion point;
+        /// synthetic wrappers for repeated data descriptors do not.
+        is_reversion_point: bool,
     },
     /// Unlimited repeat: *(...).
     UnlimitedRepeat { descriptors: Vec<FormatDesc> },
@@ -250,6 +253,7 @@ fn parse_format_list(input: &str) -> Vec<FormatDesc> {
                     result.push(FormatDesc::Group {
                         repeat: n,
                         descriptors,
+                        is_reversion_point: true,
                     });
                 }
             }
@@ -299,6 +303,7 @@ fn parse_format_list(input: &str) -> Vec<FormatDesc> {
                             result.push(FormatDesc::Group {
                                 repeat: n,
                                 descriptors: vec![d],
+                                is_reversion_point: false,
                             });
                         } else {
                             result.push(d);
@@ -727,6 +732,7 @@ impl FormatEngine {
         let mut output = FormatOutput::new();
         let mut val_idx = 0;
         let descriptors = Arc::clone(&self.descriptors);
+        let reversion_descriptors = format_reversion_descriptors(descriptors.as_ref());
         if !values.is_empty() && !format_has_data_descriptor(descriptors.as_ref()) {
             return Err(FormatError::InvalidFormat);
         }
@@ -736,15 +742,17 @@ impl FormatEngine {
         }
 
         let mut first_record = true;
+        let mut active_descriptors = descriptors.as_ref();
         while val_idx < values.len() {
             if !first_record {
                 output.new_record();
             }
             let before = val_idx;
-            self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
+            self.apply_descriptors(active_descriptors, values, &mut val_idx, &mut output)?;
             if val_idx == before {
                 return Err(FormatError::InvalidFormat);
             }
+            active_descriptors = reversion_descriptors;
             first_record = false;
         }
         Ok(output.finish())
@@ -805,6 +813,7 @@ impl FormatEngine {
                 FormatDesc::Group {
                     repeat,
                     descriptors,
+                    ..
                 } => {
                     for _ in 0..*repeat {
                         self.apply_descriptors(descriptors, values, val_idx, output)?;
@@ -1594,13 +1603,30 @@ fn format_has_data_descriptor(descs: &[FormatDesc]) -> bool {
     })
 }
 
+fn format_reversion_descriptors(descs: &[FormatDesc]) -> &[FormatDesc] {
+    let start = descs
+        .iter()
+        .rposition(|desc| {
+            matches!(
+                desc,
+                FormatDesc::Group {
+                    is_reversion_point: true,
+                    ..
+                } | FormatDesc::UnlimitedRepeat { .. }
+            )
+        })
+        .unwrap_or(0);
+    &descs[start..]
+}
+
 // ---- Helpers ----
 
 fn to_engineering(v: f64) -> (f64, i32) {
     if v == 0.0 {
         return (0.0, 0);
     }
-    let exp = (v.abs().log10().floor() as i32) / 3 * 3;
+    let decimal_exp = v.abs().log10().floor() as i32;
+    let exp = decimal_exp.div_euclid(3) * 3;
     let mantissa = v / 10f64.powi(exp);
     (mantissa, exp)
 }
@@ -2308,12 +2334,104 @@ mod tests {
     }
 
     #[test]
+    fn format_reversion_starts_at_rightmost_parenthesized_group() {
+        let mut engine = FormatEngine::new(parse_format("(\"P\",2(I0,1X))"));
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Integer(1),
+                IoValue::Integer(2),
+                IoValue::Integer(3),
+                IoValue::Integer(4),
+            ])
+            .unwrap();
+        assert_eq!(out, "P1 2\n3 4");
+    }
+
+    #[test]
+    fn format_reversion_includes_descriptors_after_group() {
+        let mut engine = FormatEngine::new(parse_format("(\"E\",2(I0,1X),\"Z\",I0)"));
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Integer(1),
+                IoValue::Integer(2),
+                IoValue::Integer(3),
+                IoValue::Integer(4),
+                IoValue::Integer(5),
+                IoValue::Integer(6),
+            ])
+            .unwrap();
+        assert_eq!(out, "E1 2 Z3\n4 5 Z6");
+    }
+
+    #[test]
+    fn format_reversion_uses_outer_group_nearest_format_end() {
+        let mut engine = FormatEngine::new(parse_format("(\"B\",2(I0,3(\"x\",I0,1X)))"));
+        let values: Vec<_> = (1..=12).map(IoValue::Integer).collect();
+        let out = engine.format_values_reverting_checked(&values).unwrap();
+        assert_eq!(out, "B1x2 x3 x4 5x6 x7 x8\n9x10 x11 x12");
+    }
+
+    #[test]
+    fn format_reversion_ignores_data_descriptor_repeat_wrapper() {
+        let mut engine = FormatEngine::new(parse_format("(\"P\",2I0)"));
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Integer(1),
+                IoValue::Integer(2),
+                IoValue::Integer(3),
+                IoValue::Integer(4),
+            ])
+            .unwrap();
+        assert_eq!(out, "P12\nP34");
+    }
+
+    #[test]
+    fn format_reversion_preserves_control_state_before_group() {
+        let mut engine = FormatEngine::new(parse_format("(SP,\"P\",(I0))"));
+        let out = engine
+            .format_values_reverting_checked(&[IoValue::Integer(1), IoValue::Integer(2)])
+            .unwrap();
+        assert_eq!(out, "P+1\n+2");
+    }
+
+    #[test]
+    fn format_reversion_keeps_unlimited_group_on_one_record() {
+        let mut engine = FormatEngine::new(parse_format("(\"P\",*(I0,1X))"));
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Integer(1),
+                IoValue::Integer(2),
+                IoValue::Integer(3),
+            ])
+            .unwrap();
+        assert_eq!(out, "P1 2 3");
+    }
+
+    #[test]
     fn format_es_dp_precision_roundtrips() {
         let value = -1.9972267279387788e-1f64;
         let descs = parse_format("(ES24.16E3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(value)]);
         assert_eq!(out.trim().parse::<f64>().unwrap(), value);
+    }
+
+    #[test]
+    fn format_en_subunit_values_use_engineering_exponents() {
+        let mut engine = FormatEngine::new(parse_format("(EN14.3)"));
+        let out = engine
+            .format_values_reverting_checked(&[
+                IoValue::Real(0.1),
+                IoValue::Real(0.01),
+                IoValue::Real(0.001),
+                IoValue::Real(0.0001),
+                IoValue::Real(-0.01),
+            ])
+            .unwrap();
+        assert_eq!(
+            out,
+            "   100.000E-03\n    10.000E-03\n     1.000E-03\n   100.000E-06\n   -10.000E-03"
+        );
     }
 
     #[test]

@@ -1,5 +1,23 @@
 //! Fortran system intrinsics: clock, timing, command-line, environment.
 
+#[cfg(target_os = "freebsd")]
+type ProcessClockT = i32;
+#[cfg(not(target_os = "freebsd"))]
+type ProcessClockT = i64;
+
+#[cfg(target_os = "freebsd")]
+const PROCESS_CLOCKS_PER_SECOND: ProcessClockT = 128;
+#[cfg(not(target_os = "freebsd"))]
+const PROCESS_CLOCKS_PER_SECOND: ProcessClockT = 1_000_000;
+
+extern "C" {
+    fn clock() -> ProcessClockT;
+}
+
+fn process_clock_seconds(ticks: ProcessClockT) -> f64 {
+    ticks as f64 / PROCESS_CLOCKS_PER_SECOND as f64
+}
+
 /// SYSTEM_CLOCK: returns monotonic clock count, rate, and max
 /// (kind-8 resolution; see afs_system_clock_k).
 #[no_mangle]
@@ -59,13 +77,9 @@ pub extern "C" fn afs_cpu_time(time: *mut f64) {
     if time.is_null() {
         return;
     }
-    extern "C" {
-        fn clock() -> i64;
-    }
-    const CLOCKS_PER_SEC: i64 = 1_000_000; // POSIX value on macOS
     let ticks = unsafe { clock() };
     unsafe {
-        *time = ticks as f64 / CLOCKS_PER_SEC as f64;
+        *time = process_clock_seconds(ticks);
     }
 }
 
@@ -190,8 +204,11 @@ pub extern "C" fn afs_date_and_time(
 // it — so std's argv comes back EMPTY on ELF targets and
 // command_argument_count() returned -1. The entry wrappers therefore
 // forward main's (argc, argv) into afs_program_init, which stores
-// them here; std::env::args stays as the fallback (macOS reads argv
+// them here; std::env::args_os stays as the fallback (macOS reads argv
 // via _NSGetArgv and never needed the handoff).
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 static STORED_ARGC: AtomicI32 = AtomicI32::new(-1);
@@ -204,9 +221,20 @@ pub(crate) fn store_args(argc: i32, argv: *const *const u8) {
     }
 }
 
-/// The program's arguments as owned strings, from the stored argv
-/// when the entry wrapper provided one, else from std.
-fn program_args() -> Vec<String> {
+fn os_string_into_bytes(value: OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        value.into_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// The program's arguments as owned bytes, from the stored argv when
+/// the entry wrapper provided one, else from std.
+fn program_args() -> Vec<Vec<u8>> {
     let argc = STORED_ARGC.load(Ordering::Acquire);
     let argv = STORED_ARGV.load(Ordering::Acquire);
     if argc >= 0 && !argv.is_null() {
@@ -217,11 +245,36 @@ fn program_args() -> Vec<String> {
                 break;
             }
             let cstr = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) };
-            out.push(cstr.to_string_lossy().into_owned());
+            out.push(cstr.to_bytes().to_vec());
         }
         return out;
     }
-    std::env::args().collect()
+    std::env::args_os().map(os_string_into_bytes).collect()
+}
+
+fn store_optional_i32(target: *mut i32, value: i32) {
+    if !target.is_null() {
+        unsafe {
+            *target = value;
+        }
+    }
+}
+
+fn write_character_result(target: *mut u8, target_len: i64, bytes: &[u8]) -> bool {
+    if target.is_null() {
+        return false;
+    }
+    let capacity = usize::try_from(target_len).unwrap_or(0);
+    let copied = bytes.len().min(capacity);
+    unsafe {
+        if copied > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, copied);
+        }
+        if copied < capacity {
+            std::ptr::write_bytes(target.add(copied), b' ', capacity - copied);
+        }
+    }
+    bytes.len() > capacity
 }
 
 /// COMMAND_ARGUMENT_COUNT: returns argc - 1.
@@ -239,45 +292,18 @@ pub extern "C" fn afs_get_command_argument(
     length: *mut i32,
     status: *mut i32,
 ) {
-    let args: Vec<String> = program_args();
+    let args = program_args();
     if number < 0 || number as usize >= args.len() {
-        if !status.is_null() {
-            unsafe {
-                *status = 1;
-            }
-        }
-        if !length.is_null() {
-            unsafe {
-                *length = 0;
-            }
-        }
+        store_optional_i32(length, 0);
+        write_character_result(value, value_len, &[]);
+        store_optional_i32(status, 1);
         return;
     }
 
-    let arg = &args[number as usize];
-    let bytes = arg.as_bytes();
-
-    if !length.is_null() {
-        unsafe {
-            *length = bytes.len() as i32;
-        }
-    }
-
-    if !value.is_null() && value_len > 0 {
-        let n = bytes.len().min(value_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), value, n);
-            if n < value_len as usize {
-                std::ptr::write_bytes(value.add(n), b' ', value_len as usize - n);
-            }
-        }
-    }
-
-    if !status.is_null() {
-        unsafe {
-            *status = 0;
-        }
-    }
+    let bytes = &args[number as usize];
+    store_optional_i32(length, bytes.len() as i32);
+    let truncated = write_character_result(value, value_len, bytes);
+    store_optional_i32(status, if truncated { -1 } else { 0 });
 }
 
 /// GET_COMMAND: retrieve the full command line.
@@ -288,28 +314,20 @@ pub extern "C" fn afs_get_command(
     length: *mut i32,
     status: *mut i32,
 ) {
-    let full: String = program_args().join(" ");
-    let bytes = full.as_bytes();
+    let bytes = program_args().join(&b" "[..]);
+    store_optional_i32(length, bytes.len() as i32);
+    let truncated = write_character_result(command, cmd_len, &bytes);
+    store_optional_i32(status, if truncated { -1 } else { 0 });
+}
 
-    if !length.is_null() {
-        unsafe {
-            *length = bytes.len() as i32;
-        }
-    }
-    if !command.is_null() && cmd_len > 0 {
-        let n = bytes.len().min(cmd_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), command, n);
-            if n < cmd_len as usize {
-                std::ptr::write_bytes(command.add(n), b' ', cmd_len as usize - n);
-            }
-        }
-    }
-    if !status.is_null() {
-        unsafe {
-            *status = 0;
-        }
-    }
+#[cfg(unix)]
+fn environment_value(name: &[u8]) -> Option<Vec<u8>> {
+    std::env::var_os(std::ffi::OsStr::from_bytes(name)).map(OsStringExt::into_vec)
+}
+
+#[cfg(not(unix))]
+fn environment_value(name: &[u8]) -> Option<Vec<u8>> {
+    std::env::var_os(String::from_utf8_lossy(name).as_ref()).map(os_string_into_bytes)
 }
 
 /// GET_ENVIRONMENT_VARIABLE: retrieve an environment variable by name.
@@ -324,50 +342,28 @@ pub extern "C" fn afs_get_environment_variable(
 ) {
     let var_name = if !name.is_null() && name_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
-        String::from_utf8_lossy(slice).trim().to_string()
+        let end = slice
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |index| index + 1);
+        &slice[..end]
     } else {
-        if !status.is_null() {
-            unsafe {
-                *status = 1;
-            }
-        }
+        store_optional_i32(length, 0);
+        write_character_result(value, value_len, &[]);
+        store_optional_i32(status, 1);
         return;
     };
 
-    match std::env::var(&var_name) {
-        Ok(val) => {
-            let bytes = val.as_bytes();
-            if !length.is_null() {
-                unsafe {
-                    *length = bytes.len() as i32;
-                }
-            }
-            if !value.is_null() && value_len > 0 {
-                let n = bytes.len().min(value_len as usize);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), value, n);
-                    if n < value_len as usize {
-                        std::ptr::write_bytes(value.add(n), b' ', value_len as usize - n);
-                    }
-                }
-            }
-            if !status.is_null() {
-                unsafe {
-                    *status = 0;
-                }
-            }
+    match environment_value(var_name) {
+        Some(bytes) => {
+            store_optional_i32(length, bytes.len() as i32);
+            let truncated = write_character_result(value, value_len, &bytes);
+            store_optional_i32(status, if truncated { -1 } else { 0 });
         }
-        Err(_) => {
-            if !length.is_null() {
-                unsafe {
-                    *length = 0;
-                }
-            }
-            if !status.is_null() {
-                unsafe {
-                    *status = 1;
-                }
-            }
+        None => {
+            store_optional_i32(length, 0);
+            write_character_result(value, value_len, &[]);
+            store_optional_i32(status, 1);
         }
     }
 }
@@ -674,9 +670,59 @@ mod tests {
     }
 
     #[test]
+    fn cpu_time_converts_one_second_of_native_ticks() {
+        assert_eq!(process_clock_seconds(PROCESS_CLOCKS_PER_SECOND), 1.0);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn cpu_time_matches_freebsd_clock_scale() {
+        extern "C" {
+            fn clock() -> i32;
+        }
+
+        let before = loop {
+            let ticks = unsafe { clock() };
+            assert!(ticks >= 0, "clock() failed");
+            if ticks > 0 {
+                break ticks;
+            }
+            std::hint::spin_loop();
+        };
+        let mut actual = -1.0f64;
+        afs_cpu_time(&mut actual);
+        let after = unsafe { clock() };
+        assert!(after >= before, "clock() moved backwards or failed");
+
+        let lower = before as f64 / 128.0;
+        let upper = after as f64 / 128.0;
+        assert!(
+            (lower..=upper).contains(&actual),
+            "CPU_TIME {actual} was outside native clock range {lower}..={upper}"
+        );
+    }
+
+    #[test]
     fn command_argument_count_nonneg() {
         let c = afs_command_argument_count();
         assert!(c >= 0);
+    }
+
+    #[test]
+    fn character_result_copies_pads_and_reports_truncation() {
+        let mut target = [b'?'; 4];
+        assert!(!write_character_result(
+            target.as_mut_ptr(),
+            target.len() as i64,
+            b"ab"
+        ));
+        assert_eq!(&target, b"ab  ");
+
+        assert!(write_character_result(target.as_mut_ptr(), 2, b"abcd"));
+        assert_eq!(&target[..2], b"ab");
+
+        assert!(write_character_result(target.as_mut_ptr(), 0, b"abcd"));
+        assert!(!write_character_result(std::ptr::null_mut(), 0, b"abcd"));
     }
 
     #[test]
