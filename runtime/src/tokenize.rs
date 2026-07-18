@@ -56,15 +56,20 @@ unsafe fn tokenize_store_int(base: *mut u8, idx: usize, kind: i64, value: i64) {
     match kind {
         1 => *(p as *mut i8) = value as i8,
         2 => *(p as *mut i16) = value as i16,
+        4 => *(p as *mut i32) = value as i32,
         8 => *(p as *mut i64) = value,
-        _ => *(p as *mut i32) = value as i32,
+        16 => *(p as *mut i128) = value as i128,
+        _ => unreachable!("TOKENIZE integer kind was validated before storage"),
     }
 }
 
 fn tokenize_int_kind(kind: i64) -> i64 {
     match kind {
-        1 | 2 | 4 | 8 => kind,
-        _ => 4,
+        1 | 2 | 4 | 8 | 16 => kind,
+        _ => {
+            eprintln!("Fortran runtime error: TOKENIZE result has unsupported integer kind {kind}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -235,6 +240,7 @@ mod tests {
                     2 => *(p as *const i16) as i64,
                     4 => *(p as *const i32) as i64,
                     8 => *(p as *const i64),
+                    16 => *(p as *const i128) as i64,
                     _ => unreachable!(),
                 }
             })
@@ -243,8 +249,8 @@ mod tests {
 
     #[test]
     fn tokenize_positions_honors_each_result_kind() {
-        for first_kind in [1, 2, 4, 8] {
-            for last_kind in [1, 2, 4, 8] {
+        for first_kind in [1, 2, 4, 8, 16] {
+            for last_kind in [1, 2, 4, 8, 16] {
                 let mut first = ArrayDescriptor::zeroed();
                 let mut last = ArrayDescriptor::zeroed();
                 afs_tokenize_positions(

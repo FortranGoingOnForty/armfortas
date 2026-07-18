@@ -4,12 +4,15 @@
 ! CHECK: first8-last1 T T
 ! CHECK: first2-last4 T T
 ! CHECK: first1-last2 T T
+! CHECK: first16-last1 T T
+! CHECK: first2-last16 T T
 program tokenize_mixed_integer_kinds
   implicit none
   integer(1), allocatable :: first1(:), last1(:)
   integer(2), allocatable :: first2(:), last2(:)
   integer(4), allocatable :: first4(:), last4(:)
   integer(8), allocatable :: first8(:), last8(:)
+  integer(16), allocatable :: first16(:), last16(:)
 
   call tokenize('a,b', ',', first4, last8)
   print *, 'first4-last8', all(first4 == [1_4, 3_4]), &
@@ -26,4 +29,12 @@ program tokenize_mixed_integer_kinds
   call tokenize('a,b', ',', first1, last2)
   print *, 'first1-last2', all(first1 == [1_1, 3_1]), &
                             all(last2 == [1_2, 3_2])
+
+  call tokenize('a,b', ',', first16, last1)
+  print *, 'first16-last1', all(first16 == [1_16, 3_16]), &
+                               all(last1 == [1_1, 3_1])
+
+  call tokenize('a,b', ',', first2, last16)
+  print *, 'first2-last16', all(first2 == [1_2, 3_2]), &
+                               all(last16 == [1_16, 3_16])
 end program tokenize_mixed_integer_kinds
