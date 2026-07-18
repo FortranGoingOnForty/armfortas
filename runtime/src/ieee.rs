@@ -340,16 +340,109 @@ pub extern "C" fn afs_ieee_logb_r4(x: f32) -> f32 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn afs_ieee_rint_r8(x: f64) -> f64 {
-    // Round to nearest, ties to even, honoring the current mode would
-    // need nearbyint; round_ties_even matches the default mode.
-    x.round_ties_even()
+/// Round a binary32/binary64 encoding by discarding fractional significand
+/// bits. Mode tags are nearest-even, zero, up, down, and nearest-away.
+fn round_integral_bits(
+    bits: u64,
+    exponent_bits: u32,
+    fraction_bits: u32,
+    exponent_bias: i32,
+    mode: i32,
+) -> u64 {
+    let sign_mask = 1u64 << (exponent_bits + fraction_bits);
+    let fraction_mask = (1u64 << fraction_bits) - 1;
+    let exponent_mask = ((1u64 << exponent_bits) - 1) << fraction_bits;
+    let exponent = ((bits & exponent_mask) >> fraction_bits) as i32;
+    let fraction = bits & fraction_mask;
+    let sign_negative = bits & sign_mask != 0;
+
+    if exponent == (1i32 << exponent_bits) - 1 || (exponent == 0 && fraction == 0) {
+        return bits;
+    }
+
+    let unbiased = exponent - exponent_bias;
+    if unbiased >= fraction_bits as i32 {
+        return bits;
+    }
+
+    if unbiased < 0 {
+        let magnitude = bits & !sign_mask;
+        let half = ((exponent_bias - 1) as u64) << fraction_bits;
+        let increment = match mode {
+            0 => magnitude > half,
+            1 => false,
+            2 => !sign_negative,
+            3 => sign_negative,
+            4 => magnitude >= half,
+            _ => false,
+        };
+        let one = (exponent_bias as u64) << fraction_bits;
+        return (bits & sign_mask) | if increment { one } else { 0 };
+    }
+
+    let fractional_bits = fraction_bits - unbiased as u32;
+    let integer_unit = 1u64 << fractional_bits;
+    let discarded_mask = integer_unit - 1;
+    let discarded = bits & discarded_mask;
+    if discarded == 0 {
+        return bits;
+    }
+
+    let truncated = bits & !discarded_mask;
+    let half = integer_unit >> 1;
+    let increment = match mode {
+        0 => discarded > half || (discarded == half && truncated & integer_unit != 0),
+        1 => false,
+        2 => !sign_negative,
+        3 => sign_negative,
+        4 => discarded >= half,
+        _ => false,
+    };
+    truncated + if increment { integer_unit } else { 0 }
 }
 
 #[no_mangle]
-pub extern "C" fn afs_ieee_rint_r4(x: f32) -> f32 {
-    x.round_ties_even()
+pub extern "C" fn afs_ieee_rint_r8(x: f64, round: i32) -> f64 {
+    let use_current = !(0..=4).contains(&round);
+    let mode = if use_current {
+        fpenv::get_rounding()
+    } else {
+        round
+    };
+    let bits = x.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    let fraction = bits & 0x000f_ffff_ffff_ffff;
+    if exponent == 0x7ff && fraction != 0 && fraction & (1u64 << 51) == 0 {
+        fpenv::set_flag(1, true);
+        return f64::from_bits(bits | (1u64 << 51));
+    }
+    let result_bits = round_integral_bits(bits, 11, 52, 1023, mode);
+    if use_current && exponent != 0x7ff && result_bits != bits {
+        fpenv::set_flag(5, true);
+    }
+    f64::from_bits(result_bits)
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_rint_r4(x: f32, round: i32) -> f32 {
+    let use_current = !(0..=4).contains(&round);
+    let mode = if use_current {
+        fpenv::get_rounding()
+    } else {
+        round
+    };
+    let bits = x.to_bits();
+    let exponent = (bits >> 23) & 0xff;
+    let fraction = bits & 0x007f_ffff;
+    if exponent == 0xff && fraction != 0 && fraction & (1u32 << 22) == 0 {
+        fpenv::set_flag(1, true);
+        return f32::from_bits(bits | (1u32 << 22));
+    }
+    let result_bits = round_integral_bits(bits as u64, 8, 23, 127, mode) as u32;
+    if use_current && exponent != 0xff && result_bits != bits {
+        fpenv::set_flag(5, true);
+    }
+    f32::from_bits(result_bits)
 }
 
 /// IEEE_SCALB(x, i) = x * 2**i, computed without intermediate overflow.
@@ -973,6 +1066,110 @@ mod tests {
         assert!(afs_ieee_next_after_r8(1.0, 0.0) < 1.0);
         assert_eq!(afs_ieee_copy_sign_r8(3.0, -1.0), -3.0);
         assert_eq!(afs_ieee_scalb_r8(1.5, 3), 12.0);
+    }
+
+    #[test]
+    fn rint_honors_explicit_rounding_modes() {
+        assert_eq!(afs_ieee_rint_r8(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_rint_r8(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_rint_r8(-1.9, 1), -1.0);
+        assert_eq!(afs_ieee_rint_r8(2.5, 0), 2.0);
+        assert_eq!(afs_ieee_rint_r8(3.5, 0), 4.0);
+        assert_eq!(afs_ieee_rint_r8(0.5, 0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(afs_ieee_rint_r8(-0.5, 0).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(afs_ieee_rint_r8(2.5, 4), 3.0);
+        assert_eq!(afs_ieee_rint_r8(-2.5, 4), -3.0);
+        assert_eq!(afs_ieee_rint_r8(-0.1, 1).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(
+            afs_ieee_rint_r8(4_503_599_627_370_495.5, 0),
+            2.0f64.powi(52)
+        );
+        assert_eq!(afs_ieee_rint_r8(f64::from_bits(1), 0).to_bits(), 0);
+        assert_eq!(afs_ieee_rint_r8(f64::INFINITY, 0), f64::INFINITY);
+
+        assert_eq!(afs_ieee_rint_r4(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_rint_r4(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_rint_r4(2.5, 0), 2.0);
+        assert_eq!(afs_ieee_rint_r4(-2.5, 4), -3.0);
+        assert_eq!(afs_ieee_rint_r4(-0.1, 1).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(afs_ieee_rint_r4(8_388_607.5, 0), 2.0f32.powi(23));
+        assert_eq!(afs_ieee_rint_r4(f32::from_bits(1), 0).to_bits(), 0);
+        assert_eq!(afs_ieee_rint_r4(f32::INFINITY, 0), f32::INFINITY);
+    }
+
+    #[test]
+    fn integral_bit_rounding_matches_all_modes() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let x64 = f64::from_bits(state);
+            if x64.is_finite() {
+                for (mode, expected) in [
+                    (0, x64.round_ties_even()),
+                    (1, x64.trunc()),
+                    (2, x64.ceil()),
+                    (3, x64.floor()),
+                    (4, x64.round()),
+                ] {
+                    assert_eq!(
+                        round_integral_bits(x64.to_bits(), 11, 52, 1023, mode),
+                        expected.to_bits()
+                    );
+                }
+            }
+
+            let x32 = f32::from_bits(state as u32);
+            if x32.is_finite() {
+                for (mode, expected) in [
+                    (0, x32.round_ties_even()),
+                    (1, x32.trunc()),
+                    (2, x32.ceil()),
+                    (3, x32.floor()),
+                    (4, x32.round()),
+                ] {
+                    assert_eq!(
+                        round_integral_bits(x32.to_bits() as u64, 8, 23, 127, mode),
+                        expected.to_bits() as u64
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn rint_uses_and_preserves_the_ambient_mode() {
+        let saved = fpenv::get_status();
+
+        afs_ieee_set_rounding(3);
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_rint_r8(3.5, 0), 4.0);
+        assert_eq!(afs_ieee_rint_r8(2.5, 4), 3.0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+        assert_eq!(afs_ieee_rint_r8(1.9, -1), 1.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r4(1.9, -1), 1.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+        assert_eq!(afs_ieee_get_rounding(), 3);
+
+        afs_ieee_set_rounding(2);
+        assert_eq!(afs_ieee_rint_r4(2.5, 0), 2.0);
+        assert_eq!(afs_ieee_rint_r4(-2.5, 4), -3.0);
+        assert_eq!(afs_ieee_rint_r8(-1.1, -1), -1.0);
+        assert_eq!(afs_ieee_rint_r4(-1.1, -1), -1.0);
+        assert_eq!(afs_ieee_rint_r8(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_get_rounding(), 2);
+
+        afs_ieee_set_flag(1, 0);
+        let quieted = afs_ieee_rint_r8(f64::from_bits(0x7ff0_0000_0000_0001), 0);
+        assert_eq!(quieted.to_bits(), 0x7ff8_0000_0000_0001);
+        assert_eq!(afs_ieee_test_flag(1), 1);
+
+        fpenv::set_status(saved);
     }
 
     #[test]
