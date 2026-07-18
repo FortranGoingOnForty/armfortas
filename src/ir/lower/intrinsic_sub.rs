@@ -524,7 +524,7 @@ pub(crate) fn lower_intrinsic_subroutine(
                 let first_kind = b.const_i64(first_kind_bytes);
                 let last_kind = b.const_i64(last_kind_bytes);
                 b.call(
-                    FuncRef::External("afs_tokenize_positions".into()),
+                    FuncRef::External("afs_tokenize_positions_kinds".into()),
                     vec![
                         str_ptr, str_len, set_ptr, set_len, first_desc, last_desc, first_kind,
                         last_kind,

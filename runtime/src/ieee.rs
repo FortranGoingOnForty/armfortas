@@ -402,7 +402,7 @@ fn round_integral_bits(
 }
 
 #[no_mangle]
-pub extern "C" fn afs_ieee_rint_r8(x: f64, round: i32) -> f64 {
+pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
     let use_current = !(0..=4).contains(&round);
     let mode = if use_current {
         fpenv::get_rounding()
@@ -424,7 +424,7 @@ pub extern "C" fn afs_ieee_rint_r8(x: f64, round: i32) -> f64 {
 }
 
 #[no_mangle]
-pub extern "C" fn afs_ieee_rint_r4(x: f32, round: i32) -> f32 {
+pub extern "C" fn afs_ieee_rint_r4_round(x: f32, round: i32) -> f32 {
     let use_current = !(0..=4).contains(&round);
     let mode = if use_current {
         fpenv::get_rounding()
@@ -443,6 +443,18 @@ pub extern "C" fn afs_ieee_rint_r4(x: f32, round: i32) -> f32 {
         fpenv::set_flag(5, true);
     }
     f32::from_bits(result_bits)
+}
+
+/// Compatibility entry points for objects compiled before the optional
+/// ROUND argument was represented in the runtime ABI.
+#[no_mangle]
+pub extern "C" fn afs_ieee_rint_r8(x: f64) -> f64 {
+    afs_ieee_rint_r8_round(x, -1)
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_rint_r4(x: f32) -> f32 {
+    afs_ieee_rint_r4_round(x, -1)
 }
 
 /// IEEE_SCALB(x, i) = x * 2**i, computed without intermediate overflow.
@@ -1070,31 +1082,40 @@ mod tests {
 
     #[test]
     fn rint_honors_explicit_rounding_modes() {
-        assert_eq!(afs_ieee_rint_r8(1.1, 2), 2.0);
-        assert_eq!(afs_ieee_rint_r8(-1.1, 3), -2.0);
-        assert_eq!(afs_ieee_rint_r8(-1.9, 1), -1.0);
-        assert_eq!(afs_ieee_rint_r8(2.5, 0), 2.0);
-        assert_eq!(afs_ieee_rint_r8(3.5, 0), 4.0);
-        assert_eq!(afs_ieee_rint_r8(0.5, 0).to_bits(), 0.0f64.to_bits());
-        assert_eq!(afs_ieee_rint_r8(-0.5, 0).to_bits(), (-0.0f64).to_bits());
-        assert_eq!(afs_ieee_rint_r8(2.5, 4), 3.0);
-        assert_eq!(afs_ieee_rint_r8(-2.5, 4), -3.0);
-        assert_eq!(afs_ieee_rint_r8(-0.1, 1).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(afs_ieee_rint_r8_round(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_rint_r8_round(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_rint_r8_round(-1.9, 1), -1.0);
+        assert_eq!(afs_ieee_rint_r8_round(2.5, 0), 2.0);
+        assert_eq!(afs_ieee_rint_r8_round(3.5, 0), 4.0);
+        assert_eq!(afs_ieee_rint_r8_round(0.5, 0).to_bits(), 0.0f64.to_bits());
         assert_eq!(
-            afs_ieee_rint_r8(4_503_599_627_370_495.5, 0),
+            afs_ieee_rint_r8_round(-0.5, 0).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(afs_ieee_rint_r8_round(2.5, 4), 3.0);
+        assert_eq!(afs_ieee_rint_r8_round(-2.5, 4), -3.0);
+        assert_eq!(
+            afs_ieee_rint_r8_round(-0.1, 1).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            afs_ieee_rint_r8_round(4_503_599_627_370_495.5, 0),
             2.0f64.powi(52)
         );
-        assert_eq!(afs_ieee_rint_r8(f64::from_bits(1), 0).to_bits(), 0);
-        assert_eq!(afs_ieee_rint_r8(f64::INFINITY, 0), f64::INFINITY);
+        assert_eq!(afs_ieee_rint_r8_round(f64::from_bits(1), 0).to_bits(), 0);
+        assert_eq!(afs_ieee_rint_r8_round(f64::INFINITY, 0), f64::INFINITY);
 
-        assert_eq!(afs_ieee_rint_r4(1.1, 2), 2.0);
-        assert_eq!(afs_ieee_rint_r4(-1.1, 3), -2.0);
-        assert_eq!(afs_ieee_rint_r4(2.5, 0), 2.0);
-        assert_eq!(afs_ieee_rint_r4(-2.5, 4), -3.0);
-        assert_eq!(afs_ieee_rint_r4(-0.1, 1).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(afs_ieee_rint_r4(8_388_607.5, 0), 2.0f32.powi(23));
-        assert_eq!(afs_ieee_rint_r4(f32::from_bits(1), 0).to_bits(), 0);
-        assert_eq!(afs_ieee_rint_r4(f32::INFINITY, 0), f32::INFINITY);
+        assert_eq!(afs_ieee_rint_r4_round(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_rint_r4_round(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_rint_r4_round(2.5, 0), 2.0);
+        assert_eq!(afs_ieee_rint_r4_round(-2.5, 4), -3.0);
+        assert_eq!(
+            afs_ieee_rint_r4_round(-0.1, 1).to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(afs_ieee_rint_r4_round(8_388_607.5, 0), 2.0f32.powi(23));
+        assert_eq!(afs_ieee_rint_r4_round(f32::from_bits(1), 0).to_bits(), 0);
+        assert_eq!(afs_ieee_rint_r4_round(f32::INFINITY, 0), f32::INFINITY);
     }
 
     #[test]
@@ -1140,32 +1161,48 @@ mod tests {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
+    fn rint_legacy_entry_points_use_the_ambient_mode() {
+        let saved = fpenv::get_status();
+
+        afs_ieee_set_rounding(3);
+        assert_eq!(afs_ieee_rint_r8(1.9), 1.0);
+        assert_eq!(afs_ieee_rint_r4(1.9), 1.0);
+
+        afs_ieee_set_rounding(2);
+        assert_eq!(afs_ieee_rint_r8(-1.1), -1.0);
+        assert_eq!(afs_ieee_rint_r4(-1.1), -1.0);
+
+        fpenv::set_status(saved);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
     fn rint_uses_and_preserves_the_ambient_mode() {
         let saved = fpenv::get_status();
 
         afs_ieee_set_rounding(3);
         afs_ieee_set_flag(5, 0);
-        assert_eq!(afs_ieee_rint_r8(1.1, 2), 2.0);
-        assert_eq!(afs_ieee_rint_r8(3.5, 0), 4.0);
-        assert_eq!(afs_ieee_rint_r8(2.5, 4), 3.0);
+        assert_eq!(afs_ieee_rint_r8_round(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_rint_r8_round(3.5, 0), 4.0);
+        assert_eq!(afs_ieee_rint_r8_round(2.5, 4), 3.0);
         assert_eq!(afs_ieee_test_flag(5), 0);
-        assert_eq!(afs_ieee_rint_r8(1.9, -1), 1.0);
+        assert_eq!(afs_ieee_rint_r8_round(1.9, -1), 1.0);
         assert_eq!(afs_ieee_test_flag(5), 1);
         afs_ieee_set_flag(5, 0);
-        assert_eq!(afs_ieee_rint_r4(1.9, -1), 1.0);
+        assert_eq!(afs_ieee_rint_r4_round(1.9, -1), 1.0);
         assert_eq!(afs_ieee_test_flag(5), 1);
         assert_eq!(afs_ieee_get_rounding(), 3);
 
         afs_ieee_set_rounding(2);
-        assert_eq!(afs_ieee_rint_r4(2.5, 0), 2.0);
-        assert_eq!(afs_ieee_rint_r4(-2.5, 4), -3.0);
-        assert_eq!(afs_ieee_rint_r8(-1.1, -1), -1.0);
-        assert_eq!(afs_ieee_rint_r4(-1.1, -1), -1.0);
-        assert_eq!(afs_ieee_rint_r8(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_rint_r4_round(2.5, 0), 2.0);
+        assert_eq!(afs_ieee_rint_r4_round(-2.5, 4), -3.0);
+        assert_eq!(afs_ieee_rint_r8_round(-1.1, -1), -1.0);
+        assert_eq!(afs_ieee_rint_r4_round(-1.1, -1), -1.0);
+        assert_eq!(afs_ieee_rint_r8_round(-1.1, 3), -2.0);
         assert_eq!(afs_ieee_get_rounding(), 2);
 
         afs_ieee_set_flag(1, 0);
-        let quieted = afs_ieee_rint_r8(f64::from_bits(0x7ff0_0000_0000_0001), 0);
+        let quieted = afs_ieee_rint_r8_round(f64::from_bits(0x7ff0_0000_0000_0001), 0);
         assert_eq!(quieted.to_bits(), 0x7ff8_0000_0000_0001);
         assert_eq!(afs_ieee_test_flag(1), 1);
 

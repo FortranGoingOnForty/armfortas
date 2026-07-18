@@ -1681,7 +1681,7 @@ pub(crate) fn lower_intrinsic(
                 .map(|round| ieee_as_i32(b, *round))
                 .unwrap_or_else(|| b.const_i32(-1));
             b.call(
-                FuncRef::External(format!("afs_ieee_rint_{}", suffix)),
+                FuncRef::External(format!("afs_ieee_rint_{}_round", suffix)),
                 vec![*arg, round],
                 ty,
             )

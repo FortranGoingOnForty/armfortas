@@ -78,7 +78,7 @@ fn tokenize_int_kind(kind: i64) -> i64 {
 /// both are allocated to the token count and filled with the 1-based
 /// start/end positions of each token.
 #[no_mangle]
-pub extern "C" fn afs_tokenize_positions(
+pub extern "C" fn afs_tokenize_positions_kinds(
     str_ptr: *const u8,
     str_len: i64,
     set_ptr: *const u8,
@@ -107,6 +107,24 @@ pub extern "C" fn afs_tokenize_positions(
             tokenize_store_int(lbase, i, last_kind, end);
         }
     }
+}
+
+/// Compatibility entry point for objects compiled before FIRST and LAST
+/// carried independent kind arguments.
+#[no_mangle]
+pub extern "C" fn afs_tokenize_positions(
+    str_ptr: *const u8,
+    str_len: i64,
+    set_ptr: *const u8,
+    set_len: i64,
+    first: *mut ArrayDescriptor,
+    last: *mut ArrayDescriptor,
+    int_kind: i64,
+) {
+    let int_kind = if int_kind <= 0 { 4 } else { int_kind };
+    afs_tokenize_positions_kinds(
+        str_ptr, str_len, set_ptr, set_len, first, last, int_kind, int_kind,
+    );
 }
 
 /// TOKENIZE Form 1: `CALL TOKENIZE(STRING, SET, TOKENS [, SEPARATOR])`.
@@ -217,11 +235,13 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_positions_form2() {
+    fn tokenize_positions_legacy_entry_point_uses_one_kind() {
         let s = b"a,bb,ccc";
         let mut first = ArrayDescriptor::zeroed();
         let mut last = ArrayDescriptor::zeroed();
-        afs_tokenize_positions(s.as_ptr(), 8, b",".as_ptr(), 1, &mut first, &mut last, 4, 4);
+        afs_tokenize_positions(s.as_ptr(), 8, b",".as_ptr(), 1, &mut first, &mut last, 4);
+        assert_eq!(first.elem_size, 4);
+        assert_eq!(last.elem_size, 4);
         assert_eq!(first.dims[0].upper_bound, 3);
         unsafe {
             let f = std::slice::from_raw_parts(first.base_addr as *const i32, 3);
@@ -253,7 +273,7 @@ mod tests {
             for last_kind in [1, 2, 4, 8, 16] {
                 let mut first = ArrayDescriptor::zeroed();
                 let mut last = ArrayDescriptor::zeroed();
-                afs_tokenize_positions(
+                afs_tokenize_positions_kinds(
                     b"a,b".as_ptr(),
                     3,
                     b",".as_ptr(),
