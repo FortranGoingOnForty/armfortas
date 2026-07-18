@@ -507,20 +507,27 @@ pub(crate) fn lower_intrinsic_subroutine(
                         IrType::Void,
                     );
                 }
-            } else if let (Some((first_desc, first_info)), Some((last_desc, _))) = (
+            } else if let (Some((first_desc, first_info)), Some((last_desc, last_info))) = (
                 nth_arg_alloc_array(b, ctx, args, 2),
                 nth_arg_alloc_array(b, ctx, args, 3),
             ) {
-                let kind_bytes = first_info
+                let first_kind_bytes = first_info
                     .ty
                     .int_width()
                     .map(|w| (w.bits() / 8) as i64)
                     .unwrap_or(4);
-                let int_kind = b.const_i64(kind_bytes);
+                let last_kind_bytes = last_info
+                    .ty
+                    .int_width()
+                    .map(|w| (w.bits() / 8) as i64)
+                    .unwrap_or(4);
+                let first_kind = b.const_i64(first_kind_bytes);
+                let last_kind = b.const_i64(last_kind_bytes);
                 b.call(
-                    FuncRef::External("afs_tokenize_positions".into()),
+                    FuncRef::External("afs_tokenize_positions_kinds".into()),
                     vec![
-                        str_ptr, str_len, set_ptr, set_len, first_desc, last_desc, int_kind,
+                        str_ptr, str_len, set_ptr, set_len, first_desc, last_desc, first_kind,
+                        last_kind,
                     ],
                     IrType::Void,
                 );

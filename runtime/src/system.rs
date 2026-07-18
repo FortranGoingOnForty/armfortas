@@ -369,6 +369,95 @@ pub extern "C" fn afs_get_environment_variable(
 }
 
 /// EXECUTE_COMMAND_LINE: run a shell command.
+const ASYNC_COMMAND_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const ASYNC_COMMAND_RECEIVE_BATCH: usize = 64;
+
+type AsyncCommandSender = std::sync::mpsc::Sender<std::process::Child>;
+
+fn async_command_sender() -> Option<&'static AsyncCommandSender> {
+    static SENDER: std::sync::OnceLock<AsyncCommandSender> = std::sync::OnceLock::new();
+
+    if let Some(sender) = SENDER.get() {
+        return Some(sender);
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("afs-command-reaper".to_string())
+        .spawn(move || reap_async_commands(receiver));
+    if spawned.is_err() {
+        return SENDER.get();
+    }
+
+    let _ = SENDER.set(sender);
+    SENDER.get()
+}
+
+fn reap_async_commands(receiver: std::sync::mpsc::Receiver<std::process::Child>) {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+
+    let mut children = Vec::new();
+    let mut connected = true;
+
+    while connected || !children.is_empty() {
+        if !connected {
+            std::thread::sleep(ASYNC_COMMAND_REAP_INTERVAL);
+        } else if children.is_empty() {
+            match receiver.recv() {
+                Ok(child) => children.push(child),
+                Err(_) => connected = false,
+            }
+        } else {
+            match receiver.recv_timeout(ASYNC_COMMAND_REAP_INTERVAL) {
+                Ok(child) => children.push(child),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => connected = false,
+            }
+        }
+
+        if connected {
+            for _ in 1..ASYNC_COMMAND_RECEIVE_BATCH {
+                match receiver.try_recv() {
+                    Ok(child) => children.push(child),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        connected = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::Interrupted,
+        });
+    }
+}
+
+fn spawn_async_command(command: &str) -> std::io::Result<u32> {
+    let sender = async_command_sender()
+        .ok_or_else(|| std::io::Error::other("could not start asynchronous command reaper"))?;
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .spawn()?;
+    let pid = child.id();
+
+    if let Err(error) = sender.send(child) {
+        let mut child = error.0;
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "asynchronous command reaper stopped",
+        ));
+    }
+
+    Ok(pid)
+}
+
 #[no_mangle]
 pub extern "C" fn afs_execute_command_line(
     command: *const u8,
@@ -413,7 +502,7 @@ pub extern "C" fn afs_execute_command_line(
             }
         }
     } else {
-        match Command::new("sh").arg("-c").arg(&cmd).spawn() {
+        match spawn_async_command(&cmd) {
             Ok(_) => {
                 if !cmdstat.is_null() {
                     unsafe {
@@ -645,6 +734,114 @@ pub extern "C" fn afs_popcount(val: u64) -> i32 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_processes_to_disappear(pids: &[u32], timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if pids.iter().all(|pid| !process_exists(*pid)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    struct ProcessCleanup {
+        pid: Option<u32>,
+    }
+
+    #[cfg(unix)]
+    impl ProcessCleanup {
+        fn new(pid: u32) -> Self {
+            Self { pid: Some(pid) }
+        }
+
+        fn pid(&self) -> u32 {
+            self.pid.expect("process cleanup should still be armed")
+        }
+
+        fn terminate_and_reap(&mut self, timeout: std::time::Duration) -> bool {
+            let Some(pid) = self.pid else {
+                return true;
+            };
+            if !process_exists(pid) {
+                self.pid = None;
+                return true;
+            }
+
+            unsafe {
+                kill(pid as i32, 15);
+            }
+            if wait_for_processes_to_disappear(std::slice::from_ref(&pid), timeout) {
+                self.pid = None;
+                return true;
+            }
+
+            unsafe {
+                kill(pid as i32, 9);
+            }
+            let reaped = wait_for_processes_to_disappear(std::slice::from_ref(&pid), timeout);
+            if reaped {
+                self.pid = None;
+            }
+            reaped
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessCleanup {
+        fn drop(&mut self) {
+            let _ = self.terminate_and_reap(std::time::Duration::from_secs(3));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_files(
+        paths: &[std::path::PathBuf],
+        timeout: std::time::Duration,
+    ) -> Option<Vec<u32>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let pids = paths
+                .iter()
+                .map(|path| std::fs::read_to_string(path).ok()?.trim().parse().ok())
+                .collect::<Option<Vec<_>>>();
+            if pids.is_some() {
+                return pids;
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn execute_async_command(command: &str) {
+        let mut cmdstat = i32::MIN;
+        afs_execute_command_line(
+            command.as_ptr(),
+            command.len() as i64,
+            0,
+            std::ptr::null_mut(),
+            &mut cmdstat,
+        );
+        assert_eq!(cmdstat, 0, "asynchronous command should start");
+    }
+
     #[test]
     fn system_clock_increases() {
         let mut c1 = 0i64;
@@ -723,6 +920,71 @@ mod tests {
 
         assert!(write_character_result(target.as_mut_ptr(), 0, b"abcd"));
         assert!(!write_character_result(std::ptr::null_mut(), 0, b"abcd"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_cleanup_reaps_during_unwind() {
+        let blocker = spawn_async_command("while :; do :; done")
+            .expect("long-running asynchronous command should start");
+        let unwind = std::panic::catch_unwind(|| {
+            let _cleanup = ProcessCleanup::new(blocker);
+            panic!("exercise process cleanup during unwind");
+        });
+
+        assert!(unwind.is_err());
+        assert!(
+            !process_exists(blocker),
+            "process cleanup should reap the child during unwind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asynchronous_commands_are_reaped_without_head_of_line_blocking() {
+        let blocker = spawn_async_command("while :; do :; done")
+            .expect("long-running asynchronous command should start");
+        let mut blocker = ProcessCleanup::new(blocker);
+        let pid_paths = (0..64)
+            .map(|index| {
+                std::path::PathBuf::from(format!(
+                    "/tmp/afs-command-reaper-{}-{index}.pid",
+                    std::process::id()
+                ))
+            })
+            .collect::<Vec<_>>();
+        for path in &pid_paths {
+            let _ = std::fs::remove_file(path);
+            execute_async_command(&format!("echo $$ > {}; exit 0", path.display()));
+        }
+
+        let quick = wait_for_pid_files(&pid_paths, std::time::Duration::from_secs(3));
+        let quick_reaped = quick
+            .as_ref()
+            .map(|pids| wait_for_processes_to_disappear(pids, std::time::Duration::from_secs(3)))
+            .unwrap_or(false);
+        let blocker_was_running = process_exists(blocker.pid());
+        let blocker_reaped = blocker.terminate_and_reap(std::time::Duration::from_secs(3));
+        for path in pid_paths {
+            let _ = std::fs::remove_file(path);
+        }
+
+        assert!(
+            quick.is_some(),
+            "asynchronous commands did not publish PIDs"
+        );
+        assert!(
+            quick_reaped,
+            "completed asynchronous commands were not reaped"
+        );
+        assert!(
+            blocker_was_running,
+            "later commands were not tested behind a running command"
+        );
+        assert!(
+            blocker_reaped,
+            "terminated asynchronous command was not reaped"
+        );
     }
 
     #[test]

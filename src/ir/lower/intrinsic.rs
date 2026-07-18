@@ -1658,16 +1658,31 @@ pub(crate) fn lower_intrinsic(
                 ))
             }
         }
-        "ieee_logb" | "ieee_rint" => args.first().map(|arg| {
+        "ieee_logb" => args.first().map(|arg| {
             let suffix = ieee_float_suffix(b, *arg);
-            let op = if name == "ieee_logb" { "logb" } else { "rint" };
             let ty = b
                 .func()
                 .value_type(*arg)
                 .unwrap_or(IrType::Float(FloatWidth::F64));
             b.call(
-                FuncRef::External(format!("afs_ieee_{}_{}", op, suffix)),
+                FuncRef::External(format!("afs_ieee_logb_{}", suffix)),
                 vec![*arg],
+                ty,
+            )
+        }),
+        "ieee_rint" => args.first().map(|arg| {
+            let suffix = ieee_float_suffix(b, *arg);
+            let ty = b
+                .func()
+                .value_type(*arg)
+                .unwrap_or(IrType::Float(FloatWidth::F64));
+            let round = args
+                .get(1)
+                .map(|round| ieee_as_i32(b, *round))
+                .unwrap_or_else(|| b.const_i32(-1));
+            b.call(
+                FuncRef::External(format!("afs_ieee_rint_{}_round", suffix)),
+                vec![*arg, round],
                 ty,
             )
         }),
