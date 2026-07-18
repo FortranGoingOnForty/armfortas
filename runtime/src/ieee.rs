@@ -48,6 +48,13 @@ pub const IEEE_POSITIVE_NORMAL: i32 = 9;
 pub const IEEE_NEGATIVE_NORMAL: i32 = 10;
 pub const IEEE_OTHER_VALUE: i32 = 11;
 
+unsafe extern "C" {
+    #[link_name = "scalbn"]
+    fn c_scalbn(x: f64, exponent: i32) -> f64;
+    #[link_name = "scalbnf"]
+    fn c_scalbnf(x: f32, exponent: i32) -> f32;
+}
+
 fn class_f64(bits: u64) -> i32 {
     let sign = bits >> 63 != 0;
     let exp = (bits >> 52) & 0x7ff;
@@ -346,12 +353,12 @@ pub extern "C" fn afs_ieee_rint_r4(x: f32) -> f32 {
 /// IEEE_SCALB(x, i) = x * 2**i, computed without intermediate overflow.
 #[no_mangle]
 pub extern "C" fn afs_ieee_scalb_r8(x: f64, i: i32) -> f64 {
-    x * (2.0f64).powi(i)
+    unsafe { c_scalbn(x, i) }
 }
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_scalb_r4(x: f32, i: i32) -> f32 {
-    x * (2.0f32).powi(i)
+    unsafe { c_scalbnf(x, i) }
 }
 
 #[no_mangle]
@@ -957,6 +964,17 @@ mod tests {
         assert!(afs_ieee_next_after_r8(1.0, 0.0) < 1.0);
         assert_eq!(afs_ieee_copy_sign_r8(3.0, -1.0), -3.0);
         assert_eq!(afs_ieee_scalb_r8(1.5, 3), 12.0);
+    }
+
+    #[test]
+    fn scalb_avoids_overflowing_or_underflowing_the_power() {
+        assert_eq!(afs_ieee_scalb_r8(f64::MIN_POSITIVE, 1024), 4.0);
+        assert_eq!(afs_ieee_scalb_r4(f32::MIN_POSITIVE, 128), 4.0);
+        assert_eq!(
+            afs_ieee_scalb_r8(f64::MAX, -1075).to_bits(),
+            0x3cbf_ffff_ffff_ffff
+        );
+        assert_eq!(afs_ieee_scalb_r4(f32::MAX, -150).to_bits(), 0x347f_ffff);
     }
 
     #[test]
