@@ -192,7 +192,8 @@ pub extern "C" fn afs_ieee_unordered_r4(x: f32, y: f32) -> i32 {
 #[no_mangle]
 pub extern "C" fn afs_ieee_value_r8(class: i32) -> f64 {
     match class {
-        IEEE_SIGNALING_NAN | IEEE_QUIET_NAN => f64::from_bits(0x7ff8_0000_0000_0000),
+        IEEE_SIGNALING_NAN => f64::from_bits(0x7ff0_0000_0000_0001),
+        IEEE_QUIET_NAN => f64::from_bits(0x7ff8_0000_0000_0000),
         IEEE_POSITIVE_INF => f64::INFINITY,
         IEEE_NEGATIVE_INF => f64::NEG_INFINITY,
         IEEE_POSITIVE_ZERO => 0.0,
@@ -208,7 +209,8 @@ pub extern "C" fn afs_ieee_value_r8(class: i32) -> f64 {
 #[no_mangle]
 pub extern "C" fn afs_ieee_value_r4(class: i32) -> f32 {
     match class {
-        IEEE_SIGNALING_NAN | IEEE_QUIET_NAN => f32::from_bits(0x7fc0_0000),
+        IEEE_SIGNALING_NAN => f32::from_bits(0x7f80_0001),
+        IEEE_QUIET_NAN => f32::from_bits(0x7fc0_0000),
         IEEE_POSITIVE_INF => f32::INFINITY,
         IEEE_NEGATIVE_INF => f32::NEG_INFINITY,
         IEEE_POSITIVE_ZERO => 0.0,
@@ -890,6 +892,8 @@ mod tests {
     #[test]
     fn value_round_trips_through_class() {
         for c in [
+            IEEE_QUIET_NAN,
+            IEEE_SIGNALING_NAN,
             IEEE_POSITIVE_INF,
             IEEE_NEGATIVE_INF,
             IEEE_POSITIVE_ZERO,
@@ -904,6 +908,11 @@ mod tests {
         }
         assert_eq!(afs_ieee_is_nan_r8(afs_ieee_value_r8(IEEE_QUIET_NAN)), 1);
         assert_eq!(afs_ieee_is_nan_r4(afs_ieee_value_r4(IEEE_QUIET_NAN)), 1);
+        assert_eq!(
+            afs_ieee_value_r8(IEEE_SIGNALING_NAN).to_bits(),
+            0x7ff0_0000_0000_0001
+        );
+        assert_eq!(afs_ieee_value_r4(IEEE_SIGNALING_NAN).to_bits(), 0x7f80_0001);
     }
 
     #[test]
