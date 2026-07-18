@@ -759,6 +759,56 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct ProcessCleanup {
+        pid: Option<u32>,
+    }
+
+    #[cfg(unix)]
+    impl ProcessCleanup {
+        fn new(pid: u32) -> Self {
+            Self { pid: Some(pid) }
+        }
+
+        fn pid(&self) -> u32 {
+            self.pid.expect("process cleanup should still be armed")
+        }
+
+        fn terminate_and_reap(&mut self, timeout: std::time::Duration) -> bool {
+            let Some(pid) = self.pid else {
+                return true;
+            };
+            if !process_exists(pid) {
+                self.pid = None;
+                return true;
+            }
+
+            unsafe {
+                kill(pid as i32, 15);
+            }
+            if wait_for_processes_to_disappear(std::slice::from_ref(&pid), timeout) {
+                self.pid = None;
+                return true;
+            }
+
+            unsafe {
+                kill(pid as i32, 9);
+            }
+            let reaped = wait_for_processes_to_disappear(std::slice::from_ref(&pid), timeout);
+            if reaped {
+                self.pid = None;
+            }
+            reaped
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessCleanup {
+        fn drop(&mut self) {
+            let _ = self.terminate_and_reap(std::time::Duration::from_secs(3));
+        }
+    }
+
+    #[cfg(unix)]
     fn wait_for_pid_files(
         paths: &[std::path::PathBuf],
         timeout: std::time::Duration,
@@ -874,9 +924,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn process_cleanup_reaps_during_unwind() {
+        let blocker = spawn_async_command("while :; do :; done")
+            .expect("long-running asynchronous command should start");
+        let unwind = std::panic::catch_unwind(|| {
+            let _cleanup = ProcessCleanup::new(blocker);
+            panic!("exercise process cleanup during unwind");
+        });
+
+        assert!(unwind.is_err());
+        assert!(
+            !process_exists(blocker),
+            "process cleanup should reap the child during unwind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn asynchronous_commands_are_reaped_without_head_of_line_blocking() {
         let blocker = spawn_async_command("while :; do :; done")
             .expect("long-running asynchronous command should start");
+        let mut blocker = ProcessCleanup::new(blocker);
         let pid_paths = (0..64)
             .map(|index| {
                 std::path::PathBuf::from(format!(
@@ -895,14 +963,8 @@ mod tests {
             .as_ref()
             .map(|pids| wait_for_processes_to_disappear(pids, std::time::Duration::from_secs(3)))
             .unwrap_or(false);
-        let blocker_was_running = process_exists(blocker);
-        unsafe {
-            kill(blocker as i32, 15);
-        }
-        let blocker_reaped = wait_for_processes_to_disappear(
-            std::slice::from_ref(&blocker),
-            std::time::Duration::from_secs(3),
-        );
+        let blocker_was_running = process_exists(blocker.pid());
+        let blocker_reaped = blocker.terminate_and_reap(std::time::Duration::from_secs(3));
         for path in pid_paths {
             let _ = std::fs::remove_file(path);
         }
