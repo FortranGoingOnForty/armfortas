@@ -61,10 +61,17 @@ unsafe fn tokenize_store_int(base: *mut u8, idx: usize, kind: i64, value: i64) {
     }
 }
 
+fn tokenize_int_kind(kind: i64) -> i64 {
+    match kind {
+        1 | 2 | 4 | 8 => kind,
+        _ => 4,
+    }
+}
+
 /// TOKENIZE Form 2: `CALL TOKENIZE(STRING, SET, FIRST, LAST)`. FIRST
-/// and LAST are allocatable rank-1 integer arrays (kind = `int_kind`
-/// bytes); both are allocated to the token count and filled with the
-/// 1-based start/end positions of each token.
+/// and LAST are allocatable rank-1 integer arrays whose kinds may differ;
+/// both are allocated to the token count and filled with the 1-based
+/// start/end positions of each token.
 #[no_mangle]
 pub extern "C" fn afs_tokenize_positions(
     str_ptr: *const u8,
@@ -73,7 +80,8 @@ pub extern "C" fn afs_tokenize_positions(
     set_len: i64,
     first: *mut ArrayDescriptor,
     last: *mut ArrayDescriptor,
-    int_kind: i64,
+    first_kind: i64,
+    last_kind: i64,
 ) {
     if first.is_null() || last.is_null() {
         return;
@@ -82,15 +90,16 @@ pub extern "C" fn afs_tokenize_positions(
     let set = tokenize_slice(set_ptr, set_len);
     let bounds = tokenize_bounds(s, set);
     let n = bounds.len() as i64;
-    let kind = if int_kind <= 0 { 4 } else { int_kind };
+    let first_kind = tokenize_int_kind(first_kind);
+    let last_kind = tokenize_int_kind(last_kind);
     unsafe {
-        tokenize_realloc_1d(first, kind, n);
-        tokenize_realloc_1d(last, kind, n);
+        tokenize_realloc_1d(first, first_kind, n);
+        tokenize_realloc_1d(last, last_kind, n);
         let fbase = (*first).base_addr;
         let lbase = (*last).base_addr;
         for (i, &(start, end)) in bounds.iter().enumerate() {
-            tokenize_store_int(fbase, i, kind, start);
-            tokenize_store_int(lbase, i, kind, end);
+            tokenize_store_int(fbase, i, first_kind, start);
+            tokenize_store_int(lbase, i, last_kind, end);
         }
     }
 }
@@ -207,13 +216,57 @@ mod tests {
         let s = b"a,bb,ccc";
         let mut first = ArrayDescriptor::zeroed();
         let mut last = ArrayDescriptor::zeroed();
-        afs_tokenize_positions(s.as_ptr(), 8, b",".as_ptr(), 1, &mut first, &mut last, 4);
+        afs_tokenize_positions(s.as_ptr(), 8, b",".as_ptr(), 1, &mut first, &mut last, 4, 4);
         assert_eq!(first.dims[0].upper_bound, 3);
         unsafe {
             let f = std::slice::from_raw_parts(first.base_addr as *const i32, 3);
             let l = std::slice::from_raw_parts(last.base_addr as *const i32, 3);
             assert_eq!(f, &[1, 3, 6]);
             assert_eq!(l, &[1, 4, 8]);
+        }
+    }
+
+    unsafe fn tokenize_int_values(desc: &ArrayDescriptor, kind: i64, len: usize) -> Vec<i64> {
+        (0..len)
+            .map(|idx| {
+                let p = desc.base_addr.add(idx * kind as usize);
+                match kind {
+                    1 => *(p as *const i8) as i64,
+                    2 => *(p as *const i16) as i64,
+                    4 => *(p as *const i32) as i64,
+                    8 => *(p as *const i64),
+                    _ => unreachable!(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tokenize_positions_honors_each_result_kind() {
+        for first_kind in [1, 2, 4, 8] {
+            for last_kind in [1, 2, 4, 8] {
+                let mut first = ArrayDescriptor::zeroed();
+                let mut last = ArrayDescriptor::zeroed();
+                afs_tokenize_positions(
+                    b"a,b".as_ptr(),
+                    3,
+                    b",".as_ptr(),
+                    1,
+                    &mut first,
+                    &mut last,
+                    first_kind,
+                    last_kind,
+                );
+
+                assert_eq!(first.elem_size, first_kind);
+                assert_eq!(last.elem_size, last_kind);
+                unsafe {
+                    assert_eq!(tokenize_int_values(&first, first_kind, 2), [1, 3]);
+                    assert_eq!(tokenize_int_values(&last, last_kind, 2), [1, 3]);
+                    crate::array::afs_deallocate_array(&mut first, ptr::null_mut());
+                    crate::array::afs_deallocate_array(&mut last, ptr::null_mut());
+                }
+            }
         }
     }
 
