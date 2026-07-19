@@ -523,6 +523,64 @@ fn arm64_macho_cross_target_compiles_to_object() {
 }
 
 #[test]
+fn arm64_fused_multiply_subtract_compiles_to_object() {
+    let armfortas = binary("armfortas");
+    let dir = unique_dir("arm64_fused_multiply_subtract");
+    let source = workspace_root().join("test_programs/fma_peephole.f90");
+    let assembly = dir.join("fma_peephole.s");
+    let object = dir.join("fma_peephole.o");
+
+    let emit_assembly = run_command(
+        Command::new(&armfortas)
+            .env_remove("AFS_AS_PATH")
+            .env_remove("AFS_AS")
+            .args(["--target", "arm64-macos", "-Ofast", "-S"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&assembly),
+        "ARM64 fused multiply-subtract assembly emission",
+    );
+    assert_success(
+        &emit_assembly,
+        "ARM64 fused multiply-subtract assembly emission",
+    );
+    let assembly_text = fs::read_to_string(&assembly).expect("read ARM64 assembly output");
+    for mnemonic in ["fmsub", "fnmsub"] {
+        assert!(
+            assembly_text.contains(&format!("    {mnemonic} ")),
+            "ARM64 compiler output omitted {mnemonic}:\n{assembly_text}"
+        );
+    }
+
+    let compile = run_command(
+        Command::new(&armfortas)
+            .env_remove("AFS_AS_PATH")
+            .env_remove("AFS_AS")
+            .args(["--target", "arm64-macos", "-Ofast", "-c"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object),
+        "ARM64 fused multiply-subtract object emission",
+    );
+    assert_success(&compile, "ARM64 fused multiply-subtract object emission");
+
+    let bytes = fs::read(&object).expect("ARM64 fused compile omitted object");
+    assert!(bytes.len() >= 8, "Mach-O object header is truncated");
+    assert_eq!(
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        0xfeed_facf,
+        "fused ARM64 output is not a 64-bit Mach-O object"
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        0x0100_000c,
+        "fused ARM64 output is not ARM64"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
     let cases = [
         ("arithmetic.f90", "30"),
