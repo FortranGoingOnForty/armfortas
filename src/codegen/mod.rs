@@ -138,6 +138,7 @@ main:
                     prog.name
                 ));
             }
+            text.push_str(".section .note.GNU-stack,\"\",@progbits\n");
             Ok(text)
         }
     }
@@ -145,8 +146,10 @@ main:
 
 #[cfg(test)]
 mod tests {
-    use super::x86_use_linear_scan;
-    use crate::driver::OptLevel;
+    use super::{emit_module, x86_use_linear_scan};
+    use crate::driver::{OptLevel, Options};
+    use crate::ir::inst::Module;
+    use crate::target::{TargetLayout, TargetSpec};
 
     /// The x86 backend must use linear-scan at EVERY opt level (the naive
     /// spill-everything allocator overflows the stack on deep recursion).
@@ -171,5 +174,17 @@ mod tests {
                 "ARMFORTAS_USE_NAIVE_REGALLOC must force naive at {opt:?}"
             );
         }
+    }
+
+    #[test]
+    fn x86_modules_request_a_non_executable_stack() {
+        let target = TargetSpec::parse("x86_64-linux-gnu").unwrap();
+        let module = Module::new("empty".into(), TargetLayout::of(&target));
+        let opts = Options {
+            target,
+            ..Options::default()
+        };
+        let asm = emit_module(&module, &opts).unwrap();
+        assert!(asm.ends_with(".section .note.GNU-stack,\"\",@progbits\n"));
     }
 }
