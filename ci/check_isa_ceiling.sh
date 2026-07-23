@@ -6,38 +6,22 @@
 # an LLVM/gcc lowering that happens to use SSE3+/SSE4.1/AVX
 # (pmulld, blendvps, haddps, ptest, v-prefixed VEX forms): system
 # `as` accepts them silently and the binary then faults on baseline
-# hardware. Compiles every test_programs/*.f90 with -S at -O3 and
-# -Ofast and greps for mnemonics above the ceiling.
+# hardware. Compiles every non-diagnostic test_programs/*.f90 with its
+# declared FLAGS at -O3 and -Ofast and greps for mnemonics above the
+# ceiling. Compiler failures, missing assembly, scanner errors, and corpus
+# count drift are all gate failures.
 #
 # Usage: ci/check_isa_ceiling.sh [path-to-armfortas]
 set -eu
 
-afs="${1:-${CARGO_TARGET_DIR:-target}/debug/armfortas}"
-if [ ! -x "$afs" ]; then
-    echo "check_isa_ceiling: compiler not found at $afs" >&2
-    exit 2
-fi
+isa_gate_name=check_isa_ceiling
+isa_gate_levels="-O3 -Ofast"
+isa_gate_level_label="-O3 and -Ofast"
+isa_gate_hit_label="above-SSE2 mnemonic"
 
-tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+isa_gate_scan() {
+    grep -nE '^\s*(v[a-z0-9]+\s|pmulld|pminsd|pmaxsd|pminud|pmaxud|pabsd|pabsw|pabsb|blendv|pblendw|ptest|haddps|haddpd|hsubps|hsubpd|movddup|movshdup|movsldup|lddqu|pshufb|palignr|pmuldq|pcmpgtq|roundps|roundpd|dpps|dppd|insertps|extractps)' "$1"
+}
 
-hits=0
-checked=0
-for lvl in -O3 -Ofast; do
-    for f in test_programs/*.f90; do
-        b=$(basename "$f" .f90)
-        out="$tmpdir/$b$lvl.s"
-        "$afs" -S "$lvl" "$f" -o "$out" 2>/dev/null || continue
-        checked=$((checked + 1))
-        if grep -nE '^\s*(v[a-z0-9]+\s|pmulld|pminsd|pmaxsd|pminud|pmaxud|pabsd|pabsw|pabsb|blendv|pblendw|ptest|haddps|haddpd|hsubps|hsubpd|movddup|movshdup|movsldup|lddqu|pshufb|palignr|pmuldq|pcmpgtq|roundps|roundpd|dpps|dppd|insertps|extractps)' "$out"; then
-            echo "check_isa_ceiling: above-SSE2 mnemonic in $b at $lvl" >&2
-            hits=$((hits + 1))
-        fi
-    done
-done
-
-if [ "$hits" -ne 0 ]; then
-    echo "check_isa_ceiling: $hits file(s) exceed the SSE2 baseline" >&2
-    exit 1
-fi
-echo "check_isa_ceiling: clean ($checked compilations, -O3 and -Ofast)"
+. "$(dirname "$0")/isa_gate_common.sh"
+isa_gate_run "$@"
