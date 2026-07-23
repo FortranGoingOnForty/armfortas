@@ -18,8 +18,27 @@ const REQUIRED_SUITES: &[RequiredSuite] = &[
     RequiredSuite {
         job: "test-afs-as",
         name: "complete afs-as suite",
-        command: "cargo test -p afs-as --all-targets -- --nocapture",
+        command: "ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture",
     },
+];
+
+const AFS_AS_REQUIRED_CONTROLS: &[(&str, &str)] = &[
+    (
+        "pinned Apple-arm64 runner",
+        "- os: macos-15\nhost_os: Darwin\nhost_arch: arm64\nskip_profile: macos-arm64",
+    ),
+    (
+        "pinned Linux-x86_64 runner",
+        "- os: ubuntu-latest\nhost_os: Linux\nhost_arch: x86_64\nskip_profile: linux-x86_64",
+    ),
+    (
+        "runtime host assertion",
+        r#"ci/assert_host.sh "${{ matrix.host_os }}" "${{ matrix.host_arch }}""#,
+    ),
+    (
+        "assembler platform-skip gate",
+        r#"ci/check_afs_as_skips.sh /tmp/afs-as-tests.log "${{ matrix.skip_profile }}""#,
+    ),
 ];
 
 fn workflow_run_commands(workflow: &str) -> Vec<(&str, &str)> {
@@ -39,12 +58,38 @@ fn workflow_run_commands(workflow: &str) -> Vec<(&str, &str)> {
     commands
 }
 
+fn workflow_job(workflow: &str, required_job: &str) -> String {
+    let mut current_job = None;
+    let mut lines = Vec::new();
+
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        let indentation = line.len() - line.trim_start().len();
+        if indentation == 2 && trimmed.ends_with(':') {
+            current_job = Some(trimmed.trim_end_matches(':'));
+        } else if current_job == Some(required_job) {
+            lines.push(trimmed);
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn missing_required_suites(workflow: &str) -> Vec<&'static str> {
     let commands = workflow_run_commands(workflow);
     REQUIRED_SUITES
         .iter()
         .filter(|suite| !commands.contains(&(suite.job, suite.command)))
         .map(|suite| suite.name)
+        .collect()
+}
+
+fn missing_afs_as_controls(workflow: &str) -> Vec<&'static str> {
+    let job = workflow_job(workflow, "test-afs-as");
+    AFS_AS_REQUIRED_CONTROLS
+        .iter()
+        .filter(|(_, required)| !job.contains(required))
+        .map(|(name, _)| *name)
         .collect()
 }
 
@@ -76,5 +121,35 @@ fn policy_check_rejects_each_omitted_suite() {
     for suite in REQUIRED_SUITES {
         let incomplete = complete.replacen(&format!("      - run: {}\n", suite.command), "", 1);
         assert_eq!(missing_required_suites(&incomplete), vec![suite.name]);
+    }
+}
+
+#[test]
+fn afs_as_ci_exposes_and_rejects_platform_skips() {
+    let missing = missing_afs_as_controls(WORKFLOW);
+    assert!(
+        missing.is_empty(),
+        "{} does not enforce afs-as platform coverage: {}",
+        Path::new(".github/workflows/ci.yml").display(),
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn policy_check_rejects_each_missing_afs_as_control() {
+    let complete = format!(
+        "jobs:\n  test-afs-as:\n    {}\n",
+        AFS_AS_REQUIRED_CONTROLS
+            .iter()
+            .map(|(_, required)| required.replace('\n', "\n    "))
+            .collect::<Vec<_>>()
+            .join("\n    ")
+    );
+    assert!(missing_afs_as_controls(&complete).is_empty());
+
+    for (name, required) in AFS_AS_REQUIRED_CONTROLS {
+        let rendered = required.replace('\n', "\n    ");
+        let incomplete = complete.replacen(&rendered, "", 1);
+        assert_eq!(missing_afs_as_controls(&incomplete), vec![*name]);
     }
 }

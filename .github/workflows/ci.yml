@@ -138,7 +138,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        include:
+          # Explicit Apple Silicon label: macos-latest is a migrating alias.
+          - os: macos-15
+            host_os: Darwin
+            host_arch: arm64
+            skip_profile: macos-arm64
+          - os: ubuntu-latest
+            host_os: Linux
+            host_arch: x86_64
+            skip_profile: linux-x86_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -146,7 +155,9 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --all-targets -- --nocapture
+      - run: ci/assert_host.sh "${{ matrix.host_os }}" "${{ matrix.host_arch }}"
+      - run: ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture
+      - run: ci/check_afs_as_skips.sh /tmp/afs-as-tests.log "${{ matrix.skip_profile }}"
 
   test-afs-ld:
     name: "Tests: afs-ld full suite (${{ matrix.os }})"
