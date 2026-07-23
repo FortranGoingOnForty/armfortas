@@ -41,6 +41,17 @@ const AFS_AS_REQUIRED_CONTROLS: &[(&str, &str)] = &[
     ),
 ];
 
+const AFS_LD_REQUIRED_INPUTS: &[(&str, &str)] = &[
+    ("afs-ld submodule pointer", "afs-ld"),
+    ("afs-ld source paths", "afs-ld/**"),
+    ("afs-as submodule pointer", "afs-as"),
+    ("afs-as source paths", "afs-as/**"),
+    ("runtime package", "runtime/**"),
+    ("workspace manifest", "Cargo.toml"),
+    ("workspace lockfile", "Cargo.lock"),
+    ("workflow definition", ".github/workflows/ci.yml"),
+];
+
 fn workflow_run_commands(workflow: &str) -> Vec<(&str, &str)> {
     let mut current_job = None;
     let mut commands = Vec::new();
@@ -89,6 +100,37 @@ fn missing_afs_as_controls(workflow: &str) -> Vec<&'static str> {
     AFS_AS_REQUIRED_CONTROLS
         .iter()
         .filter(|(_, required)| !job.contains(required))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+fn workflow_filter_paths<'a>(workflow: &'a str, required_filter: &str) -> Vec<&'a str> {
+    let mut current_filter = None;
+    let mut paths = Vec::new();
+
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        let indentation = line.len() - line.trim_start().len();
+        if indentation == 12 && trimmed.ends_with(':') {
+            current_filter = Some(trimmed.trim_end_matches(':'));
+        } else if current_filter == Some(required_filter) && indentation == 14 {
+            if let Some(path) = trimmed
+                .strip_prefix("- '")
+                .and_then(|path| path.strip_suffix('\''))
+            {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths
+}
+
+fn missing_afs_ld_inputs(workflow: &str) -> Vec<&'static str> {
+    let paths = workflow_filter_paths(workflow, "afs_ld");
+    AFS_LD_REQUIRED_INPUTS
+        .iter()
+        .filter(|(_, required)| !paths.contains(required))
         .map(|(name, _)| *name)
         .collect()
 }
@@ -151,5 +193,34 @@ fn policy_check_rejects_each_missing_afs_as_control() {
         let rendered = required.replace('\n', "\n    ");
         let incomplete = complete.replacen(&rendered, "", 1);
         assert_eq!(missing_afs_as_controls(&incomplete), vec![*name]);
+    }
+}
+
+#[test]
+fn afs_ld_ci_tracks_every_built_or_consumed_input() {
+    let missing = missing_afs_ld_inputs(WORKFLOW);
+    assert!(
+        missing.is_empty(),
+        "{} does not rerun afs-ld compatibility tests for changes to: {}",
+        Path::new(".github/workflows/ci.yml").display(),
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn policy_check_rejects_each_missing_afs_ld_input() {
+    let complete = format!(
+        "jobs:\n  changes:\n    steps:\n      - with:\n          filters: |\n            afs_ld:\n{}\n",
+        AFS_LD_REQUIRED_INPUTS
+            .iter()
+            .map(|(_, path)| format!("              - '{path}'"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(missing_afs_ld_inputs(&complete).is_empty());
+
+    for (name, path) in AFS_LD_REQUIRED_INPUTS {
+        let incomplete = complete.replacen(&format!("              - '{path}'\n"), "", 1);
+        assert_eq!(missing_afs_ld_inputs(&incomplete), vec![*name]);
     }
 }

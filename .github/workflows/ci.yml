@@ -13,13 +13,11 @@ env:
   CARGO_TARGET_DIR: .cargo-target
 
 jobs:
-  # Detect whether a change can affect the afs-as assembler suite. afs-as
-  # is a standalone workspace crate (`cargo test -p afs-as`) that does not
-  # depend on the armfortas compiler crate, so an armfortas-only PR cannot
-  # break it. Gate its complete macOS/Linux suite on paths that actually
-  # reach afs-as: the submodule itself, the workspace manifest/lockfile
-  # (shared deps), and this workflow. Skipped required jobs count as passing
-  # for branch protection.
+  # Detect whether a change can affect either path-gated standalone suite.
+  # afs-as is independent of the armfortas compiler crate. The afs-ld matrix,
+  # however, builds and consumes both afs-as and armfortas-rt, so its filter
+  # must include those transitive inputs as well as the linker itself.
+  # Skipped required jobs count as passing for branch protection.
   changes:
     name: "Detect changed paths"
     runs-on: ubuntu-latest
@@ -41,6 +39,9 @@ jobs:
             afs_ld:
               - 'afs-ld'
               - 'afs-ld/**'
+              - 'afs-as'
+              - 'afs-as/**'
+              - 'runtime/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
