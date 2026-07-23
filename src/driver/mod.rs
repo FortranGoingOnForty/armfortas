@@ -18,7 +18,10 @@ use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
 use crate::parser::Parser;
-use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
+use crate::runtime::artifact::{
+    fresh_runtime_lib, materialize_bundled_runtime, runtime_lib_candidate, RuntimeArchive,
+    RuntimeProfile,
+};
 use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
@@ -1294,6 +1297,13 @@ fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
 /// Execute a fully parsed CLI job, dispatching between source
 /// compilation and pure link steps based on the positional inputs.
 pub fn execute(opts: &Options) -> Result<(), String> {
+    execute_with_bundled_runtime(opts, None)
+}
+
+pub(crate) fn execute_with_bundled_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     let inputs = all_input_paths(opts);
     if let Some(input) = inputs
         .iter()
@@ -1311,9 +1321,9 @@ pub fn execute(opts: &Options) -> Result<(), String> {
     match (has_source, has_link_artifact) {
         (true, false) => {
             if opts.extra_inputs.is_empty() {
-                compile(opts)
+                compile_with_bundled_runtime(opts, bundled_runtime)
             } else {
-                compile_multi(opts)
+                compile_multi_with_bundled_runtime(opts, bundled_runtime)
             }
         }
         (false, true) => {
@@ -1322,13 +1332,13 @@ pub fn execute(opts: &Options) -> Result<(), String> {
                 .output
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("a.out"));
-            link_inputs(&inputs, &output, opts)
+            link_inputs(&inputs, &output, opts, bundled_runtime)
         }
         // Mixed `foo.f90 bar.o libbaz.a -o prog`: gfortran/flang accept it:
         // compile the sources, then link the resulting objects together with
         // the prebuilt artifacts (in command order). compile_multi handles the
         // partition.
-        (true, true) => compile_multi(opts),
+        (true, true) => compile_multi_with_bundled_runtime(opts, bundled_runtime),
         (false, false) => unreachable!("parse_cli guarantees at least one input"),
     }
 }
@@ -1513,6 +1523,13 @@ fn module_source_provenance(input: &Path) -> String {
 }
 
 pub fn compile(opts: &Options) -> Result<(), String> {
+    compile_with_bundled_runtime(opts, None)
+}
+
+fn compile_with_bundled_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
         eprintln!("{}", version_string());
@@ -2110,7 +2127,12 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         let binary_path = opts.output_path();
         let phase = phases.start("link");
-        let result = link_inputs(std::slice::from_ref(&obj_path), &binary_path, opts);
+        let result = link_inputs(
+            std::slice::from_ref(&obj_path),
+            &binary_path,
+            opts,
+            bundled_runtime,
+        );
         phase.end(&mut phases);
         result?;
         if opts.verbose {
@@ -2159,7 +2181,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 11. Link.
     let binary_path = opts.output_path();
     let phase = phases.start("link");
-    link(&obj_path, &binary_path, opts)?;
+    link(&obj_path, &binary_path, opts, bundled_runtime)?;
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" linked: {}", binary_path.display());
@@ -2265,8 +2287,13 @@ fn escape_make_dep_token(token: &str) -> String {
 /// Link an object file with the runtime library to produce a binary.
 /// `opts` contributes the user-supplied `-L`, `-l`, `-rpath`,
 /// `-shared`, and `-static` flags that need to make it through to the linker.
-fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
-    link_inputs(&[obj.to_path_buf()], output, opts)
+fn link(
+    obj: &Path,
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
+    link_inputs(&[obj.to_path_buf()], output, opts, bundled_runtime)
 }
 
 /// Link prebuilt objects and archives with the runtime to produce a
@@ -2280,6 +2307,15 @@ pub(crate) fn link_inputs_elf(
     inputs: &[PathBuf],
     output: &Path,
     opts: &Options,
+) -> Result<(), String> {
+    link_inputs_elf_with_bundled_runtime(inputs, output, opts, None)
+}
+
+fn link_inputs_elf_with_bundled_runtime(
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
 ) -> Result<(), String> {
     let host = crate::target::TargetSpec::host();
     if host.arch != opts.target.arch
@@ -2313,7 +2349,7 @@ pub(crate) fn link_inputs_elf(
         override_dirs.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
     let crt = elf_crt::find_crt(&opts.target, &override_dirs, pie)?;
-    let rt_path = find_runtime_lib()?;
+    let runtime = find_runtime_lib(bundled_runtime)?;
     // LIBRARY_PATH: the cc-compatible -L env knob. On NixOS libgcc_s
     // lives in a third store path (gcc's -libgcc output) that no crt
     // root covers.
@@ -2325,7 +2361,7 @@ pub(crate) fn link_inputs_elf(
         &opts.target,
         &crt,
         inputs,
-        Path::new(&rt_path),
+        runtime.path(),
         output,
         pie,
         &lib_paths,
@@ -2352,15 +2388,20 @@ pub(crate) fn link_inputs_elf(
     Ok(())
 }
 
-fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+fn link_inputs(
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
-        return link_inputs_elf(inputs, output, opts);
+        return link_inputs_elf_with_bundled_runtime(inputs, output, opts, bundled_runtime);
     }
     if let Some(linker) = afs_ld_override() {
-        return link_inputs_with_afs_ld(&linker, inputs, output, opts);
+        return link_inputs_with_afs_ld(&linker, inputs, output, opts, bundled_runtime);
     }
 
-    let rt_path = find_runtime_lib()?;
+    let runtime = find_runtime_lib(bundled_runtime)?;
     let sdk = Command::new("xcrun")
         .args(["--show-sdk-path"])
         .output()
@@ -2372,7 +2413,7 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
         args.push(input.to_string_lossy().into_owned());
     }
     args.extend([
-        rt_path,
+        runtime.path().to_string_lossy().into_owned(),
         "-lSystem".into(),
         "-syslibroot".into(),
         sysroot,
@@ -2408,12 +2449,13 @@ fn link_inputs_with_afs_ld(
     inputs: &[PathBuf],
     output: &Path,
     opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
 ) -> Result<(), String> {
     if opts.static_link {
         return Err("AFS_LD override does not yet support static-link mode".into());
     }
 
-    let rt_path = find_runtime_lib()?;
+    let runtime = find_runtime_lib(bundled_runtime)?;
     let libsystem_tbd = find_libsystem_tbd()?;
     let mut args: Vec<String> = vec!["-arch".into(), "arm64".into()];
     if opts.shared {
@@ -2425,7 +2467,7 @@ fn link_inputs_with_afs_ld(
     for input in inputs {
         args.push(input.to_string_lossy().into_owned());
     }
-    args.push(rt_path);
+    args.push(runtime.path().to_string_lossy().into_owned());
     args.push(libsystem_tbd);
     push_afs_ld_link_flags(&mut args, opts);
 
@@ -2551,8 +2593,13 @@ fn env_override(name: &str) -> Option<String> {
 }
 
 /// Link multiple object files with the runtime to produce a binary.
-fn link_multi(objs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
-    link_inputs(objs, output, opts)
+fn link_multi(
+    objs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
+    link_inputs(objs, output, opts, bundled_runtime)
 }
 
 /// Compile multiple Fortran source files with automatic dependency
@@ -2563,6 +2610,13 @@ fn link_multi(objs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), Str
 /// 3. Compile each in order to a temp .o + .amod.
 /// 4. Link all .o files into the output binary.
 pub fn compile_multi(opts: &Options) -> Result<(), String> {
+    compile_multi_with_bundled_runtime(opts, None)
+}
+
+fn compile_multi_with_bundled_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     let mut all_inputs = vec![opts.input.clone()];
     all_inputs.extend(opts.extra_inputs.iter().cloned());
 
@@ -2637,7 +2691,7 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
             }
             paths
         };
-        compile(&sub_opts)?;
+        compile_with_bundled_runtime(&sub_opts, bundled_runtime)?;
         if !opts.emit_obj {
             object_files.push(obj_path.clone());
             src_to_obj.push((src.clone(), obj_path));
@@ -2675,7 +2729,7 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"));
-    link_multi(&link_list, &output, opts)?;
+    link_multi(&link_list, &output, opts, bundled_runtime)?;
 
     // Cleanup.
     if let Some(tmp_dir) = tmp_dir {
@@ -2686,7 +2740,7 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
 }
 
 /// Find libarmfortas_rt.a in common locations.
-fn find_runtime_lib() -> Result<String, String> {
+fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArchive, String> {
     // 1. $AFS_RUNTIME_PATH — the explicit override.  Accepts either
     //    a directory containing libarmfortas_rt.a or the archive
     //    path directly.
@@ -2695,10 +2749,10 @@ fn find_runtime_lib() -> Result<String, String> {
         if p.is_dir() {
             let candidate = p.join("libarmfortas_rt.a");
             if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
+                return Ok(RuntimeArchive::external(candidate));
             }
         } else if p.exists() {
-            return Ok(env_path);
+            return Ok(RuntimeArchive::external(p));
         }
     }
 
@@ -2706,12 +2760,12 @@ fn find_runtime_lib() -> Result<String, String> {
     if let Some(workspace_root) = find_workspace_root() {
         let profile = RuntimeProfile::current();
         if let Some(candidate) = fresh_runtime_lib(&workspace_root, profile) {
-            return Ok(candidate.to_string_lossy().into_owned());
+            return Ok(RuntimeArchive::external(candidate));
         }
         maybe_refresh_runtime_lib(&workspace_root, profile)?;
         let candidate = runtime_lib_candidate(&workspace_root, profile);
         if candidate.exists() {
-            return Ok(candidate.to_string_lossy().into_owned());
+            return Ok(RuntimeArchive::external(candidate));
         }
     }
 
@@ -2728,25 +2782,34 @@ fn find_runtime_lib() -> Result<String, String> {
         ];
         for candidate in &candidates {
             if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
+                return Ok(RuntimeArchive::external(candidate.clone()));
             }
         }
     }
 
-    // 4. Standard install locations.
+    // 4. Runtime carried by the compiler binary. Cargo installs executable
+    //    targets but has no data-file installation hook, so installed
+    //    armfortas/afs binaries materialize their target-matched archive into
+    //    a private temporary directory for the duration of the linker call.
+    //    Prefer this exact-match runtime over a potentially stale global one.
+    if let Some(bytes) = bundled_runtime {
+        return materialize_bundled_runtime(bytes);
+    }
+
+    // 5. Standard install locations.
     for fixed in &[
         "/usr/local/lib/libarmfortas_rt.a",
         "/usr/local/lib/armfortas/libarmfortas_rt.a",
         "/opt/homebrew/lib/libarmfortas_rt.a",
     ] {
         if Path::new(fixed).exists() {
-            return Ok((*fixed).to_string());
+            return Ok(RuntimeArchive::external(PathBuf::from(fixed)));
         }
     }
 
     Err("cannot find libarmfortas_rt.a. Searched: \
          $AFS_RUNTIME_PATH, cargo workspace, next to the compiler \
-         binary, and /usr/local/lib. Build with \
+         binary, the compiler's bundled runtime, and /usr/local/lib. Build with \
          'cargo build -p armfortas-rt' or set AFS_RUNTIME_PATH."
         .into())
 }

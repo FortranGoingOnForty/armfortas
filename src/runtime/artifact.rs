@@ -1,7 +1,103 @@
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+static NEXT_BUNDLED_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct RuntimeArchive {
+    path: PathBuf,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl RuntimeArchive {
+    pub(crate) fn external(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup_dir: None,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RuntimeArchive {
+    fn drop(&mut self) {
+        let Some(dir) = self.cleanup_dir.as_ref() else {
+            return;
+        };
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+pub(crate) fn materialize_bundled_runtime(bytes: &[u8]) -> Result<RuntimeArchive, String> {
+    if !bytes.starts_with(b"!<arch>\n") {
+        return Err("bundled libarmfortas_rt.a is not a valid archive".into());
+    }
+
+    let base = std::env::temp_dir();
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for _ in 0..128 {
+        let id = NEXT_BUNDLED_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!(
+            "armfortas-runtime-{}-{timestamp}-{id}",
+            std::process::id()
+        ));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "cannot create bundled runtime directory '{}': {err}",
+                    dir.display()
+                ));
+            }
+        }
+
+        let path = dir.join("libarmfortas_rt.a");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = options
+            .open(&path)
+            .and_then(|mut file| file.write_all(bytes));
+        if let Err(err) = result {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(&dir);
+            return Err(format!(
+                "cannot write bundled runtime archive '{}': {err}",
+                path.display()
+            ));
+        }
+        return Ok(RuntimeArchive {
+            path,
+            cleanup_dir: Some(dir),
+        });
+    }
+
+    Err(format!(
+        "cannot create a unique bundled runtime directory under '{}'",
+        base.display()
+    ))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeProfile {
@@ -176,5 +272,39 @@ mod tests {
             cargo_target_dir_from(root, Some(OsStr::new("/tmp/armfortas-target"))),
             PathBuf::from("/tmp/armfortas-target")
         );
+    }
+
+    #[test]
+    fn bundled_runtime_is_private_and_removed_with_its_guard() {
+        let archive = b"!<arch>\ncontained runtime bytes";
+        let guard = materialize_bundled_runtime(archive).expect("materialize runtime");
+        let path = guard.path().to_path_buf();
+        let dir = path.parent().expect("runtime has parent").to_path_buf();
+
+        assert_eq!(fs::read(&path).unwrap(), archive);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        drop(guard);
+        assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn bundled_runtime_rejects_non_archive_bytes() {
+        let err = materialize_bundled_runtime(b"not an archive")
+            .err()
+            .expect("invalid bytes must fail");
+        assert!(err.contains("not a valid archive"), "{err}");
     }
 }
