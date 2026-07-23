@@ -7,9 +7,10 @@
 # (pmulld, blendvps, haddps, ptest, v-prefixed VEX forms): system
 # `as` accepts them silently and the binary then faults on baseline
 # hardware. Compiles every non-diagnostic test_programs/*.f90 with its
-# declared FLAGS at -O3 and -Ofast and greps for mnemonics above the
-# ceiling. Compiler failures, missing assembly, scanner errors, and corpus
-# count drift are all gate failures.
+# declared FLAGS at -O3 and -Ofast and validates every emitted instruction
+# against the ceiling. GNU as is the instruction-set oracle, avoiding an
+# open-ended mnemonic denylist. Compiler failures, missing assembly,
+# policy-checker errors, and corpus count drift are all gate failures.
 #
 # Usage: ci/check_isa_ceiling.sh [path-to-armfortas]
 set -eu
@@ -18,10 +19,11 @@ isa_gate_name=check_isa_ceiling
 isa_gate_levels="-O3 -Ofast"
 isa_gate_level_label="-O3 and -Ofast"
 isa_gate_hit_label="above-SSE2 mnemonic"
-
-isa_gate_scan() {
-    grep -nE '^\s*(v[a-z0-9]+\s|pmulld|pminsd|pmaxsd|pminud|pmaxud|pabsd|pabsw|pabsb|blendv|pblendw|ptest|haddps|haddpd|hsubps|hsubpd|movddup|movshdup|movsldup|lddqu|pshufb|palignr|pmuldq|pcmpgtq|roundps|roundpd|dpps|dppd|insertps|extractps)' "$1"
-}
+isa_gate_scanner="${AS:-as}"
+isa_gate_arch_prelude='.arch generic64
+.arch .sse2'
+isa_gate_allowed_probe='movsd %xmm0, %xmm1'
+isa_gate_forbidden_probe='addsubps %xmm0, %xmm1'
 
 . "$(dirname "$0")/isa_gate_common.sh"
 isa_gate_run "$@"

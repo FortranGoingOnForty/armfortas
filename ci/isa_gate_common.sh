@@ -6,6 +6,26 @@
 isa_gate_expected_sources=812
 isa_gate_expected_diagnostics=117
 
+isa_gate_validate_assembly() {
+    if grep -nE '^[[:space:]]*\.arch([[:space:]]|$)' "$1"; then
+        echo "$isa_gate_name: generated assembly may not override the gate architecture" >&2
+        return 1
+    else
+        isa_gate_grep_status=$?
+        if [ "$isa_gate_grep_status" -ne 1 ]; then
+            return "$isa_gate_grep_status"
+        fi
+    fi
+
+    if printf '%s\n' "$isa_gate_arch_prelude" |
+        "$isa_gate_scanner" --64 -o "$1.isa-gate.o" - "$1"; then
+        return 0
+    else
+        isa_gate_scanner_status=$?
+        return "$isa_gate_scanner_status"
+    fi
+}
+
 isa_gate_run() {
     if [ "$#" -gt 1 ]; then
         echo "$isa_gate_name: usage: $0 [path-to-armfortas]" >&2
@@ -15,6 +35,10 @@ isa_gate_run() {
     isa_gate_compiler="${1:-${CARGO_TARGET_DIR:-target}/debug/armfortas}"
     if [ ! -x "$isa_gate_compiler" ]; then
         echo "$isa_gate_name: compiler not found at $isa_gate_compiler" >&2
+        return 2
+    fi
+    if ! command -v "$isa_gate_scanner" >/dev/null 2>&1; then
+        echo "$isa_gate_name: policy checker not found: $isa_gate_scanner" >&2
         return 2
     fi
 
@@ -35,6 +59,34 @@ isa_gate_run() {
     isa_gate_tmpdir=$(mktemp -d)
     trap 'rm -rf "$isa_gate_tmpdir"' EXIT
     trap 'exit 2' HUP INT TERM
+
+    isa_gate_allowed_path="$isa_gate_tmpdir/allowed-probe.s"
+    printf '.text\n%s\nret\n' "$isa_gate_allowed_probe" >"$isa_gate_allowed_path"
+    if ! isa_gate_validate_assembly "$isa_gate_allowed_path" \
+        >"$isa_gate_tmpdir/allowed-probe.stdout" \
+        2>"$isa_gate_tmpdir/allowed-probe.stderr"; then
+        echo "$isa_gate_name: policy checker rejected its allowed-instruction control" >&2
+        sed -n '1,20{s/^/  /;p;}' "$isa_gate_tmpdir/allowed-probe.stdout" >&2
+        sed -n '1,20{s/^/  /;p;}' "$isa_gate_tmpdir/allowed-probe.stderr" >&2
+        return 2
+    fi
+
+    isa_gate_forbidden_path="$isa_gate_tmpdir/forbidden-probe.s"
+    printf '.text\n%s\nret\n' "$isa_gate_forbidden_probe" >"$isa_gate_forbidden_path"
+    if isa_gate_validate_assembly "$isa_gate_forbidden_path" \
+        >"$isa_gate_tmpdir/forbidden-probe.stdout" \
+        2>"$isa_gate_tmpdir/forbidden-probe.stderr"; then
+        echo "$isa_gate_name: policy checker accepted its forbidden-instruction control" >&2
+        return 2
+    else
+        isa_gate_probe_status=$?
+        if [ "$isa_gate_probe_status" -ne 1 ]; then
+            echo "$isa_gate_name: forbidden-instruction control failed unexpectedly (exit $isa_gate_probe_status)" >&2
+            sed -n '1,20{s/^/  /;p;}' "$isa_gate_tmpdir/forbidden-probe.stdout" >&2
+            sed -n '1,20{s/^/  /;p;}' "$isa_gate_tmpdir/forbidden-probe.stderr" >&2
+            return 2
+        fi
+    fi
 
     isa_gate_levels_count=0
     for isa_gate_level in $isa_gate_levels; do
@@ -113,13 +165,15 @@ isa_gate_run() {
             fi
 
             isa_gate_checked=$((isa_gate_checked + 1))
-            if isa_gate_scan "$isa_gate_out" >&2; then
-                echo "$isa_gate_name: $isa_gate_hit_label in $isa_gate_base at $isa_gate_level" >&2
-                isa_gate_hits=$((isa_gate_hits + 1))
+            if isa_gate_validate_assembly "$isa_gate_out" >&2; then
+                :
             else
                 isa_gate_scan_status=$?
-                if [ "$isa_gate_scan_status" -ne 1 ]; then
-                    echo "$isa_gate_name: scanner failed for $isa_gate_base at $isa_gate_level (exit $isa_gate_scan_status)" >&2
+                if [ "$isa_gate_scan_status" -eq 1 ]; then
+                    echo "$isa_gate_name: $isa_gate_hit_label in $isa_gate_base at $isa_gate_level" >&2
+                    isa_gate_hits=$((isa_gate_hits + 1))
+                else
+                    echo "$isa_gate_name: policy checker failed for $isa_gate_base at $isa_gate_level (exit $isa_gate_scan_status)" >&2
                     isa_gate_scan_failures=$((isa_gate_scan_failures + 1))
                 fi
             fi
