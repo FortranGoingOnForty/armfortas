@@ -393,8 +393,23 @@ pub struct RunCapture {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-/// Capture the requested stages for one source file.
+/// Capture the requested stages for one source file without external module
+/// search paths.
 pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, CaptureFailure> {
+    capture_from_path_with_module_search_paths(request, &[])
+}
+
+/// Capture the requested stages for one source file while resolving module
+/// interfaces from the supplied search paths.
+///
+/// This is the testing equivalent of the driver's `-I` surface. It lets
+/// project harnesses capture a translation unit after its dependencies have
+/// produced real `.amod` artifacts, instead of concatenating independent
+/// sources into a synthetic file.
+pub fn capture_from_path_with_module_search_paths(
+    request: &CaptureRequest,
+    module_search_paths: &[PathBuf],
+) -> Result<CaptureResult, CaptureFailure> {
     let mut stages = BTreeMap::new();
     let wants = |stage| request.requested.contains(&stage);
     let needs_backend = request.requested.iter().any(|stage| {
@@ -417,6 +432,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     let pp_config = crate::preprocess::PreprocConfig {
         filename: input.to_string_lossy().into_owned(),
         fixed_form: matches!(source_form, SourceForm::FixedForm),
+        include_paths: module_search_paths.to_vec(),
         ..crate::preprocess::PreprocConfig::default()
     };
     let pp_result =
@@ -478,7 +494,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
 
     let rr = resolve::resolve_file(
         &units,
-        &[],
+        module_search_paths,
         crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
     )
     .map_err(|e| {
@@ -497,6 +513,21 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             stages: stages.clone(),
         }
     })?;
+    let mut external_globals = std::collections::HashMap::new();
+    let mut external_optional_params = std::collections::HashMap::new();
+    let mut external_descriptor_params = std::collections::HashMap::new();
+    let mut external_char_len_star = std::collections::HashMap::new();
+    for external_module in &rr.external_modules {
+        external_globals.extend(crate::sema::amod::extract_module_globals(external_module));
+        external_optional_params
+            .extend(crate::sema::amod::extract_optional_params(external_module));
+        external_descriptor_params.extend(crate::sema::amod::extract_descriptor_params(
+            external_module,
+        ));
+        external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(
+            external_module,
+        ));
+    }
     let st = rr.st;
     let type_layouts = rr.type_layouts;
     let diags = validate::validate_file(&units, &st);
@@ -524,10 +555,10 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         &units,
         &st,
         &type_layouts,
-        std::collections::HashMap::new(),
-        std::collections::HashMap::new(),
-        std::collections::HashMap::new(),
-        std::collections::HashMap::new(),
+        external_globals,
+        external_optional_params,
+        external_descriptor_params,
+        external_char_len_star,
         crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
     );
     let ir_errors = verify::verify_module(&ir_module);
