@@ -16,10 +16,10 @@ jobs:
   # Detect whether a change can affect the afs-as assembler suite. afs-as
   # is a standalone workspace crate (`cargo test -p afs-as`) that does not
   # depend on the armfortas compiler crate, so an armfortas-only PR cannot
-  # break it — those ~14 macOS jobs just burn runner slots. Gate them on
-  # paths that actually reach afs-as: the submodule itself, the workspace
-  # manifest/lockfile (shared deps), and this workflow. Skipped required
-  # jobs count as passing for branch protection.
+  # break it. Gate its complete macOS/Linux suite on paths that actually
+  # reach afs-as: the submodule itself, the workspace manifest/lockfile
+  # (shared deps), and this workflow. Skipped required jobs count as passing
+  # for branch protection.
   changes:
     name: "Detect changed paths"
     runs-on: ubuntu-latest
@@ -79,15 +79,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  test-armfortas-lib:
-    name: "Tests: armfortas library unit"
+  test-workspace-libs:
+    name: "Tests: workspace library units"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p armfortas --lib --release
+      - run: cargo test --workspace --lib --release
 
   test-end-to-end:
     name: "Tests: end-to-end (compile + run Fortran programs)"
@@ -131,161 +131,22 @@ jobs:
       - run: ci/run_logged.sh /tmp/tests.log cargo test -p armfortas --tests --release -- --nocapture
       - run: ci/check_skips.sh /tmp/tests.log macos
 
-  test-afs-as-unit:
-    name: "Tests: afs-as unit"
-    runs-on: macos-latest
+  test-afs-as:
+    name: "Tests: afs-as full suite (${{ matrix.os }})"
     needs: changes
     if: needs.changes.outputs.afs_as == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --lib
-
-  test-afs-as-harness:
-    name: "Tests: afs-as differential harness"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test differential_harness
-
-  test-afs-as-corpus:
-    name: "Tests: afs-as corpus compatibility"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test corpus_compat
-
-  test-afs-as-roundtrip:
-    name: "Tests: afs-as round-trip"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test roundtrip
-
-  test-afs-as-system:
-    name: "Tests: afs-as vs system assembler"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test verify_against_system_as
-
-  test-afs-as-e2e:
-    name: "Tests: afs-as end-to-end"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test hello_world
-
-  test-afs-as-cli:
-    name: "Tests: afs-as cli smoke"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test cli_smoke
-
-  test-afs-as-diagnostics:
-    name: "Tests: afs-as diagnostic snapshots"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test diagnostic_snapshots
-
-  test-afs-as-clang-dashboard:
-    name: "Tests: afs-as clang probe dashboard"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test clang_probe_dashboard
-
-  test-afs-as-generated-stress:
-    name: "Tests: afs-as generated stress"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test generated_stress
-
-  test-afs-as-differential-fuzz:
-    name: "Tests: afs-as differential fuzz"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test differential_fuzz
-
-  test-afs-as-malformed-mutation:
-    name: "Tests: afs-as malformed mutation"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test malformed_mutation
-
-  test-afs-as-perf:
-    name: "Tests: afs-as performance sanity"
-    runs-on: macos-latest
-    needs: changes
-    if: needs.changes.outputs.afs_as == 'true'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p afs-as --test perf_sanity
+      - run: cargo test -p afs-as --all-targets -- --nocapture
 
   test-afs-ld:
     name: "Tests: afs-ld full suite (${{ matrix.os }})"
@@ -307,8 +168,8 @@ jobs:
 
   # ---- Sprint x01: non-macOS hosts. Compiler + lib suite run for real;
   # e2e suites skip with machine-readable counts until x06 lands the
-  # native ELF toolchain path. afs-as suites stay on the macOS jobs:
-  # ARM64 + Mach-O by construction.
+  # native ELF toolchain path. The complete afs-as suite has its own
+  # path-gated macOS/Linux matrix above.
   build-linux-gnu:
     name: "Linux glibc: build + tests (e2e skip-gated)"
     runs-on: ubuntu-latest
