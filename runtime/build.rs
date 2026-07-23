@@ -40,12 +40,12 @@ fn assert_rustc_success(output: Output) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=runtime/Cargo.toml");
-    println!("cargo:rerun-if-changed=runtime/src");
+    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rustc-check-cfg=cfg(armfortas_staticlib_payload)");
 
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
-    let runtime_source = manifest_dir.join("runtime/src/lib.rs");
+    let runtime_source = manifest_dir.join("src/lib.rs");
     let output_archive = PathBuf::from(required_env("OUT_DIR")).join("libarmfortas_rt.a");
     let target = required_env("TARGET");
     let opt_level = required_env("OPT_LEVEL");
@@ -53,13 +53,15 @@ fn main() {
 
     // Stable Cargo cannot expose a staticlib dependency artifact to another
     // package target (`artifact = "staticlib"` still requires `-Z bindeps`),
-    // and `cargo install` copies executables only. Compile the dependency-free
-    // runtime with Cargo's target compiler and target flags, then embed that
-    // exact archive in each installable compiler binary.
+    // and `cargo install` copies executables only. Compile this dependency-free
+    // runtime with Cargo's target compiler and target flags, then expose that
+    // exact archive through the rlib for each installable compiler binary.
     let rustc = PathBuf::from(required_env("RUSTC"));
     let mut command = rustc_command(&rustc);
     command
         .arg(&runtime_source)
+        .arg("--cfg")
+        .arg("armfortas_staticlib_payload")
         .arg("--target")
         .arg(target)
         .arg("-C")

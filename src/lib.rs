@@ -37,7 +37,8 @@ pub fn cli_entry() -> ! {
 ///
 /// Cargo installs executable targets but not the compiler's static runtime
 /// archive. Each binary therefore carries the target-matched archive produced
-/// by `build.rs` and offers it to the driver as the final runtime source.
+/// by the `armfortas-rt` package and offers it to the driver as the final
+/// runtime source.
 #[doc(hidden)]
 pub fn cli_entry_with_bundled_runtime(runtime_archive: &'static [u8]) -> ! {
     cli_entry_impl(Some(runtime_archive))

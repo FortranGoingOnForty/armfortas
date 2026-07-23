@@ -12,6 +12,12 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::items_after_test_module)]
 
+#[cfg(not(armfortas_staticlib_payload))]
+mod bundle;
+
+#[cfg(not(armfortas_staticlib_payload))]
+pub use bundle::bundled_archive;
+
 pub mod array;
 pub mod descriptor;
 pub mod format;

@@ -12,6 +12,14 @@ name = "armfortas"
 version = "0.1.0"
 edition = "2021"
 description = "Bespoke ARM64 Fortran compiler"
+license = "GPL-3.0-only"
+repository = "https://github.com/FortranGoingOnForty/armfortas"
+readme = "README.md"
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/src/**",
+]
 
 [lib]
 name = "armfortas"
@@ -30,4 +38,5 @@ name = "afs"
 path = "src/bin/afs.rs"
 
 [dependencies]
-afs-as = { path = "afs-as" }
+afs-as = { version = "0.1.0", path = "afs-as" }
+armfortas-rt = { version = "0.1.0", path = "runtime" }
