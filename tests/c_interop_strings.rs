@@ -134,8 +134,8 @@ fn run_case(opt_flag: &str) {
 fn c_interop_strings_differential() {
     if !clang_available() {
         eprintln!(
-            "HARNESS_SKIP suite=c_interop_strings test=c_interop_strings_differential \
-             count=0 reason=\"clang not found on PATH\""
+            "\nHARNESS_SKIP suite=c_interop_strings test=c_interop_strings_differential \
+             count=2 reason=\"clang not found on PATH\""
         );
         return;
     }

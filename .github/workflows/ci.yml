@@ -128,7 +128,9 @@ jobs:
       # test files; building all of them inside `cargo test` previously
       # consumed the bulk of the timed step on macos-latest.
       - run: cargo test -p armfortas --tests --release --no-run
-      - run: ci/run_logged.sh /tmp/tests.log cargo test -p armfortas --tests --release -- --nocapture
+      # Serialize libtest output so each machine-readable skip record remains
+      # intact for the exact manifest comparison below.
+      - run: ci/run_logged.sh /tmp/tests.log cargo test -p armfortas --tests --release -- --nocapture --test-threads=1
       - run: ci/check_skips.sh /tmp/tests.log macos
 
   test-afs-as:

@@ -1,9 +1,23 @@
-# Suites expected to skip on macOS (macos profile): tests that need
-# an x86_64 ELF host. Everything else must run — zero other skips.
-x86_emit_golden
-abi_differential
-x86_object_smoke
-x86_afs_as_differential
-x86_complex_value_runtime
-elf_link_e2e
-elf_static_link
+# Exact skips expected from the complete armfortas integration suite on
+# macOS arm64. Format: <suite> <test> <positive-count>.
+# Any added, removed, duplicated, or count-changed record requires review.
+# Baseline: GitHub Actions run 29799241535 at 9d901856abceefc3b46f06301b0b06fbabfad5f5.
+abi_differential all_c_self_check 14
+abi_differential armfortas_callee_legs_pending_x05_x06 14
+abi_differential armfortas_caller_legs_pending_x05_x06 14
+elf_link_e2e afs_ld_route_links_without_explicit_crt_dir 1
+elf_link_e2e binaries_request_the_target_dynamic_linker 1
+elf_link_e2e curated_programs_link_run_and_match_check_lines 7
+elf_link_e2e no_pie_links_a_position_dependent_executable_that_runs 1
+elf_link_e2e out_of_scope_link_paths_diagnose_cleanly 3
+elf_static_link afs_ld_statically_links_and_runs_fortran 1
+x86_afs_as_differential whole_corpus_matches_gas 1
+x86_complex_value_runtime bind_c_complex_f32_value_arguments_match_packed_xmm_abi 6
+x86_emit_golden x86_goldens_accepted_by_system_assembler 4
+x86_object_smoke big_frames_emit_the_probe_loop 1
+x86_object_smoke conversion_spill_traffic_uses_fp_width 1
+x86_object_smoke curated_programs_compile_to_elf_objects 12
+x86_object_smoke division_uses_fixed_register_choreography 1
+x86_object_smoke fp_compares_use_ucomi_with_unsigned_conditions 1
+x86_object_smoke one_megabyte_frame_compiles_and_probes 1
+x86_object_smoke setcc_is_always_paired_with_zero_extension 1

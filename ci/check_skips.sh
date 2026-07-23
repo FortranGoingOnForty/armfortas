@@ -1,22 +1,23 @@
 #!/bin/sh
-# Skip-count gate (sprint x01).
+# Exact skip-manifest gate (sprint x01, hardened by AR37).
 #
 # Usage: ci/check_skips.sh <test-log> <profile>
 #
 # Profiles:
-#   macos     — asserts the closed set of platform-only suites in
-#               ci/expected_skips_macos.txt. Missing, zero-count, and
-#               unexpected skips fail.
-#   posix-elf — asserts the gated suites (ci/expected_skips_posix-elf.txt)
-#               each emitted at least one HARNESS_SKIP line, every line
-#               carries an integer count >= 1, and no suite outside the
-#               expected list skipped. Silent skips and count=0 skips
-#               both fail.
-#   posix-elf-musl — posix-elf plus the suites in
-#               ci/expected_skips_posix-elf-musl-extra.txt (x06: the
-#               native link gate, which a musl host cannot run until
-#               x11). Same strictness, larger expected set.
+#   macos            — exact records in expected_skips_macos.txt
+#   posix-elf         — exact records in expected_skips_posix-elf.txt
+#   posix-elf-musl    — posix-elf plus exact records in
+#                       expected_skips_posix-elf-musl-extra.txt
+#
+# Manifest rows are: <suite> <test> <positive-count>. The comparison is an
+# exact multiset comparison: missing records, unexpected test identities,
+# changed counts, and duplicates all fail.
 set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 <test-log> <macos|posix-elf|posix-elf-musl>" >&2
+    exit 2
+fi
 
 log="$1"
 profile="$2"
@@ -24,17 +25,22 @@ script_dir=$(dirname "$0")
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' 0 HUP INT TERM
 
+if [ ! -r "$log" ]; then
+    echo "check_skips: cannot read test log '$log'" >&2
+    exit 2
+fi
+
 case "$profile" in
 macos)
-    expected_list="$script_dir/expected_skips_macos.txt"
+    manifest_input="$script_dir/expected_skips_macos.txt"
     ;;
 posix-elf)
-    expected_list="$script_dir/expected_skips_posix-elf.txt"
+    manifest_input="$script_dir/expected_skips_posix-elf.txt"
     ;;
 posix-elf-musl)
-    expected_list="$tmp_dir/expected"
+    manifest_input="$tmp_dir/manifest-input"
     cat "$script_dir/expected_skips_posix-elf.txt" \
-        "$script_dir/expected_skips_posix-elf-musl-extra.txt" > "$expected_list"
+        "$script_dir/expected_skips_posix-elf-musl-extra.txt" > "$manifest_input"
     ;;
 *)
     echo "check_skips: unknown profile '$profile' (macos | posix-elf | posix-elf-musl)" >&2
@@ -42,36 +48,102 @@ posix-elf-musl)
     ;;
 esac
 
-skips=$(grep -c '^HARNESS_SKIP ' "$log" || true)
-if [ "$skips" -eq 0 ]; then
-    echo "check_skips: no HARNESS_SKIP lines at all — gated suites ran or vanished silently" >&2
-    exit 1
-fi
-
-bad_counts=$(grep '^HARNESS_SKIP ' "$log" | grep -cv ' count=[1-9][0-9]* ' || true)
-if [ "$bad_counts" -ne 0 ]; then
-    echo "check_skips: $bad_counts skip line(s) with missing/zero count:" >&2
-    grep '^HARNESS_SKIP ' "$log" | grep -v ' count=[1-9][0-9]* ' >&2
-    exit 1
-fi
-
-status=0
-while IFS= read -r suite; do
+expected_unsorted="$tmp_dir/expected-unsorted"
+while IFS=' ' read -r suite test count extra; do
     case "$suite" in ''|'#'*) continue ;; esac
-    if ! grep -Fq "HARNESS_SKIP suite=$suite " "$log"; then
-        echo "check_skips: expected suite '$suite' emitted no HARNESS_SKIP line" >&2
-        status=1
-    fi
-done < "$expected_list"
 
-seen_list="$tmp_dir/seen"
-grep '^HARNESS_SKIP ' "$log" | sed 's/^HARNESS_SKIP suite=\([^ ]*\) .*/\1/' | sort -u > "$seen_list"
-while IFS= read -r seen; do
-    if ! grep -Fqx "$seen" "$expected_list"; then
-        echo "check_skips: unexpected suite '$seen' skipped (not in $expected_list)" >&2
-        status=1
+    if [ -n "${extra:-}" ] || [ -z "${test:-}" ] || [ -z "${count:-}" ]; then
+        echo "check_skips: malformed manifest row in $manifest_input: '$suite ${test:-} ${count:-} ${extra:-}'" >&2
+        exit 2
     fi
-done < "$seen_list"
+    case "$count" in
+        ''|0|*[!0-9]*)
+            echo "check_skips: manifest has non-positive count for suite=$suite test=$test count=$count" >&2
+            exit 2
+            ;;
+    esac
+    printf '%s %s %s\n' "$suite" "$test" "$count"
+done < "$manifest_input" > "$expected_unsorted"
 
-[ "$status" -eq 0 ] && echo "check_skips: $profile profile clean ($skips skip lines)"
-exit "$status"
+expected="$tmp_dir/expected"
+LC_ALL=C sort "$expected_unsorted" > "$expected"
+expected_duplicates="$tmp_dir/expected-duplicates"
+uniq -d "$expected" > "$expected_duplicates"
+if [ -s "$expected_duplicates" ]; then
+    echo "check_skips: duplicate rows in expected manifest:" >&2
+    awk '{printf "  suite=%s test=%s count=%s\n", $1, $2, $3}' "$expected_duplicates" >&2
+    exit 2
+fi
+
+markers="$tmp_dir/markers"
+grep -o 'HARNESS_SKIP ' "$log" > "$markers" || true
+if [ ! -s "$markers" ]; then
+    echo "check_skips: no HARNESS_SKIP records at all — gated tests ran or vanished silently" >&2
+    exit 1
+fi
+
+observed_raw="$tmp_dir/observed-raw"
+grep -o 'HARNESS_SKIP suite=[^[:space:]]* test=[^[:space:]]* count=[^[:space:]]*' "$log" \
+    > "$observed_raw" || true
+marker_count=$(wc -l < "$markers" | tr -d ' ')
+record_count=$(wc -l < "$observed_raw" | tr -d ' ')
+if [ "$record_count" -ne "$marker_count" ]; then
+    echo "check_skips: malformed HARNESS_SKIP record(s): found $marker_count marker(s), parsed $record_count" >&2
+    grep -Fn 'HARNESS_SKIP ' "$log" >&2 || true
+    exit 1
+fi
+
+observed_unsorted="$tmp_dir/observed-unsorted"
+while IFS=' ' read -r marker suite_field test_field count_field extra; do
+    suite=${suite_field#suite=}
+    test=${test_field#test=}
+    count=${count_field#count=}
+    if [ "$marker" != "HARNESS_SKIP" ] \
+        || [ "$suite" = "$suite_field" ] \
+        || [ "$test" = "$test_field" ] \
+        || [ "$count" = "$count_field" ] \
+        || [ -n "${extra:-}" ] \
+        || [ -z "$suite" ] \
+        || [ -z "$test" ]; then
+        echo "check_skips: malformed HARNESS_SKIP record: '$marker $suite_field $test_field $count_field ${extra:-}'" >&2
+        exit 1
+    fi
+    case "$count" in
+        ''|0|*[!0-9]*)
+            echo "check_skips: non-positive skip count: suite=$suite test=$test count=$count" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s %s %s\n' "$suite" "$test" "$count"
+done < "$observed_raw" > "$observed_unsorted"
+
+observed="$tmp_dir/observed"
+LC_ALL=C sort "$observed_unsorted" > "$observed"
+observed_duplicates="$tmp_dir/observed-duplicates"
+uniq -d "$observed" > "$observed_duplicates"
+if [ -s "$observed_duplicates" ]; then
+    echo "check_skips: duplicate HARNESS_SKIP records:" >&2
+    awk '{printf "  suite=%s test=%s count=%s\n", $1, $2, $3}' "$observed_duplicates" >&2
+    exit 1
+fi
+
+if ! cmp -s "$expected" "$observed"; then
+    echo "check_skips: $profile skip manifest mismatch" >&2
+    missing="$tmp_dir/missing"
+    unexpected="$tmp_dir/unexpected"
+    comm -23 "$expected" "$observed" > "$missing"
+    comm -13 "$expected" "$observed" > "$unexpected"
+    if [ -s "$missing" ]; then
+        echo "check_skips: missing records:" >&2
+        awk '{printf "  suite=%s test=%s count=%s\n", $1, $2, $3}' "$missing" >&2
+    fi
+    if [ -s "$unexpected" ]; then
+        echo "check_skips: unexpected records:" >&2
+        awk '{printf "  suite=%s test=%s count=%s\n", $1, $2, $3}' "$unexpected" >&2
+    fi
+    exit 1
+fi
+
+records=$(wc -l < "$observed" | tr -d ' ')
+cases=$(awk '{total += $3} END {print total + 0}' "$observed")
+echo "check_skips: $profile profile clean ($records exact records, $cases skipped cases)"
