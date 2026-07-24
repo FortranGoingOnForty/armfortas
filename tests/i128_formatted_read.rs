@@ -25,7 +25,8 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
     }
 }
 
-fn stdout_has_fields(stdout: &str, expected: &[&str]) -> bool {
+fn stdout_has_fields(stdout: &[u8], expected: &[&str]) -> bool {
+    let stdout = std::str::from_utf8(stdout).expect("run stdout should be UTF-8");
     let fields: Vec<_> = stdout.split_whitespace().collect();
     fields
         .windows(expected.len())

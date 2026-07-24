@@ -391,9 +391,21 @@ impl CapturedStage {
 #[derive(Debug, Clone)]
 pub struct RunCapture {
     pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
     pub files: BTreeMap<String, Vec<u8>>,
+}
+
+impl RunCapture {
+    /// Decode standard output when a caller explicitly requires text.
+    pub fn stdout_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.stdout)
+    }
+
+    /// Decode standard error when a caller explicitly requires text.
+    pub fn stderr_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.stderr)
+    }
 }
 
 /// Capture the requested stages for one source file without external module
@@ -829,8 +841,8 @@ pub fn capture_from_path_with_module_search_paths(
                 Stage::Run,
                 CapturedStage::Run(RunCapture {
                     exit_code: output.status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
                     files,
                 }),
             );

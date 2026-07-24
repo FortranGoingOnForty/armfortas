@@ -98,10 +98,11 @@ fn capture_program_entry_fixture_runs_at_o2() {
         run.exit_code, 0,
         "program should run successfully:\n{run:#?}"
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.split_whitespace().any(|field| field == "99"),
+        stdout.split_whitespace().any(|field| field == "99"),
         "program body should execute and print the helper-written value:\n{}",
-        run.stdout
+        stdout
     );
 }
 

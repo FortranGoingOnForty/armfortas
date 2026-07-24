@@ -130,8 +130,9 @@ fn module_global_host_assoc_runs_across_opt_levels_and_keeps_o2_object_determini
             "module-global host association should run successfully at {:?}:\n{:#?}",
             level, run
         );
+        let stdout = run.stdout_text().expect("run stdout should be UTF-8");
         assert!(
-            run.stdout.contains("99"),
+            stdout.contains("99"),
             "module-global host association should preserve the shared module write at {:?}:\n{:#?}",
             level, run
         );

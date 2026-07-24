@@ -133,11 +133,12 @@ fn high_opt_backend_runs_internal_integer16_call() {
             "expected successful {} integer(16) run:\n{:#?}",
             label, run
         );
+        let stdout = run.stdout_text().expect("run stdout should be UTF-8");
         assert!(
-            run.stdout.contains('1'),
+            stdout.contains('1'),
             "{} integer(16) internal call program should print score 1:\n{}",
             label,
-            run.stdout
+            stdout
         );
     }
 }

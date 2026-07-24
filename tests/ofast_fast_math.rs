@@ -118,13 +118,17 @@ fn ofast_reassociates_float_constant_chain_but_o3_stays_strict() {
         Stage::Obj,
     );
 
+    let o3_stdout = o3_run.stdout_text().expect("O3 stdout should be UTF-8");
+    let ofast_stdout = ofast_run
+        .stdout_text()
+        .expect("Ofast stdout should be UTF-8");
     assert_eq!(
-        parse_last_int(&o3_run.stdout),
+        parse_last_int(o3_stdout),
         0,
         "strict O3 run should keep IEEE-style rounding loss"
     );
     assert_eq!(
-        parse_last_int(&ofast_run.stdout),
+        parse_last_int(ofast_stdout),
         1,
         "Ofast run should expose fast-math reassociation"
     );

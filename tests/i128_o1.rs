@@ -81,10 +81,11 @@ fn o1_backend_runs_internal_integer16_call() {
         "expected successful O1 integer(16) run:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains('1'),
+        stdout.contains('1'),
         "O1 integer(16) internal call program should print score 1:\n{}",
-        run.stdout
+        stdout
     );
 }
 
@@ -188,9 +189,10 @@ fn o1_branchy_integer16_program_runs_after_mem2reg() {
         "expected successful O1 branchy integer(16) run:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains('1'),
+        stdout.contains('1'),
         "branchy O1 integer(16) program should print score 1:\n{}",
-        run.stdout
+        stdout
     );
 }
