@@ -25,7 +25,9 @@ use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Token};
 use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
-use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
+use crate::runtime::artifact::{
+    find_source_workspace_from, fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile,
+};
 use crate::sema::{resolve, validate};
 use managed_process::{run as run_managed, CommandClass};
 
@@ -1416,24 +1418,15 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
 
 fn find_workspace_root() -> Option<PathBuf> {
     let mut bases = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        bases.push(cwd);
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             bases.push(dir.to_path_buf());
         }
     }
-
-    for base in bases {
-        for ancestor in base.ancestors() {
-            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists()
-            {
-                return Some(ancestor.to_path_buf());
-            }
-        }
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd);
     }
-    None
+    find_source_workspace_from(&bases)
 }
 
 /// Object-file inspection dispatched on object format (sprint x01).

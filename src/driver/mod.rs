@@ -19,8 +19,8 @@ use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
 use crate::parser::Parser;
 use crate::runtime::artifact::{
-    fresh_runtime_lib, materialize_bundled_runtime, runtime_lib_candidate, RuntimeArchive,
-    RuntimeProfile,
+    find_source_workspace_from, fresh_runtime_lib, materialize_bundled_runtime,
+    runtime_lib_candidate, RuntimeArchive, RuntimeProfile,
 };
 use crate::sema::{resolve, validate};
 
@@ -2920,20 +2920,21 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
         }
     }
 
-    // 2. Cargo workspace — when running out of the build tree.
-    if let Some(workspace_root) = find_workspace_root() {
-        let profile = RuntimeProfile::current();
-        if let Some(candidate) = fresh_runtime_lib(&workspace_root, profile) {
-            return Ok(RuntimeArchive::external(candidate));
-        }
-        maybe_refresh_runtime_lib(&workspace_root, profile)?;
-        let candidate = runtime_lib_candidate(&workspace_root, profile);
-        if candidate.exists() {
-            return Ok(RuntimeArchive::external(candidate));
+    // 2. A source workspace that owns the compiler executable. Development
+    //    binaries under target/{debug,release} retain automatic runtime
+    //    freshness without trusting the caller's current directory.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(workspace_root) = exe
+            .parent()
+            .and_then(|dir| find_source_workspace_from(&[dir.to_path_buf()]))
+        {
+            if let Some(runtime) = runtime_from_workspace(&workspace_root)? {
+                return Ok(runtime);
+            }
         }
     }
 
-    // 3. Sibling of the compiler binary:
+    // 3. Runtime installed with the compiler binary:
     //      <bindir>/libarmfortas_rt.a
     //      <bindir>/../lib/libarmfortas_rt.a      (classic FHS)
     //      <bindir>/../lib/armfortas/libarmfortas_rt.a
@@ -2955,12 +2956,25 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
     //    targets but has no data-file installation hook, so installed
     //    armfortas/afs binaries materialize their target-matched archive into
     //    a private temporary directory for the duration of the linker call.
-    //    Prefer this exact-match runtime over a potentially stale global one.
+    //    Compiler-owned runtimes must win over anything inferred from the
+    //    caller's current directory.
     if let Some(bytes) = bundled_runtime {
         return materialize_bundled_runtime(bytes);
     }
 
-    // 5. Standard install locations.
+    // 5. Verified current source workspace — only for programmatic
+    //    development callers that do not carry a runtime. Installed binaries
+    //    return from the compiler-owned sources above and never reach this
+    //    caller-controlled fallback.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(workspace_root) = find_source_workspace_from(&[cwd]) {
+            if let Some(runtime) = runtime_from_workspace(&workspace_root)? {
+                return Ok(runtime);
+            }
+        }
+    }
+
+    // 6. Standard install locations.
     for fixed in &[
         "/usr/local/lib/libarmfortas_rt.a",
         "/usr/local/lib/armfortas/libarmfortas_rt.a",
@@ -2972,8 +2986,8 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
     }
 
     Err("cannot find libarmfortas_rt.a. Searched: \
-         $AFS_RUNTIME_PATH, cargo workspace, next to the compiler \
-         binary, the compiler's bundled runtime, and /usr/local/lib. Build with \
+         $AFS_RUNTIME_PATH, next to the compiler binary, the compiler's \
+         bundled runtime, a verified armfortas workspace, and /usr/local/lib. Build with \
          'cargo build -p armfortas-rt' or set AFS_RUNTIME_PATH."
         .into())
 }
@@ -3035,26 +3049,16 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
     }
 }
 
-fn find_workspace_root() -> Option<PathBuf> {
-    let mut bases = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        bases.push(cwd);
+fn runtime_from_workspace(workspace_root: &Path) -> Result<Option<RuntimeArchive>, String> {
+    let profile = RuntimeProfile::current();
+    if let Some(candidate) = fresh_runtime_lib(workspace_root, profile) {
+        return Ok(Some(RuntimeArchive::external(candidate)));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            bases.push(dir.to_path_buf());
-        }
-    }
-
-    for base in bases {
-        for ancestor in base.ancestors() {
-            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists()
-            {
-                return Some(ancestor.to_path_buf());
-            }
-        }
-    }
-    None
+    maybe_refresh_runtime_lib(workspace_root, profile)?;
+    let candidate = runtime_lib_candidate(workspace_root, profile);
+    Ok(candidate
+        .exists()
+        .then(|| RuntimeArchive::external(candidate)))
 }
 
 #[cfg(test)]

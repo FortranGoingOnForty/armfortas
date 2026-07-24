@@ -195,6 +195,62 @@ fn newest_mtime(path: &Path) -> Option<SystemTime> {
     Some(newest)
 }
 
+pub(crate) fn find_source_workspace_from(bases: &[PathBuf]) -> Option<PathBuf> {
+    for base in bases {
+        for ancestor in base.ancestors() {
+            if is_armfortas_source_workspace(ancestor) {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+fn is_armfortas_source_workspace(root: &Path) -> bool {
+    manifest_package_name(&root.join("Cargo.toml")).as_deref() == Some("armfortas")
+        && manifest_package_name(&root.join("runtime/Cargo.toml")).as_deref()
+            == Some("armfortas-rt")
+        && root.join("src/lib.rs").is_file()
+        && root.join("src/driver/mod.rs").is_file()
+        && root.join("runtime/src/lib.rs").is_file()
+}
+
+fn manifest_package_name(path: &Path) -> Option<String> {
+    let manifest = fs::read_to_string(path).ok()?;
+    let mut in_package = false;
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_package = line
+                .strip_prefix('[')
+                .and_then(|section| section.split_once(']'))
+                .is_some_and(|(section, _)| section.trim() == "package");
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        let value = value.trim();
+        let quote = value.as_bytes().first().copied()?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        let value = &value[1..];
+        let end = value.as_bytes().iter().position(|byte| *byte == quote)?;
+        return Some(value[..end].to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +327,48 @@ mod tests {
         assert_eq!(
             cargo_target_dir_from(root, Some(OsStr::new("/tmp/armfortas-target"))),
             PathBuf::from("/tmp/armfortas-target")
+        );
+    }
+
+    #[test]
+    fn source_workspace_discovery_requires_armfortas_project_identity() {
+        let root = temp_root("workspace-identity");
+        let nested = root.join("examples/nested");
+        fs::create_dir_all(root.join("src/driver")).unwrap();
+        fs::create_dir_all(root.join("runtime/src")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            b"[workspace]\nmembers = [\"runtime\"]\n\n[package]\nname = \"unrelated\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("runtime/Cargo.toml"),
+            b"[package]\nname = 'armfortas-rt'\n",
+        )
+        .unwrap();
+        for source in [
+            root.join("src/lib.rs"),
+            root.join("src/driver/mod.rs"),
+            root.join("runtime/src/lib.rs"),
+        ] {
+            fs::write(source, b"// unrelated fixture\n").unwrap();
+        }
+
+        assert!(
+            find_source_workspace_from(&[nested]).is_none(),
+            "Cargo layout and a coincidental runtime package must not establish compiler ownership"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_workspace_discovery_accepts_the_armfortas_source_tree() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            find_source_workspace_from(&[root.join("src/driver")]),
+            Some(root),
+            "development callers must still find the owning source workspace"
         );
     }
 
