@@ -9,7 +9,7 @@ pub mod managed_process;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -856,28 +856,130 @@ pub fn capture_from_path_with_module_search_paths(
     })
 }
 
+const MAX_SANDBOX_DEPTH: usize = 64;
+const MAX_SANDBOX_FILES: usize = 4096;
+const MAX_SANDBOX_ENTRIES: usize = 8192;
+const MAX_SANDBOX_BYTES: u64 = 64 * 1024 * 1024;
+
 fn collect_sandbox_files(
     root: &Path,
     dir: &Path,
     out: &mut BTreeMap<String, Vec<u8>>,
+    depth: usize,
+    visited_entries: &mut usize,
+    total_bytes: &mut u64,
 ) -> std::io::Result<()> {
+    if depth > MAX_SANDBOX_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "sandbox directory depth exceeds limit of {}",
+                MAX_SANDBOX_DEPTH
+            ),
+        ));
+    }
+
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        *visited_entries += 1;
+        if *visited_entries > MAX_SANDBOX_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox entry count exceeds limit of {}",
+                    MAX_SANDBOX_ENTRIES
+                ),
+            ));
+        }
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            collect_sandbox_files(root, &path, out)?;
-        } else {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_sandbox_files(root, &path, out, depth + 1, visited_entries, total_bytes)?;
+        } else if file_type.is_file() {
+            if out.len() >= MAX_SANDBOX_FILES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("sandbox file count exceeds limit of {}", MAX_SANDBOX_FILES),
+                ));
+            }
             let rel = path.strip_prefix(root).unwrap();
-            out.insert(rel.to_string_lossy().replace('\\', "/"), fs::read(&path)?);
+            let rel = normalize_snapshot_path(root, rel)?;
+            let remaining = MAX_SANDBOX_BYTES.saturating_sub(*total_bytes);
+            let mut bytes = Vec::new();
+            fs::File::open(&path)?
+                .take(remaining + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("sandbox file bytes exceed limit of {}", MAX_SANDBOX_BYTES),
+                ));
+            }
+            *total_bytes += bytes.len() as u64;
+            out.insert(rel, bytes);
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox entry '{}' is not a regular file or directory",
+                    path.display()
+                ),
+            ));
         }
     }
     Ok(())
 }
 
-fn snapshot_sandbox_files(sandbox: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+fn normalize_snapshot_path(root: &Path, relative: &Path) -> std::io::Result<String> {
+    let mut normalized = String::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox path '{}' is not a normal relative path",
+                    relative.display()
+                ),
+            ));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("sandbox path below '{}' is not valid UTF-8", root.display()),
+            )
+        })?;
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    if normalized.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sandbox file path is empty",
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Snapshot regular files created below an isolated run directory.
+///
+/// The snapshot is exact and bounded. Non-UTF-8 paths, symlinks, special
+/// files, excessive nesting, too many entries or files, and oversized file sets are
+/// rejected instead of being normalized or followed.
+pub fn snapshot_sandbox_files(sandbox: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut files = BTreeMap::new();
-    collect_sandbox_files(sandbox, sandbox, &mut files)
-        .map_err(|e| format!("cannot snapshot sandbox '{}': {}", sandbox.display(), e))?;
+    let mut visited_entries = 0;
+    let mut total_bytes = 0;
+    collect_sandbox_files(
+        sandbox,
+        sandbox,
+        &mut files,
+        0,
+        &mut visited_entries,
+        &mut total_bytes,
+    )
+    .map_err(|e| format!("cannot snapshot sandbox '{}': {}", sandbox.display(), e))?;
     Ok(files)
 }
 
@@ -1441,6 +1543,65 @@ fn normalize_tool_output(text: &str) -> String {
 #[cfg(test)]
 mod inspector_tests {
     use super::*;
+
+    #[test]
+    fn sandbox_snapshot_preserves_nested_binary_files() {
+        let root = next_temp_root("afs_snapshot_nested");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/artifact.bin"), [0x00, 0xff, 0x7f]).unwrap();
+
+        let files = snapshot_sandbox_files(&root).unwrap();
+        assert_eq!(
+            files,
+            BTreeMap::from([("nested/artifact.bin".to_string(), vec![0x00, 0xff, 0x7f])])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_snapshot_does_not_collapse_literal_backslashes_into_directories() {
+        let root = next_temp_root("afs_snapshot_backslash");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/artifact"), b"directory path").unwrap();
+        fs::write(root.join("nested\\artifact"), b"literal backslash").unwrap();
+
+        let files = snapshot_sandbox_files(&root).unwrap();
+        assert_eq!(files.get("nested/artifact").unwrap(), b"directory path");
+        assert_eq!(files.get("nested\\artifact").unwrap(), b"literal backslash");
+        assert_eq!(files.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_snapshot_rejects_non_utf8_paths_and_symlinks() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let invalid_root = next_temp_root("afs_snapshot_invalid_path");
+        fs::create_dir_all(&invalid_root).unwrap();
+        let invalid_name = std::ffi::OsString::from_vec(vec![b'f', 0xff]);
+        fs::write(invalid_root.join(invalid_name), b"bytes").unwrap();
+        let invalid_error = snapshot_sandbox_files(&invalid_root).unwrap_err();
+        assert!(invalid_error.contains("not valid UTF-8"), "{invalid_error}");
+        let _ = fs::remove_dir_all(invalid_root);
+
+        let symlink_root = next_temp_root("afs_snapshot_symlink");
+        fs::create_dir_all(&symlink_root).unwrap();
+        let outside = next_temp_root("afs_snapshot_outside");
+        fs::write(&outside, b"outside bytes").unwrap();
+        symlink(&outside, symlink_root.join("escape")).unwrap();
+        let symlink_error = snapshot_sandbox_files(&symlink_root).unwrap_err();
+        assert!(
+            symlink_error.contains("not a regular file or directory"),
+            "{symlink_error}"
+        );
+        let _ = fs::remove_dir_all(symlink_root);
+        let _ = fs::remove_file(outside);
+    }
 
     #[test]
     fn tool_resolution_env_override_wins() {
