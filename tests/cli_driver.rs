@@ -13887,6 +13887,263 @@ fn multi_input_dash_c_produces_one_object_per_source() {
 }
 
 #[test]
+fn multi_input_terminal_modes_preserve_requested_artifacts() {
+    let file_modes = [
+        ("-S", "s", ".text"),
+        ("--emit-ir", "ir", "helper"),
+        ("--emit-ast", "ast", "Subroutine"),
+        ("--emit-tokens", "tokens", "Token { kind:"),
+    ];
+
+    for (flag, suffix, helper_marker) in file_modes {
+        let dir = unique_dir(&format!("multi_terminal_{}", &suffix));
+        write_program_in(
+            &dir,
+            "helper.F90",
+            "#define HELPER_VALUE 41\nsubroutine helper(x)\n  integer, intent(out) :: x\n  x = HELPER_VALUE\nend subroutine helper\n",
+        );
+        write_program_in(
+            &dir,
+            "main.F90",
+            "#define MAIN_VALUE 77\nprogram p\n  integer :: x\n  call helper(x)\n  print *, x + MAIN_VALUE\nend program p\n",
+        );
+
+        let helper_output = dir.join(format!("helper.{suffix}"));
+        let main_output = dir.join(format!("main.{suffix}"));
+        assert!(!helper_output.exists(), "test output must start fresh");
+        assert!(!main_output.exists(), "test output must start fresh");
+
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([flag, "helper.F90", "main.F90"])
+            .output()
+            .expect("multi-input terminal-mode compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "{flag} multi-input compile failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let helper_text =
+            std::fs::read_to_string(&helper_output).expect("missing first per-source output");
+        let main_text =
+            std::fs::read_to_string(&main_output).expect("missing second per-source output");
+        assert!(
+            helper_text.contains(helper_marker),
+            "{flag} first output has the wrong artifact type:\n{helper_text}"
+        );
+        assert!(
+            !main_text.is_empty(),
+            "{flag} second per-source output should not be empty"
+        );
+        assert!(
+            !dir.join("a.out").exists(),
+            "{flag} must not replace the requested terminal mode with a link"
+        );
+        assert!(
+            !dir.join("helper.o").exists() && !dir.join("main.o").exists(),
+            "{flag} must not leave child objects behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("multi_terminal_pp");
+    write_program_in(
+        &dir,
+        "helper.F90",
+        "#define HELPER_VALUE 41\nsubroutine helper(x)\n  integer, intent(out) :: x\n  x = HELPER_VALUE\nend subroutine helper\n",
+    );
+    write_program_in(
+        &dir,
+        "main.F90",
+        "#define MAIN_VALUE 77\nprogram p\n  integer :: x\n  call helper(x)\n  print *, x + MAIN_VALUE\nend program p\n",
+    );
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "helper.F90", "main.F90"])
+        .output()
+        .expect("multi-input preprocessing failed to spawn");
+    assert!(
+        result.status.success(),
+        "-E multi-input preprocessing failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("x = 41") && stdout.contains("x + 77"),
+        "-E should write both preprocessed inputs to stdout:\n{stdout}"
+    );
+    assert!(
+        !dir.join("a.out").exists(),
+        "-E must not replace preprocessing with a link"
+    );
+    assert!(
+        !dir.join("helper.o").exists() && !dir.join("main.o").exists(),
+        "-E must not leave child objects behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_preprocess_does_not_lex_fortran_or_reorder_inputs() {
+    let dir = unique_dir("multi_terminal_pp_raw");
+    let first = b"#define FIRST 11\nFIRST @@@ is deliberately not Fortran\n";
+    let second = b"#define SECOND 22\nSECOND ### is also deliberately not Fortran\n";
+    write_program_bytes_in(&dir, "first.F90", first);
+    write_program_bytes_in(&dir, "second.F90", second);
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "first.F90", "second.F90"])
+        .output()
+        .expect("raw multi-input preprocessing failed to spawn");
+    assert!(
+        result.status.success(),
+        "-E should not lex or parse its inputs: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let first_pos = stdout
+        .find("11 @@@ is deliberately not Fortran")
+        .expect("missing first preprocessed input");
+    let second_pos = stdout
+        .find("22 ### is also deliberately not Fortran")
+        .expect("missing second preprocessed input");
+    assert!(
+        first_pos < second_pos,
+        "-E should preserve positional input order:\n{stdout}"
+    );
+    assert!(
+        !dir.join("a.out").exists(),
+        "-E must not create a linked output"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_syntax_dumps_do_not_resolve_module_cycles() {
+    for (flag, suffix) in [("--emit-tokens", "tokens"), ("--emit-ast", "ast")] {
+        let dir = unique_dir(&format!("multi_terminal_cycle_{suffix}"));
+        write_program_in(
+            &dir,
+            "left.f90",
+            "module left\n  use right\nend module left\n",
+        );
+        write_program_in(
+            &dir,
+            "right.f90",
+            "module right\n  use left\nend module right\n",
+        );
+
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([flag, "left.f90", "right.f90"])
+            .output()
+            .expect("multi-input syntax dump failed to spawn");
+        assert!(
+            result.status.success(),
+            "{flag} should stop before semantic module dependency resolution: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            dir.join(format!("left.{suffix}")).exists()
+                && dir.join(format!("right.{suffix}")).exists(),
+            "{flag} should produce one output per syntactically valid input"
+        );
+        assert!(
+            !dir.join("a.out").exists(),
+            "{flag} must not create a linked output"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn multi_input_terminal_modes_reject_a_shared_output() {
+    for flag in ["-S", "-E", "--emit-ir", "--emit-ast", "--emit-tokens"] {
+        let dir = unique_dir("multi_terminal_o");
+        write_program_in(
+            &dir,
+            "first.f90",
+            "subroutine first()\nend subroutine first\n",
+        );
+        write_program_in(
+            &dir,
+            "second.f90",
+            "subroutine second()\nend subroutine second\n",
+        );
+
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([flag, "first.f90", "second.f90", "-o", "combined.out"])
+            .output()
+            .expect("multi-input shared-output rejection failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{flag} with multiple inputs and one -o should fail"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("-o") && stderr.contains("multiple input files"),
+            "expected a multi-input -o diagnostic for {flag}: {stderr}"
+        );
+        assert!(
+            !dir.join("combined.out").exists(),
+            "{flag} rejection must not create the requested shared output"
+        );
+        assert!(
+            !dir.join("a.out").exists(),
+            "{flag} rejection must not link an executable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn multi_input_terminal_mode_failure_removes_only_the_failed_stale_output() {
+    let dir = unique_dir("multi_terminal_partial");
+    write_program_in(
+        &dir,
+        "good.f90",
+        "subroutine good()\n  print *, 1\nend subroutine good\n",
+    );
+    write_program_in(
+        &dir,
+        "broken.f90",
+        "program broken\n  integer :: x\n  x =\nend program broken\n",
+    );
+    std::fs::write(dir.join("broken.s"), "stale assembly\n").expect("write stale output");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-S", "good.f90", "broken.f90"])
+        .output()
+        .expect("partial multi-input compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "a malformed second input should fail the overall command"
+    );
+    let good_asm =
+        std::fs::read_to_string(dir.join("good.s")).expect("successful first output is missing");
+    assert!(
+        good_asm.contains(".text"),
+        "successful first input should retain its requested assembly output"
+    );
+    assert!(
+        !dir.join("broken.s").exists(),
+        "the failed input must not leave a stale output looking successful"
+    );
+    assert!(
+        !dir.join("a.out").exists(),
+        "a partial terminal-mode failure must not link an executable"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn compile_only_explicit_object_path_keeps_module_in_current_dir() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

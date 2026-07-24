@@ -146,6 +146,95 @@ enum CliInputKind {
     UnsupportedSource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    Preprocess,
+    Tokens,
+    Ast,
+    Ir,
+    Assembly,
+    Object,
+}
+
+impl TerminalMode {
+    /// Return the first terminal phase reached by `compile_with_bundled_runtime`.
+    ///
+    /// Keeping this order aligned with that pipeline makes multi-input jobs
+    /// obey the same mode precedence as single-input jobs even if callers
+    /// construct `Options` directly with more than one mode bit set.
+    fn from_options(opts: &Options) -> Option<Self> {
+        if opts.preprocess_only {
+            Some(Self::Preprocess)
+        } else if opts.emit_tokens {
+            Some(Self::Tokens)
+        } else if opts.emit_ast {
+            Some(Self::Ast)
+        } else if opts.emit_ir {
+            Some(Self::Ir)
+        } else if opts.emit_asm {
+            Some(Self::Assembly)
+        } else if opts.emit_obj {
+            Some(Self::Object)
+        } else {
+            None
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Preprocess => "-E",
+            Self::Tokens => "--emit-tokens",
+            Self::Ast => "--emit-ast",
+            Self::Ir => "--emit-ir",
+            Self::Assembly => "-S",
+            Self::Object => "-c",
+        }
+    }
+
+    fn requires_dependency_order(self) -> bool {
+        matches!(self, Self::Ir | Self::Assembly | Self::Object)
+    }
+
+    fn configure_child(self, opts: &mut Options) {
+        opts.preprocess_only = false;
+        opts.emit_tokens = false;
+        opts.emit_ast = false;
+        opts.emit_ir = false;
+        opts.emit_asm = false;
+        opts.emit_obj = false;
+        match self {
+            Self::Preprocess => opts.preprocess_only = true,
+            Self::Tokens => opts.emit_tokens = true,
+            Self::Ast => opts.emit_ast = true,
+            Self::Ir => opts.emit_ir = true,
+            Self::Assembly => opts.emit_asm = true,
+            Self::Object => opts.emit_obj = true,
+        }
+    }
+
+    fn output_for_input(self, input: &Path) -> Option<PathBuf> {
+        if self == Self::Preprocess {
+            return None;
+        }
+        if self == Self::Object {
+            return Some(input.with_extension("o"));
+        }
+        let stem = input
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("a");
+        let extension = match self {
+            Self::Tokens => "tokens",
+            Self::Ast => "ast",
+            Self::Ir => "ir",
+            Self::Assembly => "s",
+            Self::Preprocess | Self::Object => unreachable!(),
+        };
+        Some(PathBuf::from(format!("{stem}.{extension}")))
+    }
+}
+
 /// Compilation options.
 #[derive(Clone)]
 pub struct Options {
@@ -2602,13 +2691,14 @@ fn link_multi(
     link_inputs(objs, output, opts, bundled_runtime)
 }
 
-/// Compile multiple Fortran source files with automatic dependency
-/// resolution, producing a single linked binary.
+/// Compile multiple Fortran source files while preserving the requested
+/// terminal phase.
 ///
-/// 1. Scan all files for MODULE/USE dependencies.
-/// 2. Topological sort (error on cycles).
-/// 3. Compile each in order to a temp .o + .amod.
-/// 4. Link all .o files into the output binary.
+/// Preprocessing and syntax dumps run in command order because they stop
+/// before module resolution. Later phases scan and topologically order module
+/// dependencies. Linking jobs compile temporary objects and link them; other
+/// terminal modes publish one natural output per source (or ordered stdout for
+/// `-E`) and never enter the linker.
 pub fn compile_multi(opts: &Options) -> Result<(), String> {
     compile_multi_with_bundled_runtime(opts, None)
 }
@@ -2620,8 +2710,12 @@ fn compile_multi_with_bundled_runtime(
     let mut all_inputs = vec![opts.input.clone()];
     all_inputs.extend(opts.extra_inputs.iter().cloned());
 
-    if opts.emit_obj && opts.output.is_some() {
-        return Err("-o cannot be used with -c and multiple input files".into());
+    let terminal_mode = TerminalMode::from_options(opts);
+    if let (Some(mode), Some(_)) = (terminal_mode, opts.output.as_ref()) {
+        return Err(format!(
+            "-o cannot be used with {} and multiple input files",
+            mode.flag()
+        ));
     }
 
     // Partition into Fortran sources (to compile) and prebuilt link
@@ -2639,21 +2733,47 @@ fn compile_multi_with_bundled_runtime(
         .cloned()
         .collect();
 
-    // Scan dependencies (sources only).
-    let file_deps: Vec<dep_scan::FileDeps> = source_inputs
-        .iter()
-        .map(|p| {
-            let source_form = source_form_for_input(opts, p);
-            let pp_config = preproc_config_for_input(opts, p, source_form);
-            dep_scan::scan_file(p, &pp_config)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // A terminal multi-input job owns one default output per source. Remove
+    // those destinations before scanning or compiling so a failed input can
+    // never leave an older artifact looking like the result of this command.
+    if let Some(mode) = terminal_mode {
+        for output in source_inputs
+            .iter()
+            .filter_map(|input| mode.output_for_input(input))
+        {
+            match fs::remove_file(&output) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot remove stale output '{}': {}",
+                        output.display(),
+                        error
+                    ));
+                }
+            }
+        }
+    }
 
-    // Topological sort.
-    let order = dep_scan::resolve_compilation_order(&file_deps)?;
+    // Syntax-only terminal phases must not acquire semantic dependency
+    // requirements merely because more than one input was supplied. Later
+    // phases still need module producers before their consumers.
+    let order: Vec<usize> = if terminal_mode.is_some_and(|mode| !mode.requires_dependency_order()) {
+        (0..source_inputs.len()).collect()
+    } else {
+        let file_deps: Vec<dep_scan::FileDeps> = source_inputs
+            .iter()
+            .map(|path| {
+                let source_form = source_form_for_input(opts, path);
+                let pp_config = preproc_config_for_input(opts, path, source_form);
+                dep_scan::scan_file(path, &pp_config)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        dep_scan::resolve_compilation_order(&file_deps)?
+    };
 
     // Compile each file in order.
-    let tmp_dir = if opts.emit_obj {
+    let tmp_dir = if terminal_mode.is_some() {
         None
     } else {
         let dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
@@ -2664,26 +2784,25 @@ fn compile_multi_with_bundled_runtime(
     let mut object_files: Vec<PathBuf> = Vec::new();
     let mut src_to_obj: Vec<(PathBuf, PathBuf)> = Vec::new();
     for &idx in &order {
-        let src = &file_deps[idx].path;
-        let obj_path = if opts.emit_obj {
-            src.with_extension("o")
+        let src = &source_inputs[idx];
+        let child_output = if let Some(mode) = terminal_mode {
+            mode.output_for_input(src)
         } else {
             let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-            tmp_dir.join(format!("source_{}.o", idx))
+            Some(tmp_dir.join(format!("source_{}.o", idx)))
         };
 
-        // Preserve every compilation-affecting option. Only orchestration
-        // fields and mutually exclusive output modes differ for a child job.
+        // Preserve every compilation-affecting option. Only orchestration and
+        // output ownership differ for a child job.
         let mut sub_opts = opts.clone();
         sub_opts.input = src.clone();
         sub_opts.extra_inputs.clear();
-        sub_opts.output = Some(obj_path.clone());
-        sub_opts.emit_asm = false;
-        sub_opts.emit_obj = true;
-        sub_opts.emit_ir = false;
-        sub_opts.emit_ast = false;
-        sub_opts.emit_tokens = false;
-        sub_opts.preprocess_only = false;
+        sub_opts.output = child_output.clone();
+        if let Some(mode) = terminal_mode {
+            mode.configure_child(&mut sub_opts);
+        } else {
+            TerminalMode::Object.configure_child(&mut sub_opts);
+        }
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
             if let Some(tmp_dir) = tmp_dir.as_ref() {
@@ -2692,13 +2811,14 @@ fn compile_multi_with_bundled_runtime(
             paths
         };
         compile_with_bundled_runtime(&sub_opts, bundled_runtime)?;
-        if !opts.emit_obj {
+        if terminal_mode.is_none() {
+            let obj_path = child_output.expect("object path for multi-file link");
             object_files.push(obj_path.clone());
             src_to_obj.push((src.clone(), obj_path));
         }
     }
 
-    if opts.emit_obj {
+    if terminal_mode.is_some() {
         return Ok(());
     }
 
