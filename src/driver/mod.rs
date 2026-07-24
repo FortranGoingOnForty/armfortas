@@ -157,6 +157,16 @@ pub enum LinkOperand {
     Library(String),
 }
 
+/// User-supplied target text for a make dependency rule.
+///
+/// GNU-compatible `-MT` accepts make syntax verbatim, while `-MQ` quotes
+/// make-special characters so the argument names a literal target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepTarget {
+    Verbatim(String),
+    Quoted(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalMode {
     Preprocess,
@@ -267,7 +277,7 @@ pub struct Options {
     /// Emit a make-style dependency file (`-MD`/`-MMD`, optionally `-MF`).
     pub emit_depfile: bool,
     pub depfile: Option<PathBuf>,
-    pub dep_targets: Vec<String>,
+    pub dep_targets: Vec<DepTarget>,
     pub depfile_phony: bool,
 
     // ---- Language ----
@@ -766,21 +776,27 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 let flag = arg.clone();
                 i += 1;
                 opts.emit_depfile = true;
-                opts.dep_targets.push(
-                    args.get(i)
-                        .ok_or_else(|| format!("{} requires a target", flag))?
-                        .clone(),
-                );
+                let target = args
+                    .get(i)
+                    .ok_or_else(|| format!("{} requires a target", flag))?
+                    .clone();
+                opts.dep_targets.push(if flag == "-MQ" {
+                    DepTarget::Quoted(target)
+                } else {
+                    DepTarget::Verbatim(target)
+                });
             }
             arg if arg.starts_with("-MT") => {
                 opts.emit_depfile = true;
-                opts.dep_targets
-                    .push(short_option_value(arg, "-MT", "a target")?.to_string());
+                opts.dep_targets.push(DepTarget::Verbatim(
+                    short_option_value(arg, "-MT", "a target")?.to_string(),
+                ));
             }
             arg if arg.starts_with("-MQ") => {
                 opts.emit_depfile = true;
-                opts.dep_targets
-                    .push(short_option_value(arg, "-MQ", "a target")?.to_string());
+                opts.dep_targets.push(DepTarget::Quoted(
+                    short_option_value(arg, "-MQ", "a target")?.to_string(),
+                ));
             }
 
             // ---- Debug / introspection ----
@@ -2380,17 +2396,19 @@ fn write_dependency_file(
         }
     }
 
-    let targets: Vec<String> = if opts.dep_targets.is_empty() {
-        vec![output.to_string_lossy().into_owned()]
-    } else {
-        opts.dep_targets.clone()
-    };
     let mut body = String::new();
-    for (idx, target) in targets.iter().enumerate() {
-        if idx > 0 {
-            body.push(' ');
+    if opts.dep_targets.is_empty() {
+        body.push_str(&escape_make_dep_token(&output.to_string_lossy()));
+    } else {
+        for (idx, target) in opts.dep_targets.iter().enumerate() {
+            if idx > 0 {
+                body.push(' ');
+            }
+            match target {
+                DepTarget::Verbatim(target) => body.push_str(target),
+                DepTarget::Quoted(target) => body.push_str(&escape_make_dep_token(target)),
+            }
         }
-        body.push_str(&escape_make_dep_token(target));
     }
     body.push_str(": ");
     body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
@@ -2415,10 +2433,11 @@ fn escape_make_dep_token(token: &str) -> String {
     let mut out = String::with_capacity(token.len());
     for ch in token.chars() {
         match ch {
-            ' ' | '#' | '\\' => {
+            ' ' | '\t' | '#' | '\\' => {
                 out.push('\\');
                 out.push(ch);
             }
+            '$' => out.push_str("$$"),
             _ => out.push(ch),
         }
     }
@@ -3152,6 +3171,29 @@ mod tests {
         let opts = Options::from_args(&args).expect("driver should accept -Os");
         assert_eq!(opts.opt_level, OptLevel::Os);
         assert_eq!(opts.input, PathBuf::from("hello.f90"));
+    }
+
+    #[test]
+    fn options_from_args_preserves_mt_and_mq_target_kinds_and_order() {
+        let args = vec![
+            "-MT".to_string(),
+            "raw separated".to_string(),
+            "-MQ".to_string(),
+            "quoted separated".to_string(),
+            "-MTraw-attached".to_string(),
+            "-MQquoted-attached".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let opts = Options::from_args(&args).expect("driver should accept -MT and -MQ targets");
+        assert_eq!(
+            opts.dep_targets,
+            vec![
+                DepTarget::Verbatim("raw separated".to_string()),
+                DepTarget::Quoted("quoted separated".to_string()),
+                DepTarget::Verbatim("raw-attached".to_string()),
+                DepTarget::Quoted("quoted-attached".to_string()),
+            ]
+        );
     }
 
     #[test]

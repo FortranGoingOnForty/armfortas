@@ -243,6 +243,87 @@ fn gnu_depfile_flags_write_make_dependency_file() {
 }
 
 #[test]
+fn depfile_distinguishes_mt_from_mq_and_quotes_dollar_paths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=depfile_distinguishes_mt_from_mq_and_quotes_dollar_paths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("depfile_dollar_quoting");
+    let src = write_program_in(
+        &dir,
+        "source$unit.f90",
+        "program dep_quote\n  print *, 42\nend program dep_quote\n",
+    );
+    let obj = dir.join("object$unit.o");
+    let default_depfile = dir.join("default.d");
+    std::fs::write(&default_depfile, "stale dependency output\n")
+        .expect("cannot seed stale dependency file");
+
+    let default_result = Command::new(compiler("armfortas"))
+        .args(["-MD", "-MF"])
+        .arg(&default_depfile)
+        .arg("-c")
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("default-target compile spawn failed");
+    assert!(
+        default_result.status.success(),
+        "default-target compile failed: {}",
+        String::from_utf8_lossy(&default_result.stderr)
+    );
+    let default_deps =
+        std::fs::read_to_string(&default_depfile).expect("missing default dependency file");
+    assert_eq!(
+        default_deps,
+        format!(
+            "{}: {}\n",
+            obj.to_string_lossy().replace('$', "$$"),
+            src.to_string_lossy().replace('$', "$$")
+        ),
+        "default targets and prerequisite paths must quote dollars for GNU make"
+    );
+
+    let explicit_depfile = dir.join("explicit.d");
+    let raw_target = "raw target$mt";
+    let quoted_target = "quoted target$mq";
+    let explicit_result = Command::new(compiler("armfortas"))
+        .args(["-MD", "-MF"])
+        .arg(&explicit_depfile)
+        .arg("-MT")
+        .arg(raw_target)
+        .arg(format!("-MQ{quoted_target}"))
+        .arg("-c")
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("explicit-target compile spawn failed");
+    assert!(
+        explicit_result.status.success(),
+        "explicit-target compile failed: {}",
+        String::from_utf8_lossy(&explicit_result.stderr)
+    );
+    let explicit_deps =
+        std::fs::read_to_string(&explicit_depfile).expect("missing explicit dependency file");
+    assert_eq!(
+        explicit_deps,
+        format!(
+            "{raw_target} quoted\\ target$$mq: {}\n",
+            src.to_string_lossy().replace('$', "$$")
+        ),
+        "-MT must remain verbatim while -MQ receives make quoting"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn depfile_tracks_transitive_preprocessor_includes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
