@@ -4,6 +4,8 @@
 //! from the compiler pipeline so the external `afs-tests` runner can assert on
 //! more than just final program output.
 
+pub mod managed_process;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
@@ -25,6 +27,7 @@ use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
 use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
 use crate::sema::{resolve, validate};
+use managed_process::{run as run_managed, CommandClass};
 
 /// Return the profile directory that contains the running Cargo test.
 ///
@@ -760,6 +763,7 @@ pub fn capture_from_path_with_module_search_paths(
             detail: format!("cannot create temp dir '{}': {}", temp_root.display(), e),
             stages: stages.clone(),
         })?;
+        let _temp_cleanup = TempTreeCleanup(temp_root.clone());
         fs::write(&asm_path, &asm_text).map_err(|e| CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,
@@ -803,16 +807,17 @@ pub fn capture_from_path_with_module_search_paths(
                 detail: format!("cannot create run sandbox '{}': {}", sandbox.display(), e),
                 stages: stages.clone(),
             })?;
-            let output = Command::new(&bin_path)
-                .current_dir(&sandbox)
-                .output()
-                .map_err(|e| CaptureFailure {
-                    input: input.clone(),
-                    opt_level: request.opt_level,
-                    stage: FailureStage::Run,
-                    detail: format!("cannot run '{}': {}", bin_path.display(), e),
-                    stages: stages.clone(),
-                })?;
+            let output = run_managed(
+                Command::new(&bin_path).current_dir(&sandbox),
+                CommandClass::Run,
+            )
+            .map_err(|e| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Run,
+                detail: format!("cannot run '{}': {}", bin_path.display(), e),
+                stages: stages.clone(),
+            })?;
             let files = snapshot_sandbox_files(&sandbox).map_err(|detail| CaptureFailure {
                 input: input.clone(),
                 opt_level: request.opt_level,
@@ -830,8 +835,6 @@ pub fn capture_from_path_with_module_search_paths(
                 }),
             );
         }
-
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     Ok(CaptureResult {
@@ -1148,6 +1151,14 @@ fn next_temp_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), id))
 }
 
+struct TempTreeCleanup(PathBuf);
+
+impl Drop for TempTreeCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Debug-format x86 machine functions for the Mir/Regalloc capture
 /// stages. A structured printer (MirView) is x10's call; until then a
 /// derive(Debug) dump is honest and greppable.
@@ -1160,14 +1171,15 @@ fn format_x86_functions(funcs: &[crate::codegen::x86::mir::X86Function]) -> Stri
 }
 
 fn assemble_with_system(asm_path: &Path, obj_path: &Path) -> Result<(), String> {
-    let output = Command::new("as")
-        .args([
+    let output = run_managed(
+        Command::new("as").args([
             "-o",
             obj_path.to_str().unwrap_or("output.o"),
             asm_path.to_str().unwrap_or("input.s"),
-        ])
-        .output()
-        .map_err(|e| format!("cannot run assembler: {}", e))?;
+        ]),
+        CommandClass::Tool,
+    )
+    .map_err(|e| format!("cannot run assembler: {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1197,10 +1209,11 @@ fn link_with_runtime(obj: &Path, output: &Path) -> Result<(), String> {
 
 fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
     let rt_path = find_runtime_lib()?;
-    let sdk = Command::new("xcrun")
-        .args(["--show-sdk-path"])
-        .output()
-        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    let sdk = run_managed(
+        Command::new("xcrun").args(["--show-sdk-path"]),
+        CommandClass::Tool,
+    )
+    .map_err(|e| format!("cannot run xcrun: {}", e))?;
     if !sdk.status.success() {
         return Err(format!(
             "xcrun failed:\n{}",
@@ -1209,8 +1222,8 @@ fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
     }
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
-    let ld = Command::new("ld")
-        .args([
+    let ld = run_managed(
+        Command::new("ld").args([
             obj.to_str().unwrap(),
             &rt_path,
             "-lSystem",
@@ -1220,9 +1233,10 @@ fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
             "_main",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| format!("cannot run linker: {}", e))?;
+        ]),
+        CommandClass::Compile,
+    )
+    .map_err(|e| format!("cannot run linker: {}", e))?;
     if ld.status.success() {
         Ok(())
     } else {
@@ -1269,11 +1283,13 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let output = Command::new(cargo)
-        .current_dir(workspace_root)
-        .args(profile.cargo_build_args())
-        .output()
-        .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
+    let output = run_managed(
+        Command::new(cargo)
+            .current_dir(workspace_root)
+            .args(profile.cargo_build_args()),
+        CommandClass::Compile,
+    )
+    .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1365,9 +1381,7 @@ pub fn find_inspection_tool(env_key: &str, candidates: &[&str]) -> String {
         return over.to_string_lossy().into_owned();
     }
     for candidate in candidates {
-        let probe = Command::new(candidate)
-            .arg("--version")
-            .output()
+        let probe = run_managed(Command::new(candidate).arg("--version"), CommandClass::Tool)
             .map(|out| out.status.success())
             .unwrap_or(false);
         if probe {
@@ -1387,9 +1401,7 @@ fn object_snapshot(path: &Path) -> Result<String, String> {
 }
 
 fn tool_output(tool: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(tool)
-        .args(args)
-        .output()
+    let output = run_managed(Command::new(tool).args(args), CommandClass::Tool)
         .map_err(|e| format!("cannot run {}: {}", tool, e))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
