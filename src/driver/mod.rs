@@ -146,6 +146,17 @@ enum CliInputKind {
     UnsupportedSource,
 }
 
+/// One user-supplied operand in the original linker stream.
+///
+/// Source paths are replaced with their compiled object paths just before
+/// linking, prebuilt artifacts pass through, and libraries retain their exact
+/// position between those inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOperand {
+    Input(PathBuf),
+    Library(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalMode {
     Preprocess,
@@ -310,8 +321,8 @@ pub struct Options {
     pub module_output_dir: Option<PathBuf>,
     /// `-L <dir>` library search paths passed to `ld`.
     pub library_search_paths: Vec<PathBuf>,
-    /// `-l<name>` libraries passed to `ld`.
-    pub link_libs: Vec<String>,
+    /// Positional inputs and `-l<name>` libraries in command-line order.
+    pub link_operands: Vec<LinkOperand>,
     /// `-shared` / `-static`.
     pub shared: bool,
     pub static_link: bool,
@@ -393,7 +404,7 @@ impl Default for Options {
             module_search_paths: Vec::new(),
             module_output_dir: None,
             library_search_paths: Vec::new(),
-            link_libs: Vec::new(),
+            link_operands: Vec::new(),
             shared: false,
             static_link: false,
             extra_link_args: Vec::new(),
@@ -593,12 +604,13 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
 
             "-l" => {
                 i += 1;
-                opts.link_libs
-                    .push(args.get(i).ok_or("-l requires a library name")?.clone());
+                opts.link_operands.push(LinkOperand::Library(
+                    args.get(i).ok_or("-l requires a library name")?.clone(),
+                ));
             }
-            arg if arg.starts_with("-l") => opts
-                .link_libs
-                .push(short_option_value(arg, "-l", "a library name")?.to_string()),
+            arg if arg.starts_with("-l") => opts.link_operands.push(LinkOperand::Library(
+                short_option_value(arg, "-l", "a library name")?.to_string(),
+            )),
 
             "-rpath" | "--rpath" => {
                 i += 1;
@@ -786,7 +798,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             }
 
             // ---- Positional input file ----
-            arg if !arg.starts_with('-') => inputs.push(PathBuf::from(arg)),
+            arg if !arg.starts_with('-') => {
+                let input = PathBuf::from(arg);
+                opts.link_operands.push(LinkOperand::Input(input.clone()));
+                inputs.push(input);
+            }
 
             other => return Err(format!("unknown option: {}", other)),
         }
@@ -1326,6 +1342,42 @@ fn all_input_paths(opts: &Options) -> Vec<PathBuf> {
     let mut inputs = vec![opts.input.clone()];
     inputs.extend(opts.extra_inputs.iter().cloned());
     inputs
+}
+
+fn resolve_link_operands(inputs: &[PathBuf], opts: &Options) -> Result<Vec<LinkOperand>, String> {
+    // Programmatic callers historically supplied only `input` /
+    // `extra_inputs`. Preserve that API by treating an empty stream as all
+    // positional inputs and no libraries.
+    if opts.link_operands.is_empty() {
+        return Ok(inputs.iter().cloned().map(LinkOperand::Input).collect());
+    }
+
+    let input_slots = opts
+        .link_operands
+        .iter()
+        .filter(|operand| matches!(operand, LinkOperand::Input(_)))
+        .count();
+    if input_slots != inputs.len() {
+        return Err(format!(
+            "internal error: linker operand stream has {} input slots for {} resolved inputs",
+            input_slots,
+            inputs.len()
+        ));
+    }
+
+    let mut resolved_inputs = inputs.iter();
+    opts.link_operands
+        .iter()
+        .map(|operand| match operand {
+            LinkOperand::Input(_) => Ok(LinkOperand::Input(
+                resolved_inputs
+                    .next()
+                    .expect("validated linker input slot count")
+                    .clone(),
+            )),
+            LinkOperand::Library(name) => Ok(LinkOperand::Library(name.clone())),
+        })
+        .collect()
 }
 
 fn classify_cli_input(path: &Path) -> CliInputKind {
@@ -2446,15 +2498,15 @@ fn link_inputs_elf_with_bundled_runtime(
     if let Some(dirs) = env_override("LIBRARY_PATH") {
         lib_paths.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
+    let operands = resolve_link_operands(inputs, opts)?;
     let args = elf_crt::elf_link_args(
         &opts.target,
         &crt,
-        inputs,
+        &operands,
         runtime.path(),
         output,
         pie,
         &lib_paths,
-        &opts.link_libs,
     )?;
 
     // x16: honor the AFS_LD routing on ELF targets too — previously
@@ -2498,8 +2550,14 @@ fn link_inputs(
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
     let mut args: Vec<String> = vec!["-o".into(), output.to_string_lossy().into_owned()];
-    for input in inputs {
-        args.push(input.to_string_lossy().into_owned());
+    for dir in &opts.library_search_paths {
+        args.push(format!("-L{}", dir.display()));
+    }
+    for operand in resolve_link_operands(inputs, opts)? {
+        match operand {
+            LinkOperand::Input(path) => args.push(path.to_string_lossy().into_owned()),
+            LinkOperand::Library(name) => args.push(format!("-l{name}")),
+        }
     }
     args.extend([
         runtime.path().to_string_lossy().into_owned(),
@@ -2514,7 +2572,7 @@ fn link_inputs(
         // Apple ld trim unused runtime surfaces from final executables.
         args.push("-dead_strip".into());
     }
-    push_link_flags(&mut args, opts);
+    push_macho_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line("ld", &args);
@@ -2553,12 +2611,22 @@ fn link_inputs_with_afs_ld(
         args.extend(["-e".into(), "_main".into()]);
     }
     args.extend(["-o".into(), output.to_string_lossy().into_owned()]);
-    for input in inputs {
-        args.push(input.to_string_lossy().into_owned());
+    for dir in &opts.library_search_paths {
+        args.push("-L".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    for operand in resolve_link_operands(inputs, opts)? {
+        match operand {
+            LinkOperand::Input(path) => args.push(path.to_string_lossy().into_owned()),
+            LinkOperand::Library(name) => {
+                args.push("-l".into());
+                args.push(name);
+            }
+        }
     }
     args.push(runtime.path().to_string_lossy().into_owned());
     args.push(libsystem_tbd);
-    push_afs_ld_link_flags(&mut args, opts);
+    push_afs_ld_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line(linker, &args);
@@ -2579,17 +2647,9 @@ fn link_inputs_with_afs_ld(
     }
 }
 
-/// Append the user-supplied linker flags from `opts` to `args`.
-/// `-L<dir>` and `-l<name>` map directly; `-rpath` is passed as a
-/// pair; `-shared` switches output type; `-static` discourages
-/// dynamic linking on supported platforms.
-fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
-    for dir in &opts.library_search_paths {
-        args.push(format!("-L{}", dir.display()));
-    }
-    for lib in &opts.link_libs {
-        args.push(format!("-l{}", lib));
-    }
+/// Append Mach-O flags that do not participate in the ordered user operand
+/// stream. Search paths and inputs/libraries are emitted before this point.
+fn push_macho_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
     for path in &opts.rpath {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
@@ -2614,15 +2674,7 @@ fn print_verbose_command_line(program: &str, args: &[String]) {
     }
 }
 
-fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
-    for dir in &opts.library_search_paths {
-        args.push("-L".into());
-        args.push(dir.to_string_lossy().into_owned());
-    }
-    for lib in &opts.link_libs {
-        args.push("-l".into());
-        args.push(lib.clone());
-    }
+fn push_afs_ld_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
     for path in &opts.rpath {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
@@ -2727,12 +2779,6 @@ fn compile_multi_with_bundled_runtime(
         .filter(|p| classify_cli_input(p) == CliInputKind::FortranSource)
         .cloned()
         .collect();
-    let artifact_inputs: Vec<PathBuf> = all_inputs
-        .iter()
-        .filter(|p| classify_cli_input(p) == CliInputKind::LinkArtifact)
-        .cloned()
-        .collect();
-
     // A terminal multi-input job owns one default output per source. Remove
     // those destinations before scanning or compiling so a failed input can
     // never leave an older artifact looking like the result of this command.
@@ -2781,8 +2827,10 @@ fn compile_multi_with_bundled_runtime(
         Some(dir)
     };
 
-    let mut object_files: Vec<PathBuf> = Vec::new();
-    let mut src_to_obj: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Compilation may run in dependency order, but linker operands must remain
+    // in command-line order. Keep each generated object in the slot belonging
+    // to its source rather than appending in compilation order.
+    let mut source_objects: Vec<Option<PathBuf>> = vec![None; source_inputs.len()];
     for &idx in &order {
         let src = &source_inputs[idx];
         let child_output = if let Some(mode) = terminal_mode {
@@ -2813,8 +2861,7 @@ fn compile_multi_with_bundled_runtime(
         compile_with_bundled_runtime(&sub_opts, bundled_runtime)?;
         if terminal_mode.is_none() {
             let obj_path = child_output.expect("object path for multi-file link");
-            object_files.push(obj_path.clone());
-            src_to_obj.push((src.clone(), obj_path));
+            source_objects[idx] = Some(obj_path);
         }
     }
 
@@ -2825,24 +2872,21 @@ fn compile_multi_with_bundled_runtime(
     // Assemble the link list in original command order: each source becomes
     // its compiled object; prebuilt artifacts pass straight through. This
     // preserves the ordering callers rely on (objects before archives).
-    let link_list: Vec<PathBuf> = if artifact_inputs.is_empty() {
-        object_files
-    } else {
-        all_inputs
-            .iter()
-            .map(|input| {
-                if classify_cli_input(input) == CliInputKind::LinkArtifact {
-                    input.clone()
-                } else {
-                    src_to_obj
-                        .iter()
-                        .find(|(src, _)| src == input)
-                        .map(|(_, obj)| obj.clone())
-                        .unwrap_or_else(|| input.clone())
-                }
-            })
-            .collect()
-    };
+    let mut next_source = 0;
+    let link_list: Vec<PathBuf> = all_inputs
+        .iter()
+        .map(|input| {
+            if classify_cli_input(input) == CliInputKind::LinkArtifact {
+                input.clone()
+            } else {
+                let object = source_objects[next_source]
+                    .take()
+                    .expect("every source must produce one link object");
+                next_source += 1;
+                object
+            }
+        })
+        .collect();
 
     // Link all object files.
     let output = opts
@@ -3307,6 +3351,68 @@ mod tests {
         };
         assert_eq!(opts.module_output_dir, Some(PathBuf::from("mods")));
         assert_eq!(opts.module_search_paths, vec![PathBuf::from("mods")]);
+    }
+
+    #[test]
+    fn parse_cli_preserves_input_and_library_operand_order() {
+        let args = vec![
+            "main.o".to_string(),
+            "-lprovider".to_string(),
+            "consumer.o".to_string(),
+            "-l".to_string(),
+            "tail".to_string(),
+        ];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should parse link operands")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.input, PathBuf::from("main.o"));
+        assert_eq!(opts.extra_inputs, vec![PathBuf::from("consumer.o")]);
+        assert_eq!(
+            opts.link_operands,
+            vec![
+                LinkOperand::Input(PathBuf::from("main.o")),
+                LinkOperand::Library("provider".to_string()),
+                LinkOperand::Input(PathBuf::from("consumer.o")),
+                LinkOperand::Library("tail".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_link_operands_substitutes_compiled_sources_without_reordering_libraries() {
+        let args = vec![
+            "consumer.f90".to_string(),
+            "-lprovider".to_string(),
+            "main.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should parse link operands")
+        else {
+            panic!("expected compile options");
+        };
+
+        assert_eq!(
+            resolve_link_operands(
+                &[
+                    PathBuf::from("/tmp/consumer.o"),
+                    PathBuf::from("/tmp/main.o"),
+                ],
+                &opts,
+            )
+            .expect("compiled sources should fill their original linker slots"),
+            vec![
+                LinkOperand::Input(PathBuf::from("/tmp/consumer.o")),
+                LinkOperand::Library("provider".to_string()),
+                LinkOperand::Input(PathBuf::from("/tmp/main.o")),
+            ]
+        );
+
+        let mismatch =
+            resolve_link_operands(&[PathBuf::from("/tmp/consumer.o")], &opts).unwrap_err();
+        assert!(
+            mismatch.contains("2 input slots for 1 resolved inputs"),
+            "malformed programmatic options must fail loudly: {mismatch}"
+        );
     }
 
     fn i128_fixture() -> PathBuf {

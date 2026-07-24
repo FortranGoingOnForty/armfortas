@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::LinkOperand;
 use crate::target::{Libc, Os, TargetSpec};
 
 /// The crt objects one PIE link needs, in link order.
@@ -258,22 +259,20 @@ fn newest_gcc_dir(roots: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// Build the complete `ld` argv for one ELF executable link. Link
-/// order is load-bearing: crt1/crti/crtbegin precede user objects;
-/// libraries follow the runtime archive (`-lc` after
-/// libarmfortas_rt.a or runtime externs go unresolved); crtend/crtn
-/// close. `--eh-frame-hdr` because Rust unwinding needs
+/// order is load-bearing: crt1/crti/crtbegin precede the ordered user
+/// operand stream; the runtime and its native libraries follow it
+/// (`-lc` after libarmfortas_rt.a or runtime externs go unresolved);
+/// crtend/crtn close. `--eh-frame-hdr` because Rust unwinding needs
 /// `PT_GNU_EH_FRAME`; `--gc-sections` keeps the coarse Rust runtime
 /// archive from dragging unused intrinsic surfaces into small binaries.
-#[allow(clippy::too_many_arguments)]
 pub fn elf_link_args(
     target: &TargetSpec,
     crt: &CrtSet,
-    objects: &[PathBuf],
+    operands: &[LinkOperand],
     runtime_lib: &Path,
     output: &Path,
     pie: bool,
     library_search_paths: &[PathBuf],
-    link_libs: &[String],
 ) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = Vec::new();
     if pie {
@@ -288,22 +287,17 @@ pub fn elf_link_args(
     args.push(crt.crt1.to_string_lossy().into_owned());
     args.push(crt.crti.to_string_lossy().into_owned());
     args.push(crt.crtbegin.to_string_lossy().into_owned());
-    for obj in objects {
-        args.push(obj.to_string_lossy().into_owned());
-    }
-    args.push(runtime_lib.to_string_lossy().into_owned());
+
+    // Search paths precede every user library while preserving user-before-
+    // system precedence. GNU ld applies -L globally, but putting them first
+    // also preserves the contract on linkers that process argv strictly.
     for dir in library_search_paths {
         args.push(format!("-L{}", dir.display()));
     }
-    for lib in link_libs {
-        args.push(format!("-l{}", lib));
-    }
-    // System search dirs after user -L: ld resolves -l left-to-right
-    // through the -L list in argv order, so user dirs win. The crt1
-    // dir rides along so a -B/AFS_CRT_DIR root (NixOS) also resolves
-    // its libc; the crtbegin dir because on Debian/Ubuntu (and in nix
-    // gcc store paths) the unversioned libgcc_s.so linker script lives
-    // in the GCC dir, nowhere on the standard -L path.
+    // The crt1 dir rides along so a -B/AFS_CRT_DIR root (NixOS) also
+    // resolves its libc; the crtbegin dir because on Debian/Ubuntu (and in
+    // nix gcc store paths) the unversioned libgcc_s.so linker script lives in
+    // the GCC dir, nowhere on the standard -L path.
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
     if let Some(parent) = crt.crt1.parent() {
         lib_dirs.push(parent.to_path_buf());
@@ -318,6 +312,14 @@ pub fn elf_link_args(
     for dir in lib_dirs.iter().filter(|d| d.is_dir()) {
         args.push(format!("-L{}", dir.display()));
     }
+
+    for operand in operands {
+        match operand {
+            LinkOperand::Input(path) => args.push(path.to_string_lossy().into_owned()),
+            LinkOperand::Library(name) => args.push(format!("-l{name}")),
+        }
+    }
+    args.push(runtime_lib.to_string_lossy().into_owned());
     for lib in native_libs(target) {
         args.push((*lib).to_string());
     }
@@ -430,12 +432,15 @@ mod tests {
         let args = elf_link_args(
             &t("x86_64-freebsd"),
             &crt,
-            &[PathBuf::from("/tmp/a.o"), PathBuf::from("/tmp/b.o")],
+            &[
+                LinkOperand::Input(PathBuf::from("/tmp/a.o")),
+                LinkOperand::Library("foo".to_string()),
+                LinkOperand::Input(PathBuf::from("/tmp/b.o")),
+            ],
             Path::new("/rt/libarmfortas_rt.a"),
             Path::new("/tmp/out"),
             true,
             &[PathBuf::from("/userlibs")],
-            &["foo".to_string()],
         )
         .unwrap();
         let expect_prefix = [
@@ -453,7 +458,8 @@ mod tests {
                 .position(|a| a == needle)
                 .unwrap_or_else(|| panic!("missing {} in {:?}", needle, args))
         };
-        // crt1 < crti < crtbegin < objects < runtime < -lfoo < -lc < crtend < crtn
+        // Search paths precede an exactly ordered a.o, -lfoo, b.o stream;
+        // the compiler runtime and native libraries follow that stream.
         let crt1 = pos(crt.crt1.to_str().unwrap());
         let crti = pos(crt.crti.to_str().unwrap());
         let begin = pos(crt.crtbegin.to_str().unwrap());
@@ -465,8 +471,8 @@ mod tests {
         let libc = pos("-lc");
         let end = pos(crt.crtend.to_str().unwrap());
         let crtn = pos(crt.crtn.to_str().unwrap());
-        assert!(crt1 < crti && crti < begin && begin < a_o && a_o < b_o && b_o < rt);
-        assert!(rt < userdir && userdir < userlib && userlib < libc);
+        assert!(crt1 < crti && crti < begin && begin < userdir && userdir < a_o);
+        assert!(a_o < userlib && userlib < b_o && b_o < rt && rt < libc);
         assert!(libc < end && end < crtn && crtn == args.len() - 1);
         // User -L outranks every system -L (left-to-right resolution).
         if let Some(sys) = args
@@ -485,11 +491,10 @@ mod tests {
         let args = elf_link_args(
             &t("x86_64-freebsd"),
             &crt,
-            &[PathBuf::from("/tmp/a.o")],
+            &[LinkOperand::Input(PathBuf::from("/tmp/a.o"))],
             Path::new("/rt/libarmfortas_rt.a"),
             Path::new("/tmp/out"),
             false,
-            &[],
             &[],
         )
         .unwrap();

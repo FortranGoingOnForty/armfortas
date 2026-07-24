@@ -14367,6 +14367,233 @@ fn prebuilt_archive_input_links_after_objects() {
 }
 
 #[test]
+fn elf_link_preserves_object_and_dash_l_operand_order() {
+    if armfortas::target::TargetSpec::host().object_format() != armfortas::target::ObjectFormat::Elf
+    {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elf_link_preserves_object_and_dash_l_operand_order count=1 reason=\"ELF archive-order contract requires an ELF host\""
+        );
+        return;
+    }
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elf_link_preserves_object_and_dash_l_operand_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("link_operand_order");
+    let provider_src = write_program_in(
+        &dir,
+        "provider.f90",
+        "integer function provider()\n  provider = 42\nend function provider\n",
+    );
+    let consumer_src = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module consumer_mod\ncontains\n  integer function consumer()\n    integer, external :: provider\n    consumer = provider()\n  end function consumer\nend module consumer_mod\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use consumer_mod, only: consumer\n  print *, consumer()\nend program p\n",
+    );
+
+    let provider_obj = dir.join("provider.o");
+    let consumer_obj = dir.join("consumer.o");
+    let main_obj = dir.join("main.o");
+    for (source, object) in [
+        (&provider_src, &provider_obj),
+        (&consumer_src, &consumer_obj),
+        (&main_src, &main_obj),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("archive-order fixture compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "archive-order fixture compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let archive = dir.join("libprovider.a");
+    let ar = Command::new("ar")
+        .args([
+            "rcs",
+            archive.to_str().unwrap(),
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("archive-order fixture ar failed to spawn");
+    assert!(
+        ar.status.success(),
+        "archive-order fixture ar failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
+
+    let correct = dir.join("correct-order");
+    let correct_link = Command::new(compiler("armfortas"))
+        .env("AFS_LD", "0")
+        .args([
+            main_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-lprovider",
+            "-o",
+            correct.to_str().unwrap(),
+        ])
+        .output()
+        .expect("correct-order link failed to spawn");
+    assert!(
+        correct_link.status.success(),
+        "objects before their provider archive should link: {}",
+        String::from_utf8_lossy(&correct_link.stderr)
+    );
+    let run = Command::new(&correct)
+        .output()
+        .expect("correct-order executable failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("42"),
+        "correct-order executable produced the wrong result:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let wrong = dir.join("wrong-order");
+    assert!(!wrong.exists(), "failure output must start fresh");
+    let wrong_link = Command::new(compiler("armfortas"))
+        .env("AFS_LD", "0")
+        .args([
+            main_obj.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-lprovider",
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            wrong.to_str().unwrap(),
+        ])
+        .output()
+        .expect("wrong-order link failed to spawn");
+    assert!(
+        !wrong_link.status.success(),
+        "an archive before the object that needs it must not be silently moved after that object"
+    );
+    assert!(
+        !wrong.exists(),
+        "a failed order-sensitive link must not leave a fresh executable"
+    );
+
+    let stale_wrong = dir.join("stale-wrong-order");
+    std::fs::copy(&correct, &stale_wrong).expect("failed to seed stale executable");
+    let stale_wrong_link = Command::new(compiler("armfortas"))
+        .env("AFS_LD", "0")
+        .args([
+            main_obj.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-lprovider",
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            stale_wrong.to_str().unwrap(),
+        ])
+        .output()
+        .expect("stale wrong-order link failed to spawn");
+    assert!(
+        !stale_wrong_link.status.success(),
+        "a stale output must not turn an order-sensitive link failure into success"
+    );
+    assert!(
+        !stale_wrong.exists(),
+        "a failed order-sensitive link must not preserve a stale executable"
+    );
+
+    // The sources are deliberately supplied consumer-last even though the
+    // module dependency requires compiling consumer.f90 before main.f90.
+    // Compilation order must not leak into the reconstructed linker stream.
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let label = &opt[1..];
+        let source_correct = dir.join(format!("source-correct-order-{label}"));
+        let source_correct_link = Command::new(compiler("armfortas"))
+            .env("AFS_LD", "0")
+            .args([
+                opt,
+                "-J",
+                dir.to_str().unwrap(),
+                main_src.to_str().unwrap(),
+                consumer_src.to_str().unwrap(),
+                "-L",
+                dir.to_str().unwrap(),
+                "-lprovider",
+                "-o",
+                source_correct.to_str().unwrap(),
+            ])
+            .output()
+            .expect("correct-order source link failed to spawn");
+        assert!(
+            source_correct_link.status.success(),
+            "{opt}: source objects before their provider archive should link: {}",
+            String::from_utf8_lossy(&source_correct_link.stderr)
+        );
+        let source_run = Command::new(&source_correct)
+            .output()
+            .expect("correct-order source executable failed to run");
+        assert!(
+            source_run.status.success()
+                && String::from_utf8_lossy(&source_run.stdout).contains("42"),
+            "{opt}: correct-order source executable produced the wrong result:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&source_run.stdout),
+            String::from_utf8_lossy(&source_run.stderr)
+        );
+
+        let source_wrong = dir.join(format!("source-wrong-order-{label}"));
+        assert!(
+            !source_wrong.exists(),
+            "{opt}: source failure output must start fresh"
+        );
+        let source_wrong_link = Command::new(compiler("armfortas"))
+            .env("AFS_LD", "0")
+            .args([
+                opt,
+                "-J",
+                dir.to_str().unwrap(),
+                main_src.to_str().unwrap(),
+                "-L",
+                dir.to_str().unwrap(),
+                "-lprovider",
+                consumer_src.to_str().unwrap(),
+                "-o",
+                source_wrong.to_str().unwrap(),
+            ])
+            .output()
+            .expect("wrong-order source link failed to spawn");
+        assert!(
+            !source_wrong_link.status.success(),
+            "{opt}: dependency-order compilation must not move consumer.f90 before its archive"
+        );
+        assert!(
+            !source_wrong.exists(),
+            "{opt}: a failed source order-sensitive link must not leave a fresh executable"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dash_capital_s_produces_assembly_text() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
