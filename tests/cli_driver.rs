@@ -14975,6 +14975,73 @@ fn dash_capital_e_rejects_conditionals_crossing_include_boundaries() {
 }
 
 #[test]
+fn dash_capital_e_short_circuits_if_expressions_without_skipping_syntax() {
+    let dir = unique_dir("pp_if_short_circuit");
+    let source = write_program_in(
+        &dir,
+        "valid.F90",
+        "#if 0 && (1 / 0)\ndead_and = 1\n#else\nand_ok = 1\n#endif\n\
+         #if 1 || (1 % 0)\nor_ok = 1\n#else\ndead_or = 1\n#endif\n",
+    );
+    let output = dir.join("valid.pp.f90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-E"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("short-circuit preprocess failed to spawn");
+    assert!(
+        result.status.success(),
+        "dead arithmetic fault was evaluated: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let preprocessed = std::fs::read_to_string(&output).expect("missing preprocess output");
+    assert!(
+        preprocessed.contains("and_ok = 1") && preprocessed.contains("or_ok = 1"),
+        "short-circuit preprocess selected the wrong branches: {preprocessed}"
+    );
+    assert!(
+        !preprocessed.contains("dead_and") && !preprocessed.contains("dead_or"),
+        "short-circuit preprocess retained a dead branch: {preprocessed}"
+    );
+
+    for (kind, expression, diagnostic) in [
+        ("malformed", "0 && (1 / )", "unexpected token"),
+        ("live", "0 && (1 / 0) || (1 / 0)", "division by zero"),
+    ] {
+        let source = write_program_in(
+            &dir,
+            &format!("{kind}.F90"),
+            &format!("#if {expression}\nunexpected = 1\n#endif\n"),
+        );
+        let output = dir.join(format!("{kind}.pp.f90"));
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("invalid short-circuit preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} short-circuit operand unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(diagnostic),
+            "{kind} short-circuit diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{kind} short-circuit failure published preprocess output"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn dash_capital_e_without_o_writes_to_stdout() {
     let dir = unique_dir("pp_stdout");
     write_program_in(

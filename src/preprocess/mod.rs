@@ -2060,7 +2060,7 @@ impl<'a> ConditionExprParser<'a> {
     }
 
     fn parse(mut self) -> Result<i64, String> {
-        let value = self.parse_logical_or()?;
+        let value = self.parse_logical_or(true)?;
         self.skip_whitespace();
         if self.pos != self.input.len() {
             return Err(self.unexpected_token());
@@ -2068,121 +2068,152 @@ impl<'a> ConditionExprParser<'a> {
         Ok(value)
     }
 
-    fn parse_logical_or(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_logical_and()?;
+    fn parse_logical_or(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_logical_and(evaluate)?;
         while self.consume("||") {
-            let right = self.parse_logical_and()?;
-            left = i64::from(left != 0 || right != 0);
+            let right = self.parse_logical_and(evaluate && left == 0)?;
+            if evaluate {
+                left = i64::from(left != 0 || right != 0);
+            }
         }
         Ok(left)
     }
 
-    fn parse_logical_and(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_equality()?;
+    fn parse_logical_and(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_equality(evaluate)?;
         while self.consume("&&") {
-            let right = self.parse_equality()?;
-            left = i64::from(left != 0 && right != 0);
+            let right = self.parse_equality(evaluate && left != 0)?;
+            if evaluate {
+                left = i64::from(left != 0 && right != 0);
+            }
         }
         Ok(left)
     }
 
-    fn parse_equality(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_relational()?;
+    fn parse_equality(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_relational(evaluate)?;
         loop {
             if self.consume("==") {
-                let right = self.parse_relational()?;
-                left = i64::from(left == right);
+                let right = self.parse_relational(evaluate)?;
+                if evaluate {
+                    left = i64::from(left == right);
+                }
             } else if self.consume("!=") {
-                let right = self.parse_relational()?;
-                left = i64::from(left != right);
+                let right = self.parse_relational(evaluate)?;
+                if evaluate {
+                    left = i64::from(left != right);
+                }
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_relational(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_additive()?;
+    fn parse_relational(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_additive(evaluate)?;
         loop {
             if self.consume("<=") {
-                let right = self.parse_additive()?;
-                left = i64::from(left <= right);
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    left = i64::from(left <= right);
+                }
             } else if self.consume(">=") {
-                let right = self.parse_additive()?;
-                left = i64::from(left >= right);
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    left = i64::from(left >= right);
+                }
             } else if self.consume("<") {
-                let right = self.parse_additive()?;
-                left = i64::from(left < right);
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    left = i64::from(left < right);
+                }
             } else if self.consume(">") {
-                let right = self.parse_additive()?;
-                left = i64::from(left > right);
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    left = i64::from(left > right);
+                }
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_additive(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_multiplicative()?;
+    fn parse_additive(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_multiplicative(evaluate)?;
         loop {
             if self.consume("+") {
-                left = left.wrapping_add(self.parse_multiplicative()?);
+                let right = self.parse_multiplicative(evaluate)?;
+                if evaluate {
+                    left = left.wrapping_add(right);
+                }
             } else if self.consume("-") {
-                left = left.wrapping_sub(self.parse_multiplicative()?);
+                let right = self.parse_multiplicative(evaluate)?;
+                if evaluate {
+                    left = left.wrapping_sub(right);
+                }
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_multiplicative(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_unary()?;
+    fn parse_multiplicative(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_unary(evaluate)?;
         loop {
             if self.consume("*") {
-                left = left.wrapping_mul(self.parse_unary()?);
+                let right = self.parse_unary(evaluate)?;
+                if evaluate {
+                    left = left.wrapping_mul(right);
+                }
             } else if self.consume("/") {
-                let right = self.parse_unary()?;
-                if right == 0 {
-                    return Err("division by zero in #if expression".into());
+                let right = self.parse_unary(evaluate)?;
+                if evaluate {
+                    if right == 0 {
+                        return Err("division by zero in #if expression".into());
+                    }
+                    left = if left == i64::MIN && right == -1 {
+                        i64::MIN
+                    } else {
+                        left / right
+                    };
                 }
-                left = if left == i64::MIN && right == -1 {
-                    i64::MIN
-                } else {
-                    left / right
-                };
             } else if self.consume("%") {
-                let right = self.parse_unary()?;
-                if right == 0 {
-                    return Err("modulo by zero in #if expression".into());
+                let right = self.parse_unary(evaluate)?;
+                if evaluate {
+                    if right == 0 {
+                        return Err("modulo by zero in #if expression".into());
+                    }
+                    left = if left == i64::MIN && right == -1 {
+                        0
+                    } else {
+                        left % right
+                    };
                 }
-                left = if left == i64::MIN && right == -1 {
-                    0
-                } else {
-                    left % right
-                };
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_unary(&mut self) -> Result<i64, String> {
+    fn parse_unary(&mut self, evaluate: bool) -> Result<i64, String> {
         if self.consume("!") {
-            return Ok(i64::from(self.parse_unary()? == 0));
+            let value = self.parse_unary(evaluate)?;
+            return Ok(if evaluate { i64::from(value == 0) } else { 0 });
         }
         if self.consume("-") {
-            return Ok(self.parse_unary()?.wrapping_neg());
+            let value = self.parse_unary(evaluate)?;
+            return Ok(if evaluate { value.wrapping_neg() } else { 0 });
         }
         if self.consume("+") {
-            return self.parse_unary();
+            return self.parse_unary(evaluate);
         }
-        self.parse_primary()
+        self.parse_primary(evaluate)
     }
 
-    fn parse_primary(&mut self) -> Result<i64, String> {
+    fn parse_primary(&mut self, evaluate: bool) -> Result<i64, String> {
         self.skip_whitespace();
         if self.consume("(") {
-            let value = self.parse_logical_or()?;
+            let value = self.parse_logical_or(evaluate)?;
             if !self.consume(")") {
                 return Err("unmatched parenthesis in #if expression".into());
             }
@@ -2214,8 +2245,9 @@ impl<'a> ConditionExprParser<'a> {
                 if self.pos == digits {
                     return Err("invalid hex in #if: missing digits".into());
                 }
-                return i64::from_str_radix(&self.input[digits..self.pos], 16)
-                    .map_err(|err| format!("invalid hex in #if: {}", err));
+                let value = i64::from_str_radix(&self.input[digits..self.pos], 16)
+                    .map_err(|err| format!("invalid hex in #if: {}", err))?;
+                return Ok(if evaluate { value } else { 0 });
             }
 
             while self
@@ -2226,9 +2258,10 @@ impl<'a> ConditionExprParser<'a> {
             {
                 self.pos += 1;
             }
-            return self.input[start..self.pos]
+            let value = self.input[start..self.pos]
                 .parse::<i64>()
-                .map_err(|err| format!("invalid integer in #if: {}", err));
+                .map_err(|err| format!("invalid integer in #if: {}", err))?;
+            return Ok(if evaluate { value } else { 0 });
         }
 
         if bytes[self.pos].is_ascii_alphabetic() || bytes[self.pos] == b'_' {
@@ -3392,6 +3425,71 @@ end program
     fn eval_logical_or() {
         assert!(eval_expr("0 || 1").unwrap());
         assert!(!eval_expr("0 || 0").unwrap());
+    }
+
+    #[test]
+    fn eval_logical_operators_short_circuit_arithmetic_faults() {
+        assert_eq!(ConditionExprParser::new("0 && (1 / 0)").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("1 || (1 % 0)").parse().unwrap(), 1);
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 / 0) || 1")
+                .parse()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || 0 && (1 / 0)")
+                .parse()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || 1 / 0 && 0").parse().unwrap(),
+            1
+        );
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 / 0) || (1 / 0)")
+                .parse()
+                .unwrap_err(),
+            "division by zero in #if expression"
+        );
+    }
+
+    #[test]
+    fn eval_short_circuited_operands_still_require_valid_syntax() {
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 / )").parse().unwrap_err(),
+            "unexpected token in #if expression: ')'"
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || (1 % 0").parse().unwrap_err(),
+            "unmatched parenthesis in #if expression"
+        );
+    }
+
+    #[test]
+    fn eval_large_short_circuit_chain_is_iterative() {
+        let mut expression = String::from("1");
+        for _ in 0..20_000 {
+            expression.push_str(" || (1 / 0)");
+        }
+        assert_eq!(ConditionExprParser::new(&expression).parse().unwrap(), 1);
+    }
+
+    #[test]
+    fn if_logical_operators_short_circuit_dead_arithmetic() {
+        let output = preprocess(
+            "#if 0 && (1 / 0)\ndead_and\n#else\nand_ok\n#endif\n\
+             #if 1 || (1 % 0)\nor_ok\n#else\ndead_or\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap()
+        .text;
+        let output_lines = lines(&output);
+        assert!(output_lines.contains(&"and_ok"), "got: {output:?}");
+        assert!(output_lines.contains(&"or_ok"), "got: {output:?}");
+        assert!(!output.contains("dead_and"), "got: {output:?}");
+        assert!(!output.contains("dead_or"), "got: {output:?}");
     }
 
     #[test]
