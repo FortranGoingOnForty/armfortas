@@ -110,6 +110,332 @@ fn million_char_statement_compiles_and_warns_only_under_f2023() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn werror_promotes_source_limit_warnings_before_output_publication() {
+    let dir = std::env::temp_dir().join(format!("afs_srclim_werror_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f90 = dir.join("overlong_comment.f90");
+    let source = format!(
+        "program p\n! {}\n  print *, 7\nend program p\n",
+        "x".repeat(140)
+    );
+    std::fs::write(&f90, source).unwrap();
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        for stale in [false, true] {
+            let state = if stale { "stale" } else { "fresh" };
+            let asm = dir.join(format!(
+                "overlong_comment_{}_{}.s",
+                &optimization[2..],
+                state
+            ));
+            let depfile = asm.with_extension("d");
+            if stale {
+                std::fs::write(&asm, b"stale assembly").unwrap();
+                std::fs::write(&depfile, b"stale dependencies").unwrap();
+            }
+
+            let result = Command::new(compiler())
+                .args(["--std=f2018", "-Werror", optimization, "-S", "-MD"])
+                .arg("-MF")
+                .arg(&depfile)
+                .arg(&f90)
+                .arg("-o")
+                .arg(&asm)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("cannot run armfortas");
+            assert_eq!(
+                result.status.code(),
+                Some(1),
+                "source-limit -Werror must fail at {optimization} with {state} output:\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains("error: line is 142 characters long")
+                    && stderr.contains("limits free-form lines to 132"),
+                "source-limit warning was not promoted at {optimization} with {state} output:\n{stderr}"
+            );
+            assert!(
+                !asm.exists(),
+                "failed source-limit -Werror retained {state} output at {optimization}"
+            );
+            assert!(
+                !depfile.exists(),
+                "failed source-limit -Werror retained {state} dependency output at {optimization}"
+            );
+        }
+    }
+
+    let warning_asm = dir.join("warning.s");
+    let warning = Command::new(compiler())
+        .args(["--std=f2018", "-S"])
+        .arg(&f90)
+        .arg("-o")
+        .arg(&warning_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        warning.status.success(),
+        "source-limit warning without -Werror must still compile:\n{}",
+        String::from_utf8_lossy(&warning.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&warning.stderr).contains("warning: line is 142 characters long"),
+        "non-promoted source-limit diagnostic lost warning severity:\n{}",
+        String::from_utf8_lossy(&warning.stderr)
+    );
+    assert!(
+        warning_asm.is_file(),
+        "non-promoted source-limit warning did not publish assembly"
+    );
+
+    let overridden_asm = dir.join("overridden.s");
+    let overridden = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-ffree-line-length-142", "-S"])
+        .arg(&f90)
+        .arg("-o")
+        .arg(&overridden_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        overridden.status.success(),
+        "a matching numeric line limit must prevent promotion:\n{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+    assert!(
+        overridden.stderr.is_empty(),
+        "matching numeric line limit emitted a diagnostic:\n{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+    assert!(
+        overridden_asm.is_file(),
+        "numeric line-limit override did not publish assembly"
+    );
+
+    let suppressed_asm = dir.join("suppressed.s");
+    let suppressed = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-w", "-S"])
+        .arg(&f90)
+        .arg("-o")
+        .arg(&suppressed_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        suppressed.status.success(),
+        "-w must suppress source-limit promotion:\n{}",
+        String::from_utf8_lossy(&suppressed.stderr)
+    );
+    assert!(
+        suppressed.stderr.is_empty(),
+        "-w leaked source-limit diagnostics:\n{}",
+        String::from_utf8_lossy(&suppressed.stderr)
+    );
+    assert!(
+        suppressed_asm.is_file(),
+        "suppressed source-limit warning did not publish assembly"
+    );
+
+    let preprocess = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-E"])
+        .arg(&f90)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert_eq!(
+        preprocess.status.code(),
+        Some(1),
+        "source-limit -Werror must fail before preprocess output"
+    );
+    assert!(
+        preprocess.stdout.is_empty(),
+        "failed source-limit -Werror published preprocess output"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn source_limit_failure_cleanup_preserves_included_inputs() {
+    let dir = std::env::temp_dir().join(format!("afs_srclim_aliases_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let include = dir.join("protected.inc");
+    let include_contents = b"integer, parameter :: answer = 7\n";
+    std::fs::write(&include, include_contents).unwrap();
+    let including_source = dir.join("overlong_include.F90");
+    std::fs::write(
+        &including_source,
+        format!(
+            "program p\n#include \"protected.inc\"\n! {}\n  print *, answer\nend program p\n",
+            "x".repeat(140)
+        ),
+    )
+    .unwrap();
+    let alias_asm = dir.join("include_alias.s");
+    std::fs::write(&alias_asm, b"stale assembly").unwrap();
+    let include_alias = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-S", "-MD", "-MF"])
+        .arg(&include)
+        .arg(&including_source)
+        .arg("-o")
+        .arg(&alias_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert_eq!(
+        include_alias.status.code(),
+        Some(1),
+        "source-limit -Werror with an include/depfile alias must fail"
+    );
+    let include_alias_stderr = String::from_utf8_lossy(&include_alias.stderr);
+    assert!(
+        include_alias_stderr.contains("error: line is 142 characters long")
+            && include_alias_stderr.contains("conflicts with compiler input"),
+        "include/depfile alias did not retain both failure diagnostics:\n{include_alias_stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&include).expect("protected include disappeared"),
+        include_contents,
+        "source-limit cleanup mutated an included compiler input"
+    );
+    assert!(
+        !alias_asm.exists(),
+        "include/depfile conflict retained stale primary output"
+    );
+
+    let output_alias = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-S"])
+        .arg(&including_source)
+        .arg("-o")
+        .arg(&include)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert_eq!(
+        output_alias.status.code(),
+        Some(1),
+        "source-limit -Werror with an include/output alias must fail"
+    );
+    assert_eq!(
+        std::fs::read(&include).expect("output-aliased include disappeared"),
+        include_contents,
+        "source-limit cleanup mutated an output-aliased compiler input"
+    );
+
+    #[cfg(unix)]
+    {
+        let include_symlink = dir.join("protected_alias.inc");
+        std::os::unix::fs::symlink(&include, &include_symlink).unwrap();
+        let symlink_source = dir.join("overlong_symlink_include.F90");
+        std::fs::write(
+            &symlink_source,
+            format!(
+                "program p\n#include \"protected_alias.inc\"\n! {}\n  print *, answer\nend program p\n",
+                "x".repeat(140)
+            ),
+        )
+        .unwrap();
+
+        let symlink_depfile_asm = dir.join("symlink_depfile_alias.s");
+        std::fs::write(&symlink_depfile_asm, b"stale assembly").unwrap();
+        let symlink_depfile_alias = Command::new(compiler())
+            .args(["--std=f2018", "-Werror", "-S", "-MD", "-MF"])
+            .arg(&include)
+            .arg(&symlink_source)
+            .arg("-o")
+            .arg(&symlink_depfile_asm)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("cannot run armfortas");
+        assert_eq!(
+            symlink_depfile_alias.status.code(),
+            Some(1),
+            "source-limit cleanup accepted a depfile alias hidden by an include symlink"
+        );
+        assert!(
+            String::from_utf8_lossy(&symlink_depfile_alias.stderr)
+                .contains("conflicts with compiler input"),
+            "missing symlink-hidden depfile conflict diagnostic:\n{}",
+            String::from_utf8_lossy(&symlink_depfile_alias.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&include).expect("symlink-aliased include target disappeared"),
+            include_contents,
+            "source-limit cleanup mutated a symlink-aliased include target"
+        );
+        assert!(
+            !symlink_depfile_asm.exists(),
+            "symlink-hidden depfile conflict retained stale primary output"
+        );
+
+        let symlink_output_alias = Command::new(compiler())
+            .args(["--std=f2018", "-Werror", "-S"])
+            .arg(&symlink_source)
+            .arg("-o")
+            .arg(&include)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("cannot run armfortas");
+        assert_eq!(
+            symlink_output_alias.status.code(),
+            Some(1),
+            "source-limit cleanup accepted an output alias hidden by an include symlink"
+        );
+        assert_eq!(
+            std::fs::read(&include).expect("symlink-hidden output target disappeared"),
+            include_contents,
+            "source-limit cleanup mutated a symlink-hidden output target"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn source_limit_promotion_retains_preprocessor_error() {
+    let dir = std::env::temp_dir().join(format!("afs_srclim_pp_error_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing_include_source = dir.join("overlong_missing_include.F90");
+    std::fs::write(
+        &missing_include_source,
+        format!(
+            "program p\n#include \"missing.inc\"\n! {}\nend program p\n",
+            "x".repeat(140)
+        ),
+    )
+    .unwrap();
+    let preprocess_failure_asm = dir.join("preprocess_failure.s");
+    let preprocess_failure = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-S"])
+        .arg(&missing_include_source)
+        .arg("-o")
+        .arg(&preprocess_failure_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert_eq!(
+        preprocess_failure.status.code(),
+        Some(1),
+        "preprocessor failure after source-limit promotion must fail"
+    );
+    let preprocess_failure_stderr = String::from_utf8_lossy(&preprocess_failure.stderr);
+    assert!(
+        preprocess_failure_stderr.contains("error: line is 142 characters long")
+            && preprocess_failure_stderr.contains("preprocessing failed"),
+        "preprocessor failure lost promoted or causal diagnostics:\n{preprocess_failure_stderr}"
+    );
+    assert!(
+        !preprocess_failure_asm.exists(),
+        "preprocessor failure published a primary output"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The explosion boundary (l01 follow-up): a deep expression chain
 /// inside the statement cap must compile, not stack-fault. Keep this
 /// large enough to require the compile-thread stack path, but below

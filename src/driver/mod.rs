@@ -316,8 +316,13 @@ fn terminal_output_collision_key(output: &Path, cwd: &Path) -> PathBuf {
     };
     let normalized = normalize_path_lexically(&absolute);
 
-    // Resolve an existing parent so equivalent spellings through a directory
-    // symlink cannot evade the preflight. The output itself may not exist yet.
+    // Resolve an existing destination first so an input file symlink cannot
+    // hide an output/input alias. Otherwise resolve the existing parent so
+    // equivalent directory-symlink spellings still collide when the output
+    // does not exist yet.
+    if let Ok(existing) = fs::canonicalize(&normalized) {
+        return existing;
+    }
     match (normalized.parent(), normalized.file_name()) {
         (Some(parent), Some(file_name)) => fs::canonicalize(parent)
             .map(|parent| parent.join(file_name))
@@ -1838,6 +1843,51 @@ fn compile_with_bundled_runtime_and_dependencies(
     Ok(dependencies)
 }
 
+fn discard_raw_source_failure_output(
+    opts: &Options,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let output = opts.output_path();
+    let preprocesses_to_stdout = opts.preprocess_only
+        && opts
+            .output
+            .as_ref()
+            .is_none_or(|path| path.as_os_str() == "-");
+    if preprocesses_to_stdout {
+        return Ok(());
+    }
+
+    // Diagnostic cleanup must never turn an output/input alias into source
+    // deletion.
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let output_key = terminal_output_collision_key(&output, &cwd);
+    if all_input_paths(opts)
+        .iter()
+        .chain(included_files)
+        .any(|input| terminal_output_collision_key(input, &cwd) == output_key)
+    {
+        return Ok(());
+    }
+
+    match fs::remove_file(&output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove stale failed output '{}': {error}",
+            output.display()
+        )),
+    }
+}
+
+fn raw_source_failure(opts: &Options, included_files: &[PathBuf]) -> String {
+    let failure = format!("aborting due to errors in {}", opts.input.display());
+    match discard_raw_source_failure_output(opts, included_files) {
+        Ok(()) => failure,
+        Err(cleanup_error) => format!("{failure}; additionally {cleanup_error}"),
+    }
+}
+
 fn compile_with_bundled_runtime_inner(
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
@@ -1899,15 +1949,23 @@ fn compile_with_bundled_runtime_inner(
     // source, before either continuation joiner runs. Explicit-std
     // runs only — the default std is permissive (gfortran's -std=gnu
     // model); a default build's stderr stays pristine.
+    let mut source_limits_are_errors = false;
     if let (true, true, Some(std)) = (opts.warnings_enabled(), opts.std_explicit, opts.std) {
-        for w in conformance::check_source_limits(
+        let warnings = conformance::check_source_limits(
             &source,
             std,
             source_form,
             opts.free_line_length_none_compat,
             opts.free_line_length_limit,
-        ) {
-            diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
+        );
+        source_limits_are_errors = opts.warnings_are_errors() && !warnings.is_empty();
+        let level = if source_limits_are_errors {
+            diag::Level::Error
+        } else {
+            diag::Level::Warning
+        };
+        for warning in warnings {
+            diag::render(&file_str, &source, warning.span, level, &warning.msg, 1);
         }
     }
     // Unconditional cap (all --std levels): keeps every recursive
@@ -1935,13 +1993,29 @@ fn compile_with_bundled_runtime_inner(
 
     let phase = phases.start("preprocess");
     let pp_config = preproc_config_for_input(opts, &opts.input, source_form);
-    let pp_result =
-        crate::preprocess::preprocess_bytes(&raw, &pp_config).map_err(|e| format!("{}", e))?;
+    let pp_result = match crate::preprocess::preprocess_bytes(&raw, &pp_config) {
+        Ok(result) => result,
+        Err(error) if source_limits_are_errors => {
+            return Err(format!(
+                "aborting due to errors in {}; additionally preprocessing failed: {error}",
+                opts.input.display()
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     phase.end(&mut phases);
     if let Some(dependencies) = dependency_output {
         dependencies.clone_from(&pp_result.included_files);
     }
     let included_files = &pp_result.included_files;
+    if source_limits_are_errors {
+        let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
+        let failure = raw_source_failure(opts, included_files);
+        return match depfile_cleanup {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
+        };
+    }
     if TerminalMode::from_options(opts).is_none() {
         prepare_dependency_file(opts, &opts.output_path(), included_files)?;
     }
