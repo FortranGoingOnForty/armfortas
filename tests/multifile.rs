@@ -1496,6 +1496,129 @@ fn module_private_default() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// AR40-01: a separate module function's RESULT identity is declared by its
+// interface. Unrelated locals and named constants must not affect same-TU
+// lowering or the identity serialized for cross-TU compilation.
+#[test]
+fn separate_module_function_result_identity_ignores_unrelated_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=separate_module_function_result_identity_ignores_unrelated_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("result_parent.f90");
+    let child_f90 = dir.join("result_child.f90");
+    let main_f90 = dir.join("result_main.f90");
+    let parent_o = dir.join("result_parent.o");
+    let child_o = dir.join("result_child.o");
+    let main_o = dir.join("result_main.o");
+    let single_f90 = dir.join("result_single.f90");
+    let single_bin = dir.join("result_single_bin");
+    let cross_tu_bin = dir.join("result_cross_tu_bin");
+
+    let parent_source = r#"module result_parent
+  implicit none
+  interface
+    module function answer() result(actual_result)
+      integer, parameter :: decoy_a = 101
+      integer, parameter :: decoy_b = 102
+      integer, parameter :: decoy_c = 103
+      integer, parameter :: decoy_d = 104
+      integer, parameter :: decoy_e = 105
+      integer, parameter :: decoy_f = 106
+      integer, parameter :: decoy_g = 107
+      integer, parameter :: decoy_h = 108
+      integer, parameter :: decoy_i = 109
+      integer, parameter :: decoy_j = 110
+      integer, parameter :: decoy_k = 111
+      integer, parameter :: decoy_l = 112
+      integer, parameter :: decoy_m = 113
+      integer, parameter :: decoy_n = 114
+      integer, parameter :: decoy_o = 115
+      integer, parameter :: decoy_p = 116
+      integer :: actual_result
+    end function answer
+  end interface
+end module result_parent
+"#;
+    let child_source = r#"submodule (result_parent) result_child
+contains
+  module procedure answer
+    actual_result = 42
+  end procedure answer
+end submodule result_child
+"#;
+    let main_source = r#"program result_main
+  use result_parent, only : answer
+  implicit none
+  if (answer() /= 42) error stop 1
+  print '(a)', 'ok'
+end program result_main
+"#;
+
+    std::fs::write(&parent_f90, parent_source).unwrap();
+    std::fs::write(&child_f90, child_source).unwrap();
+    std::fs::write(&main_f90, main_source).unwrap();
+    std::fs::write(
+        &single_f90,
+        format!("{parent_source}\n{child_source}\n{main_source}"),
+    )
+    .unwrap();
+
+    for attempt in 0..8 {
+        let single_compile = Command::new(&compiler)
+            .current_dir(&dir)
+            .args([
+                single_f90.to_str().unwrap(),
+                "-o",
+                single_bin.to_str().unwrap(),
+            ])
+            .output()
+            .expect("single-TU result-identity compile failed to spawn");
+        assert!(
+            single_compile.status.success(),
+            "single-TU result-identity compile attempt {attempt} failed:\n{}",
+            String::from_utf8_lossy(&single_compile.stderr)
+        );
+        let single_run = Command::new(&single_bin)
+            .output()
+            .expect("single-TU result-identity binary failed to spawn");
+        assert!(
+            single_run.status.success()
+                && String::from_utf8_lossy(&single_run.stdout).contains("ok"),
+            "same-TU compile attempt {attempt} selected an unrelated symbol as its result:\nstatus={:?}\nstdout={}\nstderr={}",
+            single_run.status.code(),
+            String::from_utf8_lossy(&single_run.stdout),
+            String::from_utf8_lossy(&single_run.stderr)
+        );
+    }
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    let amod = std::fs::read_to_string(dir.join("result_parent.amod")).unwrap();
+    let function_record = amod
+        .lines()
+        .find(|line| line.starts_with("@function answer "))
+        .expect("answer function record missing from result_parent.amod");
+    assert!(
+        function_record.contains("result_name=actual_result"),
+        "serialized function lost its explicit result identity: {function_record}"
+    );
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &cross_tu_bin);
+    let cross_tu_output = run_binary(&cross_tu_bin);
+    assert!(
+        cross_tu_output.contains("ok"),
+        "cross-TU separate module function lost its serialized result identity:\n{cross_tu_output}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07: a separately-compiled submodule whose body implements a parent
 // MODULE FUNCTION must return the right type. The result variable's type
 // comes from the parent interface via the `.amod`; before l07 it fell to

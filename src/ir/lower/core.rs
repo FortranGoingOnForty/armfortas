@@ -2427,53 +2427,33 @@ pub(super) fn sym_attrs_to_decl_attrs(
     out
 }
 
-/// Sprint35-SMP Phase 2: lookup the parent function scope's result
-/// variable name. Per F2008, a `module function NAME(...) result(R)`
-/// interface body declares both R and the function symbol. The body
-/// scope's `arg_order` lists only the dummies, so the result variable
-/// is the one Variable symbol in the scope whose name is NOT in
-/// arg_order. When no `result()` clause was used, the result name is
-/// the same as the function name. Returns `(result_name, type_info)`.
+/// Look up the parent function scope's explicitly recorded result entity.
+/// Returns `(result_name, symbol)` without consulting unrelated locals.
 pub(super) fn smp_function_result_info(
     st: &SymbolTable,
     parent_scope_id: crate::sema::symtab::ScopeId,
     function_name: &str,
 ) -> Option<(String, crate::sema::symtab::Symbol)> {
     let scope = st.scope(parent_scope_id);
-    let arg_set: std::collections::HashSet<String> =
-        scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-    // First look for a Variable symbol whose name isn't in arg_order
-    // (the result variable from sema's Function processing). If absent
-    // (e.g. .amod-loaded interface where only dummies are stored), fall
-    // back to a synthetic Symbol from the function symbol's type_info.
-    //
-    // For .amod-loaded modules, the result variable is recorded under
-    // a synthetic `__amod_result_<name>` key to avoid collision with
-    // user locals when both share the same proc scope. Strip that
-    // prefix so the synthesized Function decl uses the original name
-    // (`res`), matching what the SMP body's source code references.
-    for (key, sym) in &scope.symbols {
-        if arg_set.contains(key) {
-            continue;
-        }
-        if matches!(
-            sym.kind,
-            crate::sema::symtab::SymbolKind::Variable | crate::sema::symtab::SymbolKind::Parameter
-        ) {
-            let name = sym
-                .name
-                .strip_prefix("__amod_result_")
-                .map(str::to_string)
-                .unwrap_or_else(|| sym.name.clone());
-            let mut sym_clone = sym.clone();
-            sym_clone.name = name.clone();
-            return Some((name, sym_clone));
-        }
+    let result_name = scope
+        .result_name
+        .clone()
+        .unwrap_or_else(|| function_name.to_string());
+    if let Some(sym) = scope.procedure_result_symbol() {
+        let mut sym = sym.clone();
+        sym.name = result_name.clone();
+        return Some((result_name, sym));
     }
-    // No result variable in the scope — synthesize one from the
-    // function symbol itself (parent module level has the Function
-    // symbol with its return-type type_info and result_rank).
-    let parent_module_id = st.scope(parent_scope_id).parent?;
+
+    // A malformed or legacy scope may lack the result entity. Preserve the
+    // existing function-symbol fallback without guessing from other locals.
+    let mut parent_module_id = st.scope(parent_scope_id).parent?;
+    if matches!(
+        st.scope(parent_module_id).kind,
+        crate::sema::symtab::ScopeKind::Interface
+    ) {
+        parent_module_id = st.scope(parent_module_id).parent?;
+    }
     let fn_sym = st
         .scope(parent_module_id)
         .symbols
@@ -2481,7 +2461,9 @@ pub(super) fn smp_function_result_info(
     if !matches!(fn_sym.kind, crate::sema::symtab::SymbolKind::Function) {
         return None;
     }
-    Some((function_name.to_string(), fn_sym.clone()))
+    let mut result_sym = fn_sym.clone();
+    result_sym.name = result_name.clone();
+    Some((result_name, result_sym))
 }
 
 /// Sprint35-SMP Phase 2: when the parent module's interface declares
@@ -14826,23 +14808,16 @@ pub(super) fn function_scope_declared_result_rank(
     st: &SymbolTable,
     scope: &crate::sema::symtab::Scope,
 ) -> Option<usize> {
-    use crate::sema::symtab::{ScopeKind, SymbolKind};
+    use crate::sema::symtab::ScopeKind;
 
     let ScopeKind::Function(function_name) = &scope.kind else {
         return None;
     };
-    let arg_set: HashSet<String> = scope
-        .arg_order
-        .iter()
-        .map(|arg| arg.to_lowercase())
-        .collect();
-    for (key, sym) in &scope.symbols {
-        if arg_set.contains(key) {
-            continue;
-        }
-        if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-            return value_symbol_declared_rank(sym);
-        }
+    if let Some(rank) = scope
+        .procedure_result_symbol()
+        .and_then(value_symbol_declared_rank)
+    {
+        return Some(rank);
     }
 
     let key = function_name.to_ascii_lowercase();
@@ -15078,7 +15053,7 @@ fn function_scope_result_type_info(
     st: &SymbolTable,
     scope: &crate::sema::symtab::Scope,
 ) -> Option<crate::sema::symtab::TypeInfo> {
-    use crate::sema::symtab::{ScopeKind, SymbolKind};
+    use crate::sema::symtab::ScopeKind;
 
     let ScopeKind::Function(function_name) = &scope.kind else {
         return None;
@@ -15105,38 +15080,9 @@ fn function_scope_result_type_info(
         return Some(ti);
     }
 
-    // Fallback: scan the body for the result variable. With a `result(X)`
-    // clause the result variable is named X (not the function name), and a
-    // function can have other locals/parameters too — `scope.symbols` is a
-    // HashMap, so returning the first non-argument variable picked a
-    // nondeterministic one (fpm version_t%s(): result var `string` vs
-    // locals `buffer`, `ii` — generic dispatch on the call then matched
-    // the wrong specific, or none). Pick deterministically by declaration
-    // position, which puts the header-declared result variable first.
-    let arg_set: HashSet<String> = scope
-        .arg_order
-        .iter()
-        .map(|arg| arg.to_lowercase())
-        .collect();
-    let mut candidates: Vec<_> = scope
-        .symbols
-        .iter()
-        .filter(|(k, sym)| {
-            !arg_set.contains(*k)
-                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-                && sym.type_info.is_some()
-        })
-        .collect();
-    candidates.sort_by(|(ak, a), (bk, b)| {
-        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-            b.defined_at.start.line,
-            b.defined_at.start.col,
-            bk.as_str(),
-        ))
-    });
-    candidates
-        .first()
-        .and_then(|(_, sym)| sym.type_info.clone())
+    scope
+        .procedure_result_symbol()
+        .and_then(|symbol| symbol.type_info.clone())
 }
 
 fn bound_proc_result_type_info(
@@ -15662,22 +15608,7 @@ pub(super) fn assignment_expr_type_info(
                     let mut common: Option<crate::sema::symtab::TypeInfo> = None;
                     for specific in &sym.arg_names {
                         let scope = procedure_scope_by_name(st, specific)?;
-                        let arg_set: std::collections::HashSet<String> =
-                            scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                        let t = scope.symbols.iter().find_map(|(key, s)| {
-                            if arg_set.contains(key) {
-                                return None;
-                            }
-                            if matches!(
-                                s.kind,
-                                crate::sema::symtab::SymbolKind::Variable
-                                    | crate::sema::symtab::SymbolKind::Parameter
-                            ) {
-                                s.type_info.clone()
-                            } else {
-                                None
-                            }
-                        })?;
+                        let t = function_scope_result_type_info(st, scope)?;
                         match &common {
                             None => common = Some(t),
                             Some(c) => {
@@ -16691,20 +16622,9 @@ pub(super) fn specific_candidate_result_type_info(
                     })
                 })
                 .or_else(|| {
-                    let arg_set: HashSet<String> = scope
-                        .arg_order
-                        .iter()
-                        .map(|arg| arg.to_ascii_lowercase())
-                        .collect();
-                    scope.symbols.iter().find_map(|(key, sym)| {
-                        if arg_set.contains(key) {
-                            return None;
-                        }
-                        (key.starts_with("__amod_result_")
-                            || matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter))
-                        .then(|| sym.type_info.clone())
-                        .flatten()
-                    })
+                    scope
+                        .procedure_result_symbol()
+                        .and_then(|symbol| symbol.type_info.clone())
                 })
         })
 }
@@ -25275,7 +25195,7 @@ pub(super) fn callee_return_derived_info(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<(String, bool)> {
-    use crate::sema::symtab::{SymbolKind, TypeInfo};
+    use crate::sema::symtab::TypeInfo;
     if let Some(sym) = find_linkable_symbol_for_callee(st, callee_name) {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
@@ -25289,24 +25209,7 @@ pub(super) fn callee_return_derived_info(
         _ => return None,
     };
 
-    let arg_set: HashSet<String> = callee_scope.arg_order.iter().cloned().collect();
-    let mut candidates: Vec<_> = callee_scope
-        .symbols
-        .iter()
-        .filter(|(key, sym)| {
-            !arg_set.contains(*key)
-                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-                && matches!(sym.type_info, Some(TypeInfo::Derived(_)))
-        })
-        .collect();
-    candidates.sort_by(|(ak, a), (bk, b)| {
-        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-            b.defined_at.start.line,
-            b.defined_at.start.col,
-            bk.as_str(),
-        ))
-    });
-    if let Some((_, sym)) = candidates.into_iter().next() {
+    if let Some(sym) = callee_scope.procedure_result_symbol() {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
         }

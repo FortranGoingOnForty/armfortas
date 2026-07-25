@@ -916,6 +916,13 @@ fn install_external_interface(
         st.scope_mut(proc_scope).arg_order = arg_names.clone();
         st.scope_mut(proc_scope).bind_c = proc.bind_c;
         st.scope_mut(proc_scope).binding_label = proc.binding_label.clone();
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) {
+            st.scope_mut(proc_scope).result_name = Some(
+                proc.result_name
+                    .clone()
+                    .unwrap_or_else(|| proc.name.clone()),
+            );
+        }
         for arg in &proc.args {
             if arg.hidden {
                 continue;

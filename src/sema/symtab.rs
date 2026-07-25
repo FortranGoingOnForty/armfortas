@@ -147,6 +147,7 @@ impl SymbolTable {
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
+            result_name: None,
         };
         Self {
             scopes: vec![global],
@@ -304,6 +305,10 @@ impl SymbolTable {
         self.clear_lookup_caches();
         let id = self.scopes.len();
         let parent_implicit = self.scopes[self.current].implicit_rules.clone();
+        let result_name = match &kind {
+            ScopeKind::Function(name) => Some(name.clone()),
+            _ => None,
+        };
         let scope = Scope {
             id,
             parent: Some(self.current),
@@ -320,6 +325,7 @@ impl SymbolTable {
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
+            result_name,
         };
         self.scopes.push(scope);
         self.current = id;
@@ -2108,6 +2114,25 @@ pub struct Scope {
     pub pending_access: HashMap<String, Access>,
     /// Ordered dummy argument names (for function/subroutine scopes).
     pub arg_order: Vec<String>,
+    /// Exact source-level name of this function's result entity. Separate
+    /// module procedure bodies inherit it even though the parser initially
+    /// represents their body as a subroutine.
+    pub result_name: Option<String>,
+}
+
+impl Scope {
+    /// Resolve the result entity by its explicit semantic identity.
+    ///
+    /// `.amod`-loaded interfaces keep the entity under an internal synthetic
+    /// key so it cannot leak into unrelated lexical lookup. The declared name
+    /// remains in `result_name`, making the alternate key an implementation
+    /// detail instead of a result-selection heuristic.
+    pub(crate) fn procedure_result_symbol(&self) -> Option<&Symbol> {
+        let key = self.result_name.as_deref()?.to_ascii_lowercase();
+        self.symbols
+            .get(&key)
+            .or_else(|| self.symbols.get(&format!("__amod_result_{key}")))
+    }
 }
 
 /// What kind of scope this is.

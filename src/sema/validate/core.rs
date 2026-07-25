@@ -5985,25 +5985,7 @@ fn candidate_symbol<'a>(
 }
 
 fn result_symbol_in_procedure_scope(scope: &Scope) -> Option<&Symbol> {
-    let ScopeKind::Function(function_name) = &scope.kind else {
-        return None;
-    };
-    let argument_names: HashSet<_> = scope
-        .arg_order
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
-    scope
-        .symbols
-        .get(&function_name.to_ascii_lowercase())
-        .filter(|symbol| !argument_names.contains(&symbol.name.to_ascii_lowercase()))
-        .or_else(|| {
-            scope.symbols.iter().find_map(|(name, symbol)| {
-                (!argument_names.contains(name)
-                    && matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter))
-                .then_some(symbol)
-            })
-        })
+    scope.procedure_result_symbol()
 }
 
 fn generic_dummy_type_matches(

@@ -835,24 +835,38 @@ fn emit_parameter(
     }
 }
 
-/// Two TypeInfo values represent the same Fortran type. For CHARACTER,
-/// match both kind AND len so a `character(:), allocatable` local does
-/// not get promoted as the result of a `character(3)` function.
-fn result_type_matches(ret: &TypeInfo, cand: &TypeInfo) -> bool {
-    use TypeInfo::*;
-    match (ret, cand) {
-        (Integer { kind: a }, Integer { kind: b }) => a == b,
-        (Real { kind: a }, Real { kind: b }) => a == b,
-        (DoublePrecision, DoublePrecision) => true,
-        (Complex { kind: a }, Complex { kind: b }) => a == b,
-        (Logical { kind: a }, Logical { kind: b }) => a == b,
-        (Character { kind: ak, len: al }, Character { kind: bk, len: bl }) => ak == bk && al == bl,
-        (Derived(a), Derived(b)) => a.eq_ignore_ascii_case(b),
-        (Class(a), Class(b)) => a.eq_ignore_ascii_case(b),
-        (ClassStar, ClassStar) => true,
-        (TypeStar, TypeStar) => true,
-        _ => false,
-    }
+fn procedure_scope_for_module<'a>(
+    st: &'a SymbolTable,
+    mod_scope_id: ScopeId,
+    name: &str,
+) -> Option<&'a Scope> {
+    st.scopes
+        .iter()
+        .find(|scope| {
+            scope.parent == Some(mod_scope_id)
+                && matches!(
+                    &scope.kind,
+                    ScopeKind::Function(proc_name) | ScopeKind::Subroutine(proc_name)
+                        if proc_name.eq_ignore_ascii_case(name)
+                )
+        })
+        .or_else(|| {
+            st.scopes.iter().find(|scope| {
+                let matches_name = matches!(
+                    &scope.kind,
+                    ScopeKind::Function(proc_name) | ScopeKind::Subroutine(proc_name)
+                        if proc_name.eq_ignore_ascii_case(name)
+                );
+                if !matches_name {
+                    return false;
+                }
+                let Some(parent_id) = scope.parent else {
+                    return false;
+                };
+                matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+                    && st.scope(parent_id).parent == Some(mod_scope_id)
+            })
+        })
 }
 
 fn emit_procedure(
@@ -867,6 +881,7 @@ fn emit_procedure(
 ) {
     let is_func = matches!(sym.kind, SymbolKind::Function);
     let kind_str = if is_func { "function" } else { "subroutine" };
+    let proc_scope = procedure_scope_for_module(st, mod_scope_id, name);
 
     if is_func {
         let ret_str = type_info_to_string(sym.type_info.as_ref());
@@ -880,90 +895,12 @@ fn emit_procedure(
         if sym.attrs.result_rank > 0 {
             write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
         }
-        // Sprint35-SMP Phase 2: emit the result variable's user-declared
-        // name when it differs from the function name (i.e. the source
-        // had a `result(X)` clause). Submodule bodies that reference the
-        // result by its declared name need this preserved across the
-        // .amod boundary so sema can register the right symbol.
-        let result_var: Option<&Symbol> = st
-            .scopes
-            .iter()
-            .find(|s| {
-                let matches_name = match &s.kind {
-                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                        n.eq_ignore_ascii_case(name)
-                    }
-                    _ => false,
-                };
-                if !matches_name {
-                    return false;
-                }
-                let Some(parent_id) = s.parent else {
-                    return false;
-                };
-                parent_id == mod_scope_id
-                    || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
-                        && st.scope(parent_id).parent == Some(mod_scope_id)
-            })
-            .and_then(|pscope| {
-                let arg_set: std::collections::HashSet<String> =
-                    pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                // The result variable is defined from the function header
-                // before body declarations are processed. Locals can share
-                // the same type (for example allocatable character scratch
-                // strings in fortsh's expand_braces), so type matching alone
-                // is not enough and HashMap iteration order would otherwise
-                // pick a random local as result_name.
-                let ret_ti = sym.type_info.as_ref();
-                let mut typed_candidates: Vec<_> = pscope
-                    .symbols
-                    .iter()
-                    .filter(|(key, candidate)| {
-                        !arg_set.contains(*key)
-                            && matches!(
-                                candidate.kind,
-                                SymbolKind::Variable | SymbolKind::Parameter
-                            )
-                            && match (ret_ti, candidate.type_info.as_ref()) {
-                                (Some(rt), Some(ct)) => result_type_matches(rt, ct),
-                                _ => true,
-                            }
-                    })
-                    .collect();
-                typed_candidates.sort_by(|(ak, a), (bk, b)| {
-                    (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-                        b.defined_at.start.line,
-                        b.defined_at.start.col,
-                        bk.as_str(),
-                    ))
-                });
-                let mut fallback_candidates: Vec<_> = pscope
-                    .symbols
-                    .iter()
-                    .filter(|(key, candidate)| {
-                        !arg_set.contains(*key)
-                            && matches!(
-                                candidate.kind,
-                                SymbolKind::Variable | SymbolKind::Parameter
-                            )
-                    })
-                    .collect();
-                fallback_candidates.sort_by(|(ak, a), (bk, b)| {
-                    (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-                        b.defined_at.start.line,
-                        b.defined_at.start.col,
-                        bk.as_str(),
-                    ))
-                });
-                typed_candidates
-                    .into_iter()
-                    .next()
-                    .or_else(|| fallback_candidates.into_iter().next())
-                    .map(|(_, candidate)| candidate)
-            });
-        if let Some(result_var) = result_var {
-            if !result_var.name.eq_ignore_ascii_case(name) {
-                write!(out, ", result_name={}", result_var.name).unwrap();
+        // RESULT identity is semantic state, not something reconstructed from
+        // whichever same-typed local happens to sort first.
+        let result_var = proc_scope.and_then(Scope::procedure_result_symbol);
+        if let Some(result_name) = proc_scope.and_then(|scope| scope.result_name.as_deref()) {
+            if !result_name.eq_ignore_ascii_case(name) {
+                write!(out, ", result_name={result_name}").unwrap();
             }
         }
         // Sprint35-SMP Phase 3: serialize the result variable's
@@ -1025,40 +962,6 @@ fn emit_procedure(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-
-    // Walk into the procedure's scope for full arg info. Interface-declared
-    // procedures sit under an intermediate Interface scope rather than
-    // directly under the module, so check both shapes.
-    let proc_scope = st
-        .scopes
-        .iter()
-        .find(|s| {
-            s.parent == Some(mod_scope_id)
-                && match &s.kind {
-                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                        n.eq_ignore_ascii_case(name)
-                    }
-                    _ => false,
-                }
-        })
-        .or_else(|| {
-            st.scopes.iter().find(|s| {
-                let matches_name = match &s.kind {
-                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                        n.eq_ignore_ascii_case(name)
-                    }
-                    _ => false,
-                };
-                if !matches_name {
-                    return false;
-                }
-                let Some(parent_id) = s.parent else {
-                    return false;
-                };
-                let parent = st.scope(parent_id);
-                matches!(parent.kind, ScopeKind::Interface) && parent.parent == Some(mod_scope_id)
-            })
-        });
 
     let is_bind_c = sym.attrs.bind_c;
     let declared_descriptor_params = descriptor_params

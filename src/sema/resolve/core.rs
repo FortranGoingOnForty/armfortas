@@ -606,6 +606,7 @@ pub(super) fn resolve_unit(
             }
             // Define result variable.
             let result_name = result.as_deref().unwrap_or(name.as_str());
+            st.scope_mut(scope_id).result_name = Some(result_name.to_string());
             st.define(Symbol {
                 name: result_name.into(),
                 kind: SymbolKind::Variable,
@@ -1253,34 +1254,16 @@ fn inject_separate_module_procedure_args(
         })
         .collect();
 
-    // Sprint35-SMP Phase 2: also clone the result variable (function
-    // case) so the body's `res = ...` references resolve to a
-    // properly-typed Variable rather than implicit-typing as a scalar.
-    // The result variable is the non-arg Variable in the iface scope:
-    //   - For interface bodies parsed from source: sema's Function arm
-    //     defined a Symbol with the user's `result(NAME)` clause.
-    //   - For .amod-loaded modules: load_external_module synthesized
-    //     a `__amod_result_NAME` Variable that we strip the prefix off.
-    let result_sym: Option<Symbol> = {
-        let arg_set: std::collections::HashSet<String> = st
-            .scope(iface_scope)
-            .arg_order
-            .iter()
-            .map(|n| n.to_lowercase())
-            .collect();
-        st.scope(iface_scope)
-            .symbols
-            .iter()
-            .find(|(key, sym)| {
-                !arg_set.contains(*key)
-                    && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-            })
-            .map(|(_, sym)| sym.clone())
-    };
+    // Also clone the function result into the separate body. The interface
+    // scope records its exact RESULT identity; unrelated locals and named
+    // constants must never participate in this selection.
+    let result_name = st.scope(iface_scope).result_name.clone();
+    let result_sym = st.scope(iface_scope).procedure_result_symbol().cloned();
 
     st.scope_mut(body_scope).arg_order = arg_order;
     st.scope_mut(body_scope).bind_c = inherited_binding.bind_c;
     st.scope_mut(body_scope).binding_label = inherited_binding.label;
+    st.scope_mut(body_scope).result_name = result_name.clone();
     for mut sym in arg_symbols {
         sym.scope = body_scope;
         sym.defined_at = span;
@@ -1289,13 +1272,8 @@ fn inject_separate_module_procedure_args(
     if let Some(mut sym) = result_sym {
         sym.scope = body_scope;
         sym.defined_at = span;
-        // For .amod-loaded result vars the name carries the
-        // `__amod_result_` prefix to avoid shadowing user locals in
-        // the parent module's procedure scope. Strip it for the body
-        // scope so user code referencing the result by its declared
-        // name resolves correctly.
-        if let Some(stripped) = sym.name.strip_prefix("__amod_result_") {
-            sym.name = stripped.to_string();
+        if let Some(result_name) = result_name {
+            sym.name = result_name;
         }
         let _ = st.define(sym);
     }
@@ -3279,6 +3257,35 @@ mod tests {
         assert!(prog_scope.symbols.contains_key("x"));
         assert!(prog_scope.symbols.contains_key("y"));
         assert!(prog_scope.symbols.contains_key("z"));
+    }
+
+    #[test]
+    fn function_scope_retains_explicit_result_identity() {
+        let st = resolve_source(
+            "\
+module result_parent
+  implicit none
+  interface
+    module function answer() result(actual_result)
+      integer, parameter :: decoy = 101
+      integer :: actual_result
+    end function answer
+  end interface
+end module result_parent
+",
+        );
+        let function_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "answer"))
+            .unwrap();
+        assert_eq!(function_scope.result_name.as_deref(), Some("actual_result"));
+        let result = function_scope
+            .procedure_result_symbol()
+            .expect("explicit function result symbol was not retained");
+        assert_eq!(result.name, "actual_result");
+        assert!(!result.attrs.parameter);
+        assert!(function_scope.symbols.contains_key("decoy"));
     }
 
     #[test]
