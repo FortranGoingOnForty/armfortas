@@ -698,8 +698,9 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 /// `PROGRAM HELLO` and `INTEGER I, N` reaches us as `PROGRAMHELLO` and
 /// `INTEGERI,N`.  The parser does not have enough context to recover those
 /// boundaries reliably from a single opaque identifier token, so the fixed-form
-/// lexer splits a small set of keyword prefixes when we are at a statement
-/// boundary or another keyword-following context.
+/// lexer splits a small set of keyword prefixes when the statement shape makes
+/// the boundary unambiguous. Tails in name-bearing contexts stay intact; the
+/// parser resolves the remaining program-unit ambiguity with grammar context.
 ///
 /// The DO/assignment ambiguity still needs special handling before the generic
 /// prefix splitter because `DO10I=1,10` is a loop while `DO10I=1.10` is an
@@ -760,12 +761,16 @@ fn split_fixed_keyword_prefix(
     prior_tokens: &[Token],
 ) -> Option<usize> {
     let at_action_start = at_fixed_action_statement_start(prior_tokens);
-    if (!allow_fixed_keyword_split(prior_tokens) && !at_action_start) || run.len() <= 4 {
+    if run.len() <= 4 {
         return None;
     }
 
     let trailing = text.as_bytes().get(pos + run.len()).copied();
-    if matches!(trailing, Some(b'=') | Some(b'%')) {
+    if matches!(trailing, Some(b'=') | Some(b'%') | Some(b':'))
+        || identifier_precedes_assignment(text, pos + run.len())
+        || in_fixed_identifier_name_context(prior_tokens)
+        || (!allow_fixed_keyword_split(prior_tokens) && !at_action_start)
+    {
         return None;
     }
 
@@ -794,8 +799,98 @@ fn split_fixed_keyword_prefix(
     None
 }
 
+fn in_fixed_identifier_name_context(prior_tokens: &[Token]) -> bool {
+    let Some(previous) = prior_tokens.last() else {
+        return false;
+    };
+    if matches!(previous.kind, TokenKind::Comma | TokenKind::ColonColon) {
+        return true;
+    }
+    if previous.kind != TokenKind::Identifier {
+        return false;
+    }
+
+    let previous = previous.text.to_ascii_lowercase();
+    matches!(
+        previous.as_str(),
+        "program"
+            | "submodule"
+            | "subroutine"
+            | "function"
+            | "blockdata"
+            | "entry"
+            | "call"
+            | "procedure"
+            | "type"
+            | "class"
+            | "module"
+            | "integer"
+            | "real"
+            | "doubleprecision"
+            | "doublecomplex"
+            | "complex"
+            | "character"
+            | "logical"
+    ) || (previous.starts_with("end") && previous != "end")
+}
+
+/// Protect an array/substring designator or statement-function name on the
+/// left side of an assignment. A bare keyword-prefix scan cannot distinguish
+/// `FUNCTIONAL(I)=...` from a compact procedure header.
+fn identifier_precedes_assignment(text: &str, run_end: usize) -> bool {
+    if text.as_bytes().get(run_end) != Some(&b'(') {
+        return false;
+    }
+
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = run_end;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                if bytes.get(index + 1) == Some(&active_quote) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => depth += 1,
+            b')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+            }
+            b'=' if depth == 0 => {
+                let follows_relational_operator =
+                    index > 0 && matches!(bytes[index - 1], b'=' | b'/' | b'<' | b'>');
+                if bytes.get(index + 1) != Some(&b'=') && !follows_relational_operator {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 fn at_fixed_action_statement_start(prior_tokens: &[Token]) -> bool {
     if prior_tokens.is_empty() {
+        return true;
+    }
+    if prior_tokens.len() == 2
+        && prior_tokens[0].kind == TokenKind::Identifier
+        && prior_tokens[1].kind == TokenKind::Colon
+    {
         return true;
     }
     if prior_tokens.len() < 3
@@ -832,7 +927,6 @@ fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
     };
 
     match prev.kind {
-        TokenKind::Comma | TokenKind::ColonColon => true,
         TokenKind::Identifier => matches!(
             prev.text.to_ascii_lowercase().as_str(),
             "integer"
@@ -848,16 +942,11 @@ fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
                 | "program"
                 | "module"
                 | "submodule"
-                | "subroutine"
-                | "function"
-                | "entry"
-                | "call"
                 | "pure"
                 | "impure"
                 | "elemental"
                 | "recursive"
                 | "end"
-                | "endtype"
         ),
         _ => false,
     }
@@ -1746,6 +1835,73 @@ C     Hello World
     }
 
     #[test]
+    fn keyword_prefixed_names_remain_single_tokens_in_name_contexts() {
+        assert_eq!(
+            fixed_texts("      PROGRAM PRINTABLE\n"),
+            vec!["PROGRAM", "PRINTABLE"]
+        );
+        assert_eq!(
+            fixed_texts("      PROGRAMPRINTABLE\n"),
+            vec!["PROGRAM", "PRINTABLE"]
+        );
+        assert_eq!(
+            fixed_texts("      SUBROUTINE CALLABLE()\n"),
+            vec!["SUBROUTINE", "CALLABLE", "(", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      INTEGER REALIGNER\n"),
+            vec!["INTEGER", "REALIGNER"]
+        );
+        assert_eq!(
+            fixed_texts("      INTEGER :: REALIGNER, PRINTABLE\n"),
+            vec!["INTEGER", "::", "REALIGNER", ",", "PRINTABLE"]
+        );
+        assert_eq!(
+            fixed_texts("      CALL CALLABLE(PRINTABLE)\n"),
+            vec!["CALL", "CALLABLE", "(", "PRINTABLE", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      CALLCALLABLE(X,REALIGNER)\n"),
+            vec!["CALL", "CALLABLE", "(", "X", ",", "REALIGNER", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      FUNCTIONAL(1)=7\n"),
+            vec!["FUNCTIONAL", "(", "1", ")", "=", "7"]
+        );
+        assert_eq!(
+            fixed_texts("      PRINTABLE: IF (I.EQ.1) THEN\n"),
+            vec!["PRINTABLE", ":", "IF", "(", "I", ".EQ.", "1", ")", "THEN"]
+        );
+    }
+
+    #[test]
+    fn module_and_typed_procedure_ambiguities_are_deferred_to_the_parser() {
+        for source in ["      MODULE PROCEDURAL\n", "      MODULEPROCEDURAL\n"] {
+            assert_eq!(
+                fixed_texts(source),
+                vec!["MODULE", "PROCEDURAL"],
+                "got different tokens for {source:?}"
+            );
+        }
+        assert_eq!(
+            fixed_texts("      MODULE PROCEDURE PRINTABLE\n"),
+            vec!["MODULE", "PROCEDUREPRINTABLE"]
+        );
+
+        for source in [
+            "      INTEGER FUNCTION F(X)\n",
+            "      INTEGER FUNCTIONF(X)\n",
+            "      INTEGERFUNCTIONF(X)\n",
+        ] {
+            assert_eq!(
+                fixed_texts(source),
+                vec!["INTEGER", "FUNCTIONF", "(", "X", ")"],
+                "got different tokens for {source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn whitespace_stripped_print_keeps_numeric_format_label() {
         let texts = fixed_texts("      PRINT 100, I\n");
         assert_eq!(texts, vec!["PRINT", "100", ",", "I"], "got: {texts:?}");
@@ -1772,12 +1928,6 @@ C     Hello World
 
         let call = fixed_texts("      CALL PRINT100()\n");
         assert_eq!(call, vec!["CALL", "PRINT100", "(", ")"], "got: {call:?}");
-    }
-
-    #[test]
-    fn whitespace_stripped_typed_function() {
-        let texts = fixed_texts("      INTEGERFUNCTIONF(X)\n");
-        assert_eq!(texts, vec!["INTEGER", "FUNCTION", "F", "(", "X", ")"]);
     }
 
     #[test]

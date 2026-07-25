@@ -953,6 +953,64 @@ fn ordinary_fortran_include_compiles_runs_and_tracks_transitive_dependencies() {
 }
 
 #[test]
+fn fixed_form_keyword_prefixed_names_compile_and_run() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=fixed_form_keyword_prefixed_names_compile_and_run count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("fixed_keyword_prefixed_names");
+    let source = write_program_in(
+        &dir,
+        "names.f",
+        concat!(
+            "      PROGRAM PRINTABLE\n",
+            "      INTEGER FUNCTIONAL(3)\n",
+            "      FUNCTIONAL(1)=7\n",
+            "      CALL CALLABLE(FUNCTIONAL(1))\n",
+            "      PRINTABLE_BLOCK: IF (FUNCTIONAL(1).EQ.7) THEN\n",
+            "      PRINT *, FUNCTIONAL(1)\n",
+            "      END IF PRINTABLE_BLOCK\n",
+            "      CONTAINS\n",
+            "      SUBROUTINE CALLABLE(REALIGNER)\n",
+            "      INTEGER REALIGNER\n",
+            "      REALIGNER=REALIGNER\n",
+            "      END SUBROUTINE CALLABLE\n",
+            "      END PROGRAM PRINTABLE\n",
+        ),
+    );
+    let output = dir.join("fixed-names");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("fixed-form keyword-prefixed-name compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form keyword-prefixed-name compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&output)
+        .output()
+        .expect("fixed-form keyword-prefixed-name executable failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).trim().ends_with('7'),
+        "fixed-form keyword-prefixed-name executable produced the wrong result: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -488,7 +488,7 @@ pub fn capture_from_path_with_module_search_paths(
         stages.insert(Stage::Tokens, CapturedStage::Text(format_tokens(&tokens)));
     }
 
-    let mut parser = Parser::new_source_view(&tokens);
+    let mut parser = Parser::new_source_view_for_form(&tokens, source_form);
     let units = parser.parse_file().map_err(|e| {
         let resolved = pp_result.resolve_span(e.span);
         CaptureFailure {

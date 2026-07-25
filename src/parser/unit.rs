@@ -11,6 +11,108 @@ use crate::ast::unit::*;
 use crate::ast::Spanned;
 use crate::lexer::TokenKind;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactFixedUnitKind {
+    Function,
+    Subroutine,
+    Procedure,
+}
+
+/// Recognize a whitespace-insensitive fixed-form program-unit header without
+/// guessing from the author's blank placement. The caller still validates the
+/// following token shape and the grammar context in which MODULE PROCEDURE is
+/// legal before applying the returned first boundary.
+fn compact_fixed_unit_split(
+    text: &str,
+    allow_procedure: bool,
+) -> Option<(usize, CompactFixedUnitKind)> {
+    fn valid_name(name: &str) -> bool {
+        let mut bytes = name.bytes();
+        matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    let mut first_prefix_len = None;
+    let mut type_allowed = true;
+    let mut has_type = false;
+    let mut procedure_allowed = allow_procedure;
+
+    loop {
+        for (keyword, kind) in [
+            ("subroutine", CompactFixedUnitKind::Subroutine),
+            ("function", CompactFixedUnitKind::Function),
+            ("procedure", CompactFixedUnitKind::Procedure),
+        ] {
+            let Some(name) = rest.strip_prefix(keyword) else {
+                continue;
+            };
+            let permitted = match kind {
+                CompactFixedUnitKind::Function => true,
+                CompactFixedUnitKind::Subroutine => !has_type,
+                CompactFixedUnitKind::Procedure => procedure_allowed && !has_type,
+            };
+            if permitted && valid_name(name) {
+                return Some((first_prefix_len.unwrap_or(keyword.len()), kind));
+            }
+        }
+
+        let mut consumed = false;
+        for keyword in [
+            "non_recursive",
+            "elemental",
+            "recursive",
+            "impure",
+            "module",
+            "pure",
+        ] {
+            let Some(tail) = rest.strip_prefix(keyword) else {
+                continue;
+            };
+            if tail.is_empty() {
+                continue;
+            }
+            first_prefix_len.get_or_insert(keyword.len());
+            procedure_allowed |= keyword == "module";
+            rest = tail;
+            consumed = true;
+            break;
+        }
+        if consumed {
+            continue;
+        }
+
+        if type_allowed {
+            for keyword in [
+                "doubleprecision",
+                "doublecomplex",
+                "character",
+                "integer",
+                "logical",
+                "complex",
+                "real",
+            ] {
+                let Some(tail) = rest.strip_prefix(keyword) else {
+                    continue;
+                };
+                if tail.is_empty() {
+                    continue;
+                }
+                first_prefix_len.get_or_insert(keyword.len());
+                type_allowed = false;
+                has_type = true;
+                rest = tail;
+                consumed = true;
+                break;
+            }
+        }
+        if !consumed {
+            return None;
+        }
+    }
+}
+
 impl<'a> Parser<'a> {
     /// Parse a complete Fortran source file — one or more program units.
     pub fn parse_file(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {
@@ -39,6 +141,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a single program unit.
     pub fn parse_program_unit(&mut self) -> Result<SpannedUnit, ParseError> {
+        self.parse_program_unit_context(false)
+    }
+
+    fn parse_program_unit_context(
+        &mut self,
+        allow_module_prefix: bool,
+    ) -> Result<SpannedUnit, ParseError> {
         self.skip_newlines();
         let start = self.current_span();
 
@@ -54,6 +163,14 @@ impl<'a> Parser<'a> {
         let mut prefixes: Vec<Prefix> = Vec::new();
         let mut return_type: Option<crate::ast::decl::TypeSpec> = None;
         loop {
+            let allow_compact_procedure = prefixes
+                .iter()
+                .any(|prefix| matches!(prefix, Prefix::Module));
+            if let Some(prefix_len) =
+                self.compact_fixed_unit_prefix_len(self.pos, allow_compact_procedure)
+            {
+                self.split_fixed_identifier_at(self.pos, prefix_len);
+            }
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
                 "pure" => {
@@ -104,7 +221,16 @@ impl<'a> Parser<'a> {
                             | "type"
                             | "class"
                     );
-                    if is_simple_prefix || is_followed_by_decl_prefix || is_type_then_function {
+                    let is_compact_prefix = self
+                        .compact_fixed_unit_prefix_len(self.pos + 1, true)
+                        .is_some();
+                    let module_prefix_allowed = !self.fixed_form || allow_module_prefix;
+                    if module_prefix_allowed
+                        && (is_simple_prefix
+                            || is_followed_by_decl_prefix
+                            || is_type_then_function
+                            || is_compact_prefix)
+                    {
                         self.advance();
                         prefixes.push(Prefix::Module);
                     } else {
@@ -166,6 +292,61 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+    }
+
+    fn compact_fixed_unit_prefix_len(
+        &self,
+        token_index: usize,
+        allow_procedure: bool,
+    ) -> Option<usize> {
+        if !self.fixed_form {
+            return None;
+        }
+        let token = self.tokens.get(token_index)?;
+        if token.kind != TokenKind::Identifier {
+            return None;
+        }
+        let (prefix_len, kind) = compact_fixed_unit_split(&token.text, allow_procedure)?;
+        let next = self.tokens.get(token_index + 1);
+        let mut depth = 0usize;
+        let mut has_assignment = false;
+        for candidate in self.tokens.iter().skip(token_index + 1) {
+            match candidate.kind {
+                TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon | TokenKind::Eof => {
+                    break
+                }
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth = depth.saturating_sub(1),
+                TokenKind::Assign | TokenKind::Arrow if depth == 0 => {
+                    has_assignment = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let shape_matches = match kind {
+            CompactFixedUnitKind::Function => {
+                next.is_some_and(|candidate| candidate.kind == TokenKind::LParen) && !has_assignment
+            }
+            CompactFixedUnitKind::Subroutine => next.is_some_and(|candidate| {
+                matches!(
+                    candidate.kind,
+                    TokenKind::LParen
+                        | TokenKind::Newline
+                        | TokenKind::Comment
+                        | TokenKind::Semicolon
+                        | TokenKind::Eof
+                ) || (candidate.kind == TokenKind::Identifier
+                    && candidate.text.eq_ignore_ascii_case("bind"))
+            }),
+            CompactFixedUnitKind::Procedure => next.is_some_and(|candidate| {
+                matches!(
+                    candidate.kind,
+                    TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon | TokenKind::Eof
+                )
+            }),
+        };
+        shape_matches.then_some(prefix_len)
     }
 
     fn parse_program(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
@@ -537,6 +718,18 @@ impl<'a> Parser<'a> {
             }
 
             if text == "module" {
+                let next_index = self.pos + 1;
+                let compact_procedure_prefix = if self.fixed_form {
+                    self.tokens.get(next_index).and_then(|token| {
+                        let (prefix_len, kind) = compact_fixed_unit_split(&token.text, true)?;
+                        (kind == CompactFixedUnitKind::Procedure).then_some(prefix_len)
+                    })
+                } else {
+                    None
+                };
+                if let Some(prefix_len) = compact_procedure_prefix {
+                    self.split_fixed_identifier_at(next_index, prefix_len);
+                }
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
                 } else {
@@ -594,7 +787,7 @@ impl<'a> Parser<'a> {
             }
 
             // Try parsing as a subprogram.
-            let sub = self.parse_program_unit()?;
+            let sub = self.parse_program_unit_context(true)?;
             bodies.push(InterfaceBody::Subprogram(sub));
         }
 
@@ -1163,7 +1356,7 @@ impl<'a> Parser<'a> {
             ) {
                 break;
             }
-            units.push(self.parse_program_unit()?);
+            units.push(self.parse_program_unit_context(true)?);
         }
         Ok(units)
     }
@@ -1359,7 +1552,7 @@ fn fold_one_attribute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
+    use crate::lexer::{fixed::tokenize_fixed, Lexer};
 
     fn parse_units(src: &str) -> Vec<SpannedUnit> {
         let tokens = Lexer::tokenize(src, 0).unwrap();
@@ -1373,10 +1566,27 @@ mod tests {
         units.into_iter().next().unwrap()
     }
 
+    fn parse_fixed_unit(src: &str) -> SpannedUnit {
+        let tokens = tokenize_fixed(src, 0).unwrap();
+        let mut parser = Parser::new_for_form(&tokens, crate::lexer::SourceForm::FixedForm);
+        let units = parser.parse_file().unwrap();
+        assert_eq!(units.len(), 1, "expected 1 unit, got {}", units.len());
+        units.into_iter().next().unwrap()
+    }
+
     fn parse_error(src: &str) -> ParseError {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         parser.parse_file().unwrap_err()
+    }
+
+    #[test]
+    fn compact_fixed_unit_recognition_is_iterative_for_long_prefix_runs() {
+        let header = format!("{}functionf", "pure".repeat(20_000));
+        assert_eq!(
+            compact_fixed_unit_split(&header, false),
+            Some((4, CompactFixedUnitKind::Function))
+        );
     }
 
     // ---- PROGRAM ----
@@ -1574,6 +1784,44 @@ mod tests {
     }
 
     #[test]
+    fn fixed_typed_function_headers_do_not_depend_on_blank_placement() {
+        for header in [
+            "      INTEGER FUNCTION F(X)\n",
+            "      INTEGER FUNCTIONF(X)\n",
+            "      INTEGERFUNCTIONF(X)\n",
+            "      INTEGER PURE FUNCTIONF(X)\n",
+            "      PUREINTEGERFUNCTIONF(X)\n",
+        ] {
+            let source = format!("{header}      INTEGER X\n      F=X\n      END\n");
+            let unit = parse_fixed_unit(&source);
+            let ProgramUnit::Function {
+                name, return_type, ..
+            } = &unit.node
+            else {
+                panic!("not Function for {header:?}");
+            };
+            assert_eq!(name, "F");
+            assert!(return_type.is_some());
+            if header.to_ascii_lowercase().contains("pure") {
+                let ProgramUnit::Function { prefix, .. } = &unit.node else {
+                    unreachable!()
+                };
+                assert!(prefix.contains(&Prefix::Pure));
+            }
+        }
+    }
+
+    #[test]
+    fn free_form_keyword_prefixed_array_name_stays_a_declaration() {
+        let unit =
+            parse_unit("program p\n  integer functionf(3)\n  functionf(1) = 7\nend program p\n");
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(!decls.is_empty());
+    }
+
+    #[test]
     fn recursive_function() {
         let u = parse_unit("recursive function fact(n) result(f)\n  integer :: n, f\n  if (n <= 1) then\n    f = 1\n  else\n    f = n * fact(n - 1)\n  end if\nend function\n");
         if let ProgramUnit::Function { prefix, .. } = &u.node {
@@ -1594,6 +1842,56 @@ mod tests {
         } else {
             panic!("not Module");
         }
+    }
+
+    #[test]
+    fn fixed_module_name_does_not_depend_on_blank_placement() {
+        for header in ["      MODULE PROCEDURAL\n", "      MODULEPROCEDURAL\n"] {
+            let source = format!("{header}      END MODULE PROCEDURAL\n");
+            let unit = parse_fixed_unit(&source);
+            let ProgramUnit::Module { name, .. } = &unit.node else {
+                panic!("not Module for {header:?}");
+            };
+            assert_eq!(name, "PROCEDURAL");
+        }
+    }
+
+    #[test]
+    fn fixed_compact_module_procedure_headers_are_resolved_in_contains_context() {
+        let unit = parse_fixed_unit(concat!(
+            "      MODULE M\n",
+            "      CONTAINS\n",
+            "      MODULESUBROUTINECALLABLE()\n",
+            "      ENDSUBROUTINECALLABLE\n",
+            "      ENDMODULEM\n",
+        ));
+        let ProgramUnit::Module { contains, .. } = &unit.node else {
+            panic!("not Module");
+        };
+        let [contained] = contains.as_slice() else {
+            panic!("expected one contained procedure");
+        };
+        let ProgramUnit::Subroutine { name, prefix, .. } = &contained.node else {
+            panic!("not Subroutine");
+        };
+        assert_eq!(name, "CALLABLE");
+        assert!(prefix.contains(&Prefix::Module));
+    }
+
+    #[test]
+    fn fixed_compact_module_procedure_lists_stay_interface_declarations() {
+        let unit = parse_fixed_unit(concat!(
+            "      INTERFACE GENERIC_NAME\n",
+            "      MODULEPROCEDUREPRINTABLE,REALIGNER\n",
+            "      ENDINTERFACEGENERIC_NAME\n",
+        ));
+        let ProgramUnit::InterfaceBlock { bodies, .. } = &unit.node else {
+            panic!("not InterfaceBlock");
+        };
+        let [InterfaceBody::ModuleProcedure(names)] = bodies.as_slice() else {
+            panic!("expected one module-procedure declaration");
+        };
+        assert_eq!(names, &["PRINTABLE", "REALIGNER"]);
     }
 
     #[test]

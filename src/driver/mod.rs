@@ -2131,7 +2131,7 @@ fn compile_with_bundled_runtime_inner(
 
     // 4. Parse.
     let phase = phases.start("parse");
-    let mut parser = Parser::new_source_view(&tokens);
+    let mut parser = Parser::new_source_view_for_form(&tokens, source_form);
     let mut units = match parser.parse_file() {
         Ok(units) => units,
         Err(e) => {
