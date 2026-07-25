@@ -14880,6 +14880,42 @@ fn dash_capital_e_preprocesses_only() {
 }
 
 #[test]
+fn dash_capital_e_recognizes_bom_prefixed_first_line_directive() {
+    let source =
+        b"\xef\xbb\xbf#define VALUE 73\nprogram p\n  integer :: value = VALUE\nend program\n";
+    let src = write_program_bytes(source, "F90");
+    let out = unique_path("pp_bom_directive", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-E", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "BOM-prefixed -E preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let preprocessed = std::fs::read(&out).expect("missing preprocessed output");
+    assert!(
+        !preprocessed.starts_with(b"\xef\xbb\xbf"),
+        "preprocessed output retained its leading BOM: {preprocessed:?}"
+    );
+    assert!(
+        !preprocessed
+            .windows(b"#define".len())
+            .any(|bytes| bytes == b"#define"),
+        "preprocessed output retained the first-line directive: {preprocessed:?}"
+    );
+    assert!(
+        preprocessed
+            .windows(b"integer :: value = 73".len())
+            .any(|bytes| bytes == b"integer :: value = 73"),
+        "preprocessed output did not expand the first-line macro: {preprocessed:?}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn dash_capital_e_rejects_macro_arity_without_publishing_output() {
     let cases = [
         (
@@ -31264,31 +31300,82 @@ fn utf8_lexer_error_reports_character_and_caret() {
 }
 
 #[test]
-fn bom_prefixed_source_compiles_cleanly() {
+fn bom_prefixed_first_line_directive_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=bom_prefixed_source_compiles_cleanly count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=bom_prefixed_first_line_directive_compiles_and_runs count=1 reason=\"{}\"",
             reason
         );
         return;
     }
-    let src = write_program("\u{feff}program p\n  print *, 1\nend program\n", "f90");
-    let out = unique_path("bom", "o");
+    let src = write_program(
+        "\u{feff}#define VALUE 73\n\
+         program p\n\
+           implicit none\n\
+           integer, parameter :: answer = VALUE\n\
+           print *, answer\n\
+         end program\n",
+        "F90",
+    );
+    let out = unique_path("bom_directive", "bin");
     let result = Command::new(compiler("armfortas"))
-        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
         .expect("spawn failed");
     assert!(
         result.status.success(),
-        "BOM-prefixed source should compile: {}",
+        "BOM-prefixed first-line directive should compile: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(
         out.exists(),
-        "BOM-prefixed compile should produce an object"
+        "BOM-prefixed compile should produce an executable"
     );
+    let run = Command::new(&out).output().expect("run failed to spawn");
+    assert!(
+        run.status.success(),
+        "BOM-prefixed program failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "73");
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn mid_file_bom_is_rejected_without_publishing_output() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=mid_file_bom_is_rejected_without_publishing_output count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n\u{feff}  integer :: value\n  value = 1\nend program\n",
+        "f90",
+    );
+    let out = unique_path("mid_file_bom", "o");
+    assert!(!out.exists(), "test output must start absent");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "a mid-file BOM must not be silently discarded"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("lexer error: unexpected character"),
+        "expected a lexical rejection for the mid-file BOM: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "a failed mid-file BOM compile must not publish an object"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

@@ -161,7 +161,11 @@ struct SourceFile {
 }
 
 impl SourceFile {
-    fn new(filename: Arc<str>, text: String, source_view: bool) -> Self {
+    fn new(filename: Arc<str>, mut text: String, source_view: bool) -> Self {
+        // Normalize the stream marker before physical-line dispatch and source mapping.
+        if text.starts_with('\u{feff}') {
+            text.drain(..'\u{feff}'.len_utf8());
+        }
         let mut line_starts = vec![0];
         line_starts.extend(
             text.bytes()
@@ -2722,6 +2726,75 @@ mod tests {
     fn define_and_expand_object_macro() {
         let out = pp("#define FOO 42\nx = FOO\n");
         assert!(out.contains("x = 42"));
+    }
+
+    #[test]
+    fn utf8_bom_does_not_hide_first_line_directive() {
+        let output = pp_bytes(b"\xef\xbb\xbf#define FOO 42\nx = FOO\n");
+        assert!(!output.starts_with(b"\xef\xbb\xbf"), "got: {output:?}");
+        assert!(
+            !output
+                .windows(b"#define".len())
+                .any(|text| text == b"#define"),
+            "got: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"x = 42".len())
+                .any(|text| text == b"x = 42"),
+            "got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn utf8_bom_is_removed_from_included_source_before_directive_dispatch() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-bom-include-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, "\u{feff}#define INCLUDED_VALUE 73\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let source = format!("#include \"{name}\"\nx = INCLUDED_VALUE\n");
+        let output = preprocess(&source, &config).unwrap().text;
+        assert!(!output.contains('\u{feff}'), "got: {output:?}");
+        assert!(!output.contains("#define"), "got: {output:?}");
+        assert!(output.contains("x = 73"), "got: {output:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn utf8_bom_is_only_removed_at_the_start_of_each_file() {
+        let source = "x = 1\n\u{feff}#define HIDDEN 2\ny = HIDDEN\n";
+        let output = pp(source);
+        assert!(
+            output.contains("\u{feff}#define HIDDEN 2"),
+            "got: {output:?}"
+        );
+        assert!(output.contains("y = HIDDEN"), "got: {output:?}");
+    }
+
+    #[test]
+    fn utf8_bom_is_removed_before_source_map_construction() {
+        let result =
+            preprocess("\u{feff}value = @\nsecond = 1\n", &PreprocConfig::default()).unwrap();
+        assert_eq!(result.text, "value = @\nsecond = 1\n");
+        let column = result.text.lines().next().unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(Span {
+            file_id: 0,
+            start: Position {
+                line: 1,
+                col: column,
+            },
+            end: Position {
+                line: 1,
+                col: column + 1,
+            },
+        });
+        assert_eq!(resolved.source_span.start.line, 1);
+        assert_eq!(resolved.source_span.start.col, column);
+        assert!(!resolved.source.starts_with('\u{feff}'));
     }
 
     #[test]
