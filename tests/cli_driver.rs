@@ -5762,6 +5762,300 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 }
 
 #[test]
+fn bind_c_name_named_constant_exports_evaluated_label() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_name_named_constant_exports_evaluated_label count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_name_named_constant");
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        "#include <stdint.h>\n\nextern void armfortas_named_binding(int32_t *value);\n\nint main(void) {\n    int32_t value = -1;\n    armfortas_named_binding(&value);\n    return value == 42 ? 0 : 1;\n}\n",
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let fortran_src = write_program_in(
+        &dir,
+        "binding.f90",
+        "module bindings\n  use iso_c_binding, only: c_int\n  implicit none\n  character(len=*), parameter :: exported_name = 'armfortas_named_binding'\ncontains\n  subroutine set_answer(value) bind(c, name=exported_name)\n    integer(c_int), intent(out) :: value\n    value = 42_c_int\n  end subroutine set_answer\nend module bindings\n",
+    );
+    let fortran_obj = dir.join("binding.o");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            fortran_src.to_str().unwrap(),
+            "-o",
+            fortran_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("named BIND(C) constant compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "named BIND(C) constant should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let exe = dir.join("bind_c_name_named_constant.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            fortran_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("named BIND(C) constant link failed to spawn");
+    assert!(
+        link.status.success(),
+        "BIND(C) must export the evaluated constant label: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("named BIND(C) constant executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "named BIND(C) constant executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_c_name_use_associated_concat_survives_amod_and_links() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_name_use_associated_concat_survives_amod_and_links count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_name_cross_tu");
+    let labels_src = write_program_in(
+        &dir,
+        "binding_labels.f90",
+        "module binding_labels\n  implicit none\n  character(len=*), parameter :: label_prefix = 'armfortas_cross_'\n  character(len=*), parameter :: label_suffix = 'tu_binding'\nend module binding_labels\n",
+    );
+    let labels_obj = dir.join("binding_labels.o");
+    let labels_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            labels_src.to_str().unwrap(),
+            "-o",
+            labels_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("binding-label parameter module compile failed to spawn");
+    assert!(
+        labels_compile.status.success(),
+        "binding-label parameter module should compile: {}",
+        String::from_utf8_lossy(&labels_compile.stderr)
+    );
+
+    let binding_src = write_program_in(
+        &dir,
+        "binding.f90",
+        "module bindings\n  use iso_c_binding, only: c_int\n  use binding_labels, only: label_prefix, label_suffix\n  implicit none\ncontains\n  subroutine set_answer(value) bind(c, name=label_prefix // label_suffix)\n    integer(c_int), intent(out) :: value\n    value = 42_c_int\n  end subroutine set_answer\nend module bindings\n",
+    );
+    let binding_obj = dir.join("binding.o");
+    let binding_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            binding_src.to_str().unwrap(),
+            "-o",
+            binding_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("use-associated BIND(C) label compile failed to spawn");
+    assert!(
+        binding_compile.status.success(),
+        "use-associated BIND(C) label should compile: {}",
+        String::from_utf8_lossy(&binding_compile.stderr)
+    );
+
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        "#include <stdint.h>\n\nextern void armfortas_cross_tu_binding(int32_t *value);\n\nint main(void) {\n    int32_t value = -1;\n    armfortas_cross_tu_binding(&value);\n    return value == 42 ? 0 : 1;\n}\n",
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let exe = dir.join("bind_c_name_cross_tu.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            labels_obj.to_str().unwrap(),
+            binding_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("use-associated BIND(C) label link failed to spawn");
+    assert!(
+        link.status.success(),
+        "evaluated BIND(C) label must survive .amod import: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-TU BIND(C) label executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "cross-TU BIND(C) label executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_bind_c_name_preserves_native_module_linkage_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_bind_c_name_preserves_native_module_linkage_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_empty_name_cross_tu");
+    let binding_src = write_program_in(
+        &dir,
+        "empty_binding.f90",
+        "module empty_binding\n  use iso_c_binding, only: c_char, c_int\n  implicit none\ncontains\n  subroutine set_answer(value) bind(c, name='')\n    integer(c_int), intent(out) :: value\n    value = 42_c_int\n  end subroutine set_answer\n\n  function answer_marker() result(marker) bind(c, name='')\n    character(kind=c_char) :: marker\n    marker = 'Z'\n  end function answer_marker\nend module empty_binding\n",
+    );
+    let binding_obj = dir.join("empty_binding.o");
+    let binding_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            binding_src.to_str().unwrap(),
+            "-o",
+            binding_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty-label BIND(C) module compile failed to spawn");
+    assert!(
+        binding_compile.status.success(),
+        "empty-label BIND(C) module should compile: {}",
+        String::from_utf8_lossy(&binding_compile.stderr)
+    );
+    let amod = std::fs::read_to_string(dir.join("empty_binding.amod"))
+        .expect("empty-label BIND(C) module did not emit .amod");
+    assert!(
+        amod.lines().any(|line| {
+            line.starts_with("@function answer_marker ")
+                && line.contains(", bind_c")
+                && !line.contains("bind=")
+        }),
+        "NAME='' must serialize BIND(C) independently of a binding label:\n{amod}"
+    );
+
+    let caller_src = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use iso_c_binding, only: c_int\n  use empty_binding, only: answer_marker, set_answer\n  implicit none\n  integer(c_int) :: value\n  call set_answer(value)\n  if (value /= 42_c_int) error stop 1\n  if (answer_marker() /= 'Z') error stop 2\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            caller_src.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty-label BIND(C) caller compile failed to spawn");
+    assert!(
+        caller_compile.status.success(),
+        "empty-label BIND(C) .amod consumer should compile: {}",
+        String::from_utf8_lossy(&caller_compile.stderr)
+    );
+
+    let exe = dir.join("bind_c_empty_name_cross_tu.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            binding_obj.to_str().unwrap(),
+            caller_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty-label BIND(C) cross-TU link failed to spawn");
+    assert!(
+        link.status.success(),
+        "NAME='' must use native module linkage across .amod: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("empty-label BIND(C) executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "empty-label BIND(C) executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_bind_c_name_expression_removes_stale_object() {
+    let dir = unique_dir("bind_c_name_invalid");
+    let src = write_program_in(
+        &dir,
+        "invalid.f90",
+        "module invalid_binding\n  implicit none\n  character(len=32) :: mutable_name = 'not_constant'\ncontains\n  subroutine bad() bind(c, name=mutable_name)\n  end subroutine bad\nend module invalid_binding\n",
+    );
+    let output = dir.join("invalid.o");
+    std::fs::write(&output, b"stale object").expect("cannot seed stale BIND(C) object");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", src.to_str().unwrap(), "-o", output.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("invalid BIND(C) label compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "nonconstant BIND(C) NAME= unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("BIND(C) NAME= must be a scalar default-character constant expression"),
+        "unexpected BIND(C) diagnostic:\n{stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "failed BIND(C) compilation left a stale object looking successful"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fortran_name_precedes_bind_c_label_for_result_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

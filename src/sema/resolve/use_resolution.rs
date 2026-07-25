@@ -882,6 +882,7 @@ fn install_external_interface(
             elemental: proc.elemental,
             is_separate_module_interface: proc.is_separate_module_interface,
             is_separate_module_procedure: proc.is_separate_module_procedure,
+            bind_c: proc.bind_c,
             binding_label: proc.binding_label.clone(),
             result_rank: proc.result_rank,
             array_spec: result_array_spec,
@@ -913,6 +914,8 @@ fn install_external_interface(
         };
         let proc_scope = st.push_scope(proc_scope_kind);
         st.scope_mut(proc_scope).arg_order = arg_names.clone();
+        st.scope_mut(proc_scope).bind_c = proc.bind_c;
+        st.scope_mut(proc_scope).binding_label = proc.binding_label.clone();
         for arg in &proc.args {
             if arg.hidden {
                 continue;

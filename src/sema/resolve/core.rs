@@ -177,18 +177,71 @@ fn backfill_function_result_type(
     }
 }
 
-fn normalized_bind_name(
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ProcedureBinding {
+    bind_c: bool,
+    label: Option<String>,
+}
+
+fn resolved_procedure_binding(
     bind: Option<&crate::ast::unit::BindInfo>,
     default_name: &str,
-) -> Option<String> {
-    bind.map(|info| {
-        info.name
-            .as_deref()
-            .unwrap_or(default_name)
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string()
+    st: &SymbolTable,
+    scope_id: ScopeId,
+) -> Result<ProcedureBinding, SemaError> {
+    let Some(bind) = bind else {
+        return Ok(ProcedureBinding::default());
+    };
+    let Some(expr) = &bind.name else {
+        return Ok(ProcedureBinding {
+            bind_c: true,
+            label: Some(default_name.to_string()),
+        });
+    };
+    if !matches!(
+        crate::sema::types::expr_type(expr, st),
+        crate::sema::types::FortranType::Character { kind: 1, .. }
+    ) {
+        return Err(SemaError {
+            span: expr.span,
+            msg: "BIND(C) NAME= must be a scalar default-character constant expression".into(),
+        });
+    }
+    let value = eval_const_char_expr_in_scope(expr, st, scope_id).ok_or_else(|| SemaError {
+        span: expr.span,
+        msg: "BIND(C) NAME= must be a scalar default-character constant expression".into(),
+    })?;
+    if value.is_empty() {
+        return Ok(ProcedureBinding {
+            bind_c: true,
+            label: None,
+        });
+    }
+    let mut chars = value.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        return Err(SemaError {
+            span: expr.span,
+            msg: "BIND(C) NAME= must evaluate to a valid C identifier or an empty string".into(),
+        });
+    }
+    Ok(ProcedureBinding {
+        bind_c: true,
+        label: Some(value),
     })
+}
+
+fn unresolved_procedure_binding(
+    bind: Option<&crate::ast::unit::BindInfo>,
+    default_name: &str,
+) -> ProcedureBinding {
+    ProcedureBinding {
+        bind_c: bind.is_some(),
+        label: bind.map(|_| default_name.to_string()),
+    }
 }
 
 type InterfaceOuterRef = (
@@ -196,6 +249,7 @@ type InterfaceOuterRef = (
     SymbolKind,
     Option<TypeInfo>,
     Vec<String>,
+    bool, // bind(c)
     Option<String>,
     bool, // pure
     bool, // elemental
@@ -413,7 +467,7 @@ pub(super) fn resolve_unit(
             name,
             args,
             prefix,
-            bind: _,
+            bind,
             uses,
             imports,
             implicit,
@@ -481,6 +535,16 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            let binding = if is_separate_body && bind.is_none() {
+                ProcedureBinding {
+                    bind_c: st.scope(scope_id).bind_c,
+                    label: st.scope(scope_id).binding_label.clone(),
+                }
+            } else {
+                resolved_procedure_binding(bind.as_ref(), name, st, scope_id)?
+            };
+            st.scope_mut(scope_id).bind_c = binding.bind_c;
+            st.scope_mut(scope_id).binding_label = binding.label;
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
@@ -493,7 +557,7 @@ pub(super) fn resolve_unit(
             args,
             result,
             return_type,
-            bind: _,
+            bind,
             prefix,
             uses,
             imports,
@@ -556,6 +620,9 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            let binding = resolved_procedure_binding(bind.as_ref(), name, st, scope_id)?;
+            st.scope_mut(scope_id).bind_c = binding.bind_c;
+            st.scope_mut(scope_id).binding_label = binding.label;
             backfill_function_result_type(
                 st,
                 host_scope,
@@ -740,12 +807,14 @@ pub(super) fn resolve_unit(
                             result_attrs_for_iface.is_separate_module_interface = prefix
                                 .iter()
                                 .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
+                            let binding = unresolved_procedure_binding(bind.as_ref(), fn_name);
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Function,
                                 ti,
                                 arg_names,
-                                normalized_bind_name(bind.as_ref(), fn_name),
+                                binding.bind_c,
+                                binding.label,
                                 pure,
                                 elemental,
                                 result_attrs_for_iface,
@@ -778,12 +847,14 @@ pub(super) fn resolve_unit(
                             let is_separate_module_interface = prefix
                                 .iter()
                                 .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
+                            let binding = unresolved_procedure_binding(bind.as_ref(), fn_name);
                             outer_refs.push((
                                 fn_name.clone(),
                                 SymbolKind::Subroutine,
                                 None,
                                 arg_names,
-                                normalized_bind_name(bind.as_ref(), fn_name),
+                                binding.bind_c,
+                                binding.label,
                                 pure,
                                 elemental,
                                 SymbolAttrs {
@@ -797,7 +868,7 @@ pub(super) fn resolve_unit(
                 }
             }
 
-            st.push_scope(ScopeKind::Interface);
+            let interface_scope = st.push_scope(ScopeKind::Interface);
             let mut specific_names = Vec::new();
             for body in bodies {
                 match body {
@@ -810,6 +881,23 @@ pub(super) fn resolve_unit(
                             _ => {}
                         }
                         resolve_unit(st, sub, module_search_paths, layouts)?;
+                        if let Some(proc_scope) = find_unit_scope(st, interface_scope, &sub.node) {
+                            let bind_c = st.scope(proc_scope).bind_c;
+                            let binding_label = st.scope(proc_scope).binding_label.clone();
+                            let (name, kind) = match &sub.node {
+                                ProgramUnit::Function { name, .. } => (name, SymbolKind::Function),
+                                ProgramUnit::Subroutine { name, .. } => {
+                                    (name, SymbolKind::Subroutine)
+                                }
+                                _ => continue,
+                            };
+                            if let Some(outer_ref) = outer_refs.iter_mut().find(|outer_ref| {
+                                outer_ref.0.eq_ignore_ascii_case(name) && outer_ref.1 == kind
+                            }) {
+                                outer_ref.4 = bind_c;
+                                outer_ref.5 = binding_label;
+                            }
+                        }
                     }
                     InterfaceBody::ModuleProcedure(names) => {
                         for n in names {
@@ -823,8 +911,17 @@ pub(super) fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_attrs) in
-                outer_refs
+            for (
+                fn_name,
+                kind,
+                ti,
+                arg_names,
+                bind_c,
+                binding_label,
+                pure,
+                elemental,
+                result_attrs,
+            ) in outer_refs
             {
                 let span = unit.span;
                 let symbol = Symbol {
@@ -833,6 +930,7 @@ pub(super) fn resolve_unit(
                     type_info: ti.clone(),
                     attrs: SymbolAttrs {
                         external: true,
+                        bind_c,
                         binding_label: binding_label.clone(),
                         pure,
                         elemental,
@@ -862,6 +960,7 @@ pub(super) fn resolve_unit(
                             if existing.kind == SymbolKind::Variable {
                                 let mut attrs = existing.attrs.clone();
                                 attrs.external = true;
+                                attrs.bind_c = bind_c;
                                 attrs.binding_label = binding_label;
                                 attrs.pure = pure;
                                 attrs.elemental = elemental;
@@ -1122,6 +1221,21 @@ fn inject_separate_module_procedure_args(
     let Some(iface_scope) = iface_scope else {
         return;
     };
+    let inherited_binding = if st.scope(iface_scope).bind_c {
+        ProcedureBinding {
+            bind_c: true,
+            label: st.scope(iface_scope).binding_label.clone(),
+        }
+    } else {
+        st.scope(parent_module_scope)
+            .symbols
+            .get(&proc_lc)
+            .map(|symbol| ProcedureBinding {
+                bind_c: symbol.attrs.bind_c,
+                label: symbol.attrs.binding_label.clone(),
+            })
+            .unwrap_or_default()
+    };
 
     // Snapshot arg_order and dummy-arg symbols from the interface
     // scope before mutating the body scope.
@@ -1165,6 +1279,8 @@ fn inject_separate_module_procedure_args(
     };
 
     st.scope_mut(body_scope).arg_order = arg_order;
+    st.scope_mut(body_scope).bind_c = inherited_binding.bind_c;
+    st.scope_mut(body_scope).binding_label = inherited_binding.label;
     for mut sym in arg_symbols {
         sym.scope = body_scope;
         sym.defined_at = span;
@@ -1747,7 +1863,7 @@ fn eval_const_char_expr_in_scope(
         Expr::StringLiteral { value, .. } => Some(value.source_view().into_owned()),
         Expr::Name { name } => {
             let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
-            if sym.attrs.parameter {
+            if sym.attrs.parameter && sym.attrs.array_spec.is_empty() {
                 sym.const_char_value.clone()
             } else {
                 None
@@ -2687,10 +2803,12 @@ fn process_contains(
                     && prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
+                let binding = unresolved_procedure_binding(bind.as_ref(), name);
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
-                    binding_label: normalized_bind_name(bind.as_ref(), name),
+                    bind_c: binding.bind_c,
+                    binding_label: binding.label,
                     is_separate_module_procedure: is_smp,
                     ..Default::default()
                 };
@@ -2767,12 +2885,14 @@ fn process_contains(
                     && prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
+                let binding = unresolved_procedure_binding(bind.as_ref(), name);
                 let fn_attrs = SymbolAttrs {
                     allocatable: result_attrs.allocatable,
                     pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
-                    binding_label: normalized_bind_name(bind.as_ref(), name),
+                    bind_c: binding.bind_c,
+                    binding_label: binding.label,
                     result_rank: result_attrs.result_rank,
                     is_separate_module_procedure: fn_is_smp,
                     ..Default::default()
@@ -2798,7 +2918,24 @@ fn process_contains(
             }
             _ => {}
         }
+        let host_scope = st.current_scope();
         resolve_unit(st, unit, module_search_paths, layouts)?;
+        if let Some(proc_scope) = find_unit_scope(st, host_scope, &unit.node) {
+            let bind_c = st.scope(proc_scope).bind_c;
+            let binding_label = st.scope(proc_scope).binding_label.clone();
+            let name = match &unit.node {
+                ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } => name,
+                _ => continue,
+            };
+            if let Some(symbol) = st
+                .scope_mut(host_scope)
+                .symbols
+                .get_mut(&name.to_ascii_lowercase())
+            {
+                symbol.attrs.bind_c = bind_c;
+                symbol.attrs.binding_label = binding_label;
+            }
+        }
     }
     Ok(())
 }
@@ -3381,6 +3518,255 @@ end program
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.symbols.contains_key("inner"));
+    }
+
+    #[test]
+    fn bind_c_name_resolves_named_character_constant() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: exported_name = 'armfortas_named_binding'
+contains
+  subroutine set_answer(value) bind(c, name=exported_name)
+    integer, intent(out) :: value
+    value = 42
+  end subroutine
+end module
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert_eq!(
+            module_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_named_binding")
+        );
+        assert!(module_scope.symbols["set_answer"].attrs.bind_c);
+    }
+
+    #[test]
+    fn bind_c_name_resolves_concatenated_character_constants() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: prefix = 'armfortas_'
+  character(len=*), parameter :: suffix = 'concat_binding'
+contains
+  subroutine set_answer(value) bind(c, name=prefix // suffix)
+    integer, intent(out) :: value
+  end subroutine
+end module
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert_eq!(
+            module_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_concat_binding")
+        );
+    }
+
+    #[test]
+    fn bind_c_name_resolves_local_character_constant() {
+        let st = resolve_source(
+            "\
+subroutine set_answer(value) bind(c, name=exported_name)
+  character(len=*), parameter :: exported_name = 'armfortas_local_binding'
+  integer, intent(out) :: value
+end subroutine
+",
+        );
+        let proc_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "set_answer"),
+            )
+            .unwrap();
+        assert_eq!(
+            proc_scope.binding_label.as_deref(),
+            Some("armfortas_local_binding")
+        );
+        assert!(proc_scope.bind_c);
+    }
+
+    #[test]
+    fn bind_c_name_resolves_imported_interface_constant() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: exported_name = 'armfortas_iface_binding'
+  interface
+    subroutine set_answer(value) bind(c, name=exported_name)
+      import :: exported_name
+      integer, intent(out) :: value
+    end subroutine
+  end interface
+end module
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert_eq!(
+            module_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_iface_binding")
+        );
+    }
+
+    #[test]
+    fn separate_module_body_inherits_resolved_bind_c_name() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: exported_name = 'armfortas_smp_binding'
+  interface
+    module subroutine set_answer(value) bind(c, name=exported_name)
+      import :: exported_name
+      integer, intent(out) :: value
+    end subroutine
+  end interface
+end module
+submodule(bindings) implementation
+contains
+  module procedure set_answer
+    value = 42
+  end procedure set_answer
+end submodule
+",
+        );
+        let submodule_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(&scope.kind, ScopeKind::Submodule(name) if name == "implementation")
+            })
+            .unwrap();
+        let body_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                scope.parent == Some(submodule_scope.id)
+                    && matches!(
+                        &scope.kind,
+                        ScopeKind::Subroutine(name) if name == "set_answer"
+                    )
+            })
+            .unwrap();
+        assert_eq!(
+            body_scope.binding_label.as_deref(),
+            Some("armfortas_smp_binding")
+        );
+        assert!(body_scope.bind_c);
+        assert_eq!(
+            submodule_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_smp_binding")
+        );
+        assert!(submodule_scope.symbols["set_answer"].attrs.bind_c);
+    }
+
+    #[test]
+    fn bind_c_name_rejects_nonconstant_character_entity() {
+        let err = resolve_error(
+            "\
+module bindings
+  implicit none
+  character(len=32) :: exported_name = 'armfortas_named_binding'
+contains
+  subroutine set_answer(value) bind(c, name=exported_name)
+    integer, intent(out) :: value
+  end subroutine
+end module
+",
+        );
+        assert!(
+            err.msg
+                .contains("BIND(C) NAME= must be a scalar default-character constant expression"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_c_name_rejects_noncharacter_and_unknown_expressions() {
+        for source in [
+            "subroutine bad() bind(c, name=42)\nend subroutine\n",
+            "subroutine bad() bind(c, name=missing_name)\nend subroutine\n",
+            "subroutine bad() bind(c, name=wide_name)\n  character(kind=4, len=*), parameter :: wide_name = 'wide'\nend subroutine\n",
+            "subroutine bad() bind(c, name=names)\n  character(len=3), parameter :: names(2) = 'foo'\nend subroutine\n",
+        ] {
+            let err = resolve_error(source);
+            assert!(
+                err.msg.contains(
+                    "BIND(C) NAME= must be a scalar default-character constant expression"
+                ),
+                "unexpected error for {source:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_c_name_rejects_invalid_c_identifier() {
+        let err = resolve_error("subroutine bad() bind(c, name='not-a-c-name')\nend subroutine\n");
+        assert!(
+            err.msg
+                .contains("must evaluate to a valid C identifier or an empty string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_bind_c_name_has_no_binding_label() {
+        let st = resolve_source(
+            "\
+module bindings
+contains
+  subroutine native_name() bind(c, name='')
+  end subroutine
+end module
+",
+        );
+        let proc_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "native_name"),
+            )
+            .unwrap();
+        assert!(proc_scope.bind_c);
+        assert_eq!(proc_scope.binding_label, None);
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert!(module_scope.symbols["native_name"].attrs.bind_c);
+        assert_eq!(
+            module_scope.symbols["native_name"].attrs.binding_label,
+            None
+        );
     }
 
     #[test]

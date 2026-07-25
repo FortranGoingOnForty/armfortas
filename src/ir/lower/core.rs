@@ -245,7 +245,7 @@ pub fn lower_file(
     let mut internal_funcs: HashMap<String, u32> = HashMap::new();
     let mut next_internal_idx: u32 = 0;
     for unit in units {
-        collect_internal_func_names(&unit.node, &mut internal_funcs, &mut next_internal_idx);
+        collect_internal_func_names(&unit.node, st, &mut internal_funcs, &mut next_internal_idx);
     }
 
     // Host association: for every contained procedure, compute the set
@@ -1297,18 +1297,57 @@ fn collect_called_contained_names_expr(
 
 pub(super) fn collect_internal_func_names(
     unit: &ProgramUnit,
+    st: &SymbolTable,
     out: &mut HashMap<String, u32>,
     next_idx: &mut u32,
 ) {
-    collect_internal_func_names_inner(unit, false, out, next_idx);
+    collect_internal_func_names_inner(unit, st, 0, false, out, next_idx);
 }
 
 pub(super) fn collect_internal_func_names_inner(
     unit: &ProgramUnit,
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
     is_contained: bool,
     out: &mut HashMap<String, u32>,
     next_idx: &mut u32,
 ) {
+    let unit_scope = st
+        .all_scopes()
+        .iter()
+        .find(|scope| {
+            if scope.parent != Some(parent_scope) {
+                return false;
+            }
+            match (&scope.kind, unit) {
+                (
+                    crate::sema::symtab::ScopeKind::Program(scope_name),
+                    ProgramUnit::Program { name, .. },
+                ) => name
+                    .as_deref()
+                    .unwrap_or("main")
+                    .eq_ignore_ascii_case(scope_name),
+                (
+                    crate::sema::symtab::ScopeKind::Module(scope_name),
+                    ProgramUnit::Module { name, .. },
+                )
+                | (
+                    crate::sema::symtab::ScopeKind::Submodule(scope_name),
+                    ProgramUnit::Submodule { name, .. },
+                )
+                | (
+                    crate::sema::symtab::ScopeKind::Subroutine(scope_name),
+                    ProgramUnit::Subroutine { name, .. },
+                )
+                | (
+                    crate::sema::symtab::ScopeKind::Function(scope_name),
+                    ProgramUnit::Function { name, .. },
+                ) => name.eq_ignore_ascii_case(scope_name),
+                _ => false,
+            }
+        })
+        .map(|scope| scope.id)
+        .unwrap_or(parent_scope);
     match unit {
         ProgramUnit::Program { name, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -1316,44 +1355,26 @@ pub(super) fn collect_internal_func_names_inner(
             out.insert(body_name, *next_idx);
             *next_idx += 1;
             for sub in contains {
-                collect_internal_func_names_inner(&sub.node, true, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, st, unit_scope, true, out, next_idx);
             }
         }
-        ProgramUnit::Subroutine {
-            name,
-            bind,
-            contains,
-            ..
-        }
-        | ProgramUnit::Function {
-            name,
-            bind,
-            contains,
-            ..
-        } => {
+        ProgramUnit::Subroutine { name, contains, .. }
+        | ProgramUnit::Function { name, contains, .. } => {
             if is_contained {
                 let idx = *next_idx;
                 *next_idx += 1;
                 out.insert(name.to_lowercase(), idx);
-                if let Some(bind) = bind {
-                    if let Some(bind_name) = bind.name.as_deref() {
-                        out.entry(
-                            bind_name
-                                .trim_matches('\'')
-                                .trim_matches('"')
-                                .to_lowercase(),
-                        )
-                        .or_insert(idx);
-                    }
+                if let Some(bind_name) = st.scope(unit_scope).binding_label.as_deref() {
+                    out.entry(bind_name.to_lowercase()).or_insert(idx);
                 }
             }
             for sub in contains {
-                collect_internal_func_names_inner(&sub.node, true, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, st, unit_scope, true, out, next_idx);
             }
         }
         ProgramUnit::Module { contains, .. } | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
-                collect_internal_func_names_inner(&sub.node, false, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, st, unit_scope, false, out, next_idx);
             }
         }
         _ => {}
@@ -1365,7 +1386,7 @@ pub(super) fn function_hidden_result_abi(
     result: &Option<String>,
     return_type: Option<&TypeSpec>,
     decls: &[crate::ast::decl::SpannedDecl],
-    bind: Option<&crate::ast::unit::BindInfo>,
+    is_bind_c: bool,
     st: Option<&SymbolTable>,
 ) -> HiddenResultAbi {
     use crate::ast::decl::Attribute;
@@ -1399,7 +1420,7 @@ pub(super) fn function_hidden_result_abi(
                 return HiddenResultAbi::ArrayDescriptor;
             }
             if matches!(type_spec, TypeSpec::Character(_)) && !has_dims {
-                return if bind.is_some() {
+                return if is_bind_c {
                     HiddenResultAbi::None
                 } else {
                     HiddenResultAbi::StringDescriptor
@@ -1408,7 +1429,7 @@ pub(super) fn function_hidden_result_abi(
             if attrs.iter().any(|a| matches!(a, Attribute::Allocatable)) {
                 return HiddenResultAbi::ArrayDescriptor;
             }
-            if bind.is_none()
+            if !is_bind_c
                 && !decl_is_pointer(&result_key, decls)
                 && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st)
                     .is_some()
@@ -1422,21 +1443,21 @@ pub(super) fn function_hidden_result_abi(
             // of the complex literal as an address (SEGV).
             if matches!(type_spec, TypeSpec::Complex(_) | TypeSpec::DoubleComplex)
                 && !decl_is_pointer(&result_key, decls)
-                && bind.is_none()
+                && !is_bind_c
             {
                 return HiddenResultAbi::ComplexBuffer;
             }
             return HiddenResultAbi::None;
         }
     }
-    if bind.is_none()
+    if !is_bind_c
         && !decl_is_pointer(&result_key, decls)
         && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st).is_some()
     {
         return HiddenResultAbi::DerivedAggregate;
     }
     if matches!(return_type, Some(TypeSpec::Character(_))) {
-        return if bind.is_some() {
+        return if is_bind_c {
             HiddenResultAbi::None
         } else {
             HiddenResultAbi::StringDescriptor
@@ -1450,7 +1471,7 @@ pub(super) fn function_hidden_result_abi(
     if matches!(
         return_type,
         Some(TypeSpec::Complex(_)) | Some(TypeSpec::DoubleComplex)
-    ) && bind.is_none()
+    ) && !is_bind_c
     {
         return HiddenResultAbi::ComplexBuffer;
     }
@@ -1534,7 +1555,7 @@ pub(super) fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<S
                 result,
                 return_type.as_ref(),
                 decls,
-                bind.as_ref(),
+                bind.is_some(),
                 None,
             ) == HiddenResultAbi::ArrayDescriptor
             {
@@ -2365,7 +2386,7 @@ pub(super) fn synth_int_literal_expr(n: i64) -> crate::ast::expr::SpannedExpr {
 /// Sprint35-SMP Phase 2: convert a sema SymbolAttrs back to an AST
 /// Vec<Attribute> so the synthesizer's TypeDecl looks the same as one
 /// the parser would have emitted. Skips procedure-only flags (pure,
-/// elemental, result_rank, binding_label, procedure_iface) and the
+/// elemental, result_rank, bind_c, binding_label, procedure_iface) and the
 /// access flag (Public/Private rarely matter for dummies and the
 /// existing decl-attr converter sets a default).
 pub(super) fn sym_attrs_to_decl_attrs(
@@ -19725,20 +19746,14 @@ pub(super) fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
 
 pub(super) fn lowered_procedure_symbol_name(
     name: &str,
-    bind: Option<&crate::ast::unit::BindInfo>,
+    binding_label: Option<&str>,
     host_link_name: Option<&str>,
     host_module: Option<&str>,
     internal_only: bool,
     internal_funcs: &HashMap<String, u32>,
 ) -> String {
-    if let Some(bind) = bind {
-        return bind
-            .name
-            .as_deref()
-            .unwrap_or(name)
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string();
+    if let Some(binding_label) = binding_label {
+        return binding_label.to_string();
     }
     if internal_only {
         if let Some(idx) = internal_funcs.get(&name.to_lowercase()) {
@@ -25146,6 +25161,9 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
         return false;
     };
     let scope = st.scope(scope_id);
+    if scope.bind_c {
+        return true;
+    }
     let Some(proc_name) = (match &scope.kind {
         crate::sema::symtab::ScopeKind::Function(name)
         | crate::sema::symtab::ScopeKind::Subroutine(name) => Some(name.to_lowercase()),
@@ -25157,8 +25175,7 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
     while let Some(scope_id) = owner_scope {
         let scope = st.scope(scope_id);
         if scope.symbols.get(&proc_name).is_some_and(|sym| {
-            matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
-                && sym.attrs.binding_label.is_some()
+            matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) && sym.attrs.bind_c
         }) {
             return true;
         }
@@ -25444,7 +25461,7 @@ fn character_return_abi_for_symbol(
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
-    if sym.attrs.binding_label.is_some() {
+    if sym.attrs.bind_c {
         Some(CharacterReturnAbi::BindCScalarByte)
     } else {
         Some(CharacterReturnAbi::HiddenDescriptor)
@@ -25484,7 +25501,7 @@ pub(super) fn callee_hidden_result_abi(
     }
     match sym.type_info.as_ref()? {
         TypeInfo::Character { .. } => {
-            if sym.attrs.binding_label.is_some() {
+            if sym.attrs.bind_c {
                 None
             } else {
                 Some(HiddenResultAbi::StringDescriptor)
@@ -25500,7 +25517,7 @@ pub(super) fn callee_hidden_result_abi(
         // caller passed a hidden buffer that a clang-built callee never
         // writes — the x08 differential read zeros).
         TypeInfo::Complex { .. } if !sym.attrs.pointer => {
-            if sym.attrs.binding_label.is_some() {
+            if sym.attrs.bind_c {
                 None
             } else {
                 Some(HiddenResultAbi::ComplexBuffer)
@@ -25810,7 +25827,7 @@ fn symbol_returns_owned_character_temp(sym: &crate::sema::symtab::Symbol) -> boo
     ) && sym.attrs.allocatable
         && !sym.attrs.pointer
         && sym.attrs.result_rank == 0
-        && sym.attrs.binding_label.is_none()
+        && !sym.attrs.bind_c
 }
 
 fn callable_symbol_returns_owned_character_temp(

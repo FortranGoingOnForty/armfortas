@@ -998,6 +998,9 @@ fn emit_procedure(
     if !is_public(sym, st.scope(mod_scope_id)) {
         write!(out, ", private").unwrap();
     }
+    if sym.attrs.bind_c && sym.attrs.binding_label.is_none() {
+        write!(out, ", bind_c").unwrap();
+    }
     if let Some(binding_label) = &sym.attrs.binding_label {
         write!(out, ", bind={}", binding_label).unwrap();
     }
@@ -1057,7 +1060,7 @@ fn emit_procedure(
             })
         });
 
-    let is_bind_c = sym.attrs.binding_label.is_some();
+    let is_bind_c = sym.attrs.bind_c;
     let declared_descriptor_params = descriptor_params
         .get(&metadata_name)
         .or_else(|| descriptor_params.get(&name_lc));
@@ -1583,6 +1586,7 @@ pub struct AmodProc {
     pub is_separate_module_interface: bool,
     pub is_separate_module_procedure: bool,
     pub access: Access,
+    pub bind_c: bool,
     pub binding_label: Option<String>,
     pub args: Vec<AmodArg>,
 }
@@ -2303,6 +2307,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let binding_label = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
+    let bind_c = binding_label.is_some() || attr_chunks.iter().any(|attr| attr == "bind_c");
 
     let kind = if is_func {
         SymbolKind::Function
@@ -2344,6 +2349,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         is_separate_module_interface,
         is_separate_module_procedure,
         access,
+        bind_c,
         binding_label,
         args,
     }
@@ -2865,7 +2871,7 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
 pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for proc in &iface.procedures {
-        let is_bind_c = proc.binding_label.is_some();
+        let is_bind_c = proc.bind_c;
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let hidden_len_args: HashSet<String> = proc
             .args

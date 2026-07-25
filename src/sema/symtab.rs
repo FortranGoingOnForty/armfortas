@@ -142,6 +142,8 @@ impl SymbolTable {
             use_associations: Vec::new(),
             host_association: HostAssociationControl::all(),
             submodule_ancestor: None,
+            bind_c: false,
+            binding_label: None,
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
@@ -313,6 +315,8 @@ impl SymbolTable {
             use_associations: Vec::new(),
             host_association: HostAssociationControl::all(),
             submodule_ancestor: None,
+            bind_c: false,
+            binding_label: None,
             default_access: Access::Public,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
@@ -2094,6 +2098,12 @@ pub struct Scope {
     pub use_associations: Vec<UseAssociation>,
     pub(crate) host_association: HostAssociationControl,
     pub(crate) submodule_ancestor: Option<String>,
+    /// Whether this procedure scope has a `BIND(C)` language-binding
+    /// specification, independent of whether it has a binding label.
+    pub bind_c: bool,
+    /// Resolved external linkage label for a `BIND(C)` procedure scope.
+    /// `None` also represents the standard `NAME=''` no-label case.
+    pub binding_label: Option<String>,
     pub default_access: Access,
     pub pending_access: HashMap<String, Access>,
     /// Ordered dummy argument names (for function/subroutine scopes).
@@ -2198,9 +2208,12 @@ pub struct SymbolAttrs {
     pub type_owner_module: Option<String>,
     pub allocatable: bool,
     pub pointer: bool,
-    /// For BIND(C, NAME="...") procedures, preserve the actual link
-    /// symbol so lowering can call the declared external name rather
-    /// than the local Fortran alias.
+    /// Whether the procedure has a `BIND(C)` language-binding
+    /// specification, independent of whether it has a binding label.
+    pub bind_c: bool,
+    /// For `BIND(C)` procedures with a binding label, preserve the actual
+    /// link symbol so lowering can call it rather than the local alias.
+    /// `None` also represents the standard `NAME=''` no-label case.
     pub binding_label: Option<String>,
     /// For `procedure(iface), pointer :: p`, preserve the declared
     /// interface name so `.amod` can round-trip the symbol truthfully.
@@ -2248,6 +2261,7 @@ impl Default for SymbolAttrs {
             type_owner_module: None,
             allocatable: false,
             pointer: false,
+            bind_c: false,
             binding_label: None,
             procedure_iface: None,
             target: false,

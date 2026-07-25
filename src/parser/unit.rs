@@ -1422,7 +1422,7 @@ impl<'a> Parser<'a> {
         Ok(ImportStmt::Default(names))
     }
 
-    /// Parse optional BIND(C [, NAME="..."]) clause.
+    /// Parse optional BIND(C [, NAME=scalar-default-char-constant-expr]) clause.
     /// Returns `None` if no BIND, `Some(BindInfo)` if present.
     fn try_parse_bind(&mut self) -> Result<Option<BindInfo>, ParseError> {
         if !self.peek_text().eq_ignore_ascii_case("bind") {
@@ -1430,15 +1430,19 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // bind
         self.expect(&TokenKind::LParen)?;
+        if self.peek() != &TokenKind::Identifier || !self.peek_text().eq_ignore_ascii_case("c") {
+            return Err(self.error("expected C language binding in BIND clause".into()));
+        }
         self.advance(); // c
         let name = if self.eat(&TokenKind::Comma) {
-            if self.peek_text().eq_ignore_ascii_case("name") {
-                self.advance();
-                self.expect(&TokenKind::Assign)?;
-                Some(self.advance().clone().text)
-            } else {
-                None
+            if self.peek() != &TokenKind::Identifier
+                || !self.peek_text().eq_ignore_ascii_case("name")
+            {
+                return Err(self.error("expected NAME in BIND(C) clause".into()));
             }
+            self.advance();
+            self.expect(&TokenKind::Assign)?;
+            Some(self.parse_expr()?)
         } else {
             None
         };
@@ -2035,13 +2039,61 @@ mod tests {
 
     #[test]
     fn subroutine_bind_c_with_name() {
+        use crate::ast::expr::Expr;
+
         let u =
             parse_unit("subroutine foo(x) bind(c, name='c_foo')\n  real :: x\nend subroutine\n");
         if let ProgramUnit::Subroutine { bind, .. } = &u.node {
             assert!(bind.is_some());
-            assert_eq!(bind.as_ref().unwrap().name.as_deref(), Some("'c_foo'"));
+            let name = bind.as_ref().unwrap().name.as_ref().unwrap();
+            assert!(
+                matches!(
+                    &name.node,
+                    Expr::StringLiteral { value, kind: None } if value == "c_foo"
+                ),
+                "unexpected NAME expression: {name:?}"
+            );
         } else {
             panic!("not Subroutine");
         }
+    }
+
+    #[test]
+    fn bind_name_parses_constant_expression() {
+        use crate::ast::expr::{BinaryOp, Expr};
+
+        let u = parse_unit("subroutine foo() bind(c, name=prefix // suffix)\nend subroutine\n");
+        let ProgramUnit::Subroutine {
+            bind: Some(bind), ..
+        } = &u.node
+        else {
+            panic!("expected bound Subroutine");
+        };
+        assert!(
+            matches!(
+                bind.name.as_ref().map(|expr| &expr.node),
+                Some(Expr::BinaryOp {
+                    op: BinaryOp::Concat,
+                    ..
+                })
+            ),
+            "unexpected NAME expression: {:?}",
+            bind.name
+        );
+    }
+
+    #[test]
+    fn bind_rejects_non_c_language() {
+        let err = parse_error("subroutine foo() bind(fortran)\nend subroutine\n");
+        assert!(
+            err.msg.contains("expected C language binding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_rejects_unknown_specifier() {
+        let err = parse_error("subroutine foo() bind(c, value='c_foo')\nend subroutine\n");
+        assert!(err.msg.contains("expected NAME"), "unexpected error: {err}");
     }
 }

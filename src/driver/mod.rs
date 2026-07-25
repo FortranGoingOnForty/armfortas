@@ -2131,10 +2131,7 @@ fn compile_with_bundled_runtime_inner(
                 &format!("lexer error: {}", e.msg),
             );
             phases.report();
-            return Err(format!(
-                "aborting due to errors in {}",
-                opts.input.display()
-            ));
+            return Err(raw_source_failure(opts, included_files));
         }
     };
     phase.end(&mut phases);
@@ -2165,10 +2162,7 @@ fn compile_with_bundled_runtime_inner(
                 &format!("parse error: {}", e.msg),
             );
             phases.report();
-            return Err(format!(
-                "aborting due to errors in {}",
-                opts.input.display()
-            ));
+            return Err(raw_source_failure(opts, included_files));
         }
     };
     phase.end(&mut phases);
@@ -2195,10 +2189,7 @@ fn compile_with_bundled_runtime_inner(
                 phase.end(&mut phases);
                 render_preprocessed_diagnostic(&pp_result, e.span, diag::Level::Error, &e.msg);
                 phases.report();
-                return Err(format!(
-                    "aborting due to errors in {}",
-                    opts.input.display()
-                ));
+                return Err(raw_source_failure(opts, included_files));
             }
         };
     let mut st = resolve_result.st;
@@ -2240,10 +2231,7 @@ fn compile_with_bundled_runtime_inner(
     }
     if had_error {
         phases.report();
-        return Err(format!(
-            "aborting due to errors in {}",
-            opts.input.display()
-        ));
+        return Err(raw_source_failure(opts, included_files));
     }
     if opts.verbose {
         eprintln!(" sema: {} diagnostics", diags.len());
