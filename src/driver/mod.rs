@@ -422,13 +422,12 @@ pub struct Options {
     pub cli_warnings: Vec<String>,
 
     // ---- Debug / introspection ----
-    pub debug_info: bool,                      // -g (accepted; DWARF deferred)
-    pub verbose: bool,                         // -v
-    pub time_report: bool,                     // --time-report
-    pub diagnostics_format: DiagnosticsFormat, // --diagnostics-format=
-    pub check_bounds: bool,                    // -fcheck=bounds
-    pub check_all: bool,                       // -fcheck=all
-    pub backtrace_requested: bool,             // -fbacktrace (accepted; runtime wiring TODO)
+    pub debug_info: bool,          // -g (accepted; DWARF deferred)
+    pub verbose: bool,             // -v
+    pub time_report: bool,         // --time-report
+    pub check_bounds: bool,        // -fcheck=bounds
+    pub check_all: bool,           // -fcheck=all
+    pub backtrace_requested: bool, // -fbacktrace (accepted; runtime wiring TODO)
 
     // ---- Search paths / linking ----
     /// Directories to search for `.amod` module files (`-I <dir>`).
@@ -460,12 +459,6 @@ pub struct Options {
     pub no_pie: bool,
     /// ISA capability level (x10): baseline only today.
     pub target_cpu: TargetCpu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticsFormat {
-    Text,
-    Json,
 }
 
 impl Default for Options {
@@ -514,7 +507,6 @@ impl Default for Options {
             debug_info: false,
             verbose: false,
             time_report: false,
-            diagnostics_format: DiagnosticsFormat::Text,
             check_bounds: false,
             check_all: false,
             backtrace_requested: false,
@@ -920,11 +912,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "--time-report" => opts.time_report = true,
             arg if arg.starts_with("--diagnostics-format=") => {
                 let val = &arg["--diagnostics-format=".len()..];
-                opts.diagnostics_format = match val {
-                    "text" => DiagnosticsFormat::Text,
-                    "json" => DiagnosticsFormat::Json,
-                    other => return Err(format!("unknown --diagnostics-format value: {}", other)),
-                };
+                if val != "text" {
+                    return Err(format!(
+                        "unsupported --diagnostics-format value '{val}'; supported value: text"
+                    ));
+                }
             }
 
             // ---- Positional input file ----
@@ -948,10 +940,6 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
     }
 
     collect_cli_warnings(&mut opts, &unknown_warning_flags);
-
-    if matches!(opts.diagnostics_format, DiagnosticsFormat::Json) {
-        return Err("JSON diagnostics are not yet implemented".into());
-    }
 
     if inputs.is_empty() {
         return Err("no input file".into());
@@ -1361,8 +1349,7 @@ DEBUGGING:
   -fcheck=array-temps         Accept GNU-style array-temp diagnostic flag
   -fcheck=all                 Enable all runtime checks
   -fcoarray=single            Accept GNU-style single-image coarray mode flag
-  --diagnostics-format=text|json
-                              Diagnostic output format
+  --diagnostics-format=text   Diagnostic output format (text only)
 
 DIRECTORIES:
   -I <dir>                    Module/include search path

@@ -199,6 +199,11 @@ fn help_flag_shows_usage_and_exits_zero() {
             && stdout.contains("fully static ELF linking is not implemented"),
         "help must not advertise unsupported ELF static linking:\n{stdout}"
     );
+    assert!(
+        stdout.contains("--diagnostics-format=text")
+            && !stdout.contains("--diagnostics-format=text|json"),
+        "help must advertise only the implemented diagnostics format:\n{stdout}"
+    );
 }
 
 #[test]
@@ -17223,9 +17228,10 @@ fn response_file_supplies_arguments() {
 }
 
 #[test]
-fn diagnostics_format_json_is_rejected_until_implemented() {
+fn diagnostics_format_contract_advertises_and_accepts_only_text() {
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("diag_json", "bin");
+    std::fs::write(&out, b"preexisting output").unwrap();
     let result = Command::new(compiler("armfortas"))
         .args([
             "--diagnostics-format=json",
@@ -17237,16 +17243,46 @@ fn diagnostics_format_json_is_rejected_until_implemented() {
         .expect("spawn failed");
     assert!(
         !result.status.success(),
-        "--diagnostics-format=json should be rejected until implemented"
+        "--diagnostics-format=json must be rejected as unsupported"
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("JSON diagnostics are not yet implemented"),
-        "expected explicit json-format diagnostic: {}",
+        stderr.contains("unsupported --diagnostics-format value 'json'; supported value: text"),
+        "expected explicit supported-format diagnostic: {}",
         stderr
     );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"preexisting output",
+        "CLI parsing failure must not claim or mutate the requested output"
+    );
+
+    let asm = unique_path("diag_text", "s");
+    std::fs::write(&asm, b"stale assembly").unwrap();
+    let text_result = Command::new(compiler("armfortas"))
+        .args([
+            "--diagnostics-format=text",
+            "-S",
+            src.to_str().unwrap(),
+            "-o",
+            asm.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        text_result.status.success(),
+        "the documented text diagnostics mode must compile:\n{}",
+        String::from_utf8_lossy(&text_result.stderr)
+    );
+    assert_ne!(
+        std::fs::read(&asm).unwrap(),
+        b"stale assembly",
+        "successful text-mode compilation retained stale output"
+    );
+
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&asm);
 }
 
 #[test]
