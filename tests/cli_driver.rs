@@ -1374,6 +1374,271 @@ end program
 }
 
 #[test]
+fn merged_use_generics_enforce_cross_tu_specific_distinguishability() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_use_generics_enforce_cross_tu_specific_distinguishability count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("indistinguishable_use_generic");
+    let left_src = write_program_in(
+        &dir,
+        "generic_left.f90",
+        r#"
+module generic_left
+  implicit none
+  interface choose
+    module procedure choose_left
+  end interface
+  interface convert
+    module procedure choose_left
+  end interface
+  interface by_rank
+    module procedure rank_scalar_left
+  end interface
+  interface by_arity
+    module procedure arity_one_left
+  end interface
+contains
+  integer function choose_left(value)
+    integer, intent(in) :: value
+    choose_left = value + 10
+  end function
+  integer function rank_scalar_left(value)
+    integer, intent(in) :: value
+    rank_scalar_left = value + 40
+  end function
+  integer function arity_one_left(value)
+    integer, intent(in) :: value
+    arity_one_left = value + 50
+  end function
+end module
+"#,
+    );
+    let right_src = write_program_in(
+        &dir,
+        "generic_right.f90",
+        r#"
+module generic_right
+  implicit none
+  interface choose
+    module procedure choose_right
+  end interface
+  interface convert
+    module procedure convert_right
+  end interface
+  interface by_rank
+    module procedure rank_vector_right
+  end interface
+  interface by_arity
+    module procedure arity_two_right
+  end interface
+contains
+  integer function choose_right(value)
+    integer, intent(in) :: value
+    choose_right = value + 20
+  end function
+  integer function convert_right(value)
+    real, intent(in) :: value
+    convert_right = int(value) + 30
+  end function
+  integer function rank_vector_right(values)
+    integer, intent(in) :: values(:)
+    rank_vector_right = sum(values) + 60
+  end function
+  integer function arity_two_right(left, right)
+    integer, intent(in) :: left, right
+    arity_two_right = left + right + 70
+  end function
+end module
+"#,
+    );
+    let legal_main_src = write_program_in(
+        &dir,
+        "legal_main.f90",
+        r#"
+program legal_demo
+  use generic_left, only : convert
+  use generic_right, only : convert
+  use generic_left, only : by_rank
+  use generic_right, only : by_rank
+  use generic_left, only : by_arity
+  use generic_right, only : by_arity
+  implicit none
+  if (convert(1) /= 11) error stop 1
+  if (convert(1.0) /= 31) error stop 2
+  if (by_rank(2) /= 42) error stop 3
+  if (by_rank([2, 3]) /= 65) error stop 4
+  if (by_arity(1) /= 51) error stop 5
+  if (by_arity(1, 2) /= 73) error stop 6
+  print *, "ok"
+end program
+"#,
+    );
+    let rejected_main_src = write_program_in(
+        &dir,
+        "rejected_main.f90",
+        r#"
+program demo
+  use generic_left, only : choose
+  use generic_right, only : choose
+  implicit none
+  print *, choose(1)
+end program
+"#,
+    );
+    let reversed_main_src = write_program_in(
+        &dir,
+        "reversed_main.f90",
+        r#"
+program reversed_demo
+  use generic_right, only : choose
+  use generic_left, only : choose
+  implicit none
+  print *, choose(1)
+end program
+"#,
+    );
+    let unused_main_src = write_program_in(
+        &dir,
+        "unused_main.f90",
+        r#"
+program unused_demo
+  use generic_left, only : choose
+  use generic_right, only : choose
+  implicit none
+end program
+"#,
+    );
+    let block_main_src = write_program_in(
+        &dir,
+        "block_main.f90",
+        r#"
+program block_demo
+  implicit none
+  block
+    use generic_left, only : choose
+    use generic_right, only : choose
+    integer :: untouched
+    untouched = 1
+  end block
+end program
+"#,
+    );
+
+    for (src, object_name) in [
+        (&left_src, "generic_left.o"),
+        (&right_src, "generic_right.o"),
+    ] {
+        let object = dir.join(object_name);
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("provider compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "generic provider {} should compile: {}",
+            src.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    let legal_object = dir.join("legal_main.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            legal_main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            legal_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("legal consumer compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "distinguishable USE-associated specifics should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let legal_executable = dir.join("legal_main.bin");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            dir.join("generic_left.o").to_str().unwrap(),
+            dir.join("generic_right.o").to_str().unwrap(),
+            legal_object.to_str().unwrap(),
+            "-o",
+            legal_executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("legal consumer link failed to spawn");
+    assert!(
+        result.status.success(),
+        "distinguishable USE-associated specifics should link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = Command::new(&legal_executable)
+        .output()
+        .expect("legal consumer run failed to spawn");
+    assert!(
+        result.status.success() && String::from_utf8_lossy(&result.stdout).contains("ok"),
+        "distinguishable USE-associated specifics should run: status={:?} stdout={} stderr={}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let diagnostic = "generic interface 'choose' has indistinguishable specific procedures \
+                      'choose_left' and 'choose_right'";
+    for (source, object_name) in [
+        (&rejected_main_src, "rejected_main.o"),
+        (&reversed_main_src, "reversed_main.o"),
+        (&unused_main_src, "unused_main.o"),
+        (&block_main_src, "block_main.o"),
+    ] {
+        let out = dir.join(object_name);
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                source.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("consumer compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "indistinguishable USE-associated generic specifics should be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "expected one stable indistinguishable-generic diagnostic: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn direct_use_association_conflicts_with_local_declarations() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

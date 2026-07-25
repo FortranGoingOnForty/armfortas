@@ -150,6 +150,10 @@ pub(super) struct Ctx<'a> {
     /// One ambiguity in a host scope can be referenced by several contained
     /// procedures. Report it once at the first source reference.
     reported_use_ambiguities: HashSet<(ScopeId, String)>,
+    /// A malformed merged generic can remain visible through host association
+    /// in several nested scopes. Key the exact cross-owner pair so the
+    /// declaration error is emitted once instead of once per reference.
+    reported_indistinguishable_generics: HashSet<(String, ScopeId, String, ScopeId, String)>,
     /// A restricted IMPORT policy can make the same host entity appear in
     /// several declaration expressions. Diagnose the first reference only.
     reported_inaccessible_host_entities: HashSet<(ScopeId, String)>,
@@ -227,6 +231,7 @@ impl<'a> Ctx<'a> {
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
+            reported_indistinguishable_generics: HashSet::new(),
             reported_inaccessible_host_entities: HashSet::new(),
             reported_block_use_ambiguities: HashSet::new(),
             ambiguity_lexical_frames: Vec::new(),
@@ -3152,6 +3157,58 @@ fn procedure_specification_reference_facts(
     facts
 }
 
+fn program_unit_use_decls(unit: &ProgramUnit) -> &[SpannedDecl] {
+    match unit {
+        ProgramUnit::Program { uses, .. }
+        | ProgramUnit::Module { uses, .. }
+        | ProgramUnit::Submodule { uses, .. }
+        | ProgramUnit::Subroutine { uses, .. }
+        | ProgramUnit::Function { uses, .. }
+        | ProgramUnit::BlockData { uses, .. } => uses,
+        ProgramUnit::InterfaceBlock { .. } => &[],
+    }
+}
+
+fn sorted_use_binding_names(st: &SymbolTable, uses: &[SpannedDecl]) -> Vec<String> {
+    let mut names = HashSet::new();
+    collect_block_use_binding_names(st, uses, &mut names);
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort();
+    names
+}
+
+fn report_indistinguishable_merged_generic(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    generic_name: &str,
+    interfaces: Option<&[&Symbol]>,
+) {
+    let pair = interfaces.map_or_else(
+        || indistinguishable_merged_generic_specifics(ctx, generic_name),
+        |interfaces| indistinguishable_generic_specifics_from_interfaces(ctx, interfaces),
+    );
+    let Some(pair) = pair else {
+        return;
+    };
+    let report_key = (
+        generic_name.to_ascii_lowercase(),
+        pair.left_owner_scope,
+        pair.left_name.clone(),
+        pair.right_owner_scope,
+        pair.right_name.clone(),
+    );
+    if ctx.reported_indistinguishable_generics.insert(report_key) {
+        ctx.error(
+            span,
+            format!(
+                "generic interface '{}' has indistinguishable specific procedures \
+                 '{}' and '{}'",
+                generic_name, pair.left_name, pair.right_name
+            ),
+        );
+    }
+}
+
 fn validate_use_ambiguities(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
     for reference in procedure_specification_reference_facts(&unit.node, unit.span).references {
         if reference.role == ReferenceRole::Callable && is_intrinsic_name(&reference.name) {
@@ -3180,23 +3237,43 @@ fn validate_use_ambiguities(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
         }
     }
 
+    // F2023 15.4.3.4.5 constrains every pair of specifics that is accessible
+    // under one generic identifier; a call is not required to trigger the
+    // constraint. Validate each name introduced by this unit's USE statements
+    // once up front, including names re-exported through a single module.
+    let mut checked_merged_generics = HashSet::new();
+    for name in sorted_use_binding_names(ctx.st, program_unit_use_decls(&unit.node)) {
+        checked_merged_generics.insert(name.clone());
+        report_indistinguishable_merged_generic(ctx, unit.span, &name, None);
+    }
+
     let facts = procedure_reference_facts(&unit.node, unit.span);
     for reference in facts.references {
         let allow_generic_merge = reference.role == ReferenceRole::Callable;
-        let Some(ambiguity) =
+        if let Some(ambiguity) =
             ctx.st
                 .use_ambiguity_in(ctx.scope_id, &reference.name, allow_generic_merge)
-        else {
-            continue;
-        };
-        let report_key = (ambiguity.origin_scope, reference.name.clone());
-        if !ctx.reported_use_ambiguities.insert(report_key) {
+        {
+            let report_key = (ambiguity.origin_scope, reference.name.clone());
+            if !ctx.reported_use_ambiguities.insert(report_key) {
+                continue;
+            }
+            ctx.error(
+                reference.span,
+                use_ambiguity_message(&reference.name, &ambiguity.providers),
+            );
             continue;
         }
-        ctx.error(
-            reference.span,
-            use_ambiguity_message(&reference.name, &ambiguity.providers),
-        );
+        if !allow_generic_merge {
+            continue;
+        }
+        // Local generic declarations can extend a host-associated generic
+        // without introducing another USE name in this unit. Retain the
+        // reference-time fallback for that case, but never rebuild imported
+        // characteristics for every call.
+        if checked_merged_generics.insert(reference.name.clone()) {
+            report_indistinguishable_merged_generic(ctx, reference.span, &reference.name, None);
+        }
     }
 }
 
@@ -3517,6 +3594,19 @@ fn validate_block_use_ambiguities(
     collect_block_binding_names(decls, &mut shadowed);
     extend_declared_names_from_ifaces(&mut shadowed, ifaces);
 
+    // BLOCK constructs are absent from the ordinary scope graph. Check their
+    // explicit USE set here, before reference collection, so an unused merged
+    // generic is held to the same constraint as a program-unit generic.
+    let mut checked_merged_generics = HashSet::new();
+    for name in sorted_use_binding_names(ctx.st, uses) {
+        checked_merged_generics.insert(name.clone());
+        let associations = block_use_associations_for_name(ctx.st, uses, &name);
+        let interfaces = ctx
+            .st
+            .named_interface_symbols_from_use_associations(&associations, &name);
+        report_indistinguishable_merged_generic(ctx, block_span, &name, Some(&interfaces));
+    }
+
     let mut facts = ProcedureReferenceFacts::default();
     for decl in implicit.iter().chain(decls) {
         collect_reference_decl(decl, &shadowed, &mut facts);
@@ -3529,6 +3619,17 @@ fn validate_block_use_ambiguities(
         let mut block_binding_found = false;
 
         let associations = block_use_associations_for_name(ctx.st, uses, &reference.name);
+        if allow_generic_merge && checked_merged_generics.insert(reference.name.clone()) {
+            let interfaces = ctx
+                .st
+                .named_interface_symbols_from_use_associations(&associations, &reference.name);
+            report_indistinguishable_merged_generic(
+                ctx,
+                reference.span,
+                &reference.name,
+                Some(&interfaces),
+            );
+        }
         if let Some(ambiguity) = ctx.st.use_ambiguity_from_associations(
             ctx.scope_id,
             &reference.name,
@@ -7009,6 +7110,635 @@ enum DirectProcedureKind {
     Subroutine,
 }
 
+struct GenericSpecificCharacteristics {
+    name: String,
+    owner_scope: ScopeId,
+    procedure: GenericProcedureCharacteristics,
+}
+
+struct GenericProcedureCharacteristics {
+    kind: DirectProcedureKind,
+    dummies: Vec<GenericDummyCharacteristics>,
+    result: Option<GenericProcedureResult>,
+    complete: bool,
+}
+
+struct GenericDummyCharacteristics {
+    name: String,
+    optional: bool,
+    kind: GenericDummyKind,
+}
+
+enum GenericDummyKind {
+    Data(GenericDataCharacteristics),
+    Procedure(Option<Box<GenericProcedureCharacteristics>>),
+}
+
+struct GenericDataCharacteristics {
+    type_info: Option<TypeInfo>,
+    declared_scope: ScopeId,
+    rank: usize,
+    assumed_rank: bool,
+    assumed_size: bool,
+    allocatable: bool,
+    pointer: bool,
+    intent: Option<Intent>,
+}
+
+enum GenericProcedureResult {
+    Data(GenericDataCharacteristics),
+    Procedure(Option<Box<GenericProcedureCharacteristics>>),
+}
+
+fn generic_symbol_is_procedure_dummy(symbol: &Symbol) -> bool {
+    symbol.attrs.external
+        || symbol.attrs.procedure_iface.is_some()
+        || matches!(
+            symbol.kind,
+            SymbolKind::Function
+                | SymbolKind::Subroutine
+                | SymbolKind::ExternalProc
+                | SymbolKind::IntrinsicProc
+                | SymbolKind::ProcedurePointer
+        )
+}
+
+fn generic_data_characteristics(
+    symbol: &Symbol,
+    declared_scope: ScopeId,
+) -> GenericDataCharacteristics {
+    GenericDataCharacteristics {
+        type_info: symbol.type_info.clone(),
+        declared_scope,
+        rank: symbol.attrs.array_spec.len(),
+        assumed_rank: symbol
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank)),
+        assumed_size: symbol
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. })),
+        allocatable: symbol.attrs.allocatable,
+        pointer: symbol.attrs.pointer,
+        intent: symbol.attrs.intent,
+    }
+}
+
+fn generic_nested_procedure_characteristics(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    visiting: &mut HashSet<ScopeId>,
+) -> Option<Box<GenericProcedureCharacteristics>> {
+    let interface_name = symbol.attrs.procedure_iface.as_deref()?;
+    let interface_symbol = ctx.st.lookup_in(symbol.scope, interface_name)?;
+    let procedure_scope =
+        assignment_candidate_scope(ctx, &interface_symbol.name, interface_symbol.scope)?;
+    build_generic_procedure_characteristics(ctx, interface_symbol, procedure_scope, visiting)
+        .map(Box::new)
+}
+
+fn generic_function_result(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    procedure_scope: &Scope,
+    declared_scope: ScopeId,
+    visiting: &mut HashSet<ScopeId>,
+) -> Option<GenericProcedureResult> {
+    let result_symbol = procedure_scope.procedure_result_symbol();
+    if let Some(result) = result_symbol.filter(|result| {
+        result.attrs.procedure_iface.is_some()
+            || matches!(result.kind, SymbolKind::ProcedurePointer)
+    }) {
+        return Some(GenericProcedureResult::Procedure(
+            generic_nested_procedure_characteristics(ctx, result, visiting),
+        ));
+    }
+
+    let type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| result_symbol.and_then(|result| result.type_info.clone()))?;
+    let metadata_symbol = result_symbol.unwrap_or(symbol);
+    let mut data = generic_data_characteristics(metadata_symbol, declared_scope);
+    data.type_info = Some(type_info);
+    data.rank = symbol_declared_result_rank(symbol)
+        .unwrap_or(0)
+        .max(data.rank)
+        .max(usize::from(metadata_symbol.attrs.result_rank));
+    Some(GenericProcedureResult::Data(data))
+}
+
+fn build_generic_procedure_characteristics(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    procedure_scope: &Scope,
+    visiting: &mut HashSet<ScopeId>,
+) -> Option<GenericProcedureCharacteristics> {
+    if !visiting.insert(procedure_scope.id) {
+        return None;
+    }
+    let characteristics = (|| {
+        let kind = match procedure_scope.kind {
+            ScopeKind::Function(_) => DirectProcedureKind::Function,
+            ScopeKind::Subroutine(_) => DirectProcedureKind::Subroutine,
+            _ => return None,
+        };
+        let declared_scope = ctx
+            .type_layouts
+            .filter(|layouts| layouts.scope_path(procedure_scope.id).is_some())
+            .map_or(symbol.scope, |_| procedure_scope.id);
+        let mut complete = true;
+        let mut dummies = Vec::with_capacity(procedure_scope.arg_order.len());
+        for dummy_name in &procedure_scope.arg_order {
+            let dummy = procedure_scope
+                .symbols
+                .get(&dummy_name.to_ascii_lowercase())?;
+            let dummy_kind = if generic_symbol_is_procedure_dummy(dummy) {
+                let nested = generic_nested_procedure_characteristics(ctx, dummy, visiting);
+                complete &= nested
+                    .as_deref()
+                    .is_some_and(|characteristics| characteristics.complete);
+                GenericDummyKind::Procedure(nested)
+            } else {
+                let data = generic_data_characteristics(dummy, declared_scope);
+                complete &= data.type_info.is_some();
+                GenericDummyKind::Data(data)
+            };
+            dummies.push(GenericDummyCharacteristics {
+                name: dummy.name.to_ascii_lowercase(),
+                optional: dummy.attrs.optional,
+                kind: dummy_kind,
+            });
+        }
+        let result = (kind == DirectProcedureKind::Function)
+            .then(|| {
+                generic_function_result(ctx, symbol, procedure_scope, declared_scope, visiting)
+            })
+            .flatten();
+        Some(GenericProcedureCharacteristics {
+            kind,
+            dummies,
+            result,
+            complete,
+        })
+    })();
+    visiting.remove(&procedure_scope.id);
+    characteristics
+}
+
+fn generic_same_derived_type(
+    ctx: &Ctx<'_>,
+    left_scope: ScopeId,
+    left: &str,
+    right_scope: ScopeId,
+    right: &str,
+) -> bool {
+    let Some(layouts) = ctx.type_layouts else {
+        return left.eq_ignore_ascii_case(right);
+    };
+    let left_layout = layouts
+        .get_for_scope(left_scope, left)
+        .or_else(|| layouts.get(left));
+    let right_layout = layouts
+        .get_for_scope(right_scope, right)
+        .or_else(|| layouts.get(right));
+    match (left_layout, right_layout) {
+        (Some(left), Some(right)) => {
+            layouts.canonical_key_for_layout(left) == layouts.canonical_key_for_layout(right)
+        }
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
+fn generic_type_is_same_or_extension(
+    ctx: &Ctx<'_>,
+    actual_scope: ScopeId,
+    actual: &str,
+    declared_scope: ScopeId,
+    declared: &str,
+) -> bool {
+    let Some(layouts) = ctx.type_layouts else {
+        return actual.eq_ignore_ascii_case(declared);
+    };
+    let actual_layout = layouts
+        .get_for_scope(actual_scope, actual)
+        .or_else(|| layouts.get(actual));
+    let declared_layout = layouts
+        .get_for_scope(declared_scope, declared)
+        .or_else(|| layouts.get(declared));
+    match (actual_layout, declared_layout) {
+        (Some(actual), Some(declared)) => layouts.is_same_or_extension_of(actual, declared),
+        _ => actual.eq_ignore_ascii_case(declared),
+    }
+}
+
+fn generic_same_enumeration(
+    ctx: &Ctx<'_>,
+    left_scope: ScopeId,
+    left: &str,
+    right_scope: ScopeId,
+    right: &str,
+) -> bool {
+    if !left.eq_ignore_ascii_case(right) {
+        return false;
+    }
+    match (
+        ctx.st.lookup_in(left_scope, left),
+        ctx.st.lookup_in(right_scope, right),
+    ) {
+        (Some(left), Some(right)) => {
+            left.kind == SymbolKind::EnumerationType
+                && right.kind == SymbolKind::EnumerationType
+                && left.scope == right.scope
+        }
+        _ => true,
+    }
+}
+
+fn generic_type_compatible(
+    ctx: &Ctx<'_>,
+    left_scope: ScopeId,
+    left: &TypeInfo,
+    right_scope: ScopeId,
+    right: &TypeInfo,
+) -> bool {
+    fn kind_eq(left: Option<u8>, right: Option<u8>, default: u8) -> bool {
+        left.unwrap_or(default) == right.unwrap_or(default)
+    }
+
+    match (left, right) {
+        // Type compatibility is directional (F2023 7.3.3). An unlimited
+        // polymorphic declared type accepts every dynamic type, but the
+        // reverse is not true. Assumed type is TK-compatible only with
+        // assumed type; its permissive actual-argument rules are separate.
+        (TypeInfo::ClassStar, _) => true,
+        (_, TypeInfo::ClassStar) => false,
+        (TypeInfo::TypeStar, TypeInfo::TypeStar) => true,
+        (TypeInfo::TypeStar, _) | (_, TypeInfo::TypeStar) => false,
+        (TypeInfo::Derived(left), TypeInfo::Derived(right)) => {
+            generic_same_derived_type(ctx, left_scope, left, right_scope, right)
+        }
+        (TypeInfo::Class(left), TypeInfo::Derived(right) | TypeInfo::Class(right)) => {
+            generic_type_is_same_or_extension(ctx, right_scope, right, left_scope, left)
+        }
+        (TypeInfo::Derived(left), TypeInfo::Class(right)) => {
+            generic_same_derived_type(ctx, left_scope, left, right_scope, right)
+        }
+        (TypeInfo::Integer { kind: left }, TypeInfo::Integer { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_int_kind())
+        }
+        (TypeInfo::Real { kind: left }, TypeInfo::Real { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
+        (TypeInfo::DoublePrecision, TypeInfo::Real { kind })
+        | (TypeInfo::Real { kind }, TypeInfo::DoublePrecision) => {
+            kind_eq(Some(8), *kind, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Complex { kind: left }, TypeInfo::Complex { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Logical { kind: left }, TypeInfo::Logical { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_int_kind())
+        }
+        (
+            TypeInfo::Character {
+                kind: left_kind, ..
+            },
+            TypeInfo::Character {
+                kind: right_kind, ..
+            },
+        ) => kind_eq(*left_kind, *right_kind, 1),
+        (TypeInfo::Enumeration(left), TypeInfo::Enumeration(right)) => {
+            generic_same_enumeration(ctx, left_scope, left, right_scope, right)
+        }
+        _ => false,
+    }
+}
+
+fn generic_data_tkr_compatible(
+    ctx: &Ctx<'_>,
+    left: &GenericDataCharacteristics,
+    right: &GenericDataCharacteristics,
+) -> bool {
+    let types_compatible = match (&left.type_info, &right.type_info) {
+        (Some(left_type), Some(right_type)) => generic_type_compatible(
+            ctx,
+            left.declared_scope,
+            left_type,
+            right.declared_scope,
+            right_type,
+        ),
+        _ => true,
+    };
+    if !types_compatible {
+        return false;
+    }
+    left.assumed_rank || right.assumed_rank || left.rank == right.rank
+}
+
+fn generic_data_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericDataCharacteristics,
+    right: &GenericDataCharacteristics,
+) -> bool {
+    let types_overlap = match (&left.type_info, &right.type_info) {
+        (Some(left_type), Some(right_type)) => {
+            generic_type_compatible(
+                ctx,
+                left.declared_scope,
+                left_type,
+                right.declared_scope,
+                right_type,
+            ) || generic_type_compatible(
+                ctx,
+                right.declared_scope,
+                right_type,
+                left.declared_scope,
+                left_type,
+            )
+        }
+        _ => true,
+    };
+    if !types_overlap {
+        return true;
+    }
+    let assumed_type_scalar_exception = (left.assumed_size
+        && matches!(left.type_info, Some(TypeInfo::TypeStar))
+        && right.rank == 0)
+        || (right.assumed_size
+            && matches!(right.type_info, Some(TypeInfo::TypeStar))
+            && left.rank == 0);
+    if !left.assumed_rank
+        && !right.assumed_rank
+        && !assumed_type_scalar_exception
+        && left.rank != right.rank
+    {
+        return true;
+    }
+    (left.allocatable && right.pointer && right.intent != Some(Intent::In))
+        || (right.allocatable && left.pointer && left.intent != Some(Intent::In))
+}
+
+fn generic_results_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericProcedureResult,
+    right: &GenericProcedureResult,
+) -> bool {
+    match (left, right) {
+        (GenericProcedureResult::Data(left), GenericProcedureResult::Data(right)) => {
+            generic_data_distinguishable(ctx, left, right)
+        }
+        (GenericProcedureResult::Procedure(left), GenericProcedureResult::Procedure(right)) => {
+            match (left.as_deref(), right.as_deref()) {
+                (Some(left), Some(right)) => {
+                    generic_procedures_distinguishable(ctx, left, right).unwrap_or(false)
+                }
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn generic_dummy_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericDummyCharacteristics,
+    right: &GenericDummyCharacteristics,
+) -> bool {
+    match (&left.kind, &right.kind) {
+        (GenericDummyKind::Data(left), GenericDummyKind::Data(right)) => {
+            generic_data_distinguishable(ctx, left, right)
+        }
+        (GenericDummyKind::Procedure(left), GenericDummyKind::Procedure(right)) => {
+            let (Some(left), Some(right)) = (left.as_deref(), right.as_deref()) else {
+                return false;
+            };
+            if generic_procedures_distinguishable(ctx, left, right).unwrap_or(false) {
+                return true;
+            }
+            match (&left.result, &right.result) {
+                (Some(left), Some(right)) => generic_results_distinguishable(ctx, left, right),
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn generic_rule_one_distinguishes(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> bool {
+    left.iter().chain(right).any(|candidate| {
+        let GenericDummyKind::Data(candidate_data) = &candidate.kind else {
+            return false;
+        };
+        let compatible = |arguments: &[GenericDummyCharacteristics]| {
+            arguments
+                .iter()
+                .filter(|argument| !argument.optional)
+                .filter_map(|argument| match &argument.kind {
+                    GenericDummyKind::Data(data) => Some(data),
+                    GenericDummyKind::Procedure(_) => None,
+                })
+                .filter(|data| generic_data_tkr_compatible(ctx, candidate_data, data))
+                .count()
+        };
+        let not_distinguishable = |arguments: &[GenericDummyCharacteristics]| {
+            arguments
+                .iter()
+                .filter(|argument| {
+                    matches!(argument.kind, GenericDummyKind::Data(_))
+                        && !generic_dummy_distinguishable(ctx, candidate, argument)
+                })
+                .count()
+        };
+        compatible(left) > not_distinguishable(right)
+            || compatible(right) > not_distinguishable(left)
+    })
+}
+
+fn generic_first_position_disambiguator(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> Option<usize> {
+    left.iter().enumerate().find_map(|(index, argument)| {
+        if argument.optional {
+            return None;
+        }
+        right
+            .get(index)
+            .is_none_or(|other| generic_dummy_distinguishable(ctx, argument, other))
+            .then_some(index)
+    })
+}
+
+fn generic_last_name_disambiguator(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> Option<usize> {
+    left.iter().enumerate().rev().find_map(|(index, argument)| {
+        if argument.optional {
+            return None;
+        }
+        right
+            .iter()
+            .find(|other| other.name == argument.name)
+            .is_none_or(|other| generic_dummy_distinguishable(ctx, argument, other))
+            .then_some(index)
+    })
+}
+
+fn generic_rule_four_distinguishes(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> bool {
+    let one_way = |first: &[GenericDummyCharacteristics],
+                   second: &[GenericDummyCharacteristics]| {
+        generic_first_position_disambiguator(ctx, first, second)
+            .zip(generic_last_name_disambiguator(ctx, first, second))
+            .is_some_and(|(position, name)| position <= name)
+    };
+    one_way(left, right) || one_way(right, left)
+}
+
+fn generic_procedures_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericProcedureCharacteristics,
+    right: &GenericProcedureCharacteristics,
+) -> Option<bool> {
+    if left.kind != right.kind {
+        return Some(true);
+    }
+
+    let procedure_counts = |arguments: &[GenericDummyCharacteristics]| {
+        arguments.iter().fold((0usize, 0usize), |counts, argument| {
+            if matches!(argument.kind, GenericDummyKind::Procedure(_)) {
+                (counts.0 + 1, counts.1 + usize::from(!argument.optional))
+            } else {
+                counts
+            }
+        })
+    };
+    let (left_procedures, left_required_procedures) = procedure_counts(&left.dummies);
+    let (right_procedures, right_required_procedures) = procedure_counts(&right.dummies);
+    if left_required_procedures > right_procedures
+        || right_required_procedures > left_procedures
+        || generic_rule_one_distinguishes(ctx, &left.dummies, &right.dummies)
+        || generic_rule_four_distinguishes(ctx, &left.dummies, &right.dummies)
+    {
+        return Some(true);
+    }
+
+    if !left.complete || !right.complete {
+        return None;
+    }
+    let has_optional_or_unlimited_data = |procedure: &GenericProcedureCharacteristics| {
+        procedure
+            .dummies
+            .iter()
+            .any(|argument| match &argument.kind {
+                GenericDummyKind::Data(data) => {
+                    argument.optional || matches!(data.type_info, Some(TypeInfo::ClassStar))
+                }
+                GenericDummyKind::Procedure(_) => false,
+            })
+    };
+    if has_optional_or_unlimited_data(left) && has_optional_or_unlimited_data(right) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+struct IndistinguishableGenericPair {
+    left_name: String,
+    left_owner_scope: ScopeId,
+    right_name: String,
+    right_owner_scope: ScopeId,
+}
+
+fn indistinguishable_generic_specifics_from_interfaces(
+    ctx: &Ctx<'_>,
+    interfaces: &[&Symbol],
+) -> Option<IndistinguishableGenericPair> {
+    let mut specifics = Vec::new();
+    let mut seen = HashSet::new();
+    for interface in interfaces {
+        for specific_name in &interface.arg_names {
+            let owner_scope =
+                interface_specific_owner_scope(ctx, interface, specific_name.as_str());
+            let Some(procedure_scope) = assignment_candidate_scope(ctx, specific_name, owner_scope)
+            else {
+                continue;
+            };
+            let key = (owner_scope, specific_name.to_ascii_lowercase());
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(symbol) = candidate_symbol(ctx, specific_name, owner_scope, procedure_scope)
+            else {
+                continue;
+            };
+            let mut visiting = HashSet::new();
+            let Some(procedure) = build_generic_procedure_characteristics(
+                ctx,
+                symbol,
+                procedure_scope,
+                &mut visiting,
+            ) else {
+                continue;
+            };
+            specifics.push(GenericSpecificCharacteristics {
+                name: specific_name.to_ascii_lowercase(),
+                owner_scope,
+                procedure,
+            });
+        }
+    }
+    specifics.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.owner_scope.cmp(&right.owner_scope))
+    });
+
+    for left_index in 0..specifics.len() {
+        for right in &specifics[left_index + 1..] {
+            let left = &specifics[left_index];
+            if left.owner_scope == right.owner_scope {
+                continue;
+            }
+            if generic_procedures_distinguishable(ctx, &left.procedure, &right.procedure)
+                == Some(false)
+            {
+                return Some(IndistinguishableGenericPair {
+                    left_name: left.name.clone(),
+                    left_owner_scope: left.owner_scope,
+                    right_name: right.name.clone(),
+                    right_owner_scope: right.owner_scope,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn indistinguishable_merged_generic_specifics(
+    ctx: &Ctx<'_>,
+    generic_name: &str,
+) -> Option<IndistinguishableGenericPair> {
+    let interfaces = ctx.lookup_lexical_named_interfaces(generic_name);
+    indistinguishable_generic_specifics_from_interfaces(ctx, &interfaces)
+}
+
 enum ExplicitInterfaceResolution {
     None,
     Resolved(ExplicitProcedureInterface),
@@ -8814,6 +9544,45 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    #[test]
+    fn generic_tkr_compatibility_preserves_type_direction() {
+        let st = SymbolTable::new();
+        let ctx = Ctx::new(&st, None, false, false);
+        let data = |type_info| GenericDataCharacteristics {
+            type_info: Some(type_info),
+            declared_scope: 0,
+            rank: 0,
+            assumed_rank: false,
+            assumed_size: false,
+            allocatable: false,
+            pointer: false,
+            intent: None,
+        };
+        let unlimited = data(TypeInfo::ClassStar);
+        let integer = data(TypeInfo::Integer { kind: Some(4) });
+        let assumed_type = data(TypeInfo::TypeStar);
+        let assumed_size_type = GenericDataCharacteristics {
+            rank: 1,
+            assumed_size: true,
+            ..data(TypeInfo::TypeStar)
+        };
+
+        assert!(generic_data_tkr_compatible(&ctx, &unlimited, &integer));
+        assert!(!generic_data_tkr_compatible(&ctx, &integer, &unlimited));
+        assert!(!generic_data_distinguishable(&ctx, &unlimited, &integer));
+        assert!(generic_data_distinguishable(&ctx, &assumed_type, &integer));
+        assert!(!generic_data_tkr_compatible(
+            &ctx,
+            &assumed_size_type,
+            &assumed_type
+        ));
+        assert!(!generic_data_distinguishable(
+            &ctx,
+            &assumed_size_type,
+            &assumed_type
+        ));
     }
 
     #[test]
