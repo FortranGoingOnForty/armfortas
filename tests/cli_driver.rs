@@ -15011,6 +15011,54 @@ fn dash_capital_e_rejects_conditionals_crossing_include_boundaries() {
 }
 
 #[test]
+fn dash_capital_e_rejects_repeated_conditional_alternatives_without_output() {
+    let cases = [
+        (
+            "duplicate_else",
+            "#if 1\nselected = 1\n#else\nfirst_else = 1\n#else\nsecond_else = 1\n#endif\n",
+            "#else after #else",
+        ),
+        (
+            "elif_after_else",
+            "#if 0\nfirst = 1\n#else\nselected = 1\n#elif 1 / 0\nlate = 1\n#endif\n",
+            "#elif after #else",
+        ),
+        (
+            "skipped_parent",
+            "#if 0\n#if 1\nfirst = 1\n#else\nsecond = 1\n#else\nthird = 1\n#endif\n#endif\n",
+            "#else after #else",
+        ),
+    ];
+
+    for (kind, source, expected) in cases {
+        let src = write_program(source, "F90");
+        let out = unique_path(&format!("pp_repeated_alternative_{kind}"), "f90");
+        assert!(!out.exists(), "test output must start absent");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("repeated-alternative preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} repeated conditional alternative unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{kind} conditional-order diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{kind} conditional-order failure published preprocess output"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
 fn dash_capital_e_short_circuits_if_expressions_without_skipping_syntax() {
     let dir = unique_dir("pp_if_short_circuit");
     let source = write_program_in(

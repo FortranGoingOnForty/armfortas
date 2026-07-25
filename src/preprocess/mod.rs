@@ -741,18 +741,24 @@ enum MacroContext {
 enum CondState {
     /// Currently in a true branch, emitting output.
     Active,
-    /// In a false branch, skipping output. Saw the directive at this level.
+    /// No arm has matched yet, so the current arm is skipped.
     Skipping,
-    /// Already found a true branch at this level, skip rest (including #else).
+    /// A prior arm matched, so later alternatives are skipped.
     Done,
     /// Parent was skipping, so everything at this level is skipped regardless.
     ParentSkipping,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConditionalFrame {
+    state: CondState,
+    seen_else: bool,
+}
+
 struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     include_paths: Vec<PathBuf>,
-    cond_stack: Vec<CondState>,
+    cond_stack: Vec<ConditionalFrame>,
     /// O(1) counter: number of non-Active levels on the stack.
     /// `is_emitting()` is just `skip_depth == 0`.
     skip_depth: u32,
@@ -1213,11 +1219,14 @@ impl Preprocessor {
         if !matches!(state, CondState::Active) {
             self.skip_depth += 1;
         }
-        self.cond_stack.push(state);
+        self.cond_stack.push(ConditionalFrame {
+            state,
+            seen_else: false,
+        });
     }
 
     fn set_top_cond(&mut self, new: CondState) {
-        let old = *self.cond_stack.last().unwrap();
+        let old = self.cond_stack.last().unwrap().state;
         let was_skip = !matches!(old, CondState::Active);
         let now_skip = !matches!(new, CondState::Active);
         match (was_skip, now_skip) {
@@ -1225,11 +1234,11 @@ impl Preprocessor {
             (true, false) => self.skip_depth -= 1,
             _ => {}
         }
-        *self.cond_stack.last_mut().unwrap() = new;
+        self.cond_stack.last_mut().unwrap().state = new;
     }
 
     fn pop_cond(&mut self) -> Option<CondState> {
-        let popped = self.cond_stack.pop()?;
+        let popped = self.cond_stack.pop()?.state;
         if !matches!(popped, CondState::Active) {
             self.skip_depth -= 1;
         }
@@ -1300,19 +1309,28 @@ impl Preprocessor {
         conditional_floor: usize,
     ) -> Result<(), PreprocError> {
         self.require_file_local_conditional("#elif", filename, line_num, conditional_floor)?;
-        match self.cond_stack.last().copied() {
-            None => Err(PreprocError {
+        let Some(frame) = self.cond_stack.last().copied() else {
+            return Err(PreprocError {
                 filename: filename.into(),
                 line: line_num,
                 msg: "#elif without matching #if".into(),
-            }),
-            Some(CondState::ParentSkipping) => Ok(()),
-            Some(CondState::Active) => {
+            });
+        };
+        if frame.seen_else {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: line_num,
+                msg: "#elif after #else".into(),
+            });
+        }
+        match frame.state {
+            CondState::ParentSkipping => Ok(()),
+            CondState::Active => {
                 self.set_top_cond(CondState::Done);
                 Ok(())
             }
-            Some(CondState::Done) => Ok(()),
-            Some(CondState::Skipping) => {
+            CondState::Done => Ok(()),
+            CondState::Skipping => {
                 let val = self.eval_condition(args, filename, line_num)?;
                 self.set_top_cond(if val {
                     CondState::Active
@@ -1331,19 +1349,29 @@ impl Preprocessor {
         conditional_floor: usize,
     ) -> Result<(), PreprocError> {
         self.require_file_local_conditional("#else", filename, line_num, conditional_floor)?;
-        match self.cond_stack.last().copied() {
-            None => Err(PreprocError {
+        let Some(frame) = self.cond_stack.last().copied() else {
+            return Err(PreprocError {
                 filename: filename.into(),
                 line: line_num,
                 msg: "#else without matching #if".into(),
-            }),
-            Some(CondState::ParentSkipping) => Ok(()),
-            Some(CondState::Active) => {
+            });
+        };
+        if frame.seen_else {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: line_num,
+                msg: "#else after #else".into(),
+            });
+        }
+        self.cond_stack.last_mut().unwrap().seen_else = true;
+        match frame.state {
+            CondState::ParentSkipping => Ok(()),
+            CondState::Active => {
                 self.set_top_cond(CondState::Done);
                 Ok(())
             }
-            Some(CondState::Done) => Ok(()),
-            Some(CondState::Skipping) => {
+            CondState::Done => Ok(()),
+            CondState::Skipping => {
                 self.set_top_cond(CondState::Active);
                 Ok(())
             }
@@ -3273,6 +3301,85 @@ print *, FIRST("a\",b", 9)
     fn error_else_without_if() {
         let err = pp_err("#else\n");
         assert!(err.msg.contains("without matching"));
+    }
+
+    #[test]
+    fn duplicate_else_is_rejected_for_taken_and_untaken_arms() {
+        for condition in ["0", "1"] {
+            let source = format!("#if {condition}\nfirst\n#else\nsecond\n#else\nthird\n#endif\n");
+            let error = pp_err(&source);
+            assert_eq!(error.line, 5);
+            assert_eq!(error.msg, "#else after #else");
+        }
+    }
+
+    #[test]
+    fn elif_after_else_is_rejected_before_evaluating_its_expression() {
+        for condition in ["0", "1"] {
+            let source =
+                format!("#if {condition}\nfirst\n#else\nsecond\n#elif 1 / 0\nthird\n#endif\n");
+            let error = pp_err(&source);
+            assert_eq!(error.line, 5);
+            assert_eq!(error.msg, "#elif after #else");
+        }
+    }
+
+    #[test]
+    fn repeated_alternatives_are_rejected_inside_skipped_parents() {
+        for (directive, expected) in [
+            ("#else", "#else after #else"),
+            ("#elif 1", "#elif after #else"),
+        ] {
+            let source =
+                format!("#if 0\n#if 1\nfirst\n#else\nsecond\n{directive}\nthird\n#endif\n#endif\n");
+            let error = pp_err(&source);
+            assert_eq!(error.line, 6);
+            assert_eq!(error.msg, expected);
+        }
+    }
+
+    #[test]
+    fn single_else_inside_skipped_parent_preserves_following_emission() {
+        let output =
+            pp("#if 0\n#if 1\ndead_first\n#else\ndead_second\n#endif\n#endif\nafter = 1\n");
+        assert!(!output.contains("dead_first"), "got: {output:?}");
+        assert!(!output.contains("dead_second"), "got: {output:?}");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+    }
+
+    #[test]
+    fn large_conditional_chain_accepts_one_final_else() {
+        let mut source = String::with_capacity(20_000 * 8);
+        source.push_str("#if 0\n");
+        for _ in 0..20_000 {
+            source.push_str("#elif 0\n");
+        }
+        source.push_str("#else\nselected = 1\n#endif\nafter = 1\n");
+
+        let output = pp(&source);
+        assert!(output.contains("selected = 1"), "got no selected arm");
+        assert!(output.contains("after = 1"), "lost post-conditional source");
+    }
+
+    #[test]
+    fn repeated_alternative_in_include_reports_included_location() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-repeated-else-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(
+            &path,
+            "#if 1\nselected = 1\n#else\nfirst_else = 1\n#else\nsecond_else = 1\n#endif\n",
+        )
+        .unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let error = preprocess(&format!("#include \"{name}\"\n"), &config).unwrap_err();
+        assert_eq!(error.filename, path.to_string_lossy());
+        assert_eq!(error.line, 5);
+        assert_eq!(error.msg, "#else after #else");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
