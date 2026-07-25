@@ -133,6 +133,118 @@ fn isolated_compiler_binaries_carry_their_runtime_archive() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn successful_runtime_rebuild_diagnostics_reach_compiler_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=installed_runtime test=successful_runtime_rebuild_diagnostics_reach_compiler_stderr count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let root = TestDir::new("runtime-rebuild-diagnostics");
+    let workspace = root.as_ref().join("workspace");
+    let runtime_dir = workspace.join("runtime");
+    fs::create_dir_all(workspace.join("src/driver"))
+        .expect("create fake compiler source directory");
+    fs::create_dir_all(runtime_dir.join("src")).expect("create fake runtime source directory");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        b"[package]\nname = \"armfortas\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+          [workspace]\nmembers = [\"runtime\"]\nresolver = \"2\"\n",
+    )
+    .expect("write fake compiler manifest");
+    fs::write(workspace.join("src/lib.rs"), b"").expect("write fake compiler source");
+    fs::write(workspace.join("src/driver/mod.rs"), b"").expect("write fake driver source");
+    fs::write(
+        runtime_dir.join("Cargo.toml"),
+        b"[package]\nname = \"armfortas-rt\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write fake runtime manifest");
+    fs::write(runtime_dir.join("src/lib.rs"), b"").expect("write fake runtime source");
+
+    let built = armfortas::testing::built_binary("armfortas")
+        .expect("armfortas binary was not built for this test");
+    let profile = built
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .expect("built compiler has no Cargo profile directory");
+    assert!(
+        matches!(profile, "debug" | "release"),
+        "unexpected Cargo profile directory '{profile}'"
+    );
+    let copied_compiler = workspace.join("target").join(profile).join("armfortas");
+    fs::create_dir_all(copied_compiler.parent().unwrap())
+        .expect("create fake workspace target directory");
+    fs::copy(&built, &copied_compiler)
+        .unwrap_or_else(|error| panic!("copy compiler into fake workspace: {error}"));
+
+    let real_runtime = armfortas::testing::built_runtime_archive()
+        .expect("runtime archive was not built for this test profile");
+    let fake_cargo = workspace.join("cargo-with-warning.sh");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\n\
+         printf 'armfortas-test runtime build warning\\375\\n' >&2\n\
+         profile=debug\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$arg\" = --release ]; then\n\
+             profile=release\n\
+           fi\n\
+         done\n\
+         mkdir -p \"target/$profile\" || exit 81\n\
+         cp \"$AR38_REAL_RUNTIME\" \"target/$profile/libarmfortas_rt.a\" || exit 82\n",
+    )
+    .expect("write fake Cargo");
+    let mut permissions = fs::metadata(&fake_cargo)
+        .expect("inspect fake Cargo")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).expect("make fake Cargo executable");
+
+    let source = workspace.join("hello.f90");
+    fs::write(
+        &source,
+        b"program hello\n  print *, \"runtime diagnostic\"\nend program hello\n",
+    )
+    .expect("write runtime rebuild source");
+    let executable = workspace.join("hello");
+    let compile = Command::new(&copied_compiler)
+        .current_dir(&workspace)
+        .env_remove("AFS_RUNTIME_PATH")
+        .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO", &fake_cargo)
+        .env("AR38_REAL_RUNTIME", &real_runtime)
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("launch copied compiler");
+    assert_success(&compile, "compile after diagnostic runtime rebuild");
+    let marker = b"armfortas-test runtime build warning\xfd\n";
+    assert_eq!(
+        compile
+            .stderr
+            .windows(marker.len())
+            .filter(|window| *window == marker)
+            .count(),
+        1,
+        "successful runtime-build diagnostic was lost, rewritten, or duplicated:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&executable)
+        .output()
+        .expect("run output linked with rebuilt runtime");
+    assert_success(&run, "run output linked with rebuilt runtime");
+    assert_eq!(run.stdout, b" runtime diagnostic\n");
+}
+
 #[test]
 fn installed_compiler_ignores_unrelated_cargo_runtime_trees() {
     let root = TestDir::new("unrelated-workspace");

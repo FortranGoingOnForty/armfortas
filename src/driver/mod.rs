@@ -1707,6 +1707,16 @@ fn write_stdout_bytes(bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("cannot write standard output: {}", e))
 }
 
+fn forward_successful_subprocess_stderr(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    std::io::Write::write_all(&mut stderr, bytes)
+        .map_err(|e| format!("cannot forward subprocess diagnostics to standard error: {e}"))
+}
+
 fn normalize_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -2517,6 +2527,7 @@ fn compile_with_bundled_runtime_inner(
                         String::from_utf8_lossy(&as_result.stderr)
                     ));
                 }
+                forward_successful_subprocess_stderr(&as_result.stderr)?;
                 pending_output.verify("assembler")?;
             }
         }
@@ -2567,6 +2578,7 @@ fn compile_with_bundled_runtime_inner(
             .output()
             .map_err(|e| format!("cannot run assembler: {}", e))?;
         if result.status.success() {
+            forward_successful_subprocess_stderr(&result.stderr)?;
             pending_output.verify("assembler")
         } else {
             Err(format!(
@@ -2924,6 +2936,7 @@ fn link_inputs_elf_with_bundled_runtime(
             String::from_utf8_lossy(&result.stderr)
         ));
     }
+    forward_successful_subprocess_stderr(&result.stderr)?;
     pending_output.verify("linker")
 }
 
@@ -2945,6 +2958,9 @@ fn link_inputs(
         .args(["--show-sdk-path"])
         .output()
         .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    if sdk.status.success() {
+        forward_successful_subprocess_stderr(&sdk.stderr)?;
+    }
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
     let mut args: Vec<String> = vec!["-o".into(), output.to_string_lossy().into_owned()];
@@ -2987,6 +3003,7 @@ fn link_inputs(
         return Err(format!("linker failed:\n{}", stderr));
     }
 
+    forward_successful_subprocess_stderr(&ld_result.stderr)?;
     pending_output.verify("linker")
 }
 
@@ -3038,6 +3055,7 @@ fn link_inputs_with_afs_ld(
         .map_err(|e| format!("cannot run linker: {}", e))?;
 
     if link_result.status.success() {
+        forward_successful_subprocess_stderr(&link_result.stderr)?;
         pending_output.verify("linker")
     } else {
         Err(format!(
@@ -3456,6 +3474,7 @@ fn find_libsystem_tbd() -> Result<String, String> {
             String::from_utf8_lossy(&sdk.stderr)
         ));
     }
+    forward_successful_subprocess_stderr(&sdk.stderr)?;
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
     let tbd = PathBuf::from(&sysroot).join("usr/lib/libSystem.tbd");
     if tbd.exists() {
@@ -3482,6 +3501,7 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
         .output()
         .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
     if output.status.success() {
+        forward_successful_subprocess_stderr(&output.stderr)?;
         Ok(())
     } else {
         Err(format!(

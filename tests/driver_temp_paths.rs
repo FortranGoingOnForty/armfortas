@@ -322,6 +322,152 @@ fn external_tools_replace_stale_outputs_on_success() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn successful_external_tool_diagnostics_reach_compiler_stderr_in_phase_order() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_temp_paths test=successful_external_tool_diagnostics_reach_compiler_stderr_in_phase_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = compiler();
+    let assembler =
+        armfortas::testing::built_binary("afs-as").expect("afs-as binary not built for test");
+    let linker =
+        armfortas::testing::built_binary("afs-ld").expect("afs-ld binary not built for test");
+    let dir = unique_dir("successful_tool_diagnostics");
+    let source = dir.join("p.f90");
+    std::fs::write(&source, "program p\nend program\n").expect("cannot write source");
+
+    let assembler_wrapper = dir.join("assembler-warning.sh");
+    std::fs::write(
+        &assembler_wrapper,
+        "#!/bin/sh\n\
+         printf 'armfortas-test assembler warning\\377\\n' >&2\n\
+         if [ \"${AR38_FORCE_FAILURE:-0}\" = 1 ]; then\n\
+           exit 47\n\
+         fi\n\
+         exec \"$AR38_REAL_AS\" \"$@\"\n",
+    )
+    .expect("cannot write assembler wrapper");
+    let linker_wrapper = dir.join("linker-warning.sh");
+    std::fs::write(
+        &linker_wrapper,
+        "#!/bin/sh\n\
+         printf 'armfortas-test linker warning\\376\\n' >&2\n\
+         exec \"$AR38_REAL_LD\" \"$@\"\n",
+    )
+    .expect("cannot write linker wrapper");
+    for wrapper in [&assembler_wrapper, &linker_wrapper] {
+        let mut permissions = std::fs::metadata(wrapper)
+            .expect("cannot inspect wrapper")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(wrapper, permissions).expect("cannot make wrapper executable");
+    }
+
+    let object = dir.join("p.o");
+    std::fs::write(&object, b"stale object").expect("cannot seed stale object");
+    let assemble = Command::new(&compiler)
+        .env("AFS_AS_PATH", &assembler_wrapper)
+        .env("AR38_REAL_AS", &assembler)
+        .args(["-O2", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("compiler launch failed");
+    assert!(
+        assemble.status.success(),
+        "successful diagnostic assembler failed:\n{}",
+        String::from_utf8_lossy(&assemble.stderr)
+    );
+    assert_eq!(
+        assemble.stderr, b"armfortas-test assembler warning\xff\n",
+        "successful assembler diagnostics were lost or rewritten"
+    );
+    assert_ne!(
+        std::fs::read(&object).expect("cannot read assembled object"),
+        b"stale object",
+        "successful diagnostic assembler retained stale output"
+    );
+
+    let failed_object = dir.join("failed.o");
+    std::fs::write(&failed_object, b"stale failed object")
+        .expect("cannot seed failed assembler output");
+    let failed_assemble = Command::new(&compiler)
+        .env("AFS_AS_PATH", &assembler_wrapper)
+        .env("AR38_REAL_AS", &assembler)
+        .env("AR38_FORCE_FAILURE", "1")
+        .args(["-O2", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&failed_object)
+        .output()
+        .expect("failing compiler launch failed");
+    assert!(
+        !failed_assemble.status.success(),
+        "forced assembler failure unexpectedly succeeded"
+    );
+    let failure_marker = b"armfortas-test assembler warning";
+    assert_eq!(
+        failed_assemble
+            .stderr
+            .windows(failure_marker.len())
+            .filter(|window| *window == failure_marker)
+            .count(),
+        1,
+        "failing assembler diagnostics were lost or duplicated:\n{}",
+        String::from_utf8_lossy(&failed_assemble.stderr)
+    );
+    assert!(
+        !failed_object.exists(),
+        "failing diagnostic assembler retained a stale output"
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let binary = dir.join(format!("p-{}", &optimization[2..]));
+        std::fs::write(&binary, b"stale executable").expect("cannot seed stale executable");
+        let link = Command::new(&compiler)
+            .env("AFS_AS_PATH", &assembler_wrapper)
+            .env("AFS_LD_PATH", &linker_wrapper)
+            .env("AR38_REAL_AS", &assembler)
+            .env("AR38_REAL_LD", &linker)
+            .arg(optimization)
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("compiler launch failed");
+        assert!(
+            link.status.success(),
+            "successful diagnostic toolchain failed at {optimization}:\n{}",
+            String::from_utf8_lossy(&link.stderr)
+        );
+        assert_eq!(
+            link.stderr,
+            b"armfortas-test assembler warning\xff\narmfortas-test linker warning\xfe\n",
+            "successful tool diagnostics were lost, rewritten, or reordered at {optimization}"
+        );
+        let run = Command::new(&binary)
+            .output()
+            .expect("cannot run diagnostic-wrapper output");
+        assert!(
+            run.status.success(),
+            "diagnostic-wrapper output at {optimization} exited with {:?}:\n{}",
+            run.status.code(),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn valid_long_output_basename_does_not_expand_temporary_name() {
     let compiler = compiler();
