@@ -2,7 +2,7 @@
 //!
 //! Text-to-text transformation that runs before lexing. Handles #define,
 //! #ifdef/#ifndef/#if/#elif/#else/#endif, #include, Fortran INCLUDE, #undef,
-//! #error, and #warning.
+//! #error, #warning, #line/GNU linemarkers, null directives, and #pragma.
 //! Aware of Fortran string literals and comments — won't expand macros inside them.
 
 use std::collections::HashMap;
@@ -840,6 +840,17 @@ impl Preprocessor {
         }
     }
 
+    fn display_directive_name(&self, directive: &str) -> String {
+        const MAX_CHARS: usize = 80;
+
+        let Some((end, _)) = directive.char_indices().nth(MAX_CHARS) else {
+            return self.display_source_text(directive);
+        };
+        let mut displayed = self.display_source_text(&directive[..end]);
+        displayed.push_str("...");
+        displayed
+    }
+
     fn set_location_macros(&mut self, location: &ReportedLocation) {
         self.defines.insert(
             "__LINE__".into(),
@@ -1207,8 +1218,26 @@ impl Preprocessor {
             "line" => {
                 return Ok(self.do_line(args_text, reported));
             }
-            "" => {} // bare # is allowed (null directive)
-            _ => {}  // unknown directives are ignored (like #pragma)
+            "pragma" => {} // implementations may ignore unrecognized pragmas
+            "" => {}       // bare # is allowed (null directive)
+            _ if directive.parse::<u32>().is_ok() => {
+                let marker = if args_text.is_empty() {
+                    directive.to_string()
+                } else {
+                    format!("{directive} {args_text}")
+                };
+                return Ok(self.do_line(&marker, reported));
+            }
+            _ => {
+                return Err(PreprocError {
+                    filename: diagnostic_filename.to_string(),
+                    line: diagnostic_line,
+                    msg: format!(
+                        "unknown preprocessing directive #{}",
+                        self.display_directive_name(directive)
+                    ),
+                });
+            }
         }
         Ok(false)
     }
@@ -4038,6 +4067,94 @@ deep
 ";
         let out = pp(src);
         assert!(lines(&out).contains(&"deep"));
+    }
+
+    // ---- Unknown directives ----
+
+    #[test]
+    fn unknown_directive_is_rejected_in_active_source() {
+        for directive in ["incldue", "Include", "not_a_directive"] {
+            let error = pp_err(&format!("before\n#{directive} \"missing.inc\"\nafter\n"));
+            assert_eq!(error.filename, "<input>");
+            assert_eq!(error.line, 2);
+            assert_eq!(
+                error.msg,
+                format!("unknown preprocessing directive #{directive}")
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_directive_is_ignored_in_skipped_conditional_group() {
+        let output = pp("#if 0\n#incldue \"missing.inc\"\n#endif\nafter = 1\n");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+    }
+
+    #[test]
+    fn many_unknown_directives_in_skipped_group_remain_linear_and_inert() {
+        let mut source = String::with_capacity(50_000 * 20);
+        source.push_str("#if 0\n");
+        for _ in 0..50_000 {
+            source.push_str("#incldue \"missing\"\n");
+        }
+        source.push_str("#endif\nafter = 1\n");
+
+        let output = pp(&source);
+        assert!(output.contains("after = 1"), "lost following source");
+    }
+
+    #[test]
+    fn huge_unknown_directive_has_a_bounded_diagnostic() {
+        let directive = "x".repeat(256 * 1024);
+        let error = pp_err(&format!("#{directive}\n"));
+        assert_eq!(
+            error.msg,
+            format!("unknown preprocessing directive #{}...", "x".repeat(80))
+        );
+    }
+
+    #[test]
+    fn pragma_directive_remains_an_explicit_no_op() {
+        let output = pp("#pragma once\nafter = 1\n");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+    }
+
+    #[test]
+    fn gnu_numeric_linemarker_remains_a_recognized_directive() {
+        let result = preprocess(
+            "# 700 \"virtual.f90\" 1\nx = __LINE__\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result.source_map[1].filename, "virtual.f90");
+        assert_eq!(result.source_map[1].line, 700);
+        assert!(result.text.contains("x = 700"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn unknown_directive_uses_reported_location() {
+        let error = pp_err("#line 700 \"virtual.f90\"\n#incldue \"missing.inc\"\n");
+        assert_eq!(error.filename, "virtual.f90");
+        assert_eq!(error.line, 700);
+        assert_eq!(error.msg, "unknown preprocessing directive #incldue");
+    }
+
+    #[test]
+    fn unknown_directive_in_include_reports_included_location() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-unknown-directive-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, "before\n#incldue \"missing.inc\"\nafter\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+
+        let error = preprocess(&format!("#include \"{name}\"\n"), &config).unwrap_err();
+        assert_eq!(error.filename, path.to_string_lossy());
+        assert_eq!(error.line, 2);
+        assert_eq!(error.msg, "unknown preprocessing directive #incldue");
+        let _ = std::fs::remove_file(path);
     }
 
     // ---- Null directive ----

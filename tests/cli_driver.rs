@@ -15059,6 +15059,50 @@ fn dash_capital_e_rejects_repeated_conditional_alternatives_without_output() {
 }
 
 #[test]
+fn dash_capital_e_rejects_unknown_active_directives_without_output() {
+    let cases = [
+        (
+            "top_level",
+            "#incldue \"missing.inc\"\nprogram p\nend program\n",
+            "#incldue",
+        ),
+        (
+            "selected_arm",
+            "#if 1\n#not_a_directive payload\n#endif\nprogram p\nend program\n",
+            "#not_a_directive",
+        ),
+    ];
+
+    for (kind, source, expected_directive) in cases {
+        let src = write_program(source, "F90");
+        let out = unique_path(&format!("pp_unknown_directive_{kind}"), "f90");
+        assert!(!out.exists(), "test output must start absent");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("unknown-directive preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} unknown directive unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("unknown preprocessing directive")
+                && stderr.contains(expected_directive),
+            "{kind} unknown-directive diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{kind} unknown-directive failure published preprocess output"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
 fn dash_capital_e_short_circuits_if_expressions_without_skipping_syntax() {
     let dir = unique_dir("pp_if_short_circuit");
     let source = write_program_in(
@@ -15364,6 +15408,7 @@ fn preprocessor_errors_display_invalid_bytes_without_internal_markers() {
             b"#if \xff\n#endif\n",
             "unexpected token in #if expression: '\u{fffd}'",
         ),
+        (b"#\xff\n", "unknown preprocessing directive #\u{fffd}"),
     ];
 
     for &(source, expected) in cases {
