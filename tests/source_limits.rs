@@ -2,8 +2,9 @@
 //! generated source file (a checked-in ~1 MB fixture would make every
 //! harness run at every opt level pay for it — sprint-doc pitfall).
 //! Compile-only via `-S`, so this runs on every host. Acceptance never
-//! changes: the over-limit statement still compiles; only the
-//! conformance warning under --std=f2023 distinguishes it.
+//! changes: the over-limit statement still compiles, with the selected
+//! standard deciding whether character count or continuation count is
+//! the relevant conformance warning.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,8 +15,8 @@ fn compiler() -> PathBuf {
 }
 
 /// One statement totalling just over a million characters, spread over
-/// ~130-char continuation lines (under 132, so the f2018 control run
-/// is line-warning-clean).
+/// ~130-char continuation lines (under 132, so the F2018 run isolates
+/// its continuation-count warning from the physical-line warning).
 fn million_char_program() -> String {
     let mut src = String::with_capacity(1_100_000);
     src.push_str("program big_stmt\n  implicit none\n  integer :: total\n");
@@ -32,6 +33,34 @@ fn million_char_program() -> String {
         src.push_str(&term);
     }
     src.push_str("    + 1\n  print *, total\nend program big_stmt\n");
+    src
+}
+
+fn continued_program(continuations: usize) -> String {
+    let mut src = String::from(
+        "program continuation_limit\n  implicit none\n  integer :: total\n  total = 0",
+    );
+    for continuation in 0..continuations {
+        src.push_str(" &\n");
+        if continuation == continuations / 2 {
+            src.push_str("! legal continuation gap\n\n");
+        }
+        src.push_str("    + 0");
+    }
+    src.push_str("\n  print *, total\nend program continuation_limit\n");
+    src
+}
+
+fn continued_fixed_program(continuations: usize) -> String {
+    let mut src =
+        String::from("      PROGRAM CONTINUATION_LIMIT\n      INTEGER TOTAL\n      TOTAL = 0\n");
+    for continuation in 0..continuations {
+        if continuation == continuations / 2 {
+            src.push_str("C legal continuation gap\n\n");
+        }
+        src.push_str("     + + 0\n");
+    }
+    src.push_str("      PRINT *, TOTAL\n      END\n");
     src
 }
 
@@ -73,7 +102,7 @@ fn tiny_preprocess_fits_within_one_gibibyte_address_space() {
 }
 
 #[test]
-fn million_char_statement_compiles_and_warns_only_under_f2023() {
+fn million_char_statement_uses_standard_specific_limit_warning() {
     let dir = std::env::temp_dir().join(format!("afs_srclim_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let f90 = dir.join("big_stmt.f90");
@@ -97,14 +126,200 @@ fn million_char_statement_compiles_and_warns_only_under_f2023() {
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(r.status.success(), "f2018 compile failed:\n{}", stderr);
     assert!(
-        !stderr.contains("statement is"),
+        !stderr.contains("warning: statement is"),
         "statement-length warning is F2023-only, got:\n{}",
         stderr
     );
     assert!(
-        !stderr.contains("warning"),
-        "control run should be warning-free (lines are under 132):\n{}",
+        stderr.contains("statement has") && stderr.contains("continuation lines"),
+        "the F2018 run must diagnose its continuation-count violation:\n{}",
         stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f2018_continuation_limit_diagnoses_before_output_publication() {
+    let dir = std::env::temp_dir().join(format!("afs_contlim_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conforming = dir.join("continuation_255.f90");
+    let extension = dir.join("continuation_256.f90");
+    let fixed_extension = dir.join("continuation_256.f");
+    std::fs::write(&conforming, continued_program(255)).unwrap();
+    std::fs::write(&extension, continued_program(256)).unwrap();
+    std::fs::write(&fixed_extension, continued_fixed_program(256)).unwrap();
+
+    let conforming_asm = dir.join("continuation_255.s");
+    std::fs::write(&conforming_asm, b"stale conforming assembly").unwrap();
+    let conforming_result = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-S"])
+        .arg(&conforming)
+        .arg("-o")
+        .arg(&conforming_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        conforming_result.status.success(),
+        "255 continuation lines must remain conforming:\n{}",
+        String::from_utf8_lossy(&conforming_result.stderr)
+    );
+    assert!(
+        conforming_result.stderr.is_empty(),
+        "the exact F2018 boundary emitted a diagnostic:\n{}",
+        String::from_utf8_lossy(&conforming_result.stderr)
+    );
+    assert_ne!(
+        std::fs::read(&conforming_asm).unwrap(),
+        b"stale conforming assembly",
+        "successful boundary compilation retained stale assembly"
+    );
+
+    let warning_asm = dir.join("continuation_warning.s");
+    std::fs::write(&warning_asm, b"stale warning assembly").unwrap();
+    let warning = Command::new(compiler())
+        .args(["--std=f2018", "-O1", "-S"])
+        .arg(&extension)
+        .arg("-o")
+        .arg(&warning_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        warning.status.success(),
+        "continuation-count violation must remain a warning:\n{}",
+        String::from_utf8_lossy(&warning.stderr)
+    );
+    let warning_stderr = String::from_utf8_lossy(&warning.stderr);
+    assert!(
+        warning_stderr.contains("warning: statement has 256 continuation lines")
+            && warning_stderr.contains("F2018 limit of 255"),
+        "missing F2018 continuation-count warning:\n{warning_stderr}"
+    );
+    assert_ne!(
+        std::fs::read(&warning_asm).unwrap(),
+        b"stale warning assembly",
+        "successful warning compilation retained stale assembly"
+    );
+
+    let fixed_warning_asm = dir.join("continuation_fixed_warning.s");
+    let fixed_warning = Command::new(compiler())
+        .args(["--std=f2018", "-O1", "-S"])
+        .arg(&fixed_extension)
+        .arg("-o")
+        .arg(&fixed_warning_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        fixed_warning.status.success(),
+        "fixed-form continuation-count violation must remain a warning:\n{}",
+        String::from_utf8_lossy(&fixed_warning.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fixed_warning.stderr)
+            .contains("warning: statement has 256 continuation lines"),
+        "fixed form lost the F2018 continuation-count warning:\n{}",
+        String::from_utf8_lossy(&fixed_warning.stderr)
+    );
+    assert!(
+        fixed_warning_asm.is_file(),
+        "fixed-form warning compilation did not publish assembly"
+    );
+
+    for optimization in ["-O0", "-O3"] {
+        for stale in [false, true] {
+            let state = if stale { "stale" } else { "fresh" };
+            let asm = dir.join(format!("continuation_{optimization}_{state}.s"));
+            let depfile = asm.with_extension("d");
+            if stale {
+                std::fs::write(&asm, b"stale failed assembly").unwrap();
+                std::fs::write(&depfile, b"stale failed dependencies").unwrap();
+            }
+
+            let failed = Command::new(compiler())
+                .args(["--std=f2018", "-Werror", optimization, "-S", "-MD", "-MF"])
+                .arg(&depfile)
+                .arg(&extension)
+                .arg("-o")
+                .arg(&asm)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("cannot run armfortas");
+            assert_eq!(
+                failed.status.code(),
+                Some(1),
+                "continuation -Werror must fail at {optimization} with {state} output:\n{}",
+                String::from_utf8_lossy(&failed.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&failed.stderr)
+                    .contains("error: statement has 256 continuation lines"),
+                "continuation warning was not promoted at {optimization} with {state} output:\n{}",
+                String::from_utf8_lossy(&failed.stderr)
+            );
+            assert!(
+                !asm.exists(),
+                "failed continuation -Werror retained {state} output at {optimization}"
+            );
+            assert!(
+                !depfile.exists(),
+                "failed continuation -Werror retained {state} dependency output at {optimization}"
+            );
+        }
+    }
+
+    let f2023_asm = dir.join("continuation_f2023.s");
+    std::fs::write(&f2023_asm, b"stale f2023 assembly").unwrap();
+    let f2023 = Command::new(compiler())
+        .args(["--std=f2023", "-Werror", "-O2", "-S"])
+        .arg(&extension)
+        .arg("-o")
+        .arg(&f2023_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        f2023.status.success(),
+        "F2023 removed the continuation-count limit:\n{}",
+        String::from_utf8_lossy(&f2023.stderr)
+    );
+    assert!(
+        f2023.stderr.is_empty(),
+        "F2023 emitted a continuation-count diagnostic:\n{}",
+        String::from_utf8_lossy(&f2023.stderr)
+    );
+    assert_ne!(
+        std::fs::read(&f2023_asm).unwrap(),
+        b"stale f2023 assembly",
+        "successful F2023 compilation retained stale assembly"
+    );
+
+    let fixed_f2023_asm = dir.join("continuation_fixed_f2023.s");
+    std::fs::write(&fixed_f2023_asm, b"stale fixed f2023 assembly").unwrap();
+    let fixed_f2023 = Command::new(compiler())
+        .args(["--std=f2023", "-Werror", "-O2", "-S"])
+        .arg(&fixed_extension)
+        .arg("-o")
+        .arg(&fixed_f2023_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        fixed_f2023.status.success(),
+        "F2023 removed the fixed-form continuation-count limit:\n{}",
+        String::from_utf8_lossy(&fixed_f2023.stderr)
+    );
+    assert!(
+        fixed_f2023.stderr.is_empty(),
+        "F2023 fixed form emitted a continuation-count diagnostic:\n{}",
+        String::from_utf8_lossy(&fixed_f2023.stderr)
+    );
+    assert_ne!(
+        std::fs::read(&fixed_f2023_asm).unwrap(),
+        b"stale fixed f2023 assembly",
+        "successful fixed-form F2023 compilation retained stale assembly"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
