@@ -14923,6 +14923,58 @@ fn dash_capital_e_rejects_macro_arity_without_publishing_output() {
 }
 
 #[test]
+fn dash_capital_e_rejects_conditionals_crossing_include_boundaries() {
+    let cases = [
+        (
+            "close",
+            "#endif\n",
+            "#if 1\n#include \"case.inc\"\nparent = 1\n",
+            "#endif cannot match a conditional opened outside this include file",
+        ),
+        (
+            "else",
+            "#else\nchild_else = 1\n",
+            "#if 1\n#include \"case.inc\"\nparent = 1\n#endif\n",
+            "#else cannot match a conditional opened outside this include file",
+        ),
+        (
+            "open",
+            "#if 1\nincluded = 1\n",
+            "#include \"case.inc\"\n#endif\nparent = 1\n",
+            "unterminated #if/#ifdef in include file (1 level(s) still open)",
+        ),
+    ];
+
+    for (kind, included, parent, expected) in cases {
+        let dir = unique_dir(&format!("pp_conditional_boundary_{kind}"));
+        let include = write_program_in(&dir, "case.inc", included);
+        let source = write_program_in(&dir, "main.F90", parent);
+        let output = dir.join("main.pp.f90");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("conditional-boundary preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} include conditional unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(include.to_string_lossy().as_ref()) && stderr.contains(expected),
+            "{kind} include conditional diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{kind} include conditional failure published preprocess output"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
 fn dash_capital_e_without_o_writes_to_stdout() {
     let dir = unique_dir("pp_stdout");
     write_program_in(

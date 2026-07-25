@@ -724,7 +724,6 @@ impl ReportedLocation {
 
 struct ProcessEnd {
     next: ReportedLocation,
-    last: Option<ReportedLocation>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -854,19 +853,6 @@ impl Preprocessor {
             self.source_view,
         ));
         let process_end = self.process_into(root_source.clone(), &mut output, &mut source_map)?;
-
-        // Check for unterminated conditionals (only at top level).
-        if self.include_depth == 0 && !self.cond_stack.is_empty() {
-            let location = process_end.last.as_ref().unwrap_or(&process_end.next);
-            return Err(PreprocError {
-                filename: location.filename.to_string(),
-                line: location.line,
-                msg: format!(
-                    "unterminated #if/#ifdef ({} level(s) still open)",
-                    self.cond_stack.len()
-                ),
-            });
-        }
         let final_reported = process_end.next;
 
         let mut eof_origin = None;
@@ -909,6 +895,7 @@ impl Preprocessor {
             line: 1,
         };
         let mut last_reported = None;
+        let conditional_floor = self.cond_stack.len();
 
         let now = current_datetime();
         self.defines.insert(
@@ -1049,6 +1036,7 @@ impl Preprocessor {
                     output,
                     source_map,
                     &mut reported,
+                    conditional_floor,
                 )?;
                 output.push('\n');
                 source_map.push(logical_line.into_source_loc());
@@ -1101,10 +1089,25 @@ impl Preprocessor {
             reported.advance(physical_lines);
         }
 
-        Ok(ProcessEnd {
-            next: reported,
-            last: last_reported,
-        })
+        if self.cond_stack.len() > conditional_floor {
+            let open_levels = self.cond_stack.len() - conditional_floor;
+            while self.cond_stack.len() > conditional_floor {
+                self.pop_cond();
+            }
+            let location = last_reported.as_ref().unwrap_or(&reported);
+            let scope = if self.include_depth > 0 {
+                " in include file"
+            } else {
+                ""
+            };
+            return Err(PreprocError {
+                filename: location.filename.to_string(),
+                line: location.line,
+                msg: format!("unterminated #if/#ifdef{scope} ({open_levels} level(s) still open)"),
+            });
+        }
+
+        Ok(ProcessEnd { next: reported })
     }
 
     fn process_directive(
@@ -1114,6 +1117,7 @@ impl Preprocessor {
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
         reported: &mut ReportedLocation,
+        conditional_floor: usize,
     ) -> Result<bool, PreprocError> {
         let diagnostic_filename = reported.filename.clone();
         let diagnostic_line = reported.line;
@@ -1140,9 +1144,14 @@ impl Preprocessor {
             "ifdef" => self.do_ifdef(args_text, false)?,
             "ifndef" => self.do_ifdef(args_text, true)?,
             "if" => self.do_if(&args, &diagnostic_filename, diagnostic_line)?,
-            "elif" => self.do_elif(&args, &diagnostic_filename, diagnostic_line)?,
-            "else" => self.do_else(&diagnostic_filename, diagnostic_line)?,
-            "endif" => self.do_endif(&diagnostic_filename, diagnostic_line)?,
+            "elif" => self.do_elif(
+                &args,
+                &diagnostic_filename,
+                diagnostic_line,
+                conditional_floor,
+            )?,
+            "else" => self.do_else(&diagnostic_filename, diagnostic_line, conditional_floor)?,
+            "endif" => self.do_endif(&diagnostic_filename, diagnostic_line, conditional_floor)?,
             _ => {}
         }
         if matches!(
@@ -1223,6 +1232,25 @@ impl Preprocessor {
         Some(popped)
     }
 
+    fn require_file_local_conditional(
+        &self,
+        directive: &str,
+        filename: &str,
+        line_num: u32,
+        conditional_floor: usize,
+    ) -> Result<(), PreprocError> {
+        if conditional_floor > 0 && self.cond_stack.len() == conditional_floor {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: line_num,
+                msg: format!(
+                    "{directive} cannot match a conditional opened outside this include file"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     // ---- Conditional directives ----
 
     fn do_ifdef(&mut self, args: &str, negate: bool) -> Result<(), PreprocError> {
@@ -1265,7 +1293,9 @@ impl Preprocessor {
         args: &MappedText,
         filename: &str,
         line_num: u32,
+        conditional_floor: usize,
     ) -> Result<(), PreprocError> {
+        self.require_file_local_conditional("#elif", filename, line_num, conditional_floor)?;
         match self.cond_stack.last().copied() {
             None => Err(PreprocError {
                 filename: filename.into(),
@@ -1290,7 +1320,13 @@ impl Preprocessor {
         }
     }
 
-    fn do_else(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn do_else(
+        &mut self,
+        filename: &str,
+        line_num: u32,
+        conditional_floor: usize,
+    ) -> Result<(), PreprocError> {
+        self.require_file_local_conditional("#else", filename, line_num, conditional_floor)?;
         match self.cond_stack.last().copied() {
             None => Err(PreprocError {
                 filename: filename.into(),
@@ -1310,7 +1346,13 @@ impl Preprocessor {
         }
     }
 
-    fn do_endif(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn do_endif(
+        &mut self,
+        filename: &str,
+        line_num: u32,
+        conditional_floor: usize,
+    ) -> Result<(), PreprocError> {
+        self.require_file_local_conditional("#endif", filename, line_num, conditional_floor)?;
         if self.pop_cond().is_none() {
             return Err(PreprocError {
                 filename: filename.into(),
@@ -1493,7 +1535,16 @@ impl Preprocessor {
             content,
             self.source_view,
         ));
+        let conditional_depth = self.cond_stack.len();
         let include_result = self.process_into(included_source, output, source_map);
+        while self.cond_stack.len() > conditional_depth {
+            self.pop_cond();
+        }
+        debug_assert_eq!(
+            self.cond_stack.len(),
+            conditional_depth,
+            "included file crossed its conditional-stack floor"
+        );
         self.include_depth -= 1;
 
         restore_macro(&mut self.defines, "__FILE__", saved_file);
@@ -3916,6 +3967,102 @@ deep
         let src = "#include \"test_pp_define.inc\"\nx = INCLUDED_VAL\n";
         let result = preprocess(src, &config).unwrap();
         assert!(result.text.contains("x = 99"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn include_files_cannot_close_or_mutate_parent_conditionals() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let cases = [
+            (
+                "endif",
+                "#endif\n",
+                "#if 1\n#include \"{name}\"\nparent = 1\n",
+                "#endif",
+            ),
+            (
+                "else",
+                "#else\nchild_else = 1\n",
+                "#if 1\n#include \"{name}\"\nparent = 1\n#endif\n",
+                "#else",
+            ),
+            (
+                "elif",
+                "#elif 0\nchild_elif = 1\n",
+                "#if 1\n#include \"{name}\"\nparent = 1\n#endif\n",
+                "#elif",
+            ),
+        ];
+
+        for (case, included, parent_template, directive) in cases {
+            let name = format!("afs-cond-boundary-{case}-{pid}.inc");
+            let path = dir.join(&name);
+            std::fs::write(&path, included).unwrap();
+            let config = PreprocConfig {
+                include_paths: vec![dir.clone()],
+                ..PreprocConfig::default()
+            };
+            let parent = parent_template.replace("{name}", &name);
+            let error = preprocess(&parent, &config).unwrap_err();
+            assert_eq!(error.filename, path.to_string_lossy());
+            assert_eq!(error.line, 1);
+            assert!(
+                error.msg.contains(directive) && error.msg.contains("outside this include file"),
+                "unexpected diagnostic: {error}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn include_files_cannot_leave_conditionals_for_the_parent_to_close() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-cond-open-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, "#if 1\nincluded = 1\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let parent = format!("#include \"{name}\"\n#endif\nparent = 1\n");
+        let error = preprocess(&parent, &config).unwrap_err();
+        assert_eq!(error.filename, path.to_string_lossy());
+        assert_eq!(error.line, 2);
+        assert!(
+            error.msg.contains("unterminated")
+                && error.msg.contains("include file")
+                && error.msg.contains("1 level"),
+            "unexpected diagnostic: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn balanced_include_conditionals_preserve_the_parent_state() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let name = format!("afs-cond-balanced-{pid}.inc");
+        let nested_name = format!("afs-cond-balanced-nested-{pid}.inc");
+        let path = dir.join(&name);
+        let nested_path = dir.join(&nested_name);
+        std::fs::write(
+            &path,
+            format!("#if 1\nincluded = 1\n#include \"{nested_name}\"\n#endif\n"),
+        )
+        .unwrap();
+        std::fs::write(&nested_path, "#if 1\nnested = 1\n#endif\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let parent = format!("#if 1\n#include \"{name}\"\nparent = 1\n#endif\nafter = 1\n");
+        let output = preprocess(&parent, &config).unwrap().text;
+        assert!(output.contains("included = 1"), "got: {output:?}");
+        assert!(output.contains("nested = 1"), "got: {output:?}");
+        assert!(output.contains("parent = 1"), "got: {output:?}");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(nested_path);
     }
 
     #[test]
