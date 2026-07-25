@@ -849,6 +849,110 @@ fn depfile_tracks_transitive_preprocessor_includes() {
 }
 
 #[test]
+fn ordinary_fortran_include_compiles_runs_and_tracks_transitive_dependencies() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=ordinary_fortran_include_compiles_runs_and_tracks_transitive_dependencies count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("ordinary_fortran_include");
+    let inner = write_program_in(
+        &dir,
+        "inner.inc",
+        "  integer, parameter :: included_answer = 42\n",
+    );
+    let outer = write_program_in(&dir, "outer.inc", "include \"inner.inc\"\n");
+    let source = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  include 'outer.inc' ! standard Fortran include\n  print *, included_answer\nend program\n",
+    );
+    let output = dir.join("free-include");
+    let depfile = dir.join("free-include.d");
+
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O2", "-MMD", "-MP", "-MF"])
+        .arg(&depfile)
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("ordinary INCLUDE compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "ordinary INCLUDE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&output)
+        .output()
+        .expect("ordinary INCLUDE executable failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("42"),
+        "ordinary INCLUDE executable produced the wrong result: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let dependencies = std::fs::read_to_string(&depfile).expect("missing dependency file");
+    for prerequisite in [&source, &outer, &inner] {
+        assert!(
+            dependencies.contains(prerequisite.to_str().unwrap()),
+            "dependency file omitted {}:\n{dependencies}",
+            prerequisite.display()
+        );
+    }
+    for include in [&outer, &inner] {
+        assert!(
+            dependencies.contains(&format!("{}:\n", include.display())),
+            "-MP omitted the include phony rule for {}:\n{dependencies}",
+            include.display()
+        );
+    }
+
+    let fixed_include = write_program_in(
+        &dir,
+        "fixed.inc",
+        "      INTEGER, PARAMETER :: FIXED_ANSWER = 7\n",
+    );
+    let fixed_source = write_program_in(
+        &dir,
+        "main.f",
+        "      PROGRAM P\n      I N C L U D E 'fixed.inc'\n      PRINT *, FIXED_ANSWER\n      END\n",
+    );
+    let fixed_output = dir.join("fixed-include");
+    let fixed_compile = Command::new(compiler("armfortas"))
+        .args(["-O2"])
+        .arg(&fixed_source)
+        .arg("-o")
+        .arg(&fixed_output)
+        .output()
+        .expect("fixed-form INCLUDE compile spawn failed");
+    assert!(
+        fixed_compile.status.success(),
+        "fixed-form INCLUDE compile failed: {}",
+        String::from_utf8_lossy(&fixed_compile.stderr)
+    );
+    let fixed_run = Command::new(&fixed_output)
+        .output()
+        .expect("fixed-form INCLUDE executable failed to run");
+    assert!(
+        fixed_run.status.success() && String::from_utf8_lossy(&fixed_run.stdout).contains('7'),
+        "fixed-form INCLUDE executable produced the wrong result: status={:?} stdout={} stderr={}",
+        fixed_run.status,
+        String::from_utf8_lossy(&fixed_run.stdout),
+        String::from_utf8_lossy(&fixed_run.stderr)
+    );
+    assert!(fixed_include.is_file(), "fixed include fixture disappeared");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

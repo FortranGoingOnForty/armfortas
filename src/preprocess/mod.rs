@@ -1,7 +1,8 @@
 //! Fortran-aware C-style preprocessor.
 //!
 //! Text-to-text transformation that runs before lexing. Handles #define,
-//! #ifdef/#ifndef/#if/#elif/#else/#endif, #include, #undef, #error, #warning.
+//! #ifdef/#ifndef/#if/#elif/#else/#endif, #include, Fortran INCLUDE, #undef,
+//! #error, and #warning.
 //! Aware of Fortran string literals and comments — won't expand macros inside them.
 
 use std::collections::HashMap;
@@ -961,6 +962,7 @@ impl Preprocessor {
             // continues on the next line.
             // Skip for preprocessor directives (#if, #define, etc.) where ! and &
             // have C semantics, not Fortran semantics.
+            let mut joined_fortran_continuation = false;
             if !self.fixed_form && !logical_line.text.trim_start().starts_with('#') {
                 // Incremental: scan only the newly appended piece per
                 // join, carrying string state — the full-line rescan
@@ -994,6 +996,7 @@ impl Preprocessor {
                         let next_piece = next_line.slice(content_start..raw_next.len());
                         let base = logical_line.text.len();
                         logical_line.append(&next_piece);
+                        joined_fortran_continuation = true;
                         i += 1;
                         scan = scan_trailing_ampersand(
                             &logical_line.text[base..],
@@ -1057,8 +1060,39 @@ impl Preprocessor {
 
             let emitted = if self.is_emitting() {
                 let expanded = self.expand_mapped_macros(&logical_line);
-                output.push_str(&expanded.text);
-                expanded
+                match parse_fortran_include_path(&expanded.text, self.fixed_form) {
+                    Ok(Some(path)) => {
+                        if joined_fortran_continuation {
+                            return Err(PreprocError {
+                                filename: reported_start.filename.to_string(),
+                                line: reported_start.line,
+                                msg: "Fortran INCLUDE line cannot be continued".into(),
+                            });
+                        }
+                        let path = self.display_source_text(&path);
+                        self.include_file(
+                            &path,
+                            filename,
+                            false,
+                            &reported_start.filename,
+                            reported_start.line,
+                            output,
+                            source_map,
+                        )?;
+                        MappedText::empty(expanded.fallback)
+                    }
+                    Ok(None) => {
+                        output.push_str(&expanded.text);
+                        expanded
+                    }
+                    Err(msg) => {
+                        return Err(PreprocError {
+                            filename: reported_start.filename.to_string(),
+                            line: reported_start.line,
+                            msg: self.display_source_text(&msg),
+                        });
+                    }
+                }
             } else {
                 MappedText::empty(logical_line.fallback.clone())
             };
@@ -1392,6 +1426,27 @@ impl Preprocessor {
         };
         let path = self.display_source_text(path_str);
 
+        self.include_file(
+            &path,
+            source_filename,
+            search_system,
+            diagnostic_filename,
+            diagnostic_line,
+            output,
+            source_map,
+        )
+    }
+
+    fn include_file(
+        &mut self,
+        path: &str,
+        source_filename: &str,
+        search_system: bool,
+        diagnostic_filename: &str,
+        diagnostic_line: u32,
+        output: &mut String,
+        source_map: &mut Vec<SourceLoc>,
+    ) -> Result<(), PreprocError> {
         if self.include_depth >= 64 {
             return Err(PreprocError {
                 filename: diagnostic_filename.into(),
@@ -1402,7 +1457,7 @@ impl Preprocessor {
 
         // Search for the file.
         let resolved = self
-            .resolve_include(&path, source_filename, search_system)
+            .resolve_include(path, source_filename, search_system)
             .ok_or_else(|| PreprocError {
                 filename: diagnostic_filename.into(),
                 line: diagnostic_line,
@@ -2255,6 +2310,85 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
         amp: last_amp.map(|pos| base + pos),
         in_string,
     }
+}
+
+fn parse_fortran_include_path(line: &str, fixed_form: bool) -> Result<Option<String>, String> {
+    let statement = if fixed_form && !line.starts_with('\t') {
+        let end = line
+            .char_indices()
+            .nth(72)
+            .map_or(line.len(), |(offset, _)| offset);
+        &line[..end]
+    } else {
+        line
+    };
+    let bytes = statement.as_bytes();
+    let mut pos = 0;
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+
+    for expected in b"include" {
+        if fixed_form {
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+        }
+        let Some(actual) = bytes.get(pos) else {
+            return Ok(None);
+        };
+        if actual.to_ascii_lowercase() != *expected {
+            return Ok(None);
+        }
+        pos += 1;
+    }
+
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let Some(&quote) = bytes.get(pos) else {
+        return Ok(None);
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        return Ok(None);
+    }
+    pos += 1;
+
+    let mut path = String::new();
+    let mut piece_start = pos;
+    let closed_at = loop {
+        let Some(&byte) = bytes.get(pos) else {
+            return Err("unterminated Fortran INCLUDE string".into());
+        };
+        if byte == quote {
+            path.push_str(&statement[piece_start..pos]);
+            if bytes.get(pos + 1) == Some(&quote) {
+                path.push(quote as char);
+                pos += 2;
+                piece_start = pos;
+                continue;
+            }
+            break pos + 1;
+        }
+        pos += statement[pos..]
+            .chars()
+            .next()
+            .expect("INCLUDE path index must stay on a character boundary")
+            .len_utf8();
+    };
+
+    pos = closed_at;
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    if pos == bytes.len() || bytes[pos] == b'!' {
+        return Ok(Some(path));
+    }
+
+    Err(format!(
+        "unexpected text after Fortran INCLUDE path: {}",
+        statement[pos..].trim()
+    ))
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
@@ -3492,6 +3626,165 @@ deep
             result.text
         );
         assert!(result.text.contains("real :: x"));
+    }
+
+    #[test]
+    fn fortran_include_injects_file_content_and_tracks_dependency() {
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-fortran-include-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        std::fs::write(&include_path, "integer, parameter :: answer = 42\n").unwrap();
+
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let source = format!("include '{include_name}' ! ordinary Fortran include\nreal :: x\n");
+        let result = preprocess(&source, &config).unwrap();
+
+        assert!(
+            result.text.contains("integer, parameter :: answer = 42"),
+            "INCLUDE content was not injected: {:?}",
+            result.text
+        );
+        assert!(result.text.contains("real :: x"));
+        assert_eq!(result.included_files, vec![include_path.clone()]);
+        assert_eq!(result.source_map.len(), 3);
+        assert_eq!(
+            result.source_map[0].filename,
+            include_path.to_string_lossy()
+        );
+        assert_eq!(result.source_map[0].line, 1);
+        assert_eq!(result.source_map[2].filename, "<input>");
+        assert_eq!(result.source_map[2].line, 2);
+
+        let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn fortran_include_accepts_reference_free_and_fixed_forms() {
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-fortran-include-forms-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        std::fs::write(
+            &include_path,
+            "      integer, parameter :: included_value = 42\n",
+        )
+        .unwrap();
+
+        let free_config = PreprocConfig {
+            include_paths: vec![dir.clone()],
+            ..PreprocConfig::default()
+        };
+        for source in [
+            format!("INCLUDE \"{include_name}\" ! trailing comment\n"),
+            format!("include'{include_name}'\n"),
+        ] {
+            let result = preprocess(&source, &free_config).unwrap();
+            assert!(
+                result.text.contains("included_value = 42"),
+                "INCLUDE content was not injected for {source:?}: {:?}",
+                result.text
+            );
+            assert_eq!(result.included_files, vec![include_path.clone()]);
+        }
+
+        let fixed_config = PreprocConfig {
+            include_paths: vec![dir],
+            fixed_form: true,
+            ..PreprocConfig::default()
+        };
+        let fixed_source = format!("      I N C L U D E '{include_name}'\n");
+        let result = preprocess(&fixed_source, &fixed_config).unwrap();
+        assert!(
+            result.text.contains("included_value = 42"),
+            "fixed-form INCLUDE content was not injected: {:?}",
+            result.text
+        );
+        assert_eq!(result.included_files, vec![include_path.clone()]);
+
+        let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn fortran_include_path_can_be_produced_by_a_macro() {
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-fortran-include-macro-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        std::fs::write(&include_path, "integer, parameter :: macro_value = 7\n").unwrap();
+
+        let mut config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        config.defines.insert(
+            "INCLUDE_FILE".into(),
+            MacroDef::object(&format!("\"{include_name}\"")),
+        );
+        let result = preprocess("include INCLUDE_FILE\n", &config).unwrap();
+
+        assert!(result.text.contains("macro_value = 7"));
+        assert_eq!(result.included_files, vec![include_path.clone()]);
+
+        let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn fortran_include_recognition_preserves_neighboring_source() {
+        assert_eq!(
+            parse_fortran_include_path("include_file = 3", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("10 include 'decl.inc'", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("12345 INCLUDE 'decl.inc'", true).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("     1INCLUDE 'decl.inc'", true).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("include 'a''b.inc'", false).unwrap(),
+            Some("a'b.inc".into())
+        );
+
+        let result = preprocess(
+            "#if 0\ninclude 'missing-inactive-file.inc'\n#endif\ninclude_file = 3\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        assert!(result.text.contains("include_file = 3"));
+        assert!(result.included_files.is_empty());
+    }
+
+    #[test]
+    fn malformed_fortran_include_is_diagnosed_at_its_reported_location() {
+        let error = preprocess(
+            "#line 40 \"virtual.f90\"\ninclude 'decl.inc'; print *, 1\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.filename, "virtual.f90");
+        assert_eq!(error.line, 40);
+        assert_eq!(
+            error.msg,
+            "unexpected text after Fortran INCLUDE path: ; print *, 1"
+        );
+
+        let error =
+            preprocess("include 'unterminated.inc\n", &PreprocConfig::default()).unwrap_err();
+        assert_eq!(error.msg, "unterminated Fortran INCLUDE string");
+
+        let error = preprocess(
+            "include &\n  & 'continued.inc'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.msg, "Fortran INCLUDE line cannot be continued");
     }
 
     #[test]
