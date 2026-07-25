@@ -189,6 +189,16 @@ fn help_flag_shows_usage_and_exits_zero() {
         stdout.contains("-O1") && stdout.contains("equivalent to -O1"),
         "help must document the conventional bare -O shorthand"
     );
+    assert!(
+        stdout.contains("Produce shared library (Mach-O targets only)")
+            && stdout.contains("ELF targets reject this mode"),
+        "help must not advertise unsupported ELF shared-library linking:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Prefer static archives with the system Mach-O")
+            && stdout.contains("fully static ELF linking is not implemented"),
+        "help must not advertise unsupported ELF static linking:\n{stdout}"
+    );
 }
 
 #[test]
@@ -30470,12 +30480,10 @@ fn shared_compile_emits_amod_and_links_cleanly() {
         );
         return;
     }
-    // -shared on ELF is rejected by design until the x11 link work
-    // (driver: "executables only this sprint"); the dylib flow is
-    // Mach-O-only today.
+    // Shared-library linking is a Mach-O-only capability today.
     if armfortas::testing::native_macho_toolchain_support().is_err() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=shared_compile_emits_amod_and_links_cleanly count=1 reason=\"-shared on ELF lands in x11\""
+            "\nHARNESS_SKIP suite=cli_driver test=shared_compile_emits_amod_and_links_cleanly count=1 reason=\"shared-library linking is available only on Mach-O\""
         );
         return;
     }

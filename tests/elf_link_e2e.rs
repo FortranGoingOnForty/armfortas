@@ -264,8 +264,8 @@ fn afs_ld_route_links_without_explicit_crt_dir() {
     }
 }
 
-/// Out-of-scope link paths fail with diagnostics that name the sprint
-/// where they land, instead of a raw ld error.
+/// Out-of-scope link paths fail with actionable diagnostics instead of
+/// entering the linker with an unsupported configuration.
 #[test]
 fn out_of_scope_link_paths_diagnose_cleanly() {
     if skip("out_of_scope_link_paths_diagnose_cleanly", 3) {
@@ -300,8 +300,8 @@ fn out_of_scope_link_paths_diagnose_cleanly() {
         .unwrap();
     assert!(!r.status.success());
     assert!(
-        String::from_utf8_lossy(&r.stderr).contains("x11"),
-        "-static should point at sprint x11"
+        String::from_utf8_lossy(&r.stderr).contains("static CRT/runtime discovery"),
+        "-static should explain the missing ELF capability"
     );
 
     let r = Command::new(compiler())
@@ -313,4 +313,165 @@ fn out_of_scope_link_paths_diagnose_cleanly() {
         .unwrap();
     assert!(!r.status.success(), "musl link should be rejected for now");
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn unsupported_elf_link_modes_fail_before_compilation_and_discard_owned_output() {
+    if TargetSpec::host().object_format() != ObjectFormat::Elf {
+        armfortas::testing::report_harness_skip(
+            "elf_link_e2e",
+            "unsupported_elf_link_modes_fail_before_compilation_and_discard_owned_output",
+            1,
+            "needs an ELF host",
+        );
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("afs_elf_link_modes_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("must_not_compile.f90");
+    std::fs::write(
+        &source,
+        "#error compilation pipeline ran\nprogram p\nend program p\n",
+    )
+    .unwrap();
+
+    for (flag, expected) in [
+        (
+            "-shared",
+            "shared-library linking is currently available only for Mach-O targets",
+        ),
+        ("-static", "static CRT/runtime discovery is not implemented"),
+    ] {
+        for stale in [false, true] {
+            let state = if stale { "stale" } else { "fresh" };
+            let output = dir.join(format!("{}_{state}.out", &flag[1..]));
+            if stale {
+                std::fs::write(&output, b"stale link output").unwrap();
+            }
+
+            let result = Command::new(compiler())
+                .arg(flag)
+                .arg(&source)
+                .arg("-o")
+                .arg(&output)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("cannot run armfortas");
+            assert_eq!(
+                result.status.code(),
+                Some(1),
+                "{flag} must fail cleanly on ELF with {state} output"
+            );
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains(expected) && !stderr.contains("compilation pipeline ran"),
+                "{flag} did not fail before compilation with {state} output:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "{flag} retained {state} output after the rejected ELF link"
+            );
+        }
+    }
+
+    let compile_only_source = dir.join("compile_only.f90");
+    std::fs::write(
+        &compile_only_source,
+        "subroutine compile_only\nend subroutine compile_only\n",
+    )
+    .unwrap();
+    for flag in ["-shared", "-static"] {
+        let object = dir.join(format!("{}_compile_only.o", &flag[1..]));
+        let result = Command::new(compiler())
+            .args([flag, "-c"])
+            .arg(&compile_only_source)
+            .arg("-o")
+            .arg(&object)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("cannot run armfortas");
+        assert!(
+            result.status.success() && object.is_file(),
+            "{flag} was incorrectly rejected in compile-only mode:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    let aliased_source = dir.join("aliased.f90");
+    let aliased_bytes = b"program aliased\nend program aliased\n";
+    std::fs::write(&aliased_source, aliased_bytes).unwrap();
+    let alias_result = Command::new(compiler())
+        .arg("-shared")
+        .arg(&aliased_source)
+        .arg("-o")
+        .arg(&aliased_source)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert_eq!(alias_result.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(&aliased_source).unwrap(),
+        aliased_bytes,
+        "unsupported-mode cleanup deleted an aliased compiler input"
+    );
+    assert!(
+        String::from_utf8_lossy(&alias_result.stderr)
+            .contains("shared-library linking is currently available only for Mach-O"),
+        "aliased-output rejection lost the unsupported-mode diagnostic"
+    );
+
+    let second_source = dir.join("second.f90");
+    std::fs::write(
+        &second_source,
+        "#error multi-input compilation pipeline ran\nprogram q\nend program q\n",
+    )
+    .unwrap();
+    let multi_output = dir.join("multi.out");
+    std::fs::write(&multi_output, b"stale multi-input link output").unwrap();
+    let multi_result = Command::new(compiler())
+        .arg("-shared")
+        .arg(&source)
+        .arg(&second_source)
+        .arg("-o")
+        .arg(&multi_output)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    let multi_stderr = String::from_utf8_lossy(&multi_result.stderr);
+    assert_eq!(multi_result.status.code(), Some(1));
+    assert!(
+        multi_stderr.contains("shared-library linking is currently available only for Mach-O")
+            && !multi_stderr.contains("compilation pipeline ran"),
+        "multi-input ELF link mode was not rejected before compilation:\n{multi_stderr}"
+    );
+    assert!(
+        !multi_output.exists(),
+        "rejected multi-input ELF link retained stale output"
+    );
+
+    let object = dir.join("input.o");
+    let object_bytes = b"not inspected before unsupported-mode rejection";
+    std::fs::write(&object, object_bytes).unwrap();
+    let link_only_result = Command::new(compiler())
+        .arg("-static")
+        .arg(&object)
+        .arg("-o")
+        .arg(&object)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert_eq!(link_only_result.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(&object).unwrap(),
+        object_bytes,
+        "link-only unsupported-mode cleanup deleted an aliased input"
+    );
+    assert!(
+        String::from_utf8_lossy(&link_only_result.stderr)
+            .contains("static CRT/runtime discovery is not implemented"),
+        "link-only rejection lost the unsupported-mode diagnostic"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

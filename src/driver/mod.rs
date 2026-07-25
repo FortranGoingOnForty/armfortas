@@ -1371,8 +1371,10 @@ DIRECTORIES:
   -l <lib>                    Link library
 
 LINKING:
-  -shared                     Produce shared library
-  -static                     Static linking
+  -shared                     Produce shared library (Mach-O targets only);
+                              ELF targets reject this mode
+  -static                     Prefer static archives with the system Mach-O
+                              linker; fully static ELF linking is not implemented
   -rpath <path>               Runtime library path
 
 INFORMATION:
@@ -1622,6 +1624,9 @@ pub(crate) fn execute_with_bundled_runtime(
     match (has_source, has_link_artifact) {
         (true, false) => {
             if opts.extra_inputs.is_empty() {
+                if TerminalMode::from_options(opts).is_none() {
+                    reject_unsupported_elf_link_mode(opts, &opts.output_path())?;
+                }
                 compile_with_bundled_runtime(opts, bundled_runtime)
             } else {
                 compile_multi_with_bundled_runtime(opts, bundled_runtime)
@@ -1633,6 +1638,7 @@ pub(crate) fn execute_with_bundled_runtime(
                 .output
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("a.out"));
+            reject_unsupported_elf_link_mode(opts, &output)?;
             link_inputs(&inputs, &output, opts, bundled_runtime)
         }
         // Mixed `foo.f90 bar.o libbaz.a -o prog`: gfortran/flang accept it:
@@ -1853,11 +1859,11 @@ fn compile_with_bundled_runtime_and_dependencies(
     Ok(dependencies)
 }
 
-fn discard_raw_source_failure_output(
+fn discard_failed_output(
     opts: &Options,
+    output: &Path,
     included_files: &[PathBuf],
 ) -> Result<(), String> {
-    let output = opts.output_path();
     let preprocesses_to_stdout = opts.preprocess_only
         && opts
             .output
@@ -1871,7 +1877,7 @@ fn discard_raw_source_failure_output(
     // deletion.
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
-    let output_key = terminal_output_collision_key(&output, &cwd);
+    let output_key = terminal_output_collision_key(output, &cwd);
     if all_input_paths(opts)
         .iter()
         .chain(included_files)
@@ -1880,7 +1886,7 @@ fn discard_raw_source_failure_output(
         return Ok(());
     }
 
-    match fs::remove_file(&output) {
+    match fs::remove_file(output) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -1892,9 +1898,36 @@ fn discard_raw_source_failure_output(
 
 fn raw_source_failure(opts: &Options, included_files: &[PathBuf]) -> String {
     let failure = format!("aborting due to errors in {}", opts.input.display());
-    match discard_raw_source_failure_output(opts, included_files) {
+    match discard_failed_output(opts, &opts.output_path(), included_files) {
         Ok(()) => failure,
         Err(cleanup_error) => format!("{failure}; additionally {cleanup_error}"),
+    }
+}
+
+fn unsupported_elf_link_mode(opts: &Options) -> Option<&'static str> {
+    if opts.target.object_format() != crate::target::ObjectFormat::Elf {
+        return None;
+    }
+    if opts.static_link {
+        return Some(
+            "-static is not supported for ELF targets because static CRT/runtime discovery is not implemented",
+        );
+    }
+    if opts.shared {
+        return Some(
+            "-shared is not supported for ELF targets; shared-library linking is currently available only for Mach-O targets",
+        );
+    }
+    None
+}
+
+fn reject_unsupported_elf_link_mode(opts: &Options, output: &Path) -> Result<(), String> {
+    let Some(failure) = unsupported_elf_link_mode(opts) else {
+        return Ok(());
+    };
+    match discard_failed_output(opts, output, &[]) {
+        Ok(()) => Err(failure.to_string()),
+        Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
     }
 }
 
@@ -2897,15 +2930,7 @@ fn link_inputs_elf_with_bundled_runtime(
             opts.target, host
         ));
     }
-    if opts.static_link {
-        return Err("-static on ELF targets lands in sprint x11 (musl static story)".to_string());
-    }
-    if opts.shared {
-        return Err(
-            "-shared on ELF targets is a follow-up after x06 (executables only this sprint)"
-                .to_string(),
-        );
-    }
+    reject_unsupported_elf_link_mode(opts, output)?;
 
     let linker_override = afs_ld_override();
     // afs-ld's ELF backend currently emits ET_EXEC, not PIE. Route its
@@ -3217,6 +3242,7 @@ fn compile_multi_with_bundled_runtime(
         .and_then(|output| dependency_file_path(opts, output))
         .is_some();
     if let Some(output) = link_output.as_deref() {
+        reject_unsupported_elf_link_mode(opts, output)?;
         validate_dependency_file_destination(opts, output, &[])?;
     }
 
