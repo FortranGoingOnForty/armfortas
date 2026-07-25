@@ -1979,7 +1979,7 @@ fn compile_with_bundled_runtime_inner(
     // source, before either continuation joiner runs. Explicit-std
     // runs only — the default std is permissive (gfortran's -std=gnu
     // model); a default build's stderr stays pristine.
-    let mut source_limits_are_errors = false;
+    let mut conformance_warnings_are_errors = false;
     if let (true, true, Some(std)) = (opts.warnings_enabled(), opts.std_explicit, opts.std) {
         let warnings = conformance::check_source_limits(
             &source,
@@ -1988,8 +1988,8 @@ fn compile_with_bundled_runtime_inner(
             opts.free_line_length_none_compat,
             opts.free_line_length_limit,
         );
-        source_limits_are_errors = opts.warnings_are_errors() && !warnings.is_empty();
-        let level = if source_limits_are_errors {
+        conformance_warnings_are_errors = opts.warnings_are_errors() && !warnings.is_empty();
+        let level = if conformance_warnings_are_errors {
             diag::Level::Error
         } else {
             diag::Level::Warning
@@ -2025,7 +2025,7 @@ fn compile_with_bundled_runtime_inner(
     let pp_config = preproc_config_for_input(opts, &opts.input, source_form);
     let pp_result = match crate::preprocess::preprocess_bytes(&raw, &pp_config) {
         Ok(result) => result,
-        Err(error) if source_limits_are_errors => {
+        Err(error) if conformance_warnings_are_errors => {
             return Err(format!(
                 "aborting due to errors in {}; additionally preprocessing failed: {error}",
                 opts.input.display()
@@ -2034,11 +2034,33 @@ fn compile_with_bundled_runtime_inner(
         Err(error) => return Err(error.to_string()),
     };
     phase.end(&mut phases);
+    if opts.warnings_enabled() && opts.std_explicit {
+        let promoted = opts.warnings_are_errors();
+        let level = if promoted {
+            diag::Level::Error
+        } else {
+            diag::Level::Warning
+        };
+        let mut saw_warning = false;
+        for warning in pp_result.resolved_conformance_warnings() {
+            saw_warning = true;
+            diag::render_mapped(
+                warning.span.filename,
+                warning.span.source,
+                warning.span.display_span,
+                warning.span.source_span,
+                level,
+                warning.message,
+                1,
+            );
+        }
+        conformance_warnings_are_errors |= promoted && saw_warning;
+    }
     if let Some(dependencies) = dependency_output {
         dependencies.clone_from(&pp_result.included_files);
     }
     let included_files = &pp_result.included_files;
-    if source_limits_are_errors {
+    if conformance_warnings_are_errors {
         let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
         let failure = raw_source_failure(opts, included_files);
         return match depfile_cleanup {

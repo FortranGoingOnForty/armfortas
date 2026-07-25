@@ -64,6 +64,22 @@ fn continued_fixed_program(continuations: usize) -> String {
     src
 }
 
+fn continued_character_program(leading_ampersand: bool) -> String {
+    let continuation = if leading_ampersand {
+        "    &world'"
+    } else {
+        "    world'"
+    };
+    format!(
+        "program character_continuation\n\
+         implicit none\n\
+         character(len=*), parameter :: value = 'hello &\n\
+         {continuation}\n\
+         print *, value\n\
+         end program character_continuation\n"
+    )
+}
+
 fn macro_expanded_program(doublings: usize) -> String {
     let mut src = format!("#define A0 {}\n", "+1".repeat(2_048));
     for level in 1..=doublings {
@@ -338,6 +354,168 @@ fn f2018_continuation_limit_diagnoses_before_output_publication() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn strict_character_continuation_warns_and_werror_prevents_output_publication() {
+    let dir = std::env::temp_dir().join(format!("afs_char_continuation_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let extension = dir.join("missing_ampersand.f90");
+    let conforming = dir.join("leading_ampersand.f90");
+    std::fs::write(&extension, continued_character_program(false)).unwrap();
+    std::fs::write(&conforming, continued_character_program(true)).unwrap();
+
+    let permissive_asm = dir.join("permissive.s");
+    let permissive = Command::new(compiler())
+        .arg("-S")
+        .arg(&extension)
+        .arg("-o")
+        .arg(&permissive_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run default character-continuation case");
+    assert!(
+        permissive.status.success(),
+        "default mode should accept the GNU-compatible extension:\n{}",
+        String::from_utf8_lossy(&permissive.stderr)
+    );
+    assert!(
+        permissive.stderr.is_empty(),
+        "default mode diagnosed a strict conformance extension:\n{}",
+        String::from_utf8_lossy(&permissive.stderr)
+    );
+    assert!(permissive_asm.is_file());
+
+    let warning_asm = dir.join("warning.s");
+    let warning = Command::new(compiler())
+        .args(["--std=f2018", "-S"])
+        .arg(&extension)
+        .arg("-o")
+        .arg(&warning_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run strict character-continuation warning case");
+    assert!(
+        warning.status.success(),
+        "the GNU-compatible extension should remain compilable without -Werror:\n{}",
+        String::from_utf8_lossy(&warning.stderr)
+    );
+    let warning_stderr = String::from_utf8_lossy(&warning.stderr);
+    assert!(
+        warning_stderr.contains(":4:5: warning:")
+            && warning_stderr.contains("missing '&' at the start of a continued character literal"),
+        "missing strict character-continuation warning:\n{warning_stderr}"
+    );
+    assert!(
+        warning_asm.is_file(),
+        "non-promoted continuation warning did not publish assembly"
+    );
+
+    let failed_asm = dir.join("failed.s");
+    std::fs::write(&failed_asm, b"stale assembly").unwrap();
+    let failed = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-S"])
+        .arg(&extension)
+        .arg("-o")
+        .arg(&failed_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run promoted character-continuation warning case");
+    assert!(
+        !failed.status.success(),
+        "-Werror did not promote the character-continuation warning"
+    );
+    let failed_stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        failed_stderr.contains(":4:5: error:")
+            && failed_stderr.contains("missing '&' at the start of a continued character literal"),
+        "promoted continuation diagnostic mismatch:\n{failed_stderr}"
+    );
+    assert!(
+        !failed_asm.exists(),
+        "promoted continuation diagnostic retained stale assembly"
+    );
+
+    let suppressed_asm = dir.join("suppressed.s");
+    let suppressed = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-w", "-S"])
+        .arg(&extension)
+        .arg("-o")
+        .arg(&suppressed_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run suppressed character-continuation warning case");
+    assert!(
+        suppressed.status.success(),
+        "-w should suppress the promoted conformance warning:\n{}",
+        String::from_utf8_lossy(&suppressed.stderr)
+    );
+    assert!(
+        suppressed.stderr.is_empty(),
+        "-w did not suppress the character-continuation diagnostic:\n{}",
+        String::from_utf8_lossy(&suppressed.stderr)
+    );
+    assert!(suppressed_asm.is_file());
+
+    let conforming_asm = dir.join("conforming.s");
+    let conforming_result = Command::new(compiler())
+        .args(["--std=f2018", "-Werror", "-S"])
+        .arg(&conforming)
+        .arg("-o")
+        .arg(&conforming_asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run conforming character-continuation case");
+    assert!(
+        conforming_result.status.success(),
+        "leading '&' must satisfy strict continuation syntax:\n{}",
+        String::from_utf8_lossy(&conforming_result.stderr)
+    );
+    assert!(
+        conforming_result.stderr.is_empty(),
+        "conforming character continuation emitted a diagnostic:\n{}",
+        String::from_utf8_lossy(&conforming_result.stderr)
+    );
+    assert!(conforming_asm.is_file());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn strict_character_continuation_warning_preserves_included_source_location() {
+    let dir = std::env::temp_dir().join(format!("afs_char_cont_include_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.join("root.F90");
+    let include = dir.join("continued.inc");
+    let asm = dir.join("root.s");
+    std::fs::write(&root, "#include \"continued.inc\"\n").unwrap();
+    std::fs::write(&include, continued_character_program(false)).unwrap();
+
+    let result = Command::new(compiler())
+        .args(["--std=f2018", "-S"])
+        .arg(&root)
+        .arg("-o")
+        .arg(&asm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run included character-continuation case");
+    assert!(
+        result.status.success(),
+        "included continuation extension should remain a warning:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:4:5: warning:", include.display())),
+        "warning did not use the included physical location:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("4 |     world'"),
+        "warning did not show the included continuation line:\n{stderr}"
+    );
+    assert!(asm.is_file());
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

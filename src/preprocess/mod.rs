@@ -132,6 +132,7 @@ pub struct PreprocOutput {
     pub source_map: Vec<SourceLoc>,
     /// Resolved include files in first-seen order, including nested includes.
     pub included_files: Vec<PathBuf>,
+    conformance_warnings: Vec<PreprocWarning>,
     source_view: bool,
     eof_origin: SourceOrigin,
 }
@@ -250,6 +251,12 @@ impl SourceOrigin {
         origin.source_col = origin.source_col.saturating_add(source_bytes as u32);
         origin
     }
+}
+
+#[derive(Debug, Clone)]
+struct PreprocWarning {
+    origin: SourceOrigin,
+    message: &'static str,
 }
 
 fn source_text_width(text: &str, range: Range<usize>, source_view: bool) -> usize {
@@ -558,6 +565,11 @@ pub(crate) struct ResolvedSpan<'a> {
     pub source_span: Span,
 }
 
+pub(crate) struct ResolvedPreprocWarning<'a> {
+    pub span: ResolvedSpan<'a>,
+    pub message: &'static str,
+}
+
 impl PreprocOutput {
     pub(crate) fn bytes(&self) -> Vec<u8> {
         if self.source_view {
@@ -593,6 +605,29 @@ impl PreprocOutput {
             None
         };
         resolved_span_from_points(span.file_id, start, end)
+    }
+
+    pub(crate) fn resolved_conformance_warnings(
+        &self,
+    ) -> impl Iterator<Item = ResolvedPreprocWarning<'_>> {
+        self.conformance_warnings.iter().map(|warning| {
+            let display_col = warning
+                .origin
+                .source
+                .display_col(warning.origin.source_line, warning.origin.source_col);
+            let start = ResolvedPoint {
+                filename: &warning.origin.filename,
+                source: &warning.origin.source,
+                line: warning.origin.line,
+                col: display_col,
+                source_line: warning.origin.source_line,
+                source_col: warning.origin.source_col,
+            };
+            ResolvedPreprocWarning {
+                span: resolved_span_from_points(0, start, None),
+                message: warning.message,
+            }
+        })
     }
 }
 
@@ -775,6 +810,7 @@ struct Preprocessor {
     /// Whether source stripping is currently inside a C-style block comment.
     in_c_block_comment: bool,
     included_files: Vec<PathBuf>,
+    conformance_warnings: Vec<PreprocWarning>,
 }
 
 impl Preprocessor {
@@ -802,6 +838,7 @@ impl Preprocessor {
             skip_depth: 0,
             include_depth: 0,
             included_files: Vec::new(),
+            conformance_warnings: Vec::new(),
         }
     }
 
@@ -899,6 +936,7 @@ impl Preprocessor {
             text: output,
             source_map,
             included_files: self.included_files.clone(),
+            conformance_warnings: self.conformance_warnings.clone(),
             source_view: self.source_view,
             eof_origin,
         })
@@ -965,9 +1003,9 @@ impl Preprocessor {
                 i += 1;
             }
 
-            // Also join Fortran &-continued lines (free-form).
-            // A line ending with & in the code portion (not inside strings or after !)
-            // continues on the next line.
+            // Also join Fortran &-continued lines (free-form). A trailing
+            // & outside a string continues code; a trailing & inside an
+            // unterminated character literal continues that literal.
             // Skip for preprocessor directives (#if, #define, etc.) where ! and &
             // have C semantics, not Fortran semantics.
             let mut joined_fortran_continuation = false;
@@ -993,10 +1031,22 @@ impl Preprocessor {
                         }
                         logical_line.truncate(amp_pos);
                         let leading = raw_next.len() - next.len();
-                        let content_start = leading + usize::from(next.starts_with('&'));
                         let physical_line = (i + 1) as u32;
                         let piece_reported =
                             reported_start.at_physical_offset(physical_line - orig_line_num);
+                        if scan.amp_in_string && !next.starts_with('&') && self.is_emitting() {
+                            self.conformance_warnings.push(PreprocWarning {
+                                origin: Self::make_source_origin(
+                                    &source,
+                                    physical_line,
+                                    u32::try_from(leading.saturating_add(1)).unwrap_or(u32::MAX),
+                                    &piece_reported,
+                                ),
+                                message:
+                                    "missing '&' at the start of a continued character literal",
+                            });
+                        }
+                        let content_start = leading + usize::from(next.starts_with('&'));
                         let next_line = MappedText::source_line(
                             raw_next,
                             Self::make_source_origin(&source, physical_line, 1, &piece_reported),
@@ -2424,6 +2474,7 @@ fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
 struct AmpScan {
     amp: Option<usize>,
     in_string: Option<u8>,
+    amp_in_string: bool,
 }
 
 /// Scan `piece` (a suffix of the logical line starting at byte
@@ -2437,6 +2488,7 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
     let bytes = line.as_bytes();
     let mut in_string: Option<u8> = carried;
     let mut last_amp: Option<usize> = None;
+    let mut last_amp_in_string = false;
 
     let mut i = 0;
     while i < bytes.len() {
@@ -2453,19 +2505,25 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
                 }
                 in_string = None;
                 last_amp = None; // any `&` we saw was inside the now-closed string
+                last_amp_in_string = false;
                 i += 1;
                 continue;
             }
             if ch == b'&' {
                 last_amp = Some(i);
+                last_amp_in_string = true;
             } else if !ch.is_ascii_whitespace() {
                 last_amp = None;
+                last_amp_in_string = false;
             }
             i += 1;
             continue;
         }
 
         if ch == b'\'' || ch == b'"' {
+            // A quote is significant code after any earlier ampersand.
+            last_amp = None;
+            last_amp_in_string = false;
             in_string = Some(ch);
             i += 1;
             continue;
@@ -2478,9 +2536,11 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
 
         if ch == b'&' {
             last_amp = Some(i);
+            last_amp_in_string = false;
         } else if !ch.is_ascii_whitespace() {
             // Non-whitespace after the & means it's not trailing.
             last_amp = None;
+            last_amp_in_string = false;
         }
 
         i += 1;
@@ -2489,6 +2549,7 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
     AmpScan {
         amp: last_amp.map(|pos| base + pos),
         in_string,
+        amp_in_string: last_amp.is_some() && last_amp_in_string,
     }
 }
 
@@ -4531,6 +4592,135 @@ deep
             "got: {:?}",
             out.lines().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn missing_leading_ampersand_on_character_continuation_is_recorded() {
+        let config = PreprocConfig {
+            filename: "continued-character.f90".into(),
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("print *, 'hello &\n  world'\n", &config).unwrap();
+        assert!(
+            result.text.contains("print *, 'hello world'"),
+            "continuation was not joined permissively: {:?}",
+            result.text
+        );
+
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].span.filename, "continued-character.f90");
+        assert_eq!(
+            warnings[0].span.display_span.start,
+            Position { line: 2, col: 3 }
+        );
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 2, col: 3 }
+        );
+        assert_eq!(
+            warnings[0].message,
+            "missing '&' at the start of a continued character literal"
+        );
+    }
+
+    #[test]
+    fn leading_ampersand_satisfies_character_continuation_syntax() {
+        let result =
+            preprocess("print *, 'hello &\n  &world'\n", &PreprocConfig::default()).unwrap();
+        assert!(
+            result.text.contains("print *, 'hello world'"),
+            "continuation was not joined: {:?}",
+            result.text
+        );
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+    }
+
+    #[test]
+    fn code_continuation_does_not_require_a_leading_ampersand() {
+        let result = preprocess("x = 1 + &\n  2\n", &PreprocConfig::default()).unwrap();
+        assert!(result.text.contains("x = 1 + 2"), "got: {:?}", result.text);
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+    }
+
+    #[test]
+    fn character_continuation_warning_skips_comment_and_blank_lines() {
+        let result = preprocess(
+            "print *, 'hello &\n! intervening comment\n\n    world'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 4, col: 5 }
+        );
+    }
+
+    #[test]
+    fn character_continuation_warning_honors_reported_locations() {
+        let result = preprocess(
+            "#line 700 \"generated.f90\"\nprint *, 'hello &\n  world'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].span.filename, "generated.f90");
+        assert_eq!(
+            warnings[0].span.display_span.start,
+            Position { line: 701, col: 3 }
+        );
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 3, col: 3 }
+        );
+        assert_eq!(warnings[0].span.source.lines().nth(2), Some("  world'"));
+    }
+
+    #[test]
+    fn inactive_character_continuation_does_not_emit_a_warning() {
+        let result = preprocess(
+            "#if 0\nprint *, 'hidden &\n  extension'\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+    }
+
+    #[test]
+    fn only_missing_character_continuation_markers_are_recorded() {
+        let result = preprocess(
+            "print *, 'one &\n  two &\n  &three'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 2, col: 3 }
+        );
+    }
+
+    #[test]
+    fn ampersand_before_a_later_quote_is_not_a_continuation_marker() {
+        assert_eq!(find_code_trailing_ampersand("x = & 'unterminated"), None);
+    }
+
+    #[test]
+    fn long_conforming_character_continuation_chain_stays_warning_free() {
+        let fragments = 20_000;
+        let mut source = String::from("value = 'x&\n");
+        for _ in 0..fragments {
+            source.push_str("  &x&\n");
+        }
+        source.push_str("  &x'\n");
+
+        let result = preprocess(&source, &PreprocConfig::default()).unwrap();
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+        assert_eq!(result.text.matches('x').count(), fragments + 2);
     }
 
     #[test]
