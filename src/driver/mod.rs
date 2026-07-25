@@ -101,7 +101,7 @@ impl OptLevel {
     pub fn parse_flag(flag: &str) -> Option<Self> {
         match flag.to_ascii_lowercase().as_str() {
             "o0" => Some(Self::O0),
-            "o1" => Some(Self::O1),
+            "o" | "o1" => Some(Self::O1),
             "o2" => Some(Self::O2),
             "o3" => Some(Self::O3),
             "os" => Some(Self::Os),
@@ -663,7 +663,6 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-no-pie" => opts.no_pie = true,
 
             // ---- Optimization ----
-            "-O" => opts.opt_level = OptLevel::O0,
             arg if arg.starts_with("-O") => {
                 opts.opt_level = OptLevel::parse_flag(&arg[1..])
                     .ok_or_else(|| format!("unknown optimization level: {}", arg))?;
@@ -1334,6 +1333,7 @@ LANGUAGE:
   -fmax-errors=<n>            GNU-compatible diagnostic limit spelling
 
 OPTIMIZATION:
+  -O                          Optimize at level 1 (equivalent to -O1)
   -O0, -O1, -O2, -O3          Optimization level (default -O0)
   -Os                         Optimize for size
   -Ofast                      Aggressive optimization; permits floating-point
@@ -3631,10 +3631,33 @@ mod tests {
 
     #[test]
     fn parses_os_optimization_flag() {
+        assert_eq!(OptLevel::parse_flag("O"), Some(OptLevel::O1));
         assert_eq!(OptLevel::parse_flag("Os"), Some(OptLevel::Os));
         assert_eq!(OptLevel::parse_flag("os"), Some(OptLevel::Os));
         assert_eq!(OptLevel::Os.as_flag(), "-Os");
         assert_eq!(OptLevel::Os.as_str(), "Os");
+    }
+
+    #[test]
+    fn bare_o_selects_o1_and_optimization_flags_obey_last_option_wins() {
+        let parse_level = |flags: &[&str]| {
+            let mut args = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            args.push("hello.f90".to_string());
+            let ParsedCli::Compile(opts) = parse_cli(&args).expect("optimization flags must parse")
+            else {
+                panic!("optimization flags unexpectedly produced an information action");
+            };
+            opts.opt_level
+        };
+
+        assert_eq!(parse_level(&["-O"]), OptLevel::O1);
+        assert_eq!(parse_level(&["-O0", "-O"]), OptLevel::O1);
+        assert_eq!(parse_level(&["-O3", "-O"]), OptLevel::O1);
+        assert_eq!(parse_level(&["-O", "-O0"]), OptLevel::O0);
+        assert_eq!(parse_level(&["-O", "-O2"]), OptLevel::O2);
     }
 
     #[test]

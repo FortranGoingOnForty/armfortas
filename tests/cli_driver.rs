@@ -185,6 +185,94 @@ fn help_flag_shows_usage_and_exits_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("USAGE"), "help missing USAGE line");
     assert!(stdout.contains("--std="), "help missing --std= entry");
+    assert!(
+        stdout.contains("-O1") && stdout.contains("equivalent to -O1"),
+        "help must document the conventional bare -O shorthand"
+    );
+}
+
+#[test]
+fn bare_o_runs_the_o1_pipeline_and_preserves_output_ownership() {
+    let dir = unique_dir("bare_o");
+    let source = write_program_in(
+        &dir,
+        "witness.f90",
+        "program bare_o_witness\n\
+         implicit none\n\
+         integer :: value\n\
+         value = 1\n\
+         value = value + 2\n\
+         print *, value\n\
+         end program bare_o_witness\n",
+    );
+    let compiler = compiler("armfortas");
+
+    let compile_ir = |name: &str, optimization_flags: &[&str]| {
+        let output = dir.join(format!("{name}.ir"));
+        fs::write(&output, b"stale optimization output").expect("cannot seed stale IR output");
+        let result = Command::new(&compiler)
+            .args(optimization_flags)
+            .arg("--emit-ir")
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("failed to launch compiler");
+        assert!(
+            result.status.success(),
+            "{name} IR compilation failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = fs::read_to_string(&output).expect("cannot read optimized IR output");
+        assert_ne!(
+            text, "stale optimization output",
+            "{name} retained stale IR output"
+        );
+        text
+    };
+
+    let bare = compile_ir("bare", &["-O"]);
+    let o0 = compile_ir("o0", &["-O0"]);
+    let o1 = compile_ir("o1", &["-O1"]);
+    assert_eq!(bare, o1, "bare -O must run the exact -O1 IR pipeline");
+    assert_ne!(bare, o0, "the witness must distinguish -O from -O0");
+    assert_eq!(
+        compile_ir("o0_then_bare", &["-O0", "-O"]),
+        o1,
+        "a trailing bare -O must select O1"
+    );
+    assert_eq!(
+        compile_ir("bare_then_o0", &["-O", "-O0"]),
+        o0,
+        "a trailing -O0 must restore the unoptimized pipeline"
+    );
+
+    let rejected_output = dir.join("rejected.ir");
+    fs::write(&rejected_output, b"preserved after parse failure")
+        .expect("cannot seed rejected output");
+    let rejected = Command::new(&compiler)
+        .args(["-O4", "--emit-ir"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&rejected_output)
+        .output()
+        .expect("failed to launch compiler");
+    assert!(
+        !rejected.status.success(),
+        "unknown optimization level unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unknown optimization level: -O4"),
+        "unknown optimization level produced the wrong diagnostic:\n{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        fs::read(&rejected_output).expect("cannot read rejected output"),
+        b"preserved after parse failure",
+        "optimization parse failure modified a pre-existing output"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
