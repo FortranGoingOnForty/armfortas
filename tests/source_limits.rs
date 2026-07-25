@@ -64,6 +64,21 @@ fn continued_fixed_program(continuations: usize) -> String {
     src
 }
 
+fn macro_expanded_program(doublings: usize) -> String {
+    let mut src = format!("#define A0 {}\n", "+1".repeat(2_048));
+    for level in 1..=doublings {
+        src.push_str(&format!("#define A{level} A{} A{}\n", level - 1, level - 1));
+    }
+    src.push_str(
+        "program macro_limit\n\
+         implicit none\n\
+         integer :: total\n",
+    );
+    src.push_str(&format!("total = 0 A{doublings}\n"));
+    src.push_str("end program macro_limit\n");
+    src
+}
+
 fn compile_s(src_path: &Path, out: &Path, std_flag: &str) -> std::process::Output {
     Command::new(compiler())
         .args([std_flag, "-S"])
@@ -709,6 +724,84 @@ fn over_cap_statement_errors_cleanly() {
         "expected the statement-cap diagnostic, got:\n{}",
         stderr
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn macro_expansion_is_rechecked_against_statement_hard_cap() {
+    let dir = std::env::temp_dir().join(format!("afs_macro_cap_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f90 = dir.join("macro_cap.f90");
+    std::fs::write(&f90, macro_expanded_program(9)).unwrap();
+
+    for stale in [false, true] {
+        let state = if stale { "stale" } else { "fresh" };
+        let output = dir.join(format!("macro_cap_{state}.i"));
+        let depfile = dir.join(format!("macro_cap_{state}.d"));
+        if stale {
+            std::fs::write(&output, b"stale preprocessed output").unwrap();
+            std::fs::write(&depfile, b"stale dependencies").unwrap();
+        }
+
+        let result = Command::new(compiler())
+            .args(["-E", "-MD", "-MF"])
+            .arg(&depfile)
+            .arg(&f90)
+            .arg("-o")
+            .arg(&output)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("cannot run armfortas");
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "expanded over-cap statement must exit 1 with {state} outputs"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("macro_cap.f90:14:1")
+                && stderr.contains("statement expands to")
+                && stderr.contains("after preprocessing")
+                && stderr.contains("compiler limit"),
+            "missing source-mapped expanded-statement diagnostic with {state} outputs:\n{stderr}"
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "expanded over-cap statement published stdout with {state} outputs"
+        );
+        assert!(
+            !output.exists(),
+            "expanded over-cap statement retained {state} preprocess output"
+        );
+        assert!(
+            !depfile.exists(),
+            "expanded over-cap statement retained {state} dependency output"
+        );
+    }
+
+    let under_cap = dir.join("macro_under_cap.f90");
+    let under_cap_output = dir.join("macro_under_cap.i");
+    std::fs::write(&under_cap, macro_expanded_program(8)).unwrap();
+    std::fs::write(&under_cap_output, b"stale under-cap output").unwrap();
+    let under_cap_result = Command::new(compiler())
+        .arg("-E")
+        .arg(&under_cap)
+        .arg("-o")
+        .arg(&under_cap_output)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("cannot run armfortas");
+    assert!(
+        under_cap_result.status.success(),
+        "expanded statement within the compiler cap was rejected:\n{}",
+        String::from_utf8_lossy(&under_cap_result.stderr)
+    );
+    assert_ne!(
+        std::fs::read(&under_cap_output).unwrap(),
+        b"stale under-cap output",
+        "successful under-cap preprocessing retained stale output"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

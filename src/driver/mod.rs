@@ -2026,10 +2026,30 @@ fn compile_with_bundled_runtime_inner(
             Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
         };
     }
+    let preprocessed = pp_result.text.as_str();
+    if let Some((span, chars)) = conformance::find_over_cap_statement(preprocessed, source_form) {
+        render_preprocessed_diagnostic(
+            &pp_result,
+            span,
+            diag::Level::Error,
+            &format!(
+                "statement expands to {} characters after preprocessing, over the \
+                 {}-character compiler limit (the F2023 standard caps statements at \
+                 1,000,000 characters)",
+                chars,
+                conformance::STMT_HARD_CAP
+            ),
+        );
+        let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
+        let failure = raw_source_failure(opts, included_files);
+        return match depfile_cleanup {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
+        };
+    }
     if TerminalMode::from_options(opts).is_none() {
         prepare_dependency_file(opts, &opts.output_path(), included_files)?;
     }
-    let preprocessed = pp_result.text.as_str();
 
     if opts.preprocess_only {
         let preprocessed_bytes = pp_result.bytes();

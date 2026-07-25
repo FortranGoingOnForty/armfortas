@@ -9,14 +9,13 @@
 //! the same; gfortran truncates overlong lines, which we deliberately do
 //! not).
 //!
-//! Mechanism: one standalone scan over the ORIGINAL source text,
-//! invoked by the driver before preprocessing. The sprint doc offered
-//! a choice between threading `--std` into the lexer or reporting via
-//! the driver; this is the driver route, picked because (a)
-//! `FortranStandard` lives in sema and the lexer must not depend on
-//! sema, and (b) both line joiners (the lexer's `try_continuation`
-//! and the preprocessor's logical-line join) run AFTER this scan, so
-//! the diagnostic fires identically no matter which path a file takes.
+//! Mechanism: conformance warnings use one standalone scan over the
+//! original source text before preprocessing. The unconditional
+//! compiler safety cap is checked both before and after preprocessing,
+//! so macro expansion cannot bypass it. The sprint doc offered a choice
+//! between threading `--std` into the lexer or reporting via the driver;
+//! this is the driver route, picked because `FortranStandard` lives in
+//! sema and the lexer must not depend on sema.
 //!
 //! Statement length counts the characters of every physical line of a
 //! continued statement (the standard's limit is on the statement as
