@@ -2335,10 +2335,20 @@ fn compile_with_bundled_runtime_inner(
     let phase = phases.start("codegen");
     let asm_text = crate::codegen::emit_module(&ir_module, opts)?;
     phase.end(&mut phases);
+    let module_artifacts = ModuleArtifactContext {
+        units: &units,
+        symbol_table: &st,
+        source_provenance: &source_provenance,
+        source_content: &raw,
+        module_globals: &module_globals,
+        type_layouts: &type_layouts,
+        ir_module: &ir_module,
+    };
     if opts.emit_asm {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_module_artifacts(opts, &module_artifacts)?;
         write_dependency_file(opts, &out, included_files)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
@@ -2395,119 +2405,7 @@ fn compile_with_bundled_runtime_inner(
     let _obj_cleanup = (!opts.emit_obj).then(|| RemoveFileOnDrop(obj_path.clone()));
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
-    // x05: ELF targets assemble with the system assembler when the
-    let local_descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(&units);
-    let local_char_len_star_params =
-        crate::ir::lower::collect_char_len_star_params_for_units(&units);
-
-    let module_artifact_dir: std::path::PathBuf =
-        opts.module_output_dir.clone().unwrap_or_else(|| {
-            if opts.emit_obj {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            } else {
-                opts.output_path()
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .to_path_buf()
-            }
-        });
-
-    // Emit module interface files for each MODULE in the compilation unit.
-    // -J <dir> overrides where they go. For compile-only (-c) builds
-    // without -J, keep the traditional compiler behavior of writing
-    // module files into the current working directory even if the
-    // object output path points into a source subdirectory. For full
-    // link/shared outputs, keep following the primary output path.
-    for unit in &units {
-        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
-            let mod_key = name.to_lowercase();
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                let amod_text = crate::sema::amod::write_amod(
-                    name,
-                    &source_provenance,
-                    &raw,
-                    &st,
-                    mod_scope_id,
-                    &module_globals,
-                    &type_layouts,
-                    &ir_module,
-                    &local_descriptor_params,
-                    &local_char_len_star_params,
-                );
-                let amod_path = module_artifact_dir.join(format!("{}.amod", mod_key));
-                write_module_file_atomic(&amod_path, &amod_text)?;
-                // `.amod` remains the ARMFORTAS module ABI file. A
-                // byte-identical `.mod` alias keeps conventional Fortran
-                // build systems such as CMake able to track module
-                // dependencies for unknown compilers.
-                let mod_path = module_artifact_dir.join(format!("{}.mod", mod_key));
-                write_module_file_atomic(&mod_path, &amod_text)?;
-                if opts.verbose {
-                    eprintln!(" amod: {}", amod_path.display());
-                }
-            }
-        }
-    }
-    for unit in &units {
-        if let crate::ast::unit::ProgramUnit::Submodule {
-            parent,
-            ancestor,
-            name,
-            ..
-        } = &unit.node
-        {
-            let parent_key = parent.to_lowercase();
-            let name_key = name.to_lowercase();
-            let parent_spec = if let Some(ancestor) = ancestor {
-                format!("{}:{}", parent_key, ancestor.to_lowercase())
-            } else {
-                parent_key.clone()
-            };
-            let artifact_stem = format!("{}@{}", parent_key, name_key);
-            let interface_name = format!("{}.amod", artifact_stem);
-            let submodule_scope_id =
-                st.find_submodule_scope(&parent_key, &name_key)
-                    .ok_or_else(|| {
-                        format!(
-                            "cannot emit interface for unresolved submodule '{}:{}'",
-                            parent_key, name_key
-                        )
-                    })?;
-            let interface_text = crate::sema::amod::write_amod(
-                name,
-                &source_provenance,
-                &raw,
-                &st,
-                submodule_scope_id,
-                &module_globals,
-                &type_layouts,
-                &ir_module,
-                &local_descriptor_params,
-                &local_char_len_star_params,
-            );
-            let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
-            let interface_path = module_artifact_dir.join(&interface_name);
-            write_module_file_atomic(&interface_path, &interface_text)?;
-            if opts.verbose {
-                eprintln!(" amod: {}", interface_path.display());
-            }
-            let smod_text = format!(
-                "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
-                crate::sema::amod::SMOD_VERSION,
-                env!("CARGO_PKG_VERSION"),
-                source_provenance,
-                parent_spec,
-                name_key,
-                interface_name,
-                interface_fingerprint
-            );
-            let smod_path = module_artifact_dir.join(format!("{}.smod", artifact_stem));
-            write_module_file_atomic(&smod_path, &smod_text)?;
-            if opts.verbose {
-                eprintln!(" smod: {}", smod_path.display());
-            }
-        }
-    }
+    write_module_artifacts(opts, &module_artifacts)?;
 
     // ELF assembly routing (x14): the in-process afs-as x86 pipeline
     // is the default. AFS_AS_PATH substitutes a subprocess assembler
@@ -2655,6 +2553,145 @@ fn compile_with_bundled_runtime_inner(
     )?;
 
     phases.report();
+    Ok(())
+}
+
+struct ModuleArtifactContext<'a> {
+    units: &'a [crate::ast::unit::SpannedUnit],
+    symbol_table: &'a crate::sema::symtab::SymbolTable,
+    source_provenance: &'a str,
+    source_content: &'a [u8],
+    module_globals:
+        &'a std::collections::HashMap<(String, String), crate::ir::lower::ModuleGlobalInfo>,
+    type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+    ir_module: &'a Module,
+}
+
+fn write_module_artifacts(
+    opts: &Options,
+    context: &ModuleArtifactContext<'_>,
+) -> Result<(), String> {
+    let has_module_artifacts = context.units.iter().any(|unit| {
+        matches!(
+            unit.node,
+            crate::ast::unit::ProgramUnit::Module { .. }
+                | crate::ast::unit::ProgramUnit::Submodule { .. }
+        )
+    });
+    if !has_module_artifacts {
+        return Ok(());
+    }
+
+    let descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(context.units);
+    let char_len_star_params =
+        crate::ir::lower::collect_char_len_star_params_for_units(context.units);
+    let output_dir = opts.module_output_dir.clone().unwrap_or_else(|| {
+        if opts.emit_obj {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            opts.output_path()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        }
+    });
+
+    // -J <dir> overrides where interfaces go. For compile-only (-c)
+    // builds without -J, keep the traditional behavior of writing them
+    // into the current working directory even if the object output path
+    // points into a source subdirectory. Link and assembly-only outputs
+    // follow the primary output path.
+    for unit in context.units {
+        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            if let Some(mod_scope_id) = context.symbol_table.find_module_scope(&mod_key) {
+                let amod_text = crate::sema::amod::write_amod(
+                    name,
+                    context.source_provenance,
+                    context.source_content,
+                    context.symbol_table,
+                    mod_scope_id,
+                    context.module_globals,
+                    context.type_layouts,
+                    context.ir_module,
+                    &descriptor_params,
+                    &char_len_star_params,
+                );
+                let amod_path = output_dir.join(format!("{}.amod", mod_key));
+                write_module_file_atomic(&amod_path, &amod_text)?;
+                // `.amod` remains the ARMFORTAS module ABI file. A
+                // byte-identical `.mod` alias keeps conventional Fortran
+                // build systems such as CMake able to track module
+                // dependencies for unknown compilers.
+                let mod_path = output_dir.join(format!("{}.mod", mod_key));
+                write_module_file_atomic(&mod_path, &amod_text)?;
+                if opts.verbose {
+                    eprintln!(" amod: {}", amod_path.display());
+                }
+            }
+        }
+    }
+    for unit in context.units {
+        if let crate::ast::unit::ProgramUnit::Submodule {
+            parent,
+            ancestor,
+            name,
+            ..
+        } = &unit.node
+        {
+            let parent_key = parent.to_lowercase();
+            let name_key = name.to_lowercase();
+            let parent_spec = if let Some(ancestor) = ancestor {
+                format!("{}:{}", parent_key, ancestor.to_lowercase())
+            } else {
+                parent_key.clone()
+            };
+            let artifact_stem = format!("{}@{}", parent_key, name_key);
+            let interface_name = format!("{}.amod", artifact_stem);
+            let submodule_scope_id = context
+                .symbol_table
+                .find_submodule_scope(&parent_key, &name_key)
+                .ok_or_else(|| {
+                    format!(
+                        "cannot emit interface for unresolved submodule '{}:{}'",
+                        parent_key, name_key
+                    )
+                })?;
+            let interface_text = crate::sema::amod::write_amod(
+                name,
+                context.source_provenance,
+                context.source_content,
+                context.symbol_table,
+                submodule_scope_id,
+                context.module_globals,
+                context.type_layouts,
+                context.ir_module,
+                &descriptor_params,
+                &char_len_star_params,
+            );
+            let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
+            let interface_path = output_dir.join(&interface_name);
+            write_module_file_atomic(&interface_path, &interface_text)?;
+            if opts.verbose {
+                eprintln!(" amod: {}", interface_path.display());
+            }
+            let smod_text = format!(
+                "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
+                crate::sema::amod::SMOD_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                context.source_provenance,
+                parent_spec,
+                name_key,
+                interface_name,
+                interface_fingerprint
+            );
+            let smod_path = output_dir.join(format!("{}.smod", artifact_stem));
+            write_module_file_atomic(&smod_path, &smod_text)?;
+            if opts.verbose {
+                eprintln!(" smod: {}", smod_path.display());
+            }
+        }
+    }
     Ok(())
 }
 

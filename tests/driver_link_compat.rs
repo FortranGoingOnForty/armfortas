@@ -188,6 +188,104 @@ fn dash_j_writes_smod_alias_for_submodule() {
 }
 
 #[test]
+fn assembly_only_publishes_module_and_submodule_interfaces() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=assembly_only_publishes_module_and_submodule_interfaces count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("assembly_module_interfaces");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module asm_parent\n  interface\n    module subroutine fill(x)\n      integer, intent(out) :: x\n    end subroutine\n  end interface\nend module\n",
+    );
+    let child = write_program_in(
+        &dir,
+        "child.f90",
+        "submodule (asm_parent) asm_child\ncontains\n  module procedure fill\n    x = 7\n  end procedure\nend submodule\n",
+    );
+    let mod_dir = dir.join("mods");
+    std::fs::create_dir_all(&mod_dir).expect("cannot create module dir");
+
+    let parent_mod = mod_dir.join("asm_parent.mod");
+    std::fs::write(&parent_mod, "stale module alias\n").expect("cannot seed stale .mod");
+    let parent_asm = dir.join("parent.s");
+    let parent_result = Command::new(compiler("armfortas"))
+        .args([
+            "-S",
+            parent.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            parent_asm.to_str().unwrap(),
+        ])
+        .output()
+        .expect("parent assembly compile spawn failed");
+    assert!(
+        parent_result.status.success(),
+        "parent assembly compile failed: {}",
+        String::from_utf8_lossy(&parent_result.stderr)
+    );
+    let parent_amod = mod_dir.join("asm_parent.amod");
+    let parent_interface =
+        std::fs::read_to_string(&parent_amod).expect("assembly-only build omitted parent .amod");
+    assert_eq!(
+        parent_interface,
+        std::fs::read_to_string(&parent_mod).expect("assembly-only build omitted parent .mod"),
+        "assembly-only build should replace the stale .mod with the canonical interface"
+    );
+    assert!(
+        parent_asm.exists(),
+        "assembly-only parent build omitted its primary output"
+    );
+
+    let child_smod = mod_dir.join("asm_parent@asm_child.smod");
+    std::fs::write(&child_smod, "stale submodule alias\n").expect("cannot seed stale .smod");
+    let child_asm = dir.join("child.s");
+    let child_result = Command::new(compiler("armfortas"))
+        .args([
+            "-S",
+            child.to_str().unwrap(),
+            "-I",
+            mod_dir.to_str().unwrap(),
+            "-J",
+            mod_dir.to_str().unwrap(),
+            "-o",
+            child_asm.to_str().unwrap(),
+        ])
+        .output()
+        .expect("submodule assembly compile spawn failed");
+    assert!(
+        child_result.status.success(),
+        "submodule assembly compile failed: {}",
+        String::from_utf8_lossy(&child_result.stderr)
+    );
+    let child_interface = mod_dir.join("asm_parent@asm_child.amod");
+    assert!(
+        std::fs::read_to_string(&child_interface)
+            .expect("assembly-only build omitted submodule interface")
+            .contains("# ancestor-module: asm_parent"),
+        "submodule interface should retain its parent identity"
+    );
+    let smod_text =
+        std::fs::read_to_string(&child_smod).expect("assembly-only build omitted .smod alias");
+    assert!(
+        smod_text.starts_with("#!smod 2\n")
+            && smod_text.contains("@interface asm_parent@asm_child.amod"),
+        "assembly-only build should replace the stale .smod: {smod_text}"
+    );
+    assert!(
+        child_asm.exists(),
+        "assembly-only submodule build omitted its primary output"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn gnu_depfile_flags_write_make_dependency_file() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
