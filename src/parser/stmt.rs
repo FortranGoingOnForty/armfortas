@@ -781,24 +781,31 @@ impl<'a> Parser<'a> {
         start: crate::lexer::Span,
         is_error: bool,
     ) -> Result<SpannedStmt, ParseError> {
-        let code = if !self.at_stmt_end() && !self.peek_text().eq_ignore_ascii_case("quiet") {
+        let starts_quiet_spec = self.peek_text().eq_ignore_ascii_case("quiet")
+            && self.peek_kind_at(1) == Some(&TokenKind::Assign);
+        let code = if !self.at_stmt_end() && self.peek() != &TokenKind::Comma && !starts_quiet_spec
+        {
             Some(self.parse_expr()?)
         } else {
             None
         };
 
-        // Check for QUIET= specifier.
-        let mut quiet = false;
-        let _ = self.eat(&TokenKind::Comma); // optional comma before QUIET=
-        if self.peek_text().eq_ignore_ascii_case("quiet") {
+        let quiet = if self.eat(&TokenKind::Comma) {
+            if !self.peek_text().eq_ignore_ascii_case("quiet") {
+                return Err(
+                    self.error("expected QUIET= specifier after ',' in STOP statement".into())
+                );
+            }
             self.advance();
             self.expect(&TokenKind::Assign)?;
-            let val_text = self.peek_text().to_lowercase();
-            if val_text == ".true." || val_text == ".t." {
-                quiet = true;
-            }
-            self.advance(); // consume the logical literal
-        }
+            Some(self.parse_expr()?)
+        } else if self.peek_text().eq_ignore_ascii_case("quiet")
+            && self.peek_kind_at(1) == Some(&TokenKind::Assign)
+        {
+            return Err(self.error("expected ',' before QUIET= specifier".into()));
+        } else {
+            None
+        };
 
         let span = span_from_to(start, self.prev_span());
         if is_error {
@@ -2223,6 +2230,34 @@ mod tests {
     fn error_stop() {
         let s = parse_one("error stop\n");
         assert!(matches!(s.node, Stmt::ErrorStop { .. }));
+    }
+
+    #[test]
+    fn stop_quiet_accepts_a_full_logical_expression() {
+        let stmt = parse_one("error stop 'boom', quiet=(enabled .and. probe())\n");
+        let Stmt::ErrorStop {
+            quiet: Some(quiet), ..
+        } = stmt.node
+        else {
+            panic!("QUIET= expression was not retained in the AST");
+        };
+        assert!(
+            matches!(quiet.node, Expr::ParenExpr { .. }),
+            "QUIET= must retain the complete parenthesized expression"
+        );
+    }
+
+    #[test]
+    fn stop_quiet_requires_the_standard_comma() {
+        let tokens = Lexer::tokenize("error stop 'boom' quiet=.true.\n", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let err = parser
+            .parse_file()
+            .expect_err("QUIET= without its separating comma must be rejected");
+        assert!(
+            err.to_string().contains("expected ',' before QUIET="),
+            "unexpected diagnostic: {err}"
+        );
     }
 
     #[test]

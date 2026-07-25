@@ -85,6 +85,18 @@ fn root_object_name(expr: &SpannedExpr) -> Option<String> {
     }
 }
 
+fn lower_stop_quiet_value(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx<'_>,
+    quiet: Option<&SpannedExpr>,
+) -> Option<ValueId> {
+    quiet.map(|expr| {
+        let raw = super::expr::lower_expr_ctx(b, ctx, expr);
+        let logical = coerce_to_type(b, raw, &IrType::Bool);
+        coerce_to_type(b, logical, &IrType::Int(IntWidth::I32))
+    })
+}
+
 fn emit_scalar_class_star_char_source_copy_on_success(
     b: &mut FuncBuilder,
     stat_addr: ValueId,
@@ -6826,7 +6838,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
         }
 
-        Stmt::Stop { code, .. } => {
+        Stmt::Stop { code, quiet } => {
             enum StopCode {
                 Msg(ValueId, ValueId),
                 Int(ValueId),
@@ -6858,6 +6870,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 StopCode::None
             };
+            let quiet = lower_stop_quiet_value(b, ctx, quiet.as_ref());
             if !matches!(stop_code, StopCode::Msg(..)) {
                 let skip = if matches!(
                     ctx.hidden_result_abi,
@@ -6879,28 +6892,49 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     true,
                 );
             }
-            match stop_code {
-                StopCode::Msg(ptr, len) => {
+            match (stop_code, quiet) {
+                (StopCode::Msg(ptr, len), Some(quiet)) => {
+                    b.call(
+                        FuncRef::External("afs_stop_msg_quiet".into()),
+                        vec![ptr, len, quiet],
+                        IrType::Void,
+                    );
+                }
+                (StopCode::Int(widened), Some(quiet)) => {
+                    b.call(
+                        FuncRef::External("afs_stop_int_quiet".into()),
+                        vec![widened, quiet],
+                        IrType::Void,
+                    );
+                }
+                (StopCode::None, Some(quiet)) => {
+                    b.call(
+                        FuncRef::External("afs_stop_quiet".into()),
+                        vec![quiet],
+                        IrType::Void,
+                    );
+                }
+                (StopCode::Msg(ptr, len), None) => {
                     b.call(
                         FuncRef::External("afs_stop_msg".into()),
                         vec![ptr, len],
                         IrType::Void,
                     );
                 }
-                StopCode::Int(widened) => {
+                (StopCode::Int(widened), None) => {
                     b.call(
                         FuncRef::External("afs_stop_int".into()),
                         vec![widened],
                         IrType::Void,
                     );
                 }
-                StopCode::None => {
+                (StopCode::None, None) => {
                     b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
                 }
             }
             b.unreachable();
         }
-        Stmt::ErrorStop { code, .. } => {
+        Stmt::ErrorStop { code, quiet } => {
             // F2018 §11.4: error stop with a stop-code prints the
             // implementation banner together with the user's code. The
             // earlier lowering threw the code away so all stdlib error
@@ -6949,6 +6983,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 StopCode::None
             };
+            let quiet = lower_stop_quiet_value(b, ctx, quiet.as_ref());
 
             // Skip implicit dealloc for character-stop-code error stops.
             // The user-provided message often references a local
@@ -6980,22 +7015,43 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 );
             }
 
-            match stop_code {
-                StopCode::Msg(ptr, len) => {
+            match (stop_code, quiet) {
+                (StopCode::Msg(ptr, len), Some(quiet)) => {
+                    b.call(
+                        FuncRef::External("afs_error_stop_msg_quiet".into()),
+                        vec![ptr, len, quiet],
+                        IrType::Void,
+                    );
+                }
+                (StopCode::Int(widened), Some(quiet)) => {
+                    b.call(
+                        FuncRef::External("afs_error_stop_int_quiet".into()),
+                        vec![widened, quiet],
+                        IrType::Void,
+                    );
+                }
+                (StopCode::None, Some(quiet)) => {
+                    b.call(
+                        FuncRef::External("afs_error_stop_quiet".into()),
+                        vec![quiet],
+                        IrType::Void,
+                    );
+                }
+                (StopCode::Msg(ptr, len), None) => {
                     b.call(
                         FuncRef::External("afs_error_stop_msg".into()),
                         vec![ptr, len],
                         IrType::Void,
                     );
                 }
-                StopCode::Int(widened) => {
+                (StopCode::Int(widened), None) => {
                     b.call(
                         FuncRef::External("afs_error_stop_int".into()),
                         vec![widened],
                         IrType::Void,
                     );
                 }
-                StopCode::None => {
+                (StopCode::None, None) => {
                     b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
                 }
             }

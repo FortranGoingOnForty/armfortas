@@ -2095,9 +2095,17 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 validate_const_int_expr_tree(ctx, expr);
             }
         }
-        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
             if let Some(code) = code {
                 validate_const_int_expr_tree(ctx, code);
+            }
+            if let Some(quiet) = quiet {
+                validate_const_int_expr_tree(ctx, quiet);
+            }
+        }
+        Stmt::Return { value } => {
+            if let Some(value) = value {
+                validate_const_int_expr_tree(ctx, value);
             }
         }
         Stmt::Write { controls, items }
@@ -2966,9 +2974,17 @@ fn collect_reference_stmt(
             nested_shadowed.extend(assocs.iter().map(|(name, _)| name.to_lowercase()));
             collect_reference_stmts(body, &nested_shadowed, facts);
         }
-        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
             if let Some(code) = code {
                 collect_reference_expr(code, shadowed, facts);
+            }
+            if let Some(quiet) = quiet {
+                collect_reference_expr(quiet, shadowed, facts);
+            }
+        }
+        Stmt::Return { value } => {
+            if let Some(value) = value {
+                collect_reference_expr(value, shadowed, facts);
             }
         }
         Stmt::ComputedGoto { selector, .. } | Stmt::ArithmeticIf { expr: selector, .. } => {
@@ -4703,6 +4719,22 @@ fn validate_allocation_options(
     presence
 }
 
+fn validate_stop_quiet(ctx: &mut Ctx<'_>, quiet: Option<&SpannedExpr>) {
+    let Some(quiet) = quiet else {
+        return;
+    };
+    ctx.require_std(quiet.span, FortranStandard::F2018, "QUIET= specifier");
+    let metadata = validation_expr_metadata(ctx, quiet);
+    let wrong_type = metadata
+        .type_info
+        .as_ref()
+        .is_some_and(|ty| !matches!(ty, TypeInfo::Logical { .. }));
+    let wrong_rank = metadata.rank.is_some_and(|rank| rank != 0);
+    if wrong_type || wrong_rank {
+        ctx.error(quiet.span, "QUIET= expression must be a scalar LOGICAL");
+    }
+}
+
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
     validate_stmt_enum_usage(ctx, stmt);
@@ -4809,11 +4841,15 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         // ---- STOP / ERROR STOP in pure ----
         // F2018 §11.4 forbids STOP in pure procedures; F2023 §11.4 explicitly
         // permits ERROR STOP in pure procedures, which stdlib relies on.
-        Stmt::Stop { .. } if ctx.in_pure => {
-            ctx.error(stmt.span, "STOP not allowed in pure procedure");
+        Stmt::Stop { quiet, .. } => {
+            if ctx.in_pure {
+                ctx.error(stmt.span, "STOP not allowed in pure procedure");
+            }
+            validate_stop_quiet(ctx, quiet.as_ref());
         }
-        Stmt::ErrorStop { .. } => {
+        Stmt::ErrorStop { quiet, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "ERROR STOP");
+            validate_stop_quiet(ctx, quiet.as_ref());
         }
 
         // ---- GOTO / labels ----
@@ -12743,6 +12779,61 @@ end program
         assert!(errs
             .iter()
             .any(|e| e.contains("ERROR STOP") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn stop_quiet_requires_f2018() {
+        let errs = errors_with_std(
+            "\
+program test
+  implicit none
+  stop, quiet=.true.
+end program
+",
+            FortranStandard::F2008,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("QUIET=") && e.contains("F2018")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn stop_quiet_requires_a_scalar_logical_expression() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: wrong_type
+  logical :: wrong_rank(2)
+  stop, quiet=wrong_type
+  error stop, quiet=wrong_rank
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.contains("QUIET=") && e.contains("scalar LOGICAL"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn stop_quiet_accepts_a_scalar_logical_expression() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  logical :: enabled
+  enabled = .true.
+  error stop 'boom', quiet=(enabled .and. .true.)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]

@@ -3729,9 +3729,12 @@ pub(super) fn collect_host_refs_stmt(
         Stmt::Return { value: Some(e) } | Stmt::ComputedGoto { selector: e, .. } => {
             collect_host_refs_expr(e, host_names, sub_locals, refs);
         }
-        Stmt::Stop { code: Some(e), .. }
-        | Stmt::ErrorStop { code: Some(e), .. }
-        | Stmt::ArithmeticIf { expr: e, .. } => {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
+            for e in code.iter().chain(quiet.iter()) {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::ArithmeticIf { expr: e, .. } => {
             collect_host_refs_expr(e, host_names, sub_locals, refs);
         }
         Stmt::PointerAssignment { target, value } => {
@@ -4099,8 +4102,10 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         Stmt::Return { value: Some(e) }
         | Stmt::ComputedGoto { selector: e, .. }
         | Stmt::ArithmeticIf { expr: e, .. } => collect_name_refs_expr(e, out),
-        Stmt::Stop { code: Some(e), .. } | Stmt::ErrorStop { code: Some(e), .. } => {
-            collect_name_refs_expr(e, out);
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
+            for e in code.iter().chain(quiet.iter()) {
+                collect_name_refs_expr(e, out);
+            }
         }
         Stmt::Labeled { stmt, .. } => collect_name_refs_stmt(stmt, out),
         Stmt::SelectCase {
@@ -4240,8 +4245,6 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         }
         Stmt::Declaration(decl) => collect_name_refs_decls(std::slice::from_ref(decl), out),
         Stmt::Return { value: None }
-        | Stmt::Stop { code: None, .. }
-        | Stmt::ErrorStop { code: None, .. }
         | Stmt::Exit { .. }
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
@@ -7821,8 +7824,8 @@ pub(super) fn check_filtered_in_stmt(
         }
 
         // ---- Branch / transfer ----
-        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } => {
-            if let Some(e) = code {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
+            for e in code.iter().chain(quiet.iter()) {
                 check_filtered_in_expr(e, filtered);
             }
         }

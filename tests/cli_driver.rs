@@ -4202,6 +4202,73 @@ fn stop_with_integer_code_exits_with_that_status() {
 }
 
 #[test]
+fn stop_quiet_expression_controls_diagnostics_and_is_evaluated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stop_quiet_expression_controls_diagnostics_and_is_evaluated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=1) :: mode\n  logical :: host_quiet\n  call get_command_argument(1, mode)\n  host_quiet = mode /= 'l'\n  select case (mode)\n  case ('z')\n    stop, quiet=quiet_probe()\n  case ('s')\n    stop 'stop-visible', quiet=quiet_probe()\n  case ('i')\n    stop 7, quiet=quiet_probe()\n  case ('e')\n    error stop 'error-visible', quiet=quiet_probe()\n  case ('r')\n    error stop 13, quiet=quiet_probe()\n  case ('n')\n    error stop, quiet=quiet_probe()\n  case ('l')\n    error stop 'error-visible', quiet=quiet_probe()\n  case default\n    error stop 99\n  end select\ncontains\n  logical function quiet_probe()\n    print '(a)', 'quiet-evaluated'\n    quiet_probe = host_quiet\n  end function quiet_probe\nend program\n",
+        "stop_quiet_expr.f90",
+    );
+    let out = unique_path("stop_quiet_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("STOP QUIET expression compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "STOP QUIET expression compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    for (mode, expected_status, expect_banner) in [
+        ("z", 0, false),
+        ("s", 0, false),
+        ("i", 7, false),
+        ("e", 1, false),
+        ("r", 13, false),
+        ("n", 1, false),
+        ("l", 1, true),
+    ] {
+        let run = Command::new(&out)
+            .arg(mode)
+            .output()
+            .expect("STOP QUIET expression run failed");
+        assert_eq!(
+            run.status.code(),
+            Some(expected_status),
+            "mode={mode}: status={:?}, stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("quiet-evaluated"),
+            "mode={mode}: QUIET expression was not evaluated; stdout={}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        if expect_banner {
+            assert!(
+                stderr.contains("error-visible"),
+                "mode={mode}: missing STOP diagnostic: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.is_empty(),
+                "mode={mode}: QUIET=.TRUE. emitted a STOP diagnostic: {stderr}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn error_stop_with_allocatable_character_message_prints_user_text() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

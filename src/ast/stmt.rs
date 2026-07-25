@@ -141,11 +141,11 @@ pub enum Stmt {
     },
     Stop {
         code: Option<SpannedExpr>,
-        quiet: bool,
+        quiet: Option<SpannedExpr>,
     },
     ErrorStop {
         code: Option<SpannedExpr>,
-        quiet: bool,
+        quiet: Option<SpannedExpr>,
     },
     Return {
         value: Option<SpannedExpr>,
