@@ -1585,9 +1585,19 @@ impl Preprocessor {
                 if let Some(def) = self.defines.get(ident) {
                     let invocation = line.origin_at(start);
                     if def.is_function {
-                        if i < bytes.len() && bytes[i] == b'(' {
+                        let mut paren_start = i;
+                        while paren_start < bytes.len() && bytes[paren_start].is_ascii_whitespace()
+                        {
+                            paren_start += 1;
+                        }
+                        if paren_start < bytes.len() && bytes[paren_start] == b'(' {
                             if let Some((expanded, new_i)) = self.expand_mapped_function_macro(
-                                def, line, i, invocation, expanding, context,
+                                def,
+                                line,
+                                paren_start,
+                                invocation,
+                                expanding,
+                                context,
                             ) {
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
@@ -2557,10 +2567,20 @@ mod tests {
     }
 
     #[test]
+    fn function_macro_expands_after_preprocessing_whitespace() {
+        let out = pp("#define DOUBLE(x) ((x) * 2)\ny = DOUBLE \t (21)\n");
+        assert!(
+            out.contains("y = ((21) * 2)"),
+            "spaced function-like invocation remained unexpanded: {out:?}"
+        );
+    }
+
+    #[test]
     fn function_macro_no_parens_not_expanded() {
-        let out = pp("#define FOO(x) (x+1)\ny = FOO\n");
-        // No parens after FOO — should not expand.
-        assert!(out.contains("y = FOO"));
+        let out = pp("#define FOO(x) (x+1)\ny = FOO \t + 2\n");
+        // No invocation parens after the preprocessing whitespace: preserve
+        // both the identifier and the intervening bytes.
+        assert!(out.contains("y = FOO \t + 2"), "got: {out:?}");
     }
 
     #[test]
@@ -2987,12 +3007,12 @@ end program
             filename: "macro-arg.f90".into(),
             ..PreprocConfig::default()
         };
-        let result = preprocess("#define ID(x) x\nv = ID(   @ )\n", &config).unwrap();
+        let result = preprocess("#define ID(x) x\nv = ID \t (   @ )\n", &config).unwrap();
         let generated_col = result.text.lines().nth(1).unwrap().find('@').unwrap() as u32 + 1;
         let resolved = result.resolve_span(diagnostic_span(2, generated_col));
 
-        assert_eq!(resolved.display_span.start, Position { line: 2, col: 11 });
-        assert_eq!(resolved.source_span.start, Position { line: 2, col: 11 });
+        assert_eq!(resolved.display_span.start, Position { line: 2, col: 14 });
+        assert_eq!(resolved.source_span.start, Position { line: 2, col: 14 });
     }
 
     #[test]
@@ -3275,6 +3295,16 @@ end program
         assert!(
             lines(&out).contains(&"yes"),
             "function macro in #if failed, got: {:?}",
+            lines(&out)
+        );
+    }
+
+    #[test]
+    fn if_function_macro_expands_after_preprocessing_whitespace() {
+        let out = pp("#define INC(x) ((x) + 1)\n#if INC \t (41) > 41\nyes\n#endif\n");
+        assert!(
+            lines(&out).contains(&"yes"),
+            "spaced function macro in #if failed, got: {:?}",
             lines(&out)
         );
     }
