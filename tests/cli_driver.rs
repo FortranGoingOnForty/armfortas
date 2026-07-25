@@ -13887,6 +13887,134 @@ fn multi_input_dash_c_produces_one_object_per_source() {
 }
 
 #[test]
+fn multi_input_dash_c_rejects_same_stem_output_collisions() {
+    let dir = unique_dir("multi_c_same_stem");
+    write_program_in(&dir, "a.f", "      subroutine from_fixed()\n      end\n");
+    write_program_in(&dir, "a.f90", "subroutine from_free()\nend subroutine\n");
+
+    let output = dir.join("a.o");
+    let input_orders = [["a.f", "a.f90"], ["a.f90", "a.f"], ["./a.f", "./a.f90"]];
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        for inputs in input_orders {
+            for stale in [false, true] {
+                if stale {
+                    std::fs::write(&output, b"preexisting object")
+                        .expect("cannot seed stale object");
+                } else {
+                    let _ = std::fs::remove_file(&output);
+                }
+                let before = std::fs::read(&output).ok();
+                let result = Command::new(compiler("armfortas"))
+                    .current_dir(&dir)
+                    .args([optimization, "-c", inputs[0], inputs[1]])
+                    .output()
+                    .expect("colliding multi-input compile failed to spawn");
+                assert!(
+                    !result.status.success(),
+                    "same-stem multi-input -c unexpectedly succeeded for {inputs:?} at {optimization} with stale={stale}"
+                );
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let first_input = format!("'{}'", inputs[0]);
+                let second_input = format!("'{}'", inputs[1]);
+                assert!(
+                    stderr.contains(&first_input)
+                        && stderr.contains(&second_input)
+                        && stderr.contains("a.o")
+                        && stderr.contains("same output"),
+                    "collision diagnostic must name both inputs and their output:\n{stderr}"
+                );
+                assert_eq!(
+                    std::fs::read(&output).ok(),
+                    before,
+                    "collision preflight mutated the destination for {inputs:?} at {optimization} with stale={stale}"
+                );
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_input_dash_c_rejects_output_collisions_through_directory_symlinks() {
+    let dir = unique_dir("multi_c_symlink_collision");
+    let real = dir.join("real");
+    std::fs::create_dir(&real).expect("cannot create real source directory");
+    std::os::unix::fs::symlink(&real, dir.join("alias")).expect("cannot create source symlink");
+    write_program_in(&real, "a.f", "      subroutine from_fixed()\n      end\n");
+    write_program_in(&real, "a.f90", "subroutine from_free()\nend subroutine\n");
+
+    let output = real.join("a.o");
+    std::fs::write(&output, b"preexisting object").expect("cannot seed stale object");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "real/a.f", "alias/a.f90"])
+        .output()
+        .expect("symlink-colliding multi-input compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "directory aliases must not evade output collision detection"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("real/a.f")
+            && stderr.contains("alias/a.f90")
+            && stderr.contains("alias/a.o")
+            && stderr.contains("same output"),
+        "collision diagnostic must retain the user-spelled paths:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&output).expect("stale output disappeared"),
+        b"preexisting object",
+        "collision preflight mutated the aliased destination"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_dash_c_allows_same_stem_outputs_in_distinct_directories() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=multi_input_dash_c_allows_same_stem_outputs_in_distinct_directories count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("multi_c_distinct_dirs");
+    let fixed_dir = dir.join("fixed");
+    let free_dir = dir.join("free");
+    std::fs::create_dir(&fixed_dir).expect("cannot create fixed-form directory");
+    std::fs::create_dir(&free_dir).expect("cannot create free-form directory");
+    write_program_in(
+        &fixed_dir,
+        "a.f",
+        "      subroutine from_fixed()\n      end\n",
+    );
+    write_program_in(
+        &free_dir,
+        "a.f90",
+        "subroutine from_free()\nend subroutine\n",
+    );
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "fixed/a.f", "free/a.f90"])
+        .output()
+        .expect("distinct-output multi-input compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "distinct output paths were rejected:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(fixed_dir.join("a.o").exists(), "fixed/a.o was not written");
+    assert!(free_dir.join("a.o").exists(), "free/a.o was not written");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn multi_input_terminal_modes_preserve_requested_artifacts() {
     let file_modes = [
         ("-S", "s", ".text"),

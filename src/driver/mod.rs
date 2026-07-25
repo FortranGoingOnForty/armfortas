@@ -308,6 +308,54 @@ impl TerminalMode {
     }
 }
 
+fn terminal_output_collision_key(output: &Path, cwd: &Path) -> PathBuf {
+    let absolute = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        cwd.join(output)
+    };
+    let normalized = normalize_path_lexically(&absolute);
+
+    // Resolve an existing parent so equivalent spellings through a directory
+    // symlink cannot evade the preflight. The output itself may not exist yet.
+    match (normalized.parent(), normalized.file_name()) {
+        (Some(parent), Some(file_name)) => fs::canonicalize(parent)
+            .map(|parent| parent.join(file_name))
+            .unwrap_or(normalized),
+        _ => normalized,
+    }
+}
+
+fn validate_unique_terminal_outputs(
+    inputs: &[PathBuf],
+    outputs: &[Option<PathBuf>],
+) -> Result<(), String> {
+    debug_assert_eq!(inputs.len(), outputs.len());
+    if outputs.iter().all(Option::is_none) {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let mut claimed = std::collections::HashMap::<PathBuf, usize>::with_capacity(outputs.len());
+    for (index, output) in outputs.iter().enumerate() {
+        let Some(output) = output else {
+            continue;
+        };
+        let key = terminal_output_collision_key(output, &cwd);
+        if let Some(first_index) = claimed.insert(key, index) {
+            return Err(format!(
+                "multiple input files '{}' and '{}' map to the same output '{}'; \
+                 compile them separately or use distinct source basenames",
+                inputs[first_index].display(),
+                inputs[index].display(),
+                output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Compilation options.
 #[derive(Clone)]
 pub struct Options {
@@ -2856,15 +2904,22 @@ fn compile_multi_with_bundled_runtime(
         .filter(|p| classify_cli_input(p) == CliInputKind::FortranSource)
         .cloned()
         .collect();
+    let terminal_outputs = terminal_mode.map(|mode| {
+        source_inputs
+            .iter()
+            .map(|input| mode.output_for_input(input))
+            .collect::<Vec<_>>()
+    });
+    if let Some(outputs) = terminal_outputs.as_deref() {
+        validate_unique_terminal_outputs(&source_inputs, outputs)?;
+    }
+
     // A terminal multi-input job owns one default output per source. Remove
     // those destinations before scanning or compiling so a failed input can
     // never leave an older artifact looking like the result of this command.
-    if let Some(mode) = terminal_mode {
-        for output in source_inputs
-            .iter()
-            .filter_map(|input| mode.output_for_input(input))
-        {
-            match fs::remove_file(&output) {
+    if let Some(outputs) = terminal_outputs.as_deref() {
+        for output in outputs.iter().flatten() {
+            match fs::remove_file(output) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -2910,11 +2965,12 @@ fn compile_multi_with_bundled_runtime(
     let mut source_objects: Vec<Option<PathBuf>> = vec![None; source_inputs.len()];
     for &idx in &order {
         let src = &source_inputs[idx];
-        let child_output = if let Some(mode) = terminal_mode {
-            mode.output_for_input(src)
-        } else {
-            let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-            Some(tmp_dir.join(format!("source_{}.o", idx)))
+        let child_output = match terminal_outputs.as_ref() {
+            Some(outputs) => outputs[idx].clone(),
+            None => {
+                let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
+                Some(tmp_dir.join(format!("source_{}.o", idx)))
+            }
         };
 
         // Preserve every compilation-affecting option. Only orchestration and
