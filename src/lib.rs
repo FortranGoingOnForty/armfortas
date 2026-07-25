@@ -133,11 +133,11 @@ fn cli_entry_impl(bundled_runtime: Option<&'static [u8]>) -> ! {
 }
 
 fn emit_cli_warnings(program_name: &str, opts: &driver::Options) -> bool {
-    if opts.cli_warnings.is_empty() {
+    if !opts.warnings_enabled() || opts.cli_warnings.is_empty() {
         return false;
     }
 
-    let label = if opts.warn_as_error {
+    let label = if opts.warnings_are_errors() {
         "error"
     } else {
         "warning"
@@ -145,7 +145,7 @@ fn emit_cli_warnings(program_name: &str, opts: &driver::Options) -> bool {
     for warning in &opts.cli_warnings {
         eprintln!("{}: {}: {}", program_name, label, warning);
     }
-    opts.warn_as_error
+    opts.warnings_are_errors()
 }
 
 /// Map a compile error message to the appropriate exit code.  Today

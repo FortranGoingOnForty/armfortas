@@ -17672,6 +17672,161 @@ fn wdeprecated_warns_on_common_block() {
 }
 
 #[test]
+fn specific_warning_suppressions_control_semantic_diagnostics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=specific_warning_suppressions_control_semantic_diagnostics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for (group, source, expected_warning) in [
+        (
+            "pedantic",
+            "program p\n  integer :: i\n  i = 0\n  if (i) 10, 20, 30\n10 continue\n20 continue\n30 continue\nend program\n",
+            "arithmetic IF is an obsolescent feature",
+        ),
+        (
+            "deprecated",
+            "program p\n  integer :: x\n  common /blk/ x\nend program\n",
+            "COMMON block is an obsolescent feature",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+            let suppressed_out =
+                unique_path(&format!("wno_{group}_{}", &optimization[2..]), "o");
+            let suppressed = Command::new(compiler("armfortas"))
+                .args(["-c", optimization])
+                .arg(format!("-W{group}"))
+                .arg(format!("-Wno-{group}"))
+                .arg("-Werror")
+                .arg(&src)
+                .arg("-o")
+                .arg(&suppressed_out)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("suppressed warning compile failed to spawn");
+            assert!(
+                suppressed.status.success(),
+                "-Wno-{group} must suppress -W{group} under -Werror at {optimization}: {}",
+                String::from_utf8_lossy(&suppressed.stderr)
+            );
+            assert!(
+                !String::from_utf8_lossy(&suppressed.stderr).contains(expected_warning),
+                "-Wno-{group} leaked its semantic warning at {optimization}: {}",
+                String::from_utf8_lossy(&suppressed.stderr)
+            );
+            assert!(
+                suppressed_out.is_file(),
+                "suppressed {group} warning did not publish its object at {optimization}"
+            );
+            let _ = std::fs::remove_file(&suppressed_out);
+        }
+
+        let enabled_out = unique_path(&format!("wno_{group}_reenabled"), "o");
+        let enabled = Command::new(compiler("armfortas"))
+            .arg("-c")
+            .arg(format!("-Wno-{group}"))
+            .arg(format!("-W{group}"))
+            .arg(&src)
+            .arg("-o")
+            .arg(&enabled_out)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("re-enabled warning compile failed to spawn");
+        assert!(
+            enabled.status.success(),
+            "re-enabled {group} warning compile failed: {}",
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&enabled.stderr).contains(expected_warning),
+            "the last same-specificity warning option must win: {}",
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&enabled_out);
+    }
+}
+
+#[test]
+fn lowercase_w_suppresses_warnings_but_not_errors() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=lowercase_w_suppresses_warnings_but_not_errors count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let warning_source = format!(
+        "program p\n!{}\n  integer :: i\n  integer, allocatable :: x\n  character(32) :: msg\n  i = 0\n  allocate(x, errmsg=msg)\n  deallocate(x, errmsg=msg)\n  if (i) 10, 20, 30\n10 continue\n20 continue\n30 continue\nend program\n",
+        "x".repeat(140)
+    );
+    let warning_src = write_program(&warning_source, "f90");
+    for (label, warning_args) in [
+        (
+            "first",
+            ["--std=f2018", "-w", "-Wpedantic", "-Wall", "-Werror"],
+        ),
+        (
+            "last",
+            ["--std=f2018", "-Wpedantic", "-Wall", "-Werror", "-w"],
+        ),
+    ] {
+        let out = unique_path(&format!("lowercase_w_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .arg("-c")
+            .args(warning_args)
+            .arg(&warning_src)
+            .arg("-o")
+            .arg(&out)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("-w warning suppression compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "-w must suppress semantic and CLI warnings regardless of position: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.stderr.is_empty(),
+            "-w must keep stderr warning-clean, got: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(out.is_file(), "-w compile did not publish its object");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    let error_src = write_program(
+        "program p\n  integer :: i\n  i = 'not an integer'\nend program\n",
+        "f90",
+    );
+    let error_out = unique_path("lowercase_w_error", "o");
+    let error = Command::new(compiler("armfortas"))
+        .args(["-c", "-w"])
+        .arg(&error_src)
+        .arg("-o")
+        .arg(&error_out)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("-w error preservation compile failed to spawn");
+    assert!(!error.status.success(), "-w suppressed a semantic error");
+    assert!(
+        String::from_utf8_lossy(&error.stderr).contains("error:"),
+        "-w lost the semantic error diagnostic: {}",
+        String::from_utf8_lossy(&error.stderr)
+    );
+    assert!(!error_out.exists(), "failed -w compile published an object");
+
+    let _ = std::fs::remove_file(&warning_src);
+    let _ = std::fs::remove_file(&error_src);
+}
+
+#[test]
 fn unknown_warning_flag_can_be_suppressed() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

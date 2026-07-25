@@ -411,6 +411,7 @@ pub struct Options {
     pub warn_pedantic: bool,
     pub warn_deprecated: bool,
     pub warn_as_error: bool,
+    pub suppress_warnings: bool, // -w
     pub werror_implicit_interface_compat: bool,
     pub disabled_warnings: Vec<String>,
     pub cli_warnings: Vec<String>,
@@ -501,6 +502,7 @@ impl Default for Options {
             warn_pedantic: false,
             warn_deprecated: false,
             warn_as_error: false,
+            suppress_warnings: false,
             werror_implicit_interface_compat: false,
             disabled_warnings: Vec::new(),
             cli_warnings: Vec::new(),
@@ -561,6 +563,14 @@ impl Options {
         } else {
             PathBuf::from(stem)
         }
+    }
+
+    pub(crate) fn warnings_enabled(&self) -> bool {
+        !self.suppress_warnings
+    }
+
+    pub(crate) fn warnings_are_errors(&self) -> bool {
+        self.warnings_enabled() && self.warn_as_error
     }
 }
 
@@ -839,23 +849,23 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-fbacktrace" => opts.backtrace_requested = true,
 
             // ---- Warnings (accepted; gating is gradual sprint work) ----
-            "-Wall" => opts.warn_all = true,
-            "-Wextra" => opts.warn_extra = true,
-            "-Wpedantic" | "-pedantic" => opts.warn_pedantic = true,
-            "-Wdeprecated" => opts.warn_deprecated = true,
-            "-Werror" => opts.warn_as_error = true,
+            "-Wall" => set_warning_option(&mut opts, "all", true),
+            "-Wextra" => set_warning_option(&mut opts, "extra", true),
+            "-Wpedantic" | "-pedantic" => set_warning_option(&mut opts, "pedantic", true),
+            "-Wdeprecated" => set_warning_option(&mut opts, "deprecated", true),
+            "-Werror" => set_warning_option(&mut opts, "error", true),
             "-Werror=implicit-interface" => opts.werror_implicit_interface_compat = true,
             arg if arg.starts_with("-Werror=") => {
-                opts.warn_as_error = true;
+                set_warning_option(&mut opts, "error", true);
                 unknown_warning_flags.push(arg.to_string());
             }
             arg if arg.starts_with("-Wno-") => {
-                opts.disabled_warnings.push(arg[5..].to_string());
+                set_warning_option(&mut opts, &arg[5..], false);
             }
             arg if arg.starts_with("-W") => {
                 unknown_warning_flags.push(arg.to_string());
             }
-            "-w" => {}
+            "-w" => opts.suppress_warnings = true,
 
             // ---- Make-style dependency-file compatibility ----
             "-MD" | "-MMD" => opts.emit_depfile = true,
@@ -1141,7 +1151,35 @@ fn parse_free_line_length(value: &str) -> Result<usize, String> {
     Ok(limit)
 }
 
+fn set_warning_option(opts: &mut Options, name: &str, enabled: bool) {
+    if enabled {
+        opts.disabled_warnings.retain(|disabled| disabled != name);
+    } else if !opts
+        .disabled_warnings
+        .iter()
+        .any(|disabled| disabled == name)
+    {
+        opts.disabled_warnings.push(name.to_string());
+    }
+
+    let destination = match name {
+        "all" => Some(&mut opts.warn_all),
+        "extra" => Some(&mut opts.warn_extra),
+        "pedantic" => Some(&mut opts.warn_pedantic),
+        "deprecated" => Some(&mut opts.warn_deprecated),
+        "error" => Some(&mut opts.warn_as_error),
+        _ => None,
+    };
+    if let Some(destination) = destination {
+        *destination = enabled;
+    }
+}
+
 fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
+    if !opts.warnings_enabled() {
+        return;
+    }
+
     if opts.cpp_compat {
         opts.cli_warnings.push(
             "-cpp is accepted for compatibility; preprocessing already runs for Fortran inputs"
@@ -1302,6 +1340,7 @@ WARNINGS:
   -Wpedantic                  Pedantic standard conformance warnings
   -Wdeprecated                Deprecated feature warnings
   -Werror                     Treat warnings as errors
+  -w                          Suppress all warnings
   -Werror=implicit-interface  Accept GNU-style implicit-interface diagnostic flag
   -Wno-<name>                 Disable specific warning
 
@@ -1860,7 +1899,7 @@ fn compile_with_bundled_runtime_inner(
     // source, before either continuation joiner runs. Explicit-std
     // runs only — the default std is permissive (gfortran's -std=gnu
     // model); a default build's stderr stays pristine.
-    if let (true, Some(std)) = (opts.std_explicit, opts.std) {
+    if let (true, true, Some(std)) = (opts.warnings_enabled(), opts.std_explicit, opts.std) {
         for w in conformance::check_source_limits(
             &source,
             std,
@@ -2033,12 +2072,15 @@ fn compile_with_bundled_runtime_inner(
         &st,
         opts.std,
         &type_layouts,
-        opts.warn_pedantic,
-        opts.warn_deprecated,
+        opts.warnings_enabled() && opts.warn_pedantic,
+        opts.warnings_enabled() && opts.warn_deprecated,
     );
     phase.end(&mut phases);
     let mut had_error = false;
     for d in &diags {
+        if d.kind == validate::DiagKind::Warning && !opts.warnings_enabled() {
+            continue;
+        }
         let level = match d.kind {
             validate::DiagKind::Error => diag::Level::Error,
             validate::DiagKind::Warning => diag::Level::Warning,
@@ -2046,7 +2088,7 @@ fn compile_with_bundled_runtime_inner(
         render_preprocessed_diagnostic(&pp_result, d.span, level, &d.msg);
         match d.kind {
             validate::DiagKind::Error => had_error = true,
-            validate::DiagKind::Warning if opts.warn_as_error => had_error = true,
+            validate::DiagKind::Warning if opts.warnings_are_errors() => had_error = true,
             _ => {}
         }
     }
@@ -3694,6 +3736,62 @@ mod tests {
             "expected unknown warning option diagnostic, got {:?}",
             opts.cli_warnings
         );
+    }
+
+    #[test]
+    fn parse_cli_warning_controls_honor_last_option_and_global_suppression() {
+        let disabled_last = vec![
+            "-Wall".to_string(),
+            "-Werror".to_string(),
+            "-Wno-all".to_string(),
+            "-Wno-error".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&disabled_last).expect("driver should parse warning suppressions")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(!opts.warn_all);
+        assert!(!opts.warn_as_error);
+        assert!(opts.cli_warnings.is_empty());
+
+        let enabled_last = vec![
+            "-Wno-all".to_string(),
+            "-Wno-error".to_string(),
+            "-Wall".to_string(),
+            "-Werror".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&enabled_last).expect("driver should re-enable warning controls")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(opts.warn_all);
+        assert!(opts.warn_as_error);
+        assert_eq!(opts.cli_warnings.len(), 1);
+
+        for args in [
+            vec![
+                "-w".to_string(),
+                "-Wall".to_string(),
+                "hello.f90".to_string(),
+            ],
+            vec![
+                "-Wall".to_string(),
+                "-w".to_string(),
+                "hello.f90".to_string(),
+            ],
+        ] {
+            let ParsedCli::Compile(opts) =
+                parse_cli(&args).expect("driver should parse global warning suppression")
+            else {
+                panic!("expected compile options");
+            };
+            assert!(opts.suppress_warnings);
+            assert!(opts.cli_warnings.is_empty());
+        }
     }
 
     #[test]
