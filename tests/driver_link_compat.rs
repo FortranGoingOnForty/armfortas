@@ -243,6 +243,373 @@ fn gnu_depfile_flags_write_make_dependency_file() {
 }
 
 #[test]
+fn compile_and_link_publishes_dependency_file_after_success() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=compile_and_link_publishes_dependency_file_after_success count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("linked_depfile");
+    let include = write_program_in(&dir, "answer.inc", "integer, parameter :: answer = 42\n");
+    let src = write_program_in(
+        &dir,
+        "main.F90",
+        "program p\n#include \"answer.inc\"\n  print *, answer\nend program\n",
+    );
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let output = dir.join(format!("app-{}", &optimization[2..]));
+        let depfile = output.with_extension("d");
+        std::fs::write(&depfile, "stale dependency output\n")
+            .expect("cannot seed stale dependency file");
+
+        let result = Command::new(compiler("armfortas"))
+            .arg(optimization)
+            .args(["-MD", "-MP", "-MF"])
+            .arg(&depfile)
+            .arg(&src)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("compile-and-link spawn failed");
+        assert!(
+            result.status.success(),
+            "compile-and-link failed at {optimization}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(output.is_file(), "linked executable was not published");
+
+        let deps = std::fs::read_to_string(&depfile).expect("missing linked dependency file");
+        assert!(
+            deps.starts_with(&format!("{}: ", output.display())),
+            "default dependency target must be the final executable at {optimization}:\n{deps}"
+        );
+        for prerequisite in [&src, &include] {
+            assert!(
+                deps.contains(prerequisite.to_str().unwrap()),
+                "linked dependency file omitted {} at {optimization}:\n{deps}",
+                prerequisite.display()
+            );
+        }
+        assert!(
+            deps.contains(&format!("\n{}:\n", include.display())),
+            "-MP omitted the include phony rule at {optimization}:\n{deps}"
+        );
+        assert!(
+            !deps.contains("stale dependency output"),
+            "stale dependency text survived at {optimization}"
+        );
+
+        let run = Command::new(&output)
+            .output()
+            .expect("linked dependency witness failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("42"),
+            "linked dependency witness produced the wrong result at {optimization}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_source_link_publishes_one_combined_dependency_file() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=multi_source_link_publishes_one_combined_dependency_file count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("multi_link_depfile");
+    let include = write_program_in(&dir, "answer.inc", "integer, parameter :: value = 42\n");
+    let provider = write_program_in(
+        &dir,
+        "provider.F90",
+        "module values\n#include \"answer.inc\"\ncontains\n  integer function answer()\n    answer = value\n  end function\nend module\n",
+    );
+    let main = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use values\n  print *, answer()\nend program\n",
+    );
+
+    for explicit_depfile in [false, true] {
+        let stem = if explicit_depfile {
+            "explicit"
+        } else {
+            "default"
+        };
+        let output = dir.join(stem);
+        let depfile = if explicit_depfile {
+            dir.join("deps").join("combined.d")
+        } else {
+            output.with_extension("d")
+        };
+        if let Some(parent) = depfile.parent() {
+            std::fs::create_dir_all(parent).expect("cannot create depfile parent");
+        }
+        std::fs::write(&depfile, "stale dependency output\n")
+            .expect("cannot seed stale dependency file");
+
+        let mut command = Command::new(compiler("armfortas"));
+        command.args(["-MD", "-MP"]);
+        if explicit_depfile {
+            command
+                .arg("-MF")
+                .arg(&depfile)
+                .arg("-MT")
+                .arg("combined_target");
+        }
+        let result = command
+            // Deliberately put the consumer first. Compilation must reorder
+            // for the module edge, while dependency text stays in CLI order.
+            .arg(&main)
+            .arg(&provider)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("multi-source compile-and-link spawn failed");
+        assert!(
+            result.status.success(),
+            "multi-source compile-and-link failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let deps = std::fs::read_to_string(&depfile).expect("missing combined dependency file");
+        assert_eq!(
+            deps,
+            format!(
+                "{}: {} {} {}\n\n{}:\n",
+                if explicit_depfile {
+                    "combined_target".to_string()
+                } else {
+                    output.display().to_string()
+                },
+                main.display(),
+                provider.display(),
+                include.display(),
+                include.display()
+            ),
+            "outer dependency ownership must use final paths and CLI source order"
+        );
+        assert!(
+            !deps.contains("afs_multi_") && !deps.contains("source_0.o"),
+            "temporary child paths escaped into the dependency file:\n{deps}"
+        );
+
+        let run = Command::new(&output)
+            .output()
+            .expect("multi-source dependency witness failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("42"),
+            "multi-source dependency witness produced the wrong result: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn failed_link_removes_stale_dependency_file() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=failed_link_removes_stale_dependency_file count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("failed_link_depfile");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  call missing_external()\nend program\n",
+    );
+    let output = dir.join("app");
+    let depfile = dir.join("app.d");
+    std::fs::write(&depfile, "stale dependency output\n")
+        .expect("cannot seed stale dependency file");
+
+    let result = Command::new(compiler("armfortas"))
+        .args(["-MD", "-MF"])
+        .arg(&depfile)
+        .arg(&src)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("failing compile-and-link spawn failed");
+    assert!(!result.status.success(), "undefined symbol link succeeded");
+    assert!(
+        !depfile.exists(),
+        "failed link left a stale dependency file"
+    );
+    assert!(!output.exists(), "failed link left a stale executable");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn failed_dependency_publication_removes_fresh_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=failed_dependency_publication_removes_fresh_executable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("failed_depfile_publication");
+    let src = write_program_in(&dir, "main.f90", "program p\n  print *, 42\nend program\n");
+    let output = dir.join("app");
+    let blocked_parent = dir.join("not-a-directory");
+    let depfile = blocked_parent.join("app.d");
+    std::fs::create_dir(&blocked_parent).expect("cannot create initial depfile directory");
+    let linker = write_program_in(
+        &dir,
+        "linker.sh",
+        "#!/bin/sh\n\
+         output=\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           if [ \"$1\" = \"-o\" ]; then\n\
+             shift\n\
+             output=$1\n\
+           fi\n\
+           shift\n\
+         done\n\
+         [ -n \"$output\" ] || exit 90\n\
+         printf 'fresh linked output\\n' > \"$output\" || exit 91\n\
+         rmdir \"$DEPFILE_PARENT_TO_BLOCK\" || exit 92\n\
+         printf 'preserve this blocker\\n' > \"$DEPFILE_PARENT_TO_BLOCK\" || exit 93\n",
+    );
+    std::fs::set_permissions(&linker, std::fs::Permissions::from_mode(0o755))
+        .expect("cannot make fake linker executable");
+
+    let result = Command::new(compiler("armfortas"))
+        .env("AFS_LD_PATH", &linker)
+        .env("DEPFILE_PARENT_TO_BLOCK", &blocked_parent)
+        .args(["-MD", "-MF"])
+        .arg(&depfile)
+        .arg(&src)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("depfile publication failure probe failed to spawn");
+    assert!(
+        !result.status.success(),
+        "compile-and-link succeeded without publishing its requested depfile"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("cannot create depfile directory"),
+        "missing depfile publication diagnostic: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !output.exists(),
+        "failed dependency publication left a fresh executable"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&blocked_parent).expect("depfile parent blocker disappeared"),
+        "preserve this blocker\n",
+        "dependency failure mutated its blocking destination"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn linked_dependency_file_cannot_alias_the_executable() {
+    let dir = unique_dir("linked_depfile_alias");
+    let src = write_program_in(&dir, "main.f90", "program p\n  print *, 42\nend program\n");
+    let output = dir.join("app");
+    let original = b"preexisting executable";
+    std::fs::write(&output, original).expect("cannot seed existing output");
+
+    let result = Command::new(compiler("armfortas"))
+        .args(["-MD", "-MF"])
+        .arg(&output)
+        .arg(&src)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("depfile/output alias probe failed to spawn");
+    assert!(
+        !result.status.success(),
+        "dependency file aliasing the executable was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("conflicts with output"),
+        "missing depfile/output conflict diagnostic: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&output).expect("preexisting output disappeared"),
+        original,
+        "destination conflict mutated the preexisting output"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn linked_dependency_file_cannot_alias_compiler_inputs() {
+    let dir = unique_dir("linked_depfile_input_alias");
+    let include_text = "integer, parameter :: answer = 42\n";
+    let source_text = "program p\n#include \"answer.inc\"\n  print *, answer\nend program\n";
+    let include = write_program_in(&dir, "answer.inc", include_text);
+    let src = write_program_in(&dir, "main.F90", source_text);
+
+    for (name, depfile) in [("source", &src), ("include", &include)] {
+        let output = dir.join(format!("app-{name}"));
+        let result = Command::new(compiler("armfortas"))
+            .args(["-MD", "-MF"])
+            .arg(depfile)
+            .arg(&src)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("depfile/input alias probe failed to spawn");
+        assert!(
+            !result.status.success(),
+            "dependency file aliasing the {name} input was accepted"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("conflicts with compiler input"),
+            "missing depfile/{name} conflict diagnostic: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            !output.exists(),
+            "depfile/{name} conflict published an executable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).expect("source input disappeared"),
+            source_text,
+            "depfile/{name} conflict mutated the source input"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&include).expect("include input disappeared"),
+            include_text,
+            "depfile/{name} conflict mutated the include input"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn depfile_distinguishes_mt_from_mq_and_quotes_dollar_paths() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

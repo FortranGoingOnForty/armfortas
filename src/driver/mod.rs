@@ -1787,6 +1787,27 @@ fn compile_with_bundled_runtime(
     opts: &Options,
     bundled_runtime: Option<&'static [u8]>,
 ) -> Result<(), String> {
+    compile_with_bundled_runtime_inner(opts, bundled_runtime, None)
+}
+
+fn compile_with_bundled_runtime_and_dependencies(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut dependencies = Vec::new();
+    compile_with_bundled_runtime_inner(opts, bundled_runtime, Some(&mut dependencies))?;
+    Ok(dependencies)
+}
+
+fn compile_with_bundled_runtime_inner(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+    dependency_output: Option<&mut Vec<PathBuf>>,
+) -> Result<(), String> {
+    if TerminalMode::from_options(opts).is_none() {
+        validate_dependency_file_destination(opts, &opts.output_path(), &[])?;
+    }
+
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
         eprintln!("{}", version_string());
@@ -1878,7 +1899,13 @@ fn compile_with_bundled_runtime(
     let pp_result =
         crate::preprocess::preprocess_bytes(&raw, &pp_config).map_err(|e| format!("{}", e))?;
     phase.end(&mut phases);
+    if let Some(dependencies) = dependency_output {
+        dependencies.clone_from(&pp_result.included_files);
+    }
     let included_files = &pp_result.included_files;
+    if TerminalMode::from_options(opts).is_none() {
+        prepare_dependency_file(opts, &opts.output_path(), included_files)?;
+    }
     let preprocessed = pp_result.text.as_str();
 
     if opts.preprocess_only {
@@ -2397,6 +2424,12 @@ fn compile_with_bundled_runtime(
         if opts.verbose {
             eprintln!(" linked: {}", binary_path.display());
         }
+        write_link_dependency_file(
+            opts,
+            &binary_path,
+            std::slice::from_ref(&opts.input),
+            included_files,
+        )?;
         phases.report();
         return Ok(());
     }
@@ -2446,6 +2479,12 @@ fn compile_with_bundled_runtime(
     if opts.verbose {
         eprintln!(" linked: {}", binary_path.display());
     }
+    write_link_dependency_file(
+        opts,
+        &binary_path,
+        std::slice::from_ref(&opts.input),
+        included_files,
+    )?;
 
     phases.report();
     Ok(())
@@ -2473,20 +2512,89 @@ fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn dependency_file_path(opts: &Options, output: &Path) -> Option<PathBuf> {
+    if !opts.emit_depfile && opts.depfile.is_none() {
+        return None;
+    }
+    Some(opts.depfile.clone().unwrap_or_else(|| {
+        let mut path = output.to_path_buf();
+        path.set_extension("d");
+        path
+    }))
+}
+
+fn validate_dependency_file_destination(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let Some(depfile) = dependency_file_path(opts, output) else {
+        return Ok(());
+    };
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let depfile_key = terminal_output_collision_key(&depfile, &cwd);
+    if depfile_key == terminal_output_collision_key(output, &cwd) {
+        return Err(format!(
+            "dependency file '{}' conflicts with output '{}'",
+            depfile.display(),
+            output.display()
+        ));
+    }
+    for input in all_input_paths(opts).iter().chain(included_files) {
+        if depfile_key == terminal_output_collision_key(input, &cwd) {
+            return Err(format!(
+                "dependency file '{}' conflicts with compiler input '{}'",
+                depfile.display(),
+                input.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_dependency_file(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let Some(depfile) = dependency_file_path(opts, output) else {
+        return Ok(());
+    };
+    validate_dependency_file_destination(opts, output, included_files)?;
+    match fs::remove_file(&depfile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove stale dependency file '{}': {error}",
+            depfile.display()
+        )),
+    }
+}
+
 fn write_dependency_file(
     opts: &Options,
     output: &Path,
     included_files: &[PathBuf],
 ) -> Result<(), String> {
-    if !opts.emit_depfile && opts.depfile.is_none() {
-        return Ok(());
-    }
+    write_dependency_file_for_sources(
+        opts,
+        output,
+        std::slice::from_ref(&opts.input),
+        included_files,
+    )
+}
 
-    let depfile = opts.depfile.clone().unwrap_or_else(|| {
-        let mut path = output.to_path_buf();
-        path.set_extension("d");
-        path
-    });
+fn write_dependency_file_for_sources(
+    opts: &Options,
+    output: &Path,
+    source_inputs: &[PathBuf],
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let Some(depfile) = dependency_file_path(opts, output) else {
+        return Ok(());
+    };
+    validate_dependency_file_destination(opts, output, included_files)?;
     if let Some(parent) = depfile.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -2514,7 +2622,12 @@ fn write_dependency_file(
         }
     }
     body.push_str(": ");
-    body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+    for (index, input) in source_inputs.iter().enumerate() {
+        if index > 0 {
+            body.push(' ');
+        }
+        body.push_str(&escape_make_dep_token(&input.to_string_lossy()));
+    }
     for include in included_files {
         body.push(' ');
         body.push_str(&escape_make_dep_token(&include.to_string_lossy()));
@@ -2528,8 +2641,54 @@ fn write_dependency_file(
         }
     }
 
-    fs::write(&depfile, body)
-        .map_err(|e| format!("cannot write depfile '{}': {}", depfile.display(), e))
+    write_dependency_file_atomic(&depfile, &body)
+}
+
+fn write_dependency_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dependencies");
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), id));
+    let _cleanup = RemoveFileOnDrop(temporary.clone());
+
+    fs::write(&temporary, contents).map_err(|error| {
+        format!(
+            "cannot write temporary dependency file '{}': {error}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "cannot replace dependency file '{}' atomically: {error}",
+            path.display()
+        )
+    })
+}
+
+fn write_link_dependency_file(
+    opts: &Options,
+    output: &Path,
+    source_inputs: &[PathBuf],
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    if let Err(error) =
+        write_dependency_file_for_sources(opts, output, source_inputs, included_files)
+    {
+        return match fs::remove_file(output) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error)
+            }
+            Err(cleanup_error) => Err(format!(
+                "{error}; additionally cannot remove failed link output '{}': {cleanup_error}",
+                output.display()
+            )),
+        };
+    }
+    Ok(())
 }
 
 fn escape_make_dep_token(token: &str) -> String {
@@ -2894,6 +3053,18 @@ fn compile_multi_with_bundled_runtime(
             mode.flag()
         ));
     }
+    let link_output = terminal_mode.is_none().then(|| {
+        opts.output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("a.out"))
+    });
+    let collect_link_dependencies = link_output
+        .as_deref()
+        .and_then(|output| dependency_file_path(opts, output))
+        .is_some();
+    if let Some(output) = link_output.as_deref() {
+        validate_dependency_file_destination(opts, output, &[])?;
+    }
 
     // Partition into Fortran sources (to compile) and prebuilt link
     // artifacts (objects/archives to pass straight to the linker). gfortran
@@ -2963,6 +3134,8 @@ fn compile_multi_with_bundled_runtime(
     // in command-line order. Keep each generated object in the slot belonging
     // to its source rather than appending in compilation order.
     let mut source_objects: Vec<Option<PathBuf>> = vec![None; source_inputs.len()];
+    let mut source_includes =
+        collect_link_dependencies.then(|| vec![Vec::new(); source_inputs.len()]);
     for &idx in &order {
         let src = &source_inputs[idx];
         let child_output = match terminal_outputs.as_ref() {
@@ -2991,7 +3164,19 @@ fn compile_multi_with_bundled_runtime(
             }
             paths
         };
-        compile_with_bundled_runtime(&sub_opts, bundled_runtime)?;
+        if let Some(source_includes) = source_includes.as_mut() {
+            // The outer link job owns one durable dependency file. Child
+            // objects are temporary implementation details and must not
+            // publish rules targeting their temporary paths.
+            sub_opts.emit_depfile = false;
+            sub_opts.depfile = None;
+            sub_opts.dep_targets.clear();
+            sub_opts.depfile_phony = false;
+            source_includes[idx] =
+                compile_with_bundled_runtime_and_dependencies(&sub_opts, bundled_runtime)?;
+        } else {
+            compile_with_bundled_runtime(&sub_opts, bundled_runtime)?;
+        }
         if terminal_mode.is_none() {
             let obj_path = child_output.expect("object path for multi-file link");
             source_objects[idx] = Some(obj_path);
@@ -3021,17 +3206,25 @@ fn compile_multi_with_bundled_runtime(
         })
         .collect();
 
+    let mut seen_includes = std::collections::HashSet::new();
+    let included_files: Vec<PathBuf> = source_includes
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|path| seen_includes.insert(path.clone()))
+        .collect();
+
     // Link all object files.
-    let output = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("a.out"));
+    let output = link_output.expect("link output for multi-file link");
+    prepare_dependency_file(opts, &output, &included_files)?;
     link_multi(&link_list, &output, opts, bundled_runtime)?;
 
     // Cleanup.
     if let Some(tmp_dir) = tmp_dir {
         let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    write_link_dependency_file(opts, &output, &source_inputs, &included_files)?;
 
     Ok(())
 }
