@@ -34,6 +34,58 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
+/// Transaction guard for an object or executable written directly by a
+/// subprocess. Preparing removes any old destination; only a verified,
+/// non-empty regular file survives the guard.
+struct PendingExternalOutput {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PendingExternalOutput {
+    fn prepare(path: &Path, tool: &str) -> Result<Self, String> {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot remove stale {tool} output '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            committed: false,
+        })
+    }
+
+    fn verify(mut self, tool: &str) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            format!(
+                "{tool} reported success but did not produce output '{}': {error}",
+                self.path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() == 0 {
+            return Err(format!(
+                "{tool} reported success but did not produce a non-empty regular output '{}'",
+                self.path.display()
+            ));
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingExternalOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Optimization level requested at the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptLevel {
@@ -2260,6 +2312,7 @@ fn compile_with_bundled_runtime(
                 phase.end(&mut phases);
             }
             Some(assembler) => {
+                let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
                 let as_result = Command::new(assembler)
                     .args(["--64", "-o"])
                     .arg(&obj_path)
@@ -2273,6 +2326,7 @@ fn compile_with_bundled_runtime(
                         String::from_utf8_lossy(&as_result.stderr)
                     ));
                 }
+                pending_output.verify("assembler")?;
             }
         }
         if opts.emit_obj {
@@ -2308,6 +2362,7 @@ fn compile_with_bundled_runtime(
         afs_as::assemble::assemble_file(&asm_path, &obj_path).map_err(|e| format!("afs-as: {}", e))
     } else {
         let assembler = assembler.unwrap_or_else(|| "as".into());
+        let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
         let result = Command::new(assembler)
             .arg(&asm_path)
             .arg("-o")
@@ -2315,7 +2370,7 @@ fn compile_with_bundled_runtime(
             .output()
             .map_err(|e| format!("cannot run assembler: {}", e))?;
         if result.status.success() {
-            Ok(())
+            pending_output.verify("assembler")
         } else {
             Err(format!(
                 "assembler failed:\n{}",
@@ -2535,6 +2590,7 @@ fn link_inputs_elf_with_bundled_runtime(
     if opts.verbose {
         print_verbose_command_line(&linker, &args);
     }
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let result = Command::new(&linker)
         .args(&args)
         .output()
@@ -2545,7 +2601,7 @@ fn link_inputs_elf_with_bundled_runtime(
             String::from_utf8_lossy(&result.stderr)
         ));
     }
-    Ok(())
+    pending_output.verify("linker")
 }
 
 fn link_inputs(
@@ -2597,6 +2653,7 @@ fn link_inputs(
         print_verbose_command_line("ld", &args);
     }
 
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let ld_result = Command::new("ld")
         .args(&args)
         .output()
@@ -2607,7 +2664,7 @@ fn link_inputs(
         return Err(format!("linker failed:\n{}", stderr));
     }
 
-    Ok(())
+    pending_output.verify("linker")
 }
 
 fn link_inputs_with_afs_ld(
@@ -2651,17 +2708,18 @@ fn link_inputs_with_afs_ld(
         print_verbose_command_line(linker, &args);
     }
 
-    let output = Command::new(linker)
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
+    let link_result = Command::new(linker)
         .args(&args)
         .output()
         .map_err(|e| format!("cannot run linker: {}", e))?;
 
-    if output.status.success() {
-        Ok(())
+    if link_result.status.success() {
+        pending_output.verify("linker")
     } else {
         Err(format!(
             "linker failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&link_result.stderr)
         ))
     }
 }
@@ -3084,6 +3142,49 @@ fn runtime_from_workspace(workspace_root: &Path) -> Result<Option<RuntimeArchive
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn pending_external_output_rejects_and_cleans_uncommitted_artifacts() {
+        let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_pending_external_output_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::write(&output, b"stale").expect("cannot seed stale output");
+
+        let pending =
+            PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        assert!(!output.exists(), "prepare retained a stale output");
+
+        fs::write(&output, b"").expect("cannot write empty output");
+        let error = pending
+            .verify("test tool")
+            .expect_err("empty output must not commit");
+        assert!(
+            error.contains("non-empty regular output"),
+            "unexpected empty-output diagnostic: {error}"
+        );
+        assert!(!output.exists(), "verify retained an empty output");
+
+        let pending =
+            PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        fs::write(&output, b"partial").expect("cannot write partial output");
+        drop(pending);
+        assert!(!output.exists(), "drop retained a partial output");
+
+        let pending =
+            PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        fs::write(&output, b"complete").expect("cannot write complete output");
+        pending
+            .verify("test tool")
+            .expect("non-empty regular output must commit");
+        assert_eq!(
+            fs::read(&output).expect("cannot read committed output"),
+            b"complete"
+        );
+        let _ = fs::remove_file(output);
+    }
 
     #[test]
     fn normalizes_module_source_provenance() {
