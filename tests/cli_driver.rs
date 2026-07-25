@@ -14880,6 +14880,49 @@ fn dash_capital_e_preprocesses_only() {
 }
 
 #[test]
+fn dash_capital_e_rejects_macro_arity_without_publishing_output() {
+    let cases = [
+        (
+            "missing",
+            "#define PAIR(a, b) ((a) + (b))\nvalue = PAIR(1)\n",
+            "macro \"PAIR\" requires 2 arguments, but only 1 given",
+        ),
+        (
+            "extra",
+            "#define ID(x) (x)\nvalue = ID(1, 2)\n",
+            "macro \"ID\" passed 2 arguments, but takes just 1",
+        ),
+    ];
+
+    for (kind, source, expected) in cases {
+        let src = write_program(source, "F90");
+        let out = unique_path(&format!("pp_macro_arity_{kind}"), "f90");
+        assert!(!out.exists(), "test output must start absent");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("macro-arity preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} macro arguments unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{kind} macro-arity diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{kind} macro-arity failure retained a preprocess output"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
 fn dash_capital_e_without_o_writes_to_stdout() {
     let dir = unique_dir("pp_stdout");
     write_program_in(

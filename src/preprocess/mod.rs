@@ -1059,7 +1059,7 @@ impl Preprocessor {
             }
 
             let emitted = if self.is_emitting() {
-                let expanded = self.expand_mapped_macros(&logical_line);
+                let expanded = self.expand_mapped_macros(&logical_line)?;
                 match parse_fortran_include_path(&expanded.text, self.fixed_form) {
                     Ok(Some(path)) => {
                         if joined_fortran_continuation {
@@ -1533,7 +1533,7 @@ impl Preprocessor {
         line_num: u32,
     ) -> Result<bool, PreprocError> {
         // Expand macros in the expression first.
-        let expanded = self.expand_condition_macros(expr);
+        let expanded = self.expand_condition_macros(expr)?;
         // Parse and evaluate the expression.
         eval_expr(&expanded).map_err(|msg| PreprocError {
             filename: filename.into(),
@@ -1548,15 +1548,16 @@ impl Preprocessor {
     /// ordinary source lines, but apply condition-specific semantics:
     /// `defined` is resolved during the walk and any remaining identifiers
     /// are rewritten to `0` at the end.
-    fn expand_condition_macros(&self, expr: &MappedText) -> String {
+    fn expand_condition_macros(&self, expr: &MappedText) -> Result<String, PreprocError> {
         let expanding = std::collections::HashSet::new();
-        let expanded = self.expand_mapped_macros_inner(expr, &expanding, MacroContext::Condition);
-        replace_undefined_idents(&expanded.text)
+        let expanded =
+            self.expand_mapped_macros_inner(expr, &expanding, MacroContext::Condition)?;
+        Ok(replace_undefined_idents(&expanded.text))
     }
 
     // ---- Macro expansion in source lines ----
 
-    fn expand_mapped_macros(&self, line: &MappedText) -> MappedText {
+    fn expand_mapped_macros(&self, line: &MappedText) -> Result<MappedText, PreprocError> {
         let expanding = std::collections::HashSet::new();
         self.expand_mapped_macros_inner(line, &expanding, MacroContext::Source)
     }
@@ -1566,9 +1567,9 @@ impl Preprocessor {
         line: &MappedText,
         expanding: &std::collections::HashSet<String>,
         context: MacroContext,
-    ) -> MappedText {
+    ) -> Result<MappedText, PreprocError> {
         if self.defines.is_empty() && context == MacroContext::Source {
-            return line.clone();
+            return Ok(line.clone());
         }
 
         let mut result = MappedText::empty(line.fallback.clone());
@@ -1647,20 +1648,21 @@ impl Preprocessor {
                         }
                         if paren_start < bytes.len() && bytes[paren_start] == b'(' {
                             if let Some((expanded, new_i)) = self.expand_mapped_function_macro(
+                                ident,
                                 def,
                                 line,
                                 paren_start,
                                 invocation,
                                 expanding,
                                 context,
-                            ) {
+                            )? {
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
                                 result.append(&self.expand_mapped_macros_inner(
                                     &expanded,
                                     &next_expanding,
                                     context,
-                                ));
+                                )?);
                                 i = new_i;
                                 continue;
                             }
@@ -1674,7 +1676,7 @@ impl Preprocessor {
                             &body,
                             &next_expanding,
                             context,
-                        ));
+                        )?);
                     }
                 } else {
                     result.append_slice(line, start..i);
@@ -1687,18 +1689,19 @@ impl Preprocessor {
             i = end;
         }
 
-        result
+        Ok(result)
     }
 
     fn expand_mapped_function_macro(
         &self,
+        name: &str,
         def: &MacroDef,
         line: &MappedText,
         paren_start: usize,
         invocation: SourceOrigin,
         expanding: &std::collections::HashSet<String>,
         context: MacroContext,
-    ) -> Option<(MappedText, usize)> {
+    ) -> Result<Option<(MappedText, usize)>, PreprocError> {
         let bytes = line.text.as_bytes();
         let mut i = paren_start + 1;
         let mut arg_start = i;
@@ -1752,17 +1755,49 @@ impl Preprocessor {
         }
 
         if depth != 0 {
-            return None;
+            return Ok(None);
         }
 
-        let args: Vec<MappedText> = arg_ranges
+        let mut args: Vec<MappedText> = arg_ranges
             .into_iter()
             .map(|range| line.slice(range))
             .collect();
+        let provided = if def.params.is_empty() && args.len() == 1 && args[0].text.is_empty() {
+            0
+        } else {
+            args.len()
+        };
+        let required = def.params.len();
+        let too_few = provided < required;
+        let too_many = !def.is_variadic && provided > required;
+        if too_few || too_many {
+            let msg = if too_few {
+                let minimum = if def.is_variadic {
+                    format!("at least {required}")
+                } else {
+                    required.to_string()
+                };
+                format!(
+                    "macro \"{name}\" requires {minimum} argument{}, but only {provided} given",
+                    if required == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("macro \"{name}\" passed {provided} arguments, but takes just {required}")
+            };
+            return Err(PreprocError {
+                filename: invocation.filename.to_string(),
+                line: invocation.line,
+                msg,
+            });
+        }
+        if provided == 0 {
+            args.clear();
+        }
+
         let expanded_args: Vec<MappedText> = args
             .iter()
             .map(|arg| self.expand_mapped_macros_inner(arg, expanding, context))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let mut param_map: HashMap<&str, usize> = HashMap::new();
         for (pi, param) in def.params.iter().enumerate() {
@@ -1872,7 +1907,7 @@ impl Preprocessor {
             bi = end;
         }
 
-        Some((body, i))
+        Ok(Some((body, i)))
     }
 }
 
@@ -2721,6 +2756,86 @@ mod tests {
     fn function_macro_nested_parens() {
         let out = pp("#define F(x) (x)\ny = F(a(b, c))\n");
         assert!(out.contains("y = (a(b, c))"));
+    }
+
+    #[test]
+    fn function_macro_rejects_missing_arguments() {
+        let err = pp_err("#define PAIR(a, b) ((a) + (b))\ny = PAIR(1)\n");
+        assert_eq!(err.line, 2);
+        assert!(
+            err.msg.contains("PAIR")
+                && err.msg.contains("requires 2 arguments")
+                && err.msg.contains("only 1 given"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn function_macro_rejects_extra_arguments() {
+        let err = pp_err("#define ID(x) x\ny = ID(1, 2)\n");
+        assert_eq!(err.line, 2);
+        assert!(
+            err.msg.contains("ID")
+                && err.msg.contains("passed 2 arguments")
+                && err.msg.contains("takes just 1"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn function_macro_accepts_zero_and_empty_arguments() {
+        let out = pp(concat!(
+            "#define ZERO() 7\n",
+            "#define EMPTY(x) [x]\n",
+            "a = ZERO()\n",
+            "b = EMPTY()\n",
+        ));
+        assert!(out.contains("a = 7"), "got: {out:?}");
+        assert!(out.contains("b = []"), "got: {out:?}");
+    }
+
+    #[test]
+    fn variadic_macro_allows_extra_arguments_but_requires_fixed_parameters() {
+        let out = pp("#define V(first, ...) first + __VA_ARGS__\ny = V(1, 2, 3)\n");
+        assert!(out.contains("y = 1 + 2, 3"), "got: {out:?}");
+
+        let err = pp_err("#define V(first, second, ...) first + second\ny = V(1)\n");
+        assert!(
+            err.msg.contains("requires at least 2 arguments") && err.msg.contains("only 1 given"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_function_macro_arity_error_uses_invocation_location() {
+        let err = pp_err(concat!(
+            "#define PAIR(a, b) ((a) + (b))\n",
+            "#define WRAP(x) PAIR(x)\n",
+            "#line 40 \"virtual.f90\"\n",
+            "y = WRAP(1)\n",
+        ));
+        assert_eq!(err.filename, "virtual.f90");
+        assert_eq!(err.line, 40);
+        assert!(err.msg.contains("PAIR"), "unexpected diagnostic: {err}");
+    }
+
+    #[test]
+    fn condition_function_macro_arity_error_is_not_discarded() {
+        let err = pp_err("#define PAIR(a, b) ((a) + (b))\n#if PAIR(1)\n#endif\n");
+        assert_eq!(err.line, 2);
+        assert!(err.msg.contains("PAIR"), "unexpected diagnostic: {err}");
+    }
+
+    #[test]
+    fn function_macro_large_extra_argument_list_is_rejected_iteratively() {
+        let arguments = std::iter::repeat_n("1", 20_000)
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = pp_err(&format!("#define ID(x) x\nvalue = ID({arguments})\n"));
+        assert!(
+            err.msg.contains("passed 20000 arguments"),
+            "unexpected diagnostic: {err}"
+        );
     }
 
     #[test]
