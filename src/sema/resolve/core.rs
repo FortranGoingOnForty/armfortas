@@ -2800,9 +2800,7 @@ fn process_contains(
                         }
                     })
                     .collect();
-                let key = name.to_ascii_lowercase();
-                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
-                let define_result = st.define(Symbol {
+                st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
                     type_info: None,
@@ -2812,12 +2810,7 @@ fn process_contains(
                     arg_names,
                     const_value: None,
                     const_char_value: None,
-                });
-                if let Err(err) = define_result {
-                    if !had_local_symbol {
-                        return Err(err);
-                    }
-                }
+                })?;
             }
             ProgramUnit::Function {
                 name,
@@ -2875,9 +2868,7 @@ fn process_contains(
                     is_separate_module_procedure: fn_is_smp,
                     ..Default::default()
                 };
-                let key = name.to_ascii_lowercase();
-                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
-                let define_result = st.define(Symbol {
+                st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
                     type_info: ret_type_info,
@@ -2887,12 +2878,7 @@ fn process_contains(
                     arg_names: vec![],
                     const_value: None,
                     const_char_value: None,
-                });
-                if let Err(err) = define_result {
-                    if !had_local_symbol {
-                        return Err(err);
-                    }
-                }
+                })?;
             }
             _ => {}
         }
@@ -3235,7 +3221,7 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
         match resolve_file(&units, &[], crate::target::TargetLayout::LP64) {
-            Ok(_) => panic!("expected semantic resolution to fail"),
+            Ok(_) => panic!("expected semantic resolution to fail for source:\n{src}"),
             Err(err) => err,
         }
     }
@@ -3525,6 +3511,108 @@ end program
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.symbols.contains_key("inner"));
+    }
+
+    #[test]
+    fn contains_rejects_conflicting_local_identifiers() {
+        for source in [
+            "\
+program collision
+  implicit none
+  integer :: child
+contains
+  subroutine child()
+  end subroutine child
+end program collision
+",
+            "\
+program collision
+  implicit none
+  integer, parameter :: child = 1
+contains
+  integer function child()
+    child = 2
+  end function child
+end program collision
+",
+            "\
+subroutine outer(child)
+  implicit none
+  integer, intent(in) :: child
+contains
+  subroutine child()
+  end subroutine child
+end subroutine outer
+",
+            "\
+program collision
+  implicit none
+  type :: child
+  end type child
+contains
+  integer function child()
+    child = 1
+  end function child
+end program collision
+",
+            "\
+program collision
+  implicit none
+contains
+  subroutine child()
+  end subroutine child
+  subroutine child()
+  end subroutine child
+end program collision
+",
+        ] {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg, "symbol 'child' already defined in this scope",
+                "unexpected collision diagnostic for source:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_allows_a_generic_name_to_name_its_own_specific() {
+        let st = resolve_source(
+            "\
+module same_name_host
+  implicit none
+  interface child
+    module procedure child
+    module procedure child_real
+  end interface child
+contains
+  integer function child(value)
+    integer, intent(in) :: value
+    child = value + 1
+  end function child
+  integer function child_real(value)
+    real, intent(in) :: value
+    child_real = int(value) + 2
+  end function child_real
+end module same_name_host
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "same_name_host"),
+            )
+            .unwrap();
+        let procedure = module_scope.symbols.get("child").unwrap();
+        assert_eq!(procedure.kind, SymbolKind::Function);
+        let generic = st
+            .named_interface_facet_symbol_in_scope(module_scope.id, "child")
+            .unwrap();
+        assert_eq!(generic.arg_names, ["child", "child_real"]);
+        assert!(st.scopes.iter().any(|scope| {
+            scope.parent == Some(module_scope.id)
+                && matches!(&scope.kind, ScopeKind::Function(name) if name == "child")
+        }));
     }
 
     #[test]

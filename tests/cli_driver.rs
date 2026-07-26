@@ -1764,6 +1764,93 @@ fn direct_use_association_conflicts_with_local_declarations() {
 }
 
 #[test]
+fn contained_procedure_names_must_be_unique_in_the_host_scope() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_procedure_names_must_be_unique_in_the_host_scope count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "contained_variable_collision",
+            "program collision\n  implicit none\n  integer :: child\ncontains\n  subroutine child()\n  end subroutine child\nend program collision\n",
+        ),
+        (
+            "contained_parameter_collision",
+            "program collision\n  implicit none\n  integer, parameter :: child = 1\ncontains\n  integer function child()\n    child = 2\n  end function child\nend program collision\n",
+        ),
+        (
+            "contained_dummy_collision",
+            "subroutine outer(child)\n  implicit none\n  integer, intent(in) :: child\ncontains\n  subroutine child()\n  end subroutine child\nend subroutine outer\n",
+        ),
+        (
+            "contained_type_collision",
+            "program collision\n  implicit none\n  type :: child\n  end type child\ncontains\n  integer function child()\n    child = 1\n  end function child\nend program collision\n",
+        ),
+        (
+            "duplicate_contained_procedure",
+            "program collision\n  implicit none\ncontains\n  subroutine child()\n  end subroutine child\n  subroutine child()\n  end subroutine child\nend program collision\n",
+        ),
+    ];
+
+    let diagnostic = "symbol 'child' already defined in this scope";
+    for (stem, source) in rejected {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("contained-procedure collision compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable collision diagnostic: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{stem} published an object despite the semantic error"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let legal_src = write_program(
+        "module same_name_host\n  implicit none\n  interface child\n    module procedure child\n    module procedure child_real\n  end interface child\ncontains\n  integer function child(value)\n    integer, intent(in) :: value\n    child = value + 1\n  end function child\n  integer function child_real(value)\n    real, intent(in) :: value\n    child_real = int(value) + 2\n  end function child_real\nend module same_name_host\n",
+        "f90",
+    );
+    let legal_out = unique_path("contained_same_name_generic", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            legal_src.to_str().unwrap(),
+            "-o",
+            legal_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name generic compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "a generic may share its name with one of its specifics: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        legal_out.exists(),
+        "legal same-name generic did not produce an object"
+    );
+    let _ = std::fs::remove_file(&legal_out);
+    let _ = std::fs::remove_file(&legal_src);
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
