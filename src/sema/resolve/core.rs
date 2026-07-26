@@ -52,6 +52,142 @@ fn merged_visible_generic_specifics(
     merged
 }
 
+fn interface_specific_names(bodies: &[InterfaceBody]) -> Vec<String> {
+    let mut names = Vec::new();
+    for body in bodies {
+        match body {
+            InterfaceBody::Subprogram(sub) => match &sub.node {
+                ProgramUnit::Function { name, .. } | ProgramUnit::Subroutine { name, .. } => {
+                    names.push(name.to_lowercase());
+                }
+                _ => {}
+            },
+            InterfaceBody::ModuleProcedure(procedures) => {
+                names.extend(procedures.iter().map(|name| name.to_lowercase()));
+            }
+        }
+    }
+    names
+}
+
+fn procedure_owner_scope(st: &SymbolTable, from_scope: ScopeId, name: &str) -> ScopeId {
+    st.lookup_in(from_scope, name)
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Function
+                    | SymbolKind::Subroutine
+                    | SymbolKind::ExternalProc
+                    | SymbolKind::IntrinsicProc
+                    | SymbolKind::ProcedurePointer
+            )
+        })
+        .map(|symbol| symbol.scope)
+        .unwrap_or(from_scope)
+}
+
+fn duplicate_generic_specific_error(
+    generic_name: &str,
+    specific: &str,
+    span: crate::lexer::Span,
+) -> SemaError {
+    SemaError {
+        span,
+        msg: format!(
+            "specific procedure '{specific}' is already present in generic interface \
+             '{generic_name}'"
+        ),
+    }
+}
+
+fn validate_explicit_generic_specifics(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+    local_specifics: &[String],
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    let mut declared_here = HashSet::new();
+    let mut visible_specifics = HashSet::new();
+    let mut interfaces = st.named_interface_symbols_in(scope_id, generic_name);
+    interfaces.extend(st.named_interface_symbols_from_use_associations(
+        &st.scope(scope_id).use_associations,
+        generic_name,
+    ));
+    let mut seen_interfaces = HashSet::new();
+    for interface in interfaces {
+        let interface_key = (interface.scope, interface.name.to_ascii_lowercase());
+        if interface.scope == scope_id || !seen_interfaces.insert(interface_key) {
+            continue;
+        }
+        visible_specifics.extend(interface.arg_names.iter().map(|specific| {
+            (
+                specific.to_ascii_lowercase(),
+                procedure_owner_scope(st, interface.scope, specific),
+            )
+        }));
+    }
+
+    for specific in local_specifics {
+        let key = specific.to_ascii_lowercase();
+        if !declared_here.insert(key.clone()) {
+            return Err(duplicate_generic_specific_error(
+                generic_name,
+                specific,
+                span,
+            ));
+        }
+
+        // A specific may have the same local name as a different procedure
+        // owned by another module. Compare owner scope as well as spelling so
+        // legal generic merges retain that distinction.
+        let local_owner = procedure_owner_scope(st, scope_id, specific);
+        if visible_specifics.contains(&(key, local_owner)) {
+            return Err(duplicate_generic_specific_error(
+                generic_name,
+                specific,
+                span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_generic_declarations(
+    st: &SymbolTable,
+    units: &[SpannedUnit],
+) -> Result<(), SemaError> {
+    let scope_id = st.current_scope();
+    let mut declared = HashSet::new();
+    for unit in units {
+        let ProgramUnit::InterfaceBlock {
+            name: Some(generic_name),
+            bodies,
+            ..
+        } = &unit.node
+        else {
+            continue;
+        };
+        if generic_name.is_empty() {
+            continue;
+        }
+        let specifics = interface_specific_names(bodies);
+        validate_explicit_generic_specifics(st, scope_id, generic_name, &specifics, unit.span)?;
+        let generic_key = generic_name.to_ascii_lowercase();
+        for specific in specifics {
+            let specific_key = specific.to_ascii_lowercase();
+            if !declared.insert((generic_key.clone(), specific_key)) {
+                return Err(duplicate_generic_specific_error(
+                    generic_name,
+                    &specific,
+                    unit.span,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Walk a list of program units and build the symbol table.
 /// Result of resolving a file: symbol table, type layouts, and any
 /// external module interfaces loaded from .amod files during USE
@@ -756,6 +892,17 @@ pub(super) fn resolve_unit(
             is_abstract: _,
             bodies,
         } => {
+            let specific_names = interface_specific_names(bodies);
+            if let Some(generic_name) = name.as_deref().filter(|name| !name.is_empty()) {
+                validate_explicit_generic_specifics(
+                    st,
+                    st.current_scope(),
+                    generic_name,
+                    &specific_names,
+                    unit.span,
+                )?;
+            }
+
             // Collect each subprogram's name and return type BEFORE
             // pushing the Interface scope — the subprogram body gets
             // its own scope via resolve_unit, and we need to surface
@@ -887,17 +1034,9 @@ pub(super) fn resolve_unit(
             }
 
             let interface_scope = st.push_scope(ScopeKind::Interface);
-            let mut specific_names = Vec::new();
             for body in bodies {
                 match body {
                     InterfaceBody::Subprogram(sub) => {
-                        match &sub.node {
-                            ProgramUnit::Function { name: fn_name, .. }
-                            | ProgramUnit::Subroutine { name: fn_name, .. } => {
-                                specific_names.push(fn_name.to_lowercase());
-                            }
-                            _ => {}
-                        }
                         resolve_unit(st, sub, module_search_paths, layouts)?;
                         if let Some(proc_scope) = find_unit_scope(st, interface_scope, &sub.node) {
                             let bind_c = st.scope(proc_scope).bind_c;
@@ -917,11 +1056,7 @@ pub(super) fn resolve_unit(
                             }
                         }
                     }
-                    InterfaceBody::ModuleProcedure(names) => {
-                        for n in names {
-                            specific_names.push(n.to_lowercase());
-                        }
-                    }
+                    InterfaceBody::ModuleProcedure(_) => {}
                 }
             }
             st.pop_scope();
@@ -2782,6 +2917,8 @@ fn process_contains(
     module_search_paths: &[std::path::PathBuf],
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
 ) -> Result<(), SemaError> {
+    validate_local_generic_declarations(st, contains)?;
+
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
         let host_is_submodule =
@@ -3638,6 +3775,222 @@ end module same_name_host
             scope.parent == Some(module_scope.id)
                 && matches!(&scope.kind, ScopeKind::Function(name) if name == "child")
         }));
+    }
+
+    #[test]
+    fn named_generic_rejects_repeated_specific_declarations() {
+        let cases = [
+            (
+                "same statement",
+                "\
+module duplicate_same_statement_m
+  implicit none
+  interface generic_value
+    module procedure integer_value, INTEGER_VALUE
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_same_statement_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "separate statements",
+                "\
+module duplicate_across_statements_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+    procedure :: INTEGER_VALUE
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_across_statements_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "reopened interface",
+                "\
+module duplicate_reopened_interface_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+  end interface generic_value
+  interface generic_value
+    module procedure INTEGER_VALUE
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_reopened_interface_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "imported specific",
+                "\
+module duplicate_import_base_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_import_base_m
+
+module duplicate_import_extension_m
+  use duplicate_import_base_m, only: generic_value, integer_value
+  implicit none
+  interface generic_value
+    module procedure INTEGER_VALUE
+  end interface generic_value
+end module duplicate_import_extension_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "defined operator",
+                "\
+module duplicate_operator_specific_m
+  implicit none
+  interface operator(+)
+    module procedure add_integer, ADD_INTEGER
+  end interface operator(+)
+contains
+  integer function add_integer(left, right)
+    integer, intent(in) :: left, right
+    add_integer = left + right
+  end function add_integer
+end module duplicate_operator_specific_m
+",
+                "operator(+)",
+                "add_integer",
+            ),
+        ];
+
+        for (label, source, generic_name, specific_name) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg,
+                format!(
+                    "specific procedure '{specific_name}' is already present in generic interface \
+                     '{generic_name}'"
+                ),
+                "unexpected duplicate-specific diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_generic_allows_distinct_extensions_and_duplicate_use_paths() {
+        let st = resolve_source(
+            "\
+module generic_base_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module generic_base_m
+
+module generic_left_m
+  use generic_base_m, only: generic_value
+end module generic_left_m
+
+module generic_right_m
+  use generic_base_m, only: generic_value
+end module generic_right_m
+
+module generic_extension_m
+  use generic_left_m, only: generic_value
+  use generic_right_m, only: generic_value
+  implicit none
+  interface generic_value
+    module procedure real_value
+  end interface generic_value
+  interface generic_value
+    procedure :: logical_value
+  end interface generic_value
+contains
+  integer function real_value(value)
+    real, intent(in) :: value
+    real_value = int(value)
+  end function real_value
+  integer function logical_value(value)
+    logical, intent(in) :: value
+    logical_value = merge(1, 0, value)
+  end function logical_value
+end module generic_extension_m
+",
+        );
+        let extension_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "generic_extension_m"),
+            )
+            .unwrap();
+        let generic = st
+            .named_interface_symbol_in_scope(extension_scope.id, "generic_value")
+            .unwrap();
+        assert_eq!(
+            generic.arg_names,
+            ["integer_value", "real_value", "logical_value"]
+        );
+    }
+
+    #[test]
+    fn named_generic_allows_same_specific_spelling_from_a_different_owner() {
+        resolve_source(
+            "\
+module same_name_owner_base_m
+  implicit none
+  private
+  public :: select_value
+  interface select_value
+    module procedure pick
+  end interface select_value
+contains
+  integer function pick(value)
+    integer, intent(in) :: value
+    pick = value
+  end function pick
+end module same_name_owner_base_m
+
+module same_name_owner_extension_m
+  use same_name_owner_base_m, only: select_value
+  implicit none
+  interface select_value
+    module procedure pick
+  end interface select_value
+contains
+  integer function pick(value)
+    real, intent(in) :: value
+    pick = int(value)
+  end function pick
+end module same_name_owner_extension_m
+",
+        );
     }
 
     #[test]

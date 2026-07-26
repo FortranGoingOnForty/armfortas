@@ -1988,6 +1988,188 @@ fn explicit_interface_names_must_not_collide_with_local_entities() {
 }
 
 #[test]
+fn named_generic_specifics_must_be_unique() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_generic_specifics_must_be_unique count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "generic_duplicate_same_statement",
+            "module duplicate_same_statement_m\n  implicit none\n  interface generic_value\n    module procedure integer_value, INTEGER_VALUE\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_same_statement_m\n",
+        ),
+        (
+            "generic_duplicate_across_statements",
+            "module duplicate_across_statements_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n    procedure :: INTEGER_VALUE\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_across_statements_m\n",
+        ),
+        (
+            "generic_duplicate_reopened_interface",
+            "module duplicate_reopened_interface_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n  end interface generic_value\n  interface generic_value\n    module procedure INTEGER_VALUE\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_reopened_interface_m\n",
+        ),
+        (
+            "generic_duplicate_imported_specific",
+            "module duplicate_import_base_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_import_base_m\n\nmodule duplicate_import_extension_m\n  use duplicate_import_base_m, only: generic_value, integer_value\n  implicit none\n  interface generic_value\n    module procedure INTEGER_VALUE\n  end interface generic_value\nend module duplicate_import_extension_m\n",
+        ),
+    ];
+    let diagnostic =
+        "specific procedure 'integer_value' is already present in generic interface 'generic_value'";
+
+    for (stem, source) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "provider.f90", source);
+        let object = dir.join("provider.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("duplicate generic provider compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable duplicate-specific diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("generic_distinct_split");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module generic_provider_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n  end interface generic_value\n  interface generic_value\n    procedure :: real_value\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\n  integer function real_value(value)\n    real, intent(in) :: value\n    real_value = int(value)\n  end function real_value\nend module generic_provider_m\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("distinct generic provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "distinct generic provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+    let amod = std::fs::read_to_string(dir.join("generic_provider_m.amod"))
+        .expect("distinct generic provider did not publish its module interface");
+    assert_eq!(
+        amod.matches("@specific integer_value").count(),
+        1,
+        "integer specific should be serialized exactly once: {amod}"
+    );
+    assert_eq!(
+        amod.matches("@specific real_value").count(),
+        1,
+        "real specific should be serialized exactly once: {amod}"
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consume_generic\n  use generic_provider_m, only: generic_value\n  implicit none\n  if (generic_value(42) /= 42) error stop 1\n  if (generic_value(19.0) /= 19) error stop 2\n  print *, 'ok'\nend program consume_generic\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("distinct generic consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "serialized distinct generic should remain usable: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("distinct generic consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "distinct generic consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let owner_extension = write_program_in(
+        &dir,
+        "owner_extension.f90",
+        "module same_name_owner_base_m\n  implicit none\n  private\n  public :: select_value\n  interface select_value\n    module procedure pick\n  end interface select_value\ncontains\n  integer function pick(value)\n    integer, intent(in) :: value\n    pick = value\n  end function pick\nend module same_name_owner_base_m\n\nmodule same_name_owner_extension_m\n  use same_name_owner_base_m, only: select_value\n  implicit none\n  interface select_value\n    module procedure pick\n  end interface select_value\ncontains\n  integer function pick(value)\n    real, intent(in) :: value\n    pick = int(value)\n  end function pick\nend module same_name_owner_extension_m\n\nprogram consume_same_name_owners\n  use same_name_owner_extension_m, only: select_value\n  implicit none\n  if (select_value(42) /= 42) error stop 1\n  if (select_value(19.0) /= 19) error stop 2\n  print *, 'owner-ok'\nend program consume_same_name_owners\n",
+    );
+    let owner_executable = dir.join("owner_consumer");
+    let owner_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            owner_extension.to_str().unwrap(),
+            "-o",
+            owner_executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name owner extension compile failed to spawn");
+    assert!(
+        owner_result.status.success(),
+        "same spelling from distinct procedure owners should compile: {}",
+        String::from_utf8_lossy(&owner_result.stderr)
+    );
+    let owner_run = Command::new(&owner_executable)
+        .output()
+        .expect("same-name owner extension failed to run");
+    assert!(
+        owner_run.status.success()
+            && String::from_utf8_lossy(&owner_run.stdout).contains("owner-ok"),
+        "same-name owner extension failed: status={:?} stdout={} stderr={}",
+        owner_run.status,
+        String::from_utf8_lossy(&owner_run.stdout),
+        String::from_utf8_lossy(&owner_run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
