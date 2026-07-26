@@ -199,7 +199,7 @@ enum AmbiguityLexicalFrame {
         uses: Vec<SpannedDecl>,
         bindings: HashSet<String>,
         named_types: HashSet<String>,
-        import_control: BlockImportControl,
+        import_control: Box<BlockImportControl>,
     },
     Associate {
         bindings: HashSet<String>,
@@ -5331,7 +5331,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     uses: uses.clone(),
                     bindings: ambiguity_bindings,
                     named_types,
-                    import_control,
+                    import_control: Box::new(import_control),
                 });
             validate_decls(ctx, implicit);
             validate_decls(ctx, decls);
