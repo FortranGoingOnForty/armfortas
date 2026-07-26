@@ -2535,7 +2535,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     {
                         if let Some(init) = entity.init.as_ref() {
                             let derived_len =
-                                derived_char_init_len(&init.node, st).map(|n| n as i64);
+                                derived_char_init_len(&init.node, st, st.current_scope())
+                                    .map(|n| n as i64);
                             if let Some(n) = derived_len {
                                 if let TypeInfo::Character { len, .. } = &mut entity_type_info {
                                     *len = Some(n);
@@ -3903,6 +3904,109 @@ end module
                 len: Some(16),
                 kind: None
             }
+        ));
+    }
+
+    #[test]
+    fn character_parameter_length_inference_is_lexically_scoped() {
+        for source in [
+            "\
+module unrelated
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module unrelated
+
+module victim
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: direct = seed
+  character(*), parameter :: parenthesized = (seed)
+  character(*), parameter :: concatenated = seed // seed
+  character(*), parameter :: repeated = repeat(seed, 2)
+end module victim
+",
+            "\
+module victim
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: direct = seed
+  character(*), parameter :: parenthesized = (seed)
+  character(*), parameter :: concatenated = seed // seed
+  character(*), parameter :: repeated = repeat(seed, 2)
+end module victim
+
+module unrelated
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module unrelated
+",
+        ] {
+            let st = resolve_source(source);
+            let victim = st
+                .scopes
+                .iter()
+                .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "victim"))
+                .expect("missing victim module scope");
+
+            for (name, expected_len) in [
+                ("direct", 1),
+                ("parenthesized", 1),
+                ("concatenated", 2),
+                ("repeated", 2),
+            ] {
+                assert!(
+                    matches!(
+                        victim.symbols[name].type_info,
+                        Some(TypeInfo::Character {
+                            len: Some(actual),
+                            ..
+                        }) if actual == expected_len
+                    ),
+                    "{name} inferred the wrong length in source:\n{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn character_parameter_length_inference_honors_use_and_host_association() {
+        let st = resolve_source(
+            "\
+module provider
+  implicit none
+  character(3), parameter :: imported = 'abc'
+end module provider
+
+module consumer
+  use provider, only: imported
+  implicit none
+  character(*), parameter :: use_copy = imported
+contains
+  subroutine nested
+    character(*), parameter :: host_copy = use_copy
+  end subroutine nested
+end module consumer
+",
+        );
+
+        let consumer = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "consumer"))
+            .expect("missing consumer module scope");
+        assert!(matches!(
+            consumer.symbols["use_copy"].type_info,
+            Some(TypeInfo::Character { len: Some(3), .. })
+        ));
+
+        let nested = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "nested"))
+            .expect("missing nested subroutine scope");
+        assert!(matches!(
+            nested.symbols["host_copy"].type_info,
+            Some(TypeInfo::Character { len: Some(3), .. })
         ));
     }
 }

@@ -754,6 +754,102 @@ fn module_parameter_constants() {
 }
 
 #[test]
+fn character_parameter_length_is_independent_of_unrelated_module_order() {
+    for level in ["-O0", "-O2"] {
+        if let Err(reason) = armfortas::testing::native_e2e_level_support(level) {
+            eprintln!(
+                "\nHARNESS_SKIP suite=multifile test=character_parameter_length_is_independent_of_unrelated_module_order count=4 reason=\"{}\"",
+                reason
+            );
+            return;
+        }
+    }
+
+    let compiler = find_compiler();
+    let producer_orders = [
+        (
+            "foreign_first",
+            "\
+module foreign_m
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module foreign_m
+
+module victim_m
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: copied = seed
+end module victim_m
+",
+        ),
+        (
+            "victim_first",
+            "\
+module victim_m
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: copied = seed
+end module victim_m
+
+module foreign_m
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module foreign_m
+",
+        ),
+    ];
+
+    for (order, producer_source) in producer_orders {
+        let dir = unique_dir();
+        let producer_f90 = dir.join(format!("producer_{order}.f90"));
+        let producer_o = dir.join(format!("producer_{order}.o"));
+        let consumer_f90 = dir.join("consumer.f90");
+
+        std::fs::write(&producer_f90, producer_source).unwrap();
+        std::fs::write(
+            &consumer_f90,
+            "\
+program consumer
+  use victim_m, only: copied
+  implicit none
+  if (len(copied) /= 1) error stop 1
+  if (iachar(copied(1:1)) /= iachar('Z')) error stop 2
+  print *, len(copied), iachar(copied(1:1))
+end program consumer
+",
+        )
+        .unwrap();
+
+        compile_file(&compiler, &producer_f90, &producer_o, None);
+        let amod = std::fs::read_to_string(dir.join("victim_m.amod"))
+            .expect("producer did not emit victim_m.amod");
+        let copied = amod
+            .lines()
+            .find(|line| line.starts_with("@param copied :"))
+            .expect("victim_m.amod omitted copied");
+        assert!(
+            copied.contains("character(len=1)"),
+            "{order} serialized a non-lexical character length:\n{copied}"
+        );
+
+        for level in ["-O0", "-O2"] {
+            let suffix = level.trim_start_matches('-');
+            let consumer_o = dir.join(format!("consumer_{suffix}.o"));
+            let binary = dir.join(format!("consumer_{suffix}"));
+            compile_file_flags(&compiler, &consumer_f90, &consumer_o, Some(&dir), &[level]);
+            link_files(&[&producer_o, &consumer_o], &binary);
+            let output = run_binary(&binary);
+            assert!(
+                output_contains_expected(&output, "1 90"),
+                "{order} consumer at {level} observed the wrong value:\n{output}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn imported_logical_kinds_preserve_storage_and_semantics() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
