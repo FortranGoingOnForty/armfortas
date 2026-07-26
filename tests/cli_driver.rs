@@ -1851,6 +1851,143 @@ fn contained_procedure_names_must_be_unique_in_the_host_scope() {
 }
 
 #[test]
+fn explicit_interface_names_must_not_collide_with_local_entities() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_interface_names_must_not_collide_with_local_entities count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "interface_variable_collision",
+            "interface_variable_collision_m",
+            "module interface_variable_collision_m\n  implicit none\n  integer :: collide\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\nend module interface_variable_collision_m\n",
+        ),
+        (
+            "interface_reversed_case_collision",
+            "interface_reversed_case_collision_m",
+            "module interface_reversed_case_collision_m\n  implicit none\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\n  integer :: COLLIDE\nend module interface_reversed_case_collision_m\n",
+        ),
+        (
+            "interface_parameter_collision",
+            "interface_parameter_collision_m",
+            "module interface_parameter_collision_m\n  implicit none\n  integer, parameter :: collide = 1\n  interface\n    integer function collide()\n    end function collide\n  end interface\nend module interface_parameter_collision_m\n",
+        ),
+        (
+            "interface_type_collision",
+            "interface_type_collision_m",
+            "module interface_type_collision_m\n  implicit none\n  type :: collide\n    integer :: value\n  end type collide\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\nend module interface_type_collision_m\n",
+        ),
+        (
+            "interface_procedure_collision",
+            "interface_procedure_collision_m",
+            "module interface_procedure_collision_m\n  implicit none\n  interface\n    integer function collide()\n    end function collide\n  end interface\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\nend module interface_procedure_collision_m\n",
+        ),
+        (
+            "interface_contained_collision",
+            "interface_contained_collision_m",
+            "module interface_contained_collision_m\n  implicit none\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\ncontains\n  subroutine collide()\n  end subroutine collide\nend module interface_contained_collision_m\n",
+        ),
+        (
+            "interface_value_dummy_collision",
+            "interface_value_dummy_collision_m",
+            "module interface_value_dummy_collision_m\n  implicit none\ncontains\n  subroutine outer(collide)\n    integer, value :: collide\n    interface\n      subroutine collide()\n      end subroutine collide\n    end interface\n  end subroutine outer\nend module interface_value_dummy_collision_m\n",
+        ),
+    ];
+
+    let diagnostic = "symbol 'collide' already defined in this scope";
+    for (stem, module_name, source) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "provider.f90", source);
+        let object = dir.join("provider.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", src.to_str().unwrap(), "-o", object.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("explicit-interface collision compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable collision diagnostic: {stderr}"
+        );
+        assert!(
+            !object.exists()
+                && !dir.join(format!("{module_name}.amod")).exists()
+                && !dir.join(format!("{module_name}.mod")).exists(),
+            "{stem} published compiler artifacts despite the semantic error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("interface_dummy_merge");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module callback_provider\n  implicit none\ncontains\n  subroutine invoke(callback, value)\n    interface\n      integer function callback(argument)\n        integer, intent(in) :: argument\n      end function callback\n    end interface\n    integer, intent(out) :: value\n    value = callback(5)\n  end subroutine invoke\nend module callback_provider\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-dummy provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "legal procedure-dummy interface should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consume_callback\n  use callback_provider, only: invoke\n  implicit none\n  integer :: value\n  call invoke(add_one, value)\n  if (value /= 6) error stop 1\ncontains\n  integer function add_one(argument)\n    integer, intent(in) :: argument\n    add_one = argument + 1\n  end function add_one\nend program consume_callback\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-dummy consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "serialized procedure-dummy interface should remain usable: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("procedure-dummy consumer failed to run");
+    assert!(
+        run.status.success(),
+        "procedure-dummy consumer failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

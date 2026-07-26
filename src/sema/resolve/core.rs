@@ -244,17 +244,32 @@ fn unresolved_procedure_binding(
     }
 }
 
-type InterfaceOuterRef = (
-    String,
-    SymbolKind,
-    Option<TypeInfo>,
-    Vec<String>,
-    bool, // bind(c)
-    Option<String>,
-    bool, // pure
-    bool, // elemental
-    SymbolAttrs,
-);
+struct InterfaceOuterRef {
+    name: String,
+    kind: SymbolKind,
+    type_info: Option<TypeInfo>,
+    arg_names: Vec<String>,
+    bind_c: bool,
+    binding_label: Option<String>,
+    pure: bool,
+    elemental: bool,
+    result_attrs: SymbolAttrs,
+    defined_at: crate::lexer::Span,
+}
+
+fn can_merge_interface_body_with_dummy(symbol: &Symbol) -> bool {
+    // Header dummies begin as variables. Declarations that establish
+    // incompatible data-object or procedure attributes make the placeholder
+    // ineligible to become the explicitly declared procedure.
+    symbol.kind == SymbolKind::Variable
+        && symbol.attrs.array_spec.is_empty()
+        && !symbol.attrs.allocatable
+        && !symbol.attrs.intrinsic
+        && !symbol.attrs.save
+        && !symbol.attrs.target
+        && !symbol.attrs.value
+        && !(symbol.attrs.external && symbol.type_info.is_some())
+}
 
 fn reject_imports_in_disallowed_scope(
     imports: &[ImportStmt],
@@ -809,17 +824,18 @@ pub(super) fn resolve_unit(
                                 .iter()
                                 .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
                             let binding = unresolved_procedure_binding(bind.as_ref(), fn_name);
-                            outer_refs.push((
-                                fn_name.clone(),
-                                SymbolKind::Function,
-                                ti,
+                            outer_refs.push(InterfaceOuterRef {
+                                name: fn_name.clone(),
+                                kind: SymbolKind::Function,
+                                type_info: ti,
                                 arg_names,
-                                binding.bind_c,
-                                binding.label,
+                                bind_c: binding.bind_c,
+                                binding_label: binding.label,
                                 pure,
                                 elemental,
-                                result_attrs_for_iface,
-                            ));
+                                result_attrs: result_attrs_for_iface,
+                                defined_at: sub.span,
+                            });
                         }
                         ProgramUnit::Subroutine {
                             name: fn_name,
@@ -849,20 +865,21 @@ pub(super) fn resolve_unit(
                                 .iter()
                                 .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
                             let binding = unresolved_procedure_binding(bind.as_ref(), fn_name);
-                            outer_refs.push((
-                                fn_name.clone(),
-                                SymbolKind::Subroutine,
-                                None,
+                            outer_refs.push(InterfaceOuterRef {
+                                name: fn_name.clone(),
+                                kind: SymbolKind::Subroutine,
+                                type_info: None,
                                 arg_names,
-                                binding.bind_c,
-                                binding.label,
+                                bind_c: binding.bind_c,
+                                binding_label: binding.label,
                                 pure,
                                 elemental,
-                                SymbolAttrs {
+                                result_attrs: SymbolAttrs {
                                     is_separate_module_interface,
                                     ..Default::default()
                                 },
-                            ));
+                                defined_at: sub.span,
+                            });
                         }
                         _ => {}
                     }
@@ -893,10 +910,10 @@ pub(super) fn resolve_unit(
                                 _ => continue,
                             };
                             if let Some(outer_ref) = outer_refs.iter_mut().find(|outer_ref| {
-                                outer_ref.0.eq_ignore_ascii_case(name) && outer_ref.1 == kind
+                                outer_ref.name.eq_ignore_ascii_case(name) && outer_ref.kind == kind
                             }) {
-                                outer_ref.4 = bind_c;
-                                outer_ref.5 = binding_label;
+                                outer_ref.bind_c = bind_c;
+                                outer_ref.binding_label = binding_label;
                             }
                         }
                     }
@@ -912,19 +929,19 @@ pub(super) fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (
-                fn_name,
-                kind,
-                ti,
-                arg_names,
-                bind_c,
-                binding_label,
-                pure,
-                elemental,
-                result_attrs,
-            ) in outer_refs
-            {
-                let span = unit.span;
+            for outer_ref in outer_refs {
+                let InterfaceOuterRef {
+                    name: fn_name,
+                    kind,
+                    type_info: ti,
+                    arg_names,
+                    bind_c,
+                    binding_label,
+                    pure,
+                    elemental,
+                    result_attrs,
+                    defined_at,
+                } = outer_ref;
                 let symbol = Symbol {
                     name: fn_name.clone(),
                     kind: kind.clone(),
@@ -942,7 +959,7 @@ pub(super) fn resolve_unit(
                         is_separate_module_interface: result_attrs.is_separate_module_interface,
                         ..Default::default()
                     },
-                    defined_at: span,
+                    defined_at,
                     scope: st.current_scope(),
                     arg_names: arg_names.clone(),
                     const_value: None,
@@ -956,17 +973,19 @@ pub(super) fn resolve_unit(
                     }
                     let scope_id = st.current_scope();
                     let is_dummy_arg = st.scope(scope_id).arg_order.iter().any(|arg| arg == &key);
+                    let mut merged_dummy = false;
                     if is_dummy_arg {
                         if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
-                            if existing.kind == SymbolKind::Variable {
+                            if can_merge_interface_body_with_dummy(existing) {
                                 let mut attrs = existing.attrs.clone();
+                                let dummy_is_pointer = attrs.pointer;
                                 attrs.external = true;
                                 attrs.bind_c = bind_c;
                                 attrs.binding_label = binding_label;
                                 attrs.pure = pure;
                                 attrs.elemental = elemental;
                                 attrs.allocatable = result_attrs.allocatable;
-                                attrs.pointer = result_attrs.pointer;
+                                attrs.pointer = dummy_is_pointer || result_attrs.pointer;
                                 attrs.result_rank = result_attrs.result_rank;
                                 attrs.array_spec = result_attrs.array_spec;
                                 attrs.is_separate_module_interface =
@@ -975,8 +994,12 @@ pub(super) fn resolve_unit(
                                 existing.type_info = ti;
                                 existing.attrs = attrs;
                                 existing.arg_names = arg_names;
+                                merged_dummy = true;
                             }
                         }
+                    }
+                    if !merged_dummy {
+                        return Err(err);
                     }
                 }
             }
@@ -3615,6 +3638,216 @@ end module same_name_host
             scope.parent == Some(module_scope.id)
                 && matches!(&scope.kind, ScopeKind::Function(name) if name == "child")
         }));
+    }
+
+    #[test]
+    fn interface_body_registration_rejects_conflicting_local_identifiers() {
+        for source in [
+            "\
+module collision
+  implicit none
+  integer :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+  integer :: COLLIDE
+end module collision
+",
+            "\
+module collision
+  implicit none
+  integer, parameter :: collide = 1
+  interface
+    integer function collide()
+    end function collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  type :: collide
+    integer :: value
+  end type collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  interface
+    integer function collide()
+    end function collide
+  end interface
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+contains
+  subroutine collide()
+  end subroutine collide
+end module collision
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, intent(in) :: collide(:)
+  interface
+    subroutine collide(value)
+      integer, intent(in) :: value
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, value :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, allocatable :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, target :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, save :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, intrinsic :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, external :: collide
+  interface
+    integer function collide()
+    end function collide
+  end interface
+end subroutine outer
+",
+        ] {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg, "symbol 'collide' already defined in this scope",
+                "unexpected interface collision diagnostic for source:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_body_registration_merges_a_procedure_dummy() {
+        let st = resolve_source(
+            "\
+subroutine invoke(callback)
+  implicit none
+  external :: callback
+  interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+end subroutine invoke
+",
+        );
+        let invoke = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "invoke"))
+            .expect("missing invoke scope");
+        let callback = invoke
+            .symbols
+            .get("callback")
+            .expect("procedure dummy interface was not published");
+        assert_eq!(callback.kind, SymbolKind::Subroutine);
+        assert!(callback.attrs.external);
+        assert_eq!(callback.arg_names, ["value"]);
+    }
+
+    #[test]
+    fn interface_body_registration_preserves_compatible_dummy_attributes() {
+        let st = resolve_source(
+            "\
+subroutine invoke(callback)
+  implicit none
+  integer, pointer, optional :: callback
+  interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+end subroutine invoke
+",
+        );
+        let invoke = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "invoke"))
+            .expect("missing invoke scope");
+        let callback = invoke
+            .symbols
+            .get("callback")
+            .expect("procedure dummy interface was not published");
+        assert_eq!(callback.kind, SymbolKind::Subroutine);
+        assert!(callback.attrs.external);
+        assert!(callback.attrs.pointer);
+        assert!(callback.attrs.optional);
+        assert_eq!(callback.arg_names, ["value"]);
     }
 
     #[test]

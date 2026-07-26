@@ -1825,7 +1825,7 @@ fn generic_character_function_dispatches_to_character_specific() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  interface pick\n    integer function pick_i(n)\n      integer, intent(in) :: n\n    end function pick_i\n    integer function pick_c(s)\n      character(len=*), intent(in) :: s\n    end function pick_c\n  end interface\n  if (pick('ab') /= 2) error stop 1\n  print *, pick('ab')\ncontains\n  integer function pick_i(n)\n    integer, intent(in) :: n\n    pick_i = n + 100\n  end function pick_i\n  integer function pick_c(s)\n    character(len=*), intent(in) :: s\n    pick_c = len_trim(s)\n  end function pick_c\nend program\n",
+        "program p\n  implicit none\n  interface pick\n    procedure :: pick_i, pick_c\n  end interface\n  if (pick('ab') /= 2) error stop 1\n  print *, pick('ab')\ncontains\n  integer function pick_i(n)\n    integer, intent(in) :: n\n    pick_i = n + 100\n  end function pick_i\n  integer function pick_c(s)\n    character(len=*), intent(in) :: s\n    pick_c = len_trim(s)\n  end function pick_c\nend program\n",
     );
     let exe = dir.join("generic_character_dispatch.bin");
     compile_fortran_program(&src, &exe);
@@ -1863,7 +1863,7 @@ fn generic_hidden_result_character_dispatches_to_character_specific() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  character(len=8) :: out\n  interface build\n    function build_i(n) result(out)\n      integer, intent(in) :: n\n      character(len=8) :: out\n    end function build_i\n    function build_c(s) result(out)\n      character(len=*), intent(in) :: s\n      character(len=8) :: out\n    end function build_c\n  end interface\n  out = build('ab')\n  if (trim(out) /= 'ab') error stop 1\n  print *, trim(out)\ncontains\n  function build_i(n) result(out)\n    integer, intent(in) :: n\n    character(len=8) :: out\n    write(out, '(I0)') n\n  end function build_i\n  function build_c(s) result(out)\n    character(len=*), intent(in) :: s\n    character(len=8) :: out\n    out = s\n  end function build_c\nend program\n",
+        "program p\n  implicit none\n  character(len=8) :: out\n  interface build\n    procedure :: build_i, build_c\n  end interface\n  out = build('ab')\n  if (trim(out) /= 'ab') error stop 1\n  print *, trim(out)\ncontains\n  function build_i(n) result(out)\n    integer, intent(in) :: n\n    character(len=8) :: out\n    write(out, '(I0)') n\n  end function build_i\n  function build_c(s) result(out)\n    character(len=*), intent(in) :: s\n    character(len=8) :: out\n    out = s\n  end function build_c\nend program\n",
     );
     let exe = dir.join("generic_hidden_result_character_dispatch.bin");
     compile_fortran_program(&src, &exe);
