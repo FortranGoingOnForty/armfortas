@@ -1592,6 +1592,161 @@ fn module_private_default() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// AR40-05: private derived-type layouts remain serialized for descendant
+// submodules, but their symbols must retain PRIVATE accessibility when an
+// ordinary consumer reconstructs the provider from its .amod.
+#[test]
+fn private_derived_type_access_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=private_derived_type_access_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    for (case, module_name, declarations) in [
+        (
+            "default_private",
+            "default_private_types",
+            "  private\n  public :: visible_t\n\n  type :: hidden_t\n    integer :: value\n  end type hidden_t\n\n  type :: visible_t\n    integer :: value\n  end type visible_t\n",
+        ),
+        (
+            "explicit_private",
+            "explicit_private_types",
+            "  type, private :: hidden_t\n    integer :: value\n  end type hidden_t\n\n  type :: visible_t\n    integer :: value\n  end type visible_t\n",
+        ),
+    ] {
+        let case_dir = dir.join(case);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let provider_f90 = case_dir.join("provider.f90");
+        let provider_o = case_dir.join("provider.o");
+        let hidden_f90 = case_dir.join("hidden_consumer.f90");
+        let hidden_o = case_dir.join("hidden_consumer.o");
+        let bare_hidden_f90 = case_dir.join("bare_hidden_consumer.f90");
+        let bare_hidden_o = case_dir.join("bare_hidden_consumer.o");
+        let child_f90 = case_dir.join("child.f90");
+        let child_o = case_dir.join("child.o");
+        let visible_f90 = case_dir.join("visible_consumer.f90");
+        let visible_o = case_dir.join("visible_consumer.o");
+
+        std::fs::write(
+            &provider_f90,
+            format!(
+                "module {module_name}\n  implicit none\n{declarations}end module {module_name}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &hidden_f90,
+            format!(
+                "program hidden_consumer\n  use {module_name}, only: hidden_t\n  implicit none\n  type(hidden_t) :: item\n  item%value = 17\nend program hidden_consumer\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &bare_hidden_f90,
+            format!(
+                "program bare_hidden_consumer\n  use {module_name}\n  implicit none\n  type(hidden_t) :: item\n  item%value = 19\nend program bare_hidden_consumer\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child_f90,
+            format!(
+                "submodule({module_name}) child\n  implicit none\n  type(hidden_t) :: item\nend submodule child\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &visible_f90,
+            format!(
+                "program visible_consumer\n  use {module_name}, only: visible_t\n  implicit none\n  type(visible_t) :: item\n  item%value = 23\nend program visible_consumer\n"
+            ),
+        )
+        .unwrap();
+
+        compile_file(&compiler, &provider_f90, &provider_o, None);
+
+        let rejected = Command::new(&compiler)
+            .current_dir(&case_dir)
+            .args([
+                hidden_f90.to_str().unwrap(),
+                "-c",
+                "-o",
+                hidden_o.to_str().unwrap(),
+            ])
+            .arg(format!("-I{}", case_dir.display()))
+            .output()
+            .expect("private-type consumer compiler launch failed");
+        assert!(
+            !rejected.status.success(),
+            "{case}: a private derived type reconstructed from .amod was USE-associated"
+        );
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "USE target 'hidden_t' is not exported by module '{module_name}'"
+            )),
+            "{case}: source and .amod private-type diagnostics diverged:\n{stderr}"
+        );
+        assert!(
+            !hidden_o.exists(),
+            "{case}: rejected private-type consumer left an object file"
+        );
+
+        let bare_rejected = Command::new(&compiler)
+            .current_dir(&case_dir)
+            .args([
+                bare_hidden_f90.to_str().unwrap(),
+                "-c",
+                "-o",
+                bare_hidden_o.to_str().unwrap(),
+            ])
+            .arg(format!("-I{}", case_dir.display()))
+            .output()
+            .expect("bare-USE private-type consumer compiler launch failed");
+        assert!(
+            !bare_rejected.status.success(),
+            "{case}: bare USE exposed a private derived type reconstructed from .amod"
+        );
+        let bare_stderr = String::from_utf8_lossy(&bare_rejected.stderr);
+        assert!(
+            bare_stderr.contains("derived type 'hidden_t' is not accessible in this scope"),
+            "{case}: bare-USE private-type diagnostic was not explicit:\n{bare_stderr}"
+        );
+        assert!(
+            !bare_hidden_o.exists(),
+            "{case}: rejected bare-USE private-type consumer left an object file"
+        );
+
+        compile_file(&compiler, &visible_f90, &visible_o, Some(&case_dir));
+        compile_file(&compiler, &child_f90, &child_o, Some(&case_dir));
+
+        let amod = std::fs::read_to_string(case_dir.join(format!("{module_name}.amod"))).unwrap();
+        let hidden_line = amod
+            .lines()
+            .find(|line| line.starts_with("@type hidden_t"))
+            .expect("private layout must remain in .amod for submodule host association");
+        let visible_line = amod
+            .lines()
+            .find(|line| line.starts_with("@type visible_t"))
+            .expect("public layout must be present in .amod");
+        assert!(
+            hidden_line.ends_with(", private"),
+            "{case}: private type accessibility missing from .amod: {hidden_line}"
+        );
+        assert!(
+            visible_line.ends_with(", public"),
+            "{case}: public type accessibility missing from .amod: {visible_line}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // AR40-01: a separate module function's RESULT identity is declared by its
 // interface. Unrelated locals and named constants must not affect same-TU
 // lowering or the identity serialized for cross-TU compilation.

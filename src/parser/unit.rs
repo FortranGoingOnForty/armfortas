@@ -1003,6 +1003,7 @@ impl<'a> Parser<'a> {
                     // pointer call semantics are deferred.
                     let span = span_from_to(start, self.prev_span());
                     let mut all_attrs = attrs;
+                    all_attrs.push(crate::ast::decl::Attribute::Procedure);
                     all_attrs.push(crate::ast::decl::Attribute::External);
                     decls.push(crate::ast::Spanned::new(
                         crate::ast::decl::Decl::TypeDecl {

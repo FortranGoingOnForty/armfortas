@@ -21,9 +21,10 @@ use crate::ast::decl::UseNature;
 use crate::ir::inst::{FuncRef, Function, InstKind, Module as IrModule};
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
-use crate::sema::type_layout::TypeLayoutRegistry;
+use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 8;
+const AMOD_VERSION: u32 = 9;
+const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -622,7 +623,8 @@ pub fn write_amod(
             .or_else(|| type_layouts.get(key))
         {
             let canonical = type_layouts.canonical_key_for_layout(layout);
-            emit_type(&mut out, &canonical, type_layouts);
+            let access = serialized_type_access(scope, layout);
+            emit_type(&mut out, &canonical, access, type_layouts);
         }
     }
 
@@ -657,6 +659,23 @@ fn is_public(sym: &Symbol, scope: &Scope) -> bool {
         Access::Public => true,
         Access::Default => !matches!(scope.default_access, Access::Private),
     }
+}
+
+fn serialized_type_access(scope: &Scope, layout: &TypeLayout) -> Access {
+    scope
+        .symbols
+        .get(&layout.name.to_ascii_lowercase())
+        .filter(|sym| matches!(sym.kind, SymbolKind::DerivedType))
+        .map(|sym| {
+            if is_public(sym, scope) {
+                Access::Public
+            } else {
+                Access::Private
+            }
+        })
+        // A closure-only layout is implementation support for another
+        // exported entity, not an independently exported module name.
+        .unwrap_or(Access::Private)
 }
 
 fn bound_proc_target_export_key(module_key: &str, target_name: &str) -> String {
@@ -1153,9 +1172,13 @@ fn touches_globals(func: &Function) -> bool {
     false
 }
 
-fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
+fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLayoutRegistry) {
     if let Some(layout) = type_layouts.get(&name.to_lowercase()) {
-        writeln!(out, "@type {}", layout.name).unwrap();
+        let access = match access {
+            Access::Private => "private",
+            Access::Public | Access::Default => "public",
+        };
+        writeln!(out, "@type {}, {}", layout.name, access).unwrap();
         writeln!(out, "  @layout size={} align={}", layout.size, layout.align).unwrap();
         if let Some(ref parent) = layout.parent {
             writeln!(out, "  @extends {}", parent).unwrap();
@@ -1531,6 +1554,16 @@ pub struct AmodInterface {
     pub access: Access,
 }
 
+/// A serialized derived-type layout and the accessibility of its module
+/// symbol. Layout presence and USE visibility are deliberately separate:
+/// descendant submodules need private layouts, while ordinary consumers must
+/// not acquire the private type name.
+#[derive(Debug, Clone)]
+pub struct AmodType {
+    pub layout: TypeLayout,
+    pub access: Access,
+}
+
 /// One serialized USE binding. `local` is the name visible in this module,
 /// `original` is the provider name, and `source_module` identifies the edge.
 /// The same shape represents an entry on an ONLY edge or a rename on a bare
@@ -1568,7 +1601,7 @@ pub struct ModuleInterface {
     pub renames: Vec<UseRename>,
     pub variables: Vec<AmodVar>,
     pub procedures: Vec<AmodProc>,
-    pub types: Vec<crate::sema::type_layout::TypeLayout>,
+    pub types: Vec<AmodType>,
     pub interfaces: Vec<AmodInterface>,
     /// F2023 strict enumeration types: (type name, enumerators in
     /// declaration order, access). Ordinals are positional (1-based).
@@ -1897,8 +1930,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
                 }
             }
         } else if trimmed.starts_with("@type ") {
-            let layout = parse_type(trimmed, &mut lines);
-            types.push(layout);
+            types.push(parse_amod_type(trimmed, &mut lines, version, path)?);
         } else if let Some(name) = trimmed.strip_prefix("@interface ") {
             // Generic interface block: header is `@interface <name>[, private]`,
             // body lists `@specific <proc>` until `@end interface`.
@@ -1929,7 +1961,8 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let final_proc_prefix = format!("afs_modproc_{}_", module_name.to_lowercase());
-    for layout in &mut types {
+    for amod_type in &mut types {
+        let layout = &mut amod_type.layout;
         for final_proc in &mut layout.final_procs {
             if final_proc.rank != usize::MAX {
                 continue;
@@ -2541,6 +2574,33 @@ fn parse_type(
     }
 }
 
+fn parse_amod_type(
+    header: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines>,
+    version: u32,
+    path: &Path,
+) -> Result<AmodType, String> {
+    let malformed = || {
+        format!(
+            "{}: corrupt .amod file (malformed @type accessibility); rebuild the provider module",
+            path.display()
+        )
+    };
+    let rest = header.strip_prefix("@type ").ok_or_else(malformed)?.trim();
+    let (name, access) = match rest.rsplit_once(", ") {
+        Some((name, "public")) if !name.trim().is_empty() => (name.trim(), Access::Public),
+        Some((name, "private")) if !name.trim().is_empty() => (name.trim(), Access::Private),
+        Some(_) => return Err(malformed()),
+        None if version < AMOD_TYPE_ACCESS_VERSION && !rest.is_empty() => (rest, Access::Public),
+        None => return Err(malformed()),
+    };
+    let layout_header = format!("@type {name}");
+    Ok(AmodType {
+        layout: parse_type(&layout_header, lines),
+        access,
+    })
+}
+
 fn parse_type_info(s: &str) -> Option<TypeInfo> {
     let s = s.trim();
     if s == "unknown" || s.is_empty() {
@@ -2675,6 +2735,7 @@ pub fn extract_module_globals(
                 if let Some(layout) = iface
                     .types
                     .iter()
+                    .map(|amod_type| &amod_type.layout)
                     .find(|layout| layout.name.eq_ignore_ascii_case(type_name))
                 {
                     crate::ir::types::IrType::Array(
@@ -3042,7 +3103,8 @@ mod tests {
         assert_eq!(af.args.len(), 2);
         assert!(af.args[1].optional);
         assert_eq!(iface.types.len(), 1);
-        let pt = &iface.types[0];
+        let pt = &iface.types[0].layout;
+        assert_eq!(iface.types[0].access, Access::Public);
         assert_eq!(pt.name, "particle");
         assert_eq!(pt.size, 12);
         assert_eq!(pt.fields.len(), 3);
@@ -3054,6 +3116,45 @@ mod tests {
                 name: "afs_modproc_physics_finish_particles".into(),
                 rank: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn current_type_records_require_and_preserve_accessibility() {
+        let amod_text = r#"#!amod 9
+# module: type_access
+
+@type exposed_t, public
+  @layout size=4 align=4
+  @field value : integer @offset 0 @size 4
+@end type
+
+@type hidden_t, private
+  @layout size=4 align=4
+  @field value : integer @offset 0 @size 4
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("type_access.amod")).unwrap();
+        assert_eq!(iface.types.len(), 2);
+        assert_eq!(iface.types[0].layout.name, "exposed_t");
+        assert_eq!(iface.types[0].access, Access::Public);
+        assert_eq!(iface.types[1].layout.name, "hidden_t");
+        assert_eq!(iface.types[1].access, Access::Private);
+
+        let missing_access = r#"#!amod 9
+# module: missing_type_access
+
+@type hidden_t
+  @layout size=4 align=4
+@end type
+"#;
+        let err = parse_amod(missing_access, Path::new("missing_type_access.amod"))
+            .expect_err("current @type records without accessibility must be rejected");
+        assert!(
+            err.contains("corrupt .amod file")
+                && err.contains("malformed @type accessibility")
+                && err.contains("rebuild the provider module"),
+            "unexpected missing-access diagnostic: {err}"
         );
     }
 
@@ -3151,7 +3252,7 @@ mod tests {
 @end type
 "#;
         let iface = parse_amod(amod_text, Path::new("legacy.amod")).unwrap();
-        assert_eq!(iface.types[0].final_procs[0].rank, 1);
+        assert_eq!(iface.types[0].layout.final_procs[0].rank, 1);
     }
 
     #[test]
@@ -3274,7 +3375,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 9
 # module: cache_test
 # source: cache_test.f90
 
@@ -3306,7 +3407,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 9
 # module: cached_parent
 # source: cached_parent.f90
 
@@ -3319,7 +3420,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 9
 # module: supplied_parent
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
@@ -3351,7 +3452,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 9
 # module: child
 # ancestor-module: root
 # parent-submodule: middle
@@ -3450,7 +3551,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 8)")
+            err.contains("incompatible .amod version 6 (compiler requires 9)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

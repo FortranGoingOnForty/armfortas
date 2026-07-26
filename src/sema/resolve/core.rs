@@ -3138,6 +3138,7 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
             Attribute::Save => sa.save = true,
             Attribute::Parameter => sa.parameter = true,
             Attribute::Value => sa.value = true,
+            Attribute::Procedure => {}
             Attribute::External => sa.external = true,
             Attribute::NoPass => {}
             Attribute::Intrinsic => sa.intrinsic = true,

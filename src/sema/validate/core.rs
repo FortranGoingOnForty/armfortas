@@ -194,6 +194,7 @@ enum AmbiguityLexicalFrame {
         scope_id: Option<ScopeId>,
         uses: Vec<SpannedDecl>,
         bindings: HashSet<String>,
+        named_types: HashSet<String>,
         import_control: BlockImportControl,
     },
     Associate {
@@ -283,6 +284,12 @@ impl<'a> Ctx<'a> {
             .iter()
             .rev()
             .find_map(|frame| frame.get(&key))
+    }
+
+    fn block_array_element_type_info(&self, name: &str) -> Option<&TypeInfo> {
+        let binding = self.block_binding_attrs(name)?;
+        binding.rank.filter(|rank| *rank > 0)?;
+        binding.type_info.as_ref()
     }
 
     /// Look up a symbol in the current validation scope.
@@ -388,6 +395,32 @@ impl<'a> Ctx<'a> {
                 AmbiguityLexicalFrame::Associate { .. } => None,
             })
             .unwrap_or(self.scope_id)
+    }
+
+    fn lexical_local_named_type(&self, name: &str) -> Option<bool> {
+        let key = name.to_lowercase();
+        for frame in self.ambiguity_lexical_frames.iter().rev() {
+            match frame {
+                AmbiguityLexicalFrame::Associate { bindings } => {
+                    if bindings.contains(&key) {
+                        return Some(false);
+                    }
+                }
+                AmbiguityLexicalFrame::Block {
+                    bindings,
+                    named_types,
+                    ..
+                } => {
+                    if named_types.contains(&key) {
+                        return Some(true);
+                    }
+                    if bindings.contains(&key) {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn error(&mut self, span: Span, msg: impl Into<String>) {
@@ -578,6 +611,80 @@ fn validate_supported_character_type_spec(ctx: &mut Ctx<'_>, span: Span, type_sp
             ),
         );
     }
+}
+
+fn symbol_is_named_type(symbol: &Symbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::DerivedType | SymbolKind::EnumerationType
+    )
+}
+
+/// Validate a source-level reference to a named derived/enumeration type.
+///
+/// Type layouts have a wider lifetime than source visibility: private
+/// layouts must remain available after `.amod` reconstruction so descendant
+/// submodules and public layouts with private component types can be lowered.
+/// Therefore a registry hit is never proof that a source name is accessible.
+/// All source spellings must resolve through the symbol table, whose ordinary
+/// USE lookup filters non-exported symbols while submodule host association
+/// deliberately retains them.
+fn validate_visible_named_type(ctx: &mut Ctx<'_>, span: Span, name: &str) {
+    match ctx.lexical_local_named_type(name) {
+        Some(true) => return,
+        Some(false) => {
+            ctx.error(
+                span,
+                format!("'{}' does not name a derived type in this scope", name),
+            );
+            return;
+        }
+        None => {}
+    }
+
+    match ctx.lookup_lexical(name) {
+        Some(symbol) if symbol_is_named_type(symbol) => {}
+        Some(_) => ctx.error(
+            span,
+            format!("'{}' does not name a derived type in this scope", name),
+        ),
+        None => ctx.error(
+            span,
+            format!("derived type '{}' is not accessible in this scope", name),
+        ),
+    }
+}
+
+fn validate_visible_type_spec(ctx: &mut Ctx<'_>, span: Span, type_spec: &TypeSpec) {
+    if let TypeSpec::Type(name) | TypeSpec::Class(name) = type_spec {
+        validate_visible_named_type(ctx, span, name);
+    }
+}
+
+fn type_decl_encodes_procedure_interface(attrs: &[Attribute], type_spec: &TypeSpec) -> bool {
+    matches!(type_spec, TypeSpec::Type(_))
+        && attrs
+            .iter()
+            .any(|attr| matches!(attr, Attribute::Procedure))
+}
+
+/// Array-constructor and SELECT TYPE guards retain their type-spec as source
+/// text. Intrinsic specs parse directly; a bare identifier is a derived or
+/// enumeration type name and must pass the same visibility check as TYPE(t).
+fn validate_visible_raw_type_spec(ctx: &mut Ctx<'_>, span: Span, raw: &str) {
+    if let Ok(tokens) =
+        crate::lexer::tokenize(raw, span.file_id, crate::lexer::SourceForm::FreeForm)
+    {
+        let mut parser = crate::parser::Parser::new(&tokens);
+        if let Some(Ok(type_spec)) = parser.try_parse_type_spec() {
+            if parser.peek() == &crate::lexer::TokenKind::Eof {
+                validate_visible_type_spec(ctx, span, &type_spec);
+                return;
+            }
+        }
+    }
+
+    validate_visible_named_type(ctx, span, raw.trim());
 }
 
 fn validate_supported_character_type_info(ctx: &mut Ctx<'_>, span: Span, info: Option<TypeInfo>) {
@@ -1669,7 +1776,9 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
             ctx.in_call_arg = saved;
         }
         Expr::ArrayConstructor { type_spec, values } => {
-            if type_spec.is_none() {
+            if let Some(type_spec) = type_spec {
+                validate_visible_raw_type_spec(ctx, expr.span, type_spec);
+            } else {
                 validate_untyped_array_constructor_elements(ctx, values);
             }
             for value in values {
@@ -2626,6 +2735,23 @@ fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>)
             }
             Decl::CommonBlock { vars, .. } => {
                 out.extend(vars.iter().map(|name| name.to_lowercase()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_block_named_type_names(decls: &[SpannedDecl], out: &mut HashSet<String>) {
+    for decl in decls {
+        match &decl.node {
+            Decl::DerivedTypeDef { name, .. } | Decl::EnumerationTypeDef { name, .. } => {
+                out.insert(name.to_lowercase());
+            }
+            Decl::EnumDef {
+                type_name: Some(name),
+                ..
+            } => {
+                out.insert(name.to_lowercase());
             }
             _ => {}
         }
@@ -4130,6 +4256,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             if let Some(return_type) = return_type {
                 validate_supported_character_type_spec(ctx, unit.span, return_type);
+                validate_visible_type_spec(ctx, unit.span, return_type);
             }
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
@@ -4359,6 +4486,9 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
 
             validate_supported_character_type_spec(ctx, decl.span, type_spec);
+            if !type_decl_encodes_procedure_interface(attrs, type_spec) {
+                validate_visible_type_spec(ctx, decl.span, type_spec);
+            }
 
             // RANK(n) (F2023 8.5.17). The parser already desugared the
             // shape to a deferred-shape Dimension; here the marker
@@ -4663,6 +4793,7 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         // Derived type definition validation.
         if let Decl::DerivedTypeDef {
             name,
+            extends,
             attrs: type_attrs,
             type_bound_procs,
             components,
@@ -4670,6 +4801,9 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         } = &decl.node
         {
             ctx.require_std(decl.span, FortranStandard::F90, "derived types");
+            if let Some(parent) = extends {
+                validate_visible_named_type(ctx, decl.span, parent);
+            }
             if type_attrs
                 .iter()
                 .any(|attr| matches!(attr, TypeAttr::Abstract))
@@ -4678,8 +4812,14 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             }
             validate_unsupported_component_forms(ctx, components);
             for component in components {
-                if let Decl::TypeDecl { type_spec, .. } = &component.node {
+                if let Decl::TypeDecl {
+                    type_spec, attrs, ..
+                } = &component.node
+                {
                     validate_supported_character_type_spec(ctx, component.span, type_spec);
+                    if !type_decl_encodes_procedure_interface(attrs, type_spec) {
+                        validate_visible_type_spec(ctx, component.span, type_spec);
+                    }
                 }
             }
             validate_derived_type(
@@ -4881,6 +5021,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         } => {
             if let Some(type_spec) = type_spec {
                 validate_supported_character_type_spec(ctx, stmt.span, type_spec);
+                validate_visible_type_spec(ctx, stmt.span, type_spec);
             }
             let option_presence =
                 validate_allocation_options(ctx, stmt.span, "ALLOCATE", opts, type_spec.is_some());
@@ -5011,6 +5152,62 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             ctx.require_std(stmt.span, FortranStandard::F2008, "DO CONCURRENT");
             validate_stmts(ctx, body);
         }
+        Stmt::SelectType {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            ctx.require_std(stmt.span, FortranStandard::F2003, "SELECT TYPE");
+            let refined_name = assoc_name.as_deref().or(match &selector.node {
+                Expr::Name { name } => Some(name.as_str()),
+                _ => None,
+            });
+            let selector_type = validation_expr_type_info(ctx, selector);
+            let selector_rank = validation_expr_rank(ctx, selector);
+            for guard in guards {
+                let (body, refined_type) = match guard {
+                    TypeGuard::TypeIs { type_name, body }
+                    | TypeGuard::ClassIs { type_name, body } => {
+                        validate_visible_raw_type_spec(ctx, stmt.span, type_name);
+                        (
+                            body,
+                            validation_array_constructor_type_info(
+                                ctx,
+                                Some(type_name.as_str()),
+                                &[],
+                            ),
+                        )
+                    }
+                    TypeGuard::ClassDefault { body } => (body, selector_type.clone()),
+                };
+                let mut refinement = HashMap::new();
+                if let (Some(name), Some(type_info)) = (refined_name, refined_type) {
+                    refinement.insert(
+                        name.to_lowercase(),
+                        BlockBindingAttrs {
+                            type_info: Some(type_info),
+                            rank: selector_rank,
+                            ..BlockBindingAttrs::default()
+                        },
+                    );
+                }
+                ctx.block_decl_frames.push(refinement);
+                validate_stmts(ctx, body);
+                ctx.block_decl_frames.pop();
+            }
+        }
+        Stmt::SelectRank { guards, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F2018, "SELECT RANK");
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                validate_stmts(ctx, body);
+            }
+        }
         Stmt::SelectCase { cases, .. } => {
             validate_select_case_arms(ctx, stmt.span, cases);
             for case in cases {
@@ -5065,23 +5262,26 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 body,
             );
             validate_decls(ctx, uses);
-            validate_decls(ctx, implicit);
-            validate_decls(ctx, decls);
             for iface in ifaces {
                 validate_unit(ctx, iface);
             }
-            let frame = block_binding_frame(ctx, stmt.span, decls);
             let mut ambiguity_bindings = HashSet::new();
             collect_block_binding_names(decls, &mut ambiguity_bindings);
             extend_declared_names_from_ifaces(&mut ambiguity_bindings, ifaces);
+            let mut named_types = HashSet::new();
+            collect_block_named_type_names(decls, &mut named_types);
             ctx.ambiguity_lexical_frames
                 .push(AmbiguityLexicalFrame::Block {
                     span: stmt.span,
                     scope_id: ctx.st.statement_block_scope(stmt.span),
                     uses: uses.clone(),
                     bindings: ambiguity_bindings,
+                    named_types,
                     import_control,
                 });
+            validate_decls(ctx, implicit);
+            validate_decls(ctx, decls);
+            let frame = block_binding_frame(ctx, stmt.span, decls);
             ctx.block_decl_frames.push(frame);
             validate_stmts(ctx, body);
             ctx.block_decl_frames.pop();
@@ -5284,15 +5484,26 @@ fn derived_type_name_for_expr(
 ) -> Option<String> {
     match &expr.node {
         Expr::Name { name } => ctx
-            .lookup(name)
-            .and_then(|sym| sym.type_info.as_ref())
-            .and_then(derived_type_name_from_type_info),
+            .block_binding_attrs(name)
+            .and_then(|binding| binding.type_info.as_ref())
+            .and_then(derived_type_name_from_type_info)
+            .or_else(|| {
+                ctx.lookup_lexical(name)
+                    .and_then(|sym| sym.type_info.as_ref())
+                    .and_then(derived_type_name_from_type_info)
+            }),
         Expr::ParenExpr { inner } => derived_type_name_for_expr(ctx, inner),
         Expr::FunctionCall { callee, .. } => {
             let Expr::Name { name } = &callee.node else {
                 return derived_type_name_for_expr(ctx, callee);
             };
-            let symbol = ctx.lookup(name)?;
+            if let Some(type_name) = ctx
+                .block_array_element_type_info(name)
+                .and_then(derived_type_name_from_type_info)
+            {
+                return Some(type_name);
+            }
+            let symbol = ctx.lookup_lexical(name)?;
             if matches!(symbol.kind, SymbolKind::DerivedType) {
                 Some(symbol.name.clone())
             } else {
@@ -5636,6 +5847,9 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                 let leaf = leaf_field_layout(ctx, expr)?;
                 return (!leaf.field.procedure_pointer).then(|| leaf.field.type_info.clone());
             };
+            if let Some(type_info) = ctx.block_array_element_type_info(name) {
+                return Some(type_info.clone());
+            }
             if let Some((type_info, _)) = named_generic_call_result_metadata(ctx, name, args) {
                 return Some(type_info);
             }
@@ -9544,6 +9758,115 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    #[test]
+    fn private_named_types_are_not_visible_through_bare_use() {
+        let errors = errors_from(
+            "\
+module private_types
+  implicit none
+  private
+  public :: visible_t
+
+  type :: hidden_t
+    integer :: value
+  end type hidden_t
+
+  type :: visible_t
+    integer :: value
+  end type visible_t
+contains
+  subroutine internal_access_is_valid()
+    type(hidden_t) :: item
+    item%value = 1
+  end subroutine internal_access_is_valid
+end module private_types
+
+program declaration_consumer
+  use private_types
+  implicit none
+  type(hidden_t) :: item
+end program declaration_consumer
+
+program extension_consumer
+  use private_types
+  implicit none
+  type, extends(hidden_t) :: child_t
+  end type child_t
+end program extension_consumer
+
+program allocation_consumer
+  use private_types
+  implicit none
+  class(*), allocatable :: item
+  allocate(hidden_t :: item)
+end program allocation_consumer
+
+program select_type_consumer
+  use private_types
+  implicit none
+  class(*), allocatable :: item
+  select type (item)
+  type is (hidden_t)
+  class default
+  end select
+end program select_type_consumer
+
+program function_result_consumer
+  use private_types
+  implicit none
+contains
+  type(hidden_t) function make_item()
+  end function make_item
+end program function_result_consumer
+
+program external_function_consumer
+  use private_types
+  implicit none
+  type(hidden_t), external :: make_item
+end program external_function_consumer
+
+program array_constructor_consumer
+  use private_types
+  implicit none
+  class(*), allocatable :: items(:)
+  items = [hidden_t ::]
+end program array_constructor_consumer
+
+program public_consumer
+  use private_types
+  implicit none
+  type(visible_t) :: item
+  item%value = 2
+end program public_consumer
+
+program block_consumers
+  implicit none
+  block
+    use private_types, only: visible_t
+    type(visible_t) :: imported_item
+    imported_item%value = 3
+  end block
+  block
+    type :: local_t
+      integer :: value
+    end type local_t
+    type(local_t) :: local_item
+    local_item%value = 4
+  end block
+end program block_consumers
+",
+        );
+
+        let inaccessible = errors
+            .iter()
+            .filter(|error| {
+                error.contains("derived type 'hidden_t' is not accessible in this scope")
+            })
+            .count();
+        assert_eq!(inaccessible, 7, "{errors:?}");
+        assert_eq!(errors.len(), 7, "{errors:?}");
     }
 
     #[test]

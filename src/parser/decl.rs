@@ -1109,6 +1109,7 @@ impl<'a> Parser<'a> {
                         }
                     }
 
+                    comp_attrs.push(crate::ast::decl::Attribute::Procedure);
                     comp_attrs.push(crate::ast::decl::Attribute::External);
                     let span = crate::parser::expr::span_from_to(comp_start, self.prev_span());
                     components.push(crate::ast::Spanned::new(

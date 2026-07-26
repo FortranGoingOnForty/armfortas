@@ -165,6 +165,12 @@ pub enum Attribute {
     Asynchronous,
     Protected,
     Contiguous,
+    /// Internal marker for a `PROCEDURE(interface)` entity. The parser
+    /// represents procedure entities as `TypeDecl` nodes so existing
+    /// declaration/lowering paths can retain the interface name in
+    /// `TypeSpec::Type`; this marker distinguishes that encoding from a
+    /// genuine `TYPE(name), EXTERNAL` function declaration.
+    Procedure,
     External,
     NoPass,
     Intrinsic,

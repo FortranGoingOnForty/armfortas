@@ -1057,8 +1057,8 @@ fn install_external_interface(
     backfill_procedure_pointer_interfaces(st, scope_id);
 
     // Register type layouts.
-    for layout in &iface.types {
-        let mut layout = layout.clone();
+    for amod_type in &iface.types {
+        let mut layout = amod_type.layout.clone();
         layout
             .owner_module
             .get_or_insert_with(|| module_name.to_string());
@@ -1067,7 +1067,7 @@ fn install_external_interface(
         type_layouts.insert(layout.clone());
         // Also add a DerivedType symbol.
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: amod_type.access,
             type_owner_module: layout.owner_module.as_deref().map(str::to_ascii_lowercase),
             ..Default::default()
         };
