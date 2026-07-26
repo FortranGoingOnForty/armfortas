@@ -5,7 +5,7 @@
 //! alignments come from `TargetLayout`, identical across the LP64
 //! targets we support).
 
-use super::symtab::{ScopeId, TypeInfo};
+use super::symtab::{Access, ScopeId, TypeInfo};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -52,6 +52,14 @@ pub fn derived_param_field_lookup_key(base: &str, field: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct FieldLayout {
     pub name: String,
+    /// Source accessibility of this component. Unlike the enclosing type's
+    /// accessibility, this controls component selection and structure
+    /// constructor arguments after the type itself has been made visible.
+    pub access: Access,
+    /// Module that declared this component. Inherited fields retain their
+    /// original owner so extending modules cannot acquire access merely by
+    /// cloning the parent's physical layout.
+    pub owner_module: Option<String>,
     pub offset: usize,
     pub size: usize,
     pub dims: Vec<(i64, i64)>,
@@ -136,6 +144,95 @@ impl TypeLayout {
             .iter()
             .filter(|p| p.method_name.eq_ignore_ascii_case(name))
             .collect()
+    }
+}
+
+/// Return the physical field targeted by a structure-constructor argument.
+///
+/// Extended types expose their immediate parent as one whole component in a
+/// constructor even though `TypeLayout::fields` stores the inherited fields
+/// flattened at the start of the child's physical layout. Positional
+/// arguments map to `[whole parent, own fields...]` when the first argument
+/// has the parent's type; otherwise a default-initialized parent is omitted
+/// and association begins with the child's own fields. A keyword matching the
+/// parent type names that same whole-parent view.
+pub fn structure_constructor_field<'a>(
+    layout: &'a TypeLayout,
+    registry: &'a TypeLayoutRegistry,
+    keyword: Option<&str>,
+    positional_index: usize,
+    positional_parent: bool,
+) -> Option<Cow<'a, FieldLayout>> {
+    let parent_name = layout.parent.as_deref();
+    let parent_layout = parent_name.and_then(|name| registry.get_related(layout, name));
+
+    if let Some(keyword) = keyword {
+        if let Some(parent) = parent_layout {
+            if parent_name.is_some_and(|name| name.eq_ignore_ascii_case(keyword))
+                || parent.name.eq_ignore_ascii_case(keyword)
+            {
+                return Some(Cow::Owned(whole_parent_component_field(parent)));
+            }
+        }
+        // Preserve existing diagnostics for invalid inherited-component
+        // keywords; general constructor-shape validation owns rejecting them.
+        return layout.field(keyword).map(Cow::Borrowed);
+    }
+
+    let Some(parent) = parent_layout else {
+        return layout.fields.get(positional_index).map(Cow::Borrowed);
+    };
+    if positional_parent && positional_index == 0 {
+        return Some(Cow::Owned(whole_parent_component_field(parent)));
+    }
+    let inherited = parent.fields.len().min(layout.fields.len());
+    let own_index = positional_index.checked_sub(usize::from(positional_parent))?;
+    layout.fields.get(inherited + own_index).map(Cow::Borrowed)
+}
+
+/// Decide whether the first positional constructor argument supplies the
+/// whole parent component or whether that default-initialized component was
+/// omitted and positional association begins with the child's own fields.
+pub fn structure_constructor_uses_positional_parent(
+    layout: &TypeLayout,
+    registry: &TypeLayoutRegistry,
+    first_positional_type: Option<&TypeInfo>,
+) -> bool {
+    let Some(parent) = layout
+        .parent
+        .as_deref()
+        .and_then(|name| registry.get_related(layout, name))
+    else {
+        return false;
+    };
+    let Some(TypeInfo::Derived(actual_name) | TypeInfo::Class(actual_name)) = first_positional_type
+    else {
+        return false;
+    };
+    registry
+        .get_related(layout, actual_name)
+        .or_else(|| registry.get(actual_name))
+        .is_some_and(|actual| registry.is_same_or_extension_of(actual, parent))
+}
+
+/// Materialize the implicit whole-parent component at offset zero.
+pub fn whole_parent_component_field(parent: &TypeLayout) -> FieldLayout {
+    FieldLayout {
+        name: parent.name.clone(),
+        access: Access::Public,
+        owner_module: parent.owner_module.clone(),
+        offset: 0,
+        size: parent.size,
+        dims: vec![],
+        declared_array: false,
+        type_info: TypeInfo::Derived(parent.name.clone()),
+        allocatable: false,
+        pointer: false,
+        deferred_char: false,
+        target: false,
+        procedure_pointer: false,
+        procedure_pointer_nopass: false,
+        default_init: None,
     }
 }
 
@@ -1357,6 +1454,18 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
     let mut fields = Vec::new();
+    let default_component_access = if components.iter().any(|decl| {
+        matches!(
+            decl.node,
+            crate::ast::decl::Decl::AccessDefault {
+                access: crate::ast::decl::Attribute::Private
+            }
+        )
+    }) {
+        Access::Private
+    } else {
+        Access::Public
+    };
 
     // If this type extends a parent, start with parent's fields.
     if let Some(parent) = parent_layout {
@@ -1384,6 +1493,15 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
             let is_target = attrs
                 .iter()
                 .any(|a| matches!(a, crate::ast::decl::Attribute::Target));
+            let component_access = attrs
+                .iter()
+                .rev()
+                .find_map(|attr| match attr {
+                    crate::ast::decl::Attribute::Public => Some(Access::Public),
+                    crate::ast::decl::Attribute::Private => Some(Access::Private),
+                    _ => None,
+                })
+                .unwrap_or(default_component_access);
             let dimension_attr_specs = attrs.iter().find_map(|a| {
                 if let crate::ast::decl::Attribute::Dimension(specs) = a {
                     Some(specs)
@@ -1499,6 +1617,8 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
 
                 fields.push(FieldLayout {
                     name: entity.name.clone(),
+                    access: component_access,
+                    owner_module: host_module.map(str::to_string),
                     offset,
                     size: field_size,
                     dims,
@@ -1740,6 +1860,8 @@ mod tests {
             fields: vec![
                 FieldLayout {
                     name: "x".into(),
+                    access: Access::Public,
+                    owner_module: None,
                     offset: 0,
                     size: 4,
                     dims: vec![],
@@ -1755,6 +1877,8 @@ mod tests {
                 },
                 FieldLayout {
                     name: "y".into(),
+                    access: Access::Public,
+                    owner_module: None,
                     offset: 4,
                     size: 4,
                     dims: vec![],
@@ -1798,6 +1922,8 @@ mod tests {
             fields: vec![
                 FieldLayout {
                     name: "a".into(),
+                    access: Access::Public,
+                    owner_module: None,
                     offset: 0,
                     size: 1,
                     dims: vec![],
@@ -1813,6 +1939,8 @@ mod tests {
                 },
                 FieldLayout {
                     name: "b".into(),
+                    access: Access::Public,
+                    owner_module: None,
                     offset: 8,
                     size: 8,
                     dims: vec![],
@@ -1828,6 +1956,8 @@ mod tests {
                 },
                 FieldLayout {
                     name: "c".into(),
+                    access: Access::Public,
+                    owner_module: None,
                     offset: 16,
                     size: 4,
                     dims: vec![],
@@ -2125,7 +2255,7 @@ mod tests {
     fn compute_layout_with_extends() {
         // type :: base; integer :: x; end type
         // type, extends(base) :: child; real :: y; end type
-        let reg = TypeLayoutRegistry::new();
+        let mut reg = TypeLayoutRegistry::new();
         let base_comps = vec![make_component(
             "x",
             crate::ast::decl::TypeSpec::Integer(None),
@@ -2142,6 +2272,7 @@ mod tests {
             crate::target::TargetLayout::LP64,
         );
         assert_eq!(base_layout.size, 4);
+        reg.insert(base_layout.clone());
 
         let child_comps = vec![make_component("y", crate::ast::decl::TypeSpec::Real(None))];
         let child_layout = compute_layout(
@@ -2159,6 +2290,45 @@ mod tests {
         assert_eq!(child_layout.field("x").unwrap().offset, 0); // inherited
         assert_eq!(child_layout.field("y").unwrap().offset, 4); // appended
         assert_eq!(child_layout.size, 8);
+
+        let explicit_parent = TypeInfo::Derived("base".into());
+        assert!(structure_constructor_uses_positional_parent(
+            &child_layout,
+            &reg,
+            Some(&explicit_parent),
+        ));
+        let positional_parent =
+            structure_constructor_field(&child_layout, &reg, None, 0, true).unwrap();
+        assert_eq!(positional_parent.name, "base");
+        assert_eq!(
+            positional_parent.type_info,
+            TypeInfo::Derived("base".into())
+        );
+        assert_eq!(positional_parent.offset, 0);
+        assert_eq!(positional_parent.size, 4);
+        assert_eq!(
+            structure_constructor_field(&child_layout, &reg, None, 1, true)
+                .unwrap()
+                .name,
+            "y"
+        );
+        assert!(!structure_constructor_uses_positional_parent(
+            &child_layout,
+            &reg,
+            Some(&TypeInfo::Integer { kind: None }),
+        ));
+        assert_eq!(
+            structure_constructor_field(&child_layout, &reg, None, 0, false)
+                .unwrap()
+                .name,
+            "y"
+        );
+        assert_eq!(
+            structure_constructor_field(&child_layout, &reg, Some("base"), 0, false)
+                .unwrap()
+                .type_info,
+            TypeInfo::Derived("base".into())
+        );
     }
 
     #[test]

@@ -4152,6 +4152,30 @@ fn defined_assignment_derived_operator_result_fixture_passes_at_o0() {
 }
 
 #[test]
+fn ar40_private_parent_constructor_fixture_passes_all_opts() {
+    if skip_native_e2e("ar40_private_parent_constructor_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar40_private_parent_constructor.f90");
+    assert!(
+        source.exists(),
+        "ar40_private_parent_constructor.f90 missing"
+    );
+
+    // The fixture's OPT_EQ and reproducibility annotations expand this O0
+    // anchor across every supported optimization and compile surface.
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar40_private_parent_constructor.f90 should pass at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;

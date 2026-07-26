@@ -114,6 +114,10 @@ pub(super) struct Ctx<'a> {
     /// selector, so parameter/intent attributes of a USE-imported symbol
     /// with the same name don't apply inside the body).
     pub(super) associate_frames: Vec<HashSet<String>>,
+    /// Derived types inherited by ASSOCIATE names from their selectors.
+    /// ASSOCIATE is not a symbol-table scope, but component validation must
+    /// still know the alias's type after lexical shadowing takes effect.
+    associate_type_frames: Vec<HashMap<String, TypeInfo>>,
     /// Stack of BLOCK-local declarations. BLOCK constructs are
     /// scoping units, but the resolver does not currently materialize
     /// statement-level block scopes in the symbol table. Validation
@@ -222,6 +226,7 @@ impl<'a> Ctx<'a> {
             allocatable_array_targets: HashSet::new(),
             lookup_cache: RefCell::new(std::collections::HashMap::new()),
             associate_frames: Vec::new(),
+            associate_type_frames: Vec::new(),
             block_decl_frames: Vec::new(),
             warn_pedantic,
             warn_deprecated,
@@ -281,6 +286,14 @@ impl<'a> Ctx<'a> {
     fn block_binding_attrs(&self, name: &str) -> Option<&BlockBindingAttrs> {
         let key = name.to_lowercase();
         self.block_decl_frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&key))
+    }
+
+    fn associate_binding_type_info(&self, name: &str) -> Option<&TypeInfo> {
+        let key = name.to_lowercase();
+        self.associate_type_frames
             .iter()
             .rev()
             .find_map(|frame| frame.get(&key))
@@ -1736,6 +1749,15 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
         Expr::FunctionCall { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
+                let derived_constructor = ctx
+                    .lookup_lexical(name)
+                    .filter(|symbol| matches!(symbol.kind, SymbolKind::DerivedType))
+                    .map(|symbol| symbol.name.clone());
+                if let Some(type_name) = derived_constructor {
+                    validate_structure_constructor_component_access(
+                        ctx, expr.span, &type_name, args,
+                    );
+                }
                 let enum_ctor = ctx.lookup(name).and_then(|sym| {
                     matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
                         .then(|| (sym.name.clone(), sym.arg_names.len()))
@@ -2311,7 +2333,39 @@ fn validate_unsupported_component_forms(
     ctx: &mut Ctx<'_>,
     components: &[crate::ast::decl::SpannedDecl],
 ) {
-    let _ = (ctx, components);
+    let in_module_specification_part =
+        matches!(ctx.st.scope(ctx.scope_id).kind, ScopeKind::Module(_));
+    for component in components {
+        let attrs = match &component.node {
+            Decl::AccessDefault {
+                access: Attribute::Private,
+            } => {
+                if !in_module_specification_part {
+                    ctx.error(
+                        component.span,
+                        "component PRIVATE statement is permitted only for a type defined in a module specification part",
+                    );
+                }
+                continue;
+            }
+            Decl::TypeDecl { attrs, .. } => attrs,
+            _ => continue,
+        };
+        let public = attrs.iter().any(|attr| matches!(attr, Attribute::Public));
+        let private = attrs.iter().any(|attr| matches!(attr, Attribute::Private));
+        if public && private {
+            ctx.error(
+                component.span,
+                "derived-type component cannot be both PUBLIC and PRIVATE",
+            );
+        }
+        if (public || private) && !in_module_specification_part {
+            ctx.error(
+                component.span,
+                "component PUBLIC/PRIVATE attribute is permitted only for a type defined in a module specification part",
+            );
+        }
+    }
 }
 
 /// Find the scope ID for a program unit, preferring children of `parent_scope`.
@@ -5484,9 +5538,13 @@ fn derived_type_name_for_expr(
 ) -> Option<String> {
     match &expr.node {
         Expr::Name { name } => ctx
-            .block_binding_attrs(name)
-            .and_then(|binding| binding.type_info.as_ref())
+            .associate_binding_type_info(name)
             .and_then(derived_type_name_from_type_info)
+            .or_else(|| {
+                ctx.block_binding_attrs(name)
+                    .and_then(|binding| binding.type_info.as_ref())
+                    .and_then(derived_type_name_from_type_info)
+            })
             .or_else(|| {
                 ctx.lookup_lexical(name)
                     .and_then(|sym| sym.type_info.as_ref())
@@ -5811,8 +5869,12 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
     }
     let resolved = match &expr.node {
         Expr::Name { name } => ctx
-            .block_binding_attrs(name)
-            .and_then(|binding| binding.type_info.clone())
+            .associate_binding_type_info(name)
+            .cloned()
+            .or_else(|| {
+                ctx.block_binding_attrs(name)
+                    .and_then(|binding| binding.type_info.clone())
+            })
             .or_else(|| {
                 ctx.lookup_lexical(name)
                     .and_then(|symbol| symbol.type_info.clone())
@@ -7129,6 +7191,58 @@ fn layout_component_type_info(
     None
 }
 
+fn scope_has_private_component_access(ctx: &Ctx<'_>, owner_module: &str) -> bool {
+    let mut scope_id = Some(ctx.lexical_scope_id());
+    while let Some(current) = scope_id {
+        let scope = ctx.st.scope(current);
+        if matches!(
+            &scope.kind,
+            ScopeKind::Module(name) if name.eq_ignore_ascii_case(owner_module)
+        ) || (matches!(scope.kind, ScopeKind::Submodule(_))
+            && scope
+                .submodule_ancestor
+                .as_deref()
+                .is_some_and(|ancestor| ancestor.eq_ignore_ascii_case(owner_module)))
+        {
+            return true;
+        }
+        scope_id = scope.parent;
+    }
+    false
+}
+
+fn field_is_accessible(ctx: &Ctx<'_>, field: &crate::sema::type_layout::FieldLayout) -> bool {
+    if field.access != Access::Private {
+        return true;
+    }
+    // PRIVATE components outside a module specification part are diagnosed
+    // at their declarations. Avoid cascading an access error when such a
+    // source-only layout has no meaningful module owner.
+    field
+        .owner_module
+        .as_deref()
+        .is_none_or(|owner| scope_has_private_component_access(ctx, owner))
+}
+
+fn report_inaccessible_component(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    component: &str,
+    base_type: &str,
+    owner_module: Option<&str>,
+) {
+    let owner = owner_module
+        .map(|module| format!(" (declared in module '{}')", module))
+        .unwrap_or_default();
+    ctx.error(
+        span,
+        format!(
+            "private component '{}' of derived type '{}' is not accessible in this scope{}",
+            component, base_type, owner
+        ),
+    );
+}
+
 fn resolve_component_access_type(
     ctx: &Ctx<'_>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -7142,7 +7256,10 @@ fn resolve_component_access_type(
     let Some(layouts) = ctx.type_layouts else {
         return Ok(None);
     };
-    let Some(layout) = layouts.get(&base_type) else {
+    let Some(layout) = layouts
+        .get_for_scope(ctx.lexical_scope_id(), &base_type)
+        .or_else(|| layouts.get(&base_type))
+    else {
         return Ok(None);
     };
     let Some(type_info) = layout_component_type_info(layout, component, layouts) else {
@@ -7155,6 +7272,28 @@ fn resolve_component_access_type(
 }
 
 fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    if let Expr::ComponentAccess { base, component } = &expr.node {
+        if let (Some(base_type), Some(layouts)) =
+            (derived_type_name_for_expr(ctx, base), ctx.type_layouts)
+        {
+            if let Some(layout) = layouts
+                .get_for_scope(ctx.lexical_scope_id(), &base_type)
+                .or_else(|| layouts.get(&base_type))
+            {
+                if let Some(field) = layout.field(component) {
+                    if !field_is_accessible(ctx, field) {
+                        report_inaccessible_component(
+                            ctx,
+                            expr.span,
+                            component,
+                            &base_type,
+                            field.owner_module.as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     if let Err((span, component, base_type)) = resolve_component_access_type(ctx, expr) {
         ctx.error(
             span,
@@ -7163,6 +7302,66 @@ fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Spanned
                 component, base_type
             ),
         );
+    }
+}
+
+fn validate_structure_constructor_component_access(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    type_name: &str,
+    args: &[Argument],
+) {
+    let Some(layouts) = ctx.type_layouts else {
+        return;
+    };
+    let Some(layout) = layouts
+        .get_for_scope(ctx.lexical_scope_id(), type_name)
+        .or_else(|| layouts.get(type_name))
+    else {
+        return;
+    };
+
+    let first_positional_type = args
+        .first()
+        .filter(|argument| argument.keyword.is_none())
+        .and_then(|argument| match &argument.value {
+            SectionSubscript::Element(value) => validation_expr_type_info(ctx, value),
+            SectionSubscript::Range { .. } => None,
+        });
+    let positional_parent = crate::sema::type_layout::structure_constructor_uses_positional_parent(
+        layout,
+        layouts,
+        first_positional_type.as_ref(),
+    );
+    let mut positional_index = 0usize;
+    for argument in args {
+        let field = crate::sema::type_layout::structure_constructor_field(
+            layout,
+            layouts,
+            argument.keyword.as_deref(),
+            positional_index,
+            positional_parent,
+        );
+        if argument.keyword.is_none() {
+            positional_index += 1;
+        }
+        let Some(field) = field else {
+            continue;
+        };
+        let field = field.as_ref();
+        if !field_is_accessible(ctx, field) {
+            let argument_span = match &argument.value {
+                SectionSubscript::Element(value) => value.span,
+                SectionSubscript::Range { .. } => span,
+            };
+            report_inaccessible_component(
+                ctx,
+                argument_span,
+                &field.name,
+                type_name,
+                field.owner_module.as_deref(),
+            );
+        }
     }
 }
 
@@ -8707,11 +8906,20 @@ fn validate_associate(
             }
         })
         .collect();
+    let type_frame = assocs
+        .iter()
+        .filter_map(|(name, selector)| {
+            validation_expr_type_info(ctx, selector)
+                .map(|type_info| (name.to_lowercase(), type_info))
+        })
+        .collect();
     ctx.associate_frames.push(frame.clone());
+    ctx.associate_type_frames.push(type_frame);
     ctx.ambiguity_lexical_frames
         .push(AmbiguityLexicalFrame::Associate { bindings: frame });
     validate_stmts(ctx, body);
     ctx.ambiguity_lexical_frames.pop();
+    ctx.associate_type_frames.pop();
     ctx.associate_frames.pop();
 }
 
@@ -9867,6 +10075,129 @@ end program block_consumers
             .count();
         assert_eq!(inaccessible, 7, "{errors:?}");
         assert_eq!(errors.len(), 7, "{errors:?}");
+    }
+
+    #[test]
+    fn private_components_are_visible_only_to_their_defining_module() {
+        let errors = errors_from(
+            "\
+module private_component_owner
+  implicit none
+
+  abstract interface
+    subroutine callback_iface()
+    end subroutine callback_iface
+  end interface
+
+  type, public :: explicit_box
+    integer, private :: explicit_hidden = 0
+    integer, public :: explicit_shown = 0
+    procedure(callback_iface), pointer, private, nopass :: private_callback
+  end type explicit_box
+
+  type, public :: default_box
+    private
+    integer :: default_hidden = 0
+    integer, public :: default_shown = 0
+  end type default_box
+contains
+  subroutine owner_access_is_valid(left, right)
+    type(explicit_box), intent(out) :: left
+    type(default_box), intent(out) :: right
+    left%explicit_hidden = 1
+    right%default_hidden = 2
+    if (associated(left%private_callback)) stop 1
+    left = explicit_box(explicit_hidden=3, explicit_shown=4)
+    right = default_box(5, 6)
+  end subroutine owner_access_is_valid
+end module private_component_owner
+
+module module_default_owner
+  implicit none
+  private
+  public :: public_box
+  type :: public_box
+    integer :: visible = 0
+  end type public_box
+end module module_default_owner
+
+program component_consumer
+  use private_component_owner, only: renamed_box => explicit_box, default_box
+  use module_default_owner, only: public_box
+  implicit none
+  type(renamed_box) :: left
+  type(default_box) :: right
+  type(public_box) :: unaffected
+  left%explicit_hidden = 7
+  right%default_hidden = 8
+  if (associated(left%private_callback)) stop 2
+  left%explicit_shown = 9
+  right%default_shown = 10
+  unaffected%visible = 11
+  left = renamed_box(explicit_hidden=12)
+  right = default_box(13)
+  left = renamed_box(explicit_shown=14)
+  right = default_box(default_shown=15)
+  associate (alias => left)
+    alias%explicit_hidden = 16
+    associate (nested_alias => alias)
+      nested_alias%explicit_hidden = 17
+    end associate
+  end associate
+end program component_consumer
+
+module foreign_extension
+  use private_component_owner, only: default_box
+  implicit none
+  type, extends(default_box) :: child_box
+    integer :: child_value = 0
+  end type child_box
+contains
+  subroutine foreign_access_is_invalid(value)
+    type(child_box), intent(inout) :: value
+    value%default_hidden = 18
+  end subroutine foreign_access_is_invalid
+end module foreign_extension
+",
+        );
+
+        let inaccessible = errors
+            .iter()
+            .filter(|error| error.contains("private component"))
+            .count();
+        assert_eq!(inaccessible, 8, "{errors:?}");
+        assert_eq!(errors.len(), 8, "{errors:?}");
+    }
+
+    #[test]
+    fn component_access_specs_require_a_module_type_definition() {
+        let errors = errors_from(
+            "\
+program local_types
+  implicit none
+  type :: explicit_private_t
+    integer, private :: hidden
+  end type explicit_private_t
+  type :: explicit_public_t
+    integer, public :: shown
+  end type explicit_public_t
+  type :: default_private_t
+    private
+    integer :: hidden
+  end type default_private_t
+end program local_types
+",
+        );
+
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("module specification part"))
+                .count(),
+            3,
+            "{errors:?}"
+        );
+        assert_eq!(errors.len(), 3, "{errors:?}");
     }
 
     #[test]

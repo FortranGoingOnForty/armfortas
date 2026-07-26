@@ -7319,16 +7319,22 @@ pub(super) fn eval_const_derived_ctor_global_init(
     let layout = registry.get(type_name)?;
     let mut bytes = vec![0u8; layout.size];
     let mut wrote = apply_derived_const_default_bytes(&mut bytes, 0, layout, registry);
+    let positional_parent =
+        structure_constructor_expr_uses_positional_parent(layout, args, None, st, registry);
     let mut positional_idx = 0usize;
 
     for arg in args {
-        let field = if let Some(keyword) = &arg.keyword {
-            layout.field(keyword)?
-        } else {
-            let field = layout.fields.get(positional_idx)?;
+        let field = crate::sema::type_layout::structure_constructor_field(
+            layout,
+            registry,
+            arg.keyword.as_deref(),
+            positional_idx,
+            positional_parent,
+        )?;
+        if arg.keyword.is_none() {
             positional_idx += 1;
-            field
-        };
+        }
+        let field = field.as_ref();
         if !field.dims.is_empty() || field.allocatable || field.pointer {
             return None;
         }
@@ -7352,6 +7358,27 @@ pub(super) fn eval_const_derived_ctor_global_init(
     } else {
         None
     }
+}
+
+fn structure_constructor_expr_uses_positional_parent(
+    layout: &crate::sema::type_layout::TypeLayout,
+    args: &[crate::ast::expr::Argument],
+    locals: Option<&HashMap<String, LocalInfo>>,
+    st: &SymbolTable,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    let Some(first) = args.first().filter(|argument| argument.keyword.is_none()) else {
+        return false;
+    };
+    let crate::ast::expr::SectionSubscript::Element(first_expr) = &first.value else {
+        return false;
+    };
+    let first_type = operator_expr_type_info(first_expr, locals, st, Some(registry));
+    crate::sema::type_layout::structure_constructor_uses_positional_parent(
+        layout,
+        registry,
+        first_type.as_ref(),
+    )
 }
 
 pub(super) fn collect_decl_param_consts_with_host(
@@ -55274,21 +55301,9 @@ pub(super) fn layout_component_field_or_parent_view(
         if parent_name.eq_ignore_ascii_case(component)
             || parent_layout.name.eq_ignore_ascii_case(component)
         {
-            return Some(crate::sema::type_layout::FieldLayout {
-                name: parent_layout.name.clone(),
-                offset: 0,
-                size: parent_layout.size,
-                dims: vec![],
-                declared_array: false,
-                type_info: crate::sema::symtab::TypeInfo::Derived(parent_layout.name.clone()),
-                allocatable: false,
-                pointer: false,
-                deferred_char: false,
-                target: false,
-                procedure_pointer: false,
-                procedure_pointer_nopass: false,
-                default_init: None,
-            });
+            return Some(crate::sema::type_layout::whole_parent_component_field(
+                parent_layout,
+            ));
         }
         parent = parent_layout.parent.as_deref();
     }
@@ -61967,15 +61982,20 @@ pub(super) fn lower_structure_constructor_expr(
         zero_fill_bytes(b, tmp, layout.size as i64);
     }
 
+    let positional_parent =
+        structure_constructor_expr_uses_positional_parent(layout, args, Some(locals), st, tl);
     let mut positional_idx = 0usize;
     for arg in args {
-        let field = if let Some(keyword) = &arg.keyword {
-            layout.field(keyword)
-        } else {
-            let field = layout.fields.get(positional_idx);
+        let field = crate::sema::type_layout::structure_constructor_field(
+            layout,
+            tl,
+            arg.keyword.as_deref(),
+            positional_idx,
+            positional_parent,
+        );
+        if arg.keyword.is_none() {
             positional_idx += 1;
-            field
-        };
+        }
         let Some(field) = field else {
             eprintln!(
                 "warning: structure constructor for '{}' has invalid field initializer",
@@ -61983,6 +62003,7 @@ pub(super) fn lower_structure_constructor_expr(
             );
             continue;
         };
+        let field = field.as_ref();
         if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));

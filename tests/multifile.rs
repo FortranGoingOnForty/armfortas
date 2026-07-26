@@ -1747,6 +1747,192 @@ fn private_derived_type_access_round_trips_through_amod() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// AR40-06: component accessibility is part of a derived type's semantic
+// interface. It must survive .amod reconstruction without hiding the layout
+// bytes required by descendant submodules and extending types.
+#[test]
+fn private_component_access_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=private_component_access_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_f90 = dir.join("provider.f90");
+    let provider_o = dir.join("provider.o");
+    let consumer_f90 = dir.join("consumer.f90");
+    let consumer_o = dir.join("consumer.o");
+    let public_consumer_f90 = dir.join("public_consumer.f90");
+    let public_consumer_o = dir.join("public_consumer.o");
+    let child_f90 = dir.join("child.f90");
+    let child_o = dir.join("child.o");
+
+    std::fs::write(
+        &provider_f90,
+        "\
+module component_provider
+  implicit none
+  private
+  public :: explicit_box, default_box, extended_box, set_hidden
+
+  abstract interface
+    subroutine callback_iface()
+    end subroutine callback_iface
+  end interface
+
+  type :: explicit_box
+    integer, private :: explicit_hidden = 0
+    integer, public :: explicit_shown = 0
+    procedure(callback_iface), pointer, private, nopass :: private_callback
+  end type explicit_box
+
+  type :: default_box
+    private
+    integer :: default_hidden = 0
+    integer, public :: default_shown = 0
+  end type default_box
+
+  type, extends(default_box) :: extended_box
+    integer, public :: extended_shown = 0
+  end type extended_box
+
+  interface
+    module subroutine set_hidden(value)
+      type(default_box), intent(inout) :: value
+    end subroutine set_hidden
+  end interface
+end module component_provider
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_f90,
+        "\
+module foreign_extension
+  use component_provider, only: default_box
+  implicit none
+  type, extends(default_box) :: child_box
+    integer :: child_value = 0
+  end type child_box
+contains
+  subroutine touch(value)
+    type(child_box), intent(inout) :: value
+    value%default_hidden = 1
+  end subroutine touch
+end module foreign_extension
+
+program private_consumer
+  use component_provider, only: renamed_box => explicit_box, default_box
+  implicit none
+  type(renamed_box) :: left
+  type(default_box) :: right
+  left%explicit_hidden = 2
+  right%default_hidden = 3
+  if (associated(left%private_callback)) stop 1
+  left = renamed_box(explicit_hidden=4)
+  right = default_box(5)
+  associate (alias => left)
+    alias%explicit_hidden = 6
+  end associate
+end program private_consumer
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &public_consumer_f90,
+        "\
+program public_consumer
+  use component_provider, only: explicit_box, default_box, extended_box
+  implicit none
+  type(explicit_box) :: left
+  type(default_box) :: right
+  type(extended_box) :: extended
+  left%explicit_shown = 7
+  right%default_shown = 8
+  left = explicit_box(explicit_shown=9)
+  right = default_box(default_shown=10)
+  extended = extended_box(default_box(default_shown=11), 12)
+  extended = extended_box(default_box=default_box(default_shown=13), extended_shown=14)
+end program public_consumer
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "\
+submodule(component_provider) component_child
+contains
+  module subroutine set_hidden(value)
+    type(default_box), intent(inout) :: value
+    value%default_hidden = 11
+  end subroutine set_hidden
+end submodule component_child
+",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &provider_f90, &provider_o, None);
+
+    let amod = std::fs::read_to_string(dir.join("component_provider.amod")).expect("missing .amod");
+    for (field, access) in [
+        ("explicit_hidden", "private"),
+        ("explicit_shown", "public"),
+        ("private_callback", "private"),
+        ("default_hidden", "private"),
+        ("default_shown", "public"),
+    ] {
+        let line = amod
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("@field {field} ")))
+            .unwrap_or_else(|| panic!("missing {field} field record:\n{amod}"));
+        assert!(
+            line.contains(&format!("@access {access}"))
+                && line.contains("@owner component_provider"),
+            "{field} accessibility/owner missing from .amod: {line}"
+        );
+    }
+
+    let rejected = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            consumer_f90.to_str().unwrap(),
+            "-c",
+            "-o",
+            consumer_o.to_str().unwrap(),
+        ])
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("private-component consumer compiler launch failed");
+    assert!(
+        !rejected.status.success(),
+        "ordinary and foreign-extending consumers accessed private components"
+    );
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert_eq!(
+        stderr.matches("private component").count(),
+        7,
+        "private-component diagnostics were incomplete:\n{stderr}"
+    );
+    assert!(
+        !consumer_o.exists(),
+        "rejected private-component consumer left an object file"
+    );
+
+    compile_file(
+        &compiler,
+        &public_consumer_f90,
+        &public_consumer_o,
+        Some(&dir),
+    );
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // AR40-01: a separate module function's RESULT identity is declared by its
 // interface. Unrelated locals and named constants must not affect same-TU
 // lowering or the identity serialized for cross-TU compilation.

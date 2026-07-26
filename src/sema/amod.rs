@@ -23,8 +23,9 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 9;
+const AMOD_VERSION: u32 = 10;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
+const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -1227,6 +1228,14 @@ fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLa
             if let Some(default_init) = &field.default_init {
                 attrs.push_str(&render_field_default_init(default_init));
             }
+            let access = match field.access {
+                Access::Private => "private",
+                Access::Public | Access::Default => "public",
+            };
+            attrs.push_str(&format!(" @access {access}"));
+            if let Some(owner_module) = field.owner_module.as_deref() {
+                attrs.push_str(&format!(" @owner {owner_module}"));
+            }
             writeln!(
                 out,
                 "  @field {} : {} @offset {} @size {}{}{}",
@@ -2365,7 +2374,9 @@ fn parse_arg(line: &str) -> AmodArg {
 fn parse_type(
     header: &str,
     lines: &mut std::iter::Peekable<std::str::Lines>,
-) -> crate::sema::type_layout::TypeLayout {
+    version: u32,
+    path: &Path,
+) -> Result<crate::sema::type_layout::TypeLayout, String> {
     use crate::sema::type_layout::*;
 
     fn parse_field_default_init_token(token: &str) -> Option<FieldDefaultInit> {
@@ -2477,8 +2488,12 @@ fn parse_type(
                 let mut procedure_pointer = false;
                 let mut procedure_pointer_nopass = false;
                 let mut default_init = None;
-                for token in flag_tail.split_whitespace() {
-                    match token {
+                let mut access = None;
+                let mut field_owner_module = None;
+                let tokens: Vec<&str> = flag_tail.split_whitespace().collect();
+                let mut token_index = 0;
+                while token_index < tokens.len() {
+                    match tokens[token_index] {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
                         "@deferred_char" => deferred_char = true,
@@ -2486,17 +2501,96 @@ fn parse_type(
                         "@nopass" => procedure_pointer_nopass = true,
                         "@target" => target = true,
                         "@declared_array" => declared_array = true,
+                        "@access" => {
+                            if access.is_some() {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field accessibility for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            let Some(value) = tokens.get(token_index + 1) else {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (missing @field accessibility value for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            };
+                            access = Some(match *value {
+                                "public" => Access::Public,
+                                "private" => Access::Private,
+                                _ => {
+                                    return Err(format!(
+                                        "{}: corrupt .amod file (invalid @field accessibility '{}' for '{}'); rebuild the provider module",
+                                        path.display(),
+                                        value,
+                                        fname.trim()
+                                    ));
+                                }
+                            });
+                            token_index += 2;
+                            continue;
+                        }
+                        "@owner" => {
+                            if field_owner_module.is_some() {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field owner for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            let Some(value) = tokens.get(token_index + 1) else {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (missing @field owner for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            };
+                            if value.starts_with('@') {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (invalid @field owner '{}' for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    value,
+                                    fname.trim()
+                                ));
+                            }
+                            field_owner_module = Some((*value).to_string());
+                            token_index += 2;
+                            continue;
+                        }
                         _ => {
-                            if let Some(init) = parse_field_default_init_token(token) {
+                            if let Some(init) = parse_field_default_init_token(tokens[token_index])
+                            {
                                 default_init = Some(init);
                             }
                         }
                     }
+                    token_index += 1;
+                }
+                let access = match access {
+                    Some(access) => access,
+                    None if version < AMOD_FIELD_ACCESS_VERSION => Access::Public,
+                    None => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (missing @field accessibility for '{}'); rebuild the provider module",
+                            path.display(),
+                            fname.trim()
+                        ));
+                    }
+                };
+                if version >= AMOD_FIELD_ACCESS_VERSION && field_owner_module.is_none() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @field owner for '{}'); rebuild the provider module",
+                        path.display(),
+                        fname.trim()
+                    ));
                 }
                 declared_array |= !dims.is_empty();
                 let ftype = parse_type_info(ftype_str.trim());
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
+                    access,
+                    owner_module: field_owner_module,
                     offset: offset_str.trim().parse().unwrap_or(0),
                     size: size_str.trim().parse().unwrap_or(0),
                     dims,
@@ -2558,7 +2652,12 @@ fn parse_type(
     let owner_path = owner_module
         .as_ref()
         .map(|owner| owner.to_ascii_lowercase());
-    TypeLayout {
+    for field in &mut fields {
+        if field.owner_module.is_none() {
+            field.owner_module.clone_from(&owner_module);
+        }
+    }
+    Ok(TypeLayout {
         name,
         owner_module,
         owner_scope: None,
@@ -2571,7 +2670,7 @@ fn parse_type(
         type_tag,
         parent,
         is_abstract,
-    }
+    })
 }
 
 fn parse_amod_type(
@@ -2596,7 +2695,7 @@ fn parse_amod_type(
     };
     let layout_header = format!("@type {name}");
     Ok(AmodType {
-        layout: parse_type(&layout_header, lines),
+        layout: parse_type(&layout_header, lines, version, path)?,
         access,
     })
 }
@@ -3121,27 +3220,32 @@ mod tests {
 
     #[test]
     fn current_type_records_require_and_preserve_accessibility() {
-        let amod_text = r#"#!amod 9
+        let amod_text = r#"#!amod 10
 # module: type_access
 
 @type exposed_t, public
   @layout size=4 align=4
-  @field value : integer @offset 0 @size 4
+  @field value : integer @offset 0 @size 4 @access public @owner type_access
 @end type
 
 @type hidden_t, private
   @layout size=4 align=4
-  @field value : integer @offset 0 @size 4
+  @field value : integer @offset 0 @size 4 @access public @owner type_access
 @end type
 "#;
         let iface = parse_amod(amod_text, Path::new("type_access.amod")).unwrap();
         assert_eq!(iface.types.len(), 2);
         assert_eq!(iface.types[0].layout.name, "exposed_t");
         assert_eq!(iface.types[0].access, Access::Public);
+        assert_eq!(iface.types[0].layout.fields[0].access, Access::Public);
+        assert_eq!(
+            iface.types[0].layout.fields[0].owner_module.as_deref(),
+            Some("type_access")
+        );
         assert_eq!(iface.types[1].layout.name, "hidden_t");
         assert_eq!(iface.types[1].access, Access::Private);
 
-        let missing_access = r#"#!amod 9
+        let missing_access = r#"#!amod 10
 # module: missing_type_access
 
 @type hidden_t
@@ -3155,6 +3259,66 @@ mod tests {
                 && err.contains("malformed @type accessibility")
                 && err.contains("rebuild the provider module"),
             "unexpected missing-access diagnostic: {err}"
+        );
+
+        for (record, expected) in [
+            (
+                "@field value : integer @offset 0 @size 4 @owner type_access",
+                "missing @field accessibility",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access protected @owner type_access",
+                "invalid @field accessibility",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access private",
+                "missing @field owner",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access public @access private @owner type_access",
+                "duplicate @field accessibility",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access public @owner type_access @owner type_access",
+                "duplicate @field owner",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access public @owner @pointer",
+                "invalid @field owner",
+            ),
+        ] {
+            let malformed = format!(
+                "#!amod 10\n# module: type_access\n\n@type item_t, public\n  @layout size=4 align=4\n  {record}\n@end type\n"
+            );
+            let error = parse_amod(&malformed, Path::new("bad_field_access.amod"))
+                .expect_err("malformed current @field access was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains(expected)
+                    && error.contains("rebuild the provider module"),
+                "unexpected malformed-field diagnostic: {error}"
+            );
+        }
+
+        let legacy = r#"#!amod 9
+# module: legacy_type_access
+
+@type item_t, public
+  @layout size=4 align=4
+  @field value : integer @offset 0 @size 4
+  @owner legacy_type_access
+@end type
+"#;
+        let legacy_iface = parse_amod(legacy, Path::new("legacy_type_access.amod")).unwrap();
+        assert_eq!(
+            legacy_iface.types[0].layout.fields[0].access,
+            Access::Public
+        );
+        assert_eq!(
+            legacy_iface.types[0].layout.fields[0]
+                .owner_module
+                .as_deref(),
+            Some("legacy_type_access")
         );
     }
 
@@ -3261,7 +3425,7 @@ mod tests {
         let mut lines = "  @final afs_modproc_m_finish rank=oops\n@end type\n"
             .lines()
             .peekable();
-        let _ = parse_type("@type item", &mut lines);
+        let _ = parse_type("@type item", &mut lines, 2, Path::new("legacy.amod"));
     }
 
     #[test]
@@ -3375,7 +3539,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 9
+            r#"#!amod 10
 # module: cache_test
 # source: cache_test.f90
 
@@ -3407,7 +3571,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 9
+            r#"#!amod 10
 # module: cached_parent
 # source: cached_parent.f90
 
@@ -3420,7 +3584,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 9
+            r#"#!amod 10
 # module: supplied_parent
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
@@ -3452,7 +3616,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 9
+            r#"#!amod 10
 # module: child
 # ancestor-module: root
 # parent-submodule: middle
@@ -3551,7 +3715,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 9)")
+            err.contains("incompatible .amod version 6 (compiler requires 10)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

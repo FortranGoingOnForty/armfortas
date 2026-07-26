@@ -20,8 +20,9 @@ pub enum Decl {
         entities: Vec<EntityDecl>,
     },
 
-    /// Standalone `PRIVATE` or `PUBLIC` statement that sets the module's
-    /// default access for all subsequent declarations.
+    /// Standalone access statement. At module scope this sets the module's
+    /// default accessibility; inside a derived-type component stream a
+    /// `PRIVATE` record is the type's private-components statement.
     AccessDefault { access: Attribute },
 
     /// `PUBLIC :: name1, name2` or `PRIVATE :: assignment(=)` — sets
