@@ -61159,16 +61159,54 @@ pub(super) fn lower_pointer_dummy_actual(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    use crate::sema::symtab::SymbolKind;
+
     if let Expr::Name { name } = &expr.node {
-        let info = locals.get(&name.to_lowercase())?;
-        if !info.is_pointer {
+        let key = name.to_lowercase();
+        if let Some(info) = locals.get(&key).filter(|info| info.is_pointer) {
+            return Some(if info.by_ref {
+                b.load(info.addr)
+            } else {
+                info.addr
+            });
+        }
+        let is_procedure = st
+            .lookup_local_then_any(current_proc_scope(), &key)
+            .is_some_and(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                ) || symbol.attrs.external
+                    || symbol.attrs.procedure_iface.is_some()
+            });
+        if is_procedure {
+            // A direct procedure designator has no pointer slot of its own.
+            // Materialize one for a procedure-pointer dummy: its callee-side
+            // representation dereferences the incoming slot to obtain the
+            // code address.
+            let raw = lower_arg_by_ref_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            if b.func().value_type(raw).is_some_and(|ty| ty.is_ptr()) {
+                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let pointer =
+                    coerce_to_type(b, raw, &IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(pointer, slot);
+                return Some(slot);
+            }
             return None;
         }
-        return Some(if info.by_ref {
-            b.load(info.addr)
-        } else {
-            info.addr
-        });
     }
     if let Expr::ComponentAccess { .. } = &expr.node {
         let tl = type_layouts?;

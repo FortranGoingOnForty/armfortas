@@ -15,7 +15,7 @@ use super::allocatable::{
     validate_allocatable_item,
 };
 use super::pointer::validate_pointer_assignment;
-use super::procedure::validate_procedure_pointer_initializer;
+use super::procedure::{validate_procedure_dummy_actual, validate_procedure_pointer_initializer};
 use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
@@ -8219,6 +8219,8 @@ struct ExplicitDummyArg {
     allocatable: bool,
     pointer: bool,
     procedure: bool,
+    procedure_scope: ScopeId,
+    procedure_has_explicit_interface: bool,
     rank: usize,
     assumed_rank: bool,
     allows_sequence_association: bool,
@@ -8271,6 +8273,8 @@ fn build_explicit_procedure_interface(
             allocatable: dummy.attrs.allocatable,
             pointer: dummy.attrs.pointer,
             procedure: dummy.attrs.external || dummy.attrs.procedure_iface.is_some(),
+            procedure_scope: procedure_scope.id,
+            procedure_has_explicit_interface: dummy.attrs.procedure_iface.is_some(),
             rank: dummy.attrs.array_spec.len(),
             assumed_rank,
             allows_sequence_association,
@@ -8549,7 +8553,19 @@ fn validate_explicit_actual(
             ),
         );
     }
-    if dummy.procedure || matches!(actual.node, Expr::NilArgument) {
+    if matches!(actual.node, Expr::NilArgument) {
+        return;
+    }
+    if dummy.procedure {
+        validate_procedure_dummy_actual(
+            ctx,
+            &dummy.name,
+            dummy.procedure_scope,
+            dummy.procedure_has_explicit_interface,
+            dummy.pointer,
+            dummy.intent,
+            actual,
+        );
         return;
     }
 
@@ -14334,6 +14350,534 @@ end module test_m
             compatible_module_target.is_empty(),
             "unexpected errors: {compatible_module_target:?}"
         );
+    }
+
+    #[test]
+    fn procedure_dummy_actual_requires_a_callable_with_matching_characteristics() {
+        let data_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  integer :: storage
+  call apply(storage)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+        );
+        assert_eq!(
+            data_actual,
+            ["actual argument for procedure dummy 'action' is not a procedure or procedure pointer"]
+        );
+
+        let incompatible_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+
+  subroutine action(value)
+    real, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            incompatible_actual,
+            ["actual procedure 'action' for dummy 'candidate' has incompatible characteristics: dummy argument 1 has a different type"]
+        );
+
+        let function_call_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    integer function callback()
+    end function callback
+  end interface
+  integer :: storage, result
+  result = evaluate(storage)
+contains
+  integer function evaluate(candidate)
+    procedure(callback) :: candidate
+    evaluate = candidate()
+  end function evaluate
+end program test
+",
+        );
+        assert_eq!(
+            function_call_actual,
+            ["actual argument for procedure dummy 'candidate' is not a procedure or procedure pointer"]
+        );
+
+        let compatible_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+
+  pure subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert!(
+            compatible_actual.is_empty(),
+            "unexpected errors: {compatible_actual:?}"
+        );
+    }
+
+    #[test]
+    fn procedure_dummy_actual_rejects_noncallable_forms() {
+        let cases = [
+            (
+                "data expression",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  integer :: storage
+  call apply(storage + 1)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual argument for procedure dummy 'action' is not a procedure or procedure pointer",
+            ),
+            (
+                "data function result",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  call apply(make_value())
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+
+  integer function make_value()
+    make_value = 1
+  end function make_value
+end program test
+",
+                "actual argument for procedure dummy 'action' is not a procedure or procedure pointer",
+            ),
+            (
+                "abstract interface",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  call apply(callback)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual procedure 'callback' for dummy 'action' is an abstract interface and is not callable",
+            ),
+            (
+                "NULL for nonpointer dummy",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  call apply(null())
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual argument for nonpointer procedure dummy 'action' cannot be NULL()",
+            ),
+            (
+                "restricted intrinsic",
+                "\
+program test
+  implicit none
+  abstract interface
+    character function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: char
+  call apply(char)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual procedure 'char' for dummy 'action' is not an unrestricted specific intrinsic procedure",
+            ),
+        ];
+
+        for (label, source, expected) in cases {
+            let errors = errors_from(source);
+            assert_eq!(errors, [expected], "{label}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn procedure_dummy_actual_checks_full_characteristic_set() {
+        let cases = [
+            (
+                "nature",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  integer function action(value)
+    integer, intent(in) :: value
+    action = value
+  end function action
+end program test
+",
+                "procedure nature differs",
+            ),
+            (
+                "dummy count",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value, extra)
+    integer, intent(in) :: value, extra
+  end subroutine action
+end program test
+",
+                "dummy argument count differs",
+            ),
+            (
+                "dummy rank",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value(:)
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different rank or shape",
+            ),
+            (
+                "dummy intent",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different INTENT",
+            ),
+            (
+                "PURE",
+                "\
+program test
+  implicit none
+  abstract interface
+    pure subroutine callback(value)
+      integer, intent(inout) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine action
+end program test
+",
+                "target is not PURE",
+            ),
+            (
+                "BIND(C)",
+                "\
+program test
+  use iso_c_binding, only: c_int
+  implicit none
+  abstract interface
+    subroutine callback(value) bind(c)
+      import :: c_int
+      integer(c_int), value :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer(c_int), value :: value
+  end subroutine action
+end program test
+",
+                "BIND(C) attributes differ",
+            ),
+        ];
+
+        for (label, source, reason) in cases {
+            let errors = errors_from(source);
+            assert_eq!(
+                errors,
+                [format!(
+                    "actual procedure 'action' for dummy 'candidate' has incompatible characteristics: {reason}"
+                )],
+                "{label}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_dummy_actual_obeys_pointer_association_rules() {
+        let missing_intent = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call install(action)
+contains
+  subroutine install(candidate)
+    procedure(callback), pointer :: candidate
+  end subroutine install
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            missing_intent,
+            ["nonpointer actual procedure 'action' requires procedure pointer dummy 'candidate' to have INTENT(IN)"]
+        );
+
+        let compatible = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  abstract interface
+    function callback_factory() result(result)
+      import :: callback
+      procedure(callback), pointer :: result
+    end function callback_factory
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+  call consume(handler)
+  call consume(make_handler())
+  call consume(null())
+  call borrow(action)
+  call forward(action)
+contains
+  subroutine consume(candidate)
+    procedure(callback), pointer :: candidate
+  end subroutine consume
+
+  subroutine borrow(candidate)
+    procedure(callback), pointer, intent(in) :: candidate
+  end subroutine borrow
+
+  subroutine forward(candidate)
+    procedure(callback) :: candidate
+    call borrow(candidate)
+  end subroutine forward
+
+  function make_handler() result(result)
+    procedure(callback), pointer :: result
+    result => action
+  end function make_handler
+
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert!(compatible.is_empty(), "unexpected errors: {compatible:?}");
+    }
+
+    #[test]
+    fn optional_procedure_dummy_validates_only_present_conditional_arms() {
+        let compatible = errors_from(
+            "\
+program test
+  implicit none
+  logical :: enabled
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  enabled = .true.
+  call maybe((enabled ? action : .nil.))
+contains
+  subroutine maybe(candidate)
+    procedure(callback), optional :: candidate
+  end subroutine maybe
+  subroutine action()
+  end subroutine action
+end program test
+",
+        );
+        assert!(compatible.is_empty(), "unexpected errors: {compatible:?}");
+
+        let invalid_present_arm = errors_from(
+            "\
+program test
+  implicit none
+  logical :: enabled
+  integer :: storage
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  enabled = .true.
+  call maybe((enabled ? storage : .nil.))
+contains
+  subroutine maybe(candidate)
+    procedure(callback), optional :: candidate
+  end subroutine maybe
+end program test
+",
+        );
+        assert_eq!(
+            invalid_present_arm,
+            ["actual argument for procedure dummy 'candidate' is not a procedure or procedure pointer"]
+        );
+    }
+
+    #[test]
+    fn procedure_dummy_actual_accepts_characteristic_exceptions_and_external_unknowns() {
+        let errors = errors_from(
+            "\
+program test
+  abstract interface
+    subroutine impure_callback(value)
+      integer, intent(inout) :: value
+    end subroutine impure_callback
+    real function intrinsic_callback(value)
+      real, intent(in) :: value
+    end function intrinsic_callback
+  end interface
+  intrinsic :: sin
+  external :: separately_compiled
+  call apply_impure(pure_action)
+  call apply_intrinsic(sin)
+  call apply_impure(separately_compiled)
+contains
+  subroutine apply_impure(candidate)
+    procedure(impure_callback) :: candidate
+  end subroutine apply_impure
+
+  subroutine apply_intrinsic(candidate)
+    procedure(intrinsic_callback) :: candidate
+  end subroutine apply_intrinsic
+
+  pure subroutine pure_action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine pure_action
+end program test
+",
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 
     // ---- Pure constraints ----

@@ -93,6 +93,7 @@ struct PointerObject {
 struct ProcedureTarget {
     name: String,
     intrinsic: bool,
+    pointer: bool,
     explicit: bool,
     characteristics: Option<ProcedureCharacteristics>,
 }
@@ -186,6 +187,145 @@ pub(super) fn validate_procedure_pointer_initializer(
         ),
     };
     validate_pointer_target(ctx, &pointer, target, span);
+}
+
+/// Validate an actual argument associated with a procedure dummy.
+///
+/// F2018 15.5.2.9 requires every such actual to denote a procedure. When the
+/// dummy has an explicit interface, the effective procedure characteristics
+/// must also match. Procedure-pointer dummies additionally require a pointer
+/// actual unless a nonpointer procedure is associated with INTENT(IN).
+pub(super) fn validate_procedure_dummy_actual(
+    ctx: &mut Ctx<'_>,
+    dummy_name: &str,
+    dummy_scope: ScopeId,
+    dummy_has_explicit_interface: bool,
+    dummy_pointer: bool,
+    dummy_intent: Option<Intent>,
+    actual: &SpannedExpr,
+) {
+    let actual = unparenthesized(actual);
+    if matches!(actual.node, Expr::NilArgument) {
+        return;
+    }
+    if let Expr::ConditionalExpr {
+        then_val, else_val, ..
+    } = &actual.node
+    {
+        validate_procedure_dummy_actual(
+            ctx,
+            dummy_name,
+            dummy_scope,
+            dummy_has_explicit_interface,
+            dummy_pointer,
+            dummy_intent,
+            then_val,
+        );
+        validate_procedure_dummy_actual(
+            ctx,
+            dummy_name,
+            dummy_scope,
+            dummy_has_explicit_interface,
+            dummy_pointer,
+            dummy_intent,
+            else_val,
+        );
+        return;
+    }
+
+    let Some(dummy) = ctx
+        .st
+        .scope(dummy_scope)
+        .symbols
+        .get(&dummy_name.to_ascii_lowercase())
+    else {
+        return;
+    };
+    let expected = direct_procedure_characteristics(ctx, dummy, &mut HashSet::new());
+    if dummy_has_explicit_interface && expected.is_none() {
+        ctx.error(
+            actual.span,
+            format!(
+                "procedure dummy '{}' has an unresolved declared interface",
+                dummy_name
+            ),
+        );
+        return;
+    }
+
+    match resolve_procedure_target(ctx, actual) {
+        TargetResolution::Unknown => {}
+        TargetResolution::Null => {
+            if !dummy_pointer {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "actual argument for nonpointer procedure dummy '{}' cannot be NULL()",
+                        dummy_name
+                    ),
+                );
+            }
+        }
+        TargetResolution::DataName(_) | TargetResolution::DataFunctionResult(_) => {
+            ctx.error(
+                actual.span,
+                format!(
+                    "actual argument for procedure dummy '{}' is not a procedure or procedure pointer",
+                    dummy_name
+                ),
+            );
+        }
+        TargetResolution::AbstractInterface(name) => ctx.error(
+            actual.span,
+            format!(
+                "actual procedure '{}' for dummy '{}' is an abstract interface and is not callable",
+                name, dummy_name
+            ),
+        ),
+        TargetResolution::IneligibleIntrinsic(name) => ctx.error(
+            actual.span,
+            format!(
+                "actual procedure '{}' for dummy '{}' is not an unrestricted specific intrinsic procedure",
+                name, dummy_name
+            ),
+        ),
+        TargetResolution::Procedure(target) => {
+            if dummy_pointer && !target.pointer && dummy_intent != Some(Intent::In) {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "nonpointer actual procedure '{}' requires procedure pointer dummy '{}' to have INTENT(IN)",
+                        target.name, dummy_name
+                    ),
+                );
+                return;
+            }
+
+            let Some(expected) = expected.as_ref() else {
+                return;
+            };
+            let Some(actual_characteristics) = target.characteristics.as_ref() else {
+                // An explicitly EXTERNAL actual may have only an implicit
+                // interface. Its conformance remains a program requirement;
+                // the caller has no characteristics available to compare.
+                return;
+            };
+            if let Some(reason) = incompatible_characteristic(
+                ctx,
+                expected,
+                actual_characteristics,
+                target.intrinsic,
+            ) {
+                ctx.error(
+                    actual.span,
+                    format!(
+                        "actual procedure '{}' for dummy '{}' has incompatible characteristics: {}",
+                        target.name, dummy_name, reason
+                    ),
+                );
+            }
+        }
+    }
 }
 
 fn validate_pointer_target(
@@ -363,6 +503,7 @@ fn resolve_procedure_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> TargetResoluti
             TargetResolution::Procedure(ProcedureTarget {
                 name: expr.to_sexpr(),
                 intrinsic: false,
+                pointer: true,
                 explicit,
                 characteristics: characteristics.map(|characteristics| *characteristics),
             })
@@ -380,6 +521,7 @@ fn resolve_procedure_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> TargetResoluti
                     return TargetResolution::Procedure(ProcedureTarget {
                         name: expr.to_sexpr(),
                         intrinsic: false,
+                        pointer: true,
                         explicit: true,
                         characteristics: None,
                     });
@@ -389,6 +531,7 @@ fn resolve_procedure_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> TargetResoluti
             TargetResolution::Procedure(ProcedureTarget {
                 name: expr.to_sexpr(),
                 intrinsic: false,
+                pointer: true,
                 explicit: true,
                 characteristics: characteristics_for_interface_name(
                     ctx,
@@ -407,6 +550,7 @@ fn resolve_procedure_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> TargetResoluti
                     return TargetResolution::Procedure(ProcedureTarget {
                         name: name.clone(),
                         intrinsic: true,
+                        pointer: false,
                         explicit: true,
                         characteristics: Some(characteristics),
                     });
@@ -425,6 +569,7 @@ fn resolve_procedure_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> TargetResoluti
                 return TargetResolution::Procedure(ProcedureTarget {
                     name: name.clone(),
                     intrinsic: false,
+                    pointer: true,
                     explicit: symbol.attrs.procedure_iface.is_some(),
                     characteristics: procedure_pointer_characteristics(
                         ctx,
@@ -440,6 +585,7 @@ fn resolve_procedure_target(ctx: &Ctx<'_>, expr: &SpannedExpr) -> TargetResoluti
                 return TargetResolution::Procedure(ProcedureTarget {
                     name: name.clone(),
                     intrinsic,
+                    pointer: false,
                     explicit: intrinsic || characteristics.is_some(),
                     characteristics,
                 });

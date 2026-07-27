@@ -33819,6 +33819,252 @@ fn procedure_pointer_assignment_requires_a_compatible_procedure_target() {
 }
 
 #[test]
+fn procedure_dummy_actuals_require_callable_compatible_effective_arguments() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_actuals_require_callable_compatible_effective_arguments count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let provider_source = "\
+module callback_api
+  implicit none
+  private
+  public :: callback, invoke, borrow, evaluate, mutate, make_handler
+  abstract interface
+    subroutine callback(value, result)
+      integer, intent(in) :: value
+      integer, intent(out) :: result
+    end subroutine callback
+  end interface
+contains
+  subroutine invoke(candidate, value, result)
+    procedure(callback) :: candidate
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    call candidate(value, result)
+  end subroutine invoke
+
+  subroutine borrow(candidate, value, result)
+    procedure(callback), pointer, intent(in) :: candidate
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    call candidate(value, result)
+  end subroutine borrow
+
+  integer function evaluate(candidate, value)
+    procedure(callback), pointer, intent(in) :: candidate
+    integer, intent(in) :: value
+    call candidate(value, evaluate)
+  end function evaluate
+
+  subroutine mutate(candidate)
+    procedure(callback), pointer :: candidate
+    nullify(candidate)
+  end subroutine mutate
+
+  function make_handler() result(candidate)
+    procedure(callback), pointer :: candidate
+    candidate => double_value
+  end function make_handler
+
+  subroutine double_value(value, result)
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    result = value * 2
+  end subroutine double_value
+end module callback_api
+";
+
+    let invalid_dir = unique_dir("procedure_dummy_invalid");
+    let provider = write_program_in(&invalid_dir, "provider.f90", provider_source);
+    let provider_object = invalid_dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&invalid_dir)
+        .args([
+            "-O0",
+            "-c",
+            "-J",
+            invalid_dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-dummy provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "procedure-dummy provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let rejected = [
+        (
+            "data",
+            "program p\n  use callback_api, only: invoke\n  implicit none\n  integer :: storage, result\n  call invoke(storage, 1, result)\nend program p\n",
+            "actual argument for procedure dummy 'candidate' is not a procedure or procedure pointer",
+        ),
+        (
+            "characteristics",
+            "program p\n  use callback_api, only: invoke\n  implicit none\n  integer :: result\n  call invoke(action, 1, result)\ncontains\n  subroutine action(value, result)\n    real, intent(in) :: value\n    integer, intent(out) :: result\n    result = int(value)\n  end subroutine action\nend program p\n",
+            "actual procedure 'action' for dummy 'candidate' has incompatible characteristics: dummy argument 1 has a different type",
+        ),
+        (
+            "pointer_intent",
+            "program p\n  use callback_api, only: mutate\n  implicit none\n  call mutate(action)\ncontains\n  subroutine action(value, result)\n    integer, intent(in) :: value\n    integer, intent(out) :: result\n    result = value\n  end subroutine action\nend program p\n",
+            "nonpointer actual procedure 'action' requires procedure pointer dummy 'candidate' to have INTENT(IN)",
+        ),
+        (
+            "abstract",
+            "program p\n  use callback_api, only: callback, invoke\n  implicit none\n  integer :: result\n  call invoke(callback, 1, result)\nend program p\n",
+            "actual procedure 'callback' for dummy 'candidate' is an abstract interface and is not callable",
+        ),
+    ];
+
+    for (stem, source, diagnostic) in rejected {
+        let src = write_program_in(&invalid_dir, &format!("{stem}.f90"), source);
+        let object = invalid_dir.join(format!("{stem}.o"));
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&invalid_dir)
+            .args([
+                "-O0",
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                invalid_dir.to_str().unwrap(),
+                "-J",
+                invalid_dir.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid procedure-dummy consumer compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable diagnostic: {stderr}"
+        );
+        assert!(
+            !object.exists(),
+            "{stem} published an object despite the semantic error"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&invalid_dir);
+
+    let consumer_source = "\
+program p
+  use callback_api, only: invoke, borrow, evaluate, mutate, make_handler
+  implicit none
+  abstract interface
+    subroutine callback_shape(value, result)
+      integer, intent(in) :: value
+      integer, intent(out) :: result
+    end subroutine callback_shape
+  end interface
+  procedure(callback_shape), pointer :: handler
+  integer :: result
+
+  handler => double_value
+  call invoke(double_value, 4, result)
+  if (result /= 8) error stop 1
+  call invoke(handler, 5, result)
+  if (result /= 10) error stop 2
+  call borrow(double_value, 6, result)
+  if (result /= 12) error stop 3
+  call borrow(handler, 7, result)
+  if (result /= 14) error stop 4
+  call borrow(make_handler(), 8, result)
+  if (result /= 16) error stop 5
+  result = evaluate(double_value, 9)
+  if (result /= 18) error stop 6
+  result = evaluate(handler, 10)
+  if (result /= 20) error stop 7
+  result = evaluate(make_handler(), 11)
+  if (result /= 22) error stop 8
+  call mutate(handler)
+  if (associated(handler)) error stop 9
+  print *, 'ok'
+contains
+  subroutine double_value(value, result)
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    result = value * 2
+  end subroutine double_value
+end program p
+";
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let dir = unique_dir(&format!(
+            "procedure_dummy_compatible_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let provider = write_program_in(&dir, "provider.f90", provider_source);
+        let consumer = write_program_in(&dir, "consumer.f90", consumer_source);
+        let provider_object = dir.join("provider.o");
+        let provider_result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                provider.to_str().unwrap(),
+                "-o",
+                provider_object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("optimized procedure-dummy provider compile failed to spawn");
+        assert!(
+            provider_result.status.success(),
+            "{optimization}: procedure-dummy provider should compile: {}",
+            String::from_utf8_lossy(&provider_result.stderr)
+        );
+
+        let executable = dir.join("consumer");
+        let consumer_result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                consumer.to_str().unwrap(),
+                provider_object.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("optimized procedure-dummy consumer compile failed to spawn");
+        assert!(
+            consumer_result.status.success(),
+            "{optimization}: compatible procedure-dummy consumer should compile: {}",
+            String::from_utf8_lossy(&consumer_result.stderr)
+        );
+        let run = Command::new(&executable)
+            .output()
+            .expect("optimized procedure-dummy consumer failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: procedure-dummy consumer failed: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn procedure_pointer_decl_compiles_through_wrapper_calls() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
