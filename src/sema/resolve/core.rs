@@ -2858,24 +2858,153 @@ fn is_unresolved_declaration_placeholder(
             .is_some_and(|symbol| symbol.kind == SymbolKind::Variable && symbol.type_info.is_none())
 }
 
+fn repeated_symbol_access_error(name: &str, span: crate::lexer::Span) -> SemaError {
+    SemaError {
+        span,
+        msg: format!(
+            "accessibility of '{}' is specified more than once in this scope",
+            name.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn repeated_default_access_error(span: crate::lexer::Span) -> SemaError {
+    SemaError {
+        span,
+        msg: "default accessibility is specified more than once in this scope".into(),
+    }
+}
+
+fn entity_declaration_access(attrs: &[Attribute]) -> (Option<Access>, bool) {
+    let mut access = None;
+    for attr in attrs {
+        let next = match attr {
+            Attribute::Public => Access::Public,
+            Attribute::Private => Access::Private,
+            _ => continue,
+        };
+        if access.replace(next).is_some() {
+            return (access, true);
+        }
+    }
+    (access, false)
+}
+
+fn derived_type_declaration_access(attrs: &[decl::TypeAttr]) -> (Option<Access>, bool) {
+    let mut access = None;
+    for attr in attrs {
+        let next = match attr {
+            decl::TypeAttr::Public => Access::Public,
+            decl::TypeAttr::Private => Access::Private,
+            _ => continue,
+        };
+        if access.replace(next).is_some() {
+            return (access, true);
+        }
+    }
+    (access, false)
+}
+
+fn record_explicit_symbol_access(
+    seen: &mut HashSet<String>,
+    name: &str,
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    let key = name.to_ascii_lowercase();
+    if !seen.insert(key) {
+        return Err(repeated_symbol_access_error(name, span));
+    }
+    Ok(())
+}
+
+fn validate_accessibility_specifications(decls: &[SpannedDecl]) -> Result<(), SemaError> {
+    let mut default_access_seen = false;
+    let mut explicitly_accessible_names = HashSet::new();
+
+    for declaration in decls {
+        match &declaration.node {
+            Decl::AccessDefault { .. } => {
+                if default_access_seen {
+                    return Err(repeated_default_access_error(declaration.span));
+                }
+                default_access_seen = true;
+            }
+            Decl::AccessList { names, .. } => {
+                for name in names {
+                    record_explicit_symbol_access(
+                        &mut explicitly_accessible_names,
+                        name,
+                        declaration.span,
+                    )?;
+                }
+            }
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } => {
+                let (access, repeated) = entity_declaration_access(attrs);
+                let Some(first_entity) = entities.first() else {
+                    continue;
+                };
+                if repeated {
+                    return Err(repeated_symbol_access_error(
+                        &first_entity.name,
+                        declaration.span,
+                    ));
+                }
+                if access.is_some() {
+                    for entity in entities {
+                        record_explicit_symbol_access(
+                            &mut explicitly_accessible_names,
+                            &entity.name,
+                            declaration.span,
+                        )?;
+                    }
+                }
+            }
+            Decl::DerivedTypeDef { name, attrs, .. } => {
+                let (access, repeated) = derived_type_declaration_access(attrs);
+                if repeated {
+                    return Err(repeated_symbol_access_error(name, declaration.span));
+                }
+                if access.is_some() {
+                    record_explicit_symbol_access(
+                        &mut explicitly_accessible_names,
+                        name,
+                        declaration.span,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), SemaError> {
+    validate_accessibility_specifications(decls)?;
+
     // Collect AccessList entries — they must be applied AFTER all TypeDecls
     // because the list may reference symbols declared later in the module.
-    let mut pending_access: Vec<(Access, Vec<String>)> = Vec::new();
+    let mut pending_access: Vec<(Access, Vec<String>, crate::lexer::Span)> = Vec::new();
     for decl in decls {
         match &decl.node {
-            Decl::AccessDefault { access } => match access {
-                Attribute::Private => st.set_default_access(Access::Private),
-                Attribute::Public => st.set_default_access(Access::Public),
-                _ => {}
-            },
+            Decl::AccessDefault { access } => {
+                let access = match access {
+                    Attribute::Private => Access::Private,
+                    Attribute::Public => Access::Public,
+                    _ => continue,
+                };
+                if !st.set_default_access(access) {
+                    return Err(repeated_default_access_error(decl.span));
+                }
+            }
             Decl::AccessList { access, names } => {
                 let acc = match access {
                     Attribute::Private => Access::Private,
                     Attribute::Public => Access::Public,
                     _ => continue,
                 };
-                pending_access.push((acc, names.clone()));
+                pending_access.push((acc, names.clone(), decl.span));
             }
             Decl::TypeDecl {
                 type_spec,
@@ -3122,9 +3251,11 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
         }
     }
     // Apply deferred access-list overrides after all symbols are declared.
-    for (access, names) in &pending_access {
+    for (access, names, span) in &pending_access {
         for name in names {
-            st.set_symbol_access(name, *access);
+            if !st.set_symbol_access(name, *access) {
+                return Err(repeated_symbol_access_error(name, *span));
+            }
         }
     }
     Ok(())
@@ -4653,6 +4784,210 @@ end module host_generic_m
             .named_interface_symbol_in_scope(nested_scope.id, "dispatch")
             .unwrap();
         assert_eq!(generic.arg_names, ["host_value"]);
+    }
+
+    #[test]
+    fn repeated_accessibility_specifications_are_rejected() {
+        let cases = [
+            (
+                "same access in separate statements",
+                "\
+module repeated_same_access_m
+  implicit none
+  integer :: value
+  public :: value
+  public :: VALUE
+end module repeated_same_access_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "conflicting access in separate statements",
+                "\
+module repeated_conflicting_access_m
+  implicit none
+  integer :: value
+  public :: value
+  private :: value
+end module repeated_conflicting_access_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "duplicate name in one statement",
+                "\
+module repeated_in_one_access_list_m
+  implicit none
+  integer :: value
+  public :: value, VALUE
+end module repeated_in_one_access_list_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "declaration attribute before access statement",
+                "\
+module attribute_then_access_list_m
+  implicit none
+  integer, public :: value
+  private :: value
+end module attribute_then_access_list_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "access statement before declaration attribute",
+                "\
+module access_list_then_attribute_m
+  implicit none
+  public :: value
+  integer, private :: value
+end module access_list_then_attribute_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "duplicate declaration attributes",
+                "\
+module repeated_access_attribute_m
+  implicit none
+  integer, public, PUBLIC :: value
+end module repeated_access_attribute_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "conflicting declaration attributes",
+                "\
+module conflicting_access_attributes_m
+  implicit none
+  integer, public, private :: value
+end module conflicting_access_attributes_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "duplicate derived type attributes",
+                "\
+module repeated_type_access_attribute_m
+  implicit none
+  type, public, PUBLIC :: item
+    integer :: value
+  end type item
+end module repeated_type_access_attribute_m
+",
+                "accessibility of 'item' is specified more than once in this scope",
+            ),
+            (
+                "derived type attribute and access statement",
+                "\
+module repeated_type_access_m
+  implicit none
+  type, public :: item
+    integer :: value
+  end type item
+  public :: item
+end module repeated_type_access_m
+",
+                "accessibility of 'item' is specified more than once in this scope",
+            ),
+            (
+                "same default access",
+                "\
+module repeated_default_access_m
+  implicit none
+  private
+  private
+end module repeated_default_access_m
+",
+                "default accessibility is specified more than once in this scope",
+            ),
+            (
+                "conflicting default access",
+                "\
+module conflicting_default_access_m
+  implicit none
+  private
+  public
+end module conflicting_default_access_m
+",
+                "default accessibility is specified more than once in this scope",
+            ),
+            (
+                "generic access before generic declaration",
+                "\
+module repeated_generic_access_m
+  implicit none
+  public :: dispatch
+  private :: DISPATCH
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+end module repeated_generic_access_m
+",
+                "accessibility of 'dispatch' is specified more than once in this scope",
+            ),
+        ];
+
+        for (label, source, expected) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg, expected,
+                "unexpected repeated-access diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_access_and_one_named_override_are_not_repetitions() {
+        resolve_source(
+            "\
+module legal_access_override_m
+  implicit none
+  private
+  public :: visible
+  integer :: hidden
+  integer :: visible
+end module legal_access_override_m
+",
+        );
+    }
+
+    #[test]
+    fn large_accessibility_ledger_accepts_unique_names_and_finds_a_late_repeat() {
+        let names = (0..4096)
+            .map(|index| format!("value_{index:04}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let valid = format!(
+            "\
+module large_unique_access_m
+  implicit none
+  integer, public :: {names}
+end module large_unique_access_m
+"
+        );
+        resolve_source(&valid);
+
+        let invalid = format!(
+            "\
+module large_repeated_access_m
+  implicit none
+  integer, public :: {names}
+  private :: VALUE_0000
+end module large_repeated_access_m
+"
+        );
+        let err = resolve_error(&invalid);
+        assert_eq!(
+            err.msg,
+            "accessibility of 'value_0000' is specified more than once in this scope"
+        );
     }
 
     #[test]

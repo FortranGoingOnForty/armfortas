@@ -145,6 +145,7 @@ impl SymbolTable {
             bind_c: false,
             binding_label: None,
             default_access: Access::Public,
+            default_access_specified: false,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
             result_name: None,
@@ -323,6 +324,7 @@ impl SymbolTable {
             bind_c: false,
             binding_label: None,
             default_access: Access::Public,
+            default_access_specified: false,
             pending_access: HashMap::new(),
             arg_order: Vec::new(),
             result_name,
@@ -1940,16 +1942,30 @@ impl SymbolTable {
     }
 
     /// Set the default accessibility for the current scope.
-    pub fn set_default_access(&mut self, access: Access) {
+    ///
+    /// Returns `false` without mutation when the scope already has an explicit
+    /// default-access specification.
+    pub fn set_default_access(&mut self, access: Access) -> bool {
+        if self.scopes[self.current].default_access_specified {
+            return false;
+        }
         self.clear_lookup_caches();
         self.scopes[self.current].default_access = access;
+        self.scopes[self.current].default_access_specified = true;
+        true
     }
 
     /// Set the access level on a specific symbol in the current scope.
     /// Used for `PUBLIC :: name` and `PRIVATE :: name` statements.
-    pub fn set_symbol_access(&mut self, name: &str, access: Access) {
-        self.clear_lookup_caches();
+    ///
+    /// Returns `false` without mutation when the name's accessibility was
+    /// already specified in this scope.
+    pub fn set_symbol_access(&mut self, name: &str, access: Access) -> bool {
         let key = name.to_lowercase();
+        if self.scopes[self.current].pending_access.contains_key(&key) {
+            return false;
+        }
+        self.clear_lookup_caches();
         self.scopes[self.current]
             .pending_access
             .insert(key.clone(), access);
@@ -1960,6 +1976,7 @@ impl SymbolTable {
         if let Some(sym) = self.scopes[self.current].symbols.get_mut(&side_key) {
             sym.attrs.access = access;
         }
+        true
     }
 
     /// Iterate all scopes (for generic interface resolution during lowering).
@@ -2111,6 +2128,7 @@ pub struct Scope {
     /// `None` also represents the standard `NAME=''` no-label case.
     pub binding_label: Option<String>,
     pub default_access: Access,
+    pub(crate) default_access_specified: bool,
     pub pending_access: HashMap<String, Access>,
     /// Ordered dummy argument names (for function/subroutine scopes).
     pub arg_order: Vec<String>,
@@ -2680,8 +2698,8 @@ mod tests {
     fn pending_access_applies_to_late_defined_symbol() {
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Module("m".into()));
-        st.set_default_access(Access::Private);
-        st.set_symbol_access("create_list", Access::Public);
+        assert!(st.set_default_access(Access::Private));
+        assert!(st.set_symbol_access("create_list", Access::Public));
 
         let mut sym = make_symbol("create_list", SymbolKind::Function);
         sym.attrs.access = st.default_access(st.current_scope());
@@ -2689,6 +2707,23 @@ mod tests {
 
         let found = st.lookup("create_list").unwrap();
         assert_eq!(found.attrs.access, Access::Public);
+    }
+
+    #[test]
+    fn repeated_access_setters_preserve_the_first_specification() {
+        let mut st = SymbolTable::new();
+        st.push_scope(ScopeKind::Module("m".into()));
+
+        assert!(st.set_default_access(Access::Private));
+        assert!(!st.set_default_access(Access::Public));
+        assert_eq!(st.default_access(st.current_scope()), Access::Private);
+
+        assert!(st.set_symbol_access("value", Access::Public));
+        assert!(!st.set_symbol_access("VALUE", Access::Private));
+        assert_eq!(
+            st.scope(st.current_scope()).pending_access.get("value"),
+            Some(&Access::Public)
+        );
     }
 
     #[test]
@@ -3296,7 +3331,7 @@ mod tests {
         let mut st = SymbolTable::new();
         st.push_scope(ScopeKind::Module("m".into()));
         assert_eq!(st.default_access(st.current_scope()), Access::Public);
-        st.set_default_access(Access::Private);
+        assert!(st.set_default_access(Access::Private));
         assert_eq!(st.default_access(st.current_scope()), Access::Private);
     }
 }

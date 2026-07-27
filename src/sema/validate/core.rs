@@ -2351,12 +2351,25 @@ fn validate_unsupported_component_forms(
             Decl::TypeDecl { attrs, .. } => attrs,
             _ => continue,
         };
-        let public = attrs.iter().any(|attr| matches!(attr, Attribute::Public));
-        let private = attrs.iter().any(|attr| matches!(attr, Attribute::Private));
+        let public_count = attrs
+            .iter()
+            .filter(|attr| matches!(attr, Attribute::Public))
+            .count();
+        let private_count = attrs
+            .iter()
+            .filter(|attr| matches!(attr, Attribute::Private))
+            .count();
+        let public = public_count != 0;
+        let private = private_count != 0;
         if public && private {
             ctx.error(
                 component.span,
                 "derived-type component cannot be both PUBLIC and PRIVATE",
+            );
+        } else if public_count + private_count > 1 {
+            ctx.error(
+                component.span,
+                "derived-type component accessibility is specified more than once",
             );
         }
         if (public || private) && !in_module_specification_part {

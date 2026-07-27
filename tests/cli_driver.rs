@@ -2558,6 +2558,191 @@ fn generic_interfaces_must_not_mix_functions_and_subroutines() {
 }
 
 #[test]
+fn accessibility_may_be_specified_only_once_per_entity_or_default() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=accessibility_may_be_specified_only_once_per_entity_or_default count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "repeated_same_access",
+            "module repeated_same_access_m\n  implicit none\n  integer :: value\n  public :: value\n  public :: VALUE\nend module repeated_same_access_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_conflicting_access",
+            "module repeated_conflicting_access_m\n  implicit none\n  integer :: value\n  public :: value\n  private :: value\nend module repeated_conflicting_access_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_access_in_one_list",
+            "module repeated_access_in_one_list_m\n  implicit none\n  integer :: value\n  public :: value, VALUE\nend module repeated_access_in_one_list_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "access_attribute_then_list",
+            "module access_attribute_then_list_m\n  implicit none\n  integer, public :: value\n  private :: value\nend module access_attribute_then_list_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "access_list_then_attribute",
+            "module access_list_then_attribute_m\n  implicit none\n  public :: value\n  integer, private :: value\nend module access_list_then_attribute_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_access_attribute",
+            "module repeated_access_attribute_m\n  implicit none\n  integer, public, PUBLIC :: value\nend module repeated_access_attribute_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "conflicting_access_attributes",
+            "module conflicting_access_attributes_m\n  implicit none\n  integer, public, private :: value\nend module conflicting_access_attributes_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_type_access_attribute",
+            "module repeated_type_access_attribute_m\n  implicit none\n  type, public, PUBLIC :: item\n    integer :: value\n  end type item\nend module repeated_type_access_attribute_m\n",
+            "accessibility of 'item' is specified more than once in this scope",
+        ),
+        (
+            "repeated_derived_type_access",
+            "module repeated_derived_type_access_m\n  implicit none\n  type, public :: item\n    integer :: value\n  end type item\n  public :: item\nend module repeated_derived_type_access_m\n",
+            "accessibility of 'item' is specified more than once in this scope",
+        ),
+        (
+            "repeated_default_access",
+            "module repeated_default_access_m\n  implicit none\n  private\n  private\nend module repeated_default_access_m\n",
+            "default accessibility is specified more than once in this scope",
+        ),
+        (
+            "conflicting_default_access",
+            "module conflicting_default_access_m\n  implicit none\n  private\n  public\nend module conflicting_default_access_m\n",
+            "default accessibility is specified more than once in this scope",
+        ),
+        (
+            "repeated_generic_access",
+            "module repeated_generic_access_m\n  implicit none\n  public :: dispatch\n  private :: DISPATCH\n  interface dispatch\n    module procedure compute_value\n  end interface dispatch\ncontains\n  integer function compute_value(value)\n    integer, intent(in) :: value\n    compute_value = value\n  end function compute_value\nend module repeated_generic_access_m\n",
+            "accessibility of 'dispatch' is specified more than once in this scope",
+        ),
+        (
+            "repeated_component_access_attribute",
+            "module repeated_component_access_attribute_m\n  implicit none\n  type :: item\n    integer, public, PUBLIC :: value\n  end type item\nend module repeated_component_access_attribute_m\n",
+            "derived-type component accessibility is specified more than once",
+        ),
+    ];
+
+    for (stem, source, diagnostic) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("repeated-access compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable repeated-access diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("single_access_specification");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module access_contract_m\n  implicit none\n  private\n  public :: visible_value, evaluate\n  integer, parameter :: visible_value = 7\n  type, public :: exported_item\n    private\n    integer, public :: value\n  end type exported_item\n  interface evaluate\n    module procedure evaluate_integer\n  end interface evaluate\ncontains\n  integer function evaluate_integer(value)\n    integer, intent(in) :: value\n    evaluate_integer = value + visible_value\n  end function evaluate_integer\nend module access_contract_m\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-access provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "one default, named override, type access, and component access should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program access_consumer\n  use access_contract_m, only: visible_value, exported_item, evaluate\n  implicit none\n  type(exported_item) :: item\n  item%value = evaluate(5)\n  if (visible_value /= 7 .or. item%value /= 12) error stop 1\n  print *, 'ok'\nend program access_consumer\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-access consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "single accessibility specifications should survive .amod loading: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("single-access consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "single-access consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
