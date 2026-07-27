@@ -880,6 +880,7 @@ fn install_external_interface(
             pointer: proc.result_pointer,
             pure: proc.pure,
             elemental: proc.elemental,
+            abstract_interface: proc.abstract_interface,
             is_separate_module_interface: proc.is_separate_module_interface,
             is_separate_module_procedure: proc.is_separate_module_procedure,
             bind_c: proc.bind_c,
@@ -935,7 +936,13 @@ fn install_external_interface(
             // explicit-shape dummies must stay explicit-shaped, though: using
             // AssumedShape here makes lowering pass a descriptor to callees
             // whose ABI expects a bare element pointer.
-            let array_spec: Vec<ArraySpec> = if arg.assumed_rank {
+            let array_spec: Vec<ArraySpec> = if let Some(specs) = arg
+                .array_spec
+                .as_ref()
+                .filter(|specs| specs.len() == arg.rank as usize)
+            {
+                specs.clone()
+            } else if arg.assumed_rank {
                 vec![ArraySpec::AssumedRank]
             } else if arg.rank == 0 {
                 Vec::new()
@@ -964,6 +971,10 @@ fn install_external_interface(
                 value: arg.value,
                 allocatable: arg.allocatable,
                 pointer: arg.pointer,
+                target: arg.target,
+                asynchronous: arg.asynchronous,
+                contiguous: arg.contiguous,
+                volatile: arg.volatile,
                 external: arg.external,
                 procedure_iface: arg.procedure_iface.clone(),
                 array_spec,
@@ -1037,12 +1048,18 @@ fn install_external_interface(
             let result_attrs = SymbolAttrs {
                 allocatable: proc.result_allocatable,
                 pointer: proc.result_pointer,
+                external: proc.result_procedure_iface.is_some(),
+                procedure_iface: proc.result_procedure_iface.clone(),
                 array_spec: result_array_spec,
                 ..Default::default()
             };
             let _ = st.define(Symbol {
                 name: synth_name,
-                kind: crate::sema::symtab::SymbolKind::Variable,
+                kind: if proc.result_procedure_iface.is_some() {
+                    crate::sema::symtab::SymbolKind::ProcedurePointer
+                } else {
+                    crate::sema::symtab::SymbolKind::Variable
+                },
                 type_info: proc.return_type.clone(),
                 attrs: result_attrs,
                 defined_at: dummy_span,

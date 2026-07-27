@@ -23,7 +23,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 10;
+const AMOD_VERSION: u32 = 11;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 pub(crate) const SMOD_VERSION: u32 = 2;
@@ -74,21 +74,7 @@ pub(crate) fn parse_array_bounds(s: &str) -> Option<Vec<crate::ast::decl::ArrayS
         if dim.is_empty() {
             return None;
         }
-        // Find the first `:` at depth 0 (parens/brackets) to split
-        // lower:upper. Don't split on `:` inside function calls.
-        let mut depth: i32 = 0;
-        let mut split_at: Option<usize> = None;
-        for (idx, ch) in dim.char_indices() {
-            match ch {
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth -= 1,
-                ':' if depth == 0 => {
-                    split_at = Some(idx);
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let split_at = top_level_colon(dim);
         let (lower_str, upper_str) = match split_at {
             Some(i) => (Some(&dim[..i]), &dim[i + 1..]),
             None => (None, dim),
@@ -101,6 +87,79 @@ pub(crate) fn parse_array_bounds(s: &str) -> Option<Vec<crate::ast::decl::ArrayS
         specs.push(ArraySpec::Explicit { lower, upper });
     }
     Some(specs)
+}
+
+fn stringify_dummy_array_spec(specs: &[crate::ast::decl::ArraySpec]) -> Option<String> {
+    use crate::ast::decl::ArraySpec;
+    if specs.is_empty() {
+        return None;
+    }
+    let parts = specs
+        .iter()
+        .map(|spec| match spec {
+            ArraySpec::Explicit { lower, upper } => lower.as_ref().map_or_else(
+                || upper.to_sexpr(),
+                |lower| format!("{}:{}", lower.to_sexpr(), upper.to_sexpr()),
+            ),
+            ArraySpec::AssumedShape { lower } => lower
+                .as_ref()
+                .map_or_else(|| ":".to_string(), |lower| format!("{}:", lower.to_sexpr())),
+            ArraySpec::AssumedSize { lower } => lower.as_ref().map_or_else(
+                || "*".to_string(),
+                |lower| format!("{}:*", lower.to_sexpr()),
+            ),
+            ArraySpec::Deferred => "deferred".to_string(),
+            ArraySpec::AssumedRank => "..".to_string(),
+        })
+        .collect::<Vec<_>>();
+    Some(format!("({})", parts.join("; ")))
+}
+
+fn parse_dummy_array_spec(s: &str) -> Option<Vec<crate::ast::decl::ArraySpec>> {
+    use crate::ast::decl::ArraySpec;
+    let inner = s.strip_prefix('(').and_then(|s| s.strip_suffix(')'))?;
+    let mut specs = Vec::new();
+    for dim in inner.split(';') {
+        let dim = dim.trim();
+        let spec = match dim {
+            "" => return None,
+            ":" => ArraySpec::AssumedShape { lower: None },
+            "*" => ArraySpec::AssumedSize { lower: None },
+            "deferred" => ArraySpec::Deferred,
+            ".." => ArraySpec::AssumedRank,
+            _ if dim.ends_with(":*") => ArraySpec::AssumedSize {
+                lower: Some(parse_simple_expr(dim[..dim.len() - 2].trim())?),
+            },
+            _ if dim.ends_with(':') => ArraySpec::AssumedShape {
+                lower: Some(parse_simple_expr(dim[..dim.len() - 1].trim())?),
+            },
+            _ => {
+                let (lower, upper) = match top_level_colon(dim) {
+                    Some(index) => (
+                        Some(parse_simple_expr(dim[..index].trim())?),
+                        parse_simple_expr(dim[index + 1..].trim())?,
+                    ),
+                    None => (None, parse_simple_expr(dim)?),
+                };
+                ArraySpec::Explicit { lower, upper }
+            }
+        };
+        specs.push(spec);
+    }
+    Some(specs)
+}
+
+fn top_level_colon(text: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_simple_expr(src: &str) -> Option<crate::ast::expr::SpannedExpr> {
@@ -904,6 +963,9 @@ fn emit_procedure(
     let proc_scope = procedure_scope_for_module(st, mod_scope_id, name);
 
     if is_func {
+        // RESULT identity is semantic state, not something reconstructed from
+        // whichever same-typed local happens to sort first.
+        let result_var = proc_scope.and_then(Scope::procedure_result_symbol);
         let ret_str = type_info_to_string(sym.type_info.as_ref());
         write!(out, "@function {} -> {}", sym.name, ret_str).unwrap();
         if sym.attrs.allocatable {
@@ -912,12 +974,15 @@ fn emit_procedure(
         if sym.attrs.pointer {
             write!(out, ", result_pointer").unwrap();
         }
+        if let Some(interface_name) = result_var
+            .filter(|result| result.kind == SymbolKind::ProcedurePointer)
+            .and_then(|result| result.attrs.procedure_iface.as_deref())
+        {
+            write!(out, ", result_procedure={interface_name}").unwrap();
+        }
         if sym.attrs.result_rank > 0 {
             write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
         }
-        // RESULT identity is semantic state, not something reconstructed from
-        // whichever same-typed local happens to sort first.
-        let result_var = proc_scope.and_then(Scope::procedure_result_symbol);
         if let Some(result_name) = proc_scope.and_then(|scope| scope.result_name.as_deref()) {
             if !result_name.eq_ignore_ascii_case(name) {
                 write!(out, ", result_name={result_name}").unwrap();
@@ -945,6 +1010,9 @@ fn emit_procedure(
     }
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
+    }
+    if sym.attrs.abstract_interface {
+        write!(out, ", abstract_interface").unwrap();
     }
     if sym.attrs.is_separate_module_interface {
         write!(out, ", module_interface").unwrap();
@@ -1074,6 +1142,18 @@ fn emit_procedure(
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
                 }
+                if arg_sym.attrs.target {
+                    arg_attrs.push("target");
+                }
+                if arg_sym.attrs.asynchronous {
+                    arg_attrs.push("asynchronous");
+                }
+                if arg_sym.attrs.contiguous {
+                    arg_attrs.push("contiguous");
+                }
+                if arg_sym.attrs.volatile {
+                    arg_attrs.push("volatile");
+                }
                 if arg_sym
                     .attrs
                     .array_spec
@@ -1106,6 +1186,11 @@ fn emit_procedure(
                 let rank_attr = format!("rank={}", arg_sym.attrs.array_spec.len());
                 if !arg_sym.attrs.array_spec.is_empty() {
                     arg_attrs.push(rank_attr.as_str());
+                }
+                let array_spec_attr = stringify_dummy_array_spec(&arg_sym.attrs.array_spec)
+                    .map(|spec| format!("array_spec=\"{spec}\""));
+                if let Some(spec) = array_spec_attr.as_deref() {
+                    arg_attrs.push(spec);
                 }
                 if !arg_attrs.is_empty() {
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
@@ -1467,6 +1552,10 @@ pub struct AmodArg {
     pub descriptor: bool,
     pub allocatable: bool,
     pub pointer: bool,
+    pub target: bool,
+    pub asynchronous: bool,
+    pub contiguous: bool,
+    pub volatile: bool,
     pub hidden: bool,
     /// True for `procedure(iface) :: name` dummies. The producer side
     /// stores these as Variable + EXTERNAL; the consumer-side dispatch
@@ -1487,10 +1576,13 @@ pub struct AmodArg {
     /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
     /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
     /// `array_spec` of this rank, deriving each dim's kind from the
-    /// `descriptor` / `allocatable` / `pointer` flags. Bound expressions
-    /// (Explicit lower:upper) are not preserved across .amod boundaries —
-    /// SMP-body synthesis only needs the shape kind and rank for Phase 2.
+    /// `descriptor` / `allocatable` / `pointer` flags when exact metadata
+    /// from a current `.amod` is unavailable.
     pub rank: u8,
+    /// Exact source dummy shape. Procedure characteristics include shape and
+    /// nonconstant bound dependence, so rank-only reconstruction is not
+    /// semantically sufficient.
+    pub array_spec: Option<Vec<crate::ast::decl::ArraySpec>>,
 }
 
 /// A procedure parsed from an .amod file.
@@ -1501,6 +1593,10 @@ pub struct AmodProc {
     pub return_type: Option<TypeInfo>,
     pub result_allocatable: bool,
     pub result_pointer: bool,
+    /// Declared interface of a procedure-pointer function result. A plain
+    /// `result_pointer` is insufficient because data pointers can also have
+    /// a derived declared type.
+    pub result_procedure_iface: Option<String>,
     pub result_rank: u8,
     /// Sprint35-SMP Phase 2: the result variable's user-declared name
     /// (from `result(X)` clause). None when the result name matches
@@ -1518,6 +1614,9 @@ pub struct AmodProc {
     pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
+    /// The declaration came from an ABSTRACT INTERFACE body and cannot be
+    /// used as a callable designator or procedure-pointer target.
+    pub abstract_interface: bool,
     pub is_separate_module_interface: bool,
     pub is_separate_module_procedure: bool,
     pub access: Access,
@@ -2228,10 +2327,15 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let attr_chunks = split_attrs_top_level(attrs_str);
     let pure = attr_chunks.iter().any(|a| a == "pure");
     let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let abstract_interface = attr_chunks.iter().any(|a| a == "abstract_interface");
     let is_separate_module_interface = attr_chunks.iter().any(|a| a == "module_interface");
     let is_separate_module_procedure = attr_chunks.iter().any(|a| a == "module_procedure");
     let result_allocatable = attr_chunks.iter().any(|a| a == "result_allocatable");
     let result_pointer = attr_chunks.iter().any(|a| a == "result_pointer");
+    let result_procedure_iface = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("result_procedure="))
+        .map(str::to_string);
     let result_rank = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("result_rank="))
@@ -2286,11 +2390,13 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         return_type,
         result_allocatable,
         result_pointer,
+        result_procedure_iface,
         result_rank,
         result_name,
         result_array_bounds,
         pure,
         elemental,
+        abstract_interface,
         is_separate_module_interface,
         is_separate_module_procedure,
         access,
@@ -2330,29 +2436,39 @@ fn parse_arg(line: &str) -> AmodArg {
         None
     };
 
-    let optional = attr_str.contains("optional");
-    let value = attr_str.contains("value");
-    let descriptor = attr_str.contains("descriptor");
-    let allocatable = attr_str.contains("allocatable");
-    let pointer = attr_str.contains("pointer");
-    let external = attr_str
-        .split(", ")
-        .any(|tok| tok.trim().eq_ignore_ascii_case("external"));
-    let assumed_rank = attr_str
-        .split(", ")
-        .any(|tok| tok.trim().eq_ignore_ascii_case("assumed-rank"));
+    let attr_chunks = split_attrs_top_level(attr_str);
+    let has_attr = |expected: &str| {
+        attr_chunks
+            .iter()
+            .any(|attr| attr.eq_ignore_ascii_case(expected))
+    };
+    let optional = has_attr("optional");
+    let value = has_attr("value");
+    let descriptor = has_attr("descriptor");
+    let allocatable = has_attr("allocatable");
+    let pointer = has_attr("pointer");
+    let target = has_attr("target");
+    let asynchronous = has_attr("asynchronous");
+    let contiguous = has_attr("contiguous");
+    let volatile = has_attr("volatile");
+    let external = has_attr("external");
+    let assumed_rank = has_attr("assumed-rank");
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
-    let rank = attr_str
-        .split(", ")
-        .find_map(|tok| tok.strip_prefix("rank="))
+    let rank = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("rank="))
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(0);
-    let procedure_iface = attr_str.split(", ").find_map(|tok| {
-        let t = tok.trim();
-        let inner = t.strip_prefix("procedure(")?;
+    let procedure_iface = attr_chunks.iter().find_map(|attr| {
+        let inner = attr.strip_prefix("procedure(")?;
         inner.strip_suffix(')').map(|s| s.trim().to_string())
     });
+    let array_spec = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("array_spec="))
+        .map(|spec| spec.trim_matches('"'))
+        .and_then(parse_dummy_array_spec);
 
     AmodArg {
         name,
@@ -2363,11 +2479,16 @@ fn parse_arg(line: &str) -> AmodArg {
         descriptor,
         allocatable,
         pointer,
+        target,
+        asynchronous,
+        contiguous,
+        volatile,
         hidden,
         external,
         procedure_iface,
         assumed_rank,
         rank,
+        array_spec,
     }
 }
 
@@ -3220,7 +3341,7 @@ mod tests {
 
     #[test]
     fn current_type_records_require_and_preserve_accessibility() {
-        let amod_text = r#"#!amod 10
+        let amod_text = r#"#!amod 11
 # module: type_access
 
 @type exposed_t, public
@@ -3245,7 +3366,7 @@ mod tests {
         assert_eq!(iface.types[1].layout.name, "hidden_t");
         assert_eq!(iface.types[1].access, Access::Private);
 
-        let missing_access = r#"#!amod 10
+        let missing_access = r#"#!amod 11
 # module: missing_type_access
 
 @type hidden_t
@@ -3288,7 +3409,7 @@ mod tests {
             ),
         ] {
             let malformed = format!(
-                "#!amod 10\n# module: type_access\n\n@type item_t, public\n  @layout size=4 align=4\n  {record}\n@end type\n"
+                "#!amod 11\n# module: type_access\n\n@type item_t, public\n  @layout size=4 align=4\n  {record}\n@end type\n"
             );
             let error = parse_amod(&malformed, Path::new("bad_field_access.amod"))
                 .expect_err("malformed current @field access was accepted");
@@ -3532,6 +3653,58 @@ mod tests {
     }
 
     #[test]
+    fn procedure_characteristic_metadata_round_trips() {
+        let arg = parse_arg(
+            "@arg values : integer, intent(inout), optional, value, descriptor, \
+             allocatable, pointer, target, asynchronous, contiguous, volatile, \
+             external, procedure(callback), rank=6, \
+             array_spec=\"(count; 0:max(count, 1); :; 1:*; deferred; ..)\"",
+        );
+        assert_eq!(arg.intent, Some(Intent::InOut));
+        assert!(arg.optional);
+        assert!(arg.value);
+        assert!(arg.descriptor);
+        assert!(arg.allocatable);
+        assert!(arg.pointer);
+        assert!(arg.target);
+        assert!(arg.asynchronous);
+        assert!(arg.contiguous);
+        assert!(arg.volatile);
+        assert!(arg.external);
+        assert_eq!(arg.procedure_iface.as_deref(), Some("callback"));
+        assert_eq!(arg.rank, 6);
+        assert!(matches!(
+            arg.array_spec.as_deref(),
+            Some([
+                crate::ast::decl::ArraySpec::Explicit { lower: None, .. },
+                crate::ast::decl::ArraySpec::Explicit { lower: Some(_), .. },
+                crate::ast::decl::ArraySpec::AssumedShape { lower: None },
+                crate::ast::decl::ArraySpec::AssumedSize { lower: Some(_) },
+                crate::ast::decl::ArraySpec::Deferred,
+                crate::ast::decl::ArraySpec::AssumedRank,
+            ])
+        ));
+
+        let mut lines = "@end function\n".lines().peekable();
+        let procedure = parse_proc(
+            "@function factory -> type(callback), result_pointer, \
+             result_procedure=callback, result_name=result",
+            &mut lines,
+        );
+        assert!(procedure.result_pointer);
+        assert!(!procedure.abstract_interface);
+        assert_eq!(
+            procedure.result_procedure_iface.as_deref(),
+            Some("callback")
+        );
+        assert_eq!(procedure.result_name.as_deref(), Some("result"));
+
+        let mut lines = "@end subroutine\n".lines().peekable();
+        let abstract_procedure = parse_proc("@subroutine callback, abstract_interface", &mut lines);
+        assert!(abstract_procedure.abstract_interface);
+    }
+
+    #[test]
     fn amod_cache_skips_reparse_on_second_read() {
         // Write a small valid .amod, read it twice, and verify the
         // hit counter advanced exactly once.
@@ -3539,7 +3712,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 10
+            r#"#!amod 11
 # module: cache_test
 # source: cache_test.f90
 
@@ -3571,7 +3744,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 10
+            r#"#!amod 11
 # module: cached_parent
 # source: cached_parent.f90
 
@@ -3584,7 +3757,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 10
+            r#"#!amod 11
 # module: supplied_parent
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
@@ -3616,7 +3789,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 10
+            r#"#!amod 11
 # module: child
 # ancestor-module: root
 # parent-submodule: middle
@@ -3715,7 +3888,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 10)")
+            err.contains("incompatible .amod version 6 (compiler requires 11)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

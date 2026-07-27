@@ -1057,7 +1057,7 @@ impl<'a> Parser<'a> {
                 ));
             }
 
-            // PROCEDURE(interface_name) [, attrs] :: name [=> null()]
+            // PROCEDURE(interface_name) [, attrs] :: name [=> initial-target]
             // Procedure pointer components inside a derived type.
             if text == "procedure" {
                 let next_pos = self.pos + 1;
@@ -1113,37 +1113,31 @@ impl<'a> Parser<'a> {
                             String::new()
                         };
 
-                        // F2008 §4.5.4.5: a procedure pointer
-                        // component may carry a default initial
-                        // association `=> proc_name` or `=> null()`.
+                        // F2008 §4.5.4.5: a procedure pointer component may
+                        // carry a default initial association.
                         // Without capturing the right-hand side the
                         // pointer field stays uninitialized — calling
                         // `instance%fn(args)` then jumps through
                         // garbage memory.  stdlib_hashmaps's
                         // `procedure(hasher_fun), pointer, nopass ::
                         // hasher => default_hasher` motivated this fix.
-                        let mut ptr_init: Option<crate::ast::expr::SpannedExpr> = None;
-                        if self.eat(&TokenKind::Arrow) {
-                            let init_start = self.current_span();
+                        let ptr_init = if self.eat(&TokenKind::Arrow) {
                             if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
                                 if self.peek() == &TokenKind::LParen {
                                     self.advance();
-                                    let _ = self.expect(&TokenKind::RParen);
+                                    self.expect(&TokenKind::RParen)?;
                                 }
                                 // Leave ptr_init as None for `=> null()`
                                 // (matches the legacy behaviour, where
                                 // the field is zero-initialised).
-                            } else if self.peek() == &TokenKind::Identifier {
-                                let target_name = self.advance().clone().text;
-                                let span =
-                                    crate::parser::expr::span_from_to(init_start, self.prev_span());
-                                ptr_init = Some(crate::ast::Spanned::new(
-                                    crate::ast::expr::Expr::Name { name: target_name },
-                                    span,
-                                ));
+                                None
+                            } else {
+                                Some(self.parse_expr()?)
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         entities.push(crate::ast::decl::EntityDecl {
                             name: entity_name,
@@ -1877,6 +1871,33 @@ end type item",
         assert!(component_attrs("callback")
             .expect("missing callback component")
             .contains(&Attribute::Private));
+    }
+
+    #[test]
+    fn derived_type_procedure_component_preserves_named_initializer() {
+        let tokens = Lexer::tokenize(
+            "\
+type :: item
+  procedure(callback_iface), pointer, nopass :: callback => action
+end type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef { components, .. } = decl.node else {
+            panic!("not a derived type definition");
+        };
+        let Some(Decl::TypeDecl { entities, .. }) =
+            components.first().map(|component| &component.node)
+        else {
+            panic!("procedure-pointer component not preserved");
+        };
+        assert!(matches!(
+            entities[0].ptr_init.as_ref().map(|expr| &expr.node),
+            Some(crate::ast::expr::Expr::Name { name }) if name == "action"
+        ));
     }
 
     #[test]

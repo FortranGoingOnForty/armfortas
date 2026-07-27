@@ -2251,6 +2251,9 @@ pub struct SymbolAttrs {
     pub type_owner_module: Option<String>,
     pub allocatable: bool,
     pub pointer: bool,
+    pub asynchronous: bool,
+    pub contiguous: bool,
+    pub volatile: bool,
     /// Whether the procedure has a `BIND(C)` language-binding
     /// specification, independent of whether it has a binding label.
     pub bind_c: bool,
@@ -2261,6 +2264,9 @@ pub struct SymbolAttrs {
     /// For `procedure(iface), pointer :: p`, preserve the declared
     /// interface name so `.amod` can round-trip the symbol truthfully.
     pub procedure_iface: Option<String>,
+    /// Procedure declaration surfaced from an ABSTRACT INTERFACE body.
+    /// It describes characteristics but is not itself a callable target.
+    pub abstract_interface: bool,
     pub target: bool,
     pub optional: bool,
     pub save: bool,
@@ -2304,9 +2310,13 @@ impl Default for SymbolAttrs {
             type_owner_module: None,
             allocatable: false,
             pointer: false,
+            asynchronous: false,
+            contiguous: false,
+            volatile: false,
             bind_c: false,
             binding_label: None,
             procedure_iface: None,
+            abstract_interface: false,
             target: false,
             optional: false,
             save: false,

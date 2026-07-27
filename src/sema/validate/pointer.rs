@@ -11,6 +11,7 @@ use crate::lexer::Span;
 
 use super::allocatable::{expr_selects_component, leaf_field_layout};
 use super::core::{extract_base_name, Ctx};
+use super::procedure::validate_procedure_pointer_assignment;
 
 pub(super) fn validate_pointer_assignment(
     ctx: &mut Ctx,
@@ -18,6 +19,10 @@ pub(super) fn validate_pointer_assignment(
     value: &crate::ast::expr::SpannedExpr,
     span: Span,
 ) {
+    if validate_procedure_pointer_assignment(ctx, target, value, span) {
+        return;
+    }
+
     // Component-access target (`p%ptr_field => x`): check the leaf
     // component's attributes through the type-layout registry.  If
     // layouts aren't available (older callers) or the chain can't be

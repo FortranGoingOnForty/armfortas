@@ -15,6 +15,7 @@ use super::allocatable::{
     validate_allocatable_item,
 };
 use super::pointer::validate_pointer_assignment;
+use super::procedure::validate_procedure_pointer_initializer;
 use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
@@ -316,7 +317,7 @@ impl<'a> Ctx<'a> {
         resolved
     }
 
-    fn lookup_lexical(&self, name: &str) -> Option<&'a Symbol> {
+    pub(super) fn lookup_lexical(&self, name: &str) -> Option<&'a Symbol> {
         let key = name.to_lowercase();
         for frame in self.ambiguity_lexical_frames.iter().rev() {
             match frame {
@@ -4551,6 +4552,23 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            if has_pointer && type_decl_encodes_procedure_interface(attrs, type_spec) {
+                if let TypeSpec::Type(interface_name) = type_spec {
+                    let owner_scope = ctx.scope_id;
+                    for entity in entities {
+                        if let Some(initial_target) = entity.ptr_init.as_ref() {
+                            validate_procedure_pointer_initializer(
+                                ctx,
+                                &entity.name,
+                                owner_scope,
+                                interface_name,
+                                initial_target,
+                                initial_target.span,
+                            );
+                        }
+                    }
+                }
+            }
 
             validate_supported_character_type_spec(ctx, decl.span, type_spec);
             if !type_decl_encodes_procedure_interface(attrs, type_spec) {
@@ -4880,12 +4898,34 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             validate_unsupported_component_forms(ctx, components);
             for component in components {
                 if let Decl::TypeDecl {
-                    type_spec, attrs, ..
+                    type_spec,
+                    attrs,
+                    entities,
                 } = &component.node
                 {
                     validate_supported_character_type_spec(ctx, component.span, type_spec);
                     if !type_decl_encodes_procedure_interface(attrs, type_spec) {
                         validate_visible_type_spec(ctx, component.span, type_spec);
+                    }
+                    let has_pointer = attrs
+                        .iter()
+                        .any(|attribute| matches!(attribute, Attribute::Pointer));
+                    if has_pointer && type_decl_encodes_procedure_interface(attrs, type_spec) {
+                        if let TypeSpec::Type(interface_name) = type_spec {
+                            let owner_scope = ctx.scope_id;
+                            for entity in entities {
+                                if let Some(initial_target) = entity.ptr_init.as_ref() {
+                                    validate_procedure_pointer_initializer(
+                                        ctx,
+                                        &entity.name,
+                                        owner_scope,
+                                        interface_name,
+                                        initial_target,
+                                        initial_target.span,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -13430,6 +13470,870 @@ end program
 ",
         );
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_rejects_data_targets() {
+        let cases = [
+            (
+                "scalar data target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  integer, target :: storage
+  handler => storage
+end program test
+",
+                "procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer",
+            ),
+            (
+                "data pointer target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  integer, pointer :: storage
+  handler => storage
+end program test
+",
+                "procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer",
+            ),
+            (
+                "component procedure pointer and data target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  type :: holder_t
+    procedure(callback), pointer, nopass :: handler
+  end type holder_t
+  type(holder_t) :: holder
+  integer, target :: storage
+  holder%handler => storage
+end program test
+",
+                "procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer",
+            ),
+            (
+                "data function result",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback()
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => make_data()
+contains
+  integer function make_data()
+    make_data = 7
+  end function make_data
+end program test
+",
+                "procedure pointer 'handler' target 'make_data()' is not a procedure-pointer function result",
+            ),
+            (
+                "abstract interface",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => callback
+end program test
+",
+                "procedure pointer 'handler' target 'callback' is an abstract interface and cannot be a procedure target",
+            ),
+        ];
+
+        for (label, source, expected) in cases {
+            let errs = errors_from(source);
+            assert_eq!(errs, [expected], "unexpected diagnostic for {label}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_requires_compatible_characteristics() {
+        let cases = [
+            (
+                "procedure nature",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => transform
+contains
+  integer function transform(value)
+    integer, intent(in) :: value
+    transform = value
+  end function transform
+end program test
+",
+                "procedure nature differs",
+            ),
+            (
+                "dummy count",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value, extra)
+    integer, intent(in) :: value
+    integer, intent(in) :: extra
+  end subroutine action
+end program test
+",
+                "dummy argument count differs",
+            ),
+            (
+                "dummy type",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer(8), intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    logical(1), intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different type",
+            ),
+            (
+                "dummy rank",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value(:)
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different rank or shape",
+            ),
+            (
+                "dummy intent",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different INTENT",
+            ),
+            (
+                "dummy value attribute",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, value :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different VALUE attributes",
+            ),
+            (
+                "function result type",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => transform
+contains
+  logical function transform(value)
+    integer, intent(in) :: value
+    transform = value > 0
+  end function transform
+end program test
+",
+                "function result has a different type",
+            ),
+            (
+                "function result rank",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => transform
+contains
+  function transform(value) result(result)
+    integer, intent(in) :: value
+    integer :: result(1)
+    result = value
+  end function transform
+end program test
+",
+                "function result has a different rank or shape",
+            ),
+            (
+                "pure pointer and impure target",
+                "\
+program test
+  implicit none
+  abstract interface
+    pure subroutine callback(value)
+      integer, intent(inout) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine action
+end program test
+",
+                "target is not PURE",
+            ),
+            (
+                "bind mismatch",
+                "\
+program test
+  use iso_c_binding, only: c_int
+  implicit none
+  abstract interface
+    subroutine callback(value) bind(c)
+      import :: c_int
+      integer(c_int), value :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer(c_int), value :: value
+  end subroutine action
+end program test
+",
+                "BIND(C) attributes differ",
+            ),
+        ];
+
+        for (label, source, reason) in cases {
+            let errs = errors_from(source);
+            assert_eq!(
+                errs.len(),
+                1,
+                "unexpected diagnostic count for {label}: {errs:?}"
+            );
+            assert!(
+                errs[0].contains("procedure pointer 'handler'")
+                    && errs[0].contains("incompatible characteristics")
+                    && errs[0].contains(reason),
+                "unexpected diagnostic for {label}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_checks_full_characteristic_set() {
+        let cases = [
+            (
+                "optional",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, optional :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different OPTIONAL attributes",
+            ),
+            (
+                "allocatable",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, allocatable, intent(inout) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(inout) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different ALLOCATABLE attributes",
+            ),
+            (
+                "asynchronous",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, asynchronous :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different ASYNCHRONOUS attributes",
+            ),
+            (
+                "contiguous",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, contiguous :: value(:)
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value(:)
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different CONTIGUOUS attributes",
+            ),
+            (
+                "volatile",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, volatile :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different VOLATILE attributes",
+            ),
+            (
+                "pointer",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, pointer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different POINTER attributes",
+            ),
+            (
+                "target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, target, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different TARGET attributes",
+            ),
+            (
+                "character length",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      character(4), intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    character(5), intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different type",
+            ),
+            (
+                "explicit shape",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value(3)
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value(4)
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different rank or shape",
+            ),
+            (
+                "nested procedure dummy",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine integer_action(value)
+      integer, intent(in) :: value
+    end subroutine integer_action
+  end interface
+  abstract interface
+    subroutine real_action(value)
+      real, intent(in) :: value
+    end subroutine real_action
+  end interface
+  abstract interface
+    subroutine callback(action)
+      import :: integer_action
+      procedure(integer_action) :: action
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => apply
+contains
+  subroutine apply(action)
+    procedure(real_action) :: action
+  end subroutine apply
+end program test
+",
+                "dummy argument 1 has incompatible procedure characteristics",
+            ),
+            (
+                "allocatable result",
+                "\
+program test
+  implicit none
+  abstract interface
+    function callback() result(value)
+      integer, allocatable :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => make_value
+contains
+  integer function make_value()
+    make_value = 1
+  end function make_value
+end program test
+",
+                "function result has different ALLOCATABLE attributes",
+            ),
+            (
+                "pointer result",
+                "\
+program test
+  implicit none
+  abstract interface
+    function callback() result(value)
+      integer, pointer :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => make_value
+contains
+  integer function make_value()
+    make_value = 1
+  end function make_value
+end program test
+",
+                "function result has different POINTER attributes",
+            ),
+            (
+                "specific intrinsic characteristics",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: handler
+  handler => sin
+end program test
+",
+                "dummy argument 1 has a different type",
+            ),
+        ];
+
+        for (label, source, reason) in cases {
+            let errs = errors_from(source);
+            assert_eq!(
+                errs.len(),
+                1,
+                "unexpected diagnostic count for {label}: {errs:?}"
+            );
+            assert!(
+                errs[0].contains("incompatible characteristics") && errs[0].contains(reason),
+                "unexpected diagnostic for {label}: {errs:?}"
+            );
+        }
+
+        let elemental = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  elemental subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            elemental,
+            ["procedure pointer 'handler' target 'action' is a nonintrinsic ELEMENTAL procedure"]
+        );
+
+        let restricted_intrinsic = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    character function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: char
+  procedure(callback), pointer :: handler
+  handler => char
+end program test
+",
+        );
+        assert_eq!(
+            restricted_intrinsic,
+            ["procedure pointer 'handler' target 'char' is not an unrestricted specific intrinsic procedure"]
+        );
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_accepts_compatible_targets() {
+        let errs = errors_from(
+            "\
+module procedure_targets_m
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value(:)
+    end function callback
+    subroutine impure_callback(value)
+      integer, intent(inout) :: value
+    end subroutine impure_callback
+    subroutine shape_callback(count, values)
+      integer, intent(in) :: count
+      integer, intent(in) :: values(count)
+    end subroutine shape_callback
+    real function intrinsic_callback(value)
+      real, intent(in) :: value
+    end function intrinsic_callback
+  end interface
+  abstract interface
+    function callback_factory() result(result)
+      import :: callback
+      procedure(callback), pointer :: result
+    end function callback_factory
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: first
+  procedure(callback), pointer :: second
+  procedure(callback_factory), pointer :: factory
+  procedure(impure_callback), pointer :: impure_handler
+  procedure(shape_callback), pointer :: shape_handler
+  procedure(intrinsic_callback), pointer :: intrinsic_handler
+  type :: holder_t
+    procedure(callback), pointer, nopass :: slot
+    procedure(callback_factory), pointer, nopass :: factory_slot
+  end type holder_t
+  type(holder_t) :: holder
+contains
+  subroutine configure()
+    first => transform
+    second => first
+    holder%slot => transform
+    first => holder%slot
+    first => make_handler()
+    factory => make_handler
+    first => factory()
+    holder%factory_slot => make_handler
+    first => holder%factory_slot()
+    first => null()
+    impure_handler => pure_action
+    shape_handler => shaped_action
+    intrinsic_handler => sin
+  end subroutine configure
+
+  integer function transform(value)
+    integer, intent(in) :: value(:)
+    transform = sum(value)
+  end function transform
+
+  function make_handler() result(result)
+    procedure(callback), pointer :: result
+    result => transform
+  end function make_handler
+
+  pure subroutine pure_action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine pure_action
+
+  subroutine shaped_action(size, items)
+    integer, intent(in) :: size
+    integer, intent(in) :: items(size)
+  end subroutine shaped_action
+end module procedure_targets_m
+",
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn procedure_pointer_initialization_uses_same_characteristic_rules() {
+        let data_target = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  integer, target :: storage
+  procedure(callback), pointer :: handler => storage
+end program test
+",
+        );
+        assert_eq!(
+            data_target,
+            ["procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer"]
+        );
+
+        let incompatible_target = errors_from(
+            "\
+module test_m
+  implicit none
+  abstract interface
+    integer function callback()
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler => action
+contains
+  logical function action()
+    action = .true.
+  end function action
+end module test_m
+",
+        );
+        assert_eq!(
+            incompatible_target,
+            ["procedure pointer 'handler' target 'action' has incompatible characteristics: function result has a different type"]
+        );
+
+        let abstract_target = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler => callback
+end program test
+",
+        );
+        assert_eq!(
+            abstract_target,
+            ["procedure pointer 'handler' target 'callback' is an abstract interface and cannot be a procedure target"]
+        );
+
+        let component_data_target = errors_from(
+            "\
+module test_m
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  integer, target :: storage
+  type :: holder_t
+    procedure(callback), pointer, nopass :: handler => storage
+  end type holder_t
+end module test_m
+",
+        );
+        assert_eq!(
+            component_data_target,
+            ["procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer"]
+        );
+
+        let internal_target = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler => action
+contains
+  subroutine action()
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            internal_target,
+            ["procedure pointer 'handler' initializer 'action' must name an external, module, or unrestricted specific intrinsic procedure"]
+        );
+
+        let compatible_module_target = errors_from(
+            "\
+module test_m
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler => action
+  type :: holder_t
+    procedure(callback), pointer, nopass :: slot => action
+  end type holder_t
+contains
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end module test_m
+",
+        );
+        assert!(
+            compatible_module_target.is_empty(),
+            "unexpected errors: {compatible_module_target:?}"
+        );
     }
 
     // ---- Pure constraints ----

@@ -604,6 +604,7 @@ struct InterfaceOuterRef {
     binding_label: Option<String>,
     pure: bool,
     elemental: bool,
+    abstract_interface: bool,
     result_attrs: SymbolAttrs,
     defined_at: crate::lexer::Span,
 }
@@ -1105,7 +1106,7 @@ pub(super) fn resolve_unit(
         }
         ProgramUnit::InterfaceBlock {
             name,
-            is_abstract: _,
+            is_abstract,
             bodies,
         } => {
             let specific_names = interface_specific_names(bodies);
@@ -1196,6 +1197,7 @@ pub(super) fn resolve_unit(
                                 binding_label: binding.label,
                                 pure,
                                 elemental,
+                                abstract_interface: *is_abstract,
                                 result_attrs: result_attrs_for_iface,
                                 defined_at: sub.span,
                             });
@@ -1237,6 +1239,7 @@ pub(super) fn resolve_unit(
                                 binding_label: binding.label,
                                 pure,
                                 elemental,
+                                abstract_interface: *is_abstract,
                                 result_attrs: SymbolAttrs {
                                     is_separate_module_interface,
                                     ..Default::default()
@@ -1290,6 +1293,7 @@ pub(super) fn resolve_unit(
                     binding_label,
                     pure,
                     elemental,
+                    abstract_interface,
                     result_attrs,
                     defined_at,
                 } = outer_ref;
@@ -1303,6 +1307,7 @@ pub(super) fn resolve_unit(
                         binding_label: binding_label.clone(),
                         pure,
                         elemental,
+                        abstract_interface,
                         allocatable: result_attrs.allocatable,
                         pointer: result_attrs.pointer,
                         result_rank: result_attrs.result_rank,
@@ -3673,6 +3678,9 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
         match attr {
             Attribute::Allocatable => sa.allocatable = true,
             Attribute::Pointer => sa.pointer = true,
+            Attribute::Asynchronous => sa.asynchronous = true,
+            Attribute::Contiguous => sa.contiguous = true,
+            Attribute::Volatile => sa.volatile = true,
             Attribute::Target => sa.target = true,
             Attribute::Optional => sa.optional = true,
             Attribute::Save => sa.save = true,

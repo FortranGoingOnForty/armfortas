@@ -3729,7 +3729,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 10\n", "#!amod 9\n", 1);
+        .replacen("#!amod 11\n", "#!amod 10\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3756,7 +3756,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 9 (compiler requires 10)")
+        stderr.contains("incompatible .amod version 10 (compiler requires 11)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -33596,6 +33596,229 @@ fn coarray_sync_reports_not_implemented() {
 }
 
 #[test]
+fn procedure_pointer_assignment_requires_a_compatible_procedure_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_assignment_requires_a_compatible_procedure_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "procptr_data_scalar",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  integer, target :: storage\n  handler => storage\nend program\n",
+            "target 'storage' is not a procedure or procedure pointer",
+        ),
+        (
+            "procptr_data_component",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(callback), pointer, nopass :: handler\n  end type\n  type(holder_t) :: holder\n  integer, target :: storage\n  holder%handler => storage\nend program\n",
+            "target 'storage' is not a procedure or procedure pointer",
+        ),
+        (
+            "procptr_data_function",
+            "program p\n  implicit none\n  abstract interface\n    integer function callback()\n    end function\n  end interface\n  procedure(callback), pointer :: handler\n  handler => make_data()\ncontains\n  integer function make_data()\n    make_data = 7\n  end function\nend program\n",
+            "target 'make_data()' is not a procedure-pointer function result",
+        ),
+        (
+            "procptr_abstract_interface",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback()\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => callback\nend program\n",
+            "target 'callback' is an abstract interface and cannot be a procedure target",
+        ),
+        (
+            "procptr_nature_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => transform\ncontains\n  integer function transform(value)\n    integer, intent(in) :: value\n    transform = value\n  end function\nend program\n",
+            "incompatible characteristics: procedure nature differs",
+        ),
+        (
+            "procptr_dummy_count_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value, extra)\n    integer, intent(in) :: value, extra\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument count differs",
+        ),
+        (
+            "procptr_dummy_type_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer(8), intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    logical(1), intent(in) :: value\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has a different type",
+        ),
+        (
+            "procptr_dummy_rank_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer, intent(in) :: value(:)\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has a different rank or shape",
+        ),
+        (
+            "procptr_dummy_intent_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer, intent(out) :: value\n    value = 1\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has a different INTENT",
+        ),
+        (
+            "procptr_dummy_value_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, value :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer :: value\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has different VALUE attributes",
+        ),
+        (
+            "procptr_result_type_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    integer function callback(value)\n      integer, intent(in) :: value\n    end function\n  end interface\n  procedure(callback), pointer :: handler\n  handler => transform\ncontains\n  logical function transform(value)\n    integer, intent(in) :: value\n    transform = value > 0\n  end function\nend program\n",
+            "incompatible characteristics: function result has a different type",
+        ),
+        (
+            "procptr_result_rank_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    integer function callback(value)\n      integer, intent(in) :: value\n    end function\n  end interface\n  procedure(callback), pointer :: handler\n  handler => transform\ncontains\n  function transform(value) result(result)\n    integer, intent(in) :: value\n    integer :: result(1)\n    result = value\n  end function\nend program\n",
+            "incompatible characteristics: function result has a different rank or shape",
+        ),
+        (
+            "procptr_pure_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    pure subroutine callback(value)\n      integer, intent(inout) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine\nend program\n",
+            "incompatible characteristics: target is not PURE",
+        ),
+        (
+            "procptr_bind_mismatch",
+            "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  abstract interface\n    subroutine callback(value) bind(c)\n      import :: c_int\n      integer(c_int), value :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer(c_int), value :: value\n  end subroutine\nend program\n",
+            "incompatible characteristics: BIND(C) attributes differ",
+        ),
+    ];
+
+    for (stem, source, diagnostic) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("procedure-pointer invalid compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("procptr_compatible_import");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module callback_api\n  implicit none\n  private\n  public :: callback, handler, invoke, make_handler, rich_callback, rich_handler\n  abstract interface\n    integer function callback(values)\n      integer, intent(in) :: values(:)\n    end function callback\n    subroutine rich_callback(optional_value, alloc_value, contiguous_value, watched_value, count, shaped_values, trailing_values)\n      integer, optional, intent(in) :: optional_value\n      integer, allocatable, intent(inout) :: alloc_value\n      integer, contiguous, intent(in) :: contiguous_value(:)\n      integer, target, asynchronous, volatile, intent(inout) :: watched_value\n      integer, intent(in) :: count\n      integer, intent(in) :: shaped_values(0:count - 1)\n      integer, intent(in) :: trailing_values(*)\n    end subroutine rich_callback\n  end interface\n  procedure(callback), pointer :: handler => null()\n  procedure(rich_callback), pointer :: rich_handler => null()\ncontains\n  integer function invoke(values)\n    integer, intent(in) :: values(:)\n    invoke = handler(values)\n  end function invoke\n\n  function make_handler() result(result)\n    procedure(callback), pointer :: result\n    result => provider_sum\n  end function make_handler\n\n  integer function provider_sum(values)\n    integer, intent(in) :: values(:)\n    provider_sum = sum(values)\n  end function provider_sum\nend module callback_api\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-pointer provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "procedure-pointer provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let invalid_consumer = write_program_in(
+        &dir,
+        "invalid_consumer.f90",
+        "program p\n  use callback_api, only: callback, handler\n  implicit none\n  handler => callback\nend program p\n",
+    );
+    let invalid_object = dir.join("invalid_consumer.o");
+    let invalid_consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            invalid_consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            invalid_object.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("abstract-interface consumer compile failed to spawn");
+    let invalid_stderr = String::from_utf8_lossy(&invalid_consumer_result.stderr);
+    assert!(
+        !invalid_consumer_result.status.success()
+            && invalid_stderr
+                .contains("target 'callback' is an abstract interface and cannot be a procedure target")
+            && !invalid_object.exists(),
+        "imported abstract interface must not be a procedure target: status={:?} stderr={invalid_stderr}",
+        invalid_consumer_result.status
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module callback_impl\n  use callback_api, only: handler, make_handler, rich_handler\n  implicit none\ncontains\n  subroutine configure()\n    handler => sum_values\n    handler => make_handler()\n    rich_handler => rich_action\n  end subroutine configure\n\n  integer function sum_values(values)\n    integer, intent(in) :: values(:)\n    sum_values = sum(values)\n  end function sum_values\n\n  subroutine rich_action(optional_value, alloc_value, contiguous_value, watched_value, size, items, tail)\n    integer, optional, intent(in) :: optional_value\n    integer, allocatable, intent(inout) :: alloc_value\n    integer, contiguous, intent(in) :: contiguous_value(:)\n    integer, target, asynchronous, volatile, intent(inout) :: watched_value\n    integer, intent(in) :: size\n    integer, intent(in) :: items(0:size - 1)\n    integer, intent(in) :: tail(*)\n  end subroutine rich_action\nend module callback_impl\n\nprogram p\n  use callback_api, only: invoke\n  use callback_impl, only: configure\n  implicit none\n  call configure()\n  if (invoke([1, 2, 3, 4]) /= 10) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-pointer consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "compatible imported procedure-pointer assignment should compile: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("procedure-pointer consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure-pointer consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn procedure_pointer_decl_compiles_through_wrapper_calls() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -35815,7 +36038,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 10\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 11\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

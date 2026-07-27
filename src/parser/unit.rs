@@ -962,8 +962,8 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
 
-                    // Comma-separated entity list. Each entity may
-                    // carry its own optional `=> null()` initializer.
+                    // Comma-separated entity list. Each entity may carry
+                    // its own optional procedure-pointer initializer.
                     // Previously the parser stopped after the first
                     // name, dropping `g` in `procedure(...) :: f, g`
                     // and tripping the next-token check on the comma.
@@ -975,22 +975,27 @@ impl<'a> Parser<'a> {
                             String::new()
                         };
 
-                        if self.eat(&TokenKind::Arrow)
-                            && self.peek_text().eq_ignore_ascii_case("null")
-                        {
-                            self.advance();
-                            if self.peek() == &TokenKind::LParen {
+                        let ptr_init = if self.eat(&TokenKind::Arrow) {
+                            if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                let _ = self.expect(&TokenKind::RParen);
+                                if self.peek() == &TokenKind::LParen {
+                                    self.advance();
+                                    self.expect(&TokenKind::RParen)?;
+                                }
+                                None
+                            } else {
+                                Some(self.parse_expr()?)
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         entities.push(crate::ast::decl::EntityDecl {
                             name: entity_name,
                             array_spec: None,
                             init: None,
                             char_len: None,
-                            ptr_init: None,
+                            ptr_init,
                         });
 
                         if !self.eat(&TokenKind::Comma) {
@@ -1557,6 +1562,8 @@ fn fold_one_attribute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::decl::Decl;
+    use crate::ast::expr::Expr;
     use crate::lexer::{fixed::tokenize_fixed, Lexer};
 
     fn parse_units(src: &str) -> Vec<SpannedUnit> {
@@ -1611,6 +1618,39 @@ mod tests {
         } else {
             panic!("not Program");
         }
+    }
+
+    #[test]
+    fn procedure_pointer_declaration_preserves_named_initializer() {
+        let unit = parse_unit(
+            "\
+program test
+  procedure(callback), pointer :: first => action, second => null(), third
+end program test
+",
+        );
+        let ProgramUnit::Program { decls, .. } = unit.node else {
+            panic!("not Program");
+        };
+        let Some(Decl::TypeDecl { entities, .. }) =
+            decls.iter().find_map(|decl| match &decl.node {
+                Decl::TypeDecl { entities, .. }
+                    if entities.iter().any(|entity| entity.name == "first") =>
+                {
+                    Some(&decl.node)
+                }
+                _ => None,
+            })
+        else {
+            panic!("procedure-pointer declaration not preserved");
+        };
+        assert_eq!(entities.len(), 3);
+        assert!(matches!(
+            entities[0].ptr_init.as_ref().map(|expr| &expr.node),
+            Some(Expr::Name { name }) if name == "action"
+        ));
+        assert!(entities[1].ptr_init.is_none());
+        assert!(entities[2].ptr_init.is_none());
     }
 
     #[test]
