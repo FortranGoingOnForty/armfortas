@@ -9,7 +9,7 @@ use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::unit::*;
 use crate::sema::symtab::*;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::statement_functions::detect_statement_functions;
 use super::type_resolution::{derived_char_init_len, entity_char_len_to_info, type_spec_to_info};
@@ -34,6 +34,21 @@ pub(super) fn merge_specific_names(into: &mut Vec<String>, additional: &[String]
     }
 }
 
+fn directly_use_associated_generic_interfaces<'a>(
+    st: &'a SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+) -> Vec<&'a Symbol> {
+    let direct_uses: Vec<_> = st
+        .scope(scope_id)
+        .use_associations
+        .iter()
+        .filter(|association| !association.is_submodule_access)
+        .cloned()
+        .collect();
+    st.named_interface_symbols_from_use_associations(&direct_uses, generic_name)
+}
+
 fn merged_visible_generic_specifics(
     st: &SymbolTable,
     scope_id: ScopeId,
@@ -41,12 +56,13 @@ fn merged_visible_generic_specifics(
     local_specifics: &[String],
 ) -> Vec<String> {
     let mut merged = Vec::new();
-    if let Some(existing) = st.lookup_in(scope_id, generic_name) {
-        if existing.kind == SymbolKind::NamedInterface
-            || (existing.kind == SymbolKind::DerivedType && !existing.arg_names.is_empty())
-        {
+    if let Some(existing) = st.named_interface_facet_symbol_in_scope(scope_id, generic_name) {
+        if existing.scope == scope_id {
             merge_specific_names(&mut merged, &existing.arg_names);
         }
+    }
+    for interface in directly_use_associated_generic_interfaces(st, scope_id, generic_name) {
+        merge_specific_names(&mut merged, &interface.arg_names);
     }
     merge_specific_names(&mut merged, local_specifics);
     merged
@@ -109,11 +125,7 @@ fn validate_explicit_generic_specifics(
 ) -> Result<(), SemaError> {
     let mut declared_here = HashSet::new();
     let mut visible_specifics = HashSet::new();
-    let mut interfaces = st.named_interface_symbols_in(scope_id, generic_name);
-    interfaces.extend(st.named_interface_symbols_from_use_associations(
-        &st.scope(scope_id).use_associations,
-        generic_name,
-    ));
+    let interfaces = directly_use_associated_generic_interfaces(st, scope_id, generic_name);
     let mut seen_interfaces = HashSet::new();
     for interface in interfaces {
         let interface_key = (interface.scope, interface.name.to_ascii_lowercase());
@@ -153,11 +165,180 @@ fn validate_explicit_generic_specifics(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProcedureNature {
+    Function,
+    Subroutine,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GenericProcedureNatures {
+    saw_function: bool,
+    saw_subroutine: bool,
+}
+
+impl GenericProcedureNatures {
+    fn add(&mut self, nature: ProcedureNature) {
+        match nature {
+            ProcedureNature::Function => self.saw_function = true,
+            ProcedureNature::Subroutine => self.saw_subroutine = true,
+        }
+    }
+
+    fn is_mixed(self) -> bool {
+        self.saw_function && self.saw_subroutine
+    }
+}
+
+fn procedure_nature(symbol: &Symbol) -> Option<ProcedureNature> {
+    match symbol.kind {
+        SymbolKind::Function => Some(ProcedureNature::Function),
+        SymbolKind::Subroutine => Some(ProcedureNature::Subroutine),
+        SymbolKind::ExternalProc if symbol.type_info.is_some() => Some(ProcedureNature::Function),
+        _ => None,
+    }
+}
+
+fn generic_procedure_natures_from_interfaces<'a>(
+    st: &SymbolTable,
+    interfaces: impl IntoIterator<Item = &'a Symbol>,
+) -> GenericProcedureNatures {
+    let mut natures = GenericProcedureNatures::default();
+    let mut seen_specifics = HashSet::new();
+    for interface in interfaces {
+        for specific in &interface.arg_names {
+            let Some(symbol) = st.lookup_in(interface.scope, specific) else {
+                continue;
+            };
+            let Some(nature) = procedure_nature(symbol) else {
+                continue;
+            };
+            if seen_specifics.insert((symbol.scope, symbol.name.to_ascii_lowercase(), nature)) {
+                natures.add(nature);
+            }
+        }
+    }
+    natures
+}
+
+fn visible_generic_procedure_natures(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+) -> GenericProcedureNatures {
+    let scope = st.scope(scope_id);
+    let mut interfaces = st.named_interface_symbols_in(scope_id, generic_name);
+    interfaces.extend(
+        st.named_interface_symbols_from_use_associations(&scope.use_associations, generic_name),
+    );
+    generic_procedure_natures_from_interfaces(st, interfaces)
+}
+
+fn use_associated_generic_procedure_natures(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+) -> GenericProcedureNatures {
+    let interfaces = directly_use_associated_generic_interfaces(st, scope_id, generic_name);
+    generic_procedure_natures_from_interfaces(st, interfaces)
+}
+
+fn mixed_generic_procedure_natures_error(
+    generic_name: &str,
+    span: crate::lexer::Span,
+) -> SemaError {
+    SemaError {
+        span,
+        msg: format!(
+            "generic interface '{}' may not mix function and subroutine specific procedures",
+            generic_name.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn declared_procedure_nature(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    unit: &ProgramUnit,
+) -> Option<(String, ProcedureNature)> {
+    match unit {
+        ProgramUnit::Function { name, .. } => {
+            Some((name.to_ascii_lowercase(), ProcedureNature::Function))
+        }
+        ProgramUnit::Subroutine {
+            name, args, prefix, ..
+        } => {
+            let inherited_nature = (args.is_empty()
+                && prefix.iter().any(|item| matches!(item, Prefix::Module))
+                && matches!(st.scope(scope_id).kind, ScopeKind::Submodule(_)))
+            .then(|| st.lookup_in(scope_id, name))
+            .flatten()
+            .and_then(procedure_nature);
+            Some((
+                name.to_ascii_lowercase(),
+                inherited_nature.unwrap_or(ProcedureNature::Subroutine),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn declared_procedure_natures(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    units: &[SpannedUnit],
+) -> HashMap<String, ProcedureNature> {
+    let mut natures = HashMap::new();
+    for unit in units {
+        if let Some((name, nature)) = declared_procedure_nature(st, scope_id, &unit.node) {
+            natures.entry(name).or_insert(nature);
+        }
+        let ProgramUnit::InterfaceBlock { bodies, .. } = &unit.node else {
+            continue;
+        };
+        for body in bodies {
+            let InterfaceBody::Subprogram(subprogram) = body else {
+                continue;
+            };
+            if let Some((name, nature)) = declared_procedure_nature(st, scope_id, &subprogram.node)
+            {
+                natures.entry(name).or_insert(nature);
+            }
+        }
+    }
+    natures
+}
+
 fn validate_local_generic_declarations(
     st: &SymbolTable,
     units: &[SpannedUnit],
+    containing_span: crate::lexer::Span,
 ) -> Result<(), SemaError> {
     let scope_id = st.current_scope();
+    let local_procedure_natures = declared_procedure_natures(st, scope_id, units);
+    let mut generic_natures = HashMap::new();
+    let mut visible_generic_names = BTreeSet::new();
+    for symbol in st.scope(scope_id).symbols.values() {
+        if symbol.kind == SymbolKind::NamedInterface {
+            visible_generic_names.insert(symbol.name.to_ascii_lowercase());
+        }
+    }
+    for association in &st.scope(scope_id).use_associations {
+        if !association.local_name.is_empty() {
+            visible_generic_names.insert(association.local_name.to_ascii_lowercase());
+        }
+    }
+    for generic_name in visible_generic_names {
+        let natures = visible_generic_procedure_natures(st, scope_id, &generic_name);
+        if natures.is_mixed() {
+            return Err(mixed_generic_procedure_natures_error(
+                &generic_name,
+                containing_span,
+            ));
+        }
+        generic_natures.insert(generic_name, natures);
+    }
+
     let mut declared = HashSet::new();
     for unit in units {
         let ProgramUnit::InterfaceBlock {
@@ -174,6 +355,40 @@ fn validate_local_generic_declarations(
         let specifics = interface_specific_names(bodies);
         validate_explicit_generic_specifics(st, scope_id, generic_name, &specifics, unit.span)?;
         let generic_key = generic_name.to_ascii_lowercase();
+        let natures = generic_natures
+            .entry(generic_key.clone())
+            .or_insert_with(|| {
+                use_associated_generic_procedure_natures(st, scope_id, &generic_key)
+            });
+        for body in bodies {
+            match body {
+                InterfaceBody::Subprogram(subprogram) => {
+                    if let Some((_, nature)) =
+                        declared_procedure_nature(st, scope_id, &subprogram.node)
+                    {
+                        natures.add(nature);
+                    }
+                }
+                InterfaceBody::ModuleProcedure(procedures) => {
+                    for procedure in procedures {
+                        let key = procedure.to_ascii_lowercase();
+                        let nature = local_procedure_natures
+                            .get(&key)
+                            .copied()
+                            .or_else(|| st.lookup_in(scope_id, &key).and_then(procedure_nature));
+                        if let Some(nature) = nature {
+                            natures.add(nature);
+                        }
+                    }
+                }
+            }
+            if natures.is_mixed() {
+                return Err(mixed_generic_procedure_natures_error(
+                    generic_name,
+                    unit.span,
+                ));
+            }
+        }
         for specific in specifics {
             let specific_key = specific.to_ascii_lowercase();
             if !declared.insert((generic_key.clone(), specific_key)) {
@@ -588,7 +803,7 @@ pub(super) fn resolve_unit(
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
-            process_contains(st, contains, module_search_paths, layouts)?;
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
@@ -608,7 +823,7 @@ pub(super) fn resolve_unit(
                 process_uses(st, uses, module_search_paths, layouts)?;
                 process_implicit(st, implicit)?;
                 process_decls(st, decls)?;
-                process_contains(st, contains, module_search_paths, layouts)?;
+                process_contains(st, contains, module_search_paths, layouts, unit.span)?;
                 backfill_procedure_pointer_interfaces(st, mod_id);
 
                 st.enter_scope(saved);
@@ -699,7 +914,7 @@ pub(super) fn resolve_unit(
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
-            process_contains(st, contains, module_search_paths, layouts)?;
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
@@ -785,7 +1000,7 @@ pub(super) fn resolve_unit(
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
-            process_contains(st, contains, module_search_paths, layouts)?;
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
@@ -794,6 +1009,7 @@ pub(super) fn resolve_unit(
             st.push_scope(ScopeKind::Program(scope_name));
             process_uses(st, uses, module_search_paths, layouts)?;
             process_decls(st, decls)?;
+            validate_local_generic_declarations(st, &[], unit.span)?;
             st.pop_scope();
         }
         ProgramUnit::Submodule {
@@ -883,7 +1099,7 @@ pub(super) fn resolve_unit(
                 });
             }
             process_decls(st, decls)?;
-            process_contains(st, contains, module_search_paths, layouts)?;
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
             backfill_procedure_pointer_interfaces(st, scope_id);
             st.pop_scope();
         }
@@ -2948,8 +3164,9 @@ fn process_contains(
     contains: &[SpannedUnit],
     module_search_paths: &[std::path::PathBuf],
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
+    containing_span: crate::lexer::Span,
 ) -> Result<(), SemaError> {
-    validate_local_generic_declarations(st, contains)?;
+    validate_local_generic_declarations(st, contains, containing_span)?;
 
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
@@ -4106,6 +4323,164 @@ end module duplicate_operator_specific_m
     }
 
     #[test]
+    fn named_generic_rejects_mixed_function_and_subroutine_specifics() {
+        let cases = [
+            (
+                "module procedures",
+                "\
+module mixed_module_procedures_m
+  implicit none
+  interface dispatch
+    module procedure compute_value, update_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_module_procedures_m
+",
+            ),
+            (
+                "bare procedure statements",
+                "\
+module mixed_procedure_statements_m
+  implicit none
+  interface dispatch
+    procedure :: compute_value
+    procedure :: update_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_procedure_statements_m
+",
+            ),
+            (
+                "explicit interface bodies",
+                "\
+module mixed_explicit_bodies_m
+  implicit none
+  interface dispatch
+    integer function compute_value(value)
+      integer, intent(in) :: value
+    end function compute_value
+    subroutine update_value(value)
+      integer, intent(inout) :: value
+    end subroutine update_value
+  end interface dispatch
+end module mixed_explicit_bodies_m
+",
+            ),
+            (
+                "reopened interface",
+                "\
+module mixed_reopened_interface_m
+  implicit none
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+  interface DISPATCH
+    module procedure update_value
+  end interface DISPATCH
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_reopened_interface_m
+",
+            ),
+            (
+                "use-associated extension",
+                "\
+module function_generic_provider_m
+  implicit none
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+end module function_generic_provider_m
+
+module mixed_generic_extension_m
+  use function_generic_provider_m, only: dispatch
+  implicit none
+  interface dispatch
+    module procedure update_value
+  end interface dispatch
+contains
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_generic_extension_m
+",
+            ),
+            (
+                "merged use-associated generics",
+                "\
+module function_generic_m
+  implicit none
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+end module function_generic_m
+
+module subroutine_generic_m
+  implicit none
+  interface dispatch
+    module procedure update_value
+  end interface dispatch
+contains
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module subroutine_generic_m
+
+program mixed_use_association
+  use function_generic_m
+  use subroutine_generic_m
+  implicit none
+end program mixed_use_association
+",
+            ),
+        ];
+
+        for (label, source) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg,
+                "generic interface 'dispatch' may not mix function and subroutine specific procedures",
+                "unexpected mixed-procedure diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
     fn named_generic_allows_distinct_extensions_and_duplicate_use_paths() {
         let st = resolve_source(
             "\
@@ -4199,6 +4574,85 @@ contains
 end module same_name_owner_extension_m
 ",
         );
+    }
+
+    #[test]
+    fn named_generic_ignores_unlisted_local_shadow_of_inherited_specific() {
+        resolve_source(
+            "\
+module shadow_base_m
+  implicit none
+  private
+  public :: dispatch
+  interface dispatch
+    module procedure pick
+  end interface dispatch
+contains
+  integer function pick(value)
+    integer, intent(in) :: value
+    pick = value
+  end function pick
+end module shadow_base_m
+
+module shadow_extension_m
+  use shadow_base_m, only: dispatch
+  implicit none
+  interface dispatch
+    module procedure pick_real
+  end interface dispatch
+contains
+  subroutine pick(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine pick
+  integer function pick_real(value)
+    real, intent(in) :: value
+    pick_real = int(value)
+  end function pick_real
+end module shadow_extension_m
+",
+        );
+    }
+
+    #[test]
+    fn local_generic_shadows_instead_of_extending_host_generic() {
+        let st = resolve_source(
+            "\
+module host_generic_m
+  implicit none
+  interface dispatch
+    module procedure host_value
+  end interface dispatch
+contains
+  integer function host_value(value)
+    integer, intent(in) :: value
+    host_value = value
+  end function host_value
+
+  subroutine nested_scope()
+    interface dispatch
+      procedure :: host_value
+    end interface dispatch
+  contains
+    subroutine host_value(value)
+      integer, intent(inout) :: value
+      value = value + 1
+    end subroutine host_value
+  end subroutine nested_scope
+end module host_generic_m
+",
+        );
+        let nested_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "nested_scope"),
+            )
+            .unwrap();
+        let generic = st
+            .named_interface_symbol_in_scope(nested_scope.id, "dispatch")
+            .unwrap();
+        assert_eq!(generic.arg_names, ["host_value"]);
     }
 
     #[test]

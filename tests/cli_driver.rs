@@ -2301,6 +2301,263 @@ fn ordinary_type_declarations_must_not_replace_local_symbols() {
 }
 
 #[test]
+fn generic_interfaces_must_not_mix_functions_and_subroutines() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_interfaces_must_not_mix_functions_and_subroutines count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "mixed_generic_module_procedures",
+            "module mixed_module_procedures_m\n  implicit none\n  interface dispatch\n    module procedure compute_value, update_value\n  end interface dispatch\ncontains\n  integer function compute_value(value)\n    integer, intent(in) :: value\n    compute_value = value\n  end function compute_value\n  subroutine update_value(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_value\nend module mixed_module_procedures_m\n",
+        ),
+        (
+            "mixed_generic_explicit_bodies",
+            "module mixed_explicit_bodies_m\n  implicit none\n  interface dispatch\n    integer function compute_value(value)\n      integer, intent(in) :: value\n    end function compute_value\n    subroutine update_value(value)\n      integer, intent(inout) :: value\n    end subroutine update_value\n  end interface dispatch\nend module mixed_explicit_bodies_m\n",
+        ),
+        (
+            "mixed_generic_reopened_interface",
+            "module mixed_reopened_interface_m\n  implicit none\n  interface dispatch\n    module procedure compute_value\n  end interface dispatch\n  interface DISPATCH\n    procedure :: update_value\n  end interface DISPATCH\ncontains\n  integer function compute_value(value)\n    integer, intent(in) :: value\n    compute_value = value\n  end function compute_value\n  subroutine update_value(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_value\nend module mixed_reopened_interface_m\n",
+        ),
+    ];
+    let diagnostic =
+        "generic interface 'dispatch' may not mix function and subroutine specific procedures";
+
+    for (stem, source) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("mixed generic provider compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable mixed-generic diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("mixed_generic_separate_compilation");
+    let function_provider = write_program_in(
+        &dir,
+        "function_provider.f90",
+        "module function_provider_m\n  implicit none\n  interface dispatch\n    module procedure compute_integer\n  end interface dispatch\ncontains\n  integer function compute_integer(value)\n    integer, intent(in) :: value\n    compute_integer = value\n  end function compute_integer\nend module function_provider_m\n",
+    );
+    let function_object = dir.join("function_provider.o");
+    let function_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            function_provider.to_str().unwrap(),
+            "-o",
+            function_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("function generic provider compile failed to spawn");
+    assert!(
+        function_result.status.success(),
+        "function generic provider should compile: {}",
+        String::from_utf8_lossy(&function_result.stderr)
+    );
+
+    let mixed_extension = write_program_in(
+        &dir,
+        "mixed_extension.f90",
+        "module mixed_extension_m\n  use function_provider_m, only: dispatch\n  implicit none\n  interface dispatch\n    module procedure update_integer\n  end interface dispatch\ncontains\n  subroutine update_integer(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_integer\nend module mixed_extension_m\n",
+    );
+    let mixed_extension_object = dir.join("mixed_extension.o");
+    let mixed_extension_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            mixed_extension.to_str().unwrap(),
+            "-o",
+            mixed_extension_object.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("mixed generic extension compile failed to spawn");
+    let mixed_extension_stderr = String::from_utf8_lossy(&mixed_extension_result.stderr);
+    assert!(
+        !mixed_extension_result.status.success(),
+        "cross-module mixed generic extension should be rejected: {mixed_extension_stderr}"
+    );
+    assert_eq!(
+        mixed_extension_stderr.matches(diagnostic).count(),
+        1,
+        "cross-module extension should emit one stable diagnostic: {mixed_extension_stderr}"
+    );
+    assert!(
+        !mixed_extension_object.exists()
+            && !dir.join("mixed_extension_m.amod").exists()
+            && !dir.join("mixed_extension_m.mod").exists(),
+        "rejected cross-module extension published compiler artifacts"
+    );
+
+    let subroutine_provider = write_program_in(
+        &dir,
+        "subroutine_provider.f90",
+        "module subroutine_provider_m\n  implicit none\n  interface dispatch\n    module procedure update_integer\n  end interface dispatch\ncontains\n  subroutine update_integer(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_integer\nend module subroutine_provider_m\n",
+    );
+    let subroutine_object = dir.join("subroutine_provider.o");
+    let subroutine_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            subroutine_provider.to_str().unwrap(),
+            "-o",
+            subroutine_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("subroutine generic provider compile failed to spawn");
+    assert!(
+        subroutine_result.status.success(),
+        "subroutine generic provider should compile: {}",
+        String::from_utf8_lossy(&subroutine_result.stderr)
+    );
+
+    let mixed_consumer = write_program_in(
+        &dir,
+        "mixed_consumer.f90",
+        "program mixed_consumer\n  use function_provider_m, only: dispatch\n  use subroutine_provider_m, only: dispatch\n  implicit none\nend program mixed_consumer\n",
+    );
+    let mixed_consumer_object = dir.join("mixed_consumer.o");
+    let mixed_consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            mixed_consumer.to_str().unwrap(),
+            "-o",
+            mixed_consumer_object.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("mixed imported generic consumer compile failed to spawn");
+    let mixed_consumer_stderr = String::from_utf8_lossy(&mixed_consumer_result.stderr);
+    assert!(
+        !mixed_consumer_result.status.success(),
+        "merged imported function/subroutine generics should be rejected: {mixed_consumer_stderr}"
+    );
+    assert_eq!(
+        mixed_consumer_stderr.matches(diagnostic).count(),
+        1,
+        "merged imported generics should emit one stable diagnostic: {mixed_consumer_stderr}"
+    );
+    assert!(
+        !mixed_consumer_object.exists(),
+        "rejected mixed-generic consumer published an object"
+    );
+
+    let valid_extension = write_program_in(
+        &dir,
+        "valid_extension.f90",
+        "module valid_extension_m\n  use function_provider_m, only: dispatch\n  implicit none\n  interface dispatch\n    module procedure compute_real\n  end interface dispatch\n  interface mutate\n    module procedure increment_integer, increment_real\n  end interface mutate\ncontains\n  integer function compute_real(value)\n    real, intent(in) :: value\n    compute_real = int(value)\n  end function compute_real\n  subroutine increment_integer(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine increment_integer\n  subroutine increment_real(value)\n    real, intent(inout) :: value\n    value = value + 1.0\n  end subroutine increment_real\nend module valid_extension_m\n",
+    );
+    let valid_extension_object = dir.join("valid_extension.o");
+    let valid_extension_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            valid_extension.to_str().unwrap(),
+            "-o",
+            valid_extension_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-nature generic extension compile failed to spawn");
+    assert!(
+        valid_extension_result.status.success(),
+        "function-only extension and subroutine-only generic should compile: {}",
+        String::from_utf8_lossy(&valid_extension_result.stderr)
+    );
+
+    let valid_consumer = write_program_in(
+        &dir,
+        "valid_consumer.f90",
+        "program valid_consumer\n  use valid_extension_m, only: dispatch, mutate\n  implicit none\n  integer :: integer_value\n  real :: real_value\n  if (dispatch(7) /= 7) error stop 1\n  if (dispatch(2.5) /= 2) error stop 2\n  integer_value = 4\n  real_value = 1.5\n  call mutate(integer_value)\n  call mutate(real_value)\n  if (integer_value /= 5) error stop 3\n  if (abs(real_value - 2.5) > 0.0001) error stop 4\n  print *, 'ok'\nend program valid_consumer\n",
+    );
+    let valid_executable = dir.join("valid_consumer");
+    let valid_consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            valid_consumer.to_str().unwrap(),
+            function_object.to_str().unwrap(),
+            valid_extension_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            valid_executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-nature generic consumer compile failed to spawn");
+    assert!(
+        valid_consumer_result.status.success(),
+        "single-nature generics should remain usable across .amod files: {}",
+        String::from_utf8_lossy(&valid_consumer_result.stderr)
+    );
+    let valid_run = Command::new(&valid_executable)
+        .output()
+        .expect("single-nature generic consumer failed to run");
+    assert!(
+        valid_run.status.success() && String::from_utf8_lossy(&valid_run.stdout).contains("ok"),
+        "single-nature generic consumer failed: status={:?} stdout={} stderr={}",
+        valid_run.status,
+        String::from_utf8_lossy(&valid_run.stdout),
+        String::from_utf8_lossy(&valid_run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
