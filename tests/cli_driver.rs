@@ -2170,6 +2170,137 @@ fn named_generic_specifics_must_be_unique() {
 }
 
 #[test]
+fn ordinary_type_declarations_must_not_replace_local_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ordinary_type_declarations_must_not_replace_local_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "duplicate_local_declaration",
+            "program duplicate_local\n  implicit none\n  integer :: value\n  real :: VALUE\nend program duplicate_local\n",
+            "VALUE",
+        ),
+        (
+            "duplicate_dummy_declaration",
+            "subroutine duplicate_dummy(value)\n  implicit none\n  integer, intent(in) :: value\n  real, intent(in) :: VALUE\nend subroutine duplicate_dummy\n",
+            "VALUE",
+        ),
+        (
+            "retyped_function_result",
+            "integer function retyped_result()\n  implicit none\n  real :: RETYPED_RESULT\n  retyped_result = 1.0\nend function retyped_result\n",
+            "RETYPED_RESULT",
+        ),
+        (
+            "dummy_replaced_by_parameter",
+            "subroutine parameter_dummy(value)\n  implicit none\n  integer, parameter :: VALUE = 1\nend subroutine parameter_dummy\n",
+            "VALUE",
+        ),
+        (
+            "result_replaced_by_parameter",
+            "function parameter_result() result(value)\n  implicit none\n  integer, parameter :: VALUE = 1\nend function parameter_result\n",
+            "VALUE",
+        ),
+        (
+            "replaced_parameter",
+            "module replaced_parameter_m\n  implicit none\n  integer, parameter :: value = 1\n  real :: VALUE\nend module replaced_parameter_m\n",
+            "VALUE",
+        ),
+        (
+            "replaced_derived_type",
+            "module replaced_type_m\n  implicit none\n  type :: payload\n    integer :: value\n  end type payload\n  integer :: PAYLOAD\nend module replaced_type_m\n",
+            "PAYLOAD",
+        ),
+    ];
+
+    for (stem, source, repeated_name) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("declaration-collision compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let diagnostic = format!("symbol '{repeated_name}' already defined in this scope");
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(&diagnostic).count(),
+            1,
+            "{stem} should emit one stable declaration-collision diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("valid_declaration_placeholders");
+    let src = write_program_in(
+        &dir,
+        "valid.f90",
+        "module declaration_placeholders_m\n  implicit none\ncontains\n  subroutine accept_value(value)\n    integer, intent(in), optional :: value\n    if (.not. present(value)) error stop 1\n    if (value /= 7) error stop 2\n  end subroutine accept_value\n\n  function make_value() result(value)\n    integer :: value\n    value = 9\n  end function make_value\nend module declaration_placeholders_m\n\nprogram valid_declaration_placeholders\n  use declaration_placeholders_m\n  implicit none\n  call accept_value(7)\n  if (make_value() /= 9) error stop 3\n  print *, 'ok'\nend program valid_declaration_placeholders\n",
+    );
+    let executable = dir.join("valid");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("valid placeholder declaration compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "valid dummy and result declarations should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("valid placeholder declaration program failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "valid placeholder declaration program failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unreferenced_use_name_collision_is_accepted_without_diagnostic() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -10493,7 +10624,7 @@ fn explicit_shape_runtime_bound_function_result_array_compiles_and_runs() {
         return;
     }
     let src = write_program(
-        "program p\n  implicit none\n  integer :: idx\n  idx = strstr('ababa', 'aba')\n  if (idx /= 1) error stop 1\n  print *, 'ok'\ncontains\n  integer function strstr(string, pattern) result(res)\n    character(*), intent(in) :: string\n    character(*), intent(in) :: pattern\n    integer :: lps_array(len(pattern))\n    integer :: res, s_i, p_i, length_string, length_pattern\n    res = 0\n    length_string = len(string)\n    length_pattern = len(pattern)\n    if (length_pattern > 0 .and. length_pattern <= length_string) then\n      lps_array = compute_lps(pattern)\n      s_i = 1\n      p_i = 1\n      do while (s_i <= length_string)\n        if (string(s_i:s_i) == pattern(p_i:p_i)) then\n          if (p_i == length_pattern) then\n            res = s_i - length_pattern + 1\n            exit\n          end if\n          s_i = s_i + 1\n          p_i = p_i + 1\n        else if (p_i > 1) then\n          p_i = lps_array(p_i - 1) + 1\n        else\n          s_i = s_i + 1\n        end if\n      end do\n    end if\n  contains\n    pure function compute_lps(string) result(lps_array)\n      character(*), intent(in) :: string\n      integer :: lps_array(len(string))\n      integer :: i, j, length_string\n      length_string = len(string)\n      if (length_string > 0) then\n        lps_array(1) = 0\n        i = 2\n        j = 1\n        do while (i <= length_string)\n          if (string(j:j) == string(i:i)) then\n            lps_array(i) = j\n            i = i + 1\n            j = j + 1\n          else if (j > 1) then\n            j = lps_array(j - 1) + 1\n          else\n            lps_array(i) = 0\n            i = i + 1\n          end if\n        end do\n      end if\n    end function compute_lps\n  end function strstr\nend program\n",
+        "program p\n  implicit none\n  integer :: idx\n  idx = strstr('ababa', 'aba')\n  if (idx /= 1) error stop 1\n  print *, 'ok'\ncontains\n  function strstr(string, pattern) result(res)\n    character(*), intent(in) :: string\n    character(*), intent(in) :: pattern\n    integer :: lps_array(len(pattern))\n    integer :: res, s_i, p_i, length_string, length_pattern\n    res = 0\n    length_string = len(string)\n    length_pattern = len(pattern)\n    if (length_pattern > 0 .and. length_pattern <= length_string) then\n      lps_array = compute_lps(pattern)\n      s_i = 1\n      p_i = 1\n      do while (s_i <= length_string)\n        if (string(s_i:s_i) == pattern(p_i:p_i)) then\n          if (p_i == length_pattern) then\n            res = s_i - length_pattern + 1\n            exit\n          end if\n          s_i = s_i + 1\n          p_i = p_i + 1\n        else if (p_i > 1) then\n          p_i = lps_array(p_i - 1) + 1\n        else\n          s_i = s_i + 1\n        end if\n      end do\n    end if\n  contains\n    pure function compute_lps(string) result(lps_array)\n      character(*), intent(in) :: string\n      integer :: lps_array(len(string))\n      integer :: i, j, length_string\n      length_string = len(string)\n      if (length_string > 0) then\n        lps_array(1) = 0\n        i = 2\n        j = 1\n        do while (i <= length_string)\n          if (string(j:j) == string(i:i)) then\n            lps_array(i) = j\n            i = i + 1\n            j = j + 1\n          else if (j > 1) then\n            j = lps_array(j - 1) + 1\n          else\n            lps_array(i) = 0\n            i = i + 1\n          end if\n        end do\n      end if\n    end function compute_lps\n  end function strstr\nend program\n",
         "f90",
     );
     let out = unique_path("runtime_bound_result_array", "bin");

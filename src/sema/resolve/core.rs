@@ -2614,6 +2614,34 @@ fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Res
     Ok(())
 }
 
+fn is_unresolved_declaration_placeholder(
+    st: &SymbolTable,
+    name: &str,
+    declared_kind: &SymbolKind,
+) -> bool {
+    if !matches!(
+        declared_kind,
+        SymbolKind::Variable | SymbolKind::ProcedurePointer
+    ) {
+        return false;
+    }
+    let key = name.to_ascii_lowercase();
+    let scope = st.scope(st.current_scope());
+    let has_placeholder_identity = scope
+        .arg_order
+        .iter()
+        .any(|argument| argument.eq_ignore_ascii_case(&key))
+        || scope
+            .result_name
+            .as_deref()
+            .is_some_and(|result| result.eq_ignore_ascii_case(&key));
+    has_placeholder_identity
+        && scope
+            .symbols
+            .get(&key)
+            .is_some_and(|symbol| symbol.kind == SymbolKind::Variable && symbol.type_info.is_none())
+}
+
 fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), SemaError> {
     // Collect AccessList entries — they must be applied AFTER all TypeDecls
     // because the list may reference symbols declared later in the module.
@@ -2713,8 +2741,12 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         .or_else(|| attr_dimension.cloned())
                         .unwrap_or_default();
                     entity_attrs.array_spec = entity_array_spec;
-                    if st.scope(st.current_scope()).symbols.contains_key(&key) {
-                        // Symbol already exists (e.g., dummy argument) — update type info.
+                    if is_unresolved_declaration_placeholder(st, &key, &kind) {
+                        // Dummy arguments and untyped function results are
+                        // registered before their declaration part. Complete
+                        // each placeholder exactly once; every other local
+                        // symbol must pass through `define` so collisions are
+                        // diagnosed instead of mutating the earlier entity.
                         let sym = st
                             .scope_mut(st.current_scope())
                             .symbols
@@ -3642,6 +3674,182 @@ end program
             .unwrap();
         assert!(fn_scope.symbols.contains_key("x"));
         assert!(fn_scope.symbols.contains_key("y"));
+    }
+
+    #[test]
+    fn ordinary_type_declarations_reject_existing_local_symbols() {
+        let cases = [
+            (
+                "duplicate in one declaration",
+                "\
+program duplicate_in_one_declaration
+  implicit none
+  integer :: value, VALUE
+end program duplicate_in_one_declaration
+",
+                "VALUE",
+            ),
+            (
+                "duplicate local declarations",
+                "\
+program duplicate_local_declarations
+  implicit none
+  integer :: value
+  real :: VALUE
+end program duplicate_local_declarations
+",
+                "VALUE",
+            ),
+            (
+                "redeclared dummy argument",
+                "\
+subroutine redeclared_dummy(value)
+  implicit none
+  integer, intent(in) :: value
+  real, intent(in) :: VALUE
+end subroutine redeclared_dummy
+",
+                "VALUE",
+            ),
+            (
+                "retyped explicit function result",
+                "\
+integer function retyped_result()
+  implicit none
+  real :: RETYPED_RESULT
+  retyped_result = 1.0
+end function retyped_result
+",
+                "RETYPED_RESULT",
+            ),
+            (
+                "dummy argument replaced by parameter",
+                "\
+subroutine parameter_dummy(value)
+  implicit none
+  integer, parameter :: VALUE = 1
+end subroutine parameter_dummy
+",
+                "VALUE",
+            ),
+            (
+                "function result replaced by parameter",
+                "\
+function parameter_result() result(value)
+  implicit none
+  integer, parameter :: VALUE = 1
+end function parameter_result
+",
+                "VALUE",
+            ),
+            (
+                "parameter replaced by variable",
+                "\
+module replaced_parameter_m
+  implicit none
+  integer, parameter :: value = 1
+  real :: VALUE
+end module replaced_parameter_m
+",
+                "VALUE",
+            ),
+            (
+                "derived type name replaced by variable",
+                "\
+module replaced_type_name_m
+  implicit none
+  type :: payload
+    integer :: value
+  end type payload
+  integer :: PAYLOAD
+end module replaced_type_name_m
+",
+                "PAYLOAD",
+            ),
+        ];
+
+        for (label, source, repeated_name) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg,
+                format!("symbol '{repeated_name}' already defined in this scope"),
+                "unexpected declaration-collision diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_type_declarations_complete_dummy_and_result_placeholders_once() {
+        let st = resolve_source(
+            "\
+module declaration_placeholders_m
+  implicit none
+  abstract interface
+    integer function callback_interface()
+    end function callback_interface
+  end interface
+contains
+  subroutine accept_value(value)
+    integer, intent(in), optional :: value
+  end subroutine accept_value
+
+  subroutine accept_callback(callback)
+    procedure(callback_interface), pointer, intent(in) :: callback
+  end subroutine accept_callback
+
+  function make_value() result(value)
+    integer :: value
+    value = 7
+  end function make_value
+
+  function make_callback() result(callback)
+    procedure(callback_interface), pointer :: callback
+  end function make_callback
+end module declaration_placeholders_m
+",
+        );
+
+        let dummy_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "accept_value"),
+            )
+            .unwrap();
+        let dummy = dummy_scope.symbols.get("value").unwrap();
+        assert_eq!(dummy.kind, SymbolKind::Variable);
+        assert_eq!(dummy.type_info, Some(TypeInfo::Integer { kind: None }));
+        assert_eq!(dummy.attrs.intent, Some(Intent::In));
+        assert!(dummy.attrs.optional);
+
+        let procedure_dummy_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "accept_callback")
+            })
+            .unwrap();
+        let procedure_dummy = procedure_dummy_scope.symbols.get("callback").unwrap();
+        assert_eq!(procedure_dummy.kind, SymbolKind::ProcedurePointer);
+
+        let function_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "make_value"))
+            .unwrap();
+        let result = function_scope.procedure_result_symbol().unwrap();
+        assert_eq!(result.kind, SymbolKind::Variable);
+        assert_eq!(result.type_info, Some(TypeInfo::Integer { kind: None }));
+
+        let procedure_result_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "make_callback"),
+            )
+            .unwrap();
+        let procedure_result = procedure_result_scope.procedure_result_symbol().unwrap();
+        assert_eq!(procedure_result.kind, SymbolKind::ProcedurePointer);
     }
 
     #[test]
