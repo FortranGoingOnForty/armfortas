@@ -3949,11 +3949,11 @@ fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u32 {
         IrType::Float(w) => w.bytes(),
         IrType::Ptr(_) => 8,
         IrType::Array(elem, count) => {
-            // Stack storage uses ABI-sized elements. Fortran LOGICAL arrays are
-            // stored as default-kind 4-byte elements, even though Bool SSA
-            // values themselves remain byte-sized.
+            // Array storage follows the IR element layout so allocation,
+            // descriptor sizes, and GEP strides cannot disagree. Scalar Bool
+            // slots remain four bytes for frame alignment, but Bool array
+            // elements are the one-byte representation used everywhere else.
             let elem_size = match elem.as_ref() {
-                IrType::Bool => 4,
                 IrType::Struct(_) => alloca_size(elem, layout),
                 _ => elem.size_bytes(&layout) as u32,
             };
@@ -4694,20 +4694,20 @@ mod tests {
     }
 
     #[test]
-    fn logical_arrays_use_default_kind_storage_for_stack_slots() {
+    fn logical_array_alloca_size_matches_bool_gep_stride() {
+        let layout = crate::target::TargetLayout::LP64;
+        let bool_stride = IrType::Bool.size_bytes(&layout) as u32;
         assert_eq!(
-            alloca_size(
-                &IrType::Array(Box::new(IrType::Bool), 3),
-                crate::target::TargetLayout::LP64
-            ),
-            12
+            alloca_size(&IrType::Array(Box::new(IrType::Bool), 3), layout),
+            bool_stride * 3,
+            "array allocation and Bool GEP lowering must use the same element width",
         );
         assert_eq!(
             alloca_size(
                 &IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
-                crate::target::TargetLayout::LP64
+                layout
             ),
-            12
+            12,
         );
     }
 

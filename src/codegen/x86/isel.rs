@@ -3630,8 +3630,9 @@ fn abi_ty_of(ty: &IrType) -> AbiTy {
     }
 }
 
-/// Stack-slot size for an alloca. Mirrors ARM isel's `alloca_size`
-/// (Bool slots stay 4 bytes wide; loads/stores still touch 1).
+/// Stack-slot size for an alloca. Mirrors ARM isel's `alloca_size`.
+/// Scalar Bool slots stay four bytes wide for frame alignment; array element
+/// widths follow the IR layout used by descriptors and GEP lowering.
 fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u64 {
     match ty {
         IrType::Void => 0,
@@ -3641,7 +3642,6 @@ fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u64 {
         IrType::Ptr(_) | IrType::FuncPtr(_) => 8,
         IrType::Array(elem, count) => {
             let elem_size = match elem.as_ref() {
-                IrType::Bool => 4,
                 IrType::Struct(_) => alloca_size(elem, layout),
                 _ => elem.size_bytes(&layout),
             };
@@ -3713,6 +3713,17 @@ mod tests {
 
     fn all_insts(mf: &X86Function) -> Vec<&X86Inst> {
         mf.blocks.iter().flat_map(|b| b.insts.iter()).collect()
+    }
+
+    #[test]
+    fn logical_array_alloca_size_matches_bool_gep_stride() {
+        let layout = crate::target::TargetLayout::LP64;
+        let bool_stride = IrType::Bool.size_bytes(&layout);
+        assert_eq!(
+            alloca_size(&IrType::Array(Box::new(IrType::Bool), 3), layout),
+            bool_stride * 3,
+            "array allocation and Bool GEP lowering must use the same element width",
+        );
     }
 
     #[test]
