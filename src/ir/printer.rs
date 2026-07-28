@@ -5,6 +5,25 @@
 use super::inst::*;
 use std::fmt::Write;
 
+/// Format an arbitrary byte sequence as an injective, ASCII-only IR string.
+fn format_byte_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    for &byte in bytes {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b' '..=b'~' => out.push(byte as char),
+            _ => write!(out, "\\x{byte:02x}").unwrap(),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Print a module to a string.
 pub fn print_module(module: &Module) -> String {
     let mut out = String::new();
@@ -28,9 +47,7 @@ pub fn print_module(module: &Module) -> String {
                 GlobalInit::Zero => write!(out, " = zeroinit").unwrap(),
                 GlobalInit::Int(v) => write!(out, " = {}", v).unwrap(),
                 GlobalInit::Float(v) => write!(out, " = {}", v).unwrap(),
-                GlobalInit::String(s) => {
-                    write!(out, " = {:?}", String::from_utf8_lossy(s)).unwrap()
-                }
+                GlobalInit::String(s) => write!(out, " = {}", format_byte_string(s)).unwrap(),
                 GlobalInit::IntArray(vs) => {
                     let s: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
                     write!(out, " = [{}]", s.join(", ")).unwrap();
@@ -211,7 +228,7 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         InstKind::ConstInt(v, w) => format!("const_int {} : {}", v, w),
         InstKind::ConstFloat(v, w) => format!("const_float {} : {}", v, w),
         InstKind::ConstBool(v) => format!("const_bool {}", v),
-        InstKind::ConstString(s) => format!("const_string {:?}", String::from_utf8_lossy(s)),
+        InstKind::ConstString(s) => format!("const_string {}", format_byte_string(s)),
         InstKind::Undef(ty) => format!("undef : {}", ty),
 
         InstKind::IAdd(a, b) => format!("iadd %{}, %{}", a.0, b.0),
@@ -468,6 +485,56 @@ mod tests {
     use super::super::builder::FuncBuilder;
     use super::super::types::*;
     use super::*;
+
+    fn print_const_string(bytes: &[u8]) -> String {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            b.const_string(bytes);
+            b.ret_void();
+        }
+        print_function(&func)
+    }
+
+    fn print_global_string(bytes: &[u8]) -> String {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "bytes".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 1),
+            initializer: Some(GlobalInit::String(bytes.to_vec())),
+        });
+        print_module(&module)
+    }
+
+    #[test]
+    fn format_byte_string_is_unambiguous_and_readable() {
+        assert_eq!(
+            format_byte_string(b"A\"\\\n\r\t\0\x1f\x7f\x80\xff"),
+            r#""A\"\\\n\r\t\x00\x1f\x7f\x80\xff""#
+        );
+    }
+
+    #[test]
+    fn print_const_string_distinguishes_arbitrary_bytes() {
+        let encoded_replacement_character = print_const_string(&[0xef, 0xbf, 0xbd]);
+        let invalid_utf8 = print_const_string(&[0xff]);
+
+        assert_ne!(
+            encoded_replacement_character, invalid_utf8,
+            "byte-distinct constants must have distinct textual IR"
+        );
+    }
+
+    #[test]
+    fn print_global_string_distinguishes_arbitrary_bytes() {
+        let encoded_replacement_character = print_global_string(&[0xef, 0xbf, 0xbd]);
+        let invalid_utf8 = print_global_string(&[0xff]);
+
+        assert_ne!(
+            encoded_replacement_character, invalid_utf8,
+            "byte-distinct global initializers must have distinct textual IR"
+        );
+    }
 
     #[test]
     fn print_simple_function() {
