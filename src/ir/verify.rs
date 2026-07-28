@@ -484,6 +484,33 @@ fn vector_shape_error(ty: &IrType) -> Option<String> {
     None
 }
 
+/// Vector shapes recognized by both instruction-selection dispatchers for
+/// arithmetic opcodes. Narrow i8/i16 vectors remain valid IR for operations
+/// such as loads, stores, and bitwise manipulation, but neither backend has an
+/// arithmetic dispatcher for them.
+fn vector_arithmetic_shape_error(ty: &IrType) -> Option<String> {
+    let supported = match ty {
+        IrType::Vector { lanes: 4, elem } => matches!(
+            elem.as_ref(),
+            IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32)
+        ),
+        IrType::Vector { lanes: 2, elem } => matches!(
+            elem.as_ref(),
+            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64)
+        ),
+        _ => false,
+    };
+    if supported {
+        None
+    } else {
+        Some(format!(
+            "vector arithmetic uses unsupported shape {}; expected <4 x i32>, \
+             <2 x i64>, <4 x f32>, or <2 x f64>",
+            ty
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RuntimeAbiType {
     Void,
@@ -601,6 +628,25 @@ fn check_runtime_call_signature(
 fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyError>) {
     if let Some(msg) = vector_shape_error(&inst.ty) {
         errors.push(VerifyError { msg });
+    }
+    if matches!(
+        &inst.kind,
+        InstKind::VAdd(_, _)
+            | InstKind::VSub(_, _)
+            | InstKind::VMul(_, _)
+            | InstKind::VDiv(_, _)
+            | InstKind::VMin(_, _)
+            | InstKind::VMax(_, _)
+            | InstKind::VFma(_, _, _)
+            | InstKind::VNeg(_)
+            | InstKind::VAbs(_)
+            | InstKind::VSqrt(_)
+    ) {
+        if let Some(msg) = vector_arithmetic_shape_error(&inst.ty) {
+            errors.push(VerifyError {
+                msg: format!("vector arithmetic %{}: {}", inst.id.0, msg),
+            });
+        }
     }
     match &inst.kind {
         InstKind::IAdd(a, b)
@@ -1761,6 +1807,74 @@ mod tests {
     }
 
     // ---- SIMD vector type / verify tests ----
+
+    fn verify_vadd_with_type(ty: IrType) -> Vec<VerifyError> {
+        let mut func = Function::new("vector_add".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let (lhs, rhs) = if matches!(&ty, IrType::Vector { .. }) {
+                let lhs_ptr = b.alloca(ty.clone());
+                let rhs_ptr = b.alloca(ty.clone());
+                (b.vload(lhs_ptr, ty.clone()), b.vload(rhs_ptr, ty.clone()))
+            } else {
+                (b.const_i32(1), b.const_i32(2))
+            };
+            b.vadd(lhs, rhs);
+            b.ret_void();
+        }
+        verify_function(&func)
+    }
+
+    #[test]
+    fn vector_arithmetic_accepts_backend_dispatch_shapes() {
+        for ty in [
+            IrType::Vector {
+                lanes: 4,
+                elem: Box::new(IrType::Int(IntWidth::I32)),
+            },
+            IrType::Vector {
+                lanes: 2,
+                elem: Box::new(IrType::Int(IntWidth::I64)),
+            },
+            IrType::Vector {
+                lanes: 4,
+                elem: Box::new(IrType::Float(FloatWidth::F32)),
+            },
+            IrType::Vector {
+                lanes: 2,
+                elem: Box::new(IrType::Float(FloatWidth::F64)),
+            },
+        ] {
+            let errs = verify_vadd_with_type(ty.clone());
+            assert!(
+                errs.is_empty(),
+                "expected backend-dispatched vector-arithmetic shape {ty} to verify, got: {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn vector_arithmetic_rejects_shapes_without_backend_dispatch() {
+        for ty in [
+            IrType::Vector {
+                lanes: 16,
+                elem: Box::new(IrType::Int(IntWidth::I8)),
+            },
+            IrType::Vector {
+                lanes: 8,
+                elem: Box::new(IrType::Int(IntWidth::I16)),
+            },
+            IrType::Int(IntWidth::I32),
+        ] {
+            let errs = verify_vadd_with_type(ty.clone());
+            assert!(
+                errs.iter().any(|error| {
+                    error.msg.contains("vector arithmetic") && error.msg.contains(&ty.to_string())
+                }),
+                "expected unsupported vector-arithmetic shape {ty} to be rejected, got: {errs:?}",
+            );
+        }
+    }
 
     #[test]
     fn vector_shape_4xi32_ok() {
