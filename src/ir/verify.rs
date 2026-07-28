@@ -52,13 +52,31 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
 pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     let mut errors = Vec::new();
 
-    // 1. Every block must have exactly one terminator.
+    // 1. Every block must have a unique identity and exactly one terminator.
+    // All later CFG and dominance checks use BlockId-keyed maps, so duplicate
+    // IDs make every downstream interpretation ambiguous.
+    let mut seen_blocks: HashMap<BlockId, &str> = HashMap::new();
+    let mut has_duplicate_blocks = false;
     for block in &func.blocks {
+        if let Some(first_name) = seen_blocks.get(&block.id) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "duplicate block ID {}: blocks '{}' and '{}' share an identity",
+                    block.id.0, first_name, block.name,
+                ),
+            });
+            has_duplicate_blocks = true;
+        } else {
+            seen_blocks.insert(block.id, block.name.as_str());
+        }
         if block.terminator.is_none() {
             errors.push(VerifyError {
                 msg: format!("block '{}' has no terminator", block.name),
             });
         }
+    }
+    if has_duplicate_blocks {
+        return errors;
     }
 
     // 2. Entry block has no predecessors. The block params on entry
@@ -1804,6 +1822,26 @@ mod tests {
         func.blocks[0].terminator = Some(Terminator::Return(None));
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("duplicate value ID")));
+    }
+
+    #[test]
+    fn duplicate_block_id_errors() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let first = func.create_block("first");
+        let _second = func.create_block("second");
+        for block in &mut func.blocks {
+            block.terminator = Some(Terminator::Return(None));
+        }
+
+        func.blocks[2].id = first;
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| error
+                .msg
+                .contains(&format!("duplicate block ID {}", first.0))),
+            "expected duplicate block ID {first:?} to be rejected, got: {errs:?}",
+        );
     }
 
     // ---- SIMD vector type / verify tests ----
