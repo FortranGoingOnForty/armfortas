@@ -167,6 +167,7 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     for block in &func.blocks {
         if let Some(term) = &block.terminator {
             check_branch_types(func, term, &block.name, &mut errors);
+            check_return_type(func, term, &block.name, &mut errors);
         }
     }
 
@@ -215,6 +216,47 @@ fn check_type_cache_entry(
             ),
         }),
         None | Some(_) => {}
+    }
+}
+
+fn check_return_type(
+    func: &Function,
+    term: &Terminator,
+    from_block: &str,
+    errors: &mut Vec<VerifyError>,
+) {
+    let Terminator::Return(value) = term else {
+        return;
+    };
+    match (&func.return_type, value) {
+        (IrType::Void, None) => {}
+        (IrType::Void, Some(value)) => errors.push(VerifyError {
+            msg: format!(
+                "return from block '{}': void function must not return a value (got %{})",
+                from_block, value.0,
+            ),
+        }),
+        (expected, None) => errors.push(VerifyError {
+            msg: format!(
+                "return from block '{}': non-void function must return a value of type {}",
+                from_block, expected,
+            ),
+        }),
+        (expected, Some(value)) => match func.value_type(*value) {
+            Some(actual) if &actual != expected => errors.push(VerifyError {
+                msg: format!(
+                    "return type mismatch in block '{}': expected {}, got {} from %{}",
+                    from_block, expected, actual, value.0,
+                ),
+            }),
+            None => errors.push(VerifyError {
+                msg: format!(
+                    "return from block '{}': value %{} has no type; expected {}",
+                    from_block, value.0, expected,
+                ),
+            }),
+            Some(_) => {}
+        },
     }
 }
 
@@ -496,6 +538,14 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         ),
                     });
                 }
+                if ta.is_int() && ta == tb && ta != &inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "integer op %{} result type {} does not match operand type {}",
+                            inst.id.0, inst.ty, ta,
+                        ),
+                    });
+                }
             }
         }
         InstKind::FAdd(a, b)
@@ -531,6 +581,14 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         msg: format!(
                             "float op %{}: operand width mismatch %{} : {} vs %{} : {}",
                             inst.id.0, a.0, ta, b.0, tb,
+                        ),
+                    });
+                }
+                if ta.is_float() && ta == tb && ta != &inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "float op %{} result type {} does not match operand type {}",
+                            inst.id.0, inst.ty, ta,
                         ),
                     });
                 }
@@ -928,6 +986,107 @@ mod tests {
             errs.iter().any(|e| e.msg.contains("width mismatch")),
             "expected width mismatch, got: {:?}",
             errs,
+        );
+    }
+
+    #[test]
+    fn scalar_arithmetic_result_type_must_match_operands() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let (integer_result, float_result);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let integer_lhs = b.const_i32(1);
+            let integer_rhs = b.const_i32(2);
+            integer_result = b.iadd(integer_lhs, integer_rhs);
+            let float_lhs = b.const_f32(1.0);
+            let float_rhs = b.const_f32(2.0);
+            float_result = b.fadd(float_lhs, float_rhs);
+            b.ret_void();
+        }
+
+        for inst in &mut func.blocks[0].insts {
+            if inst.id == integer_result {
+                inst.ty = IrType::Int(IntWidth::I64);
+            } else if inst.id == float_result {
+                inst.ty = IrType::Float(FloatWidth::F64);
+            }
+        }
+        func.rebuild_type_cache();
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| {
+                error
+                    .msg
+                    .contains(&format!("integer op %{}", integer_result.0))
+                    && error.msg.contains("result type i64")
+                    && error.msg.contains("operand type i32")
+            }),
+            "expected the integer result-type mismatch to be rejected, got: {errs:?}",
+        );
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains(&format!("float op %{}", float_result.0))
+                    && error.msg.contains("result type f64")
+                    && error.msg.contains("operand type f32")
+            }),
+            "expected the float result-type mismatch to be rejected, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn return_form_and_type_must_match_function_signature() {
+        let mut wrong_type = Function::new("wrong_type".into(), vec![], IrType::Int(IntWidth::I64));
+        {
+            let mut b = FuncBuilder::new(&mut wrong_type, crate::target::TargetLayout::LP64);
+            let value = b.const_i32(1);
+            b.ret(Some(value));
+        }
+        let wrong_type_errs = verify_function(&wrong_type);
+        assert!(
+            wrong_type_errs.iter().any(|error| {
+                error.msg.contains("return type mismatch")
+                    && error.msg.contains("expected i64")
+                    && error.msg.contains("got i32")
+            }),
+            "expected the returned value type to be checked, got: {wrong_type_errs:?}",
+        );
+
+        let mut missing_value =
+            Function::new("missing_value".into(), vec![], IrType::Int(IntWidth::I32));
+        missing_value.blocks[0].terminator = Some(Terminator::Return(None));
+        let missing_value_errs = verify_function(&missing_value);
+        assert!(
+            missing_value_errs.iter().any(|error| error
+                .msg
+                .contains("non-void function must return a value of type i32")),
+            "expected a missing return value to be rejected, got: {missing_value_errs:?}",
+        );
+
+        let mut unexpected_value = Function::new("unexpected_value".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut unexpected_value, crate::target::TargetLayout::LP64);
+            let value = b.const_i32(1);
+            b.ret(Some(value));
+        }
+        let unexpected_value_errs = verify_function(&unexpected_value);
+        assert!(
+            unexpected_value_errs
+                .iter()
+                .any(|error| error.msg.contains("void function must not return a value")),
+            "expected a value return from void to be rejected, got: {unexpected_value_errs:?}",
+        );
+
+        let mut valid = Function::new("valid".into(), vec![], IrType::Int(IntWidth::I32));
+        {
+            let mut b = FuncBuilder::new(&mut valid, crate::target::TargetLayout::LP64);
+            let value = b.const_i32(1);
+            b.ret(Some(value));
+        }
+        let valid_errs = verify_function(&valid);
+        assert!(
+            valid_errs.is_empty(),
+            "matching typed return should remain valid, got: {valid_errs:?}",
         );
     }
 
