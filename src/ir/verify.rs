@@ -120,24 +120,20 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
-    // 3a. Every defined value must have an entry in the function's
-    // type cache. A miss here means rebuild_type_cache was never
-    // run after an IR-mutating pass (or the pass forgot to set
-    // inst.ty). Without the cache entry, check_type_consistency
-    // silently skips every check on that instruction — a single
-    // stale cache turns the whole verifier into a no-op. This was
-    // a latent soundness hole: wrong-width iadd, bogus pointee
-    // mismatches, and non-integer ops all sailed through. Flag it
-    // explicitly so the bug points at the actual cache bug, not
-    // the downstream codegen symptom.
-    for val in &defined {
-        if func.value_type(*val).is_none() {
-            errors.push(VerifyError {
-                msg: format!(
-                    "value %{} is defined but has no entry in the type cache (call rebuild_type_cache)",
-                    val.0,
-                ),
-            });
+    // 3a. Every present O(1) type-cache entry must match its authoritative
+    // definition. Missing entries remain safe because value_type() walks the
+    // definitions on a miss. A present hit is different: if Inst.ty changed,
+    // all later consistency checks would otherwise reuse the stale cached
+    // type and make verification false-green.
+    for param in &func.params {
+        check_type_cache_entry(func, param.id, &param.ty, &mut errors);
+    }
+    for block in &func.blocks {
+        for param in &block.params {
+            check_type_cache_entry(func, param.id, &param.ty, &mut errors);
+        }
+        for inst in &block.insts {
+            check_type_cache_entry(func, inst.id, &inst.ty, &mut errors);
         }
     }
 
@@ -202,6 +198,24 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     check_dominance(func, &mut errors);
 
     errors
+}
+
+fn check_type_cache_entry(
+    func: &Function,
+    value: ValueId,
+    defining_type: &IrType,
+    errors: &mut Vec<VerifyError>,
+) {
+    match func.cached_value_type(value) {
+        Some(cached_type) if cached_type != defining_type => errors.push(VerifyError {
+            msg: format!(
+                "value %{} has type '{}' in the type cache but its definition has type '{}' \
+                 (call rebuild_type_cache)",
+                value.0, cached_type, defining_type,
+            ),
+        }),
+        None | Some(_) => {}
+    }
 }
 
 /// Map each ValueId to the block where it's defined.
@@ -918,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn type_consistency_survives_stale_cache() {
+    fn type_consistency_survives_missing_cache_entries() {
         // Width-mismatched iadd inserted directly into a block (i.e.
         // bypassing the builder) used to slip past the type checker
         // because the type cache hadn't been refreshed and value_type
@@ -959,6 +973,63 @@ mod tests {
             errs.iter().any(|e| e.msg.contains("width mismatch")),
             "expected width mismatch even without cache: {:?}",
             errs,
+        );
+    }
+
+    #[test]
+    fn present_but_stale_type_cache_entry_is_rejected() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let stale_value;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let lhs = b.const_i32(1);
+            let rhs = b.const_i32(2);
+            stale_value = b.iadd(lhs, rhs);
+            let zero = b.const_i32(0);
+            let _use_stale_value = b.iadd(stale_value, zero);
+            b.ret_void();
+        }
+
+        let defining_inst = func.blocks[0]
+            .insts
+            .iter_mut()
+            .find(|inst| inst.id == stale_value)
+            .expect("builder emitted the stale-cache witness");
+        assert_eq!(defining_inst.ty, IrType::Int(IntWidth::I32));
+        defining_inst.ty = IrType::Int(IntWidth::I64);
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains(&format!("value %{}", stale_value.0))
+                    && error.msg.contains("type cache")
+                    && error.msg.contains("i32")
+                    && error.msg.contains("i64")
+            }),
+            "expected the stale present cache entry to be rejected, got: {errs:?}",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.msg.contains("type cache"))
+                .count(),
+            1,
+            "one stale definition should produce one cache diagnostic: {errs:?}",
+        );
+
+        func.rebuild_type_cache();
+        let rebuilt_errs = verify_function(&func);
+        assert!(
+            rebuilt_errs
+                .iter()
+                .all(|error| !error.msg.contains("type cache")),
+            "rebuilding should restore cache consistency: {rebuilt_errs:?}",
+        );
+        assert!(
+            rebuilt_errs
+                .iter()
+                .any(|error| error.msg.contains("width mismatch")),
+            "verification should expose the underlying malformed iadd after rebuilding: \
+             {rebuilt_errs:?}",
         );
     }
 

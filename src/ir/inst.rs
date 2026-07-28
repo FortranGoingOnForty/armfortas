@@ -423,7 +423,20 @@ impl Function {
         }
     }
 
-    /// Get the type of a value by ID. O(1) via cache.
+    /// Inspect the cached type recorded for a value.
+    ///
+    /// The verifier uses this to check whether a present entry agrees with
+    /// the authoritative IR definition. A missing entry remains recoverable
+    /// through [`Self::value_type`].
+    pub(super) fn cached_value_type(&self, id: ValueId) -> Option<&IrType> {
+        self.type_cache.get(&id)
+    }
+
+    /// Get the type of a value by ID, using the O(1) cache when present.
+    ///
+    /// Cache misses fall back to the authoritative IR definitions. Mutation
+    /// pipelines must reject verifier errors before optimization or code
+    /// generation so a present but stale entry cannot acquire meaning.
     pub fn value_type(&self, id: ValueId) -> Option<IrType> {
         if let Some(ty) = self.type_cache.get(&id) {
             return Some(ty.clone());
@@ -433,7 +446,8 @@ impl Function {
         // verifier silently skipped checks whenever the cache lagged
         // behind optimiser passes, which hid width mismatches and
         // pointer-type bugs for entire compilation units. Recompute
-        // on-demand so consumers always get a consistent answer.
+        // on-demand so cache misses use the defining IR type; the verifier
+        // separately rejects present entries that no longer match it.
         for p in &self.params {
             if p.id == id {
                 return Some(p.ty.clone());
