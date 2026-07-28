@@ -818,6 +818,17 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
+        InstKind::GetElementPtr(_, indices) => {
+            if indices.len() > 1 {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "GEP %{} has {} indices; backend lowering supports at most one",
+                        inst.id.0,
+                        indices.len(),
+                    ),
+                });
+            }
+        }
 
         // Bitwise binary ops: both operands must be integers of
         // the same width. Audit Med-1.
@@ -1347,6 +1358,26 @@ mod tests {
                 .any(|e| e.msg.contains("doesn't match pointee type")),
             "expected pointee type mismatch error, got: {:?}",
             errs,
+        );
+    }
+
+    #[test]
+    fn gep_rejects_indices_the_backends_would_discard() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let base = b.alloca(IrType::Int(IntWidth::I32));
+            let first = b.const_i64(0);
+            let discarded = b.const_i64(1);
+            b.gep(base, vec![first, discarded], IrType::Int(IntWidth::I32));
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter()
+                .any(|error| error.msg.contains("GEP") && error.msg.contains("2 indices")),
+            "expected the multi-index GEP to be rejected, got: {errs:?}",
         );
     }
 
