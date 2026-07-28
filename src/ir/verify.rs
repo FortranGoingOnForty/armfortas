@@ -5,7 +5,7 @@
 //! terminator completeness, block param/branch arg matching.
 
 use super::inst::*;
-use super::types::{IntWidth, IrType, TypeSizeError};
+use super::types::{FloatWidth, IntWidth, IrType, TypeSizeError};
 use super::walk::{compute_dominator_info, inst_uses, terminator_targets, terminator_uses};
 use std::collections::{HashMap, HashSet};
 
@@ -484,6 +484,119 @@ fn vector_shape_error(ty: &IrType) -> Option<String> {
     None
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeAbiType {
+    Void,
+    I32,
+    I64,
+    F32,
+    BytePtr,
+    DataPtr,
+    PrintableInt,
+}
+
+impl RuntimeAbiType {
+    fn matches(self, ty: &IrType) -> bool {
+        match self {
+            Self::Void => matches!(ty, IrType::Void),
+            Self::I32 => matches!(ty, IrType::Int(IntWidth::I32)),
+            Self::I64 => matches!(ty, IrType::Int(IntWidth::I64)),
+            Self::F32 => matches!(ty, IrType::Float(FloatWidth::F32)),
+            Self::BytePtr => {
+                matches!(ty, IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)))
+            }
+            Self::DataPtr => matches!(ty, IrType::Ptr(_)),
+            Self::PrintableInt => matches!(
+                ty,
+                IrType::Int(IntWidth::I32 | IntWidth::I64 | IntWidth::I128)
+            ),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Void => "void",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::BytePtr => "ptr<i8>",
+            Self::DataPtr => "a data pointer",
+            Self::PrintableInt => "i32, i64, or i128",
+        }
+    }
+}
+
+fn runtime_signature(runtime_func: &RuntimeFunc) -> (&'static [RuntimeAbiType], RuntimeAbiType) {
+    use RuntimeAbiType::*;
+
+    match runtime_func {
+        RuntimeFunc::PrintInt => (&[PrintableInt], Void),
+        RuntimeFunc::PrintReal => (&[F32], Void),
+        RuntimeFunc::PrintString => (&[BytePtr, I64], Void),
+        RuntimeFunc::PrintLogical => (&[I32], Void),
+        RuntimeFunc::PrintNewline => (&[], Void),
+        RuntimeFunc::Allocate => (&[I64], BytePtr),
+        RuntimeFunc::Deallocate => (&[DataPtr], Void),
+        RuntimeFunc::StringConcat => (&[BytePtr, I64, BytePtr, I64], BytePtr),
+        RuntimeFunc::StringCopy => (&[BytePtr, I64, BytePtr, I64], Void),
+        RuntimeFunc::StringCompare => (&[BytePtr, I64, BytePtr, I64], I32),
+        RuntimeFunc::Stop | RuntimeFunc::ErrorStop => (&[], Void),
+        RuntimeFunc::CheckBounds => (&[I64, I64, I64], Void),
+    }
+}
+
+fn check_runtime_call_signature(
+    func: &Function,
+    inst: &Inst,
+    runtime_func: &RuntimeFunc,
+    args: &[ValueId],
+    errors: &mut Vec<VerifyError>,
+) {
+    let (expected_args, expected_result) = runtime_signature(runtime_func);
+
+    if !expected_result.matches(&inst.ty) {
+        errors.push(VerifyError {
+            msg: format!(
+                "runtime call {:?} %{} result type mismatch: expected {}, got {}",
+                runtime_func,
+                inst.id.0,
+                expected_result.description(),
+                inst.ty,
+            ),
+        });
+    }
+
+    if args.len() != expected_args.len() {
+        errors.push(VerifyError {
+            msg: format!(
+                "runtime call {:?} %{} argument count mismatch: expected {}, got {}",
+                runtime_func,
+                inst.id.0,
+                expected_args.len(),
+                args.len(),
+            ),
+        });
+    }
+
+    for (index, (arg, expected_type)) in args.iter().zip(expected_args).enumerate() {
+        let Some(actual_type) = func.value_type(*arg) else {
+            continue;
+        };
+        if !expected_type.matches(&actual_type) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "runtime call {:?} %{} argument {} type mismatch: expected {}, got {}",
+                    runtime_func,
+                    inst.id.0,
+                    index,
+                    expected_type.description(),
+                    actual_type,
+                ),
+            });
+        }
+    }
+}
+
 /// Check type consistency for instructions.
 fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyError>) {
     if let Some(msg) = vector_shape_error(&inst.ty) {
@@ -732,6 +845,10 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
             }
         }
 
+        InstKind::RuntimeCall(runtime_func, args) => {
+            check_runtime_call_signature(func, inst, runtime_func, args, errors);
+        }
+
         // ---- SIMD vector ops ----
         //
         // Element-wise binary / unary / fma ops require all vector
@@ -845,6 +962,142 @@ mod tests {
         module.add_function(func);
         let errs = verify_module(&module);
         assert!(errs.is_empty(), "errors: {:?}", errs);
+    }
+
+    #[test]
+    fn valid_runtime_call_signatures_are_accepted() {
+        let mut func = Function::new("runtime_calls".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let i32_value = b.const_i32(1);
+            let i64_value = b.const_i64(1);
+            let i128_value = b.const_i128(1);
+            let f32_value = b.const_f32(1.0);
+            let bytes = b.const_string(b"bytes");
+
+            b.runtime_call(RuntimeFunc::PrintInt, vec![i32_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintInt, vec![i64_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintInt, vec![i128_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintReal, vec![f32_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::PrintString,
+                vec![bytes, i64_value],
+                IrType::Void,
+            );
+            b.runtime_call(RuntimeFunc::PrintLogical, vec![i32_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintNewline, vec![], IrType::Void);
+
+            let allocation = b.runtime_call(
+                RuntimeFunc::Allocate,
+                vec![i64_value],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            b.runtime_call(RuntimeFunc::Deallocate, vec![allocation], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::StringConcat,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCopy,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Void,
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCompare,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Int(IntWidth::I32),
+            );
+            b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::CheckBounds,
+                vec![i64_value, i64_value, i64_value],
+                IrType::Void,
+            );
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.is_empty(),
+            "valid runtime ABI calls should verify, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn malformed_runtime_call_signatures_are_rejected() {
+        let mut func = Function::new("runtime_calls".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let boolean = b.const_bool(true);
+            let i32_value = b.const_i32(1);
+            let i64_value = b.const_i64(1);
+            let f64_value = b.const_f64(1.0);
+            let bytes = b.const_string(b"bytes");
+            let byte_ptr = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+
+            b.runtime_call(RuntimeFunc::PrintInt, vec![], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintReal, vec![f64_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::PrintString,
+                vec![bytes, i32_value],
+                IrType::Void,
+            );
+            b.runtime_call(RuntimeFunc::PrintLogical, vec![boolean], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintNewline, vec![i32_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::Allocate,
+                vec![i32_value],
+                IrType::Int(IntWidth::I64),
+            );
+            b.runtime_call(RuntimeFunc::Deallocate, vec![i64_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::StringConcat,
+                vec![bytes, bytes],
+                byte_ptr.clone(),
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCopy,
+                vec![bytes, i64_value, bytes, i64_value],
+                byte_ptr,
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCompare,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Void,
+            );
+            b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Int(IntWidth::I32));
+            b.runtime_call(RuntimeFunc::ErrorStop, vec![i32_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::CheckBounds,
+                vec![i64_value, i32_value, i64_value],
+                IrType::Void,
+            );
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        for runtime_func in [
+            "PrintInt",
+            "PrintReal",
+            "PrintString",
+            "PrintLogical",
+            "PrintNewline",
+            "Allocate",
+            "Deallocate",
+            "StringConcat",
+            "StringCopy",
+            "StringCompare",
+            "Stop",
+            "ErrorStop",
+            "CheckBounds",
+        ] {
+            assert!(
+                errs.iter().any(|error| error.msg.contains(runtime_func)),
+                "expected a {runtime_func} ABI diagnostic, got: {errs:?}",
+            );
+        }
     }
 
     #[test]
