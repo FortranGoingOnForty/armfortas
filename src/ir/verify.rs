@@ -35,7 +35,9 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
                     global.name, global.ty
                 ),
             });
+            continue;
         }
+        check_global_array_initializer(global, &mut errors);
     }
     for func in &module.functions {
         let mut function_errors = verify_function(func);
@@ -49,6 +51,68 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
         }
     }
     errors
+}
+
+#[derive(Clone, Copy)]
+enum GlobalArrayInitializerKind {
+    Integer,
+    Float,
+}
+
+fn check_global_array_initializer(global: &Global, errors: &mut Vec<VerifyError>) {
+    let (kind, actual_entries, kind_name) = match &global.initializer {
+        Some(GlobalInit::IntArray(values)) => (
+            GlobalArrayInitializerKind::Integer,
+            values.len() as u64,
+            "integer",
+        ),
+        Some(GlobalInit::FloatArray(values)) => (
+            GlobalArrayInitializerKind::Float,
+            values.len() as u64,
+            "floating-point",
+        ),
+        _ => return,
+    };
+
+    let Some(expected_entries) = global_array_initializer_entries(&global.ty, kind) else {
+        errors.push(VerifyError {
+            msg: format!(
+                "global '{}' {}-array initializer is incompatible with type '{}'",
+                global.name, kind_name, global.ty,
+            ),
+        });
+        return;
+    };
+
+    if actual_entries != expected_entries {
+        errors.push(VerifyError {
+            msg: format!(
+                "global '{}' array initializer has {} entries, but its type requires {}",
+                global.name, actual_entries, expected_entries,
+            ),
+        });
+    }
+}
+
+fn global_array_initializer_entries(ty: &IrType, kind: GlobalArrayInitializerKind) -> Option<u64> {
+    let IrType::Array(element, count) = ty else {
+        return None;
+    };
+    global_array_initializer_element_entries(element, kind)?.checked_mul(*count)
+}
+
+fn global_array_initializer_element_entries(
+    ty: &IrType,
+    kind: GlobalArrayInitializerKind,
+) -> Option<u64> {
+    match (ty, kind) {
+        (IrType::Bool | IrType::Int(_), GlobalArrayInitializerKind::Integer)
+        | (IrType::Float(_), GlobalArrayInitializerKind::Float) => Some(1),
+        (IrType::Array(element, count), _) => {
+            global_array_initializer_element_entries(element, kind)?.checked_mul(*count)
+        }
+        _ => None,
+    }
 }
 
 /// Verify a single function.
@@ -1455,6 +1519,87 @@ mod tests {
                     && error.msg.contains("overflows the target address space")
             }),
             "expected an oversized-global layout error, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn mismatched_global_array_initializer_cardinalities_are_rejected() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "short_ints".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
+            initializer: Some(GlobalInit::IntArray(vec![1, 2])),
+        });
+        module.add_global(Global {
+            name: "short_complex".into(),
+            ty: IrType::Array(
+                Box::new(IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2)),
+                2,
+            ),
+            initializer: Some(GlobalInit::FloatArray(vec![1.0, 2.0, 3.0])),
+        });
+        module.add_global(Global {
+            name: "long_floats".into(),
+            ty: IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2),
+            initializer: Some(GlobalInit::FloatArray(vec![1.0, 2.0, 3.0])),
+        });
+        module.add_global(Global {
+            name: "wrong_kind".into(),
+            ty: IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2),
+            initializer: Some(GlobalInit::IntArray(vec![1, 2])),
+        });
+        module.add_global(Global {
+            name: "scalar".into(),
+            ty: IrType::Int(IntWidth::I32),
+            initializer: Some(GlobalInit::IntArray(vec![1])),
+        });
+
+        let errors = verify_module(&module);
+        for expected in [
+            "global 'short_ints' array initializer has 2 entries, but its type requires 3",
+            "global 'short_complex' array initializer has 3 entries, but its type requires 4",
+            "global 'long_floats' array initializer has 3 entries, but its type requires 2",
+            "global 'wrong_kind' integer-array initializer is incompatible with type '[f32 x 2]'",
+            "global 'scalar' integer-array initializer is incompatible with type 'i32'",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.msg.contains(expected)),
+                "expected global-initializer diagnostic containing '{expected}', got: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_global_array_initializers_and_partial_strings_are_accepted() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "ints".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
+            initializer: Some(GlobalInit::IntArray(vec![1, 2, 3])),
+        });
+        module.add_global(Global {
+            name: "complex".into(),
+            ty: IrType::Array(
+                Box::new(IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2)),
+                2,
+            ),
+            initializer: Some(GlobalInit::FloatArray(vec![1.0, 2.0, 3.0, 4.0])),
+        });
+        module.add_global(Global {
+            name: "string".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 8),
+            initializer: Some(GlobalInit::String(b"abc".to_vec())),
+        });
+        module.add_global(Global {
+            name: "empty".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 0),
+            initializer: Some(GlobalInit::IntArray(Vec::new())),
+        });
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "well-shaped arrays and byte strings with implicit trailing padding should verify, got: {errors:?}",
         );
     }
 

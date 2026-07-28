@@ -65428,6 +65428,38 @@ end module
     }
 
     #[test]
+    fn source_global_array_initializers_cover_flattened_ir_storage() {
+        let (module, _) = lower_and_verify(
+            "\
+module initialized_globals
+  implicit none
+  integer :: ints(3) = [1, 2, 3]
+  complex(4), parameter :: values(2) = [(1.0, 2.0), (3.0, 4.0)]
+end module initialized_globals
+",
+        );
+        let ints = module
+            .globals
+            .iter()
+            .find(|global| global.name.ends_with("_ints"))
+            .expect("missing integer array global");
+        let values = module
+            .globals
+            .iter()
+            .find(|global| global.name.ends_with("_values"))
+            .expect("missing complex array global");
+
+        assert!(
+            matches!(&ints.initializer, Some(GlobalInit::IntArray(entries)) if entries.len() == 3),
+            "integer array initializer must cover every declared element: {ints:?}",
+        );
+        assert!(
+            matches!(&values.initializer, Some(GlobalInit::FloatArray(entries)) if entries.len() == 4),
+            "complex array initializer must cover both lanes of every declared element: {values:?}",
+        );
+    }
+
+    #[test]
     fn preserves_imported_module_logical_kinds() {
         let (_, ir) = lower_and_verify(
             "\
