@@ -19086,6 +19086,7 @@ pub(super) fn emit_resolved_operator_call(
     append_host_closure_args_raw(
         b,
         locals,
+        st,
         contained_host_refs,
         &specific_key,
         &mut call_args,
@@ -19355,6 +19356,40 @@ pub(super) fn callee_arg_ir_type(
         .map(type_info_to_ir_type)
 }
 
+fn callee_arg_call_ir_type(
+    st: &SymbolTable,
+    callee_name: &str,
+    idx: usize,
+    is_value: bool,
+) -> Option<IrType> {
+    let symbol = callee_arg_symbol(st, callee_name, idx)?;
+    let element_type = if symbol_is_procedure_dummy(symbol) {
+        procedure_code_ptr_ir_type()
+    } else {
+        symbol.type_info.as_ref().map(type_info_to_ir_type)?
+    };
+    if is_value {
+        return Some(element_type);
+    }
+
+    let uses_descriptor = symbol_uses_descriptor_for_lowering(symbol);
+    let uses_string_descriptor = matches!(
+        symbol.type_info,
+        Some(crate::sema::symtab::TypeInfo::Character { len: None, .. })
+    ) && (symbol.attrs.allocatable || symbol.attrs.pointer)
+        && symbol.attrs.array_spec.is_empty();
+    let is_derived = matches!(
+        symbol.type_info,
+        Some(crate::sema::symtab::TypeInfo::Derived(_))
+    );
+    Some(by_ref_storage_ir_type(
+        &element_type,
+        uses_descriptor,
+        uses_string_descriptor,
+        is_derived,
+    ))
+}
+
 pub(super) fn coerce_value_call_arg(
     b: &mut FuncBuilder,
     st: &SymbolTable,
@@ -19373,7 +19408,10 @@ pub(super) fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueI
         IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
         IrType::Float(FloatWidth::F64) => b.const_f64(0.0),
         IrType::Bool => b.const_bool(false),
-        IrType::Ptr(_) => b.const_i64(0),
+        IrType::Ptr(pointee) => {
+            let zero = b.const_i64(0);
+            b.int_to_ptr(zero, (**pointee).clone())
+        }
         IrType::FuncPtr(_) => b.const_i64(0),
         IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(_)) => {
             let zero = b.const_i32(0);
@@ -19392,12 +19430,15 @@ pub(super) fn missing_optional_call_arg(
     idx: usize,
     is_value: bool,
 ) -> ValueId {
-    if !is_value {
-        return b.const_i64(0);
-    }
-    callee_arg_ir_type(st, callee_name, idx)
+    callee_arg_call_ir_type(st, callee_name, idx, is_value)
         .map(|ty| zero_value_for_ir_type(b, &ty))
-        .unwrap_or_else(|| b.const_i32(0))
+        .unwrap_or_else(|| {
+            if is_value {
+                b.const_i32(0)
+            } else {
+                b.const_i64(0)
+            }
+        })
 }
 
 pub(super) fn optional_value_presence_local_name(arg_name: &str) -> String {
@@ -20902,7 +20943,14 @@ pub(super) fn emit_named_function_call(
     } else {
         &key
     };
-    append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut call_args);
+    append_host_closure_args_raw(
+        b,
+        locals,
+        st,
+        contained_host_refs,
+        closure_key,
+        &mut call_args,
+    );
 
     // After generic resolution the specific is authoritative: never let the
     // BARE generic name participate in the internal-subprogram rebind.
@@ -22443,6 +22491,7 @@ fn procedure_actual_closure_args(
     append_host_closure_args_raw(
         b,
         locals,
+        st,
         contained_host_refs,
         closure_key,
         &mut closure_args,
@@ -24615,6 +24664,7 @@ pub(super) fn append_host_closure_args(
     append_host_closure_args_raw(
         b,
         &ctx.locals,
+        ctx.st,
         Some(ctx.contained_host_refs),
         callee_key,
         arg_vals,
@@ -24624,6 +24674,7 @@ pub(super) fn append_host_closure_args(
 pub(super) fn append_host_closure_args_raw(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     callee_key: &str,
     arg_vals: &mut Vec<ValueId>,
@@ -24633,15 +24684,23 @@ pub(super) fn append_host_closure_args_raw(
         _ => return,
     };
     for hname in refs {
+        let needs_procedure_closure = current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, hname))
+            .is_some_and(symbol_is_procedure_dummy);
         let info = match locals.get(hname) {
             Some(i) => i.clone(),
             None => {
                 // Should never happen: the host-refs analysis only
                 // records names declared in the host, and every host
-                // scope installs those as locals. Push a null to keep
-                // the ABI alignment consistent rather than panic.
-                let zero = b.const_i64(0);
-                arg_vals.push(zero);
+                // scope installs those as locals. Preserve the complete
+                // typed ABI shape so the verifier can still diagnose the
+                // missing producer without shifting every later argument.
+                arg_vals.push(null_procedure_closure_arg(b));
+                if needs_procedure_closure {
+                    for _ in 0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+                        arg_vals.push(null_procedure_closure_arg(b));
+                    }
+                }
                 continue;
             }
         };
@@ -24698,7 +24757,7 @@ pub(super) fn append_host_closure_args_raw(
             arg_vals.push(len);
         }
         let mut proc_closure_args = procedure_dummy_closure_args_from_locals(b, locals, hname);
-        if !proc_closure_args.is_empty() {
+        if needs_procedure_closure || !proc_closure_args.is_empty() {
             proc_closure_args.truncate(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
             while proc_closure_args.len() < crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
                 proc_closure_args.push(null_procedure_closure_arg(b));
@@ -25155,7 +25214,12 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
                 .unwrap_or(false)
         })
         .collect();
-    mask.iter().any(|flag| *flag).then_some(mask)
+    // `Some` means that this lookup key resolved to a concrete procedure,
+    // not that the procedure necessarily has an assumed-length character
+    // dummy. Preserve an all-false mask so multi-key ABI lookup stops at the
+    // selected specific instead of falling through to a same-named imported
+    // character procedure and appending one of its hidden length arguments.
+    Some(mask)
 }
 
 /// Check if a callee has deferred-length allocatable/pointer character dummies
@@ -27597,6 +27661,7 @@ pub(super) fn emit_final_proc_call(
     append_host_closure_args_raw(
         b,
         closure_locals,
+        st,
         contained_host_refs,
         &resolved_key,
         &mut call_args,
@@ -34033,6 +34098,7 @@ fn emit_defined_io_call(
     append_host_closure_args_raw(
         b,
         &ctx.locals,
+        ctx.st,
         Some(ctx.contained_host_refs),
         &specific_key,
         &mut call_args,
@@ -58032,6 +58098,7 @@ pub(super) fn store_derived_field_expr(
                         append_host_closure_args_raw(
                             b,
                             locals,
+                            st,
                             contained_host_refs,
                             closure_key,
                             &mut closure_args,
@@ -62769,6 +62836,43 @@ end module m
     }
 
     #[test]
+    fn omitted_optional_by_reference_arg_has_the_callee_pointer_type() {
+        let module = lower_source(
+            "\
+program test
+  implicit none
+  call consume(1)
+contains
+  subroutine consume(required, optional_arg)
+    integer, intent(in) :: required
+    integer, intent(in), optional :: optional_arg
+  end subroutine consume
+end program test
+",
+        );
+        let caller = module
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("__prog_"))
+            .expect("missing lowered program");
+        let omitted_arg = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| match &inst.kind {
+                InstKind::Call(_, args) if args.len() == 2 => Some(args[1]),
+                _ => None,
+            })
+            .expect("missing call to contained subroutine");
+
+        assert_eq!(
+            caller.value_type(omitted_arg),
+            Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+            "an absent by-reference dummy must use the callee's pointer type",
+        );
+    }
+
+    #[test]
     fn nondefault_logical_array_masks_verify() {
         lower_and_verify(
             "\
@@ -63626,6 +63730,129 @@ end program
             &program_ir[borrowed_start..]
         );
         assert_eq!(program_ir.matches("rt_call @__afs_deallocate").count(), 1);
+    }
+
+    #[test]
+    fn generic_derived_result_does_not_inherit_renamed_character_dummy_abi() {
+        let (module, ir) = lower_and_verify(include_str!(
+            "../../../test_programs/generic_private_rename_derived_result.f90"
+        ));
+        let callee_name = "afs_modproc_generic_private_rename_string_mod_lower_string";
+        let (callee_index, callee) = module
+            .functions
+            .iter()
+            .enumerate()
+            .find(|(_, function)| function.name == callee_name)
+            .expect("missing selected generic specific");
+        assert_eq!(
+            callee.params.len(),
+            2,
+            "derived-result specific must use only sret plus its visible dummy",
+        );
+        let caller = module
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("__prog_"))
+            .expect("missing program caller");
+        let call_arities: Vec<usize> = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| match &inst.kind {
+                InstKind::Call(FuncRef::External(name), args) if name == callee_name => {
+                    Some(args.len())
+                }
+                InstKind::Call(FuncRef::Internal(index), args)
+                    if *index as usize == callee_index =>
+                {
+                    Some(args.len())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !call_arities.is_empty(),
+            "missing generic call to selected derived-result specific:\n{ir}",
+        );
+        assert!(
+            call_arities
+                .iter()
+                .all(|arity| *arity == callee.params.len()),
+            "renamed character procedure metadata leaked into derived-result calls: \
+             callee has {} parameters, call arities are {call_arities:?}\n{ir}",
+            callee.params.len(),
+        );
+    }
+
+    #[test]
+    fn host_associated_procedure_pointer_call_forwards_full_closure_abi() {
+        let (module, ir) = lower_and_verify(
+            "\
+program p
+  use iso_c_binding, only: c_funptr, c_funloc, c_f_procpointer, c_int
+  implicit none
+  abstract interface
+    subroutine cb_i(out) bind(C)
+      import :: c_int
+      integer(c_int), intent(out) :: out
+    end subroutine
+  end interface
+  procedure(cb_i), pointer :: fp
+  type(c_funptr) :: raw
+  integer(c_int) :: got
+
+  raw = c_funloc(fill_answer)
+  call c_f_procpointer(raw, fp)
+  call wrapper(got)
+contains
+  subroutine wrapper(out)
+    integer(c_int), intent(out) :: out
+    call fp(out)
+  end subroutine wrapper
+
+  subroutine fill_answer(out) bind(C)
+    integer(c_int), intent(out) :: out
+    out = 42_c_int
+  end subroutine fill_answer
+end program p
+",
+        );
+        let (wrapper_index, wrapper) = module
+            .functions
+            .iter()
+            .enumerate()
+            .find(|(_, function)| {
+                function.name.starts_with("afs_internal___prog_p_")
+                    && function.params.len() == 2 + crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS
+            })
+            .expect("missing contained wrapper with captured procedure pointer");
+        let caller = module
+            .functions
+            .iter()
+            .find(|function| function.name == "__prog_p")
+            .expect("missing lowered program");
+        let call_args = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| match &inst.kind {
+                InstKind::Call(FuncRef::Internal(index), args)
+                    if *index as usize == wrapper_index =>
+                {
+                    Some(args)
+                }
+                InstKind::Call(FuncRef::External(name), args) if name == &wrapper.name => {
+                    Some(args)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing call to captured procedure-pointer wrapper:\n{ir}"));
+
+        assert_eq!(
+            call_args.len(),
+            wrapper.params.len(),
+            "caller must forward the captured procedure pointer and every reserved closure slot:\n{ir}",
+        );
     }
 
     #[test]

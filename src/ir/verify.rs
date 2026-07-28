@@ -38,9 +38,12 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
         }
     }
     for func in &module.functions {
+        let mut function_errors = verify_function(func);
+        check_internal_call_signatures(module, func, &mut function_errors);
+
         // Prefix each finding with the enclosing function so a failure
         // in a large amalgamated build points at the offending routine.
-        for mut e in verify_function(func) {
+        for mut e in function_errors {
             e.msg = format!("in '{}': {}", func.name, e.msg);
             errors.push(e);
         }
@@ -217,6 +220,77 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     check_dominance(func, &mut errors);
 
     errors
+}
+
+fn check_internal_call_signatures(
+    module: &Module,
+    caller: &Function,
+    errors: &mut Vec<VerifyError>,
+) {
+    for block in &caller.blocks {
+        for inst in &block.insts {
+            let InstKind::Call(FuncRef::Internal(callee_index), args) = &inst.kind else {
+                continue;
+            };
+            let Some(callee) = module.functions.get(*callee_index as usize) else {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "internal call %{} refers to function index {}, but the module has {} functions",
+                        inst.id.0,
+                        callee_index,
+                        module.functions.len(),
+                    ),
+                });
+                continue;
+            };
+
+            if !internal_call_types_match(&callee.return_type, &inst.ty) {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "internal call %{} to '{}' result type mismatch: expected {}, got {}",
+                        inst.id.0, callee.name, callee.return_type, inst.ty,
+                    ),
+                });
+            }
+
+            if args.len() != callee.params.len() {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "internal call %{} to '{}' argument count mismatch: expected {}, got {}",
+                        inst.id.0,
+                        callee.name,
+                        callee.params.len(),
+                        args.len(),
+                    ),
+                });
+            }
+
+            for (index, (arg, param)) in args.iter().zip(&callee.params).enumerate() {
+                let Some(actual_type) = caller.value_type(*arg) else {
+                    continue;
+                };
+                if !internal_call_types_match(&param.ty, &actual_type) {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "internal call %{} to '{}' argument {} type mismatch: expected {}, got {}",
+                            inst.id.0, callee.name, index, param.ty, actual_type,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn internal_call_types_match(expected: &IrType, actual: &IrType) -> bool {
+    expected == actual
+        // Data-pointer pointees are lowering annotations, not distinct
+        // machine-level calling-convention types. For example, a derived
+        // object may reach a helper as either ptr<i8> or ptr<[i8 x N]>.
+        // Both backends classify every Ptr(_) identically, and the lowering
+        // layer deliberately passes such pointer reinterpretations through.
+        // Keep function pointers separate so their signatures remain checked.
+        || matches!((expected, actual), (IrType::Ptr(_), IrType::Ptr(_)))
 }
 
 fn check_type_cache_entry(
@@ -1171,6 +1245,196 @@ mod tests {
             assert!(
                 errs.iter().any(|error| error.msg.contains(runtime_func)),
                 "expected a {runtime_func} ABI diagnostic, got: {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn well_typed_internal_call_is_accepted() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![
+            Param {
+                name: "integer_arg".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "real_arg".into(),
+                ty: IrType::Float(FloatWidth::F64),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut callee = Function::new("callee".into(), params, IrType::Int(IntWidth::I64));
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            let result = b.const_i64(42);
+            b.ret(Some(result));
+        }
+        let callee_index = module.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let integer_arg = b.const_i32(1);
+            let real_arg = b.const_f64(2.0);
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![integer_arg, real_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "well-typed internal call should verify, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn internal_calls_accept_data_pointer_pointee_reinterpretation() {
+        let byte_ptr = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![Param {
+            name: "data".into(),
+            ty: byte_ptr.clone(),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut callee = Function::new("callee".into(), params, byte_ptr);
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            let zero = b.const_i64(0);
+            let result = b.int_to_ptr(zero, IrType::Int(IntWidth::I8));
+            b.ret(Some(result));
+        }
+        let callee_index = module.add_function(callee);
+
+        let array_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 4);
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let data = b.alloca(array_ty.clone());
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![data],
+                IrType::Ptr(Box::new(array_ty)),
+            );
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "data-pointer pointee annotations share one internal-call ABI, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn internal_calls_reject_pointer_integer_substitution() {
+        let byte_ptr = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![Param {
+            name: "data".into(),
+            ty: byte_ptr,
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut callee = Function::new("callee".into(), params, IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            b.ret_void();
+        }
+        let callee_index = module.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let integer = b.const_i64(0);
+            b.call(FuncRef::Internal(callee_index), vec![integer], IrType::Void);
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.iter().any(|error| error
+                .msg
+                .contains("argument 0 type mismatch: expected ptr<i8>, got i64")),
+            "pointer/integer substitution must remain invalid, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn malformed_internal_call_signatures_are_rejected() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![
+            Param {
+                name: "integer_arg".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "real_arg".into(),
+                ty: IrType::Float(FloatWidth::F64),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut callee = Function::new("callee".into(), params, IrType::Int(IntWidth::I64));
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            let result = b.const_i64(42);
+            b.ret(Some(result));
+        }
+        let callee_index = module.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let integer_arg = b.const_i32(1);
+            let wrong_integer_arg = b.const_i64(1);
+            let real_arg = b.const_f64(2.0);
+            b.call(
+                FuncRef::Internal(99),
+                vec![integer_arg, real_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![integer_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![wrong_integer_arg, real_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![integer_arg, real_arg],
+                IrType::Bool,
+            );
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        for expected in [
+            "function index 99",
+            "argument count mismatch: expected 2, got 1",
+            "argument 0 type mismatch: expected i32, got i64",
+            "result type mismatch: expected i64, got bool",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.msg.contains(expected)),
+                "expected internal-call diagnostic containing '{expected}', got: {errors:?}",
             );
         }
     }

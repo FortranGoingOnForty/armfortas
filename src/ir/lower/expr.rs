@@ -3022,6 +3022,7 @@ pub(crate) fn lower_expr_full(
                     append_host_closure_args_raw(
                         b,
                         locals,
+                        st,
                         contained_host_refs,
                         closure_key,
                         &mut ref_arg_vals,
