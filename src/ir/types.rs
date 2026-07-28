@@ -91,23 +91,51 @@ pub struct StructDef {
     pub fields: Vec<(String, IrType)>,
 }
 
+/// Why an IR type cannot be sized without additional module context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeSizeError {
+    /// The byte count exceeds the IR's `u64` layout domain.
+    Overflow,
+    /// A named struct needs its definition before its layout can be computed.
+    StructLayoutRequired(StructId),
+}
+
 impl IrType {
-    /// Size in bytes under the given target layout.
-    pub fn size_bytes(&self, layout: &crate::target::TargetLayout) -> u64 {
+    /// Compute the size in bytes under the given target layout, reporting
+    /// overflow and named-struct layouts instead of assigning them a size.
+    pub fn try_size_bytes(
+        &self,
+        layout: &crate::target::TargetLayout,
+    ) -> Result<u64, TypeSizeError> {
         match self {
-            Self::Void => 0,
-            Self::Bool => layout.bool_bytes as u64,
-            Self::Int(w) => w.bytes() as u64,
-            Self::Float(w) => w.bytes() as u64,
-            Self::Ptr(_) => layout.ptr_bytes as u64,
-            Self::Array(elem, count) => elem.size_bytes(layout) * count,
-            Self::Struct(_) => {
-                panic!("Struct size requires struct_defs; use Module::struct_size()")
-            }
-            Self::FuncPtr(_) => layout.ptr_bytes as u64,
+            Self::Void => Ok(0),
+            Self::Bool => Ok(layout.bool_bytes as u64),
+            Self::Int(w) => Ok(w.bytes() as u64),
+            Self::Float(w) => Ok(w.bytes() as u64),
+            Self::Ptr(_) => Ok(layout.ptr_bytes as u64),
+            Self::Array(elem, count) => elem
+                .try_size_bytes(layout)?
+                .checked_mul(*count)
+                .ok_or(TypeSizeError::Overflow),
+            Self::Struct(id) => Err(TypeSizeError::StructLayoutRequired(*id)),
+            Self::FuncPtr(_) => Ok(layout.ptr_bytes as u64),
             // Every supported lane combo fills one vector register.
             // The verifier rejects shapes that don't.
-            Self::Vector { .. } => layout.vector_bytes as u64,
+            Self::Vector { .. } => Ok(layout.vector_bytes as u64),
+        }
+    }
+
+    /// Size in bytes under the given target layout.
+    ///
+    /// Panics when the byte count overflows or named-struct context is absent.
+    /// Callers handling arbitrary IR should use [`Self::try_size_bytes`].
+    pub fn size_bytes(&self, layout: &crate::target::TargetLayout) -> u64 {
+        match self.try_size_bytes(layout) {
+            Ok(size) => size,
+            Err(TypeSizeError::Overflow) => panic!("IR type size exceeds u64 bytes: {self}"),
+            Err(TypeSizeError::StructLayoutRequired(_)) => {
+                panic!("Struct size requires module struct definitions")
+            }
         }
     }
 
@@ -210,5 +238,41 @@ impl std::fmt::Display for IntWidth {
 impl std::fmt::Display for FloatWidth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "f{}", self.bits())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_array_size_covers_empty_boundary_and_nested_overflow() {
+        let layout = crate::target::TargetLayout::LP64;
+        assert_eq!(
+            IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 0).try_size_bytes(&layout),
+            Ok(0),
+        );
+        assert_eq!(
+            IrType::Array(Box::new(IrType::Int(IntWidth::I8)), u64::MAX).try_size_bytes(&layout),
+            Ok(u64::MAX),
+        );
+        assert_eq!(
+            IrType::Array(
+                Box::new(IrType::Array(
+                    Box::new(IrType::Int(IntWidth::I64)),
+                    1_u64 << 60,
+                )),
+                2,
+            )
+            .try_size_bytes(&layout),
+            Err(TypeSizeError::Overflow),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "IR type size exceeds u64 bytes")]
+    fn size_bytes_never_wraps_an_oversized_array() {
+        let ty = IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 1_u64 << 61);
+        let _ = ty.size_bytes(&crate::target::TargetLayout::LP64);
     }
 }

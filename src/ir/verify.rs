@@ -5,7 +5,7 @@
 //! terminator completeness, block param/branch arg matching.
 
 use super::inst::*;
-use super::types::{IntWidth, IrType};
+use super::types::{IntWidth, IrType, TypeSizeError};
 use super::walk::{compute_dominator_info, inst_uses, terminator_targets, terminator_uses};
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +24,19 @@ impl std::fmt::Display for VerifyError {
 /// Verify a module. Returns a list of errors (empty = valid).
 pub fn verify_module(module: &Module) -> Vec<VerifyError> {
     let mut errors = Vec::new();
+    for global in &module.globals {
+        if matches!(
+            global.ty.try_size_bytes(&module.layout),
+            Err(TypeSizeError::Overflow)
+        ) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "global '{}' has type '{}' whose byte size overflows the target address space",
+                    global.name, global.ty
+                ),
+            });
+        }
+    }
     for func in &module.functions {
         // Prefix each finding with the enclosing function so a failure
         // in a large amalgamated build points at the offending routine.
@@ -755,6 +768,25 @@ mod tests {
         module.add_function(func);
         let errs = verify_module(&module);
         assert!(errs.is_empty(), "errors: {:?}", errs);
+    }
+
+    #[test]
+    fn oversized_global_array_layout_is_rejected() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "oversized".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 1_u64 << 61),
+            initializer: Some(GlobalInit::Zero),
+        });
+
+        let errs = verify_module(&module);
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains("global 'oversized'")
+                    && error.msg.contains("overflows the target address space")
+            }),
+            "expected an oversized-global layout error, got: {errs:?}",
+        );
     }
 
     #[test]

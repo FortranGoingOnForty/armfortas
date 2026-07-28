@@ -33114,6 +33114,88 @@ fn deeply_nested_expression_fails_gracefully() {
 }
 
 #[test]
+fn oversized_static_array_layout_fails_before_codegen() {
+    let src = write_program(
+        "module overflow_global\n\
+           implicit none\n\
+           integer(8), save :: payload(2305843009213693952_8)\n\
+         end module overflow_global\n",
+        "f90",
+    );
+
+    let configurations = [
+        ("-O0", None),
+        ("-O1", None),
+        ("-O2", None),
+        ("-O3", None),
+        ("-Os", None),
+        ("-Ofast", None),
+        ("-O0", Some("x86_64-linux-musl")),
+        ("-O2", Some("x86_64-linux-musl")),
+        ("-O0", Some("x86_64-freebsd")),
+        ("-O2", Some("x86_64-freebsd")),
+        ("-O0", Some("arm64-macos")),
+        ("-O2", Some("arm64-macos")),
+    ];
+    let mut baseline_stderr = None;
+    for (optimization, target) in configurations {
+        let configuration = format!(
+            "{}_{}",
+            optimization.trim_start_matches('-'),
+            target.unwrap_or("native").replace('-', "_")
+        );
+        let out = unique_path(&format!("oversized_static_array_{configuration}"), "s");
+        assert!(!out.exists(), "test output must start absent");
+        let mut command = Command::new(compiler("armfortas"));
+        command.arg(optimization);
+        if let Some(target) = target {
+            command.args(["--target", target]);
+        }
+        let result = command
+            .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("oversized static-array compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "{configuration}: oversized static array should be a compile failure: {stderr}"
+        );
+        assert_eq!(
+            stderr
+                .matches("whose byte size overflows the target address space")
+                .count(),
+            1,
+            "{configuration}: expected one stable layout diagnostic: {stderr}"
+        );
+        assert!(
+            stderr.contains("afs_mod_overflow_global_payload"),
+            "{configuration}: diagnostic should identify the rejected global: {stderr}"
+        );
+        assert!(
+            !stderr.contains("INTERNAL COMPILER ERROR"),
+            "{configuration}: layout rejection must not use the panic path: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{configuration}: failed layout verification published assembly"
+        );
+        if let Some(baseline) = baseline_stderr.as_ref() {
+            assert_eq!(
+                stderr.as_ref(),
+                baseline,
+                "{configuration}: layout diagnostic changed across optimization or target"
+            );
+        } else {
+            baseline_stderr = Some(stderr.into_owned());
+        }
+    }
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn diagnostic_gutter_stays_aligned_for_six_digit_line_numbers() {
     let mut src_text = "! filler\n".repeat(100_000);
     src_text.push_str("program p\n  error stop 'oops'\nend program\n");
