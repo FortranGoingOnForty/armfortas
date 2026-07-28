@@ -381,7 +381,9 @@ fn check_branch_types(
     }
 
     let mut check = |dest: BlockId, args: &[ValueId]| {
-        let target = func.block(dest);
+        let Some(target) = func.try_block(dest) else {
+            return;
+        };
         if target.params.len() != args.len() {
             errors.push(VerifyError {
                 msg: format!(
@@ -423,17 +425,20 @@ fn check_branch_types(
         }
         Terminator::Switch { cases, default, .. } => {
             // Switch targets shouldn't have block params (simplified model).
-            let default_block = func.block(*default);
-            if !default_block.params.is_empty() {
-                errors.push(VerifyError {
-                    msg: format!(
-                        "switch default target '{}' has block parameters",
-                        default_block.name
-                    ),
-                });
+            if let Some(default_block) = func.try_block(*default) {
+                if !default_block.params.is_empty() {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "switch default target '{}' has block parameters",
+                            default_block.name
+                        ),
+                    });
+                }
             }
             for (_, dest) in cases {
-                let target = func.block(*dest);
+                let Some(target) = func.try_block(*dest) else {
+                    continue;
+                };
                 if !target.params.is_empty() {
                     errors.push(VerifyError {
                         msg: format!("switch case target '{}' has block parameters", target.name),
@@ -929,6 +934,66 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| e.msg.contains("expected 1 args, got 0")));
+    }
+
+    #[test]
+    fn dangling_cfg_targets_are_reported_without_panicking() {
+        let dangling = BlockId(999);
+
+        let mut branch = Function::new("branch".into(), vec![], IrType::Void);
+        branch.blocks[0].terminator = Some(Terminator::Branch(dangling, vec![]));
+        let branch_errs = verify_function(&branch);
+        assert!(
+            branch_errs
+                .iter()
+                .any(|error| error.msg.contains("branches to undefined block 999")),
+            "expected a dangling branch diagnostic, got: {branch_errs:?}",
+        );
+
+        let mut conditional = Function::new("conditional".into(), vec![], IrType::Void);
+        let valid_conditional_target;
+        {
+            let mut b = FuncBuilder::new(&mut conditional, crate::target::TargetLayout::LP64);
+            let condition = b.const_bool(true);
+            valid_conditional_target = b.create_block("valid");
+            b.cond_branch(
+                condition,
+                dangling,
+                vec![],
+                valid_conditional_target,
+                vec![],
+            );
+            b.set_block(valid_conditional_target);
+            b.ret_void();
+        }
+        let conditional_errs = verify_function(&conditional);
+        assert!(
+            conditional_errs
+                .iter()
+                .any(|error| error.msg.contains("branches to undefined block 999")),
+            "expected a dangling conditional-branch diagnostic, got: {conditional_errs:?}",
+        );
+
+        let mut switch = Function::new("switch".into(), vec![], IrType::Void);
+        let selector;
+        {
+            let mut b = FuncBuilder::new(&mut switch, crate::target::TargetLayout::LP64);
+            selector = b.const_i32(1);
+        }
+        switch.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: vec![(1, dangling)],
+            default: dangling,
+        });
+        let switch_errs = verify_function(&switch);
+        assert_eq!(
+            switch_errs
+                .iter()
+                .filter(|error| error.msg.contains("branches to undefined block 999"))
+                .count(),
+            2,
+            "case and default edges should each be diagnosed: {switch_errs:?}",
+        );
     }
 
     #[test]
