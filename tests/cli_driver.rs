@@ -9222,6 +9222,52 @@ fn dead_float_result_still_raises_observed_flag_at_every_opt_level() {
 }
 
 #[test]
+fn empty_infinite_loop_remains_nonterminating_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_infinite_loop_remains_nonterminating_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("empty_infinite_loop");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  do\n  end do\n  error stop 99\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "empty_infinite_loop_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("empty infinite-loop compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: empty infinite-loop witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        assert!(
+            run_binary_with_timeout(&executable, std::time::Duration::from_secs(1)).is_none(),
+            "{optimization}: empty infinite loop terminated after CFG simplification"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_value_positive_inf_from_intrinsic_module_is_not_finite() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
