@@ -18,7 +18,8 @@
 //!  1. Lattice: `Top` (not yet seen), `Const(c)` (proven constant),
 //!     `Bottom` (overdefined / non-constant).
 //!  2. Reachability: a `HashSet<BlockId>` of reachable blocks plus a
-//!     `HashSet<(BlockId, BlockId)>` of reachable CFG edges.
+//!     `HashSet<EdgeId>` of reachable CFG edges. Edge identity includes
+//!     the terminator arm, so parallel edges remain distinct.
 //!  3. Two worklists:
 //!      * SSA-edge worklist — re-evaluate uses when a value's lattice
 //!        moves down (Top → Const, Top → Bottom, Const → Bottom).
@@ -121,19 +122,17 @@ struct Sccp<'a> {
     lattice: HashMap<ValueId, Lattice>,
     /// Reachable blocks.
     reachable_blocks: HashSet<BlockId>,
-    /// Reachable CFG edges (pred, succ).
-    reachable_edges: HashSet<(BlockId, BlockId)>,
+    /// Reachable CFG edges, identified by predecessor and terminator arm.
+    reachable_edges: HashSet<EdgeId>,
     /// CFG worklist — newly reachable edges to process.
-    cfg_worklist: VecDeque<(BlockId, BlockId)>,
+    cfg_worklist: VecDeque<EdgeId>,
     /// SSA worklist — values whose lattice changed; re-evaluate users
     /// (block params and terminators that consume them).
     ssa_worklist: VecDeque<ValueId>,
-    /// Predecessor list (built once).
-    preds: HashMap<BlockId, Vec<BlockId>>,
-    /// (pred_block, args_passed) per (pred → succ) edge — used to
-    /// look up what value flows into each block param along an edge.
-    /// Indexed by (pred, succ); empty for Return/Unreachable terms.
-    edge_args: HashMap<(BlockId, BlockId), Vec<ValueId>>,
+    /// Incoming edge identities for each destination block.
+    incoming_edges: HashMap<BlockId, Vec<EdgeId>>,
+    /// Destination and block arguments for each distinct CFG edge.
+    edge_data: HashMap<EdgeId, EdgeData>,
     /// For each block param ValueId: the (pred → succ) edges that
     /// feed it, plus its index within the block's param list. We
     /// rebuild the meet over reachable edges whenever any of the
@@ -143,6 +142,27 @@ struct Sccp<'a> {
     /// SSA-worklist when it changes. For now: only block params and
     /// terminator-conditions are tracked (we don't model arithmetic).
     value_users: HashMap<ValueId, Vec<ValueUser>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EdgeId {
+    from: BlockId,
+    arm: EdgeArm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EdgeArm {
+    Branch,
+    CondTrue,
+    CondFalse,
+    SwitchDefault,
+    SwitchCase(usize),
+}
+
+#[derive(Debug, Clone)]
+struct EdgeData {
+    to: BlockId,
+    args: Vec<ValueId>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,41 +198,77 @@ impl<'a> Sccp<'a> {
             }
         }
 
-        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        let mut edge_args: HashMap<(BlockId, BlockId), Vec<ValueId>> = HashMap::new();
+        let mut incoming_edges: HashMap<BlockId, Vec<EdgeId>> = HashMap::new();
+        let mut edge_data: HashMap<EdgeId, EdgeData> = HashMap::new();
         for block in &func.blocks {
-            preds.entry(block.id).or_default();
+            incoming_edges.entry(block.id).or_default();
         }
-        for block in &func.blocks {
-            let Some(term) = &block.terminator else {
-                continue;
+        {
+            let mut record_edge = |edge: EdgeId, to: BlockId, args: Vec<ValueId>| {
+                incoming_edges.entry(to).or_default().push(edge);
+                edge_data.insert(edge, EdgeData { to, args });
             };
-            match term {
-                Terminator::Branch(succ, args) => {
-                    preds.entry(*succ).or_default().push(block.id);
-                    edge_args.insert((block.id, *succ), args.clone());
-                }
-                Terminator::CondBranch {
-                    true_dest,
-                    true_args,
-                    false_dest,
-                    false_args,
-                    ..
-                } => {
-                    preds.entry(*true_dest).or_default().push(block.id);
-                    preds.entry(*false_dest).or_default().push(block.id);
-                    edge_args.insert((block.id, *true_dest), true_args.clone());
-                    edge_args.insert((block.id, *false_dest), false_args.clone());
-                }
-                Terminator::Switch { cases, default, .. } => {
-                    preds.entry(*default).or_default().push(block.id);
-                    edge_args.insert((block.id, *default), vec![]);
-                    for (_, tgt) in cases {
-                        preds.entry(*tgt).or_default().push(block.id);
-                        edge_args.insert((block.id, *tgt), vec![]);
+            for block in &func.blocks {
+                let Some(term) = &block.terminator else {
+                    continue;
+                };
+                match term {
+                    Terminator::Branch(succ, args) => {
+                        record_edge(
+                            EdgeId {
+                                from: block.id,
+                                arm: EdgeArm::Branch,
+                            },
+                            *succ,
+                            args.clone(),
+                        );
                     }
+                    Terminator::CondBranch {
+                        true_dest,
+                        true_args,
+                        false_dest,
+                        false_args,
+                        ..
+                    } => {
+                        record_edge(
+                            EdgeId {
+                                from: block.id,
+                                arm: EdgeArm::CondTrue,
+                            },
+                            *true_dest,
+                            true_args.clone(),
+                        );
+                        record_edge(
+                            EdgeId {
+                                from: block.id,
+                                arm: EdgeArm::CondFalse,
+                            },
+                            *false_dest,
+                            false_args.clone(),
+                        );
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        record_edge(
+                            EdgeId {
+                                from: block.id,
+                                arm: EdgeArm::SwitchDefault,
+                            },
+                            *default,
+                            vec![],
+                        );
+                        for (case_index, (_, target)) in cases.iter().enumerate() {
+                            record_edge(
+                                EdgeId {
+                                    from: block.id,
+                                    arm: EdgeArm::SwitchCase(case_index),
+                                },
+                                *target,
+                                vec![],
+                            );
+                        }
+                    }
+                    Terminator::Return(_) | Terminator::Unreachable => {}
                 }
-                Terminator::Return(_) | Terminator::Unreachable => {}
             }
         }
 
@@ -223,9 +279,9 @@ impl<'a> Sccp<'a> {
             // Block-param dependents: each param's incoming arg
             // along each pred edge.
             for (pi, p) in block.params.iter().enumerate() {
-                for pred in preds.get(&block.id).cloned().unwrap_or_default() {
-                    if let Some(args) = edge_args.get(&(pred, block.id)) {
-                        if let Some(arg) = args.get(pi) {
+                for edge in incoming_edges.get(&block.id).cloned().unwrap_or_default() {
+                    if let Some(data) = edge_data.get(&edge) {
+                        if let Some(arg) = data.args.get(pi) {
                             value_users
                                 .entry(*arg)
                                 .or_default()
@@ -263,8 +319,8 @@ impl<'a> Sccp<'a> {
             reachable_edges: HashSet::new(),
             cfg_worklist: VecDeque::new(),
             ssa_worklist: VecDeque::new(),
-            preds,
-            edge_args,
+            incoming_edges,
+            edge_data,
             param_inputs,
             value_users,
         }
@@ -298,9 +354,12 @@ impl<'a> Sccp<'a> {
 
     /// Mark a CFG edge reachable; if newly so, mark the destination
     /// block reachable and queue the edge for block-param re-meet.
-    fn mark_edge(&mut self, from: BlockId, to: BlockId) {
-        if self.reachable_edges.insert((from, to)) {
-            self.cfg_worklist.push_back((from, to));
+    fn mark_edge(&mut self, edge: EdgeId) {
+        let Some(to) = self.edge_data.get(&edge).map(|data| data.to) else {
+            return;
+        };
+        if self.reachable_edges.insert(edge) {
+            self.cfg_worklist.push_back(edge);
             self.mark_block_reachable(to);
         }
     }
@@ -317,64 +376,81 @@ impl<'a> Sccp<'a> {
         };
         match term {
             Terminator::Return(_) | Terminator::Unreachable => {}
-            Terminator::Branch(dest, _) => {
-                let dest = *dest;
-                self.mark_edge(b, dest);
+            Terminator::Branch(_, _) => {
+                self.mark_edge(EdgeId {
+                    from: b,
+                    arm: EdgeArm::Branch,
+                });
             }
-            Terminator::CondBranch {
-                cond,
-                true_dest,
-                false_dest,
-                ..
-            } => match self.lat(*cond) {
-                Lattice::Const(ConstVal::Bool(true)) => self.mark_edge(b, *true_dest),
-                Lattice::Const(ConstVal::Bool(false)) => self.mark_edge(b, *false_dest),
+            Terminator::CondBranch { cond, .. } => match self.lat(*cond) {
+                Lattice::Const(ConstVal::Bool(true)) => self.mark_edge(EdgeId {
+                    from: b,
+                    arm: EdgeArm::CondTrue,
+                }),
+                Lattice::Const(ConstVal::Bool(false)) => self.mark_edge(EdgeId {
+                    from: b,
+                    arm: EdgeArm::CondFalse,
+                }),
                 Lattice::Bottom => {
-                    let t = *true_dest;
-                    let f = *false_dest;
-                    self.mark_edge(b, t);
-                    self.mark_edge(b, f);
+                    self.mark_edge(EdgeId {
+                        from: b,
+                        arm: EdgeArm::CondTrue,
+                    });
+                    self.mark_edge(EdgeId {
+                        from: b,
+                        arm: EdgeArm::CondFalse,
+                    });
                 }
                 // Const(non-bool) is a type error in well-typed IR;
                 // be conservative and mark both. Top means we'll
                 // revisit when `cond` resolves.
                 Lattice::Const(_) => {
-                    let t = *true_dest;
-                    let f = *false_dest;
-                    self.mark_edge(b, t);
-                    self.mark_edge(b, f);
+                    self.mark_edge(EdgeId {
+                        from: b,
+                        arm: EdgeArm::CondTrue,
+                    });
+                    self.mark_edge(EdgeId {
+                        from: b,
+                        arm: EdgeArm::CondFalse,
+                    });
                 }
                 Lattice::Top => {}
             },
             Terminator::Switch {
-                selector,
-                cases,
-                default,
+                selector, cases, ..
             } => match self.lat(*selector) {
                 Lattice::Const(ConstVal::Int(sv, w)) => {
                     let bits = w.bits();
-                    let target = cases
+                    let arm = cases
                         .iter()
-                        .find(|(k, _)| sext(*k as i128, bits) == sv)
-                        .map(|(_, blk)| *blk)
-                        .unwrap_or(*default);
-                    self.mark_edge(b, target);
+                        .position(|(k, _)| sext(*k as i128, bits) == sv)
+                        .map(EdgeArm::SwitchCase)
+                        .unwrap_or(EdgeArm::SwitchDefault);
+                    self.mark_edge(EdgeId { from: b, arm });
                 }
                 Lattice::Bottom => {
-                    let cases_clone: Vec<BlockId> = cases.iter().map(|(_, t)| *t).collect();
-                    let default = *default;
-                    for t in cases_clone {
-                        self.mark_edge(b, t);
+                    for case_index in 0..cases.len() {
+                        self.mark_edge(EdgeId {
+                            from: b,
+                            arm: EdgeArm::SwitchCase(case_index),
+                        });
                     }
-                    self.mark_edge(b, default);
+                    self.mark_edge(EdgeId {
+                        from: b,
+                        arm: EdgeArm::SwitchDefault,
+                    });
                 }
                 Lattice::Const(_) => {
-                    let cases_clone: Vec<BlockId> = cases.iter().map(|(_, t)| *t).collect();
-                    let default = *default;
-                    for t in cases_clone {
-                        self.mark_edge(b, t);
+                    for case_index in 0..cases.len() {
+                        self.mark_edge(EdgeId {
+                            from: b,
+                            arm: EdgeArm::SwitchCase(case_index),
+                        });
                     }
-                    self.mark_edge(b, default);
+                    self.mark_edge(EdgeId {
+                        from: b,
+                        arm: EdgeArm::SwitchDefault,
+                    });
                 }
                 Lattice::Top => {}
             },
@@ -389,16 +465,16 @@ impl<'a> Sccp<'a> {
         };
         let block = info.block;
         let pi = info.param_idx;
-        let preds = self.preds.get(&block).cloned().unwrap_or_default();
+        let incoming_edges = self.incoming_edges.get(&block).cloned().unwrap_or_default();
         let mut new = Lattice::Top;
-        for pred in preds {
-            if !self.reachable_edges.contains(&(pred, block)) {
+        for edge in incoming_edges {
+            if !self.reachable_edges.contains(&edge) {
                 continue;
             }
-            let Some(args) = self.edge_args.get(&(pred, block)) else {
+            let Some(data) = self.edge_data.get(&edge) else {
                 continue;
             };
-            let Some(arg) = args.get(pi) else {
+            let Some(arg) = data.args.get(pi) else {
                 continue;
             };
             // If the arg IS the param itself (back-edge with same
@@ -447,8 +523,10 @@ impl<'a> Sccp<'a> {
         self.mark_block_reachable(self.func.entry);
 
         while !self.cfg_worklist.is_empty() || !self.ssa_worklist.is_empty() {
-            while let Some((from, to)) = self.cfg_worklist.pop_front() {
-                let _ = from;
+            while let Some(edge) = self.cfg_worklist.pop_front() {
+                let Some(to) = self.edge_data.get(&edge).map(|data| data.to) else {
+                    continue;
+                };
                 // Re-meet every block param of `to`, since a new
                 // reachable edge may add a new input.
                 let params: Vec<ValueId> = self
@@ -716,6 +794,7 @@ impl Pass for Sccp_ {
 mod tests {
     use super::*;
     use crate::ir::types::IrType;
+    use crate::ir::verify::verify_module;
     use crate::lexer::{Position, Span};
 
     fn dummy_span() -> Span {
@@ -939,5 +1018,146 @@ mod tests {
             m.functions[0].blocks[0].terminator,
             Some(Terminator::CondBranch { .. })
         ));
+    }
+
+    #[test]
+    fn same_target_condbranch_uses_the_selected_edge_argument() {
+        // Both arms target `merge`, but they are distinct CFG edges with
+        // distinct block arguments. A true condition must select 7, not the
+        // false edge's 99.
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let merge = f.create_block("merge");
+        let cond = f.next_value_id();
+        let true_value = f.next_value_id();
+        let false_value = f.next_value_id();
+        let merge_param = f.next_value_id();
+
+        f.block_mut(f.entry).insts.extend([
+            Inst {
+                id: cond,
+                kind: InstKind::ConstBool(true),
+                ty: IrType::Bool,
+                span: dummy_span(),
+            },
+            Inst {
+                id: true_value,
+                kind: InstKind::ConstInt(7, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span: dummy_span(),
+            },
+            Inst {
+                id: false_value,
+                kind: InstKind::ConstInt(99, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span: dummy_span(),
+            },
+        ]);
+        f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
+            cond,
+            true_dest: merge,
+            true_args: vec![true_value],
+            false_dest: merge,
+            false_args: vec![false_value],
+        });
+        f.block_mut(merge).params.push(BlockParam {
+            id: merge_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(merge_param)));
+        f.rebuild_type_cache();
+        m.add_function(f);
+
+        assert!(
+            verify_module(&m).is_empty(),
+            "same-target test IR must start valid"
+        );
+        assert!(Sccp_.run(&mut m), "SCCP should fold the known edge");
+        assert!(
+            verify_module(&m).is_empty(),
+            "SCCP must preserve valid same-target IR"
+        );
+        let merge = m.functions[0]
+            .blocks
+            .iter()
+            .find(|block| block.id == merge)
+            .expect("merge block");
+        assert!(merge.params.is_empty(), "known merge value should fold");
+        assert!(
+            matches!(
+                merge.insts.first().map(|inst| &inst.kind),
+                Some(InstKind::ConstInt(7, IntWidth::I32))
+            ),
+            "SCCP selected the wrong parallel-edge argument: {:?}",
+            merge.insts
+        );
+    }
+
+    #[test]
+    fn same_target_condbranch_with_unknown_condition_keeps_both_edges() {
+        // With an unknown condition both parallel edges are executable. Their
+        // different arguments must meet to Bottom, leaving the block parameter
+        // intact rather than replacing it with either arm's value.
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let params = vec![Param {
+            name: "condition".into(),
+            ty: IrType::Bool,
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut f = Function::new("f".into(), params, IrType::Int(IntWidth::I32));
+        let merge = f.create_block("merge");
+        let true_value = f.next_value_id();
+        let false_value = f.next_value_id();
+        let merge_param = f.next_value_id();
+
+        f.block_mut(f.entry).insts.extend([
+            Inst {
+                id: true_value,
+                kind: InstKind::ConstInt(7, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span: dummy_span(),
+            },
+            Inst {
+                id: false_value,
+                kind: InstKind::ConstInt(99, IntWidth::I32),
+                ty: IrType::Int(IntWidth::I32),
+                span: dummy_span(),
+            },
+        ]);
+        f.block_mut(f.entry).terminator = Some(Terminator::CondBranch {
+            cond: ValueId(0),
+            true_dest: merge,
+            true_args: vec![true_value],
+            false_dest: merge,
+            false_args: vec![false_value],
+        });
+        f.block_mut(merge).params.push(BlockParam {
+            id: merge_param,
+            ty: IrType::Int(IntWidth::I32),
+        });
+        f.block_mut(merge).terminator = Some(Terminator::Return(Some(merge_param)));
+        f.rebuild_type_cache();
+        m.add_function(f);
+
+        assert!(
+            verify_module(&m).is_empty(),
+            "same-target test IR must start valid"
+        );
+        let _ = Sccp_.run(&mut m);
+        assert!(
+            verify_module(&m).is_empty(),
+            "SCCP must preserve valid same-target IR"
+        );
+        let merge = m.functions[0]
+            .blocks
+            .iter()
+            .find(|block| block.id == merge)
+            .expect("merge block");
+        assert_eq!(
+            merge.params.len(),
+            1,
+            "distinct executable edges must keep the merge parameter"
+        );
     }
 }
