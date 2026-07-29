@@ -271,7 +271,11 @@ pub struct Function {
     /// O(1) type lookup cache. Populated during construction; call
     /// `rebuild_type_cache()` after optimizer passes mutate the IR.
     type_cache: HashMap<ValueId, IrType>,
-    /// Fortran PURE attribute — function has no side effects.
+    /// Fortran `PURE` source-language attribute.
+    ///
+    /// This records the semantic declaration, not an optimizer proof that the
+    /// lowered body is effect-free. Passes that remove or reuse calls must also
+    /// establish the body properties their transformation requires.
     pub is_pure: bool,
     /// Fortran ELEMENTAL attribute — operates element-wise on arrays.
     pub is_elemental: bool,

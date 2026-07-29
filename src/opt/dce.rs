@@ -40,12 +40,136 @@ use super::pass::Pass;
 use super::util::{inst_uses, prune_unreachable, terminator_uses};
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug)]
 struct InternalCallDceInfo {
-    is_pure: bool,
-    returns_void: bool,
+    discardable_when_unused: bool,
+}
+
+/// Return every address proven to remain within this invocation's stack frame.
+///
+/// A local alloca and GEPs derived directly from one can be written without
+/// making a call externally observable. Pointer loads, block parameters,
+/// integer round-trips, and other derived addresses stay conservative: a store
+/// through any of them prevents call removal.
+fn local_stack_addresses(func: &Function) -> HashSet<ValueId> {
+    let mut local = HashSet::new();
+    let mut derived_by_base: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    let mut worklist = VecDeque::new();
+
+    for inst in func.blocks.iter().flat_map(|block| block.insts.iter()) {
+        match &inst.kind {
+            InstKind::Alloca(_) => {
+                local.insert(inst.id);
+                worklist.push_back(inst.id);
+            }
+            InstKind::GetElementPtr(base, _) => {
+                derived_by_base.entry(*base).or_default().push(inst.id);
+            }
+            _ => {}
+        }
+    }
+
+    while let Some(base) = worklist.pop_front() {
+        if let Some(derived) = derived_by_base.get(&base) {
+            for &address in derived {
+                if local.insert(address) {
+                    worklist.push_back(address);
+                }
+            }
+        }
+    }
+
+    local
+}
+
+/// Collect internal callees when a function has no direct observable effect.
+///
+/// This is deliberately independent of `Function::is_pure`: that field records
+/// the source-language attribute, while this scan is the optimizer proof needed
+/// before deleting an actual call. Returning `None` means the body contains an
+/// effect DCE cannot prove local.
+fn effect_free_body_dependencies(func: &Function) -> Option<Vec<u32>> {
+    let local_addresses = local_stack_addresses(func);
+    let mut internal_callees = Vec::new();
+
+    for block in &func.blocks {
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::Store(_, addr) | InstKind::VStore(_, addr)
+                    if !local_addresses.contains(addr) =>
+                {
+                    return None;
+                }
+                InstKind::RuntimeCall(..) => return None,
+                InstKind::Call(FuncRef::Internal(idx), _) => internal_callees.push(*idx),
+                InstKind::Call(..) => return None,
+                _ => {}
+            }
+        }
+        if matches!(block.terminator.as_ref(), Some(Terminator::Unreachable)) {
+            return None;
+        }
+    }
+
+    Some(internal_callees)
+}
+
+/// Derive which internal calls can be discarded when their results are dead.
+///
+/// Candidates need both a non-void Fortran `PURE` annotation and an
+/// independently inspected body with no direct observable effects. Internal
+/// call dependencies are then solved as a greatest fixed point: starting with
+/// all direct candidates preserves effect-free recursive cycles, while any
+/// edge to an impure, effectful, void-returning, or missing callee poisons every
+/// transitive caller.
+fn derive_internal_call_dce_info(module: &Module) -> Vec<InternalCallDceInfo> {
+    let mut dependencies = Vec::with_capacity(module.functions.len());
+    let mut info = Vec::with_capacity(module.functions.len());
+
+    for func in &module.functions {
+        let body_dependencies = if !matches!(func.return_type, IrType::Void) && func.is_pure {
+            effect_free_body_dependencies(func)
+        } else {
+            None
+        };
+        let discardable_when_unused = body_dependencies.is_some();
+        dependencies.push(body_dependencies.unwrap_or_default());
+        info.push(InternalCallDceInfo {
+            discardable_when_unused,
+        });
+    }
+
+    let mut callers_by_callee = vec![Vec::new(); module.functions.len()];
+    for (caller_idx, callees) in dependencies.iter().enumerate() {
+        if !info[caller_idx].discardable_when_unused {
+            continue;
+        }
+        for &callee in callees {
+            let Some(callers) = callers_by_callee.get_mut(callee as usize) else {
+                info[caller_idx].discardable_when_unused = false;
+                break;
+            };
+            callers.push(caller_idx);
+        }
+    }
+
+    let mut worklist = info
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, summary)| (!summary.discardable_when_unused).then_some(idx))
+        .collect::<VecDeque<_>>();
+    while let Some(effectful_idx) = worklist.pop_front() {
+        for &caller_idx in &callers_by_callee[effectful_idx] {
+            if info[caller_idx].discardable_when_unused {
+                info[caller_idx].discardable_when_unused = false;
+                worklist.push_back(caller_idx);
+            }
+        }
+    }
+
+    info
 }
 
 /// True if the instruction has any side effect that prevents removal,
@@ -68,7 +192,7 @@ fn has_side_effect(kind: &InstKind, internal_calls: &[InternalCallDceInfo]) -> b
             | InstKind::Alloca(..)
     ) || match kind {
         InstKind::Call(FuncRef::Internal(idx), _) => match internal_calls.get(*idx as usize) {
-            Some(info) => !info.is_pure || info.returns_void,
+            Some(info) => !info.discardable_when_unused,
             None => true,
         },
         InstKind::Call(..) => true,
@@ -285,14 +409,7 @@ impl Pass for Dce {
         "dce"
     }
     fn run(&self, module: &mut Module) -> bool {
-        let internal_calls: Vec<InternalCallDceInfo> = module
-            .functions
-            .iter()
-            .map(|func| InternalCallDceInfo {
-                is_pure: func.is_pure,
-                returns_void: matches!(func.return_type, IrType::Void),
-            })
-            .collect();
+        let internal_calls = derive_internal_call_dce_info(module);
         let mut changed = false;
         for func in &mut module.functions {
             if dce_function(func, &internal_calls) {
@@ -328,6 +445,19 @@ mod tests {
             span: dummy_span(),
         });
         id
+    }
+
+    fn internal_call_count(func: &Function, target: u32) -> usize {
+        func.blocks
+            .iter()
+            .flat_map(|block| block.insts.iter())
+            .filter(|inst| {
+                matches!(
+                    &inst.kind,
+                    InstKind::Call(FuncRef::Internal(idx), _) if *idx == target
+                )
+            })
+            .count()
     }
 
     #[test]
@@ -463,6 +593,205 @@ mod tests {
         assert!(
             m.functions[1].blocks[0].insts.is_empty(),
             "unused PURE call should be removed"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_internal_call_when_pure_flag_hides_runtime_effect() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new("mislabelled_fn".into(), vec![], IrType::Int(IntWidth::I32));
+        callee.is_pure = true;
+        let seven = push(
+            &mut callee,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(
+            &mut callee,
+            InstKind::RuntimeCall(RuntimeFunc::PrintInt, vec![seven]),
+            IrType::Void,
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(seven)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(None));
+        m.add_function(caller);
+
+        Dce.run(&mut m);
+        assert_eq!(
+            m.functions[1].blocks[0].insts.len(),
+            1,
+            "DCE must inspect the callee body instead of trusting is_pure"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_internal_call_when_pure_flag_hides_external_call() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new("mislabelled_fn".into(), vec![], IrType::Int(IntWidth::I32));
+        callee.is_pure = true;
+        let result = push(
+            &mut callee,
+            InstKind::Call(FuncRef::External("unknown_effect".into()), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(result)));
+        m.add_function(callee);
+
+        assert!(
+            !derive_internal_call_dce_info(&m)[0].discardable_when_unused,
+            "an unknown external call must make the function observable"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_internal_call_when_pure_flag_hides_nonlocal_store() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let param = Param {
+            name: "out".into(),
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            id: ValueId(0),
+            fortran_noalias: false,
+        };
+
+        let mut callee = Function::new(
+            "mislabelled_fn".into(),
+            vec![param],
+            IrType::Int(IntWidth::I32),
+        );
+        callee.is_pure = true;
+        let one = push(
+            &mut callee,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(&mut callee, InstKind::Store(one, ValueId(0)), IrType::Void);
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(one)));
+        m.add_function(callee);
+
+        assert!(
+            !derive_internal_call_dce_info(&m)[0].discardable_when_unused,
+            "a store through a parameter must make the function observable"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_internal_call_when_transitive_callee_has_effects() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut leaf = Function::new("leaf".into(), vec![], IrType::Int(IntWidth::I32));
+        leaf.is_pure = true;
+        let seven = push(
+            &mut leaf,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(
+            &mut leaf,
+            InstKind::RuntimeCall(RuntimeFunc::PrintInt, vec![seven]),
+            IrType::Void,
+        );
+        let leaf_entry = leaf.entry;
+        leaf.block_mut(leaf_entry).terminator = Some(Terminator::Return(Some(seven)));
+        m.add_function(leaf);
+
+        let mut wrapper = Function::new("wrapper".into(), vec![], IrType::Int(IntWidth::I32));
+        wrapper.is_pure = true;
+        let result = push(
+            &mut wrapper,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let wrapper_entry = wrapper.entry;
+        wrapper.block_mut(wrapper_entry).terminator = Some(Terminator::Return(Some(result)));
+        m.add_function(wrapper);
+
+        assert!(
+            !derive_internal_call_dce_info(&m)[1].discardable_when_unused,
+            "effects must propagate through internal PURE call chains"
+        );
+    }
+
+    #[test]
+    fn removes_unused_internal_pure_call_with_local_store() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new(
+            "pure_local_store".into(),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        callee.is_pure = true;
+        let slot = push(
+            &mut callee,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let zero = push(
+            &mut callee,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let element = push(
+            &mut callee,
+            InstKind::GetElementPtr(slot, vec![zero]),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let seven = push(
+            &mut callee,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(&mut callee, InstKind::Store(seven, element), IrType::Void);
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(seven)));
+        m.add_function(callee);
+
+        assert!(
+            derive_internal_call_dce_info(&m)[0].discardable_when_unused,
+            "stores proven local to the callee must not disable PURE call removal"
+        );
+    }
+
+    #[test]
+    fn removes_unused_internal_pure_call_that_only_reads_global_state() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new(
+            "pure_global_read".into(),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        callee.is_pure = true;
+        let addr = push(
+            &mut callee,
+            InstKind::GlobalAddr("module_state".into()),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let value = push(
+            &mut callee,
+            InstKind::Load(addr),
+            IrType::Int(IntWidth::I32),
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(value)));
+        m.add_function(callee);
+
+        assert!(
+            derive_internal_call_dce_info(&m)[0].discardable_when_unused,
+            "Fortran PURE functions may read module state without making a dead call observable"
         );
     }
 
