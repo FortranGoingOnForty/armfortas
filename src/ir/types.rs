@@ -176,6 +176,32 @@ impl IrType {
         matches!(self, Self::Int(_))
     }
 
+    /// Integer width supported by the IR `Switch` terminator.
+    ///
+    /// Switch cases are stored as signed `i64` constants and both backends
+    /// lower them through scalar general-purpose registers. Wide `i128`,
+    /// logical, floating-point, pointer, and aggregate selectors therefore do
+    /// not belong to this terminator contract.
+    pub(crate) fn switch_int_width(&self) -> Option<IntWidth> {
+        match self {
+            Self::Int(width @ (IntWidth::I8 | IntWidth::I16 | IntWidth::I32 | IntWidth::I64)) => {
+                Some(*width)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a `Switch` case constant is representable by this selector.
+    pub(crate) fn switch_case_is_representable(&self, value: i64) -> bool {
+        match self.switch_int_width() {
+            Some(IntWidth::I8) => i8::try_from(value).is_ok(),
+            Some(IntWidth::I16) => i16::try_from(value).is_ok(),
+            Some(IntWidth::I32) => i32::try_from(value).is_ok(),
+            Some(IntWidth::I64) => true,
+            _ => false,
+        }
+    }
+
     /// Is this a float type?
     pub fn is_float(&self) -> bool {
         matches!(self, Self::Float(_))

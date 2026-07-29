@@ -2730,17 +2730,46 @@ fn select_terminator(
             cases,
             default,
         } => {
+            let selector_ty = func
+                .value_type(*selector)
+                .expect("switch selector must have a verified type");
+            let selector_width = selector_ty.switch_int_width().unwrap_or_else(|| {
+                panic!("switch selector must use a general-purpose register, got {selector_ty}")
+            });
             let sel_vreg = ctx.lookup_vreg(*selector);
+            let selector_class = mf.vreg_class(sel_vreg).unwrap_or_else(|| {
+                panic!("switch selector vreg {sel_vreg:?} has no registered class")
+            });
+            assert!(
+                matches!(selector_class, RegClass::Gp32 | RegClass::Gp64),
+                "switch selector must use a general-purpose register, got {selector_class:?}",
+            );
             let default_mb = ctx.lookup_block(*default);
 
             for (val, dest) in cases {
+                assert!(
+                    selector_ty.switch_case_is_representable(*val),
+                    "switch case value {val} is not representable in selector type {selector_ty}",
+                );
                 let dest_mb = ctx.lookup_block(*dest);
-                // CMP selector, #val; B.EQ case_block
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::CmpImm,
-                    operands: vec![MachineOperand::VReg(sel_vreg), MachineOperand::Imm(*val)],
-                    def: None,
-                });
+                if (0..=4095).contains(val) {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::CmpImm,
+                        operands: vec![MachineOperand::VReg(sel_vreg), MachineOperand::Imm(*val)],
+                        def: None,
+                    });
+                } else {
+                    let case_vreg = mf.new_vreg(selector_class);
+                    emit_const_int(mf, mb, case_vreg, *val as i128, selector_width);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::CmpReg,
+                        operands: vec![
+                            MachineOperand::VReg(sel_vreg),
+                            MachineOperand::VReg(case_vreg),
+                        ],
+                        def: None,
+                    });
+                }
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::BCond,
                     operands: vec![
@@ -4718,6 +4747,93 @@ mod tests {
     #[should_panic(expected = "named struct storage must be rejected by IR verification")]
     fn named_struct_alloca_size_has_no_placeholder() {
         alloca_size(&IrType::Struct(0), crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    #[should_panic(expected = "switch selector must use a general-purpose register")]
+    fn switch_selection_rejects_floating_selector() {
+        let mut func = Function::new("bad_switch".into(), vec![], IrType::Void);
+        let selector;
+        let case;
+        let default;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            selector = b.const_f64(1.0);
+            case = b.create_block("case");
+            default = b.create_block("default");
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+        func.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: vec![(1, case)],
+            default,
+        });
+
+        select_function(&func, crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    fn switch_i64_case_materializes_a_gp_register_compare() {
+        let mut func = Function::new("wide_switch".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let selector = b.const_i64(0);
+            let case = b.create_block("case");
+            let default = b.create_block("default");
+            b.switch(selector, vec![(i64::MAX, case)], default);
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        let compare = mf.blocks[0]
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == ArmOpcode::CmpReg)
+            .expect("switch register compare");
+        let [MachineOperand::VReg(selector), MachineOperand::VReg(case_value)] =
+            compare.operands.as_slice()
+        else {
+            panic!("switch must compare two GP registers: {compare:?}");
+        };
+        assert_eq!(mf.vreg_class(*selector), Some(RegClass::Gp64));
+        assert_eq!(mf.vreg_class(*case_value), Some(RegClass::Gp64));
+    }
+
+    #[test]
+    fn switch_case_in_cmp_immediate_range_keeps_the_fast_path() {
+        let mut func = Function::new("small_switch".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let selector = b.const_i64(0);
+            let case = b.create_block("case");
+            let default = b.create_block("default");
+            b.switch(selector, vec![(4095, case)], default);
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        let compare = mf.blocks[0]
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.opcode, ArmOpcode::CmpImm | ArmOpcode::CmpReg))
+            .expect("switch compare");
+        assert_eq!(compare.opcode, ArmOpcode::CmpImm);
+        assert!(
+            matches!(
+                compare.operands.as_slice(),
+                [MachineOperand::VReg(_), MachineOperand::Imm(4095)]
+            ),
+            "encodable switch case must remain an immediate compare: {compare:?}",
+        );
     }
 
     // ---- VShape mapping tests (Sprint 12 Stage 2 isel hookup) ----

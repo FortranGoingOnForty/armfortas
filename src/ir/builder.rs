@@ -572,6 +572,20 @@ impl<'a> FuncBuilder<'a> {
     }
 
     pub fn switch(&mut self, selector: ValueId, cases: Vec<(i64, BlockId)>, default: BlockId) {
+        let selector_ty = self
+            .func
+            .value_type(selector)
+            .unwrap_or_else(|| panic!("switch selector %{} has no registered type", selector.0));
+        assert!(
+            selector_ty.switch_int_width().is_some(),
+            "switch selector must be i8, i16, i32, or i64, got {selector_ty}",
+        );
+        for (value, _) in &cases {
+            assert!(
+                selector_ty.switch_case_is_representable(*value),
+                "switch case value {value} is not representable in selector type {selector_ty}",
+            );
+        }
         self.func.block_mut(self.current_block).terminator = Some(Terminator::Switch {
             selector,
             cases,
@@ -665,6 +679,28 @@ mod tests {
         }
         assert_eq!(func.blocks.len(), 3);
         assert_eq!(func.block(BlockId(1)).params.len(), 1); // header has 1 param
+    }
+
+    #[test]
+    #[should_panic(expected = "switch selector must be i8, i16, i32, or i64")]
+    fn switch_builder_rejects_floating_selector() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+        let selector = b.const_f64(1.0);
+        let case = b.create_block("case");
+        let default = b.create_block("default");
+        b.switch(selector, vec![(1, case)], default);
+    }
+
+    #[test]
+    #[should_panic(expected = "case value 128 is not representable in selector type i8")]
+    fn switch_builder_rejects_case_outside_selector_width() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+        let selector = b.const_int(0, IntWidth::I8);
+        let case = b.create_block("case");
+        let default = b.create_block("default");
+        b.switch(selector, vec![(128, case)], default);
     }
 
     #[test]

@@ -63356,6 +63356,34 @@ end program
     }
 
     #[test]
+    fn source_i64_select_case_uses_a_typed_comparison_chain() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer(8) :: selector, result
+  selector = 4294967296_8
+  select case (selector)
+  case (4294967296_8)
+    result = 1_8
+  case default
+    result = 0_8
+  end select
+  if (result /= 1_8) error stop 1
+end program
+",
+        );
+        assert!(
+            ir.contains("icmp eq"),
+            "source SELECT CASE must compare values with typed integer IR:\n{ir}",
+        );
+        assert!(
+            !ir.contains("switch %"),
+            "general source SELECT CASE intentionally uses typed comparison chains:\n{ir}",
+        );
+    }
+
+    #[test]
     fn lower_nested_loops() {
         let (_, ir) = lower_and_verify(
             "\

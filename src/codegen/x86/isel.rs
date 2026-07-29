@@ -3026,20 +3026,49 @@ fn select_terminator(
             cases,
             default,
         } => {
+            let selector_ty = func
+                .value_type(*selector)
+                .expect("switch selector must have a verified type");
+            let selector_width = selector_ty.switch_int_width().unwrap_or_else(|| {
+                panic!("switch selector must use a general-purpose register, got {selector_ty}")
+            });
             let sel = ctx.lookup_vreg(*selector);
-            let size = match func.value_type(*selector) {
-                Some(IrType::Int(IntWidth::I64)) => OpSize::Q,
+            assert!(
+                matches!(sel.class, X86RegClass::Gp32 | X86RegClass::Gp64),
+                "switch selector must use a general-purpose register, got {:?}",
+                sel.class,
+            );
+            let size = match selector_width {
+                IntWidth::I64 => OpSize::Q,
                 _ => OpSize::L,
             };
             let default_mb = ctx.lookup_block(*default);
             for (val, dest) in cases {
+                assert!(
+                    selector_ty.switch_case_is_representable(*val),
+                    "switch case value {val} is not representable in selector type {selector_ty}",
+                );
                 let dest_mb = ctx.lookup_block(*dest);
+                let case_operand = if size == OpSize::Q && i32::try_from(*val).is_err() {
+                    let case_reg = mf.new_vreg(X86RegClass::Gp64);
+                    push(
+                        mf,
+                        mb,
+                        X86Opcode::MovRI,
+                        OpSize::Q,
+                        vec![X86Operand::Imm(*val)],
+                        Some(X86Operand::VReg(case_reg)),
+                    );
+                    X86Operand::VReg(case_reg)
+                } else {
+                    X86Operand::Imm(*val)
+                };
                 push(
                     mf,
                     mb,
                     X86Opcode::Cmp,
                     size,
-                    vec![X86Operand::VReg(sel), X86Operand::Imm(*val)],
+                    vec![X86Operand::VReg(sel), case_operand],
                     None,
                 );
                 push(
@@ -3733,6 +3762,85 @@ mod tests {
     #[should_panic(expected = "named struct storage must be rejected by IR verification")]
     fn named_struct_alloca_size_has_no_placeholder() {
         alloca_size(&IrType::Struct(0), crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    #[should_panic(expected = "switch selector must use a general-purpose register")]
+    fn switch_selection_rejects_floating_selector() {
+        let mut func = Function::new("bad_switch".into(), vec![], IrType::Void);
+        let selector;
+        let case;
+        let default;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            selector = b.const_f64(1.0);
+            case = b.create_block("case");
+            default = b.create_block("default");
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+        func.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: vec![(1, case)],
+            default,
+        });
+
+        select_function(
+            &func,
+            &["bad_switch".to_string()],
+            crate::target::TargetLayout::LP64,
+        );
+    }
+
+    #[test]
+    fn switch_i64_case_outside_imm32_uses_register_compare() {
+        let mut func = Function::new("wide_switch".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let selector = b.const_i64(0);
+            let case = b.create_block("case");
+            let default = b.create_block("default");
+            b.switch(selector, vec![(i64::MAX, case)], default);
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+
+        let mf = select_function(
+            &func,
+            &["wide_switch".to_string()],
+            crate::target::TargetLayout::LP64,
+        );
+        let entry = &mf.blocks[0];
+        assert!(entry.insts.iter().any(|inst| {
+            inst.opcode == X86Opcode::MovRI
+                && inst.size == OpSize::Q
+                && inst.operands == vec![X86Operand::Imm(i64::MAX)]
+        }));
+        let compare = entry
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == X86Opcode::Cmp)
+            .expect("switch compare");
+        assert!(
+            matches!(
+                compare.operands.as_slice(),
+                [
+                    X86Operand::VReg(X86VReg {
+                        class: X86RegClass::Gp64,
+                        ..
+                    }),
+                    X86Operand::VReg(X86VReg {
+                        class: X86RegClass::Gp64,
+                        ..
+                    })
+                ]
+            ),
+            "i64 cases outside signed imm32 must compare through a GP64 register: {compare:?}",
+        );
     }
 
     #[test]

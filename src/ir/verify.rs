@@ -772,7 +772,35 @@ fn check_branch_types(
             check(*true_dest, true_args);
             check(*false_dest, false_args);
         }
-        Terminator::Switch { cases, default, .. } => {
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
+            match func.value_type(*selector) {
+                Some(selector_ty) if selector_ty.switch_int_width().is_some() => {
+                    for (value, _) in cases {
+                        if !selector_ty.switch_case_is_representable(*value) {
+                            errors.push(VerifyError {
+                                msg: format!(
+                                    "switch case value {value} is not representable in selector \
+                                     type {selector_ty}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                Some(selector_ty) => errors.push(VerifyError {
+                    msg: format!("switch selector must be i8, i16, i32, or i64, got {selector_ty}"),
+                }),
+                None => errors.push(VerifyError {
+                    msg: format!(
+                        "switch selector %{} has no type; expected i8, i16, i32, or i64",
+                        selector.0,
+                    ),
+                }),
+            }
+
             // Switch targets shouldn't have block params (simplified model).
             if let Some(default_block) = func.try_block(*default) {
                 if !default_block.params.is_empty() {
@@ -1353,6 +1381,38 @@ mod tests {
     use super::super::builder::FuncBuilder;
     use super::super::types::*;
     use super::*;
+
+    fn switch_verify_errors(selector_ty: IrType, case_values: &[i64]) -> Vec<VerifyError> {
+        let mut func = Function::new("switch_test".into(), vec![], IrType::Void);
+        let selector;
+        let case_block;
+        let default_block;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            selector = match selector_ty {
+                IrType::Bool => b.const_bool(false),
+                IrType::Int(width) => b.const_int(0, width),
+                IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+                IrType::Float(FloatWidth::F64) => b.const_f64(0.0),
+                ref other => panic!("unsupported switch test selector type: {other}"),
+            };
+            case_block = b.create_block("case");
+            default_block = b.create_block("default");
+            b.set_block(case_block);
+            b.ret_void();
+            b.set_block(default_block);
+            b.ret_void();
+        }
+        func.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: case_values
+                .iter()
+                .map(|value| (*value, case_block))
+                .collect(),
+            default: default_block,
+        });
+        verify_function(&func)
+    }
 
     #[test]
     fn valid_simple_function() {
@@ -2040,6 +2100,83 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("non-integer operand")));
+    }
+
+    #[test]
+    fn switch_rejects_non_integer_and_i128_selectors() {
+        for selector_ty in [
+            IrType::Float(FloatWidth::F32),
+            IrType::Float(FloatWidth::F64),
+            IrType::Bool,
+            IrType::Int(IntWidth::I128),
+        ] {
+            let errors = switch_verify_errors(selector_ty.clone(), &[0]);
+            assert!(
+                errors.iter().any(|error| {
+                    error
+                        .msg
+                        .contains("switch selector must be i8, i16, i32, or i64")
+                        && error.msg.contains(&selector_ty.to_string())
+                }),
+                "unsupported switch selector {selector_ty} must be rejected: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn switch_rejects_case_values_outside_selector_width() {
+        for (selector_ty, cases, expected) in [
+            (
+                IrType::Int(IntWidth::I8),
+                vec![-129, 128],
+                "selector type i8",
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                vec![-32_769, 32_768],
+                "selector type i16",
+            ),
+            (
+                IrType::Int(IntWidth::I32),
+                vec![i32::MIN as i64 - 1, i32::MAX as i64 + 1],
+                "selector type i32",
+            ),
+        ] {
+            let errors = switch_verify_errors(selector_ty, &cases);
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|error| error.msg.contains(expected))
+                    .count(),
+                2,
+                "both out-of-range cases must be rejected: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn switch_accepts_supported_integer_boundary_cases() {
+        for (selector_ty, cases) in [
+            (
+                IrType::Int(IntWidth::I8),
+                vec![i8::MIN as i64, i8::MAX as i64],
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                vec![i16::MIN as i64, i16::MAX as i64],
+            ),
+            (
+                IrType::Int(IntWidth::I32),
+                vec![i32::MIN as i64, i32::MAX as i64],
+            ),
+            (IrType::Int(IntWidth::I64), vec![i64::MIN, i64::MAX]),
+        ] {
+            let errors = switch_verify_errors(selector_ty.clone(), &cases);
+            assert!(
+                errors.is_empty(),
+                "valid switch selector {selector_ty} and boundary cases must verify: {errors:?}",
+            );
+        }
     }
 
     #[test]
