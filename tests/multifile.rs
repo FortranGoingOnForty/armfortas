@@ -1063,8 +1063,8 @@ fn generic_interface_cross_module() {
     }
     multifile_test(
         "module mgen\n  implicit none\n  interface add\n    module procedure add_int, add_real\n  end interface\ncontains\n  integer function add_int(a, b)\n    integer, intent(in) :: a, b\n    add_int = a + b\n  end function\n  real function add_real(a, b)\n    real, intent(in) :: a, b\n    add_real = a + b\n  end function\nend module\n",
-        "program p\n  use mgen\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n",
-        "3",
+        "program p\n  use mgen\n  implicit none\n  integer :: integer_result\n  real :: real_result\n  integer_result = add(1, 2)\n  real_result = add(1.5, 2.5)\n  if (integer_result /= 3) error stop 1\n  if (abs(real_result - 4.0) > 1.0e-6) error stop 2\n  print '(a)', 'generic-dispatch-ok'\nend program\n",
+        "generic-dispatch-ok",
     );
 }
 
