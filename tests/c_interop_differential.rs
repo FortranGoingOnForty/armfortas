@@ -45,7 +45,7 @@ fn require_clang() -> PathBuf {
     // whole suite with a count, exactly like run_programs.
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
-            "\nHARNESS_SKIP suite=c_interop_differential test=all count=9 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=c_interop_differential test=all count=10 reason=\"{}\"",
             reason
         );
         std::process::exit(0);
@@ -59,7 +59,7 @@ fn require_clang() -> PathBuf {
             }
             // Non-ELF host without clang: counted skip (x01 convention).
             eprintln!(
-                "\nHARNESS_SKIP suite=c_interop_differential test=all count=9 reason=\"clang not found on this host\""
+                "\nHARNESS_SKIP suite=c_interop_differential test=all count=10 reason=\"clang not found on this host\""
             );
             std::process::exit(0);
         }
@@ -427,6 +427,61 @@ int main(void) {
         wb.link_and_run("fp_contract_bin", &[&c, &strict, &fast]),
         "ok"
     );
+}
+
+#[test]
+fn external_rounding_mode_reaches_bind_c_entry_at_every_opt_level() {
+    let wb = Workbench::new("external_rounding");
+    let c = wb.c_obj(
+        "main",
+        r#"
+#include <fenv.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#pragma STDC FENV_ACCESS ON
+
+double externally_rounded_sum(void);
+
+static uint64_t bits(double value) {
+  uint64_t result;
+  memcpy(&result, &value, sizeof(result));
+  return result;
+}
+
+int main(void) {
+  if (fesetround(FE_UPWARD) != 0) return 2;
+  const double rounded = externally_rounded_sum();
+  if (fesetround(FE_TONEAREST) != 0) return 3;
+  if (bits(rounded) != UINT64_C(0x3ff0000000000001)) {
+    fprintf(stderr, "rounded=%016llx\n", (unsigned long long)bits(rounded));
+    return 1;
+  }
+  puts("ok");
+  return 0;
+}
+"#,
+    );
+    let source = r#"
+function externally_rounded_sum() result(r) bind(c, name="externally_rounded_sum")
+  use iso_c_binding
+  real(c_double) :: r, a, b
+  a = 1.0_c_double
+  b = 5.5511151231257827e-17_c_double
+  r = a + b
+end function externally_rounded_sum
+"#;
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let tag = opt.trim_start_matches('-').to_lowercase();
+        let fortran = wb.fortran_obj_at(&format!("callee_{tag}"), source, opt);
+        let output = wb.link_and_run(&format!("external_rounding_{tag}"), &[&c, &fortran]);
+        assert_eq!(
+            output, "ok",
+            "{opt}: BIND(C) entry ignored its external caller's rounding mode"
+        );
+    }
 }
 
 #[test]

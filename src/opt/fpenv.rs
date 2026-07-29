@@ -156,6 +156,15 @@ pub(super) fn analyze_fpenv_effects(module: &Module) -> FpEnvEffects {
     }
 
     let mut may_run_in_dynamic_fpenv = may_cross_fpenv_barrier.clone();
+    for (func_idx, function) in module.functions.iter().enumerate() {
+        // Functions that participate in the object ABI can be entered from a
+        // separately compiled caller after that caller establishes any
+        // supported floating-point environment. The current module cannot
+        // prove otherwise, so every such entry is a dynamic-environment root.
+        if !function.internal_only {
+            may_run_in_dynamic_fpenv[func_idx] = true;
+        }
+    }
     let mut worklist: VecDeque<usize> = may_run_in_dynamic_fpenv
         .iter()
         .enumerate()
@@ -244,6 +253,7 @@ mod tests {
 
     fn function_with_calls(name: &str, callees: Vec<FuncRef>) -> Function {
         let mut function = Function::new(name.into(), vec![], IrType::Void);
+        function.internal_only = true;
         let entry = function.entry;
         let position = Position { line: 0, col: 0 };
         for callee in callees {
@@ -358,6 +368,28 @@ mod tests {
         let effects = analyze_fpenv_effects(&module);
         assert_eq!(effects.may_cross_fpenv_barrier, vec![false, false]);
         assert_eq!(effects.may_run_in_dynamic_fpenv, vec![false, false]);
+    }
+
+    #[test]
+    fn external_entry_and_its_internal_callees_may_inherit_dynamic_environment() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut external_entry = function_with_calls("external_entry", vec![FuncRef::Internal(1)]);
+        external_entry.internal_only = false;
+        module.add_function(external_entry);
+        module.add_function(function_with_calls("reachable_helper", vec![]));
+        module.add_function(function_with_calls("closed_helper", vec![]));
+
+        let effects = analyze_fpenv_effects(&module);
+        assert_eq!(
+            effects.may_cross_fpenv_barrier,
+            vec![false, false, false],
+            "an ambient caller environment is not a callee-side barrier"
+        );
+        assert_eq!(
+            effects.may_run_in_dynamic_fpenv,
+            vec![true, true, false],
+            "an external caller may establish nondefault rounding before entry"
+        );
     }
 
     #[test]

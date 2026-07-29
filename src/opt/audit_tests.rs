@@ -50,6 +50,7 @@ fn push(f: &mut Function, kind: InstKind, ty: IrType) -> ValueId {
 fn audit_const_fold_int_to_f32_must_round() {
     let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
+    f.internal_only = true;
     let i = push(
         &mut f,
         InstKind::ConstInt(16_777_217, IntWidth::I32),
@@ -91,6 +92,7 @@ fn audit_const_fold_int_to_f32_must_round() {
 fn audit_const_fold_float_trunc_must_round() {
     let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
+    f.internal_only = true;
     let d = push(
         &mut f,
         InstKind::ConstFloat(16_777_217.0, FloatWidth::F64),
@@ -1898,6 +1900,7 @@ fn audit_const_fold_fcmp_f32_after_m1_fix() {
     // ConstFloat(16777216.0, F32) should now return true.
     let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Bool);
+    f.internal_only = true;
     let i = push(
         &mut f,
         InstKind::ConstInt(16_777_217, IntWidth::I32),
@@ -1941,6 +1944,7 @@ fn audit_const_fold_floattoint_from_f32_after_m1_fix() {
     // FloatToInt(_, I32) should produce 16777216, not 16777217.
     let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+    f.internal_only = true;
     let i = push(
         &mut f,
         InstKind::ConstInt(16_777_217, IntWidth::I32),
@@ -2022,6 +2026,7 @@ fn audit_const_fold_popcount_uses_inst_ty() {
 fn audit_int_to_f32_then_fsub_wrong_answer_today() {
     let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
     let mut f = Function::new("f".into(), vec![], IrType::Float(FloatWidth::F32));
+    f.internal_only = true;
     let i_a = push(
         &mut f,
         InstKind::ConstInt(16_777_217, IntWidth::I32),

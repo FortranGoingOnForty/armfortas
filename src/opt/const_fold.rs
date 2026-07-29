@@ -646,6 +646,7 @@ mod tests {
     fn make_module_with(insts: Vec<(InstKind, IrType)>) -> (Module, Vec<ValueId>) {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
+        f.internal_only = true;
         let entry = f.entry;
         let mut ids = Vec::new();
         for (kind, ty) in insts {
@@ -798,6 +799,31 @@ mod tests {
             "constant FP arithmetic must remain dynamic when the function changes rounding mode"
         );
         assert!(matches!(first_block_kinds(&m)[4], InstKind::FAdd(..)));
+    }
+
+    #[test]
+    fn leaves_rounding_dependent_fold_in_external_entry() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FAdd(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+        m.functions[0].internal_only = false;
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "constant FP arithmetic must remain dynamic at an external entry"
+        );
+        assert!(matches!(first_block_kinds(&m)[2], InstKind::FAdd(..)));
     }
 
     #[test]

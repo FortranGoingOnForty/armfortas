@@ -979,6 +979,7 @@ mod tests {
     fn float_chain_is_dead_without_fp_environment_access() {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
+        f.internal_only = true;
         let a = push(
             &mut f,
             InstKind::ConstFloat(1.5, FloatWidth::F64),
