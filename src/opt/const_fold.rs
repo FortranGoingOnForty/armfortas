@@ -201,7 +201,17 @@ fn try_fold(
         InstKind::FNeg(a) => fold_float_un(get(a), ty, |x| -x),
         InstKind::FAbs(a) => fold_float_un(get(a), ty, |x| x.abs()),
         InstKind::FSqrt(a) => fold_float_un(get(a), ty, |x| x.sqrt()),
-        InstKind::FPow(a, b) => fold_float_bin(get(a), get(b), ty, |x, y| x.powf(y)),
+        InstKind::FPow(a, b) => {
+            // REAL(4) power lowers to the selected target's `powf`.
+            // Evaluating binary64 power and narrowing is not equivalent,
+            // while host `f32::powf` still cannot define a cross-target
+            // libm result. Retain the runtime call unless this is F64.
+            if matches!(ty, IrType::Float(FloatWidth::F32)) {
+                None
+            } else {
+                fold_float_bin(get(a), get(b), ty, |x, y| x.powf(y))
+            }
+        }
 
         // Comparisons -----------------------------------------------------
         InstKind::ICmp(op, a, b) => {
@@ -765,6 +775,57 @@ mod tests {
             }
             _ => panic!("expected ConstFloat"),
         }
+    }
+
+    #[test]
+    fn leaves_f32_pow_for_target_powf() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(f32::from_bits(0x3edd_1cea) as f64, FloatWidth::F32),
+                IrType::Float(FloatWidth::F32),
+            ),
+            (
+                InstKind::ConstFloat(f32::from_bits(0xbf4b_5bd3) as f64, FloatWidth::F32),
+                IrType::Float(FloatWidth::F32),
+            ),
+            (
+                InstKind::FPow(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F32),
+            ),
+        ]);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "REAL(4) power must retain the target runtime's powf semantics"
+        );
+        assert!(
+            matches!(first_block_kinds(&m)[2], InstKind::FPow(..)),
+            "REAL(4) power must not be evaluated through binary64 and narrowed"
+        );
+    }
+
+    #[test]
+    fn folds_f64_pow_when_environment_is_closed() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(4.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(0.5, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FPow(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+
+        assert!(ConstFold.run(&mut m));
+        assert!(matches!(
+            first_block_kinds(&m)[2],
+            InstKind::ConstFloat(2.0, FloatWidth::F64)
+        ));
     }
 
     #[test]
