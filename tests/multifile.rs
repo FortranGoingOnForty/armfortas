@@ -172,6 +172,67 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn volatile_module_variable_survives_amod_round_trip() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let module_source = dir.join("volatile_provider.f90");
+    let module_object = dir.join("volatile_provider.o");
+    let consumer_source = dir.join("volatile_consumer.f90");
+
+    std::fs::write(
+        &module_source,
+        "module volatile_provider\n  implicit none\n  integer, volatile :: watched\nend module volatile_provider\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_source,
+        "subroutine observe_volatile()\n  use volatile_provider, only: watched\n  implicit none\n  integer :: sink\n\n  sink = watched\n  watched = sink + 1\nend subroutine observe_volatile\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &module_source, &module_object, None);
+    let amod = std::fs::read_to_string(dir.join("volatile_provider.amod"))
+        .expect("volatile provider did not emit its module interface");
+    assert!(
+        amod.lines()
+            .any(|line| line.starts_with("@var watched :") && line.contains("volatile")),
+        "VOLATILE module-variable metadata must survive serialization:\n{amod}"
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let ir = dir.join(format!(
+            "volatile_consumer_{}.ir",
+            optimization.trim_start_matches('-')
+        ));
+        let emit = Command::new(&compiler)
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "--emit-ir",
+                consumer_source.to_str().unwrap(),
+                "-o",
+                ir.to_str().unwrap(),
+            ])
+            .arg(format!("-I{}", dir.display()))
+            .output()
+            .expect("volatile consumer IR emission failed to spawn");
+        assert!(
+            emit.status.success(),
+            "{optimization}: volatile consumer IR emission failed: {}",
+            String::from_utf8_lossy(&emit.stderr)
+        );
+        let ir_text =
+            std::fs::read_to_string(&ir).expect("cannot read volatile consumer IR output");
+        assert!(
+            ir_text.contains("volatile_load") && ir_text.contains("volatile_store"),
+            "{optimization}: imported VOLATILE storage must retain both observable accesses:\n{ir_text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn serialized_intrinsic_use_keeps_provider_nature() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

@@ -1135,7 +1135,7 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
-        InstKind::Store(val, addr) => {
+        InstKind::Store(val, addr) | InstKind::VolatileStore(val, addr) => {
             let addr_ty = func.value_type(*addr);
             if let Some(ty) = &addr_ty {
                 if !ty.is_ptr() {
@@ -1168,7 +1168,7 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
-        InstKind::Load(addr) => {
+        InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
             if let Some(ty) = func.value_type(*addr) {
                 if !ty.is_ptr() {
                     errors.push(VerifyError {

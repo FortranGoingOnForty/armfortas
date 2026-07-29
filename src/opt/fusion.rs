@@ -11,7 +11,7 @@
 
 use super::dep_analysis;
 use super::loop_utils::remap_inst_kind;
-use super::loop_utils::{find_preheader, resolve_const_int};
+use super::loop_utils::{find_preheader, loop_contains_volatile_memory, resolve_const_int};
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::{find_natural_loops, predecessors};
@@ -48,6 +48,11 @@ fn fusion_in_function(func: &mut Function, layout: crate::target::TargetLayout) 
         for j in (i + 1)..loops.len() {
             let lp_a = &loops[i];
             let lp_b = &loops[j];
+            if loop_contains_volatile_memory(func, lp_a)
+                || loop_contains_volatile_memory(func, lp_b)
+            {
+                continue;
+            }
             let blocks_a = &ordered_bodies[i];
             let blocks_b = &ordered_bodies[j];
 

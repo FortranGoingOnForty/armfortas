@@ -217,7 +217,8 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         | InstKind::Shl(a, b)
         | InstKind::LShr(a, b)
         | InstKind::AShr(a, b)
-        | InstKind::Store(a, b) => *a == param_id || *b == param_id,
+        | InstKind::Store(a, b)
+        | InstKind::VolatileStore(a, b) => *a == param_id || *b == param_id,
 
         InstKind::INeg(a)
         | InstKind::FNeg(a)
@@ -237,6 +238,7 @@ fn inst_uses_param(kind: &InstKind, param_id: ValueId) -> bool {
         | InstKind::PtrToInt(a)
         | InstKind::IntToPtr(a, _)
         | InstKind::Load(a)
+        | InstKind::VolatileLoad(a)
         | InstKind::ExtractField(a, _) => *a == param_id,
 
         InstKind::Select(c, t, f) => *c == param_id || *t == param_id || *f == param_id,

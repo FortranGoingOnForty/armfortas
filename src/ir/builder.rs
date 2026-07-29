@@ -23,6 +23,14 @@ pub struct FuncBuilder<'a> {
     local_modules: std::rc::Rc<std::collections::HashSet<String>>,
     owned_string_descriptors: std::collections::HashSet<ValueId>,
     owned_string_temps: std::collections::HashMap<ValueId, Vec<ValueId>>,
+    /// Address values whose memory accesses are source-language VOLATILE.
+    /// This is lowering metadata only: emitted accesses carry their semantics
+    /// explicitly as `VolatileLoad` / `VolatileStore` in the durable IR.
+    volatile_addresses: std::collections::HashSet<ValueId>,
+    /// Compiler-generated pointer slots for by-reference VOLATILE entities.
+    /// Loading the slot is ordinary, but the pointer obtained from it
+    /// designates volatile storage.
+    indirect_volatile_addresses: std::collections::HashSet<ValueId>,
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -35,6 +43,8 @@ impl<'a> FuncBuilder<'a> {
             local_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             owned_string_descriptors: std::collections::HashSet::new(),
             owned_string_temps: std::collections::HashMap::new(),
+            volatile_addresses: std::collections::HashSet::new(),
+            indirect_volatile_addresses: std::collections::HashSet::new(),
         }
     }
 
@@ -71,6 +81,33 @@ impl<'a> FuncBuilder<'a> {
 
     pub fn take_owned_string_temp_bases(&mut self, value: ValueId) -> Vec<ValueId> {
         self.owned_string_temps.remove(&value).unwrap_or_default()
+    }
+
+    /// Mark a directly-addressed entity as source-language VOLATILE.
+    pub fn mark_volatile_address(&mut self, address: ValueId) {
+        self.volatile_addresses.insert(address);
+    }
+
+    /// Mark a compiler spill slot whose loaded pointer designates a
+    /// source-language VOLATILE entity (the normal by-reference ABI shape).
+    pub fn mark_indirect_volatile_address(&mut self, slot: ValueId) {
+        self.indirect_volatile_addresses.insert(slot);
+    }
+
+    fn propagate_volatile_pointer_result(
+        &mut self,
+        source: ValueId,
+        result: ValueId,
+        result_ty: &IrType,
+    ) {
+        if !result_ty.is_ptr() {
+            return;
+        }
+        if self.indirect_volatile_addresses.contains(&source)
+            || self.volatile_addresses.contains(&source)
+        {
+            self.volatile_addresses.insert(result);
+        }
     }
 
     /// Switch to emitting into a different block.
@@ -305,7 +342,20 @@ impl<'a> FuncBuilder<'a> {
             .func
             .value_type(true_val)
             .unwrap_or(IrType::Int(IntWidth::I32));
-        self.emit(InstKind::Select(cond, true_val, false_val), ty)
+        let result = self.emit(InstKind::Select(cond, true_val, false_val), ty.clone());
+        if ty.is_ptr()
+            && (self.volatile_addresses.contains(&true_val)
+                || self.volatile_addresses.contains(&false_val))
+        {
+            self.volatile_addresses.insert(result);
+        }
+        if ty.is_ptr()
+            && (self.indirect_volatile_addresses.contains(&true_val)
+                || self.indirect_volatile_addresses.contains(&false_val))
+        {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     // ---- Logic ----
@@ -423,12 +473,26 @@ impl<'a> FuncBuilder<'a> {
     }
 
     pub fn ptr_to_int(&mut self, val: ValueId) -> ValueId {
-        self.emit(InstKind::PtrToInt(val), IrType::Int(IntWidth::I64))
+        let result = self.emit(InstKind::PtrToInt(val), IrType::Int(IntWidth::I64));
+        if self.volatile_addresses.contains(&val) {
+            self.volatile_addresses.insert(result);
+        }
+        if self.indirect_volatile_addresses.contains(&val) {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     pub fn int_to_ptr(&mut self, val: ValueId, pointee: IrType) -> ValueId {
         let ptr_ty = IrType::Ptr(Box::new(pointee));
-        self.emit(InstKind::IntToPtr(val, ptr_ty.clone()), ptr_ty)
+        let result = self.emit(InstKind::IntToPtr(val, ptr_ty.clone()), ptr_ty);
+        if self.volatile_addresses.contains(&val) {
+            self.volatile_addresses.insert(result);
+        }
+        if self.indirect_volatile_addresses.contains(&val) {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     // ---- Memory ----
@@ -452,24 +516,50 @@ impl<'a> FuncBuilder<'a> {
             Some(IrType::Ptr(inner)) => *inner,
             _ => IrType::Int(IntWidth::I64), // fallback
         };
-        self.emit(InstKind::Load(addr), ty)
+        let kind = if self.volatile_addresses.contains(&addr) {
+            InstKind::VolatileLoad(addr)
+        } else {
+            InstKind::Load(addr)
+        };
+        let result = self.emit(kind, ty.clone());
+        self.propagate_volatile_pointer_result(addr, result, &ty);
+        result
     }
 
     /// Load with an explicit result type (ignoring the pointer's inner type).
     /// Used for loading fields from aggregate pointers (e.g., first 8 bytes of a descriptor).
     pub fn load_typed(&mut self, addr: ValueId, ty: IrType) -> ValueId {
-        self.emit(InstKind::Load(addr), ty)
+        let kind = if self.volatile_addresses.contains(&addr) {
+            InstKind::VolatileLoad(addr)
+        } else {
+            InstKind::Load(addr)
+        };
+        let result = self.emit(kind, ty.clone());
+        self.propagate_volatile_pointer_result(addr, result, &ty);
+        result
     }
 
     pub fn store(&mut self, value: ValueId, addr: ValueId) -> ValueId {
-        self.emit(InstKind::Store(value, addr), IrType::Void)
+        let kind = if self.volatile_addresses.contains(&addr) {
+            InstKind::VolatileStore(value, addr)
+        } else {
+            InstKind::Store(value, addr)
+        };
+        self.emit(kind, IrType::Void)
     }
 
     pub fn gep(&mut self, base: ValueId, indices: Vec<ValueId>, result_ty: IrType) -> ValueId {
-        self.emit(
+        let result = self.emit(
             InstKind::GetElementPtr(base, indices),
             IrType::Ptr(Box::new(result_ty)),
-        )
+        );
+        if self.volatile_addresses.contains(&base) {
+            self.volatile_addresses.insert(result);
+        }
+        if self.indirect_volatile_addresses.contains(&base) {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     // ---- Calls ----

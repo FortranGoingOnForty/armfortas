@@ -2570,6 +2570,9 @@ pub(super) fn sym_attrs_to_decl_attrs(
     if attrs.target {
         out.push(Attribute::Target);
     }
+    if attrs.volatile {
+        out.push(Attribute::Volatile);
+    }
     if attrs.value {
         out.push(Attribute::Value);
     }
@@ -3466,6 +3469,7 @@ pub struct ModuleGlobalInfo {
     pub declared_rank: usize,
     pub allocatable: bool,
     pub is_pointer: bool,
+    pub volatile: bool,
     pub deferred_char: bool,
     pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
@@ -4762,9 +4766,14 @@ pub(super) fn collect_module_globals(
             });
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let is_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            let is_volatile = attrs.iter().any(|a| matches!(a, Attribute::Volatile));
             let is_parameter_decl = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
             for entity in entities {
                 let key = entity.name.to_lowercase();
+                let entity_is_volatile = is_volatile
+                    || module_scope_id
+                        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                        .is_some_and(|symbol| symbol.attrs.volatile);
                 let symbol = format!("afs_mod_{}_{}", mod_name.to_lowercase(), key);
                 let init_expr = entity
                     .init
@@ -4840,6 +4849,7 @@ pub(super) fn collect_module_globals(
                             declared_rank,
                             allocatable: true,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: array_char_kind,
@@ -4873,6 +4883,7 @@ pub(super) fn collect_module_globals(
                             declared_rank: 0,
                             allocatable: false,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: true,
                             derived_type: None,
                             char_kind: CharKind::Deferred,
@@ -5038,6 +5049,7 @@ pub(super) fn collect_module_globals(
                             dims,
                             allocatable: false,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
@@ -5066,6 +5078,7 @@ pub(super) fn collect_module_globals(
                                 declared_rank: 0,
                                 allocatable: false,
                                 is_pointer: true,
+                                volatile: entity_is_volatile,
                                 deferred_char: false,
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
@@ -5106,6 +5119,7 @@ pub(super) fn collect_module_globals(
                                     declared_rank: 0,
                                     allocatable: false,
                                     is_pointer: false,
+                                    volatile: entity_is_volatile,
                                     deferred_char: false,
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
@@ -5157,6 +5171,7 @@ pub(super) fn collect_module_globals(
                                     declared_rank: 0,
                                     allocatable: false,
                                     is_pointer,
+                                    volatile: entity_is_volatile,
                                     deferred_char: false,
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
@@ -5224,6 +5239,7 @@ pub(super) fn collect_module_globals(
                             declared_rank: 0,
                             allocatable: false,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: false,
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
@@ -8354,6 +8370,9 @@ pub(super) fn install_one_global(
         info.ty.clone()
     };
     let addr = b.global_addr(&info.symbol, addr_ty);
+    if info.volatile {
+        b.mark_volatile_address(addr);
+    }
     locals.insert(
         local_key,
         LocalInfo {
@@ -24237,6 +24256,39 @@ pub(super) fn decl_is_pointer(name: &str, decls: &[crate::ast::decl::SpannedDecl
     false
 }
 
+/// Does the named variable in `decls` carry the VOLATILE attribute?
+/// Covers both declaration attributes and standalone `VOLATILE :: name`
+/// statements.
+pub(super) fn decl_is_volatile(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    use crate::ast::decl::Attribute;
+    let key = name.to_lowercase();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } if entities
+                .iter()
+                .any(|entity| entity.name.to_lowercase() == key) =>
+            {
+                if attrs
+                    .iter()
+                    .any(|attribute| matches!(attribute, Attribute::Volatile))
+                {
+                    return true;
+                }
+            }
+            Decl::AttributeStmt { attr, entities }
+                if matches!(attr, Attribute::Volatile)
+                    && entities.iter().any(|entity| entity.to_lowercase() == key) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Does the named variable in `decls` carry the OPTIONAL attribute?
 pub(super) fn decl_is_optional(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     use crate::ast::decl::Attribute;
@@ -24622,6 +24674,7 @@ pub(super) struct HostRefParamInfo {
     allocatable: bool,
     is_pointer: bool,
     is_class: bool,
+    volatile: bool,
     /// SSA value id of an extra hidden i64 length parameter when the
     /// host var is a `character(*)` (assumed-length) variable that needs
     /// its runtime length forwarded alongside the pointer.
@@ -24783,6 +24836,7 @@ pub(super) fn build_host_ref_params(
             allocatable: alloc,
             is_pointer: ptr_is_pointer,
             is_class: decl_is_class(hname, host_decls),
+            volatile: decl_is_volatile(hname, host_decls),
             assumed_len_id,
             procedure_dummy_closure_ids,
         });
@@ -24947,6 +25001,9 @@ pub(super) fn install_host_ref_locals(
         );
         let slot = b.alloca(slot_ty);
         b.store(info.id, slot);
+        if info.volatile {
+            b.mark_indirect_volatile_address(slot);
+        }
         // For character(*) host refs, store the forwarded length into a
         // dedicated slot and set CharKind::AssumedLen so substring access
         // can recover the runtime length.

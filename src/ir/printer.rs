@@ -284,6 +284,8 @@ fn print_inst_with_module_opt(inst: &Inst, module: Option<&Module>) -> String {
         InstKind::Alloca(ty) => format!("alloca {}", ty),
         InstKind::Load(a) => format!("load %{}", a.0),
         InstKind::Store(v, a) => format!("store %{}, %{}", v.0, a.0),
+        InstKind::VolatileLoad(a) => format!("volatile_load %{}", a.0),
+        InstKind::VolatileStore(v, a) => format!("volatile_store %{}, %{}", v.0, a.0),
         InstKind::GetElementPtr(base, idxs) => {
             let idx_str: Vec<String> = idxs.iter().map(|i| format!("%{}", i.0)).collect();
             format!("gep %{}, [{}]", base.0, idx_str.join(", "))

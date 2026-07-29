@@ -549,7 +549,7 @@ fn select_inst(
                 emit_store_pair_to_slot(mf, mb, dest, Rax, Rdx);
                 return mb;
             }
-            InstKind::Load(addr) => {
+            InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
                 let dest = ctx.lookup_wide_slot(inst.id);
                 match ctx.addr_operand(*addr) {
                     X86Operand::FrameSlot(base_slot) => {
@@ -1879,13 +1879,13 @@ fn select_inst(
             );
         }
 
-        InstKind::Load(addr) => {
+        InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
             let dest = ctx.lookup_vreg(inst.id);
             let addr_op = ctx.addr_operand(*addr);
             emit_load(mf, mb, dest, &inst.ty, addr_op);
         }
 
-        InstKind::Store(val, addr) => {
+        InstKind::Store(val, addr) | InstKind::VolatileStore(val, addr) => {
             let val_ty = func
                 .value_type(*val)
                 .unwrap_or_else(|| panic!("isel: missing type for stored value %{}", val.0));

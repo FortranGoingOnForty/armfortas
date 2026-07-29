@@ -26,6 +26,7 @@
 //!
 //! In Fortran, the following are observable:
 //!  * `Store` — writes user memory
+//!  * `VolatileLoad` / `VolatileStore` — source-required observable access
 //!  * `Call` / `RuntimeCall` — print, allocate, free, etc.
 //!  * Scalar FP operations when the surrounding call graph accesses the
 //!    floating-point environment — their unused value can still raise an
@@ -33,11 +34,8 @@
 //!  * `Return` / branches / `Unreachable` — terminators are *always*
 //!    live; we never remove them.
 //!
-//! `Load` is conservatively pure here. That is technically incorrect
-//! when the same address is later stored to (the load could be
-//! observing volatile memory), but for SSA-form Fortran loads of
-//! locals it's a safe approximation. A future alias-analysis pass can
-//! refine this.
+//! Ordinary `Load` is pure; source-language VOLATILE references are lowered
+//! to the distinct `VolatileLoad` opcode before optimization.
 
 use super::pass::Pass;
 use super::util::{inst_uses, prune_unreachable, terminator_uses};
@@ -108,6 +106,7 @@ fn effect_free_body_dependencies(func: &Function, preserve_fp_effects: bool) -> 
                 {
                     return None;
                 }
+                InstKind::VolatileLoad(..) | InstKind::VolatileStore(..) => return None,
                 InstKind::RuntimeCall(..) => return None,
                 InstKind::Call(FuncRef::Internal(idx), _) => internal_callees.push(*idx),
                 InstKind::Call(..) => return None,
@@ -200,6 +199,8 @@ fn has_side_effect(
     matches!(
         &inst.kind,
         InstKind::Store(..)
+            | InstKind::VolatileLoad(..)
+            | InstKind::VolatileStore(..)
             // VStore writes 128 bits to memory just like Store; it
             // must not be DCE'd. NeonVectorize emits VStore as the
             // sink of every vectorized loop body — without this,
@@ -561,6 +562,34 @@ mod tests {
     }
 
     #[test]
+    fn keeps_unused_volatile_load() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let addr = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let volatile_load = push(
+            &mut f,
+            InstKind::VolatileLoad(addr),
+            IrType::Int(IntWidth::I32),
+        );
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dce.run(&mut m));
+        assert!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .any(|inst| inst.id == volatile_load
+                    && matches!(inst.kind, InstKind::VolatileLoad(_)))
+        );
+    }
+
+    #[test]
     fn cascades_through_chain() {
         // %1 = const 3
         // %2 = const 4
@@ -834,6 +863,50 @@ mod tests {
         assert!(
             derive_internal_call_dce_info(&m)[0].discardable_when_unused,
             "Fortran PURE functions may read module state without making a dead call observable"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_internal_call_that_reads_volatile_state() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new(
+            "mislabelled_volatile_read".into(),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        callee.is_pure = true;
+        let addr = push(
+            &mut callee,
+            InstKind::GlobalAddr("volatile_state".into()),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let value = push(
+            &mut callee,
+            InstKind::VolatileLoad(addr),
+            IrType::Int(IntWidth::I32),
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(value)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(None));
+        m.add_function(caller);
+
+        Dce.run(&mut m);
+        assert!(
+            m.functions[1].blocks[0]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, InstKind::Call(FuncRef::Internal(0), _))),
+            "a volatile read makes an otherwise PURE-looking call observable"
         );
     }
 

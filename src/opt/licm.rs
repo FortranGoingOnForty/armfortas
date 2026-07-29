@@ -62,6 +62,8 @@ fn is_non_memory_hoist_candidate(kind: &InstKind) -> bool {
     !matches!(
         kind,
         InstKind::Store(..)
+            | InstKind::VolatileLoad(..)
+            | InstKind::VolatileStore(..)
             | InstKind::Alloca(..)
             | InstKind::Call(..)
             | InstKind::RuntimeCall(..)
@@ -92,7 +94,7 @@ fn load_is_loop_invariant(
                 continue;
             }
             match &inst.kind {
-                InstKind::Store(_, ptr)
+                InstKind::Store(_, ptr) | InstKind::VolatileStore(_, ptr)
                     if !matches!(
                         alias::query(func, *ptr, load_ptr, layout),
                         AliasResult::NoAlias
@@ -100,7 +102,9 @@ fn load_is_loop_invariant(
                 {
                     return false;
                 }
-                InstKind::Call(..) | InstKind::RuntimeCall(..) => return false,
+                InstKind::VolatileLoad(..) | InstKind::Call(..) | InstKind::RuntimeCall(..) => {
+                    return false
+                }
                 _ => {}
             }
         }

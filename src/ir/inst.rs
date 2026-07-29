@@ -135,7 +135,14 @@ pub enum InstKind {
     // ---- Memory ----
     Alloca(IrType),
     Load(ValueId),
-    Store(ValueId, ValueId),              // store(value, addr)
+    Store(ValueId, ValueId), // store(value, addr)
+    /// A source-language VOLATILE read. Unlike `Load`, the access itself is
+    /// observable even when the result is unused and must not be promoted,
+    /// forwarded, hoisted, combined, vectorized, or eliminated.
+    VolatileLoad(ValueId),
+    /// A source-language VOLATILE write. The store must remain in program
+    /// order with other volatile accesses.
+    VolatileStore(ValueId, ValueId), // volatile_store(value, addr)
     GetElementPtr(ValueId, Vec<ValueId>), // base, indices
     /// Address of a module-level global. Returns `Ptr<T>` where T
     /// is the global's declared type. Used by SAVE'd locals (those
@@ -826,10 +833,14 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
     match &inst.kind {
         InstKind::ConstInt(_, IntWidth::I128) => true,
         InstKind::Undef(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
-        InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+        InstKind::Load(_) | InstKind::VolatileLoad(_)
+            if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
+        {
+            true
+        }
         // Loading a *pointer* whose pointee happens to be i128 is just
         // an 8-byte vreg load — the wide-slot machinery isn't involved.
-        InstKind::Load(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
+        InstKind::Load(_) | InstKind::VolatileLoad(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
         {
@@ -862,7 +873,7 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::IntToPtr(value, _) => func
             .value_type(*value)
             .is_some_and(|ty| !type_contains_i128(module, &ty)),
-        InstKind::Store(..) => true,
+        InstKind::Store(..) | InstKind::VolatileStore(..) => true,
         // Address-producing ops are safe even when they walk storage that
         // contains i128. The widened backend already knows how to carry the
         // actual loads/stores/calls that touch the value; rejecting the byte

@@ -1167,14 +1167,17 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // ALLOCATABLE / POINTER / TARGET attribute statements
+            // ALLOCATABLE / POINTER / TARGET / VOLATILE attribute statements
             // (F2018 R526/R535/R859): `allocatable :: a, b`, `pointer p`,
             // `target :: t`. Parsed to AttributeStmt; fold_attribute_statements
             // (run at end of the unit body) merges each into the entity's
             // type declaration. Disambiguate from a same-named variable by
             // requiring `::` or an entity identifier next — `pointer = x`
             // (`=`) and `pointer(i) = x` (`(`) fall through to assignment.
-            if text == "allocatable" || text == "pointer" || text == "target" {
+            if matches!(
+                text.as_str(),
+                "allocatable" | "pointer" | "target" | "volatile"
+            ) {
                 let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
                 let is_attr_stmt = matches!(
                     next_kind,
@@ -1185,7 +1188,8 @@ impl<'a> Parser<'a> {
                     let attr = match text.as_str() {
                         "allocatable" => crate::ast::decl::Attribute::Allocatable,
                         "pointer" => crate::ast::decl::Attribute::Pointer,
-                        _ => crate::ast::decl::Attribute::Target,
+                        "target" => crate::ast::decl::Attribute::Target,
+                        _ => crate::ast::decl::Attribute::Volatile,
                     };
                     self.advance(); // consume the attribute keyword
                     let _ = self.eat(&TokenKind::ColonColon);
@@ -1198,7 +1202,7 @@ impl<'a> Parser<'a> {
                         // dropping the shape.
                         if self.peek() == &TokenKind::LParen {
                             return Err(self.error(
-                                "array-spec in a standalone ALLOCATABLE/POINTER/TARGET \
+                                "array-spec in a standalone ALLOCATABLE/POINTER/TARGET/VOLATILE \
                                  statement is not supported yet; declare the shape on \
                                  the type declaration instead"
                                     .to_string(),
@@ -1475,10 +1479,10 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Fold standalone ALLOCATABLE/POINTER/TARGET attribute statements into the
-/// type declaration of each named entity, so every downstream consumer
-/// (resolve plus all lowering storage sites) sees the attribute through the
-/// normal `Decl::TypeDecl` path with no extra plumbing.
+/// Fold standalone ALLOCATABLE/POINTER/TARGET/VOLATILE attribute statements
+/// into the type declaration of each named entity, so every downstream
+/// consumer (resolve plus all lowering storage sites) sees the attribute
+/// through the normal `Decl::TypeDecl` path with no extra plumbing.
 ///
 /// A declaration that names several entities is split so the attribute lands
 /// on only its entity: `integer :: y, z` + `allocatable :: y` becomes
@@ -1494,7 +1498,10 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
             Decl::AttributeStmt { attr, entities }
                 if matches!(
                     attr,
-                    Attribute::Allocatable | Attribute::Pointer | Attribute::Target
+                    Attribute::Allocatable
+                        | Attribute::Pointer
+                        | Attribute::Target
+                        | Attribute::Volatile
                 ) =>
             {
                 (attr.clone(), entities.clone())
@@ -1924,6 +1931,24 @@ end program test
         }
         assert!(a_allocatable, "a should be allocatable");
         assert!(!b_allocatable, "b should not be allocatable");
+    }
+
+    #[test]
+    fn standalone_volatile_statement_folds_into_type_decl() {
+        use crate::ast::decl::{Attribute, Decl};
+        let unit =
+            parse_unit("program p\n  integer :: watched\n  volatile :: watched\nend program p\n");
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::TypeDecl { attrs, entities, .. }
+                    if entities.iter().any(|entity| entity.name == "watched")
+                        && attrs.iter().any(|attr| matches!(attr, Attribute::Volatile))
+            )
+        }));
     }
 
     #[test]

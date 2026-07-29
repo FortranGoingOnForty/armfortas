@@ -9279,6 +9279,110 @@ fn float_to_int_keeps_observed_inexact_flag_at_every_opt_level() {
 }
 
 #[test]
+fn volatile_scalar_accesses_survive_every_optimization_level() {
+    let dir = unique_dir("volatile_scalar_accesses");
+    let src = write_program_in(
+        &dir,
+        "volatile_scalar.f90",
+        "subroutine touch_volatile()\n  implicit none\n  integer, volatile :: watched\n  integer :: sink\n\n  watched = 41\n  sink = watched\nend subroutine touch_volatile\n\nsubroutine touch_standalone()\n  implicit none\n  integer :: watched\n  integer :: sink\n  volatile :: watched\n\n  watched = 42\n  sink = watched\nend subroutine touch_standalone\n\nsubroutine touch_dummy(watched)\n  implicit none\n  integer, volatile, intent(inout) :: watched\n  integer :: sink\n\n  sink = watched\n  watched = sink + 1\nend subroutine touch_dummy\n\nsubroutine touch_array()\n  implicit none\n  integer, volatile :: watched(2)\n  integer :: sink\n\n  watched(1) = 43\n  sink = watched(1)\nend subroutine touch_array\n\nsubroutine touch_loop()\n  implicit none\n  integer, volatile :: watched(4)\n  integer :: sink\n  integer :: i\n\n  do i = 1, 4\n    watched(i) = i\n    sink = watched(i)\n  end do\nend subroutine touch_loop\n\nsubroutine touch_nonvolatile()\n  implicit none\n  integer :: ordinary\n  integer :: sink\n\n  ordinary = 44\n  sink = ordinary\nend subroutine touch_nonvolatile\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let ir = dir.join(format!(
+            "volatile_scalar_{}.ir",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "--emit-ir",
+                src.to_str().unwrap(),
+                "-o",
+                ir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("volatile scalar IR compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: volatile scalar witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let ir_text = std::fs::read_to_string(&ir).expect("cannot read volatile scalar IR");
+        let volatile_stores = ir_text.matches("volatile_store").count();
+        let volatile_loads = ir_text.matches("volatile_load").count();
+        assert_eq!(
+            volatile_stores, 5,
+            "{optimization}: each scalar, dummy, array, and loop-body VOLATILE store must remain exactly once in static IR while the ordinary boundary stays nonvolatile:\n{ir_text}"
+        );
+        assert_eq!(
+            volatile_loads, 5,
+            "{optimization}: each scalar, dummy, array, and loop-body VOLATILE load must remain exactly once in static IR even when its result is dead, while the ordinary boundary stays nonvolatile:\n{ir_text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn volatile_accesses_execute_correctly_at_every_optimization_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=volatile_accesses_execute_correctly_at_every_optimization_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("volatile_runtime");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, volatile :: watched\n  integer :: observed\n\n  watched = 40\n  call bump(watched)\n  observed = watched\n  if (observed /= 42) error stop 1\n  print *, 'volatile-ok'\ncontains\n  subroutine bump(value)\n    integer, volatile, intent(inout) :: value\n    value = value + 2\n  end subroutine bump\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "volatile_runtime_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("volatile runtime compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: volatile runtime witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("volatile runtime executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: volatile runtime witness failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("volatile-ok"),
+            "{optimization}: unexpected volatile runtime output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn empty_infinite_loop_remains_nonterminating_at_every_opt_level() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

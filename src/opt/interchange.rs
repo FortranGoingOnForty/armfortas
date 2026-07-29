@@ -25,6 +25,7 @@
 //! read-before-write. This avoids needing full dependence analysis.
 
 use super::loop_tree::build_loop_tree;
+use super::loop_utils::blocks_contain_volatile_memory;
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::predecessors;
@@ -55,6 +56,12 @@ fn interchange_in_function(func: &mut Function) -> bool {
     for (outer_id, inner_id) in &pairs {
         let outer = tree.node(*outer_id);
         let inner = tree.node(*inner_id);
+
+        // Interchange deliberately changes the dynamic order of iterations,
+        // which is not legal for source-observable VOLATILE accesses.
+        if blocks_contain_volatile_memory(func, &outer.body) {
+            continue;
+        }
 
         // Both loops must have a recognized counted-loop structure:
         // header(%iv) → cmp_block(icmp, condBr) → body → latch(iadd, br header)

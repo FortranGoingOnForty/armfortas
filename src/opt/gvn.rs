@@ -113,8 +113,9 @@ impl PureCallPolicy {
 /// variable is fully legal, and GVN must not hash-cons such a call
 /// across an intervening store to that variable.
 ///
-/// We conservatively reject any callee that contains a `GlobalAddr`
-/// or a non-Internal `Call` / `RuntimeCall`.  The existing
+/// We conservatively reject any callee that contains a `GlobalAddr`,
+/// a source-observable VOLATILE access, or a non-Internal `Call` /
+/// `RuntimeCall`. The existing
 /// argument-policy machinery already handles the "reads through
 /// argument pointer" case via `ReadOnlyWrapperPtr`.
 /// External math intrinsics whose `Call` sites are pure functions of
@@ -189,6 +190,7 @@ fn reads_non_argument_memory(func: &Function) -> bool {
         for inst in &block.insts {
             match &inst.kind {
                 InstKind::GlobalAddr(_) => return true,
+                InstKind::VolatileLoad(..) | InstKind::VolatileStore(..) => return true,
                 InstKind::Call(FuncRef::External(name), _) if !is_pure_external_intrinsic(name) => {
                     return true;
                 }
@@ -599,6 +601,8 @@ fn key_of(
         // Impure: loads, stores, runtime calls, external calls, alloca — not GVN candidates.
         InstKind::Load(..)
         | InstKind::Store(..)
+        | InstKind::VolatileLoad(..)
+        | InstKind::VolatileStore(..)
         | InstKind::Alloca(..)
         | InstKind::Call(..)
         | InstKind::RuntimeCall(..)
@@ -1322,6 +1326,65 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn gvn_does_not_reuse_calls_that_access_volatile_storage() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee =
+            Function::new("volatile_reader".into(), vec![], IrType::Int(IntWidth::I32));
+        callee.is_pure = true;
+        let callee_entry = callee.entry;
+        let slot = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let value = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::VolatileLoad(slot),
+            IrType::Int(IntWidth::I32),
+        );
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(value)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
+        let caller_entry = caller.entry;
+        let call1 = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let call2 = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let sum = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::IAdd(call1, call2),
+            IrType::Int(IntWidth::I32),
+        );
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(sum)));
+        m.add_function(caller);
+
+        let pass = Gvn;
+        assert!(!pass.run(&mut m));
+        assert_eq!(
+            m.functions[1].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Call(..)))
+                .count(),
+            2,
+            "each call must perform its own volatile read"
+        );
     }
 
     #[test]

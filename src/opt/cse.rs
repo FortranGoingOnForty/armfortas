@@ -200,6 +200,8 @@ fn key_of(inst: &Inst) -> Option<Key> {
         // Impure / not handled ------------------------------------------
         InstKind::Load(..)
         | InstKind::Store(..)
+        | InstKind::VolatileLoad(..)
+        | InstKind::VolatileStore(..)
         | InstKind::Alloca(..)
         | InstKind::Call(..)
         | InstKind::RuntimeCall(..)

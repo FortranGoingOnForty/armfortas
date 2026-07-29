@@ -187,12 +187,12 @@ pub fn collect_mem_refs(
         let block = func.block(bid);
         for inst in &block.insts {
             match &inst.kind {
-                InstKind::Store(_, ptr) => {
+                InstKind::Store(_, ptr) | InstKind::VolatileStore(_, ptr) => {
                     if let Some(mr) = extract_mem_ref(func, inst.id, *ptr, true, ivs) {
                         refs.push(mr);
                     }
                 }
-                InstKind::Load(ptr) => {
+                InstKind::Load(ptr) | InstKind::VolatileLoad(ptr) => {
                     if let Some(mr) = extract_mem_ref(func, inst.id, *ptr, false, ivs) {
                         refs.push(mr);
                     }

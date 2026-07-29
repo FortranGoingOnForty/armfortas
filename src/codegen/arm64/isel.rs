@@ -943,7 +943,7 @@ fn select_inst(
                 );
                 return;
             }
-            InstKind::Load(addr) => {
+            InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
                 let dest_slot = ctx.lookup_wide_slot(inst.id);
                 if let Some(&offset) = ctx.alloca_offsets.get(addr) {
                     emit_load_phys_i128_pair(
@@ -1743,7 +1743,7 @@ fn select_inst(
             }
         }
 
-        InstKind::Load(addr) => {
+        InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
             // Audit CRITICAL-2: dispatch on the IR result type so the
             // load opcode width matches the value, not the pointer.
             // Previously every integer load used `ldr w_, [_]` regardless
@@ -1759,7 +1759,7 @@ fn select_inst(
             });
         }
 
-        InstKind::Store(val, addr) => {
+        InstKind::Store(val, addr) | InstKind::VolatileStore(val, addr) => {
             if matches!(func.value_type(*val), Some(ref t) if is_wide_pair_ty_arm(t)) {
                 let src_slot = ctx.lookup_wide_slot(*val);
                 emit_load_phys_i128_pair(

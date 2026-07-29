@@ -747,6 +747,51 @@ mod tests {
     }
 
     #[test]
+    fn volatile_access_disqualifies_stack_slot_promotion() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        let slot = push_inst(
+            &mut f,
+            entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let c7 = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(
+            &mut f,
+            entry,
+            InstKind::VolatileStore(c7, slot),
+            IrType::Void,
+        );
+        let loaded = push_inst(
+            &mut f,
+            entry,
+            InstKind::VolatileLoad(slot),
+            IrType::Int(IntWidth::I32),
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(loaded)));
+        m.add_function(f);
+
+        assert!(!Mem2Reg.run(&mut m));
+        let insts = &m.functions[0].blocks[0].insts;
+        assert!(insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Alloca(_))));
+        assert!(insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::VolatileStore(..))));
+        assert!(insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::VolatileLoad(_))));
+    }
+
+    #[test]
     fn skips_promotion_when_store_type_differs_from_slot_pointee() {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);

@@ -787,6 +787,7 @@ fn install_external_interface(
             save: var.save,
             pointer: var.pointer,
             target: var.target,
+            volatile: var.volatile,
             parameter: var.is_parameter,
             external: var.proc_pointer,
             array_spec,

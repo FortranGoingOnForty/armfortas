@@ -114,6 +114,10 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                         }
                     }
 
+                    InstKind::VolatileLoad(_) | InstKind::VolatileStore(..) => {
+                        available.clear();
+                    }
+
                     InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
                         // A callee may access module/global state without
                         // receiving its address as an argument.
@@ -311,6 +315,47 @@ mod tests {
             matches!(&add_inst.kind, InstKind::IAdd(a, _) if *a == val42),
             "IAdd operand should be forwarded to val42, got {:?}",
             add_inst.kind
+        );
+    }
+
+    #[test]
+    fn volatile_load_invalidates_available_value() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let val42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(&mut f, InstKind::Store(val42, alloca), IrType::Void);
+        let volatile_load = push(
+            &mut f,
+            InstKind::VolatileLoad(alloca),
+            IrType::Int(IntWidth::I32),
+        );
+        let ordinary_load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(ordinary_load)));
+        m.add_function(f);
+
+        assert!(!LocalLsf.run(&mut m));
+        let insts = &m.functions[0].blocks[0].insts;
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.id == volatile_load
+                    && matches!(inst.kind, InstKind::VolatileLoad(_)))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.id == ordinary_load && matches!(inst.kind, InstKind::Load(_))),
+            "an ordinary load after a volatile access must re-read memory"
         );
     }
 

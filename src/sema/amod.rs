@@ -791,6 +791,9 @@ fn emit_variable(
     if sym.attrs.target {
         attrs.push("target");
     }
+    if sym.attrs.volatile {
+        attrs.push("volatile");
+    }
     if sym.attrs.access == Access::Private {
         attrs.push("private");
     }
@@ -1636,6 +1639,7 @@ pub struct AmodVar {
     pub pointer: bool,
     pub proc_pointer: bool,
     pub target: bool,
+    pub volatile: bool,
     pub ir_symbol: Option<String>,
     pub deferred_char: bool,
     pub rank: usize,
@@ -2155,6 +2159,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let pointer = attr_str.contains("pointer");
     let proc_pointer = attr_str.contains("procptr");
     let target = attr_str.contains("target");
+    let volatile = attr_str.contains("volatile");
     let access = if attr_str.contains("private") {
         Access::Private
     } else {
@@ -2227,6 +2232,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         pointer,
         proc_pointer,
         target,
+        volatile,
         ir_symbol,
         deferred_char,
         rank: rank.max(dims.len()),
@@ -2990,6 +2996,7 @@ pub fn extract_module_globals(
                     declared_rank,
                     allocatable: var.allocatable,
                     is_pointer: var.pointer,
+                    volatile: var.volatile,
                     deferred_char: var.deferred_char,
                     derived_type,
                     char_kind: match var.type_info.as_ref() {

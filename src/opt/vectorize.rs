@@ -13,7 +13,9 @@ use crate::ir::inst::*;
 use crate::ir::types::{FloatWidth, IntWidth, IrType};
 use crate::ir::walk::prune_unreachable;
 
-use super::loop_utils::{find_preheader, loop_defined_values, resolve_const_int};
+use super::loop_utils::{
+    find_preheader, loop_contains_volatile_memory, loop_defined_values, resolve_const_int,
+};
 use super::pass::Pass;
 use super::util::{find_natural_loops, inst_uses, predecessors, terminator_uses, NaturalLoop};
 
@@ -106,6 +108,9 @@ fn vectorize_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
+        if loop_contains_volatile_memory(func, lp) {
+            continue;
+        }
         let Some(shape) = detect_counted_loop(func, lp, &preds) else {
             continue;
         };

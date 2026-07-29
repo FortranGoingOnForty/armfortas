@@ -1363,6 +1363,39 @@ pub(crate) fn alloc_decls(
             }
         }
     }
+
+    // VOLATILE is a property of the referenced storage, not of one
+    // particular load/store syntax. Mark the address once after all
+    // declarations have been installed so every lowering helper (scalar,
+    // array, component, descriptor, and pointer paths) emits explicit
+    // volatile memory operations through FuncBuilder.
+    let mut volatile_names = std::collections::HashSet::new();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } if attrs.iter().any(|attr| matches!(attr, Attribute::Volatile)) => {
+                volatile_names.extend(entities.iter().map(|entity| entity.name.to_lowercase()));
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::Volatile,
+                entities,
+            } => {
+                volatile_names.extend(entities.iter().map(|name| name.to_lowercase()));
+            }
+            _ => {}
+        }
+    }
+    for name in volatile_names {
+        let Some(info) = locals.get(&name) else {
+            continue;
+        };
+        if info.by_ref {
+            b.mark_indirect_volatile_address(info.addr);
+        } else {
+            b.mark_volatile_address(info.addr);
+        }
+    }
 }
 
 fn rewrite_heap_promoted_declared_bounds(b: &mut FuncBuilder, desc: ValueId, dims: &[(i64, i64)]) {

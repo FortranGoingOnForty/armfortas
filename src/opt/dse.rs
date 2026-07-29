@@ -77,6 +77,11 @@ fn find_dead_stores(
                 });
             }
 
+            // VOLATILE accesses are explicit optimizer barriers. In addition
+            // to preserving the access itself, assume asynchronously visible
+            // storage may have changed at this point.
+            InstKind::VolatileLoad(_) | InstKind::VolatileStore(..) => pending.clear(),
+
             // The alias oracle compares point addresses, while vector memory
             // operations cover a 16-byte range. Until range aliasing exists,
             // no pending scalar store is proven disjoint from that access.
@@ -259,6 +264,31 @@ mod tests {
             .collect();
         assert_eq!(stores.len(), 1);
         assert!(matches!(stores[0].kind, InstKind::Store(v, _) if v == v2));
+    }
+
+    #[test]
+    fn volatile_access_is_a_dead_store_barrier() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, ptr), IrType::Void);
+        push(&mut f, InstKind::VolatileLoad(ptr), i32_ty());
+        push(&mut f, InstKind::Store(v2, ptr), IrType::Void);
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dse.run(&mut m));
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
     }
 
     #[test]

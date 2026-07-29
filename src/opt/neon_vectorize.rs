@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 
-use super::loop_utils::{loop_defined_values, remap_inst_kind};
+use super::loop_utils::{loop_contains_volatile_memory, loop_defined_values, remap_inst_kind};
 use super::pass::Pass;
 use super::util::{find_natural_loops, predecessors, NaturalLoop};
 use super::vec_analysis::{
@@ -92,6 +92,9 @@ fn vectorize_one_loop(
     let preds = predecessors(func);
 
     for lp in &loops {
+        if loop_contains_volatile_memory(func, lp) {
+            continue;
+        }
         // Try element-wise vectorization first (no escaping values).
         if let Some(shape) = detect_counted_loop(func, lp, &preds) {
             let loop_defs = loop_defined_values(func, lp);
@@ -1339,6 +1342,11 @@ fn substitute_in_inst(kind: &mut InstKind, from: ValueId, to: ValueId) {
     match kind {
         InstKind::Load(p) => replace(p),
         InstKind::Store(v, p) => {
+            replace(v);
+            replace(p);
+        }
+        InstKind::VolatileLoad(p) => replace(p),
+        InstKind::VolatileStore(v, p) => {
             replace(v);
             replace(p);
         }

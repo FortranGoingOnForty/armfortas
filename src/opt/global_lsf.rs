@@ -199,6 +199,7 @@ fn memory_effect(
             AliasResult::MayAlias => MemoryEffect::Clobbered,
             AliasResult::NoAlias => MemoryEffect::NoAlias,
         },
+        InstKind::VolatileLoad(..) | InstKind::VolatileStore(..) => MemoryEffect::Clobbered,
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
             // A callee may access module/global state without receiving its
             // address as an argument.
