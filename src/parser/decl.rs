@@ -424,6 +424,55 @@ impl<'a> Parser<'a> {
         Ok(specs)
     }
 
+    /// Parse `DIMENSION [::] array-name(array-spec) [, ...]`.
+    ///
+    /// The keyword has not been consumed. A standalone DIMENSION statement
+    /// differs from a type-declaration DIMENSION attribute: each named entity
+    /// has its own parenthesized array specification.
+    pub fn parse_dimension_stmt(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        self.advance(); // DIMENSION
+        let _ = self.eat(&TokenKind::ColonColon);
+
+        let mut entities = Vec::new();
+        loop {
+            if self.peek() != &TokenKind::Identifier {
+                return Err(
+                    self.error("expected an array name in standalone DIMENSION statement".into())
+                );
+            }
+            let name = self.advance().clone().text;
+            if !self.eat(&TokenKind::LParen) {
+                return Err(self.error(format!(
+                    "array '{}' in standalone DIMENSION statement requires an array-spec",
+                    name
+                )));
+            }
+            let array_spec = self.parse_array_spec_list()?;
+            self.expect(&TokenKind::RParen)?;
+            entities.push(DimensionEntity { name, array_spec });
+
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+            if self.at_stmt_end() {
+                return Err(self.error(
+                    "expected an array name after ',' in standalone DIMENSION statement".into(),
+                ));
+            }
+        }
+
+        if !self.at_stmt_end() {
+            return Err(self.error(format!(
+                "unexpected token '{}' after standalone DIMENSION statement",
+                self.peek_text()
+            )));
+        }
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        self.skip_newlines();
+        Ok(Spanned::new(Decl::DimensionStmt { entities }, span))
+    }
+
     fn parse_array_spec_list(&mut self) -> Result<Vec<ArraySpec>, ParseError> {
         let mut specs = Vec::new();
         loop {

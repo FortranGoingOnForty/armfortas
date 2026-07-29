@@ -86,11 +86,24 @@ pub enum Decl {
         enumerators: Vec<String>,
     },
 
-    /// Standalone attribute statement: `allocatable :: x`, `dimension(10) :: a`
+    /// Standalone attribute statement: `allocatable :: x`, `target :: a`
     AttributeStmt {
         attr: Attribute,
         entities: Vec<String>,
     },
+
+    /// Standalone `DIMENSION [::] array-name(array-spec), ...` statement.
+    ///
+    /// Unlike a `DIMENSION(...)` attribute on a type declaration, every
+    /// entity in this statement carries its own array specification.
+    DimensionStmt { entities: Vec<DimensionEntity> },
+}
+
+/// One entity in a standalone DIMENSION statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimensionEntity {
+    pub name: String,
+    pub array_spec: Vec<ArraySpec>,
 }
 
 // ---- Type specifiers ----

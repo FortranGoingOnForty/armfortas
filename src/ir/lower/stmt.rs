@@ -8413,19 +8413,96 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // range, then run alloc_decls / init_decls over the
             // combined list.
             let pre_block_keys: HashSet<String> = ctx.locals.keys().cloned().collect();
-            let mut effective_decls: Vec<crate::ast::decl::SpannedDecl> = decls.clone();
             let mut implicit_map: std::collections::HashMap<char, crate::ast::decl::TypeSpec> =
                 std::collections::HashMap::new();
+            if let Some(scope_id) = ctx.st.statement_block_scope(stmt.span) {
+                let rules = &ctx.st.scope(scope_id).implicit_rules;
+                if !rules.none_type {
+                    for (letter, implicit_type) in &rules.rules {
+                        let type_spec = match implicit_type {
+                            crate::sema::symtab::ImplicitType::Integer => {
+                                crate::ast::decl::TypeSpec::Integer(None)
+                            }
+                            crate::sema::symtab::ImplicitType::Real => {
+                                crate::ast::decl::TypeSpec::Real(None)
+                            }
+                            crate::sema::symtab::ImplicitType::DoublePrecision => {
+                                crate::ast::decl::TypeSpec::DoublePrecision
+                            }
+                            crate::sema::symtab::ImplicitType::Complex => {
+                                crate::ast::decl::TypeSpec::Complex(None)
+                            }
+                            crate::sema::symtab::ImplicitType::Logical => {
+                                crate::ast::decl::TypeSpec::Logical(None)
+                            }
+                            crate::sema::symtab::ImplicitType::Character => {
+                                crate::ast::decl::TypeSpec::Character(None)
+                            }
+                        };
+                        implicit_map.insert(*letter, type_spec);
+                    }
+                }
+            }
             for d in implicit {
-                if let crate::ast::decl::Decl::ImplicitStmt { specs } = &d.node {
-                    for spec in specs {
-                        for &(start, end) in &spec.ranges {
-                            for letter_byte in start as u8..=end as u8 {
-                                let letter = (letter_byte as char).to_ascii_lowercase();
-                                implicit_map.insert(letter, spec.type_spec.clone());
+                match &d.node {
+                    crate::ast::decl::Decl::ImplicitNone { type_, .. } => {
+                        if *type_ {
+                            implicit_map.clear();
+                        }
+                    }
+                    crate::ast::decl::Decl::ImplicitStmt { specs } => {
+                        for spec in specs {
+                            for &(start, end) in &spec.ranges {
+                                for letter_byte in start as u8..=end as u8 {
+                                    let letter = (letter_byte as char).to_ascii_lowercase();
+                                    implicit_map.insert(letter, spec.type_spec.clone());
+                                }
                             }
                         }
                     }
+                    _ => {}
+                }
+            }
+
+            let mut effective_decls: Vec<crate::ast::decl::SpannedDecl> = Vec::new();
+            for declaration in decls {
+                let crate::ast::decl::Decl::DimensionStmt { entities } = &declaration.node else {
+                    effective_decls.push(declaration.clone());
+                    continue;
+                };
+                for entity in entities {
+                    let type_spec = entity
+                        .name
+                        .chars()
+                        .next()
+                        .and_then(|first| implicit_map.get(&first.to_ascii_lowercase()))
+                        .cloned();
+                    let Some(type_spec) = type_spec else {
+                        // Validation rejects this under IMPLICIT NONE. Retain
+                        // the source node on direct-lowering error paths rather
+                        // than inventing a type and silently miscompiling it.
+                        effective_decls.push(crate::ast::Spanned::new(
+                            crate::ast::decl::Decl::DimensionStmt {
+                                entities: vec![entity.clone()],
+                            },
+                            declaration.span,
+                        ));
+                        continue;
+                    };
+                    effective_decls.push(crate::ast::Spanned::new(
+                        crate::ast::decl::Decl::TypeDecl {
+                            type_spec,
+                            attrs: Vec::new(),
+                            entities: vec![crate::ast::decl::EntityDecl {
+                                name: entity.name.clone(),
+                                array_spec: Some(entity.array_spec.clone()),
+                                char_len: None,
+                                init: None,
+                                ptr_init: None,
+                            }],
+                        },
+                        declaration.span,
+                    ));
                 }
             }
             if !implicit_map.is_empty() {

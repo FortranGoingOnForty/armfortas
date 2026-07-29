@@ -1218,6 +1218,23 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // Standalone DIMENSION statement (F2018 R832):
+            // `dimension [::] a(10), b(2, 3)`. Every entity has its own
+            // array-spec, so this uses a dedicated AST node rather than the
+            // shared DIMENSION(...) type-declaration attribute. As with other
+            // keyword statements, preserve Fortran's non-reserved keywords:
+            // `dimension = x` and `dimension(i) = x` remain assignments.
+            if text == "dimension" {
+                let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
+                if matches!(
+                    next_kind,
+                    Some(TokenKind::ColonColon) | Some(TokenKind::Identifier)
+                ) {
+                    decls.push(self.parse_dimension_stmt()?);
+                    continue;
+                }
+            }
+
             // PRIVATE / PUBLIC access statements.
             if text == "private" || text == "public" {
                 let start = self.current_span();
@@ -1274,6 +1291,7 @@ impl<'a> Parser<'a> {
         }
 
         fold_attribute_statements(&mut decls);
+        fold_dimension_statements(&mut decls)?;
         Ok((uses, imports, implicit, decls, body, interfaces))
     }
 
@@ -1559,6 +1577,137 @@ fn fold_one_attribute(
     true
 }
 
+/// Fold standalone DIMENSION entities into matching type declarations.
+///
+/// A DIMENSION statement may precede or follow the entity's type declaration,
+/// so the full declaration list is searched. Entities with no explicit type
+/// declaration remain as `DimensionStmt` nodes: semantic resolution assigns
+/// their implicit type (or diagnoses IMPLICIT NONE), and the lowering
+/// normalization then materializes an equivalent typed declaration.
+fn fold_dimension_statements(decls: &mut Vec<SpannedDecl>) -> Result<(), ParseError> {
+    use crate::ast::decl::Decl;
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for decl in decls.iter() {
+        if let Decl::DimensionStmt { entities } = &decl.node {
+            for entity in entities {
+                let key = entity.name.to_ascii_lowercase();
+                if !seen.insert(key) {
+                    return Err(ParseError {
+                        span: decl.span,
+                        msg: format!(
+                            "duplicate DIMENSION attribute specified for '{}'",
+                            entity.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut i = 0;
+    while i < decls.len() {
+        let (entities, stmt_span) = match &decls[i].node {
+            Decl::DimensionStmt { entities } => (entities.clone(), decls[i].span),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let mut unfolded = Vec::new();
+        for entity in entities {
+            if !fold_one_dimension(decls, &entity.name, &entity.array_spec, stmt_span)? {
+                unfolded.push(entity);
+            }
+        }
+
+        if unfolded.is_empty() {
+            decls.remove(i);
+        } else {
+            if let Decl::DimensionStmt { entities } = &mut decls[i].node {
+                *entities = unfolded;
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn fold_one_dimension(
+    decls: &mut Vec<SpannedDecl>,
+    name: &str,
+    array_spec: &[crate::ast::decl::ArraySpec],
+    stmt_span: crate::lexer::Span,
+) -> Result<bool, ParseError> {
+    use crate::ast::decl::{Attribute, Decl};
+
+    let mut found: Option<(usize, usize, usize)> = None;
+    for (decl_index, decl) in decls.iter().enumerate() {
+        if let Decl::TypeDecl { entities, .. } = &decl.node {
+            if let Some(entity_index) = entities
+                .iter()
+                .position(|entity| entity.name.eq_ignore_ascii_case(name))
+            {
+                found = Some((decl_index, entity_index, entities.len()));
+                break;
+            }
+        }
+    }
+    let Some((decl_index, entity_index, entity_count)) = found else {
+        return Ok(false);
+    };
+
+    let has_decl_dimension = match &decls[decl_index].node {
+        Decl::TypeDecl {
+            attrs, entities, ..
+        } => {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::Dimension(_)))
+                || entities[entity_index].array_spec.is_some()
+        }
+        _ => unreachable!(),
+    };
+    if has_decl_dimension {
+        return Err(ParseError {
+            span: stmt_span,
+            msg: format!("duplicate DIMENSION attribute specified for '{}'", name),
+        });
+    }
+
+    if entity_count == 1 {
+        if let Decl::TypeDecl { entities, .. } = &mut decls[decl_index].node {
+            entities[entity_index].array_spec = Some(array_spec.to_vec());
+        }
+    } else {
+        let decl_span = decls[decl_index].span;
+        let (type_spec, attrs, mut entity) = match &mut decls[decl_index].node {
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities,
+            } => (
+                type_spec.clone(),
+                attrs.clone(),
+                entities.remove(entity_index),
+            ),
+            _ => unreachable!(),
+        };
+        entity.array_spec = Some(array_spec.to_vec());
+        decls.push(Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities: vec![entity],
+            },
+            decl_span,
+        ));
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1775,6 +1924,123 @@ end program test
         }
         assert!(a_allocatable, "a should be allocatable");
         assert!(!b_allocatable, "b should not be allocatable");
+    }
+
+    #[test]
+    fn standalone_dimension_preserves_entity_shapes_and_implicit_entities() {
+        let unit = parse_unit(
+            "program p\n\
+               dimension :: a(3), b(2, 4), x(-1:1)\n\
+               integer :: a, b\n\
+             end program p\n",
+        );
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+
+        let mut explicit_ranks = std::collections::HashMap::new();
+        let mut implicit_dimension = None;
+        for decl in decls {
+            match &decl.node {
+                Decl::TypeDecl { entities, .. } => {
+                    for entity in entities {
+                        if let Some(specs) = &entity.array_spec {
+                            explicit_ranks.insert(entity.name.to_ascii_lowercase(), specs.len());
+                        }
+                    }
+                }
+                Decl::DimensionStmt { entities } => {
+                    assert_eq!(
+                        entities.len(),
+                        1,
+                        "only the implicitly typed entity should remain standalone"
+                    );
+                    implicit_dimension = entities.first();
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(explicit_ranks.get("a"), Some(&1));
+        assert_eq!(explicit_ranks.get("b"), Some(&2));
+        let implicit = implicit_dimension.expect("missing implicit DIMENSION entity");
+        assert_eq!(implicit.name, "x");
+        assert_eq!(implicit.array_spec.len(), 1);
+    }
+
+    #[test]
+    fn standalone_dimension_rejects_duplicate_shape_sources() {
+        for source in [
+            "program p\ninteger :: a(2)\ndimension a(3)\nend program p\n",
+            "program p\ninteger, dimension(2) :: a\ndimension :: a(3)\nend program p\n",
+            "program p\ndimension a(2)\ndimension a(3)\nend program p\n",
+            "program p\ndimension :: a(2), A(3)\nend program p\n",
+        ] {
+            let error = parse_error(source);
+            assert!(
+                error.msg.contains("duplicate DIMENSION attribute"),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_dimension_requires_each_entity_shape() {
+        let error = parse_error("program p\ndimension :: a\nend program p\n");
+        assert!(
+            error.msg.contains("requires an array-spec"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fixed_form_standalone_dimension_folds_into_the_type_declaration() {
+        let unit = parse_fixed_unit(
+            "      PROGRAM P
+      INTEGER A
+      DIMENSION A(3)
+      END
+",
+        );
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        let array_rank = decls.iter().find_map(|decl| {
+            let Decl::TypeDecl { entities, .. } = &decl.node else {
+                return None;
+            };
+            entities
+                .iter()
+                .find(|entity| entity.name.eq_ignore_ascii_case("a"))
+                .and_then(|entity| entity.array_spec.as_ref())
+                .map(Vec::len)
+        });
+        assert_eq!(array_rank, Some(1));
+        assert!(!decls
+            .iter()
+            .any(|decl| matches!(decl.node, Decl::DimensionStmt { .. })));
+    }
+
+    #[test]
+    fn dimension_keyword_can_still_name_an_assignment_target() {
+        let unit = parse_unit(
+            "program p\n\
+               integer :: dimension, i\n\
+               integer :: values(2)\n\
+               dimension = 1\n\
+               values(i) = dimension\n\
+             end program p\n",
+        );
+        let ProgramUnit::Program { decls, body, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(!decls
+            .iter()
+            .any(|decl| matches!(decl.node, Decl::DimensionStmt { .. })));
+        assert_eq!(body.len(), 2);
+        assert!(body
+            .iter()
+            .all(|stmt| matches!(stmt.node, crate::ast::stmt::Stmt::Assignment { .. })));
     }
 
     // ---- SUBROUTINE ----

@@ -2835,6 +2835,20 @@ fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Res
     Ok(())
 }
 
+fn implicit_type_to_type_info(implicit_type: ImplicitType) -> TypeInfo {
+    match implicit_type {
+        ImplicitType::Integer => TypeInfo::Integer { kind: None },
+        ImplicitType::Real => TypeInfo::Real { kind: None },
+        ImplicitType::DoublePrecision => TypeInfo::DoublePrecision,
+        ImplicitType::Complex => TypeInfo::Complex { kind: None },
+        ImplicitType::Logical => TypeInfo::Logical { kind: None },
+        ImplicitType::Character => TypeInfo::Character {
+            len: Some(1),
+            kind: None,
+        },
+    }
+}
+
 fn is_unresolved_declaration_placeholder(
     st: &SymbolTable,
     name: &str,
@@ -2846,6 +2860,15 @@ fn is_unresolved_declaration_placeholder(
     ) {
         return false;
     }
+    is_procedure_entity_placeholder(st, name)
+        && st
+            .scope(st.current_scope())
+            .symbols
+            .get(&name.to_ascii_lowercase())
+            .is_some_and(|symbol| symbol.type_info.is_none())
+}
+
+fn is_procedure_entity_placeholder(st: &SymbolTable, name: &str) -> bool {
     let key = name.to_ascii_lowercase();
     let scope = st.scope(st.current_scope());
     let has_placeholder_identity = scope
@@ -2860,7 +2883,7 @@ fn is_unresolved_declaration_placeholder(
         && scope
             .symbols
             .get(&key)
-            .is_some_and(|symbol| symbol.kind == SymbolKind::Variable && symbol.type_info.is_none())
+            .is_some_and(|symbol| symbol.kind == SymbolKind::Variable)
 }
 
 fn repeated_symbol_access_error(name: &str, span: crate::lexer::Span) -> SemaError {
@@ -3136,6 +3159,75 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             arg_names: arg_names.clone(),
                             const_value,
                             const_char_value,
+                        })?;
+                    }
+                }
+            }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    let key = entity.name.to_ascii_lowercase();
+                    let is_placeholder = is_procedure_entity_placeholder(st, &key);
+                    if is_placeholder {
+                        let existing_type = st
+                            .scope(st.current_scope())
+                            .symbols
+                            .get(&key)
+                            .and_then(|symbol| symbol.type_info.clone());
+                        let type_info = match existing_type {
+                            Some(type_info) => type_info,
+                            None => st
+                                .implicit_type(&entity.name)
+                                .map(implicit_type_to_type_info)
+                                .ok_or_else(|| SemaError {
+                                    span: decl.span,
+                                    msg: format!(
+                                        "array '{}' in DIMENSION statement has no implicit type",
+                                        entity.name
+                                    ),
+                                })?,
+                        };
+                        let current_scope = st.current_scope();
+                        let symbol = st
+                            .scope_mut(current_scope)
+                            .symbols
+                            .get_mut(&key)
+                            .expect("declaration placeholder should remain in its scope");
+                        if !symbol.attrs.array_spec.is_empty() {
+                            return Err(SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "duplicate DIMENSION attribute specified for '{}'",
+                                    entity.name
+                                ),
+                            });
+                        }
+                        symbol.type_info = Some(type_info);
+                        symbol.attrs.array_spec = entity.array_spec.clone();
+                    } else {
+                        let type_info = st
+                            .implicit_type(&entity.name)
+                            .map(implicit_type_to_type_info)
+                            .ok_or_else(|| SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "array '{}' in DIMENSION statement has no implicit type",
+                                    entity.name
+                                ),
+                            })?;
+                        st.define(Symbol {
+                            name: entity.name.clone(),
+                            kind: SymbolKind::Variable,
+                            type_info: Some(type_info),
+                            attrs: SymbolAttrs {
+                                access: st.default_access(st.current_scope()),
+                                array_spec: entity.array_spec.clone(),
+                                ..Default::default()
+                            },
+                            defined_at: decl.span,
+                            scope: st.current_scope(),
+                            arg_names: vec![],
+                            const_value: None,
+                            const_char_value: None,
                         })?;
                     }
                 }
@@ -3715,30 +3807,43 @@ fn function_result_attrs(
         .unwrap_or(function_name)
         .to_ascii_lowercase();
     for decl in decls {
-        let crate::ast::decl::Decl::TypeDecl {
-            attrs, entities, ..
-        } = &decl.node
-        else {
-            continue;
-        };
-        let matching_entity = entities
-            .iter()
-            .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
-        if let Some(entity) = matching_entity {
-            let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
-            // Capture result rank: prefer the entity-local array_spec
-            // (e.g. `real :: w(:)`), falling back to a `dimension(...)`
-            // attribute on the type-decl statement.
-            let rank_from_entity = entity.array_spec.as_ref().map(|specs| specs.len());
-            let rank_from_attrs = attrs.iter().find_map(|a| match a {
-                crate::ast::decl::Attribute::Dimension(specs) => Some(specs.len()),
-                _ => None,
-            });
-            sym_attrs.result_rank = rank_from_entity
-                .or(rank_from_attrs)
-                .unwrap_or(0)
-                .min(u8::MAX as usize) as u8;
-            return sym_attrs;
+        match &decl.node {
+            crate::ast::decl::Decl::TypeDecl {
+                attrs, entities, ..
+            } => {
+                let matching_entity = entities
+                    .iter()
+                    .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
+                if let Some(entity) = matching_entity {
+                    let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
+                    // Capture result rank: prefer the entity-local array_spec
+                    // (e.g. `real :: w(:)`), falling back to a
+                    // `dimension(...)` attribute on the type declaration.
+                    let rank_from_entity = entity.array_spec.as_ref().map(|specs| specs.len());
+                    let rank_from_attrs = attrs.iter().find_map(|a| match a {
+                        crate::ast::decl::Attribute::Dimension(specs) => Some(specs.len()),
+                        _ => None,
+                    });
+                    sym_attrs.result_rank = rank_from_entity
+                        .or(rank_from_attrs)
+                        .unwrap_or(0)
+                        .min(u8::MAX as usize) as u8;
+                    return sym_attrs;
+                }
+            }
+            crate::ast::decl::Decl::DimensionStmt { entities } => {
+                if let Some(entity) = entities
+                    .iter()
+                    .find(|entity| entity.name.eq_ignore_ascii_case(&result_key))
+                {
+                    return SymbolAttrs {
+                        result_rank: entity.array_spec.len().min(u8::MAX as usize) as u8,
+                        array_spec: entity.array_spec.clone(),
+                        ..SymbolAttrs::default()
+                    };
+                }
+            }
+            _ => {}
         }
     }
     SymbolAttrs::default()
@@ -3833,6 +3938,79 @@ end module result_parent
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.implicit_rules.none_type);
+    }
+
+    #[test]
+    fn standalone_dimension_defines_an_implicitly_typed_array() {
+        let st = resolve_source(
+            "program test\n\
+               dimension :: x(-1:1, 4)\n\
+             end program test\n",
+        );
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap();
+        let symbol = program_scope
+            .symbols
+            .get("x")
+            .expect("DIMENSION entity should be declared");
+        assert_eq!(symbol.type_info, Some(TypeInfo::Real { kind: None }));
+        assert_eq!(symbol.attrs.array_spec.len(), 2);
+    }
+
+    #[test]
+    fn standalone_dimension_obeys_implicit_none() {
+        let error = resolve_error(
+            "program test\n\
+               implicit none\n\
+               dimension :: x(3)\n\
+             end program test\n",
+        );
+        assert!(
+            error.msg.contains("has no implicit type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn standalone_dimension_can_shape_a_prefixed_function_result() {
+        let st = resolve_source(
+            "module result_shapes\n\
+               implicit none\n\
+             contains\n\
+               real function values()\n\
+                 implicit none\n\
+                 dimension :: values(3)\n\
+               end function values\n\
+             end module result_shapes\n",
+        );
+        let function_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "values"))
+            .unwrap();
+        let result = function_scope
+            .procedure_result_symbol()
+            .expect("function result symbol");
+        assert_eq!(result.type_info, Some(TypeInfo::Real { kind: None }));
+        assert_eq!(result.attrs.array_spec.len(), 1);
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    &scope.kind,
+                    ScopeKind::Module(name) if name == "result_shapes"
+                )
+            })
+            .expect("module scope");
+        let function = module_scope
+            .symbols
+            .get("values")
+            .expect("contained function symbol");
+        assert_eq!(function.attrs.result_rank, 1);
     }
 
     #[test]

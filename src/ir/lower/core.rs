@@ -53,6 +53,19 @@ pub fn lower_file(
     external_char_len_star: HashMap<String, Vec<bool>>,
     layout: crate::target::TargetLayout,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
+    // Some declaration forms resolve their concrete type only after sema.
+    // Normalize an owned copy at the lowering boundary so every caller of
+    // `lower_file` (not only the CLI driver) gets the same typed AST.
+    let normalized_units = units
+        .iter()
+        .any(unit_needs_resolved_decl_normalization)
+        .then(|| {
+            let mut owned = units.to_vec();
+            normalize_resolved_decls(&mut owned, st);
+            owned
+        });
+    let units = normalized_units.as_deref().unwrap_or(units);
+
     let mut module = Module::new("main".into(), layout);
     // Modules defined in this unit — lets any function CALL a local-module
     // type's out-of-line memory helpers instead of inlining the walk.
@@ -2213,75 +2226,217 @@ pub(super) fn smp_parent_interface_scope(
     })
 }
 
-/// Rewrite `TYPEOF(entity)` / `CLASSOF(entity)` declaration specs to
-/// the concrete specs resolution recorded on the declared symbols,
-/// recursing through CONTAINS. Runs once in the driver before
-/// lowering: every lowering pre-pass (descriptor params, class-dummy
-/// detection, result ABI, derived storage) keys on the syntactic
-/// TypeSpec, so an unresolved TypeOf silently took the unknown-type
-/// fallbacks — a TYPEOF(point) local dropped its component stores and
-/// a CLASSOF dummy missed the caller-side class descriptor.
-pub fn normalize_typeof_specs(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
-    for unit in units {
-        normalize_typeof_specs_in_unit(&mut unit.node, st);
+fn unit_needs_resolved_decl_normalization(unit: &SpannedUnit) -> bool {
+    fn decls_need_normalization(decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+        decls.iter().any(|decl| match &decl.node {
+            Decl::TypeDecl { type_spec, .. } => {
+                matches!(type_spec, TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_))
+            }
+            Decl::DimensionStmt { .. } => true,
+            _ => false,
+        })
+    }
+
+    match &unit.node {
+        ProgramUnit::Program {
+            decls, contains, ..
+        }
+        | ProgramUnit::Module {
+            decls, contains, ..
+        }
+        | ProgramUnit::Submodule {
+            decls, contains, ..
+        }
+        | ProgramUnit::Subroutine {
+            decls, contains, ..
+        }
+        | ProgramUnit::Function {
+            decls, contains, ..
+        } => {
+            decls_need_normalization(decls)
+                || contains.iter().any(unit_needs_resolved_decl_normalization)
+        }
+        ProgramUnit::BlockData { decls, .. } => decls_need_normalization(decls),
+        ProgramUnit::InterfaceBlock { bodies, .. } => bodies.iter().any(|body| match body {
+            crate::ast::unit::InterfaceBody::Subprogram(unit) => {
+                unit_needs_resolved_decl_normalization(unit)
+            }
+            crate::ast::unit::InterfaceBody::ModuleProcedure(_) => false,
+        }),
     }
 }
 
-fn normalize_typeof_specs_in_unit(unit: &mut ProgramUnit, st: &SymbolTable) {
+/// Normalize declarations whose concrete type is known only after semantic
+/// resolution, recursing through CONTAINS.
+///
+/// TYPEOF/CLASSOF specs become their resolved concrete type. Remaining
+/// standalone DIMENSION nodes denote implicitly typed entities and become
+/// ordinary TypeDecl nodes, keeping every lowering pre-pass and allocation
+/// site on the canonical typed-declaration path.
+fn normalize_resolved_decls(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
+    for unit in units {
+        normalize_resolved_decls_in_unit(&mut unit.node, st, 0);
+    }
+}
+
+/// Compatibility entry point used by the driver. It now normalizes all
+/// sema-resolved declaration forms, not only TYPEOF/CLASSOF.
+pub fn normalize_typeof_specs(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
+    normalize_resolved_decls(units, st);
+}
+
+fn resolved_scope_for_unit(
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
+    unit: &ProgramUnit,
+) -> Option<crate::sema::symtab::ScopeId> {
     use crate::sema::symtab::ScopeKind;
-    let (scope_id, decls, contains) = match unit {
+
+    let expected_name = match unit {
+        ProgramUnit::Program { name, .. } => name.as_deref().unwrap_or("main"),
+        ProgramUnit::BlockData { name, .. } => name.as_deref().unwrap_or("<block_data>"),
+        ProgramUnit::Module { name, .. }
+        | ProgramUnit::Submodule { name, .. }
+        | ProgramUnit::Subroutine { name, .. }
+        | ProgramUnit::Function { name, .. } => name,
+        ProgramUnit::InterfaceBlock { .. } => return None,
+    };
+
+    st.all_scopes().iter().find_map(|scope| {
+        if scope.parent != Some(parent_scope) {
+            return None;
+        }
+        let name = match &scope.kind {
+            ScopeKind::Program(name)
+                if matches!(
+                    unit,
+                    ProgramUnit::Program { .. } | ProgramUnit::BlockData { .. }
+                ) =>
+            {
+                name
+            }
+            ScopeKind::Module(name) if matches!(unit, ProgramUnit::Module { .. }) => name,
+            ScopeKind::Submodule(name) if matches!(unit, ProgramUnit::Submodule { .. }) => name,
+            ScopeKind::Subroutine(name) if matches!(unit, ProgramUnit::Subroutine { .. }) => name,
+            ScopeKind::Function(name) if matches!(unit, ProgramUnit::Function { .. }) => name,
+            _ => return None,
+        };
+        name.eq_ignore_ascii_case(expected_name).then_some(scope.id)
+    })
+}
+
+fn normalize_resolved_decls_in_unit(
+    unit: &mut ProgramUnit,
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
+) {
+    if let ProgramUnit::InterfaceBlock { bodies, .. } = unit {
+        for body in bodies {
+            let crate::ast::unit::InterfaceBody::Subprogram(subprogram) = body else {
+                continue;
+            };
+            let interface_scope = st.all_scopes().iter().find_map(|scope| {
+                (scope.parent == Some(parent_scope)
+                    && matches!(scope.kind, crate::sema::symtab::ScopeKind::Interface)
+                    && resolved_scope_for_unit(st, scope.id, &subprogram.node).is_some())
+                .then_some(scope.id)
+            });
+            if let Some(interface_scope) = interface_scope {
+                normalize_resolved_decls_in_unit(&mut subprogram.node, st, interface_scope);
+            }
+        }
+        return;
+    }
+
+    let Some(scope_id) = resolved_scope_for_unit(st, parent_scope, unit) else {
+        return;
+    };
+    let (decls, contains) = match unit {
         ProgramUnit::Program {
-            name,
-            decls,
-            contains,
-            ..
-        } => {
-            let target = name.clone();
-            let sid = st
-                .all_scopes()
-                .iter()
-                .find(|s| match (&s.kind, target.as_deref()) {
-                    (ScopeKind::Program(n), Some(t)) => n.eq_ignore_ascii_case(t),
-                    (ScopeKind::Program(_), None) => true,
-                    _ => false,
-                })
-                .map(|s| s.id);
-            (sid, decls, contains)
+            decls, contains, ..
         }
-        ProgramUnit::Function {
-            name,
-            decls,
-            contains,
-            ..
-        }
-        | ProgramUnit::Subroutine {
-            name,
-            decls,
-            contains,
-            ..
-        } => (
-            procedure_scope_by_name(st, name).map(|s| s.id),
-            decls,
-            contains,
-        ),
-        ProgramUnit::Module {
-            name,
-            decls,
-            contains,
-            ..
+        | ProgramUnit::Module {
+            decls, contains, ..
         }
         | ProgramUnit::Submodule {
-            name,
-            decls,
-            contains,
-            ..
-        } => (st.find_module_scope(name), decls, contains),
-        _ => return,
+            decls, contains, ..
+        }
+        | ProgramUnit::Subroutine {
+            decls, contains, ..
+        }
+        | ProgramUnit::Function {
+            decls, contains, ..
+        } => (decls, Some(contains)),
+        ProgramUnit::BlockData { decls, .. } => (decls, None),
+        ProgramUnit::InterfaceBlock { .. } => unreachable!(),
     };
-    rewrite_typeof_decls(decls, st, scope_id);
-    for contained in contains {
-        normalize_typeof_specs_in_unit(&mut contained.node, st);
+
+    rewrite_typeof_decls(decls, st, Some(scope_id));
+    rewrite_dimension_decls(decls, st, Some(scope_id));
+    if let Some(contains) = contains {
+        for contained in contains {
+            normalize_resolved_decls_in_unit(&mut contained.node, st, scope_id);
+        }
     }
+}
+
+fn rewrite_dimension_decls(
+    decls: &mut Vec<crate::ast::decl::SpannedDecl>,
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+) {
+    use crate::ast::decl::{Decl, EntityDecl, LenSpec};
+
+    let Some(scope_id) = scope_id else {
+        return;
+    };
+    let mut rewritten = Vec::with_capacity(decls.len());
+    for decl in std::mem::take(decls) {
+        let crate::ast::Spanned { node, span } = decl;
+        let Decl::DimensionStmt { entities } = node else {
+            rewritten.push(crate::ast::Spanned::new(node, span));
+            continue;
+        };
+
+        for entity in entities {
+            let key = entity.name.to_ascii_lowercase();
+            let symbol = st.scope(scope_id).symbols.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "resolved DIMENSION entity '{}' is missing from scope {}",
+                    entity.name, scope_id
+                )
+            });
+            let type_info = symbol.type_info.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "resolved DIMENSION entity '{}' has no concrete type",
+                    entity.name
+                )
+            });
+            let type_spec = type_info_to_type_spec(Some(type_info));
+            let char_len = match type_info {
+                crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
+                    Some(LenSpec::Expr(synth_int_literal_expr(*len)))
+                }
+                crate::sema::symtab::TypeInfo::Character { len: None, .. } => Some(LenSpec::Star),
+                _ => None,
+            };
+            rewritten.push(crate::ast::Spanned::new(
+                Decl::TypeDecl {
+                    type_spec,
+                    attrs: sym_attrs_to_decl_attrs(&symbol.attrs),
+                    entities: vec![EntityDecl {
+                        name: entity.name,
+                        array_spec: Some(entity.array_spec),
+                        char_len,
+                        init: None,
+                        ptr_init: None,
+                    }],
+                },
+                span,
+            ));
+        }
+    }
+    *decls = rewritten;
 }
 
 fn rewrite_typeof_decls(
@@ -4443,6 +4598,13 @@ pub(super) fn collect_name_refs_decls(
             Decl::AttributeStmt { attr, .. } => {
                 if let Attribute::Dimension(specs) = attr {
                     for spec in specs {
+                        collect_name_refs_array_spec(spec, out);
+                    }
+                }
+            }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    for spec in &entity.array_spec {
                         collect_name_refs_array_spec(spec, out);
                     }
                 }

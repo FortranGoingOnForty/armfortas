@@ -1958,6 +1958,13 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
                 }
             }
         }
+        Decl::DimensionStmt { entities } => {
+            for entity in entities {
+                for spec in &entity.array_spec {
+                    validate_const_int_array_spec(ctx, spec);
+                }
+            }
+        }
         Decl::ParameterStmt { pairs } => {
             for (_, expr) in pairs {
                 validate_const_int_expr_tree(ctx, expr);
@@ -2766,6 +2773,13 @@ fn collect_reference_decl(
                 collect_reference_array_spec(spec, shadowed, facts);
             }
         }
+        Decl::DimensionStmt { entities } => {
+            for entity in entities {
+                for spec in &entity.array_spec {
+                    collect_reference_array_spec(spec, shadowed, facts);
+                }
+            }
+        }
         Decl::ImplicitStmt { specs } => {
             for spec in specs {
                 collect_reference_type_spec(&spec.type_spec, decl.span, shadowed, facts);
@@ -2800,6 +2814,9 @@ fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>)
             }
             Decl::AttributeStmt { entities, .. } => {
                 out.extend(entities.iter().map(|name| name.to_lowercase()));
+            }
+            Decl::DimensionStmt { entities } => {
+                out.extend(entities.iter().map(|entity| entity.name.to_lowercase()));
             }
             Decl::CommonBlock { vars, .. } => {
                 out.extend(vars.iter().map(|name| name.to_lowercase()));
@@ -2867,6 +2884,11 @@ fn block_local_bindings(
             Decl::AttributeStmt { entities, .. } => {
                 for name in entities {
                     push(name);
+                }
+            }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    push(&entity.name);
                 }
             }
             Decl::CommonBlock { vars, .. } => {
@@ -5387,8 +5409,9 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     import_control: Box::new(import_control),
                 });
             validate_decls(ctx, implicit);
+            validate_block_dimension_implicit_types(ctx, stmt.span, implicit, decls);
             validate_decls(ctx, decls);
-            let frame = block_binding_frame(ctx, stmt.span, decls);
+            let frame = block_binding_frame(ctx, stmt.span, implicit, decls);
             ctx.block_decl_frames.push(frame);
             validate_stmts(ctx, body);
             ctx.block_decl_frames.pop();
@@ -8995,6 +9018,7 @@ fn validate_associate(
 fn block_binding_frame(
     ctx: &Ctx<'_>,
     block_span: Span,
+    implicit: &[SpannedDecl],
     decls: &[SpannedDecl],
 ) -> HashMap<String, BlockBindingAttrs> {
     let mut frame = HashMap::new();
@@ -9002,6 +9026,53 @@ fn block_binding_frame(
         .st
         .statement_block_scope(block_span)
         .unwrap_or(ctx.scope_id);
+    let mut implicit_types = HashMap::new();
+    let scope_rules = &ctx.st.scope(scope_id).implicit_rules;
+    if !scope_rules.none_type {
+        for (letter, implicit_type) in &scope_rules.rules {
+            let type_info = match implicit_type {
+                ImplicitType::Integer => TypeInfo::Integer { kind: None },
+                ImplicitType::Real => TypeInfo::Real { kind: None },
+                ImplicitType::DoublePrecision => TypeInfo::DoublePrecision,
+                ImplicitType::Complex => TypeInfo::Complex { kind: None },
+                ImplicitType::Logical => TypeInfo::Logical { kind: None },
+                ImplicitType::Character => TypeInfo::Character {
+                    len: Some(1),
+                    kind: None,
+                },
+            };
+            implicit_types.insert(*letter, type_info);
+        }
+    }
+    for declaration in implicit {
+        match &declaration.node {
+            Decl::ImplicitNone { type_, .. } => {
+                if *type_ {
+                    implicit_types.clear();
+                }
+            }
+            Decl::ImplicitStmt { specs } => {
+                for spec in specs {
+                    let type_info =
+                        crate::sema::resolve::type_resolution::type_spec_to_info_in_scope(
+                            &spec.type_spec,
+                            ctx.st,
+                            scope_id,
+                        );
+                    for &(start, end) in &spec.ranges {
+                        for letter_byte in start as u8..=end as u8 {
+                            implicit_types.insert(
+                                (letter_byte as char).to_ascii_lowercase(),
+                                type_info.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl {
@@ -9048,10 +9119,83 @@ fn block_binding_frame(
                     );
                 }
             }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    let type_info =
+                        entity.name.chars().next().and_then(|first| {
+                            implicit_types.get(&first.to_ascii_lowercase()).cloned()
+                        });
+                    frame.insert(
+                        entity.name.to_lowercase(),
+                        BlockBindingAttrs {
+                            type_info,
+                            rank: Some(entity.array_spec.len()),
+                            ..BlockBindingAttrs::default()
+                        },
+                    );
+                }
+            }
             _ => {}
         }
     }
     frame
+}
+
+fn validate_block_dimension_implicit_types(
+    ctx: &mut Ctx<'_>,
+    block_span: Span,
+    implicit: &[SpannedDecl],
+    decls: &[SpannedDecl],
+) {
+    let mut typed_letters = ctx
+        .st
+        .statement_block_scope(block_span)
+        .map(|scope_id| &ctx.st.scope(scope_id).implicit_rules)
+        .filter(|rules| !rules.none_type)
+        .map(|rules| rules.rules.keys().copied().collect::<HashSet<_>>())
+        .unwrap_or_default();
+
+    for declaration in implicit {
+        match &declaration.node {
+            Decl::ImplicitNone { type_, .. } => {
+                if *type_ {
+                    typed_letters.clear();
+                }
+            }
+            Decl::ImplicitStmt { specs } => {
+                for spec in specs {
+                    for &(start, end) in &spec.ranges {
+                        for letter_byte in start as u8..=end as u8 {
+                            typed_letters.insert((letter_byte as char).to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for declaration in decls {
+        let Decl::DimensionStmt { entities } = &declaration.node else {
+            continue;
+        };
+        for entity in entities {
+            let has_type = entity
+                .name
+                .chars()
+                .next()
+                .is_some_and(|first| typed_letters.contains(&first.to_ascii_lowercase()));
+            if !has_type {
+                ctx.error(
+                    declaration.span,
+                    format!(
+                        "array '{}' in DIMENSION statement has no implicit type",
+                        entity.name
+                    ),
+                );
+            }
+        }
+    }
 }
 
 fn block_attrs_from_decl(attrs: &[Attribute]) -> BlockBindingAttrs {
@@ -9157,6 +9301,11 @@ fn extend_declared_names_from_decls(
             Decl::TypeDecl { entities, .. } => {
                 for e in entities {
                     declared.insert(e.name.to_lowercase());
+                }
+            }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    declared.insert(entity.name.to_lowercase());
                 }
             }
             // COMMON block variables are also declared.
