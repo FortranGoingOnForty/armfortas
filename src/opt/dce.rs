@@ -27,6 +27,9 @@
 //! In Fortran, the following are observable:
 //!  * `Store` — writes user memory
 //!  * `Call` / `RuntimeCall` — print, allocate, free, etc.
+//!  * Scalar FP operations when the surrounding call graph accesses the
+//!    floating-point environment — their unused value can still raise an
+//!    IEEE status flag observed by the program.
 //!  * `Return` / branches / `Unreachable` — terminators are *always*
 //!    live; we never remove them.
 //!
@@ -90,12 +93,15 @@ fn local_stack_addresses(func: &Function) -> HashSet<ValueId> {
 /// the source-language attribute, while this scan is the optimizer proof needed
 /// before deleting an actual call. Returning `None` means the body contains an
 /// effect DCE cannot prove local.
-fn effect_free_body_dependencies(func: &Function) -> Option<Vec<u32>> {
+fn effect_free_body_dependencies(func: &Function, preserve_fp_effects: bool) -> Option<Vec<u32>> {
     let local_addresses = local_stack_addresses(func);
     let mut internal_callees = Vec::new();
 
     for block in &func.blocks {
         for inst in &block.insts {
+            if preserve_fp_effects && super::fpenv::is_scalar_fpenv_sensitive(func, inst) {
+                return None;
+            }
             match &inst.kind {
                 InstKind::Store(_, addr) | InstKind::VStore(_, addr)
                     if !local_addresses.contains(addr) =>
@@ -124,13 +130,17 @@ fn effect_free_body_dependencies(func: &Function) -> Option<Vec<u32>> {
 /// all direct candidates preserves effect-free recursive cycles, while any
 /// edge to an impure, effectful, void-returning, or missing callee poisons every
 /// transitive caller.
-fn derive_internal_call_dce_info(module: &Module) -> Vec<InternalCallDceInfo> {
+fn derive_internal_call_dce_info_for_context(
+    module: &Module,
+    preserve_fp_effects: &[bool],
+) -> Vec<InternalCallDceInfo> {
+    debug_assert_eq!(module.functions.len(), preserve_fp_effects.len());
     let mut dependencies = Vec::with_capacity(module.functions.len());
     let mut info = Vec::with_capacity(module.functions.len());
 
-    for func in &module.functions {
+    for (func_idx, func) in module.functions.iter().enumerate() {
         let body_dependencies = if !matches!(func.return_type, IrType::Void) && func.is_pure {
-            effect_free_body_dependencies(func)
+            effect_free_body_dependencies(func, preserve_fp_effects[func_idx])
         } else {
             None
         };
@@ -172,11 +182,23 @@ fn derive_internal_call_dce_info(module: &Module) -> Vec<InternalCallDceInfo> {
     info
 }
 
+fn derive_internal_call_dce_info(module: &Module) -> Vec<InternalCallDceInfo> {
+    let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
+    derive_internal_call_dce_info_for_context(module, &fpenv_effects.may_run_in_dynamic_fpenv)
+}
+
 /// True if the instruction has any side effect that prevents removal,
 /// regardless of whether its result is used.
-fn has_side_effect(kind: &InstKind, internal_calls: &[InternalCallDceInfo]) -> bool {
+fn has_side_effect(
+    inst: &Inst,
+    internal_calls: &[InternalCallDceInfo],
+    preserved_fp_effects: &HashSet<ValueId>,
+) -> bool {
+    if preserved_fp_effects.contains(&inst.id) {
+        return true;
+    }
     matches!(
-        kind,
+        &inst.kind,
         InstKind::Store(..)
             // VStore writes 128 bits to memory just like Store; it
             // must not be DCE'd. NeonVectorize emits VStore as the
@@ -190,7 +212,7 @@ fn has_side_effect(kind: &InstKind, internal_calls: &[InternalCallDceInfo]) -> b
             // if no one reads from it (the address may escape via a
             // future store/call). Treat as side-effecting for safety.
             | InstKind::Alloca(..)
-    ) || match kind {
+    ) || match &inst.kind {
         InstKind::Call(FuncRef::Internal(idx), _) => match internal_calls.get(*idx as usize) {
             Some(info) => !info.discardable_when_unused,
             None => true,
@@ -235,7 +257,21 @@ fn collect_live_uses(func: &Function) -> HashSet<ValueId> {
 ///    corresponding slot. Removing an arg can free its defining
 ///    instruction, so we re-run the inner loop afterwards. Audit
 ///    finding Med-5 / C-1.
-fn dce_function(func: &mut Function, internal_calls: &[InternalCallDceInfo]) -> bool {
+fn dce_function(
+    func: &mut Function,
+    internal_calls: &[InternalCallDceInfo],
+    preserve_fp_effects: bool,
+) -> bool {
+    let preserved_fp_effects: HashSet<ValueId> = if preserve_fp_effects {
+        func.blocks
+            .iter()
+            .flat_map(|block| block.insts.iter())
+            .filter(|inst| super::fpenv::is_scalar_fpenv_sensitive(func, inst))
+            .map(|inst| inst.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut any_change = false;
     let mut outer_changed = true;
     while outer_changed {
@@ -249,7 +285,7 @@ fn dce_function(func: &mut Function, internal_calls: &[InternalCallDceInfo]) -> 
             for block in &mut func.blocks {
                 let before = block.insts.len();
                 block.insts.retain(|inst| {
-                    if has_side_effect(&inst.kind, internal_calls) {
+                    if has_side_effect(inst, internal_calls, &preserved_fp_effects) {
                         return true;
                     }
                     if live.contains(&inst.id) {
@@ -409,10 +445,16 @@ impl Pass for Dce {
         "dce"
     }
     fn run(&self, module: &mut Module) -> bool {
-        let internal_calls = derive_internal_call_dce_info(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
+        // Unknown externals and the IEEE flag/status entry points are
+        // conservatively classified as environment barriers. Their downward
+        // closure identifies every internal function whose dead FP operations
+        // may be observed by a caller's status query.
+        let preserve_fp_effects = &fpenv_effects.may_run_in_dynamic_fpenv;
+        let internal_calls = derive_internal_call_dce_info_for_context(module, preserve_fp_effects);
         let mut changed = false;
-        for func in &mut module.functions {
-            if dce_function(func, &internal_calls) {
+        for (func_idx, func) in module.functions.iter_mut().enumerate() {
+            if dce_function(func, &internal_calls, preserve_fp_effects[func_idx]) {
                 changed = true;
             }
         }
@@ -824,7 +866,117 @@ mod tests {
     }
 
     #[test]
-    fn float_chain_is_dead() {
+    fn keeps_dead_fp_operation_when_status_is_observed() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let one = push(
+            &mut f,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let division = push(
+            &mut f,
+            InstKind::FDiv(one, zero),
+            IrType::Float(FloatWidth::F64),
+        );
+        let divide_by_zero = push(
+            &mut f,
+            InstKind::ConstInt(2, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let raised = push(
+            &mut f,
+            InstKind::Call(
+                FuncRef::External("afs_ieee_test_flag".into()),
+                vec![divide_by_zero],
+            ),
+            IrType::Int(IntWidth::I32),
+        );
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(raised)));
+        m.add_function(f);
+
+        assert!(
+            !Dce.run(&mut m),
+            "an unused division remains observable through IEEE_DIVIDE_BY_ZERO"
+        );
+        assert!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .any(|inst| inst.id == division),
+            "DCE removed the only instruction that raises the observed flag"
+        );
+    }
+
+    #[test]
+    fn keeps_unused_pure_call_when_status_observes_callee_fp_operation() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee = Function::new("divide".into(), vec![], IrType::Float(FloatWidth::F64));
+        callee.is_pure = true;
+        let one = push(
+            &mut callee,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let zero = push(
+            &mut callee,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let quotient = push(
+            &mut callee,
+            InstKind::FDiv(one, zero),
+            IrType::Float(FloatWidth::F64),
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(quotient)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Int(IntWidth::I32));
+        let call = push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Float(FloatWidth::F64),
+        );
+        let divide_by_zero = push(
+            &mut caller,
+            InstKind::ConstInt(2, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let raised = push(
+            &mut caller,
+            InstKind::Call(
+                FuncRef::External("afs_ieee_test_flag".into()),
+                vec![divide_by_zero],
+            ),
+            IrType::Int(IntWidth::I32),
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(raised)));
+        m.add_function(caller);
+
+        assert!(
+            !Dce.run(&mut m),
+            "a PURE call is not discardable when its FP status effect is observed"
+        );
+        assert!(
+            m.functions[1].blocks[0]
+                .insts
+                .iter()
+                .any(|inst| inst.id == call),
+            "DCE removed the call that raises the observed flag"
+        );
+    }
+
+    #[test]
+    fn float_chain_is_dead_without_fp_environment_access() {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
         let a = push(

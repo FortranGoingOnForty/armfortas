@@ -243,7 +243,7 @@ impl Pass for LocalCse {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
             // Collect all (old, new) rewrites first, then apply them
@@ -256,12 +256,12 @@ impl Pass for LocalCse {
             // sensitive FP ops must not be CSE'd. Their values can differ
             // across rounding-mode changes, and repeated execution can
             // re-raise a sticky IEEE status flag after a reset.
-            let fpenv_barrier = rounding_effects.may_change_rounding[func_idx];
+            let fpenv_barrier = fpenv_effects.may_cross_fpenv_barrier[func_idx];
             let mut rewrite_map: HashMap<ValueId, ValueId> = HashMap::new();
             for block in &func.blocks {
                 let mut seen: HashMap<Key, ValueId> = HashMap::new();
                 for inst in &block.insts {
-                    if fpenv_barrier && super::fpenv::is_fpenv_sensitive_for_reuse(&inst.kind) {
+                    if fpenv_barrier && super::fpenv::is_fpenv_sensitive(&inst.kind) {
                         continue;
                     }
                     let Some(k) = key_of(inst) else { continue };

@@ -571,10 +571,10 @@ impl Pass for ConstFold {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
-            let fpenv_barrier = rounding_effects.may_run_after_change[func_idx];
+            let fpenv_barrier = fpenv_effects.may_run_in_dynamic_fpenv[func_idx];
 
             // Audit N-8: we walk `func.blocks` in vec order, which
             // is NOT guaranteed to be reverse-postorder. If a fold

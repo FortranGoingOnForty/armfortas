@@ -9165,6 +9165,63 @@ fn signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level() {
 }
 
 #[test]
+fn dead_float_result_still_raises_observed_flag_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dead_float_result_still_raises_observed_flag_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_dead_float_result");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_value, ieee_positive_zero, ieee_positive_normal\n  use, intrinsic :: ieee_exceptions, only : ieee_divide_by_zero, ieee_set_flag, ieee_get_flag\n  implicit none\n  real :: zero, one, unused_result\n  logical :: raised\n\n  zero = ieee_value(0.0, ieee_positive_zero)\n  one = ieee_value(0.0, ieee_positive_normal)\n  call ieee_set_flag(ieee_divide_by_zero, .false.)\n  unused_result = one / zero\n  call ieee_get_flag(ieee_divide_by_zero, raised)\n\n  if (.not. raised) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_dead_float_result_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("dead floating-result compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: dead floating-result witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("dead floating-result executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: a dead FP result must retain its observed IEEE flag effect: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected dead floating-result output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_value_positive_inf_from_intrinsic_module_is_not_finite() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

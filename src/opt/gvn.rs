@@ -27,7 +27,7 @@ impl Pass for Gvn {
             .iter()
             .map(PureCallPolicy::for_function)
             .collect();
-        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
             // Sprint 15 Stage 2: congruence closure via fixpoint.
@@ -43,7 +43,7 @@ impl Pass for Gvn {
                 if gvn_function(
                     func,
                     &pure_calls,
-                    rounding_effects.may_change_rounding[func_idx],
+                    fpenv_effects.may_cross_fpenv_barrier[func_idx],
                 ) {
                     local_changed = true;
                 } else {
@@ -463,7 +463,7 @@ fn key_of(
     // In a function that accesses the floating-point environment, sensitive
     // FP ops are not value-numbered at all. Besides rounding-dependent values,
     // repeated executions can re-raise sticky IEEE flags after a reset.
-    if fpenv_barrier && super::fpenv::is_fpenv_sensitive_for_reuse(&inst.kind) {
+    if fpenv_barrier && super::fpenv::is_fpenv_sensitive(&inst.kind) {
         return None;
     }
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
