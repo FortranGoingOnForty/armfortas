@@ -9222,6 +9222,63 @@ fn dead_float_result_still_raises_observed_flag_at_every_opt_level() {
 }
 
 #[test]
+fn float_to_int_keeps_observed_inexact_flag_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=float_to_int_keeps_observed_inexact_flag_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_live_float_to_int");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use, intrinsic :: ieee_exceptions, only : ieee_inexact, ieee_set_flag, ieee_get_flag\n  implicit none\n  real(kind=8) :: input\n  integer(kind=4) :: converted\n  logical :: raised\n\n  input = 1.5_8\n  call ieee_set_flag(ieee_inexact, .false.)\n  converted = int(input, kind=4)\n  call ieee_get_flag(ieee_inexact, raised)\n\n  if (converted /= 1) error stop 1\n  if (.not. raised) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_live_float_to_int_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("live float-to-int compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: live float-to-int witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("live float-to-int executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: a live conversion must retain its observed IEEE_INEXACT effect: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected live float-to-int output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn empty_infinite_loop_remains_nonterminating_at_every_opt_level() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

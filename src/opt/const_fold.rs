@@ -17,8 +17,9 @@
 //!    behavior on divide-by-zero is implementation-defined, and the
 //!    runtime / hardware should observe it the same way it would
 //!    without optimization.
-//!  * Float operations follow IEEE 754 semantics; division by zero
-//!    yields well-defined ±inf or NaN and is folded.
+//!  * Float operations follow IEEE 754 semantics; folds are disabled when
+//!    the surrounding call graph can observe their rounding or sticky-status
+//!    effects.
 //!
 //! Constant *propagation* (replacing uses of a value that happens to
 //! be a constant) is a separate pass; this one only rewrites the
@@ -121,9 +122,9 @@ fn try_fold(
     kind: &InstKind,
     ty: &IrType,
     consts: &HashMap<ValueId, Const>,
-    fpenv_barrier: bool,
+    preserve_fpenv_effects: bool,
 ) -> Option<InstKind> {
-    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(kind) {
+    if preserve_fpenv_effects && super::fpenv::is_fpenv_sensitive(kind) {
         return None;
     }
 
@@ -574,7 +575,7 @@ impl Pass for ConstFold {
         let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
-            let fpenv_barrier = fpenv_effects.may_run_in_dynamic_fpenv[func_idx];
+            let preserve_fpenv_effects = fpenv_effects.may_run_in_dynamic_fpenv[func_idx];
 
             // Audit N-8: we walk `func.blocks` in vec order, which
             // is NOT guaranteed to be reverse-postorder. If a fold
@@ -612,7 +613,7 @@ impl Pass for ConstFold {
                             continue;
                         }
                         if let Some(new_kind) =
-                            try_fold(&inst.kind, &inst.ty, &consts, fpenv_barrier)
+                            try_fold(&inst.kind, &inst.ty, &consts, preserve_fpenv_effects)
                         {
                             if let Some(c) = Const::from_inst(&new_kind) {
                                 consts.insert(inst.id, c);
@@ -764,6 +765,57 @@ mod tests {
             }
             _ => panic!("expected ConstFloat"),
         }
+    }
+
+    #[test]
+    fn folds_float_to_int_when_environment_is_closed() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.5, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FloatToInt(ValueId(0), IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+        ]);
+
+        assert!(ConstFold.run(&mut m));
+        assert!(matches!(
+            first_block_kinds(&m)[1],
+            InstKind::ConstInt(1, IntWidth::I32)
+        ));
+    }
+
+    #[test]
+    fn leaves_flag_raising_float_to_int_when_environment_is_observed() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.5, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FloatToInt(ValueId(0), IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(5, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::Call(
+                    FuncRef::External("afs_ieee_test_flag".into()),
+                    vec![ValueId(2)],
+                ),
+                IrType::Int(IntWidth::I32),
+            ),
+        ]);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "folding a live inexact conversion suppresses its IEEE_INEXACT effect"
+        );
+        assert!(matches!(first_block_kinds(&m)[1], InstKind::FloatToInt(..)));
     }
 
     #[test]
