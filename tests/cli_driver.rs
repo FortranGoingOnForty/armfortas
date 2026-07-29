@@ -9108,6 +9108,63 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
 }
 
 #[test]
+fn signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_signaling_comparison");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_value, ieee_signaling_nan\n  use, intrinsic :: ieee_exceptions, only : ieee_invalid, ieee_set_flag, ieee_get_flag\n  implicit none\n  real :: x\n  logical :: first_result, second_result, first_raised, second_raised\n\n  x = ieee_value(0.0, ieee_signaling_nan)\n  call ieee_set_flag(ieee_invalid, .false.)\n  first_result = (x == 0.0)\n  call ieee_get_flag(ieee_invalid, first_raised)\n  call ieee_set_flag(ieee_invalid, .false.)\n  second_result = (x == 0.0)\n  call ieee_get_flag(ieee_invalid, second_raised)\n\n  if (first_result .or. second_result) error stop 1\n  if (.not. first_raised) error stop 2\n  if (.not. second_raised) error stop 3\n  print *, 'ok'\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_signaling_comparison_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("signaling comparison compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: signaling comparison should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("signaling comparison executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: each signaling comparison must raise IEEE_INVALID after a reset: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected signaling comparison output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ieee_value_positive_inf_from_intrinsic_module_is_not_finite() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

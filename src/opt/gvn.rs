@@ -460,11 +460,10 @@ fn key_of(
     defs: &HashMap<ValueId, &Inst>,
     fpenv_barrier: bool,
 ) -> Option<Key> {
-    // In a function that changes the rounding mode, rounding-dependent FP
-    // ops are not value-numbered at all (conservative — the merge across
-    // a mode change is the bug; FP-env code is rare so the lost CSE is
-    // cheap).
-    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(&inst.kind) {
+    // In a function that accesses the floating-point environment, sensitive
+    // FP ops are not value-numbered at all. Besides rounding-dependent values,
+    // repeated executions can re-raise sticky IEEE flags after a reset.
+    if fpenv_barrier && super::fpenv::is_fpenv_sensitive_for_reuse(&inst.kind) {
         return None;
     }
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
@@ -960,6 +959,124 @@ mod tests {
         assert!(
             !Gvn.run(&mut m),
             "an indirect call may change the rounding mode between FP expressions"
+        );
+    }
+
+    #[test]
+    fn gvn_keeps_fcmp_distinct_when_function_accesses_fp_environment() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Bool);
+        let entry = f.entry;
+        let f64_ty = IrType::Float(FloatWidth::F64);
+        let snan = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(f64::from_bits(0x7ff0_0000_0000_0001), FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let zero = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            f64_ty,
+        );
+        let first = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Eq, snan, zero),
+            IrType::Bool,
+        );
+        let invalid = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let clear = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(
+            &mut f,
+            entry,
+            InstKind::Call(
+                FuncRef::External("afs_ieee_set_flag".into()),
+                vec![invalid, clear],
+            ),
+            IrType::Void,
+        );
+        let second = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Eq, snan, zero),
+            IrType::Bool,
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(f);
+
+        assert!(
+            !Gvn.run(&mut m),
+            "the second signaling comparison must execute after IEEE_INVALID is cleared"
+        );
+        let comparisons = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.kind, InstKind::FCmp(..)))
+            .map(|inst| inst.id)
+            .collect::<Vec<_>>();
+        assert_eq!(comparisons, vec![first, second]);
+        assert!(matches!(
+            m.functions[0].blocks[0].terminator,
+            Some(Terminator::Return(Some(value))) if value == second
+        ));
+    }
+
+    #[test]
+    fn gvn_still_dedupes_fcmp_without_fp_environment_access() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Bool);
+        let entry = f.entry;
+        let f64_ty = IrType::Float(FloatWidth::F64);
+        let value = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let zero = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            f64_ty,
+        );
+        let first = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Gt, value, zero),
+            IrType::Bool,
+        );
+        let second = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Gt, value, zero),
+            IrType::Bool,
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(f);
+
+        assert!(Gvn.run(&mut m));
+        assert!(matches!(
+            m.functions[0].blocks[0].terminator,
+            Some(Terminator::Return(Some(result))) if result == first
+        ));
+        assert!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .all(|inst| inst.id != second),
+            "ordinary comparison GVN must remain enabled without an FP-environment barrier"
         );
     }
 

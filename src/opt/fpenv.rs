@@ -186,6 +186,21 @@ pub(super) fn is_rounding_dependent_fp(kind: &InstKind) -> bool {
     )
 }
 
+/// True when removing or reusing an execution may change observable
+/// floating-point-environment behavior.
+///
+/// Rounding-dependent operations qualify because a mode change can alter
+/// their value. Comparisons and the remaining conversions also qualify even
+/// when their value is rounding-independent: signaling NaNs and invalid or
+/// inexact conversions can raise sticky IEEE status flags on each execution.
+pub(super) fn is_fpenv_sensitive_for_reuse(kind: &InstKind) -> bool {
+    is_rounding_dependent_fp(kind)
+        || matches!(
+            kind,
+            InstKind::FCmp(..) | InstKind::FloatToInt(..) | InstKind::FloatExtend(..)
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
