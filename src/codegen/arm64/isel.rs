@@ -3954,13 +3954,16 @@ fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u32 {
             // slots remain four bytes for frame alignment, but Bool array
             // elements are the one-byte representation used everywhere else.
             let elem_size = match elem.as_ref() {
-                IrType::Struct(_) => alloca_size(elem, layout),
+                IrType::Array(_, _) | IrType::Struct(_) => alloca_size(elem, layout),
                 _ => elem.size_bytes(&layout) as u32,
             };
             elem_size * (*count as u32)
         }
         IrType::FuncPtr(_) => 8,
-        IrType::Struct(_) => 8,      // placeholder
+        IrType::Struct(id) => panic!(
+            "named struct storage must be rejected by IR verification before ARM64 selection \
+             (struct.{id})"
+        ),
         IrType::Vector { .. } => 16, // 128-bit NEON
     }
 }
@@ -4709,6 +4712,12 @@ mod tests {
             ),
             12,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "named struct storage must be rejected by IR verification")]
+    fn named_struct_alloca_size_has_no_placeholder() {
+        alloca_size(&IrType::Struct(0), crate::target::TargetLayout::LP64);
     }
 
     // ---- VShape mapping tests (Sprint 12 Stage 2 isel hookup) ----

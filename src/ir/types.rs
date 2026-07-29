@@ -1,8 +1,9 @@
 //! IR type system.
 //!
 //! Low-level types for the SSA IR. Fortran types are lowered to these
-//! during AST→IR construction. Array descriptors, character descriptors,
-//! and derived types become IR structs.
+//! during AST→IR construction. Production aggregate storage is represented
+//! explicitly with arrays and byte buffers. Named structs remain reserved IR
+//! metadata until field-offset semantics are implemented end to end.
 
 /// An IR type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -14,7 +15,10 @@ pub enum IrType {
     Ptr(Box<IrType>),
     /// Fixed-size array: [T; N].
     Array(Box<IrType>, u64),
-    /// Named struct (index into Module::struct_defs).
+    /// Named struct metadata (index into `Module::struct_defs`).
+    ///
+    /// Layout-sensitive uses are rejected by module verification until the IR
+    /// defines field offsets and both backends can honor them.
     Struct(StructId),
     /// Function pointer.
     FuncPtr(Box<FuncSig>),

@@ -24,7 +24,18 @@ impl std::fmt::Display for VerifyError {
 /// Verify a module. Returns a list of errors (empty = valid).
 pub fn verify_module(module: &Module) -> Vec<VerifyError> {
     let mut errors = Vec::new();
+    check_module_struct_references(module, &mut errors);
     for global in &module.globals {
+        if type_needs_named_struct_layout(&global.ty) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "global '{}' uses named-struct storage, which is unsupported; \
+                     lower aggregate storage to an explicit byte array",
+                    global.name,
+                ),
+            });
+            continue;
+        }
         if matches!(
             global.ty.try_size_bytes(&module.layout),
             Err(TypeSizeError::Overflow)
@@ -42,6 +53,7 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
     for func in &module.functions {
         let mut function_errors = verify_function(func);
         check_internal_call_signatures(module, func, &mut function_errors);
+        check_function_struct_storage(func, &mut function_errors);
 
         // Prefix each finding with the enclosing function so a failure
         // in a large amalgamated build points at the offending routine.
@@ -51,6 +63,187 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
         }
     }
     errors
+}
+
+fn check_module_struct_references(module: &Module, errors: &mut Vec<VerifyError>) {
+    for (id, def) in module.struct_defs.iter().enumerate() {
+        for (field_name, field_ty) in &def.fields {
+            check_defined_struct_ids(
+                module,
+                field_ty,
+                &format!("named struct.{id} field '{field_name}'"),
+                errors,
+            );
+        }
+    }
+    for global in &module.globals {
+        check_defined_struct_ids(
+            module,
+            &global.ty,
+            &format!("global '{}'", global.name),
+            errors,
+        );
+    }
+    for external in &module.extern_funcs {
+        for (index, param_ty) in external.sig.params.iter().enumerate() {
+            check_defined_struct_ids(
+                module,
+                param_ty,
+                &format!("external function '{}' parameter {index}", external.name),
+                errors,
+            );
+        }
+        check_defined_struct_ids(
+            module,
+            &external.sig.ret,
+            &format!("external function '{}' return type", external.name),
+            errors,
+        );
+    }
+    for func in &module.functions {
+        check_defined_struct_ids(
+            module,
+            &func.return_type,
+            &format!("function '{}' return type", func.name),
+            errors,
+        );
+        for (index, param) in func.params.iter().enumerate() {
+            check_defined_struct_ids(
+                module,
+                &param.ty,
+                &format!("function '{}' parameter {index}", func.name),
+                errors,
+            );
+        }
+        for block in &func.blocks {
+            for param in &block.params {
+                check_defined_struct_ids(
+                    module,
+                    &param.ty,
+                    &format!("function '{}' block '{}' parameter", func.name, block.name),
+                    errors,
+                );
+            }
+            for inst in &block.insts {
+                check_defined_struct_ids(
+                    module,
+                    &inst.ty,
+                    &format!("function '{}' instruction %{}", func.name, inst.id.0),
+                    errors,
+                );
+                if let InstKind::Alloca(allocated_ty) = &inst.kind {
+                    check_defined_struct_ids(
+                        module,
+                        allocated_ty,
+                        &format!("function '{}' alloca %{}", func.name, inst.id.0),
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn check_defined_struct_ids(
+    module: &Module,
+    ty: &IrType,
+    context: &str,
+    errors: &mut Vec<VerifyError>,
+) {
+    match ty {
+        IrType::Ptr(inner) | IrType::Array(inner, _) | IrType::Vector { elem: inner, .. } => {
+            check_defined_struct_ids(module, inner, context, errors);
+        }
+        IrType::Struct(id) => {
+            if module.struct_defs.get(*id as usize).is_none() {
+                errors.push(VerifyError {
+                    msg: format!("{context} references undefined named struct.{id}"),
+                });
+            }
+        }
+        IrType::FuncPtr(sig) => {
+            for param in &sig.params {
+                check_defined_struct_ids(module, param, context, errors);
+            }
+            check_defined_struct_ids(module, &sig.ret, context, errors);
+        }
+        _ => {}
+    }
+}
+
+fn type_needs_named_struct_layout(ty: &IrType) -> bool {
+    match ty {
+        IrType::Struct(_) => true,
+        IrType::Array(element, _) => type_needs_named_struct_layout(element),
+        _ => false,
+    }
+}
+
+fn check_function_struct_storage(func: &Function, errors: &mut Vec<VerifyError>) {
+    if type_needs_named_struct_layout(&func.return_type) {
+        errors.push(VerifyError {
+            msg:
+                "named-struct return values are unsupported; pass explicit byte storage by pointer"
+                    .into(),
+        });
+    }
+    for (index, param) in func.params.iter().enumerate() {
+        if type_needs_named_struct_layout(&param.ty) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "parameter {index} uses an unsupported named-struct value; \
+                     pass explicit byte storage by pointer"
+                ),
+            });
+        }
+    }
+    for block in &func.blocks {
+        for param in &block.params {
+            if type_needs_named_struct_layout(&param.ty) {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "block '{}' has an unsupported named-struct value parameter",
+                        block.name,
+                    ),
+                });
+            }
+        }
+        for inst in &block.insts {
+            if type_needs_named_struct_layout(&inst.ty) {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "instruction %{} produces an unsupported named-struct value",
+                        inst.id.0,
+                    ),
+                });
+            }
+            match &inst.kind {
+                InstKind::Alloca(allocated_ty) if type_needs_named_struct_layout(allocated_ty) => {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "alloca %{} requests named-struct stack storage, which is unsupported; \
+                             lower aggregate storage to an explicit byte array",
+                            inst.id.0,
+                        ),
+                    });
+                }
+                InstKind::GetElementPtr(_, _)
+                    if matches!(
+                        &inst.ty,
+                        IrType::Ptr(element) if type_needs_named_struct_layout(element)
+                    ) =>
+                {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "GEP %{} requires an unsupported named-struct element stride",
+                            inst.id.0,
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1519,6 +1712,107 @@ mod tests {
                     && error.msg.contains("overflows the target address space")
             }),
             "expected an oversized-global layout error, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn named_struct_stack_storage_is_rejected_before_codegen() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let record_id = module.add_struct(StructDef {
+            name: "large_record".into(),
+            fields: vec![
+                ("first".into(), IrType::Int(IntWidth::I64)),
+                ("second".into(), IrType::Int(IntWidth::I64)),
+            ],
+        });
+        let mut func = Function::new("uses_struct_storage".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let record = b.alloca(IrType::Struct(record_id));
+            b.alloca(IrType::Array(Box::new(IrType::Struct(record_id)), 2));
+            let second_field_index = b.const_i64(1);
+            let second_field = b.gep(record, vec![second_field_index], IrType::Int(IntWidth::I64));
+            let value = b.const_i64(22);
+            b.store(value, second_field);
+            b.ret_void();
+        }
+        module.add_function(func);
+
+        let errors = verify_module(&module);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.msg.contains("named-struct stack storage"))
+                .count(),
+            2,
+            "direct and array-nested named-struct allocas must both be rejected: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn undefined_struct_references_are_rejected_but_opaque_pointers_are_accepted() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let record_id = module.add_struct(StructDef {
+            name: "opaque_record".into(),
+            fields: vec![("value".into(), IrType::Int(IntWidth::I64))],
+        });
+        let params = vec![Param {
+            name: "record".into(),
+            ty: IrType::Ptr(Box::new(IrType::Struct(record_id))),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut opaque_user = Function::new("opaque_user".into(), params, IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut opaque_user, crate::target::TargetLayout::LP64);
+            b.ret_void();
+        }
+        module.add_function(opaque_user);
+
+        let params = vec![Param {
+            name: "records".into(),
+            ty: IrType::Ptr(Box::new(IrType::Struct(record_id))),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut stride_user = Function::new("stride_user".into(), params, IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut stride_user, crate::target::TargetLayout::LP64);
+            let index = b.const_i64(1);
+            b.gep(ValueId(0), vec![index], IrType::Struct(record_id));
+            b.ret_void();
+        }
+        module.add_function(stride_user);
+
+        let mut invalid_user = Function::new("invalid_user".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut invalid_user, crate::target::TargetLayout::LP64);
+            b.alloca(IrType::Struct(99));
+            b.ret_void();
+        }
+        module.add_function(invalid_user);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.msg.contains("undefined named struct.99")),
+            "undefined StructId must be rejected with module context: {errors:?}",
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.msg.contains("opaque_user")),
+            "an opaque pointer to a defined struct does not require layout: {errors:?}",
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.msg.contains("stride_user")
+                    && error
+                        .msg
+                        .contains("unsupported named-struct element stride")
+            }),
+            "a GEP that needs a named-struct stride must be rejected: {errors:?}",
         );
     }
 

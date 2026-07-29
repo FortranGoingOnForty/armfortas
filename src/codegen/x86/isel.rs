@@ -3642,12 +3642,15 @@ fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u64 {
         IrType::Ptr(_) | IrType::FuncPtr(_) => 8,
         IrType::Array(elem, count) => {
             let elem_size = match elem.as_ref() {
-                IrType::Struct(_) => alloca_size(elem, layout),
+                IrType::Array(_, _) | IrType::Struct(_) => alloca_size(elem, layout),
                 _ => elem.size_bytes(&layout),
             };
             elem_size * count
         }
-        IrType::Struct(_) => 8, // placeholder, mirrors ARM
+        IrType::Struct(id) => panic!(
+            "named struct storage must be rejected by IR verification before x86 selection \
+             (struct.{id})"
+        ),
         IrType::Vector { .. } => 16,
     }
 }
@@ -3724,6 +3727,12 @@ mod tests {
             bool_stride * 3,
             "array allocation and Bool GEP lowering must use the same element width",
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "named struct storage must be rejected by IR verification")]
+    fn named_struct_alloca_size_has_no_placeholder() {
+        alloca_size(&IrType::Struct(0), crate::target::TargetLayout::LP64);
     }
 
     #[test]

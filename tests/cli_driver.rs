@@ -39769,6 +39769,51 @@ fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
 }
 
 #[test]
+fn two_i64_derived_local_preserves_full_stack_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=two_i64_derived_local_preserves_full_stack_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: pair_t\n    integer(8) :: first\n    integer(8) :: second\n  end type pair_t\n  integer(8) :: guard_before, guard_after\n  type(pair_t) :: pair\n  guard_before = 101_8\n  pair%first = 11_8\n  pair%second = 22_8\n  guard_after = 202_8\n  if (pair%first + pair%second /= 33_8) error stop 1\n  if (guard_before /= 101_8 .or. guard_after /= 202_8) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("two_i64_derived_stack_storage", "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), opt, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("two-i64 derived local compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "two-i64 derived local should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out).output().expect("run failed");
+        assert!(
+            run.status.success(),
+            "two-i64 derived local should preserve adjacent stack storage at {opt}: \
+             status={:?} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected two-i64 derived local output at {opt}: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_char_component_store_accepts_component_subscript_expr() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

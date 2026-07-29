@@ -65460,6 +65460,44 @@ end module initialized_globals
     }
 
     #[test]
+    fn source_derived_local_uses_explicit_full_sized_byte_storage() {
+        let (module, ir) = lower_and_verify(
+            "\
+program derived_stack_storage
+  implicit none
+  type :: pair_t
+    integer(8) :: first
+    integer(8) :: second
+  end type pair_t
+  type(pair_t) :: pair
+  pair%first = 11_8
+  pair%second = 22_8
+  if (pair%first + pair%second /= 33_8) error stop 1
+end program derived_stack_storage
+",
+        );
+
+        assert!(
+            module.struct_defs.is_empty(),
+            "source derived types must not enter the reserved named-struct IR surface: {ir}",
+        );
+        assert!(
+            module.functions.iter().any(|func| {
+                func.blocks.iter().any(|block| {
+                    block.insts.iter().any(|inst| {
+                        matches!(
+                            &inst.kind,
+                            InstKind::Alloca(IrType::Array(element, 16))
+                                if matches!(element.as_ref(), IrType::Int(IntWidth::I8))
+                        )
+                    })
+                })
+            }),
+            "a two-i64 derived local must reserve its complete 16-byte layout: {ir}",
+        );
+    }
+
+    #[test]
     fn preserves_imported_module_logical_kinds() {
         let (_, ir) = lower_and_verify(
             "\
