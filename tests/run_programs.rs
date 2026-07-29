@@ -4176,6 +4176,27 @@ fn ar40_private_parent_constructor_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar42_gvn_transitive_global_fixture_passes_all_opts() {
+    if skip_native_e2e("ar42_gvn_transitive_global_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar42_gvn_transitive_global.f90");
+    assert!(source.exists(), "ar42_gvn_transitive_global.f90 missing");
+
+    // OPT_EQ makes this focused O0 anchor compare runtime behavior with every
+    // supported optimization level, including each level that enables GVN.
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar42_gvn_transitive_global.f90 should pass at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;
