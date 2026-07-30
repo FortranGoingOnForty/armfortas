@@ -29263,6 +29263,55 @@ pub(super) fn collect_label_blocks(
     });
 }
 
+/// Return the IR edge for a transfer to `label`, inserting cleanup blocks for
+/// every active lexical construct the transfer exits.
+///
+/// Fortran I/O branch specifiers (`ERR=`, `END=`) are control transfers just
+/// like `GOTO`: leaving a BLOCK or an owning ASSOCIATE must finalize and
+/// deallocate that construct's locals before entering the labeled statement.
+/// Centralizing the edge construction keeps explicit and implicit transfers
+/// on the same cleanup path.
+pub(super) fn lexical_cleanup_edge_for_label(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    label: u64,
+    cleanup_name: &str,
+) -> Option<BlockId> {
+    let target = *ctx.label_blocks.get(&label)?;
+    if ctx
+        .lexical_cleanups
+        .last()
+        .is_none_or(|scope| scope.labels.contains(&label))
+    {
+        return Some(target);
+    }
+
+    let source = b.current_block();
+    let cleanup = b.create_block(cleanup_name);
+    b.set_block(cleanup);
+    for scope in ctx.lexical_cleanups.iter().rev() {
+        if scope.labels.contains(&label) {
+            break;
+        }
+        insert_implicit_dealloc(
+            b,
+            &scope.owned_locals,
+            &ctx.locals,
+            ctx.type_layouts,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            None,
+            true,
+        );
+    }
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(target, vec![]);
+    }
+    b.set_block(source);
+    Some(cleanup)
+}
+
 pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
     for stmt in stmts {
         match &stmt.node {
@@ -34765,10 +34814,10 @@ pub(super) fn lower_read_err_branch(
     let Some(label) = err_label else {
         return;
     };
-    let Some(&target_bb) = ctx.label_blocks.get(&label) else {
+    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
         return;
     };
-    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
+    let Some(target_bb) = lexical_cleanup_edge_for_label(b, ctx, label, "io_err_cleanup") else {
         return;
     };
 
@@ -34797,9 +34846,10 @@ pub(super) fn lower_read_status_branches(
     let iostat_end = b.const_i32(-1);
     let is_end = b.icmp(CmpOp::Eq, status, iostat_end);
 
-    if let Some((label, target_bb)) =
-        end_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
-    {
+    let end_edge = end_label.and_then(|label| {
+        lexical_cleanup_edge_for_label(b, ctx, label, "read_end_cleanup").map(|edge| (label, edge))
+    });
+    if let Some((label, target_bb)) = end_edge {
         let ok_bb = b.create_block(&format!("read_not_end_{}", label));
         b.cond_branch(is_end, target_bb, vec![], ok_bb, vec![]);
         b.set_block(ok_bb);
@@ -34821,9 +34871,10 @@ pub(super) fn lower_read_status_branches(
     let not_end = b.icmp(CmpOp::Ne, status, iostat_end);
     let is_err = b.and(nonzero, not_end);
 
-    if let Some((label, target_bb)) =
-        err_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
-    {
+    let err_edge = err_label.and_then(|label| {
+        lexical_cleanup_edge_for_label(b, ctx, label, "read_err_cleanup").map(|edge| (label, edge))
+    });
+    if let Some((label, target_bb)) = err_edge {
         let ok_bb = b.create_block(&format!("read_ok_{}", label));
         b.cond_branch(is_err, target_bb, vec![], ok_bb, vec![]);
         b.set_block(ok_bb);

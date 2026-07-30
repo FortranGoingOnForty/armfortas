@@ -4311,6 +4311,25 @@ fn ar43_associate_derived_expr_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar43_io_branch_cleanup_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_io_branch_cleanup_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_io_branch_cleanup.f90");
+    assert!(source.exists(), "ar43_io_branch_cleanup.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_io_branch_cleanup.f90 should clean every BLOCK exited by an I/O label branch without cleaning an enclosing destination scope, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;

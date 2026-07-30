@@ -394,53 +394,6 @@ pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[Span
     }
 }
 
-fn goto_exits_active_scope(ctx: &LowerCtx<'_>, label: u64) -> bool {
-    ctx.lexical_cleanups
-        .last()
-        .is_some_and(|scope| !scope.labels.contains(&label))
-}
-
-fn emit_lexical_cleanups_for_goto(b: &mut FuncBuilder, ctx: &LowerCtx<'_>, label: u64) {
-    for scope in ctx.lexical_cleanups.iter().rev() {
-        if scope.labels.contains(&label) {
-            break;
-        }
-        insert_implicit_dealloc(
-            b,
-            &scope.owned_locals,
-            &ctx.locals,
-            ctx.type_layouts,
-            ctx.st,
-            ctx.internal_funcs,
-            Some(ctx.contained_host_refs),
-            None,
-            true,
-        );
-    }
-}
-
-fn goto_edge_block(
-    b: &mut FuncBuilder,
-    ctx: &LowerCtx<'_>,
-    label: u64,
-    cleanup_name: &str,
-) -> Option<BlockId> {
-    let target = *ctx.label_blocks.get(&label)?;
-    if !goto_exits_active_scope(ctx, label) {
-        return Some(target);
-    }
-
-    let source = b.current_block();
-    let cleanup = b.create_block(cleanup_name);
-    b.set_block(cleanup);
-    emit_lexical_cleanups_for_goto(b, ctx, label);
-    if b.func().block(b.current_block()).terminator.is_none() {
-        b.branch(target, vec![]);
-    }
-    b.set_block(source);
-    Some(cleanup)
-}
-
 fn copy_array_result_to_fixed_dest(
     b: &mut FuncBuilder,
     info: &LocalInfo,
@@ -2040,9 +1993,10 @@ fn lower_write_status_branches(
     let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
     let zero = b.const_i32(0);
     let failed = b.icmp(CmpOp::Ne, status, zero);
-    if let Some((label, target_bb)) =
-        err_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
-    {
+    let err_edge = err_label.and_then(|label| {
+        lexical_cleanup_edge_for_label(b, ctx, label, "write_err_cleanup").map(|edge| (label, edge))
+    });
+    if let Some((label, target_bb)) = err_edge {
         let ok_bb = b.create_block(&format!("write_ok_{label}"));
         b.cond_branch(failed, target_bb, vec![], ok_bb, vec![]);
         b.set_block(ok_bb);
@@ -8948,8 +8902,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         Stmt::Format { .. } => {}            // non-executable metadata
 
         Stmt::Goto { label } => {
-            if let Some(&target_bb) = ctx.label_blocks.get(label) {
-                emit_lexical_cleanups_for_goto(b, ctx, *label);
+            if let Some(target_bb) = lexical_cleanup_edge_for_label(b, ctx, *label, "goto_cleanup")
+            {
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(target_bb, vec![]);
                 }
@@ -8978,24 +8932,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 _ => sel_raw,
             };
             for (i, label) in labels.iter().enumerate() {
-                let Some(&target_bb) = ctx.label_blocks.get(label) else {
+                let Some(target_bb) =
+                    lexical_cleanup_edge_for_label(b, ctx, *label, "computed_goto_cleanup")
+                else {
                     continue;
                 };
                 let key = (i + 1) as i32;
                 let key_val = b.const_i32(key);
                 let matches = b.icmp(CmpOp::Eq, sel_i32, key_val);
                 let next_check = b.create_block("computed_goto_next");
-                if goto_exits_active_scope(ctx, *label) {
-                    let cleanup = b.create_block("computed_goto_cleanup");
-                    b.cond_branch(matches, cleanup, vec![], next_check, vec![]);
-                    b.set_block(cleanup);
-                    emit_lexical_cleanups_for_goto(b, ctx, *label);
-                    if b.func().block(b.current_block()).terminator.is_none() {
-                        b.branch(target_bb, vec![]);
-                    }
-                } else {
-                    b.cond_branch(matches, target_bb, vec![], next_check, vec![]);
-                }
+                b.cond_branch(matches, target_bb, vec![], next_check, vec![]);
                 b.set_block(next_check);
             }
             // Falling out of the loop, current block is the post-chain
@@ -9030,7 +8976,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
 
             let nonnegative = b.create_block("arithmetic_if_nonnegative");
-            let negative_edge = goto_edge_block(b, ctx, *neg, "arithmetic_if_negative_cleanup");
+            let negative_edge =
+                lexical_cleanup_edge_for_label(b, ctx, *neg, "arithmetic_if_negative_cleanup");
             if let Some(negative_edge) = negative_edge {
                 b.cond_branch(is_negative, negative_edge, vec![], nonnegative, vec![]);
             } else {
@@ -9038,8 +8985,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
 
             b.set_block(nonnegative);
-            let zero_edge = goto_edge_block(b, ctx, *zero, "arithmetic_if_zero_cleanup");
-            let positive_edge = goto_edge_block(b, ctx, *pos, "arithmetic_if_positive_cleanup");
+            let zero_edge =
+                lexical_cleanup_edge_for_label(b, ctx, *zero, "arithmetic_if_zero_cleanup");
+            let positive_edge =
+                lexical_cleanup_edge_for_label(b, ctx, *pos, "arithmetic_if_positive_cleanup");
             match (zero_edge, positive_edge) {
                 (Some(zero_edge), Some(positive_edge)) => {
                     b.cond_branch(is_zero, zero_edge, vec![], positive_edge, vec![]);
