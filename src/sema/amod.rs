@@ -1079,13 +1079,6 @@ fn emit_procedure(
                 .collect()
         })
         .unwrap_or_default();
-    writeln!(
-        out,
-        "  @abi cc=aapcs64 hidden_char_lens={}",
-        hidden_char_len_args.len()
-    )
-    .unwrap();
-
     if let Some(pscope) = proc_scope {
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {

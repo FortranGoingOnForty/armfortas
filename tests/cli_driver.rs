@@ -7865,8 +7865,8 @@ fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
 
     let amod = std::fs::read_to_string(dir.join("c_strings.amod")).expect("missing c_strings.amod");
     assert!(
-        amod.contains("@abi cc=aapcs64 hidden_char_lens=0"),
-        "bind(c) c_char buffer interface should not advertise hidden lengths: {}",
+        !amod.contains("@abi cc="),
+        "bind(c) c_char buffer interface should not advertise a target calling convention: {}",
         amod
     );
     assert!(
@@ -7973,8 +7973,8 @@ fn amod_preserves_allocatable_assumed_len_char_array_hidden_len() {
     );
     let amod = std::fs::read_to_string(dir.join("provider.amod")).expect("missing provider.amod");
     assert!(
-        amod.contains("@abi cc=aapcs64 hidden_char_lens=1"),
-        "provider .amod should advertise the vector element length: {}",
+        !amod.contains("@abi cc="),
+        "provider .amod should not advertise a target calling convention: {}",
         amod
     );
     assert!(

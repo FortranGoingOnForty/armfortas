@@ -757,17 +757,42 @@ fn amod_omits_stale_abi_stamp() {
     let compiler = find_compiler();
     let dir = unique_dir();
     let module_f90 = dir.join("target_stamp.f90");
-    let module_o = dir.join("target_stamp.o");
 
     std::fs::write(
         &module_f90,
-        "module target_stamp\n  implicit none\n  integer, parameter :: answer = 42\nend module\n",
+        "module target_stamp\n  implicit none\ncontains\n  subroutine consume(text)\n    character(*), intent(in) :: text\n    if (len(text) < 0) error stop\n  end subroutine\nend module\n",
     )
     .unwrap();
-    compile_file(&compiler, &module_f90, &module_o, None);
 
-    let amod =
-        std::fs::read_to_string(dir.join("target_stamp.amod")).expect("missing target_stamp.amod");
+    let mut artifacts = Vec::new();
+    for target in ["x86_64-linux-musl", "arm64-macos"] {
+        let target_dir = dir.join(target);
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let compile = Command::new(&compiler)
+            .current_dir(&dir)
+            .args(["-c", "--target", target, "-J"])
+            .arg(&target_dir)
+            .arg(&module_f90)
+            .args(["-o"])
+            .arg(target_dir.join("target_stamp.o"))
+            .output()
+            .expect("cross-target module compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{target} module compile failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        artifacts.push(
+            std::fs::read_to_string(target_dir.join("target_stamp.amod"))
+                .expect("missing target_stamp.amod"),
+        );
+    }
+
+    assert_eq!(
+        artifacts[0], artifacts[1],
+        ".amod procedure metadata should be destination-independent"
+    );
+    let amod = &artifacts[0];
     assert!(
         !amod.lines().any(|line| line.starts_with("# abi:")),
         ".amod should not stamp a non-authoritative ABI line:\n{}",
@@ -776,6 +801,11 @@ fn amod_omits_stale_abi_stamp() {
     assert!(
         !amod.contains("cc=aapcs64") && !amod.contains("@abi pass="),
         ".amod should not stamp target-specific procedure ABI annotations:\n{}",
+        amod
+    );
+    assert!(
+        amod.contains("@arg text@len : integer(8)"),
+        ".amod must retain target-independent hidden-length metadata:\n{}",
         amod
     );
 
