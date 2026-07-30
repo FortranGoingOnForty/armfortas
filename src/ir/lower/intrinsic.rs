@@ -1743,6 +1743,16 @@ pub(crate) fn lower_intrinsic(
         // Honest support answers (l09 deliverable 1 matrix). True only for
         // what is implemented and tested; the rest say false so the
         // stdlib probe-before-use pattern routes around them.
+        "ieee_support_rounding" => args.first().map(|round| {
+            let round = ieee_as_i32(b, *round);
+            let supported = b.call(
+                FuncRef::External("afs_ieee_support_rounding".into()),
+                vec![round],
+                IrType::Int(IntWidth::I32),
+            );
+            let zero = b.const_i32(0);
+            b.icmp(CmpOp::Ne, supported, zero)
+        }),
         "ieee_support_datatype"
         | "ieee_support_denormal"
         | "ieee_support_inf"
@@ -1751,7 +1761,6 @@ pub(crate) fn lower_intrinsic(
         | "ieee_support_divide"
         | "ieee_support_sqrt"
         | "ieee_support_io"
-        | "ieee_support_rounding"
         | "ieee_support_flag" => Some(b.const_bool(true)),
         "ieee_support_underflow_control" | "ieee_support_halting" | "ieee_support_standard" => {
             Some(b.const_bool(false))

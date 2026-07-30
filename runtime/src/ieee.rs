@@ -28,7 +28,8 @@
 //! | ieee_support_datatype/nan/inf    | true (r4,r8)    | -                        |
 //! | ieee_support_denormal/subnormal  | true            | -                        |
 //! | ieee_support_divide/sqrt/io      | true            | -                        |
-//! | ieee_support_rounding/flag       | true            | -                        |
+//! | ieee_support_rounding            | mode-dependent  | FPCR (arm) / MXCSR (x86) |
+//! | ieee_support_flag                | true            | -                        |
 //! | ieee_support_underflow_control   | false           | FZ flipping out of scope |
 //! | ieee_support_halting             | false           | trap delivery unreliable |
 //! | ieee_support_standard            | false           | implies halting (false)  |
@@ -727,7 +728,8 @@ pub extern "C" fn afs_ieee_min_num_mag_r4(x: f32, y: f32) -> f32 {
 // both in MXCSR. Ported from libgfortran/config/fpu-aarch64.h and the
 // MXCSR halves of fpu-387.h.
 //
-// Rounding tags (ieee_round_type): 0=nearest, 1=to_zero, 2=up, 3=down.
+// Rounding tags (ieee_round_type): 0=nearest, 1=to_zero, 2=up, 3=down,
+// 4=away, 5=other. FPCR and MXCSR represent only the first four.
 // Flag tags (ieee_flag_type): 1=invalid, 2=divide_by_zero, 3=overflow,
 // 4=underflow, 5=inexact.
 
@@ -761,12 +763,16 @@ mod fpenv {
             _ => 1,    // to_zero
         }
     }
+    pub fn supports_rounding(tag: i32) -> bool {
+        matches!(tag, 0..=3)
+    }
     pub fn set_rounding(tag: i32) {
         let rmode: u64 = match tag {
+            0 => 0b00,
             2 => 0b01,
             3 => 0b10,
             1 => 0b11,
-            _ => 0b00,
+            _ => return,
         };
         let fpcr = (read_fpcr() & !(0b11 << 22)) | (rmode << 22);
         write_fpcr(fpcr);
@@ -828,12 +834,16 @@ mod fpenv {
             _ => 1,    // to_zero
         }
     }
+    pub fn supports_rounding(tag: i32) -> bool {
+        matches!(tag, 0..=3)
+    }
     pub fn set_rounding(tag: i32) {
         let rc: u32 = match tag {
+            0 => 0b00,
             3 => 0b01,
             2 => 0b10,
             1 => 0b11,
-            _ => 0b00,
+            _ => return,
         };
         let mxcsr = (read_mxcsr() & !(0b11 << 13)) | (rc << 13);
         write_mxcsr(mxcsr);
@@ -879,6 +889,9 @@ mod fpenv {
     pub fn get_rounding() -> i32 {
         0
     }
+    pub fn supports_rounding(tag: i32) -> bool {
+        tag == 0
+    }
     pub fn set_rounding(_tag: i32) {}
     pub fn test_flag(_tag: i32) -> i32 {
         0
@@ -893,6 +906,11 @@ mod fpenv {
 #[no_mangle]
 pub extern "C" fn afs_ieee_get_rounding() -> i32 {
     fpenv::get_rounding()
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_support_rounding(tag: i32) -> i32 {
+    i32::from(fpenv::supports_rounding(tag))
 }
 
 #[no_mangle]
@@ -1034,6 +1052,8 @@ mod tests {
         assert_eq!(afs_ieee_get_rounding(), 2);
         afs_ieee_set_rounding(3); // down
         assert_eq!(afs_ieee_get_rounding(), 3);
+        afs_ieee_set_rounding(1); // toward zero
+        assert_eq!(afs_ieee_get_rounding(), 1);
         afs_ieee_set_rounding(0); // nearest
         assert_eq!(afs_ieee_get_rounding(), 0);
         afs_ieee_set_rounding(orig);
@@ -1047,6 +1067,39 @@ mod tests {
         assert_eq!(afs_ieee_test_flag(1), 0); // invalid still clear
 
         unsafe { afs_ieee_set_status(saved.as_ptr()) };
+    }
+
+    #[test]
+    fn rounding_support_matches_the_architecture() {
+        assert_eq!(afs_ieee_support_rounding(0), 1);
+
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        for tag in 1..=3 {
+            assert_eq!(afs_ieee_support_rounding(tag), 1, "rounding tag {tag}");
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        for tag in 1..=3 {
+            assert_eq!(afs_ieee_support_rounding(tag), 0, "rounding tag {tag}");
+        }
+
+        for tag in [4, 5, -1, i32::MAX] {
+            assert_eq!(afs_ieee_support_rounding(tag), 0, "rounding tag {tag}");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn unsupported_rounding_tags_preserve_the_environment() {
+        let saved = fpenv::get_status();
+
+        afs_ieee_set_rounding(2);
+        for tag in [4, 5, -1, i32::MAX] {
+            afs_ieee_set_rounding(tag);
+            assert_eq!(afs_ieee_get_rounding(), 2, "rounding tag {tag}");
+        }
+
+        fpenv::set_status(saved);
     }
 
     #[test]
