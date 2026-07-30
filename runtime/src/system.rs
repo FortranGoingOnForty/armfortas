@@ -673,6 +673,7 @@ thread_local! {
 }
 
 const RANDOM_SEED_VECTOR_SIZE: i64 = 1;
+const RANDOM_INIT_REPEATABLE_SEED: u64 = 0x243f_6a88_85a3_08d3;
 
 fn default_random_seed() -> u64 {
     let now = std::time::SystemTime::now()
@@ -955,6 +956,22 @@ pub extern "C" fn afs_random_seed(seed_val: i64) {
 #[no_mangle]
 pub extern "C" fn afs_random_seed_init() {
     set_random_seed(default_random_seed());
+}
+
+/// RANDOM_INIT: reset RANDOM_NUMBER's generator.
+///
+/// ARMFORTAS currently executes a single Fortran image, so
+/// IMAGE_DISTINCT cannot distinguish any peer image. REPEATABLE uses a
+/// fixed processor seed; the nonrepeatable path retains RANDOM_SEED's
+/// process-dependent initialization.
+#[no_mangle]
+pub extern "C" fn afs_random_init(repeatable: i32, _image_distinct: i32) {
+    let seed = if repeatable != 0 {
+        RANDOM_INIT_REPEATABLE_SEED
+    } else {
+        default_random_seed()
+    };
+    set_random_seed(seed);
 }
 
 #[no_mangle]
@@ -1427,6 +1444,29 @@ mod tests {
         afs_random_seed(42);
         afs_random_number_f64(&mut second);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn random_init_repeatable_restarts_the_same_sequence() {
+        let mut first = [0.0f64; 3];
+        let mut advanced = [0.0f64; 3];
+        let mut repeated = [0.0f64; 3];
+
+        afs_random_init(1, 0);
+        for value in &mut first {
+            afs_random_number_f64(value);
+        }
+        for value in &mut advanced {
+            afs_random_number_f64(value);
+        }
+
+        afs_random_init(1, 1);
+        for value in &mut repeated {
+            afs_random_number_f64(value);
+        }
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, advanced);
     }
 }
 

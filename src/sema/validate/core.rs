@@ -5700,6 +5700,12 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
                     validate_system_clock_args(ctx, args, stmt.span);
                 }
+                if name.eq_ignore_ascii_case("random_init")
+                    && !intrinsic_name_is_shadowed(ctx, "random_init")
+                {
+                    ctx.require_std(stmt.span, FortranStandard::F2018, "RANDOM_INIT");
+                    validate_random_init_args(ctx, args, stmt.span);
+                }
             }
             if let Some(name) = call_target_function_name(ctx, callee) {
                 ctx.error(
@@ -7843,6 +7849,96 @@ fn validate_system_clock_args(ctx: &mut Ctx, args: &[crate::ast::expr::Argument]
             span,
             "SYSTEM_CLOCK integer arguments must all have the same kind (F2023 16.9.202)",
         );
+    }
+}
+
+/// F2018 RANDOM_INIT has two required scalar LOGICAL INTENT(IN)
+/// arguments. Intrinsics have no user-declared explicit
+/// interface to drive the generic call validator, so validate their
+/// positional and keyword associations here.
+fn validate_random_init_args(ctx: &mut Ctx, args: &[Argument], span: Span) {
+    const FORMALS: [&str; 2] = ["repeatable", "image_distinct"];
+    let mut associated = [false; FORMALS.len()];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let arg_span = argument_span(arg, span);
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            let Some(index) = FORMALS
+                .iter()
+                .position(|formal| formal.eq_ignore_ascii_case(keyword))
+            else {
+                ctx.error(
+                    arg_span,
+                    format!(
+                        "unknown keyword argument '{}' in call to 'random_init'",
+                        keyword
+                    ),
+                );
+                continue;
+            };
+            index
+        } else {
+            if saw_keyword {
+                ctx.error(
+                    arg_span,
+                    "positional argument follows a keyword argument in call to 'random_init'",
+                );
+                continue;
+            }
+            let index = positional;
+            positional += 1;
+            if index >= FORMALS.len() {
+                continue;
+            }
+            index
+        };
+
+        if associated[index] {
+            ctx.error(
+                arg_span,
+                format!(
+                    "argument '{}' is associated more than once in call to 'random_init'",
+                    FORMALS[index]
+                ),
+            );
+            continue;
+        }
+        associated[index] = true;
+
+        let SectionSubscript::Element(actual) = &arg.value else {
+            ctx.error(
+                arg_span,
+                format!(
+                    "RANDOM_INIT argument '{}' must be scalar",
+                    FORMALS[index].to_ascii_uppercase()
+                ),
+            );
+            continue;
+        };
+        if !matches!(
+            validation_expr_type_info(ctx, actual),
+            Some(TypeInfo::Logical { .. })
+        ) {
+            ctx.error(
+                actual.span,
+                format!(
+                    "RANDOM_INIT argument '{}' must be LOGICAL",
+                    FORMALS[index].to_ascii_uppercase()
+                ),
+            );
+        }
+        if validation_expr_rank(ctx, actual).is_some_and(|rank| rank != 0) {
+            ctx.error(
+                actual.span,
+                format!(
+                    "RANDOM_INIT argument '{}' must be scalar",
+                    FORMALS[index].to_ascii_uppercase()
+                ),
+            );
+        }
     }
 }
 
@@ -10263,6 +10359,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "system_clock" => (0, Some(3)),
         "date_and_time" => (0, Some(4)),
         "random_seed" => (0, Some(3)),
+        "random_init" => (2, Some(2)),
         "execute_command_line" => (1, Some(5)),
         "get_command_argument" => (1, Some(5)),
         "get_environment_variable" => (1, Some(6)),
@@ -10286,6 +10383,7 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
             | "cpu_time"
             | "random_number"
             | "random_seed"
+            | "random_init"
             | "move_alloc"
             | "mvbits"
             | "execute_command_line"
@@ -10558,7 +10656,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "mvbits" | "transfer" | "bge" | "bgt" | "ble" | "blt" |
         "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
         "new_line" | "null" | "move_alloc" | "next" | "previous" |
-        "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
+        "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" | "random_init" |
         // F2023 string-parsing subroutines.
         "split" | "tokenize" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
@@ -12479,6 +12577,79 @@ end program
                 "missing {intrinsic} diagnostic: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn random_init_requires_f2018() {
+        let errs = errors_with_std(
+            "\
+program p
+  implicit none
+  call random_init(.true., .false.)
+end program
+",
+            FortranStandard::F2008,
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("RANDOM_INIT requires --std=F2018")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn random_init_requires_two_scalar_logical_arguments() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: wrong_type
+  logical :: wrong_rank(2)
+  call random_init(wrong_type, wrong_rank)
+  call random_init(.true.)
+  call random_init(repeatable=.true., unknown=.false.)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("REPEATABLE") && err.contains("must be LOGICAL")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("IMAGE_DISTINCT") && err.contains("must be scalar")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("intrinsic 'random_init' takes 2 arguments")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("unknown keyword argument 'unknown'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_random_init_shadows_the_intrinsic_contract() {
+        let errs = errors_with_std(
+            "\
+program p
+  implicit none
+  interface
+    subroutine random_init(value)
+      integer, intent(in) :: value
+    end subroutine
+  end interface
+  call random_init(7)
+end program
+",
+            FortranStandard::F2008,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]

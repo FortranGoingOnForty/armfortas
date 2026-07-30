@@ -784,6 +784,19 @@ pub(crate) fn lower_intrinsic_subroutine(
             }
             true
         }
+        "random_init" => {
+            let repeatable = nth_arg_val(b, ctx, args, 0, 0);
+            let image_distinct = nth_arg_val(b, ctx, args, 1, 0);
+            let abi_ty = IrType::Int(IntWidth::I32);
+            let repeatable = coerce_to_type(b, repeatable, &abi_ty);
+            let image_distinct = coerce_to_type(b, image_distinct, &abi_ty);
+            b.call(
+                FuncRef::External("afs_random_init".into()),
+                vec![repeatable, image_distinct],
+                IrType::Void,
+            );
+            true
+        }
         "execute_command_line" => {
             let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
             let wait = nth_arg_val(b, ctx, args, 1, 1);
