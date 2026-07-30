@@ -4375,6 +4375,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
+            validate_control_transfer_regions(ctx, body);
             validate_label_consistency(ctx, unit.span);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
@@ -4460,6 +4461,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
+            validate_control_transfer_regions(ctx, body);
             validate_label_consistency(ctx, unit.span);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
             ctx.current_args = saved_args;
@@ -4605,6 +4607,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
+            validate_control_transfer_regions(ctx, body);
             validate_label_consistency(ctx, unit.span);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
             ctx.current_args = saved_args;
@@ -5329,9 +5332,40 @@ fn validate_arithmetic_if_expr(ctx: &mut Ctx<'_>, expr: &SpannedExpr) {
     }
 }
 
+fn visit_io_branch_labels(stmt: &Stmt, mut visit: impl FnMut(u64)) {
+    let controls = match stmt {
+        Stmt::Write { controls, .. } | Stmt::Read { controls, .. } => controls,
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Inquire { specs, .. }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => specs,
+        _ => return,
+    };
+    for control in controls {
+        let is_branch = control.keyword.as_deref().is_some_and(|keyword| {
+            matches!(keyword.to_ascii_lowercase().as_str(), "err" | "end" | "eor")
+        });
+        if !is_branch {
+            continue;
+        }
+        if let Expr::IntegerLiteral { text, .. } = &control.value.node {
+            if let Ok(label) = text.parse::<u64>() {
+                visit(label);
+            }
+        }
+    }
+}
+
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
     validate_stmt_enum_usage(ctx, stmt);
+    visit_io_branch_labels(&stmt.node, |label| {
+        ctx.labels_referenced.push((label, stmt.span));
+    });
 
     match &stmt.node {
         // ---- Assignment ----
@@ -9051,6 +9085,166 @@ fn register_label(ctx: &mut Ctx, label: u64, span: Span) {
         ctx.error(span, format!("duplicate label {}", label));
     } else {
         ctx.labels_defined.push(label);
+    }
+}
+
+#[derive(Default)]
+struct ControlTransferRegionFacts {
+    next_region: u64,
+    definitions: HashMap<u64, Vec<Vec<u64>>>,
+    references: Vec<(u64, Span, Vec<u64>)>,
+}
+
+impl ControlTransferRegionFacts {
+    fn define(&mut self, label: u64, regions: &[u64]) {
+        self.definitions
+            .entry(label)
+            .or_default()
+            .push(regions.to_vec());
+    }
+
+    fn reference(&mut self, label: u64, span: Span, regions: &[u64]) {
+        self.references.push((label, span, regions.to_vec()));
+    }
+}
+
+fn collect_control_transfer_region(
+    body: &[SpannedStmt],
+    regions: &mut Vec<u64>,
+    facts: &mut ControlTransferRegionFacts,
+) {
+    let region = facts.next_region;
+    facts.next_region += 1;
+    regions.push(region);
+    collect_control_transfer_regions(body, regions, facts);
+    regions.pop();
+}
+
+fn collect_control_transfer_regions(
+    stmts: &[SpannedStmt],
+    regions: &mut Vec<u64>,
+    facts: &mut ControlTransferRegionFacts,
+) {
+    for stmt in stmts {
+        visit_io_branch_labels(&stmt.node, |label| {
+            facts.reference(label, stmt.span, regions);
+        });
+        match &stmt.node {
+            Stmt::Goto { label } => facts.reference(*label, stmt.span, regions),
+            Stmt::ComputedGoto { labels, .. } => {
+                for label in labels {
+                    facts.reference(*label, stmt.span, regions);
+                }
+            }
+            Stmt::ArithmeticIf { neg, zero, pos, .. } => {
+                for label in [neg, zero, pos] {
+                    facts.reference(*label, stmt.span, regions);
+                }
+            }
+            Stmt::Continue { label: Some(label) } => facts.define(*label, regions),
+            Stmt::Labeled { label, stmt } => {
+                facts.define(*label, regions);
+                collect_control_transfer_regions(
+                    std::slice::from_ref(stmt.as_ref()),
+                    regions,
+                    facts,
+                );
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_control_transfer_region(then_body, regions, facts);
+                for (_, body) in else_ifs {
+                    collect_control_transfer_region(body, regions, facts);
+                }
+                if let Some(body) = else_body {
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::ForallStmt { stmt: action, .. } => {
+                collect_control_transfer_region(
+                    std::slice::from_ref(action.as_ref()),
+                    regions,
+                    facts,
+                );
+            }
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::ForallConstruct { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. } => {
+                collect_control_transfer_region(body, regions, facts);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_control_transfer_region(&case.body, regions, facts);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_control_transfer_region(body, regions, facts);
+                for (_, body) in elsewhere {
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A branch may remain within its current structured region or leave one or
+/// more enclosing regions. It may not enter a deeper region or a sibling arm.
+fn validate_control_transfer_regions(ctx: &mut Ctx<'_>, body: &[SpannedStmt]) {
+    let mut facts = ControlTransferRegionFacts::default();
+    collect_control_transfer_regions(body, &mut Vec::new(), &mut facts);
+
+    let mut reported = HashSet::new();
+    for (label, span, source_regions) in facts.references {
+        let Some(definitions) = facts.definitions.get(&label) else {
+            continue;
+        };
+        // Duplicate and undefined labels have their own diagnostics. Avoid
+        // deriving a region result from an ambiguous target.
+        let [target_regions] = definitions.as_slice() else {
+            continue;
+        };
+        if source_regions.starts_with(target_regions) {
+            continue;
+        }
+        let key = (label, span.file_id, span.start.line, span.start.col);
+        if reported.insert(key) {
+            ctx.error(
+                span,
+                format!("control transfer to label {label} enters a structured construct"),
+            );
+        }
     }
 }
 
@@ -15569,11 +15763,158 @@ end program
         );
     }
 
-    // Note: the parser does not yet assign labels to statements (labels are
-    // separate tokens consumed but not attached). Full GOTO-target validation
-    // requires a parser enhancement to track statement labels. The validation
-    // infrastructure is in place; these tests verify the diagnostic machinery
-    // using the programmatic API directly.
+    #[test]
+    fn goto_cannot_enter_block_construct() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  go to 10
+  block
+10  continue
+  end block
+end program
+",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .contains("control transfer to label 10 enters a structured construct")),
+            "branching into a BLOCK must be rejected before lowering: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn computed_goto_and_arithmetic_if_cannot_enter_structured_constructs() {
+        let computed_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: selector
+  selector = 1
+  go to (10), selector
+  if (.true.) then
+10  continue
+  end if
+end program
+",
+        );
+        assert!(
+            computed_errors.iter().any(|error| error
+                .contains("control transfer to label 10 enters a structured construct")),
+            "computed GOTO must not enter an IF arm: {computed_errors:?}"
+        );
+
+        let arithmetic_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: selector
+  selector = 0
+  if (selector) 20, 20, 20
+  do
+20  exit
+  end do
+end program
+",
+        );
+        assert!(
+            arithmetic_errors.iter().any(|error| error
+                .contains("control transfer to label 20 enters a structured construct")),
+            "arithmetic IF must not enter a DO construct: {arithmetic_errors:?}"
+        );
+    }
+
+    #[test]
+    fn io_branch_specifier_cannot_enter_block_construct() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: value
+  read (*, *, err=25) value
+  block
+25  continue
+  end block
+end program
+",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .contains("control transfer to label 25 enters a structured construct")),
+            "an I/O branch specifier must not enter a BLOCK: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_cannot_cross_between_sibling_if_arms() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  logical :: choose_first
+  choose_first = .true.
+  if (choose_first) then
+    go to 30
+  else
+30  continue
+  end if
+end program
+",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .contains("control transfer to label 30 enters a structured construct")),
+            "a branch between sibling IF arms must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_may_stay_within_or_leave_structured_construct() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  block
+    go to 40
+40  continue
+    go to 50
+  end block
+50 continue
+end program
+",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("enters a structured construct")),
+            "a branch may remain in or leave its current construct: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_may_target_labeled_construct_boundary() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  go to 60
+60 block
+     integer :: value
+     value = 1
+   end block
+end program
+",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("enters a structured construct")),
+            "the label on a construct statement is outside its body region: {errors:?}"
+        );
+    }
+
+    // Keep direct context-level tests for undefined/duplicate bookkeeping in
+    // addition to the parsed-source region tests above.
 
     #[test]
     fn goto_undefined_label_detected() {

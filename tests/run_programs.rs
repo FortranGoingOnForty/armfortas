@@ -4528,6 +4528,25 @@ fn ar43_do_concurrent_named_cycle_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar43_goto_into_block_fixture_is_rejected_without_ice() {
+    if skip_native_e2e("ar43_goto_into_block_fixture_is_rejected_without_ice", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_goto_into_block.f90");
+    assert!(source.exists(), "ar43_goto_into_block.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_goto_into_block.f90 should fail with a semantic control-transfer diagnostic rather than an IR verifier error, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;
