@@ -621,15 +621,20 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "get_environment_variable" => {
-            // call get_environment_variable(name, value, length, status)
-            // Runtime: afs_get_environment_variable(name, name_len, value, value_len, length, status)
+            // call get_environment_variable(name, value, length, status, trim_name)
+            // Runtime: afs_get_environment_variable_trim(
+            //     name, name_len, value, value_len, length, status, trim_name)
             let (name_ptr, name_len) = nth_arg_str(b, ctx, args, 0);
             let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
             let length = nth_arg_ref(b, ctx, args, 2);
             let status = nth_arg_ref(b, ctx, args, 3);
+            let trim_name = nth_arg_val(b, ctx, args, 4, 1);
+            let trim_name = coerce_to_type(b, trim_name, &IrType::Int(IntWidth::I32));
             b.call(
-                FuncRef::External("afs_get_environment_variable".into()),
-                vec![name_ptr, name_len, val_ptr, val_len, length, status],
+                FuncRef::External("afs_get_environment_variable_trim".into()),
+                vec![
+                    name_ptr, name_len, val_ptr, val_len, length, status, trim_name,
+                ],
                 IrType::Void,
             );
             true

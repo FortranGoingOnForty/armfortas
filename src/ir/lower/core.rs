@@ -19612,7 +19612,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "date_and_time" => Some(&["date", "time", "zone", "values"]),
         "get_command_argument" => Some(&["number", "value", "length", "status"]),
         "get_command" => Some(&["command", "length", "status"]),
-        "get_environment_variable" => Some(&["name", "value", "length", "status"]),
+        "get_environment_variable" => Some(&["name", "value", "length", "status", "trim_name"]),
         "random_number" => Some(&["harvest"]),
         "random_seed" => Some(&["size", "put", "get"]),
         "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),

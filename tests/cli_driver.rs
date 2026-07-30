@@ -42717,6 +42717,52 @@ fn get_environment_variable_literal_name_populates_value_and_status() {
 
 #[cfg(unix)]
 #[test]
+fn get_environment_variable_trim_name_false_preserves_trailing_blanks() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=get_environment_variable_trim_name_false_preserves_trailing_blanks count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=14) :: name\n  character(len=16) :: value\n  integer :: length, status\n  name = 'AFS_AR53_TRIM'\n  value = '?'\n  call get_environment_variable(name, value, length, status)\n  if (status /= 0 .or. length /= 7 .or. value(1:length) /= 'trimmed') error stop 1\n  value = '?'\n  call get_environment_variable(name, value, length, status, trim_name=.false.)\n  if (status /= 0 .or. length /= 5 .or. value(1:length) /= 'exact') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("get_environment_variable_trim_name", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("TRIM_NAME get_environment_variable compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "TRIM_NAME get_environment_variable should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .env("AFS_AR53_TRIM", "trimmed")
+        .env("AFS_AR53_TRIM ", "exact")
+        .output()
+        .expect("TRIM_NAME get_environment_variable run failed");
+    assert!(
+        run.status.success(),
+        "TRIM_NAME get_environment_variable should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected TRIM_NAME get_environment_variable output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[cfg(unix)]
+#[test]
 fn unix_command_and_environment_preserve_non_utf8_bytes() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;

@@ -431,23 +431,29 @@ fn environment_value(name: &[u8]) -> Option<Vec<u8>> {
     std::env::var_os(String::from_utf8_lossy(name).as_ref()).map(os_string_into_bytes)
 }
 
-/// GET_ENVIRONMENT_VARIABLE: retrieve an environment variable by name.
-#[no_mangle]
-pub extern "C" fn afs_get_environment_variable(
+fn environment_variable_name(name: &[u8], trim_name: bool) -> &[u8] {
+    if !trim_name {
+        return name;
+    }
+    let end = name
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |index| index + 1);
+    &name[..end]
+}
+
+fn get_environment_variable(
     name: *const u8,
     name_len: i64,
     value: *mut u8,
     value_len: i64,
     length: *mut i32,
     status: *mut i32,
+    trim_name: bool,
 ) {
     let var_name = if !name.is_null() && name_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
-        let end = slice
-            .iter()
-            .rposition(|byte| *byte != b' ')
-            .map_or(0, |index| index + 1);
-        &slice[..end]
+        environment_variable_name(slice, trim_name)
     } else {
         store_optional_i32(length, 0);
         write_character_result(value, value_len, &[]);
@@ -467,6 +473,41 @@ pub extern "C" fn afs_get_environment_variable(
             store_optional_i32(status, 1);
         }
     }
+}
+
+/// Compatibility entry point for compiler output predating TRIM_NAME support.
+#[no_mangle]
+pub extern "C" fn afs_get_environment_variable(
+    name: *const u8,
+    name_len: i64,
+    value: *mut u8,
+    value_len: i64,
+    length: *mut i32,
+    status: *mut i32,
+) {
+    get_environment_variable(name, name_len, value, value_len, length, status, true);
+}
+
+/// GET_ENVIRONMENT_VARIABLE with the Fortran 2018 TRIM_NAME argument.
+#[no_mangle]
+pub extern "C" fn afs_get_environment_variable_trim(
+    name: *const u8,
+    name_len: i64,
+    value: *mut u8,
+    value_len: i64,
+    length: *mut i32,
+    status: *mut i32,
+    trim_name: i32,
+) {
+    get_environment_variable(
+        name,
+        name_len,
+        value,
+        value_len,
+        length,
+        status,
+        trim_name != 0,
+    );
 }
 
 /// EXECUTE_COMMAND_LINE: run a shell command.
@@ -1179,6 +1220,14 @@ mod tests {
     fn command_argument_count_nonneg() {
         let c = afs_command_argument_count();
         assert!(c >= 0);
+    }
+
+    #[test]
+    fn environment_variable_name_honors_trim_name() {
+        assert_eq!(environment_variable_name(b"PATH   ", true), b"PATH");
+        assert_eq!(environment_variable_name(b"PATH   ", false), b"PATH   ");
+        assert_eq!(environment_variable_name(b"   ", true), b"");
+        assert_eq!(environment_variable_name(b"   ", false), b"   ");
     }
 
     #[test]
