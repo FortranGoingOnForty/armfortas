@@ -14279,6 +14279,17 @@ pub(super) fn resolve_generic_call_by_semantics(
     resolve_generic_call_by_semantics_impl(st, locals, callee, args, type_layouts, false)
 }
 
+pub(super) fn resolved_generic_specific_name_by_semantics(
+    st: &SymbolTable,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    callee: &str,
+    args: &[crate::ast::expr::Argument],
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<String> {
+    resolve_generic_call_by_semantics(st, locals, callee, args, type_layouts)
+        .map(|candidate| candidate.name)
+}
+
 pub(super) fn resolve_generic_call_by_semantics_and_rank(
     st: &SymbolTable,
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -46758,7 +46769,7 @@ fn function_call_has_vector_subscript(
     })
 }
 
-fn array_expr_descriptor_may_own_temp(
+pub(super) fn array_expr_descriptor_may_own_temp(
     expr: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,

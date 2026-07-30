@@ -157,8 +157,8 @@ pub(super) struct ConstructExitScope {
     pub(super) exit: BlockId,
 }
 
-/// Runtime cleanup owned by an active BLOCK construct.
-pub(super) struct BlockCleanupScope {
+/// Runtime cleanup owned by an active lexical construct.
+pub(super) struct LexicalCleanupScope {
     pub(super) labels: HashSet<u64>,
     pub(super) owned_locals: HashMap<String, LocalInfo>,
 }
@@ -274,7 +274,7 @@ pub(super) struct LowerCtx<'a> {
     pub(super) optional_locals: HashSet<String>,
     pub(super) loops: Vec<LoopScope>,
     pub(super) construct_exits: Vec<ConstructExitScope>,
-    pub(super) block_cleanups: Vec<BlockCleanupScope>,
+    pub(super) lexical_cleanups: Vec<LexicalCleanupScope>,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -368,7 +368,7 @@ impl<'a> LowerCtx<'a> {
             optional_locals: HashSet::new(),
             loops: Vec::new(),
             construct_exits: Vec::new(),
-            block_cleanups: Vec::new(),
+            lexical_cleanups: Vec::new(),
             st,
             globals,
             type_layouts,

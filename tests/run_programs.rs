@@ -4292,6 +4292,25 @@ fn ar43_arithmetic_if_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar43_associate_derived_expr_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_associate_derived_expr_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_associate_derived_expr.f90");
+    assert!(source.exists(), "ar43_associate_derived_expr.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_associate_derived_expr.f90 should preserve derived selector metadata and finalize expression selectors on every exit, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;

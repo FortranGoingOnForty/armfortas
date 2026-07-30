@@ -16,7 +16,7 @@ use crate::ir::types::*;
 
 use super::core::*;
 use super::ctx::{
-    BlockCleanupScope, BlockScopeGuard, BlockUseGuard, CharKind, HiddenResultAbi, LocalInfo,
+    BlockScopeGuard, BlockUseGuard, CharKind, HiddenResultAbi, LexicalCleanupScope, LocalInfo,
     LowerCtx,
 };
 use super::helpers::coerce_to_type;
@@ -227,6 +227,157 @@ fn finalizable_function_result_type_name(ctx: &LowerCtx, expr: &SpannedExpr) -> 
         .map(|layout| layout.name.clone())
 }
 
+fn associate_selector_returns_pointer(ctx: &LowerCtx<'_>, expr: &SpannedExpr) -> bool {
+    let Expr::ParenExpr { inner } = &expr.node else {
+        let Expr::FunctionCall { callee, args } = &expr.node else {
+            return false;
+        };
+        let Expr::Name { name } = &callee.node else {
+            return false;
+        };
+        if derived_constructor_type_info(name, ctx.st).is_some() {
+            return false;
+        }
+
+        let target = resolved_generic_specific_name_by_semantics(
+            ctx.st,
+            Some(&ctx.locals),
+            name,
+            args,
+            Some(ctx.type_layouts),
+        )
+        .unwrap_or_else(|| name.clone());
+        return callee_return_derived_info(ctx.st, &target)
+            .or_else(|| callee_return_derived_info(ctx.st, name))
+            .is_some_and(|(_, is_pointer)| is_pointer);
+    };
+    associate_selector_returns_pointer(ctx, inner)
+}
+
+fn associate_scalar_selector_may_own_temp(ctx: &LowerCtx<'_>, expr: &SpannedExpr) -> bool {
+    match &expr.node {
+        Expr::ParenExpr { inner } => associate_scalar_selector_may_own_temp(ctx, inner),
+        Expr::UnaryOp { .. } | Expr::BinaryOp { .. } => true,
+        Expr::FunctionCall { .. } => array_expr_descriptor_may_own_temp(expr, &ctx.locals, ctx.st),
+        _ => false,
+    }
+}
+
+fn materialize_associate_expression(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx<'_>,
+    expr: &SpannedExpr,
+) -> (LocalInfo, bool) {
+    let semantic_type =
+        operator_expr_type_info(expr, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts));
+    let derived_type_name = match semantic_type.as_ref() {
+        Some(crate::sema::symtab::TypeInfo::Derived(type_name)) => Some(type_name.as_str()),
+        _ => None,
+    };
+    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts)).unwrap_or(0);
+
+    if let Some(type_name) = derived_type_name.filter(|_| rank > 0) {
+        if let Some(layout) = ctx.type_layouts.get(type_name) {
+            if let Some((descriptor, elem_ty)) = lower_array_expr_descriptor(
+                b,
+                &ctx.locals,
+                expr,
+                ctx.st,
+                Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ) {
+                let is_pointer = associate_selector_returns_pointer(ctx, expr);
+                let owns_storage =
+                    !is_pointer && array_expr_descriptor_may_own_temp(expr, &ctx.locals, ctx.st);
+                return (
+                    LocalInfo {
+                        addr: descriptor,
+                        ty: elem_ty,
+                        dims: vec![(1, 1); rank],
+                        allocatable: owns_storage,
+                        descriptor_arg: true,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: Some(layout.name.clone()),
+                        inline_const: None,
+                        is_pointer,
+                        runtime_dim_upper: vec![],
+                        is_class: false,
+                        logical_kind: None,
+                        last_dim_assumed_size: false,
+                    },
+                    owns_storage,
+                );
+            }
+        }
+    }
+
+    let value = super::expr::lower_expr_ctx(b, ctx, expr);
+    let value_ty = b
+        .func()
+        .value_type(value)
+        .unwrap_or(IrType::Int(IntWidth::I32));
+
+    if let Some(type_name) = derived_type_name {
+        if value_ty.is_ptr() {
+            if let Some(layout) = ctx.type_layouts.get(type_name) {
+                let is_pointer = associate_selector_returns_pointer(ctx, expr);
+                let owns_storage = !is_pointer && associate_scalar_selector_may_own_temp(ctx, expr);
+                let addr = if is_pointer {
+                    let slot = b.alloca(value_ty);
+                    b.store(value, slot);
+                    slot
+                } else {
+                    value
+                };
+                return (
+                    LocalInfo {
+                        addr,
+                        ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: Some(layout.name.clone()),
+                        inline_const: None,
+                        is_pointer,
+                        runtime_dim_upper: vec![],
+                        is_class: false,
+                        logical_kind: None,
+                        last_dim_assumed_size: false,
+                    },
+                    owns_storage,
+                );
+            }
+        }
+    }
+
+    let addr = b.alloca(value_ty.clone());
+    b.store(value, addr);
+    (
+        LocalInfo {
+            addr,
+            ty: value_ty,
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+        false,
+    )
+}
+
 pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[SpannedStmt]) {
     for stmt in stmts {
         // Labeled statements and labeled CONTINUEs create new basic blocks; they must be
@@ -243,14 +394,14 @@ pub(crate) fn lower_stmts(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmts: &[Span
     }
 }
 
-fn goto_exits_active_block(ctx: &LowerCtx<'_>, label: u64) -> bool {
-    ctx.block_cleanups
+fn goto_exits_active_scope(ctx: &LowerCtx<'_>, label: u64) -> bool {
+    ctx.lexical_cleanups
         .last()
         .is_some_and(|scope| !scope.labels.contains(&label))
 }
 
-fn emit_block_cleanups_for_goto(b: &mut FuncBuilder, ctx: &LowerCtx<'_>, label: u64) {
-    for scope in ctx.block_cleanups.iter().rev() {
+fn emit_lexical_cleanups_for_goto(b: &mut FuncBuilder, ctx: &LowerCtx<'_>, label: u64) {
+    for scope in ctx.lexical_cleanups.iter().rev() {
         if scope.labels.contains(&label) {
             break;
         }
@@ -275,14 +426,14 @@ fn goto_edge_block(
     cleanup_name: &str,
 ) -> Option<BlockId> {
     let target = *ctx.label_blocks.get(&label)?;
-    if !goto_exits_active_block(ctx, label) {
+    if !goto_exits_active_scope(ctx, label) {
         return Some(target);
     }
 
     let source = b.current_block();
     let cleanup = b.create_block(cleanup_name);
     b.set_block(cleanup);
-    emit_block_cleanups_for_goto(b, ctx, label);
+    emit_lexical_cleanups_for_goto(b, ctx, label);
     if b.func().block(b.current_block()).terminator.is_none() {
         b.branch(target, vec![]);
     }
@@ -8652,7 +8803,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 .filter(|k| ctx.locals.contains_key(*k))
                 .filter_map(|k| ctx.locals.get(k).map(|v| (k.clone(), v.clone())))
                 .collect();
-            ctx.block_cleanups.push(BlockCleanupScope {
+            ctx.lexical_cleanups.push(LexicalCleanupScope {
                 labels: collect_statement_labels(body),
                 owned_locals: block_only,
             });
@@ -8661,7 +8812,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             lower_stmts(b, ctx, body);
             ctx.pop_construct_exit(name);
             let block_cleanup = ctx
-                .block_cleanups
+                .lexical_cleanups
                 .pop()
                 .expect("BLOCK cleanup scope must remain active while lowering its body");
 
@@ -8708,6 +8859,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         Stmt::Associate { name, assocs, body } => {
             // Associate names are scoped — they only exist within the body.
             let mut saved = Vec::with_capacity(assocs.len());
+            let mut owned_selectors = HashMap::new();
 
             for (assoc_name, expr) in assocs {
                 let key = assoc_name.to_lowercase();
@@ -8716,35 +8868,51 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ctx.locals.insert(key, info);
                     continue;
                 }
-                let val = super::expr::lower_expr_ctx(b, ctx, expr);
-                let ty = b
-                    .func()
-                    .value_type(val)
-                    .unwrap_or(IrType::Int(IntWidth::I32));
-                let addr = b.alloca(ty.clone());
-                b.store(val, addr);
-                ctx.locals.insert(
-                    key,
-                    LocalInfo {
-                        addr,
-                        ty,
-                        dims: vec![],
-                        allocatable: false,
-                        descriptor_arg: false,
-                        by_ref: false,
-                        char_kind: CharKind::None,
-                        derived_type: None,
-                        inline_const: None,
-                        is_pointer: false,
-                        runtime_dim_upper: vec![],
-                        is_class: false,
-                        logical_kind: None,
-                        last_dim_assumed_size: false,
-                    },
-                );
+                let (info, owns_storage) = materialize_associate_expression(b, ctx, expr);
+                if owns_storage {
+                    owned_selectors.insert(key.clone(), info.clone());
+                }
+                ctx.locals.insert(key, info);
             }
 
-            if name.is_some() {
+            if !owned_selectors.is_empty() {
+                let bb_cleanup = b.create_block("associate_cleanup");
+                let bb_after = b.create_block("associate_after");
+                ctx.lexical_cleanups.push(LexicalCleanupScope {
+                    labels: collect_statement_labels(body),
+                    owned_locals: owned_selectors,
+                });
+
+                ctx.push_construct_exit(name.clone(), bb_cleanup);
+                lower_stmts(b, ctx, body);
+                ctx.pop_construct_exit(name);
+                let cleanup_scope = ctx
+                    .lexical_cleanups
+                    .pop()
+                    .expect("ASSOCIATE cleanup scope must remain active while lowering its body");
+
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_cleanup, vec![]);
+                }
+                b.set_block(bb_cleanup);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    insert_implicit_dealloc(
+                        b,
+                        &cleanup_scope.owned_locals,
+                        &ctx.locals,
+                        ctx.type_layouts,
+                        ctx.st,
+                        ctx.internal_funcs,
+                        Some(ctx.contained_host_refs),
+                        None,
+                        true,
+                    );
+                }
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_after, vec![]);
+                }
+                b.set_block(bb_after);
+            } else if name.is_some() {
                 let bb_after = b.create_block("associate_after");
                 ctx.push_construct_exit(name.clone(), bb_after);
                 lower_stmts(b, ctx, body);
@@ -8781,7 +8949,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
         Stmt::Goto { label } => {
             if let Some(&target_bb) = ctx.label_blocks.get(label) {
-                emit_block_cleanups_for_goto(b, ctx, *label);
+                emit_lexical_cleanups_for_goto(b, ctx, *label);
                 if b.func().block(b.current_block()).terminator.is_none() {
                     b.branch(target_bb, vec![]);
                 }
@@ -8817,11 +8985,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 let key_val = b.const_i32(key);
                 let matches = b.icmp(CmpOp::Eq, sel_i32, key_val);
                 let next_check = b.create_block("computed_goto_next");
-                if goto_exits_active_block(ctx, *label) {
+                if goto_exits_active_scope(ctx, *label) {
                     let cleanup = b.create_block("computed_goto_cleanup");
                     b.cond_branch(matches, cleanup, vec![], next_check, vec![]);
                     b.set_block(cleanup);
-                    emit_block_cleanups_for_goto(b, ctx, *label);
+                    emit_lexical_cleanups_for_goto(b, ctx, *label);
                     if b.func().block(b.current_block()).terminator.is_none() {
                         b.branch(target_bb, vec![]);
                     }
