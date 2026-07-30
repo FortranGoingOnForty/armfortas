@@ -2049,6 +2049,27 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactRawRead {
+    Complete,
+    EndOfFile,
+    Truncated,
+}
+
+fn read_raw_exact(u: &mut Unit, buf: &mut [u8]) -> io::Result<ExactRawRead> {
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        match u.read_raw(&mut buf[offset..]) {
+            Ok(0) if offset == 0 => return Ok(ExactRawRead::EndOfFile),
+            Ok(0) => return Ok(ExactRawRead::Truncated),
+            Ok(n) => offset += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(ExactRawRead::Complete)
+}
+
 /// Begin a list-directed READ statement. Mandatory before per-item
 /// helpers when iostat=/iomsg= are requested or when the unit may be
 /// sequential-unformatted (which needs the leading record marker
@@ -2082,10 +2103,12 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
     if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
         return;
     }
+    u.pending_read = None;
+
     let mut len_buf = [0u8; 4];
-    match u.read_raw(&mut len_buf) {
-        Ok(4) => {}
-        Ok(0) => {
+    match read_raw_exact(u, &mut len_buf) {
+        Ok(ExactRawRead::Complete) => {}
+        Ok(ExactRawRead::EndOfFile) => {
             set_read_status_or_exit(iostat, IOSTAT_END);
             return;
         }
@@ -2095,13 +2118,21 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
         }
     }
     let record_len = u32::from_ne_bytes(len_buf) as usize;
-    let mut data = vec![0u8; record_len];
-    if record_len > 0 && u.read_raw(&mut data).is_err() {
+    let mut data = Vec::new();
+    if data.try_reserve_exact(record_len).is_err() {
         set_read_status_or_exit(iostat, 1);
         return;
     }
+    data.resize(record_len, 0);
+    if !matches!(read_raw_exact(u, &mut data), Ok(ExactRawRead::Complete)) {
+        set_read_status_or_exit(iostat, 1);
+        return;
+    }
+
     let mut trailer = [0u8; 4];
-    if u.read_raw(&mut trailer).is_err() {
+    if !matches!(read_raw_exact(u, &mut trailer), Ok(ExactRawRead::Complete))
+        || u32::from_ne_bytes(trailer) as usize != record_len
+    {
         set_read_status_or_exit(iostat, 1);
         return;
     }
@@ -7092,6 +7123,161 @@ mod tests {
         // This test just verifies no panic — output goes to test runner's stdout.
         afs_write_int(6, 42);
         afs_write_newline(6);
+    }
+
+    #[test]
+    fn sequential_unformatted_read_rejects_incomplete_or_mismatched_framing() {
+        let payload = 1234i32.to_ne_bytes();
+        let marker4 = 4u32.to_ne_bytes();
+        let marker8 = 8u32.to_ne_bytes();
+        let cases = [
+            (
+                "truncated_payload",
+                [marker8.as_slice(), payload.as_slice()].concat(),
+            ),
+            (
+                "truncated_trailer",
+                [marker4.as_slice(), payload.as_slice(), &marker4[..2]].concat(),
+            ),
+            (
+                "mismatched_trailer",
+                [marker4.as_slice(), payload.as_slice(), marker8.as_slice()].concat(),
+            ),
+        ];
+
+        for (index, (name, bytes)) in cases.into_iter().enumerate() {
+            let path = format!(
+                "/tmp/afs_seq_unformatted_bad_frame_{}_{}_{}.dat",
+                std::process::id(),
+                line!(),
+                index
+            );
+            std::fs::write(&path, bytes).expect("create malformed unformatted record");
+
+            let unit = 810 + index as i32;
+            let mut iostat = -99;
+            let cb = OpenControlBlock {
+                unit,
+                filename: path.as_ptr(),
+                filename_len: path.len() as i64,
+                status: "old".as_ptr(),
+                status_len: 3,
+                action: "read".as_ptr(),
+                action_len: 4,
+                access: "sequential".as_ptr(),
+                access_len: 10,
+                form: "unformatted".as_ptr(),
+                form_len: 11,
+                recl: 0,
+                iostat: &mut iostat,
+                newunit: std::ptr::null_mut(),
+                position: std::ptr::null(),
+                position_len: 0,
+                leading_zero: std::ptr::null(),
+                leading_zero_len: 0,
+                iomsg: std::ptr::null_mut(),
+                iomsg_len: 0,
+            };
+            afs_open(&cb);
+            assert_eq!(iostat, 0, "{name}: OPEN failed");
+
+            afs_list_read_begin(unit, &mut iostat, std::ptr::null_mut(), 0);
+            assert_ne!(iostat, 0, "{name}: malformed record was accepted");
+            {
+                let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+                let connected = state.get_unit(unit).expect("test unit must remain open");
+                assert!(
+                    connected.pending_read.is_none(),
+                    "{name}: malformed record payload was published"
+                );
+            }
+
+            afs_close(unit, &mut iostat);
+            assert_eq!(iostat, 0, "{name}: CLOSE failed");
+            std::fs::remove_file(path).expect("remove malformed unformatted record");
+        }
+    }
+
+    #[test]
+    fn sequential_unformatted_read_accepts_exact_empty_and_payload_records() {
+        let path = format!(
+            "/tmp/afs_seq_unformatted_valid_frame_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let marker0 = 0u32.to_ne_bytes();
+        let marker4 = 4u32.to_ne_bytes();
+        let payload = 2468i32.to_ne_bytes();
+        std::fs::write(
+            &path,
+            [
+                marker0.as_slice(),
+                marker0.as_slice(),
+                marker4.as_slice(),
+                payload.as_slice(),
+                marker4.as_slice(),
+            ]
+            .concat(),
+        )
+        .expect("create valid unformatted records");
+
+        let mut iostat = -99;
+        let cb = OpenControlBlock {
+            unit: 809,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "old".as_ptr(),
+            status_len: 3,
+            action: "read".as_ptr(),
+            action_len: 4,
+            access: "sequential".as_ptr(),
+            access_len: 10,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
+        };
+        afs_open(&cb);
+        assert_eq!(iostat, 0, "OPEN failed");
+
+        afs_list_read_begin(809, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0, "empty record framing must be accepted");
+        {
+            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+            let connected = state.get_unit(809).expect("test unit must remain open");
+            assert_eq!(connected.pending_read, Some((Vec::new(), 0)));
+        }
+        afs_list_read_end(809, &mut iostat, std::ptr::null_mut(), 0);
+
+        afs_list_read_begin(809, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0, "payload record framing must be accepted");
+        let mut value = -1;
+        afs_read_int(809, &mut value, &mut iostat);
+        assert_eq!(iostat, 0, "exact payload read must succeed");
+        assert_eq!(value, 2468);
+        afs_list_read_end(809, &mut iostat, std::ptr::null_mut(), 0);
+
+        afs_list_read_begin(809, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, IOSTAT_END, "clean record boundary EOF expected");
+        {
+            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+            let connected = state.get_unit(809).expect("test unit must remain open");
+            assert!(
+                connected.pending_read.is_none(),
+                "EOF must not retain a completed record"
+            );
+        }
+
+        afs_close(809, &mut iostat);
+        assert_eq!(iostat, 0, "CLOSE failed");
+        std::fs::remove_file(path).expect("remove valid unformatted records");
     }
 
     #[test]
