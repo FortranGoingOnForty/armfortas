@@ -1603,7 +1603,7 @@ fn format_has_data_descriptor(descs: &[FormatDesc]) -> bool {
     })
 }
 
-fn format_reversion_descriptors(descs: &[FormatDesc]) -> &[FormatDesc] {
+pub(crate) fn format_reversion_descriptors(descs: &[FormatDesc]) -> &[FormatDesc] {
     let start = descs
         .iter()
         .rposition(|desc| {

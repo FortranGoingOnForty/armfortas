@@ -4597,8 +4597,8 @@ pub extern "C" fn afs_io_finalize() {
 //   afs_fmt_end()
 
 use crate::format::{
-    parse_format, BlankInterpretation, DecimalSep, FormatDesc, FormatEngine, IoValue,
-    LeadingZeroMode,
+    format_reversion_descriptors, parse_format, BlankInterpretation, DecimalSep, FormatDesc,
+    FormatEngine, IoValue, LeadingZeroMode,
 };
 use std::cell::RefCell;
 
@@ -5412,6 +5412,114 @@ fn update_formatted_input_state(desc: &FormatDesc, state: &mut FormattedInputSta
     }
 }
 
+fn finite_formatted_data_count(descs: &[FormatDesc]) -> Result<Option<usize>, ()> {
+    let mut total = 0usize;
+    for desc in descs {
+        let count = match desc {
+            FormatDesc::IntegerI { .. }
+            | FormatDesc::IntegerB { .. }
+            | FormatDesc::IntegerO { .. }
+            | FormatDesc::IntegerZ { .. }
+            | FormatDesc::RealF { .. }
+            | FormatDesc::RealE { .. }
+            | FormatDesc::RealEN { .. }
+            | FormatDesc::RealES { .. }
+            | FormatDesc::RealEX { .. }
+            | FormatDesc::RealD { .. }
+            | FormatDesc::RealG { .. }
+            | FormatDesc::Logical { .. }
+            | FormatDesc::Character { .. } => 1,
+            FormatDesc::Group {
+                repeat,
+                descriptors,
+                ..
+            } => {
+                let Some(nested) = finite_formatted_data_count(descriptors)? else {
+                    return Ok(None);
+                };
+                repeat.checked_mul(nested).ok_or(())?
+            }
+            FormatDesc::UnlimitedRepeat { .. } => return Ok(None),
+            _ => 0,
+        };
+        total = total.checked_add(count).ok_or(())?;
+    }
+    Ok(Some(total))
+}
+
+fn apply_formatted_input_state_scan(descs: &[FormatDesc], state: &mut FormattedInputState) {
+    for desc in descs {
+        match desc {
+            FormatDesc::Group {
+                repeat,
+                descriptors,
+                ..
+            } if *repeat > 0 => {
+                // Every input-state descriptor assigns a mode rather than
+                // incrementally mutating it, so one traversal has the same
+                // final state as any positive repeat count.
+                apply_formatted_input_state_scan(descriptors, state);
+            }
+            FormatDesc::UnlimitedRepeat { descriptors } => {
+                apply_formatted_input_state_scan(descriptors, state);
+            }
+            _ => update_formatted_input_state(desc, state),
+        }
+    }
+}
+
+struct FormattedInputPlan<'a> {
+    descriptors: &'a [FormatDesc],
+    local_data_index: usize,
+    state: FormattedInputState,
+    starts_new_record: bool,
+}
+
+fn plan_formatted_input(descs: &[FormatDesc], data_index: i64) -> Option<FormattedInputPlan<'_>> {
+    let data_index = usize::try_from(data_index.max(0)).ok()?;
+    let Some(initial_count) = finite_formatted_data_count(descs).ok()? else {
+        return Some(FormattedInputPlan {
+            descriptors: descs,
+            local_data_index: data_index,
+            state: FormattedInputState::default(),
+            starts_new_record: data_index == 0,
+        });
+    };
+    if initial_count == 0 {
+        return None;
+    }
+    if data_index < initial_count {
+        return Some(FormattedInputPlan {
+            descriptors: descs,
+            local_data_index: data_index,
+            state: FormattedInputState::default(),
+            starts_new_record: data_index == 0,
+        });
+    }
+
+    let reversion_descs = format_reversion_descriptors(descs);
+    let reversion_count = finite_formatted_data_count(reversion_descs).ok()??;
+    if reversion_count == 0 {
+        return None;
+    }
+
+    let reverted_index = data_index - initial_count;
+    let completed_reversion_scans = reverted_index / reversion_count;
+    let local_data_index = reverted_index % reversion_count;
+    let mut state = FormattedInputState::default();
+    apply_formatted_input_state_scan(descs, &mut state);
+    if completed_reversion_scans > 0 {
+        apply_formatted_input_state_scan(reversion_descs, &mut state);
+    }
+
+    Some(FormattedInputPlan {
+        descriptors: reversion_descs,
+        local_data_index,
+        state,
+        starts_new_record: local_data_index == 0,
+    })
+}
+
 fn extract_nth_formatted_field_with_state(
     descs: &[FormatDesc],
     input: &[u8],
@@ -5664,13 +5772,15 @@ fn read_nonadvancing_chunk(
     Ok(buf)
 }
 
-fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<Vec<u8>, i32> {
+fn formatted_read_record_for_unit(unit: i32, starts_new_record: bool) -> Result<Vec<u8>, i32> {
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
         return Err(1);
     };
 
-    if data_index <= 0 || u.formatted_read_record.is_none() {
+    if starts_new_record || u.formatted_read_record.is_none() {
+        u.formatted_read_record = None;
+        u.formatted_read_cursor = 0;
         match u.read_line_bytes() {
             Ok(line) if !line.is_empty() => {
                 u.formatted_read_record = Some(line);
@@ -5684,6 +5794,40 @@ fn formatted_read_record_for_unit(unit: i32, data_index: i64) -> Result<Vec<u8>,
         .as_ref()
         .map(|line| trim_record_newline(line.clone()))
         .ok_or(IOSTAT_END)
+}
+
+fn parse_nth_formatted_unit_field_with_state(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+) -> Result<(FormatDesc, Vec<u8>, FormattedInputState), i32> {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    let descs = parse_format(&fmt);
+    let plan = plan_formatted_input(&descs, data_index).ok_or(1)?;
+    let input = formatted_read_record_for_unit(unit, plan.starts_new_record)?;
+    let mut cursor = 0usize;
+    let mut remaining = plan.local_data_index;
+    let mut state = plan.state;
+
+    extract_nth_formatted_field_with_state(
+        plan.descriptors,
+        &input,
+        &mut cursor,
+        &mut remaining,
+        &mut state,
+    )
+    .ok_or(IOSTAT_END)
+}
+
+fn parse_nth_formatted_unit_field(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+) -> Result<(FormatDesc, Vec<u8>), i32> {
+    parse_nth_formatted_unit_field_with_state(unit, fmt_str, fmt_len, data_index)
+        .map(|(desc, field, _)| (desc, field))
 }
 
 fn store_formatted_char_result(
@@ -5876,9 +6020,7 @@ pub extern "C" fn afs_fmt_read_string(
             }
         }
     }
-    match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
-    {
+    match parse_nth_formatted_unit_field(unit, fmt_str, fmt_len, data_index) {
         Ok((FormatDesc::Character { .. }, field)) => {
             store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
         }
@@ -6007,9 +6149,7 @@ pub extern "C" fn afs_fmt_read_int(
     val: *mut i32,
     iostat: *mut i32,
 ) {
-    match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
-    {
+    match parse_nth_formatted_unit_field(unit, fmt_str, fmt_len, data_index) {
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
@@ -6049,8 +6189,7 @@ pub extern "C" fn afs_fmt_read_logical(
     val: *mut i32,
     iostat: *mut i32,
 ) {
-    let result = formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index));
+    let result = parse_nth_formatted_unit_field(unit, fmt_str, fmt_len, data_index);
     store_formatted_logical_result(result, val, iostat);
 }
 
@@ -6063,9 +6202,7 @@ pub extern "C" fn afs_fmt_read_int64(
     val: *mut i64,
     iostat: *mut i32,
 ) {
-    match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
-    {
+    match parse_nth_formatted_unit_field(unit, fmt_str, fmt_len, data_index) {
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
@@ -6105,9 +6242,7 @@ pub extern "C" fn afs_fmt_read_int128(
     val: *mut i128,
     iostat: *mut i32,
 ) {
-    match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record(&line, fmt_str, fmt_len, data_index))
-    {
+    match parse_nth_formatted_unit_field(unit, fmt_str, fmt_len, data_index) {
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
@@ -6145,9 +6280,7 @@ pub extern "C" fn afs_fmt_read_real(
     val: *mut f64,
     iostat: *mut i32,
 ) {
-    match formatted_read_record_for_unit(unit, data_index)
-        .and_then(|line| parse_nth_formatted_record_with_state(&line, fmt_str, fmt_len, data_index))
-    {
+    match parse_nth_formatted_unit_field_with_state(unit, fmt_str, fmt_len, data_index) {
         Ok((desc, field, input_state)) if formatted_real_decimals(&desc).is_some() => {
             match parse_formatted_real_field(&desc, &field, input_state) {
                 Some(v) => {
@@ -7961,6 +8094,123 @@ mod tests {
         assert_eq!(iostat, 0);
         assert_eq!(first, 170141183460469231731687303715884105727i128);
         assert_eq!(second, 42);
+    }
+
+    #[test]
+    fn formatted_unit_read_reverts_to_rightmost_group_and_preserves_state() {
+        let path = "/tmp/afs_fmt_read_reversion_group_test.dat";
+        std::fs::write(path, " 1 2\n3 4\n").unwrap();
+
+        afs_open_simple(
+            91,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let format = "(BZ,1X,(F3.0))";
+        let mut first = -1.0;
+        let mut second = -1.0;
+        let mut iostat = -99;
+        afs_fmt_read_real(
+            91,
+            format.as_ptr(),
+            format.len() as i64,
+            0,
+            &mut first,
+            &mut iostat,
+        );
+        assert_eq!(iostat, 0);
+        afs_fmt_read_real(
+            91,
+            format.as_ptr(),
+            format.len() as i64,
+            1,
+            &mut second,
+            &mut iostat,
+        );
+        afs_close(91, std::ptr::null_mut());
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(iostat, 0);
+        assert_eq!(first, 102.0);
+        assert_eq!(second, 304.0);
+    }
+
+    #[test]
+    fn formatted_unit_read_reversion_reports_missing_next_record() {
+        let path = "/tmp/afs_fmt_read_reversion_eof_test.dat";
+        std::fs::write(path, "01\n02\n").unwrap();
+
+        afs_open_simple(
+            90,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let format = "(I2)";
+        let mut values = [-1; 3];
+        let mut iostat = -99;
+        for (index, value) in values.iter_mut().enumerate() {
+            afs_fmt_read_int(
+                90,
+                format.as_ptr(),
+                format.len() as i64,
+                index as i64,
+                value,
+                &mut iostat,
+            );
+            if index < 2 {
+                assert_eq!(iostat, 0);
+            }
+        }
+        afs_close(90, std::ptr::null_mut());
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(values, [1, 2, -1]);
+        assert_eq!(iostat, IOSTAT_END);
+    }
+
+    #[test]
+    fn formatted_unit_read_unlimited_repeat_stays_on_one_record() {
+        let path = "/tmp/afs_fmt_read_unlimited_test.dat";
+        std::fs::write(path, "010203\n").unwrap();
+
+        afs_open_simple(
+            89,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let format = "(*(I2))";
+        let mut values = [-1; 3];
+        let mut iostat = -99;
+        for (index, value) in values.iter_mut().enumerate() {
+            afs_fmt_read_int(
+                89,
+                format.as_ptr(),
+                format.len() as i64,
+                index as i64,
+                value,
+                &mut iostat,
+            );
+            assert_eq!(iostat, 0);
+        }
+        afs_close(89, std::ptr::null_mut());
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(values, [1, 2, 3]);
     }
 
     #[test]
