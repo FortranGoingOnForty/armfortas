@@ -193,437 +193,531 @@ pub enum DecimalSep {
     Point, // DP
 }
 
-/// Parse a Fortran format string (the part inside parentheses) into descriptors.
-pub fn parse_format(fmt: &str) -> Vec<FormatDesc> {
-    let trimmed = fmt.trim();
-    // Strip outer parens if present.
-    let inner = if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-    parse_format_list(inner)
+/// Maximum explicit parenthesis nesting accepted in a dynamic format.
+///
+/// Parsing is otherwise linear in the format string and repeat counts stay
+/// structural, so hostile numeric counts cannot expand the descriptor vector.
+/// A depth limit is still required because groups are parsed recursively.
+const MAX_FORMAT_NESTING: usize = 64;
+
+/// Parse a complete Fortran format specification into descriptors.
+///
+/// Dynamic format values include their outer parentheses. Rejecting a missing
+/// or unmatched parenthesis here prevents malformed text from being
+/// "repaired" into a different, consuming format.
+pub fn parse_format(fmt: &str) -> Result<Vec<FormatDesc>, FormatError> {
+    FormatParser::new(fmt.trim()).parse()
 }
 
-fn parse_format_list(input: &str) -> Vec<FormatDesc> {
-    let mut result = Vec::new();
-    let mut chars = input.chars().peekable();
+struct FormatParser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+}
 
-    while chars.peek().is_some() {
-        skip_spaces(&mut chars);
-        if chars.peek().is_none() {
-            break;
+impl<'a> FormatParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            chars: input.chars().peekable(),
+        }
+    }
+
+    fn parse(mut self) -> Result<Vec<FormatDesc>, FormatError> {
+        self.skip_spaces();
+        if self.chars.next() != Some('(') {
+            return Err(FormatError::InvalidFormat);
         }
 
-        // Check for comma separator.
-        if chars.peek() == Some(&',') {
-            chars.next();
-            continue;
+        let descriptors = self.parse_list(1)?;
+        self.skip_spaces();
+        if self.chars.next().is_some() {
+            return Err(FormatError::InvalidFormat);
+        }
+        Ok(descriptors)
+    }
+
+    fn parse_list(&mut self, depth: usize) -> Result<Vec<FormatDesc>, FormatError> {
+        if depth > MAX_FORMAT_NESTING {
+            return Err(FormatError::InvalidFormat);
         }
 
-        // Check for negative sign (for scale factor: -kP).
-        let negative = if chars.peek() == Some(&'-') {
-            chars.next();
-            true
-        } else {
-            false
-        };
+        let mut result = Vec::new();
+        let mut has_item = false;
+        loop {
+            self.skip_spaces();
+            match self.chars.peek().copied() {
+                None => return Err(FormatError::InvalidFormat),
+                Some(')') => {
+                    self.chars.next();
+                    return Ok(result);
+                }
+                Some(',') => {
+                    if !has_item {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    self.chars.next();
+                    self.skip_spaces();
+                    match self.chars.peek().copied() {
+                        Some(')') => {
+                            self.chars.next();
+                            return Ok(result);
+                        }
+                        Some(',') | None => return Err(FormatError::InvalidFormat),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
 
-        // Check for repeat count.
-        let repeat = parse_number(&mut chars);
+            let sign = match self.chars.peek().copied() {
+                Some('-') => {
+                    self.chars.next();
+                    -1
+                }
+                Some('+') => {
+                    self.chars.next();
+                    1
+                }
+                _ => 0,
+            };
+            let repeat = self.parse_number()?;
+            self.skip_spaces();
+            let next = self
+                .chars
+                .peek()
+                .copied()
+                .ok_or(FormatError::InvalidFormat)?;
 
-        skip_spaces(&mut chars);
-        if chars.peek().is_none() {
-            break;
-        }
-
-        let c = chars.peek().copied().unwrap_or(' ');
-
-        match c {
-            // ---- Group repeat ----
-            '(' => {
-                chars.next(); // consume '('
-                let inner = collect_until_matching_paren(&mut chars);
-                let descriptors = parse_format_list(&inner);
-                let n = repeat.unwrap_or(1);
-                if n == 0 {
-                    // *(...) unlimited repeat — not representable with 0.
-                    result.push(FormatDesc::UnlimitedRepeat { descriptors });
-                } else {
+            match next {
+                '(' => {
+                    if sign != 0 || repeat == Some(0) {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    self.chars.next();
+                    let descriptors = self.parse_list(depth + 1)?;
                     result.push(FormatDesc::Group {
-                        repeat: n,
+                        repeat: repeat.unwrap_or(1),
                         descriptors,
                         is_reversion_point: true,
                     });
                 }
-            }
-
-            // ---- Literal strings ----
-            '\'' | '"' => {
-                let s = parse_string_literal(&mut chars, c);
-                for _ in 0..repeat.unwrap_or(1) {
-                    result.push(FormatDesc::LiteralString(s.clone()));
+                '\'' | '"' => {
+                    if sign != 0 || repeat == Some(0) {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    let literal = FormatDesc::LiteralString(self.parse_string_literal(next)?);
+                    Self::push_repeated(&mut result, literal, repeat.unwrap_or(1));
                 }
-            }
-
-            // ---- Newline ----
-            '/' => {
-                chars.next();
-                for _ in 0..repeat.unwrap_or(1) {
-                    result.push(FormatDesc::Newline);
+                '/' => {
+                    if sign != 0 || repeat == Some(0) {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    self.chars.next();
+                    Self::push_repeated(&mut result, FormatDesc::Newline, repeat.unwrap_or(1));
                 }
-            }
-
-            // ---- Colon ----
-            ':' => {
-                chars.next();
-                result.push(FormatDesc::Colon);
-            }
-
-            // ---- Star (unlimited repeat) ----
-            '*' => {
-                chars.next();
-                if chars.peek() == Some(&'(') {
-                    chars.next();
-                    let inner = collect_until_matching_paren(&mut chars);
-                    let descriptors = parse_format_list(&inner);
+                ':' => {
+                    if sign != 0 || repeat.is_some() {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    self.chars.next();
+                    result.push(FormatDesc::Colon);
+                }
+                '*' => {
+                    if sign != 0 || repeat.is_some() {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    self.chars.next();
+                    self.skip_spaces();
+                    if self.chars.next() != Some('(') {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                    let descriptors = self.parse_list(depth + 1)?;
                     result.push(FormatDesc::UnlimitedRepeat { descriptors });
                 }
-            }
-
-            // ---- Edit descriptors ----
-            _ => {
-                let desc = parse_edit_descriptor(&mut chars, repeat, negative);
-                if let Some(d) = desc {
-                    if let Some(n) = repeat {
-                        if n > 1
-                            && !matches!(d, FormatDesc::Skip { .. } | FormatDesc::ScaleFactor(_))
-                        {
-                            // Repeat count on a data descriptor: wrap in a group.
+                _ => {
+                    let descriptor = self.parse_edit_descriptor(repeat, sign)?;
+                    match repeat {
+                        Some(0) if !matches!(descriptor, FormatDesc::ScaleFactor(_)) => {
+                            return Err(FormatError::InvalidFormat);
+                        }
+                        Some(n) if n > 1 && Self::is_repeatable_data_descriptor(&descriptor) => {
                             result.push(FormatDesc::Group {
                                 repeat: n,
-                                descriptors: vec![d],
+                                descriptors: vec![descriptor],
                                 is_reversion_point: false,
                             });
-                        } else {
-                            result.push(d);
                         }
-                    } else {
-                        result.push(d);
+                        Some(_)
+                            if !matches!(
+                                descriptor,
+                                FormatDesc::Skip { .. } | FormatDesc::ScaleFactor(_)
+                            ) =>
+                        {
+                            return Err(FormatError::InvalidFormat);
+                        }
+                        _ => result.push(descriptor),
                     }
                 }
             }
+            has_item = true;
         }
     }
 
-    result
-}
+    fn push_repeated(result: &mut Vec<FormatDesc>, descriptor: FormatDesc, repeat: usize) {
+        if repeat == 1 {
+            result.push(descriptor);
+        } else {
+            result.push(FormatDesc::Group {
+                repeat,
+                descriptors: vec![descriptor],
+                is_reversion_point: false,
+            });
+        }
+    }
 
-fn parse_edit_descriptor(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-    repeat: Option<usize>,
-    negative: bool,
-) -> Option<FormatDesc> {
-    let letter = chars.next()?.to_ascii_uppercase();
+    fn is_repeatable_data_descriptor(descriptor: &FormatDesc) -> bool {
+        matches!(
+            descriptor,
+            FormatDesc::IntegerI { .. }
+                | FormatDesc::IntegerB { .. }
+                | FormatDesc::IntegerO { .. }
+                | FormatDesc::IntegerZ { .. }
+                | FormatDesc::RealF { .. }
+                | FormatDesc::RealE { .. }
+                | FormatDesc::RealEN { .. }
+                | FormatDesc::RealES { .. }
+                | FormatDesc::RealEX { .. }
+                | FormatDesc::RealD { .. }
+                | FormatDesc::RealG { .. }
+                | FormatDesc::Logical { .. }
+                | FormatDesc::Character { .. }
+                | FormatDesc::CharTrimmed
+                | FormatDesc::DerivedType { .. }
+        )
+    }
 
-    match letter {
-        'I' => {
-            let w = parse_number(chars).unwrap_or(0);
-            let m = if chars.peek() == Some(&'.') {
-                chars.next();
-                parse_number(chars)
-            } else {
-                None
-            };
-            Some(FormatDesc::IntegerI {
-                width: w,
-                min_digits: m,
-            })
+    fn parse_edit_descriptor(
+        &mut self,
+        repeat: Option<usize>,
+        sign: i32,
+    ) -> Result<FormatDesc, FormatError> {
+        let letter = self
+            .chars
+            .next()
+            .ok_or(FormatError::InvalidFormat)?
+            .to_ascii_uppercase();
+
+        if sign != 0 && letter != 'P' {
+            return Err(FormatError::InvalidFormat);
         }
-        'B' if chars
-            .peek()
-            .map(|c| c.is_ascii_digit() || *c == '\'')
-            .unwrap_or(false) =>
-        {
-            // B followed by digit → binary integer format.
-            // B followed by quote → BOZ literal (not handled here).
-            let w = parse_number(chars).unwrap_or(0);
-            let m = if chars.peek() == Some(&'.') {
-                chars.next();
-                parse_number(chars)
-            } else {
-                None
-            };
-            Some(FormatDesc::IntegerB {
-                width: w,
-                min_digits: m,
-            })
-        }
-        'O' => {
-            let w = parse_number(chars).unwrap_or(0);
-            let m = if chars.peek() == Some(&'.') {
-                chars.next();
-                parse_number(chars)
-            } else {
-                None
-            };
-            Some(FormatDesc::IntegerO {
-                width: w,
-                min_digits: m,
-            })
-        }
-        'Z' => {
-            let w = parse_number(chars).unwrap_or(0);
-            let m = if chars.peek() == Some(&'.') {
-                chars.next();
-                parse_number(chars)
-            } else {
-                None
-            };
-            Some(FormatDesc::IntegerZ {
-                width: w,
-                min_digits: m,
-            })
-        }
-        'F' => {
-            let w = parse_number(chars).unwrap_or(0);
-            let d = if chars.peek() == Some(&'.') {
-                chars.next();
-                parse_number(chars).unwrap_or(0)
-            } else {
-                0
-            };
-            Some(FormatDesc::RealF {
-                width: w,
-                decimals: d,
-            })
-        }
-        'E' => {
-            // Check for EN, ES, EX.
-            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
-            match next {
-                'N' => {
-                    chars.next();
-                    parse_real_desc(chars, |w, d, e| FormatDesc::RealEN {
-                        width: w,
-                        decimals: d,
-                        exp_width: e,
-                    })
-                }
-                'S' => {
-                    chars.next();
-                    parse_real_desc(chars, |w, d, e| FormatDesc::RealES {
-                        width: w,
-                        decimals: d,
-                        exp_width: e,
-                    })
-                }
-                'X' => {
-                    chars.next();
-                    parse_real_desc(chars, |w, d, e| FormatDesc::RealEX {
-                        width: w,
-                        decimals: d,
-                        exp_width: e,
-                    })
-                }
-                _ => parse_real_desc(chars, |w, d, e| FormatDesc::RealE {
-                    width: w,
-                    decimals: d,
-                    exp_width: e,
-                }),
+
+        match letter {
+            'I' => {
+                let (width, min_digits) = self.parse_integer_widths()?;
+                Ok(FormatDesc::IntegerI { width, min_digits })
             }
-        }
-        'D' => {
-            // DC/DP (decimal mode) vs DT (derived type) vs Dw.d (real format).
-            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
-            match next {
-                'C' => {
-                    chars.next();
-                    Some(FormatDesc::DecimalMode(DecimalSep::Comma))
+            'B' => match self.peek_uppercase() {
+                Some('N') => {
+                    self.chars.next();
+                    Ok(FormatDesc::BlankMode(BlankInterpretation::Null))
                 }
-                'P' => {
-                    chars.next();
-                    Some(FormatDesc::DecimalMode(DecimalSep::Point))
-                }
-                'T' => {
-                    chars.next();
-                    // DT optionally followed by 'typename'.
-                    let name = if chars.peek() == Some(&'\'') || chars.peek() == Some(&'"') {
-                        let q = *chars.peek().unwrap();
-                        parse_string_literal(chars, q)
-                    } else {
-                        String::new()
-                    };
-                    Some(FormatDesc::DerivedType { type_name: name })
+                Some('Z') => {
+                    self.chars.next();
+                    Ok(FormatDesc::BlankMode(BlankInterpretation::Zero))
                 }
                 _ => {
-                    let w = parse_number(chars).unwrap_or(0);
-                    let d = if chars.peek() == Some(&'.') {
-                        chars.next();
-                        parse_number(chars).unwrap_or(0)
-                    } else {
-                        0
+                    let (width, min_digits) = self.parse_integer_widths()?;
+                    Ok(FormatDesc::IntegerB { width, min_digits })
+                }
+            },
+            'O' => {
+                let (width, min_digits) = self.parse_integer_widths()?;
+                Ok(FormatDesc::IntegerO { width, min_digits })
+            }
+            'Z' => {
+                let (width, min_digits) = self.parse_integer_widths()?;
+                Ok(FormatDesc::IntegerZ { width, min_digits })
+            }
+            'F' => {
+                let (width, decimals) = self.parse_required_real_widths()?;
+                Ok(FormatDesc::RealF { width, decimals })
+            }
+            'E' => match self.peek_uppercase() {
+                Some('N') => {
+                    self.chars.next();
+                    self.parse_exponential_widths(|width, decimals, exp_width| FormatDesc::RealEN {
+                        width,
+                        decimals,
+                        exp_width,
+                    })
+                }
+                Some('S') => {
+                    self.chars.next();
+                    self.parse_exponential_widths(|width, decimals, exp_width| FormatDesc::RealES {
+                        width,
+                        decimals,
+                        exp_width,
+                    })
+                }
+                Some('X') => {
+                    self.chars.next();
+                    self.parse_exponential_widths(|width, decimals, exp_width| FormatDesc::RealEX {
+                        width,
+                        decimals,
+                        exp_width,
+                    })
+                }
+                _ => {
+                    self.parse_exponential_widths(|width, decimals, exp_width| FormatDesc::RealE {
+                        width,
+                        decimals,
+                        exp_width,
+                    })
+                }
+            },
+            'D' => match self.peek_uppercase() {
+                Some('C') => {
+                    self.chars.next();
+                    Ok(FormatDesc::DecimalMode(DecimalSep::Comma))
+                }
+                Some('P') => {
+                    self.chars.next();
+                    Ok(FormatDesc::DecimalMode(DecimalSep::Point))
+                }
+                Some('T') => {
+                    self.chars.next();
+                    let type_name = match self.chars.peek().copied() {
+                        Some(quote @ ('\'' | '"')) => self.parse_string_literal(quote)?,
+                        _ => String::new(),
                     };
-                    Some(FormatDesc::RealD {
-                        width: w,
-                        decimals: d,
+                    Ok(FormatDesc::DerivedType { type_name })
+                }
+                _ => {
+                    let (width, decimals) = self.parse_required_real_widths()?;
+                    Ok(FormatDesc::RealD { width, decimals })
+                }
+            },
+            'G' => {
+                let width = self.parse_required_number()?;
+                if width == 0 && self.chars.peek() != Some(&'.') {
+                    return Ok(FormatDesc::RealG {
+                        width,
+                        decimals: 0,
+                        exp_width: None,
+                    });
+                }
+                let (decimals, exp_width) = self.parse_decimal_and_exponent_widths()?;
+                Ok(FormatDesc::RealG {
+                    width,
+                    decimals,
+                    exp_width,
+                })
+            }
+            'L' => {
+                if self.peek_uppercase() == Some('Z') {
+                    self.chars.next();
+                    let mode = match self.peek_uppercase() {
+                        Some('S') => {
+                            self.chars.next();
+                            LeadingZeroMode::Suppress
+                        }
+                        Some('P') => {
+                            self.chars.next();
+                            LeadingZeroMode::Print
+                        }
+                        _ => LeadingZeroMode::Default,
+                    };
+                    Ok(FormatDesc::LeadingZero(mode))
+                } else {
+                    Ok(FormatDesc::Logical {
+                        width: self.parse_number()?.unwrap_or(1),
                     })
                 }
             }
-        }
-        'G' => parse_real_desc(chars, |w, d, e| FormatDesc::RealG {
-            width: w,
-            decimals: d,
-            exp_width: e,
-        }),
-        'L' => {
-            // LZ/LZS/LZP (F2023 leading-zero control) — matched
-            // longest-first so LZS is not read as LZ + S(ign). Plain
-            // `L`/`Lw` is logical.
-            if chars.peek().map(|c| c.to_ascii_uppercase()) == Some('Z') {
-                chars.next();
-                let mode = match chars.peek().map(|c| c.to_ascii_uppercase()) {
-                    Some('S') => {
-                        chars.next();
-                        LeadingZeroMode::Suppress
+            'A' => {
+                if self.peek_uppercase() == Some('T') {
+                    self.chars.next();
+                    Ok(FormatDesc::CharTrimmed)
+                } else {
+                    Ok(FormatDesc::Character {
+                        width: self.parse_number()?,
+                    })
+                }
+            }
+            'X' => {
+                let count = repeat.ok_or(FormatError::InvalidFormat)?;
+                if count == 0 {
+                    return Err(FormatError::InvalidFormat);
+                }
+                Ok(FormatDesc::Skip { count })
+            }
+            'T' => {
+                let direction = self.peek_uppercase();
+                let descriptor = match direction {
+                    Some('L') => {
+                        self.chars.next();
+                        FormatDesc::TabLeft {
+                            count: self.parse_positive_number()?,
+                        }
                     }
-                    Some('P') => {
-                        chars.next();
-                        LeadingZeroMode::Print
+                    Some('R') => {
+                        self.chars.next();
+                        FormatDesc::TabRight {
+                            count: self.parse_positive_number()?,
+                        }
                     }
-                    _ => LeadingZeroMode::Default,
+                    _ => FormatDesc::TabTo {
+                        position: self.parse_positive_number()?,
+                    },
                 };
-                Some(FormatDesc::LeadingZero(mode))
-            } else {
-                let w = parse_number(chars).unwrap_or(1);
-                Some(FormatDesc::Logical { width: w })
+                Ok(descriptor)
             }
-        }
-        'A' => {
-            // AT (F2023): A with trailing blanks trimmed. Distinguished
-            // from `Aw` — AT takes no width (AT4 is malformed).
-            if chars.peek().map(|c| c.to_ascii_uppercase()) == Some('T') {
-                chars.next();
-                Some(FormatDesc::CharTrimmed)
-            } else {
-                let w = parse_number(chars);
-                Some(FormatDesc::Character { width: w })
+            'S' => match self.peek_uppercase() {
+                Some('P') => {
+                    self.chars.next();
+                    Ok(FormatDesc::Sign(SignMode::Plus))
+                }
+                Some('S') => {
+                    self.chars.next();
+                    Ok(FormatDesc::Sign(SignMode::Suppress))
+                }
+                _ => Ok(FormatDesc::Sign(SignMode::Default)),
+            },
+            'P' => {
+                let magnitude = repeat.ok_or(FormatError::InvalidFormat)?;
+                let magnitude = i64::try_from(magnitude).map_err(|_| FormatError::InvalidFormat)?;
+                let signed = if sign < 0 { -magnitude } else { magnitude };
+                let scale = i32::try_from(signed).map_err(|_| FormatError::InvalidFormat)?;
+                Ok(FormatDesc::ScaleFactor(scale))
             }
-        }
-        'X' => Some(FormatDesc::Skip {
-            count: repeat.unwrap_or(1),
-        }),
-        'T' => {
-            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
-            match next {
-                'L' => {
-                    chars.next();
-                    let n = parse_number(chars).unwrap_or(1);
-                    Some(FormatDesc::TabLeft { count: n })
-                }
-                'R' => {
-                    chars.next();
-                    let n = parse_number(chars).unwrap_or(1);
-                    Some(FormatDesc::TabRight { count: n })
-                }
-                _ => {
-                    let n = parse_number(chars).unwrap_or(1);
-                    Some(FormatDesc::TabTo { position: n })
-                }
+            'R' => {
+                let mode = match self.peek_uppercase() {
+                    Some('U') => RoundMode::Up,
+                    Some('D') => RoundMode::Down,
+                    Some('Z') => RoundMode::Zero,
+                    Some('N') => RoundMode::Nearest,
+                    Some('C') => RoundMode::Compatible,
+                    Some('P') => RoundMode::ProcessorDefined,
+                    _ => return Err(FormatError::InvalidFormat),
+                };
+                self.chars.next();
+                Ok(FormatDesc::RoundingMode(mode))
             }
+            _ => Err(FormatError::InvalidFormat),
         }
-        'S' => {
-            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
-            match next {
-                'P' => {
-                    chars.next();
-                    Some(FormatDesc::Sign(SignMode::Plus))
-                }
-                'S' => {
-                    chars.next();
-                    Some(FormatDesc::Sign(SignMode::Suppress))
-                }
-                _ => Some(FormatDesc::Sign(SignMode::Default)),
-            }
-        }
-        'P' => {
-            // kP — repeat is the scale factor magnitude, sign from negative flag.
-            let k = repeat.unwrap_or(0) as i32;
-            Some(FormatDesc::ScaleFactor(if negative { -k } else { k }))
-        }
-        'R' => {
-            // Rounding modes: RU, RD, RZ, RN, RC, RP.
-            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
-            let mode = match next {
-                'U' => {
-                    chars.next();
-                    Some(RoundMode::Up)
-                }
-                'D' => {
-                    chars.next();
-                    Some(RoundMode::Down)
-                }
-                'Z' => {
-                    chars.next();
-                    Some(RoundMode::Zero)
-                }
-                'N' => {
-                    chars.next();
-                    Some(RoundMode::Nearest)
-                }
-                'C' => {
-                    chars.next();
-                    Some(RoundMode::Compatible)
-                }
-                'P' => {
-                    chars.next();
-                    Some(RoundMode::ProcessorDefined)
-                }
-                _ => None,
-            };
-            mode.map(FormatDesc::RoundingMode)
-        }
-        'B' => {
-            // BN or BZ.
-            let next = chars.peek().copied().unwrap_or(' ').to_ascii_uppercase();
-            match next {
-                'N' => {
-                    chars.next();
-                    Some(FormatDesc::BlankMode(BlankInterpretation::Null))
-                }
-                'Z' => {
-                    chars.next();
-                    Some(FormatDesc::BlankMode(BlankInterpretation::Zero))
-                }
-                _ => None,
-            }
-        }
-        _ => None, // unknown descriptor
     }
-}
 
-fn parse_real_desc(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-    constructor: impl Fn(usize, usize, Option<usize>) -> FormatDesc,
-) -> Option<FormatDesc> {
-    let w = parse_number(chars).unwrap_or(0);
-    let d = if chars.peek() == Some(&'.') {
-        chars.next();
-        parse_number(chars).unwrap_or(0)
-    } else {
-        0
-    };
-    let e = if chars
-        .peek()
-        .map(|c| c.eq_ignore_ascii_case(&'E'))
-        .unwrap_or(false)
-    {
-        chars.next();
-        parse_number(chars)
-    } else {
-        None
-    };
-    Some(constructor(w, d, e))
+    fn parse_integer_widths(&mut self) -> Result<(usize, Option<usize>), FormatError> {
+        let width = self.parse_required_number()?;
+        let min_digits = if self.chars.peek() == Some(&'.') {
+            self.chars.next();
+            Some(self.parse_required_number()?)
+        } else {
+            None
+        };
+        Ok((width, min_digits))
+    }
+
+    fn parse_required_real_widths(&mut self) -> Result<(usize, usize), FormatError> {
+        let width = self.parse_required_number()?;
+        if self.chars.next() != Some('.') {
+            return Err(FormatError::InvalidFormat);
+        }
+        let decimals = self.parse_required_number()?;
+        Ok((width, decimals))
+    }
+
+    fn parse_exponential_widths(
+        &mut self,
+        constructor: impl Fn(usize, usize, Option<usize>) -> FormatDesc,
+    ) -> Result<FormatDesc, FormatError> {
+        let (width, decimals) = self.parse_required_real_widths()?;
+        let exp_width = self.parse_optional_exponent_width(false)?;
+        Ok(constructor(width, decimals, exp_width))
+    }
+
+    fn parse_decimal_and_exponent_widths(&mut self) -> Result<(usize, Option<usize>), FormatError> {
+        if self.chars.next() != Some('.') {
+            return Err(FormatError::InvalidFormat);
+        }
+        let decimals = self.parse_required_number()?;
+        let exp_width = self.parse_optional_exponent_width(true)?;
+        Ok((decimals, exp_width))
+    }
+
+    fn parse_optional_exponent_width(
+        &mut self,
+        allow_zero: bool,
+    ) -> Result<Option<usize>, FormatError> {
+        if self.peek_uppercase() != Some('E') {
+            return Ok(None);
+        }
+        self.chars.next();
+        let width = self.parse_required_number()?;
+        if width == 0 && !allow_zero {
+            return Err(FormatError::InvalidFormat);
+        }
+        Ok(Some(width))
+    }
+
+    fn parse_positive_number(&mut self) -> Result<usize, FormatError> {
+        let number = self.parse_required_number()?;
+        if number == 0 {
+            return Err(FormatError::InvalidFormat);
+        }
+        Ok(number)
+    }
+
+    fn parse_required_number(&mut self) -> Result<usize, FormatError> {
+        self.parse_number()?.ok_or(FormatError::InvalidFormat)
+    }
+
+    fn parse_number(&mut self) -> Result<Option<usize>, FormatError> {
+        let mut value = 0usize;
+        let mut found = false;
+        while let Some(digit) = self
+            .chars
+            .peek()
+            .filter(|digit| digit.is_ascii_digit())
+            .map(|digit| *digit as usize - '0' as usize)
+        {
+            self.chars.next();
+            value = value
+                .checked_mul(10)
+                .and_then(|number| number.checked_add(digit))
+                .ok_or(FormatError::InvalidFormat)?;
+            found = true;
+        }
+        Ok(found.then_some(value))
+    }
+
+    fn parse_string_literal(&mut self, quote: char) -> Result<String, FormatError> {
+        if self.chars.next() != Some(quote) {
+            return Err(FormatError::InvalidFormat);
+        }
+        let mut literal = String::new();
+        loop {
+            let next = self.chars.next().ok_or(FormatError::InvalidFormat)?;
+            if next != quote {
+                literal.push(next);
+                continue;
+            }
+            if self.chars.peek() == Some(&quote) {
+                self.chars.next();
+                literal.push(quote);
+            } else {
+                return Ok(literal);
+            }
+        }
+    }
+
+    fn peek_uppercase(&mut self) -> Option<char> {
+        self.chars.peek().map(|c| c.to_ascii_uppercase())
+    }
+
+    fn skip_spaces(&mut self) {
+        while self.chars.peek() == Some(&' ') {
+            self.chars.next();
+        }
+    }
 }
 
 // ---- Format application (output) ----
@@ -1717,75 +1811,124 @@ fn rounded_mantissa_reached_upper_bound(text: &str, upper_bound: &str) -> bool {
     text.split_once('.').map_or(text, |(integer, _)| integer) == upper_bound
 }
 
-fn skip_spaces(chars: &mut std::iter::Peekable<std::str::Chars>) {
-    while chars.peek() == Some(&' ') {
-        chars.next();
-    }
-}
-
-fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<usize> {
-    let mut digits = String::new();
-    while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
-            digits.push(c);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse().ok()
-    }
-}
-
-fn parse_string_literal(chars: &mut std::iter::Peekable<std::str::Chars>, quote: char) -> String {
-    chars.next(); // consume opening quote
-    let mut s = String::new();
-    while let Some(&c) = chars.peek() {
-        chars.next();
-        if c == quote {
-            // Check for doubled quote (escape).
-            if chars.peek() == Some(&quote) {
-                chars.next();
-                s.push(quote);
-            } else {
-                break;
-            }
-        } else {
-            s.push(c);
-        }
-    }
-    s
-}
-
-fn collect_until_matching_paren(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
-    let mut depth = 1;
-    let mut inner = String::new();
-    while let Some(&c) = chars.peek() {
-        chars.next();
-        if c == '(' {
-            depth += 1;
-        }
-        if c == ')' {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-        inner.push(c);
-    }
-    inner
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn valid_format(fmt: &str) -> Vec<FormatDesc> {
+        parse_format(fmt).unwrap_or_else(|_| panic!("expected valid FORMAT: {fmt}"))
+    }
+
+    #[test]
+    fn malformed_formats_are_rejected_instead_of_defaulted() {
+        let malformed = [
+            "",
+            "F8.2",
+            "(F8)",
+            "(F.2)",
+            "(F8.)",
+            "(E12)",
+            "(E8.2E)",
+            "(E8.2E0)",
+            "(I)",
+            "(I5.)",
+            "(T)",
+            "(T0)",
+            "(X)",
+            "(P)",
+            "(Q5)",
+            "(,I1)",
+            "(I1,,I1)",
+            "('unterminated)",
+            "(2(I3)",
+            "(I3))",
+            "(*)",
+            "(AT4)",
+            "(0(I1))",
+            "(0X)",
+            "(0/)",
+            "(999999999999999999999999999999I1)",
+        ];
+
+        for format in malformed {
+            assert!(
+                matches!(parse_format(format), Err(FormatError::InvalidFormat)),
+                "malformed FORMAT was accepted: {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_format_boundaries_remain_accepted() {
+        let descriptors =
+            valid_format("(I0,F0.2,G0,G0.4,G12.4E0,E12.4E3,0P,+2P,-2P,2X,2/,'(',*(I1))");
+        assert_eq!(descriptors.len(), 13);
+        assert!(matches!(
+            descriptors.last(),
+            Some(FormatDesc::UnlimitedRepeat { .. })
+        ));
+    }
+
+    #[test]
+    fn parentheses_inside_literals_do_not_change_group_nesting() {
+        let descriptors = valid_format("('(',2(')(',I1),')')");
+        assert_eq!(descriptors.len(), 3);
+        assert!(matches!(
+            &descriptors[0],
+            FormatDesc::LiteralString(text) if text == "("
+        ));
+        assert!(matches!(
+            &descriptors[2],
+            FormatDesc::LiteralString(text) if text == ")"
+        ));
+    }
+
+    #[test]
+    fn format_nesting_is_bounded() {
+        let at_limit = format!(
+            "{}I1{}",
+            "(".repeat(MAX_FORMAT_NESTING),
+            ")".repeat(MAX_FORMAT_NESTING)
+        );
+        assert!(parse_format(&at_limit).is_ok());
+
+        let beyond_limit = format!(
+            "{}I1{}",
+            "(".repeat(MAX_FORMAT_NESTING + 1),
+            ")".repeat(MAX_FORMAT_NESTING + 1)
+        );
+        assert!(matches!(
+            parse_format(&beyond_limit),
+            Err(FormatError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn large_valid_format_is_linear_and_repeat_counts_stay_structural() {
+        let mut format = String::from("(");
+        for index in 0..10_000 {
+            if index != 0 {
+                format.push(',');
+            }
+            format.push_str("I1");
+        }
+        format.push(')');
+        assert_eq!(valid_format(&format).len(), 10_000);
+
+        let repeated = valid_format("(1000000000/)");
+        assert!(matches!(
+            &repeated[..],
+            [FormatDesc::Group {
+                repeat: 1_000_000_000,
+                descriptors,
+                is_reversion_point: false,
+            }] if matches!(&descriptors[..], [FormatDesc::Newline])
+        ));
+    }
+
     #[test]
     fn parse_simple_format() {
-        let descs = parse_format("(I5, F10.3, A)");
+        let descs = valid_format("(I5, F10.3, A)");
         assert_eq!(descs.len(), 3);
         assert!(matches!(
             descs[0],
@@ -1807,14 +1950,14 @@ mod tests {
     #[test]
     fn parse_with_repeat() {
         // 3I5 means "repeat I5 three times" — wrapped in a Group.
-        let descs = parse_format("(3I5)");
+        let descs = valid_format("(3I5)");
         assert_eq!(descs.len(), 1);
         assert!(matches!(descs[0], FormatDesc::Group { repeat: 3, .. }));
     }
 
     #[test]
     fn parse_control_descriptors() {
-        let descs = parse_format("(2X, /, SP, T10)");
+        let descs = valid_format("(2X, /, SP, T10)");
         assert!(matches!(descs[0], FormatDesc::Skip { count: 2 }));
         assert!(matches!(descs[1], FormatDesc::Newline));
         assert!(matches!(descs[2], FormatDesc::Sign(SignMode::Plus)));
@@ -1823,7 +1966,7 @@ mod tests {
 
     #[test]
     fn parse_string_literal() {
-        let descs = parse_format("('hello', A)");
+        let descs = valid_format("('hello', A)");
         assert_eq!(descs.len(), 2);
         if let FormatDesc::LiteralString(s) = &descs[0] {
             assert_eq!(s, "hello");
@@ -1834,7 +1977,7 @@ mod tests {
 
     #[test]
     fn parse_es_en_format() {
-        let descs = parse_format("(ES15.8, EN12.3)");
+        let descs = valid_format("(ES15.8, EN12.3)");
         assert!(matches!(
             descs[0],
             FormatDesc::RealES {
@@ -1855,7 +1998,7 @@ mod tests {
 
     #[test]
     fn format_integer() {
-        let descs = parse_format("(I5)");
+        let descs = valid_format("(I5)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(42)]);
         assert_eq!(out, "   42");
@@ -1863,7 +2006,7 @@ mod tests {
 
     #[test]
     fn format_integer_with_min_digits() {
-        let descs = parse_format("(I5.3)");
+        let descs = valid_format("(I5.3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(7)]);
         assert_eq!(out, "  007");
@@ -1871,7 +2014,7 @@ mod tests {
 
     #[test]
     fn format_real_f() {
-        let descs = parse_format("(F8.3)");
+        let descs = valid_format("(F8.3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.23456)]);
         assert_eq!(out, "   1.235");
@@ -1879,7 +2022,7 @@ mod tests {
 
     #[test]
     fn format_real_f_zero_decimals_keeps_decimal_point() {
-        let descs = parse_format("(F4.0)");
+        let descs = valid_format("(F4.0)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.0)]);
         assert_eq!(out, "  1.");
@@ -1887,7 +2030,7 @@ mod tests {
 
     #[test]
     fn format_real_sign_plus() {
-        let descs = parse_format("(SP,F6.2)");
+        let descs = valid_format("(SP,F6.2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.0)]);
         assert_eq!(out, " +1.00");
@@ -1895,7 +2038,7 @@ mod tests {
 
     #[test]
     fn format_real_overflow_uses_stars() {
-        let descs = parse_format("(F6.2,1X,F6.3)");
+        let descs = valid_format("(F6.2,1X,F6.3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(-100.0), IoValue::Real(1000.0)]);
         assert_eq!(out, "****** ******");
@@ -1903,7 +2046,7 @@ mod tests {
 
     #[test]
     fn format_exponential_omits_leading_zero_to_fit_width() {
-        let descs = parse_format("(E7.2)");
+        let descs = valid_format("(E7.2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(289.0)]);
         assert_eq!(out, ".29E+03");
@@ -1911,7 +2054,7 @@ mod tests {
 
     #[test]
     fn format_logical() {
-        let descs = parse_format("(L3)");
+        let descs = valid_format("(L3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Logical(true)]);
         assert_eq!(out, "  T");
@@ -1919,26 +2062,26 @@ mod tests {
 
     #[test]
     fn format_character() {
-        let descs = parse_format("(A5)");
+        let descs = valid_format("(A5)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Character(b"hi".to_vec())]);
         assert_eq!(out, "   hi");
 
-        let out = FormatEngine::new(parse_format("(A5)"))
+        let out = FormatEngine::new(valid_format("(A5)"))
             .format_values(&[IoValue::Character(Vec::new())]);
         assert_eq!(out, "     ");
     }
 
     #[test]
     fn format_g0_character_uses_unlimited_width() {
-        let out = FormatEngine::new(parse_format("(G0)"))
+        let out = FormatEngine::new(valid_format("(G0)"))
             .format_values(&[IoValue::Character(b"txt".to_vec())]);
         assert_eq!(out, "txt");
     }
 
     #[test]
     fn format_mixed() {
-        let descs = parse_format("('Count: ', I4)");
+        let descs = valid_format("('Count: ', I4)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(42)]);
         assert_eq!(out, "Count:   42");
@@ -1946,7 +2089,7 @@ mod tests {
 
     #[test]
     fn format_with_newline() {
-        let descs = parse_format("(I3, /, I3)");
+        let descs = valid_format("(I3, /, I3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(1), IoValue::Integer(2)]);
         assert_eq!(out, "  1\n  2");
@@ -1954,7 +2097,7 @@ mod tests {
 
     #[test]
     fn format_skip() {
-        let descs = parse_format("(I3, 3X, I3)");
+        let descs = valid_format("(I3, 3X, I3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(1), IoValue::Integer(2)]);
         assert_eq!(out, "  1     2");
@@ -1962,19 +2105,19 @@ mod tests {
 
     #[test]
     fn format_tab_descriptors_overlay_without_truncation() {
-        let out = FormatEngine::new(parse_format("(A,T3,A)")).format_values(&[
+        let out = FormatEngine::new(valid_format("(A,T3,A)")).format_values(&[
             IoValue::Character(b"abcdef".to_vec()),
             IoValue::Character(b"XY".to_vec()),
         ]);
         assert_eq!(out, "abXYef");
 
-        let out = FormatEngine::new(parse_format("(A,TL3,A)")).format_values(&[
+        let out = FormatEngine::new(valid_format("(A,TL3,A)")).format_values(&[
             IoValue::Character(b"abcdef".to_vec()),
             IoValue::Character(b"XY".to_vec()),
         ]);
         assert_eq!(out, "abcXYf");
 
-        let out = FormatEngine::new(parse_format("(A,TR3,A)")).format_values(&[
+        let out = FormatEngine::new(valid_format("(A,TR3,A)")).format_values(&[
             IoValue::Character(b"ab".to_vec()),
             IoValue::Character(b"Z".to_vec()),
         ]);
@@ -1983,14 +2126,14 @@ mod tests {
 
     #[test]
     fn format_trailing_x_only_moves_position() {
-        let out = FormatEngine::new(parse_format("(I0,1X)")).format_values(&[IoValue::Integer(5)]);
+        let out = FormatEngine::new(valid_format("(I0,1X)")).format_values(&[IoValue::Integer(5)]);
         assert_eq!(out, "5");
 
-        let out = FormatEngine::new(parse_format("(I0,1X,I0)"))
+        let out = FormatEngine::new(valid_format("(I0,1X,I0)"))
             .format_values(&[IoValue::Integer(5), IoValue::Integer(6)]);
         assert_eq!(out, "5 6");
 
-        let out = FormatEngine::new(parse_format("(3(I0,1X))")).format_values(&[
+        let out = FormatEngine::new(valid_format("(3(I0,1X))")).format_values(&[
             IoValue::Integer(1),
             IoValue::Integer(2),
             IoValue::Integer(3),
@@ -2000,7 +2143,7 @@ mod tests {
 
     #[test]
     fn format_sign_plus() {
-        let descs = parse_format("(SP, I5)");
+        let descs = valid_format("(SP, I5)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(42)]);
         assert_eq!(out, "  +42");
@@ -2008,7 +2151,7 @@ mod tests {
 
     #[test]
     fn format_hex_integer() {
-        let descs = parse_format("(Z4)");
+        let descs = valid_format("(Z4)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(255)]);
         assert_eq!(out, "  FF");
@@ -2016,7 +2159,7 @@ mod tests {
 
     #[test]
     fn format_hex_negative_uses_requested_twos_complement_width() {
-        let descs = parse_format("(Z16.16)");
+        let descs = valid_format("(Z16.16)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(-1)]);
         assert_eq!(out, "FFFFFFFFFFFFFFFF");
@@ -2024,7 +2167,7 @@ mod tests {
 
     #[test]
     fn format_octal_integer() {
-        let descs = parse_format("(O6)");
+        let descs = valid_format("(O6)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(255)]);
         assert_eq!(out, "   377");
@@ -2032,7 +2175,7 @@ mod tests {
 
     #[test]
     fn format_octal_integer_with_min_digits() {
-        let descs = parse_format("(O4.4)");
+        let descs = valid_format("(O4.4)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(18)]);
         assert_eq!(out, "0022");
@@ -2040,7 +2183,7 @@ mod tests {
 
     #[test]
     fn format_colon_stops_early() {
-        let descs = parse_format("(I3, :, ', ', I3)");
+        let descs = valid_format("(I3, :, ', ', I3)");
         let mut engine = FormatEngine::new(descs);
         // Only one value — colon stops before the comma-space-I3.
         let out = engine.format_values(&[IoValue::Integer(42)]);
@@ -2049,7 +2192,7 @@ mod tests {
 
     #[test]
     fn format_unlimited_repeat() {
-        let descs = parse_format("(*(I3, ','))");
+        let descs = valid_format("(*(I3, ','))");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Integer(1),
@@ -2061,7 +2204,7 @@ mod tests {
 
     #[test]
     fn parse_dc_dp_decimal_mode() {
-        let descs = parse_format("(DC, F8.3, DP, F8.3)");
+        let descs = valid_format("(DC, F8.3, DP, F8.3)");
         assert_eq!(descs.len(), 4);
         assert!(matches!(
             descs[0],
@@ -2075,7 +2218,7 @@ mod tests {
 
     #[test]
     fn parse_dt_derived_type() {
-        let descs = parse_format("(DT'mytype')");
+        let descs = valid_format("(DT'mytype')");
         assert_eq!(descs.len(), 1);
         if let FormatDesc::DerivedType { ref type_name } = descs[0] {
             assert_eq!(type_name, "mytype");
@@ -2086,7 +2229,7 @@ mod tests {
 
     #[test]
     fn parse_dt_no_name() {
-        let descs = parse_format("(DT)");
+        let descs = valid_format("(DT)");
         assert_eq!(descs.len(), 1);
         if let FormatDesc::DerivedType { ref type_name } = descs[0] {
             assert_eq!(type_name, "");
@@ -2097,7 +2240,7 @@ mod tests {
 
     #[test]
     fn parse_rounding_modes() {
-        let descs = parse_format("(RU, F8.3, RD, F8.3, RZ, F8.3, RN, F8.3, RC, F8.3, RP, F8.3)");
+        let descs = valid_format("(RU, F8.3, RD, F8.3, RZ, F8.3, RN, F8.3, RC, F8.3, RP, F8.3)");
         assert!(matches!(descs[0], FormatDesc::RoundingMode(RoundMode::Up)));
         assert!(matches!(
             descs[2],
@@ -2123,7 +2266,7 @@ mod tests {
 
     #[test]
     fn parse_leading_zero_modes() {
-        let descs = parse_format("(LZ, F6.3, LZS, F6.3, LZP, F6.3)");
+        let descs = valid_format("(LZ, F6.3, LZS, F6.3, LZP, F6.3)");
         assert!(matches!(
             descs[0],
             FormatDesc::LeadingZero(LeadingZeroMode::Default)
@@ -2176,11 +2319,11 @@ mod tests {
         // set_leading_zero models the OPEN/WRITE connection mode: a plain
         // (F6.3) with no LZ descriptor honors the seeded mode, and an
         // explicit LZP descriptor in the format overrides it mid-string.
-        let mut engine = FormatEngine::new(parse_format("(F6.3)"));
+        let mut engine = FormatEngine::new(valid_format("(F6.3)"));
         engine.set_leading_zero(LeadingZeroMode::Suppress);
         assert_eq!(engine.format_values(&[IoValue::Real(0.25)]).trim(), ".250");
 
-        let mut overridden = FormatEngine::new(parse_format("(LZP, F6.3)"));
+        let mut overridden = FormatEngine::new(valid_format("(LZP, F6.3)"));
         overridden.set_leading_zero(LeadingZeroMode::Suppress);
         assert_eq!(
             overridden.format_values(&[IoValue::Real(0.25)]).trim(),
@@ -2192,7 +2335,7 @@ mod tests {
     fn parse_lz_not_confused_with_logical_or_sign() {
         // LZS must tokenize as one descriptor, not LZ + S(ign default);
         // bare L is still logical.
-        let descs = parse_format("(LZS, L2)");
+        let descs = valid_format("(LZS, L2)");
         assert!(matches!(
             descs[0],
             FormatDesc::LeadingZero(LeadingZeroMode::Suppress)
@@ -2204,11 +2347,11 @@ mod tests {
     fn parse_at_descriptor_not_tab() {
         // AT is the trimmed-character descriptor, distinct from A and
         // from a T position descriptor.
-        let descs = parse_format("(1X,AT,F4.1)");
+        let descs = valid_format("(1X,AT,F4.1)");
         assert!(matches!(descs[0], FormatDesc::Skip { .. }));
         assert!(matches!(descs[1], FormatDesc::CharTrimmed));
         assert!(matches!(descs[2], FormatDesc::RealF { .. }));
-        let plain = parse_format("(A4)");
+        let plain = valid_format("(A4)");
         assert!(matches!(plain[0], FormatDesc::Character { width: Some(4) }));
     }
 
@@ -2216,15 +2359,15 @@ mod tests {
     fn format_leading_zero_suppress() {
         // LZS drops the leading zero; default/LZP keep it.
         let s =
-            FormatEngine::new(parse_format("(LZS, F6.3)")).format_values(&[IoValue::Real(0.25)]);
+            FormatEngine::new(valid_format("(LZS, F6.3)")).format_values(&[IoValue::Real(0.25)]);
         assert_eq!(s.trim(), ".250");
         let neg =
-            FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(-0.25)]);
+            FormatEngine::new(valid_format("(LZS, F7.3)")).format_values(&[IoValue::Real(-0.25)]);
         assert_eq!(neg.trim(), "-.250");
-        let def = FormatEngine::new(parse_format("(F6.3)")).format_values(&[IoValue::Real(0.25)]);
+        let def = FormatEngine::new(valid_format("(F6.3)")).format_values(&[IoValue::Real(0.25)]);
         assert_eq!(def.trim(), "0.250");
         let lzp =
-            FormatEngine::new(parse_format("(LZP, F6.3)")).format_values(&[IoValue::Real(0.25)]);
+            FormatEngine::new(valid_format("(LZP, F6.3)")).format_values(&[IoValue::Real(0.25)]);
         assert_eq!(lzp.trim(), "0.250");
     }
 
@@ -2232,7 +2375,7 @@ mod tests {
     fn format_leading_zero_suppress_only_below_one() {
         // No leading zero to drop when |value| >= 1.
         let s =
-            FormatEngine::new(parse_format("(LZS, F7.3)")).format_values(&[IoValue::Real(10.25)]);
+            FormatEngine::new(valid_format("(LZS, F7.3)")).format_values(&[IoValue::Real(10.25)]);
         assert_eq!(s.trim(), "10.250");
     }
 
@@ -2240,7 +2383,7 @@ mod tests {
     fn format_leading_zero_suppress_exponential() {
         // E-format mantissa leading zero is suppressed too.
         let s =
-            FormatEngine::new(parse_format("(LZS, E10.3)")).format_values(&[IoValue::Real(0.25)]);
+            FormatEngine::new(valid_format("(LZS, E10.3)")).format_values(&[IoValue::Real(0.25)]);
         assert!(s.contains(".250"), "got {s}");
         assert!(
             !s.trim().starts_with('0'),
@@ -2250,29 +2393,29 @@ mod tests {
 
     #[test]
     fn format_at_trims_trailing_blanks() {
-        let s = FormatEngine::new(parse_format("(AT)"))
+        let s = FormatEngine::new(valid_format("(AT)"))
             .format_values(&[IoValue::Character(b"hi   ".to_vec())]);
         assert_eq!(s, "hi");
-        let blank = FormatEngine::new(parse_format("(AT)"))
+        let blank = FormatEngine::new(valid_format("(AT)"))
             .format_values(&[IoValue::Character(b"     ".to_vec())]);
         assert_eq!(blank, "");
     }
 
     #[test]
     fn parse_negative_scale_factor() {
-        let descs = parse_format("(-2P, E15.8)");
+        let descs = valid_format("(-2P, E15.8)");
         assert!(matches!(descs[0], FormatDesc::ScaleFactor(-2)));
     }
 
     #[test]
     fn parse_positive_scale_factor() {
-        let descs = parse_format("(3P, E15.8)");
+        let descs = valid_format("(3P, E15.8)");
         assert!(matches!(descs[0], FormatDesc::ScaleFactor(3)));
     }
 
     #[test]
     fn format_decimal_comma() {
-        let descs = parse_format("(DC, F8.3)");
+        let descs = valid_format("(DC, F8.3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.23)]);
         assert!(out.contains(','), "expected comma in output: {}", out);
@@ -2281,7 +2424,7 @@ mod tests {
 
     #[test]
     fn format_rounding_up() {
-        let descs = parse_format("(RU, F6.2)");
+        let descs = valid_format("(RU, F6.2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.234)]);
         // RU rounds 1.234 up to 1.24 at 2 decimals.
@@ -2290,7 +2433,7 @@ mod tests {
 
     #[test]
     fn format_rounding_down() {
-        let descs = parse_format("(RD, F6.2)");
+        let descs = valid_format("(RD, F6.2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.236)]);
         // RD rounds 1.236 down to 1.23 at 2 decimals.
@@ -2299,7 +2442,7 @@ mod tests {
 
     #[test]
     fn format_rounding_zero() {
-        let descs = parse_format("(RZ, F6.2)");
+        let descs = valid_format("(RZ, F6.2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(-1.236)]);
         // RZ truncates toward zero: -1.236 → -1.23.
@@ -2309,7 +2452,7 @@ mod tests {
     #[test]
     fn format_scale_factor_f() {
         // 2P with F: multiplies value by 10^2 before formatting.
-        let descs = parse_format("(2P, F8.2)");
+        let descs = valid_format("(2P, F8.2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(1.5)]);
         // 1.5 * 100 = 150.00
@@ -2318,7 +2461,7 @@ mod tests {
 
     #[test]
     fn format_scale_factor_e_reduces_fractional_digits() {
-        let descs = parse_format("(2P,E12.4,1X,E12.4,1X,E12.4)");
+        let descs = valid_format("(2P,E12.4,1X,E12.4,1X,E12.4)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Real(12345.678),
@@ -2330,7 +2473,7 @@ mod tests {
 
     #[test]
     fn format_g0_nonfinite_reals() {
-        let descs = parse_format("(G0, 1X, G0, 1X, G0)");
+        let descs = valid_format("(G0, 1X, G0, 1X, G0)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Real(f64::INFINITY),
@@ -2342,7 +2485,7 @@ mod tests {
 
     #[test]
     fn format_g0_finite_reals() {
-        let descs = parse_format("(G0,1X,G0,1X,G0,1X,G0)");
+        let descs = valid_format("(G0,1X,G0,1X,G0,1X,G0)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Real32(100.0),
@@ -2358,7 +2501,7 @@ mod tests {
 
     #[test]
     fn format_g0_real_kinds_use_kind_precision() {
-        let descs = parse_format("(G0,1X,G0,1X,G0)");
+        let descs = valid_format("(G0,1X,G0,1X,G0)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Real32((1.0f32 / 3.0f32) as f64),
@@ -2371,7 +2514,7 @@ mod tests {
     #[test]
     fn format_nonzero_width_g_uses_significant_digits_and_reserved_columns() {
         let format = |value| {
-            FormatEngine::new(parse_format("(G12.4)")).format_values(&[IoValue::Real(value)])
+            FormatEngine::new(valid_format("(G12.4)")).format_values(&[IoValue::Real(value)])
         };
 
         assert_eq!(format(0.0), "   0.000    ");
@@ -2386,7 +2529,7 @@ mod tests {
     #[test]
     fn format_nonzero_width_g_selects_style_after_significant_rounding() {
         let format = |value| {
-            FormatEngine::new(parse_format("(G12.4)")).format_values(&[IoValue::Real(value)])
+            FormatEngine::new(valid_format("(G12.4)")).format_values(&[IoValue::Real(value)])
         };
 
         assert_eq!(format(0.099995), "  0.1000    ");
@@ -2396,21 +2539,21 @@ mod tests {
     #[test]
     fn format_nonzero_width_g_honors_explicit_exponent_reservation_and_overflow() {
         let out =
-            FormatEngine::new(parse_format("(G14.4E3)")).format_values(&[IoValue::Real(12.345)]);
+            FormatEngine::new(valid_format("(G14.4E3)")).format_values(&[IoValue::Real(12.345)]);
         assert_eq!(out, "    12.35     ");
 
         let out =
-            FormatEngine::new(parse_format("(G14.4E3)")).format_values(&[IoValue::Real(0.012345)]);
+            FormatEngine::new(valid_format("(G14.4E3)")).format_values(&[IoValue::Real(0.012345)]);
         assert_eq!(out, "   0.1235E-001");
 
-        let out = FormatEngine::new(parse_format("(G8.4)")).format_values(&[IoValue::Real(12.345)]);
+        let out = FormatEngine::new(valid_format("(G8.4)")).format_values(&[IoValue::Real(12.345)]);
         assert_eq!(out, "********");
     }
 
     #[test]
     fn format_nonzero_width_g_rounding_modes_control_boundary_selection() {
         let format = |descriptor, value| {
-            FormatEngine::new(parse_format(descriptor)).format_values(&[IoValue::Real(value)])
+            FormatEngine::new(valid_format(descriptor)).format_values(&[IoValue::Real(value)])
         };
 
         assert_eq!(format("(RU,G12.4)", 0.099991), "  0.1000    ");
@@ -2434,7 +2577,7 @@ mod tests {
 
     #[test]
     fn format_g0_integer_and_logical() {
-        let descs = parse_format("(G0,1X,G0,1X,SP,G0)");
+        let descs = valid_format("(G0,1X,G0,1X,SP,G0)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Integer(-1026191),
@@ -2446,7 +2589,7 @@ mod tests {
 
     #[test]
     fn format_checked_rejects_values_without_data_descriptor() {
-        let descs = parse_format("(1X)");
+        let descs = valid_format("(1X)");
         let mut engine = FormatEngine::new(descs);
         assert_eq!(
             engine.format_values_checked(&[IoValue::Logical(false)]),
@@ -2456,7 +2599,7 @@ mod tests {
 
     #[test]
     fn format_reversion_starts_new_records() {
-        let descs = parse_format("(A)");
+        let descs = valid_format("(A)");
         let mut engine = FormatEngine::new(descs);
         let out = engine
             .format_values_reverting_checked(&[
@@ -2470,7 +2613,7 @@ mod tests {
 
     #[test]
     fn format_reversion_reuses_multi_descriptor_format() {
-        let descs = parse_format("(I2,1X,I2)");
+        let descs = valid_format("(I2,1X,I2)");
         let mut engine = FormatEngine::new(descs);
         let out = engine
             .format_values_reverting_checked(&[
@@ -2485,7 +2628,7 @@ mod tests {
 
     #[test]
     fn format_reversion_starts_at_rightmost_parenthesized_group() {
-        let mut engine = FormatEngine::new(parse_format("(\"P\",2(I0,1X))"));
+        let mut engine = FormatEngine::new(valid_format("(\"P\",2(I0,1X))"));
         let out = engine
             .format_values_reverting_checked(&[
                 IoValue::Integer(1),
@@ -2499,7 +2642,7 @@ mod tests {
 
     #[test]
     fn format_reversion_includes_descriptors_after_group() {
-        let mut engine = FormatEngine::new(parse_format("(\"E\",2(I0,1X),\"Z\",I0)"));
+        let mut engine = FormatEngine::new(valid_format("(\"E\",2(I0,1X),\"Z\",I0)"));
         let out = engine
             .format_values_reverting_checked(&[
                 IoValue::Integer(1),
@@ -2515,7 +2658,7 @@ mod tests {
 
     #[test]
     fn format_reversion_uses_outer_group_nearest_format_end() {
-        let mut engine = FormatEngine::new(parse_format("(\"B\",2(I0,3(\"x\",I0,1X)))"));
+        let mut engine = FormatEngine::new(valid_format("(\"B\",2(I0,3(\"x\",I0,1X)))"));
         let values: Vec<_> = (1..=12).map(IoValue::Integer).collect();
         let out = engine.format_values_reverting_checked(&values).unwrap();
         assert_eq!(out, "B1x2 x3 x4 5x6 x7 x8\n9x10 x11 x12");
@@ -2523,7 +2666,7 @@ mod tests {
 
     #[test]
     fn format_reversion_ignores_data_descriptor_repeat_wrapper() {
-        let mut engine = FormatEngine::new(parse_format("(\"P\",2I0)"));
+        let mut engine = FormatEngine::new(valid_format("(\"P\",2I0)"));
         let out = engine
             .format_values_reverting_checked(&[
                 IoValue::Integer(1),
@@ -2537,7 +2680,7 @@ mod tests {
 
     #[test]
     fn format_reversion_preserves_control_state_before_group() {
-        let mut engine = FormatEngine::new(parse_format("(SP,\"P\",(I0))"));
+        let mut engine = FormatEngine::new(valid_format("(SP,\"P\",(I0))"));
         let out = engine
             .format_values_reverting_checked(&[IoValue::Integer(1), IoValue::Integer(2)])
             .unwrap();
@@ -2546,7 +2689,7 @@ mod tests {
 
     #[test]
     fn format_reversion_keeps_unlimited_group_on_one_record() {
-        let mut engine = FormatEngine::new(parse_format("(\"P\",*(I0,1X))"));
+        let mut engine = FormatEngine::new(valid_format("(\"P\",*(I0,1X))"));
         let out = engine
             .format_values_reverting_checked(&[
                 IoValue::Integer(1),
@@ -2560,7 +2703,7 @@ mod tests {
     #[test]
     fn format_es_dp_precision_roundtrips() {
         let value = -1.9972267279387788e-1f64;
-        let descs = parse_format("(ES24.16E3)");
+        let descs = valid_format("(ES24.16E3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(value)]);
         assert_eq!(out.trim().parse::<f64>().unwrap(), value);
@@ -2569,7 +2712,7 @@ mod tests {
     #[test]
     fn format_es_renormalizes_rounding_carry() {
         let format = |descriptor, value| {
-            FormatEngine::new(parse_format(descriptor)).format_values(&[IoValue::Real(value)])
+            FormatEngine::new(valid_format(descriptor)).format_values(&[IoValue::Real(value)])
         };
 
         assert_eq!(format("(RU,ES13.3)", 9.9991), "    1.000E+01");
@@ -2582,7 +2725,7 @@ mod tests {
     #[test]
     fn format_en_renormalizes_rounding_carry() {
         let format = |descriptor, value| {
-            FormatEngine::new(parse_format(descriptor)).format_values(&[IoValue::Real(value)])
+            FormatEngine::new(valid_format(descriptor)).format_values(&[IoValue::Real(value)])
         };
 
         assert_eq!(format("(RU,EN14.3)", 999.9991), "     1.000E+03");
@@ -2596,7 +2739,7 @@ mod tests {
 
     #[test]
     fn format_en_subunit_values_use_engineering_exponents() {
-        let mut engine = FormatEngine::new(parse_format("(EN14.3)"));
+        let mut engine = FormatEngine::new(valid_format("(EN14.3)"));
         let out = engine
             .format_values_reverting_checked(&[
                 IoValue::Real(0.1),
@@ -2614,7 +2757,7 @@ mod tests {
 
     #[test]
     fn format_exponential_nonfinite_reals() {
-        let descs = parse_format("(E8.1, 1X, ES8.1, 1X, EN8.1, 1X, D8.1)");
+        let descs = valid_format("(E8.1, 1X, ES8.1, 1X, EN8.1, 1X, D8.1)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[
             IoValue::Real(f64::INFINITY),
@@ -2627,7 +2770,7 @@ mod tests {
 
     #[test]
     fn format_e_huge_real_has_roundtripping_mantissa() {
-        let descs = parse_format("(E30.18E3)");
+        let descs = valid_format("(E30.18E3)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(f64::MAX)]);
         let text = out.trim();
@@ -2644,7 +2787,7 @@ mod tests {
 
     #[test]
     fn format_d_descriptor() {
-        let descs = parse_format("(D12.5)");
+        let descs = valid_format("(D12.5)");
         assert!(matches!(
             descs[0],
             FormatDesc::RealD {
@@ -2657,7 +2800,7 @@ mod tests {
     #[test]
     fn format_d_vs_dc() {
         // D12.5 is a real descriptor; DC is decimal comma mode.
-        let descs = parse_format("(DC, D12.5)");
+        let descs = valid_format("(DC, D12.5)");
         assert!(matches!(
             descs[0],
             FormatDesc::DecimalMode(DecimalSep::Comma)
@@ -2673,7 +2816,7 @@ mod tests {
 
     #[test]
     fn format_integer16_full_width() {
-        let descs = parse_format("(I40)");
+        let descs = valid_format("(I40)");
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(
             170141183460469231731687303715884105727i128,

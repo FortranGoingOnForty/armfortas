@@ -4729,7 +4729,7 @@ pub extern "C" fn afs_io_finalize() {
 
 use crate::format::{
     format_reversion_descriptors, parse_format, BlankInterpretation, DecimalSep, FormatDesc,
-    FormatEngine, IoValue, LeadingZeroMode,
+    FormatEngine, FormatError, IoValue, LeadingZeroMode,
 };
 use std::cell::RefCell;
 
@@ -4787,19 +4787,19 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-fn cached_format_descriptors(fmt: &str) -> Arc<[FormatDesc]> {
+fn cached_format_descriptors(fmt: &str) -> Result<Arc<[FormatDesc]>, FormatError> {
     FORMAT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(descriptors) = cache.get(fmt) {
-            return Arc::clone(descriptors);
+            return Ok(Arc::clone(descriptors));
         }
 
-        let descriptors = Arc::from(parse_format(fmt).into_boxed_slice());
+        let descriptors = Arc::from(parse_format(fmt)?.into_boxed_slice());
         if cache.len() >= FORMAT_CACHE_LIMIT {
             cache.clear();
         }
         cache.insert(fmt.to_owned(), Arc::clone(&descriptors));
-        descriptors
+        Ok(descriptors)
     })
 }
 
@@ -5228,8 +5228,14 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
             let mut io_status: i32 = 0;
             let mut io_msg: Option<&'static str> = None;
 
-            match c.sink {
-                FmtSink::Unit(unit) => {
+            match cached_format_descriptors(&c.format_str) {
+                Err(_) => {
+                    io_status = 1;
+                    io_msg = Some("invalid format");
+                }
+                Ok(descriptors) => {
+                    match c.sink {
+                    FmtSink::Unit(unit) => {
                     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
                     let fast_character = if c.stmt_leading_zero.is_none()
                         && is_simple_character_format(&c.format_str)
@@ -5254,8 +5260,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             io_msg = Some("unit not connected");
                         }
                     } else {
-                        let descriptors = cached_format_descriptors(&c.format_str);
-                        let mut engine = FormatEngine::from_shared(descriptors);
+                        let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
                         // Seed the leading-zero mode: the statement override
                         // (LEADING_ZERO= on WRITE) beats the connection mode
                         // (LEADING_ZERO= on OPEN); format LZ/LZS/LZP descriptors
@@ -5287,10 +5292,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             }
                         }
                     }
-                }
-                FmtSink::Internal { buf, buf_len } => {
-                    let descriptors = cached_format_descriptors(&c.format_str);
-                    let mut engine = FormatEngine::from_shared(descriptors);
+                    }
+                    FmtSink::Internal { buf, buf_len } => {
+                    let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }
@@ -5329,10 +5333,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             io_msg = Some("format error");
                         }
                     }
-                }
-                FmtSink::InternalAlloc { desc } => {
-                    let descriptors = cached_format_descriptors(&c.format_str);
-                    let mut engine = FormatEngine::from_shared(descriptors);
+                    }
+                    FmtSink::InternalAlloc { desc } => {
+                    let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
                     }
@@ -5363,13 +5366,12 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             io_msg = Some("format error");
                         }
                     }
-                }
-                FmtSink::InternalArray {
-                    buf,
-                    elem_len,
-                    nelems,
-                } => {
-                    let descriptors = cached_format_descriptors(&c.format_str);
+                    }
+                    FmtSink::InternalArray {
+                        buf,
+                        elem_len,
+                        nelems,
+                    } => {
                     let mut engine = FormatEngine::from_shared(descriptors);
                     if let Some(mode) = c.stmt_leading_zero {
                         engine.set_leading_zero(mode);
@@ -5426,6 +5428,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                             io_status = 1;
                             io_msg = Some("format error");
                         }
+                    }
+                    }
                     }
                 }
             }
@@ -5822,7 +5826,7 @@ fn parse_nth_formatted_record_with_state(
     data_index: i64,
 ) -> Result<(FormatDesc, Vec<u8>, FormattedInputState), i32> {
     let fmt = unsafe_str(fmt_str, fmt_len);
-    let descs = parse_format(&fmt);
+    let descs = parse_format(&fmt).map_err(|_| 1)?;
     let mut cursor = 0usize;
     let mut remaining = data_index.max(0) as usize;
     let mut state = FormattedInputState::default();
@@ -5934,7 +5938,7 @@ fn parse_nth_formatted_unit_field_with_state(
     data_index: i64,
 ) -> Result<(FormatDesc, Vec<u8>, FormattedInputState), i32> {
     let fmt = unsafe_str(fmt_str, fmt_len);
-    let descs = parse_format(&fmt);
+    let descs = parse_format(&fmt).map_err(|_| 1)?;
     let plan = plan_formatted_input(&descs, data_index).ok_or(1)?;
     let input = formatted_read_record_for_unit(unit, plan.starts_new_record)?;
     let mut cursor = 0usize;
@@ -6126,7 +6130,14 @@ pub extern "C" fn afs_fmt_read_string(
                         .unwrap_or(0);
             if has_partial_record {
                 let fmt = unsafe_str(fmt_str, fmt_len);
-                let descs = parse_format(&fmt);
+                let descs = match parse_format(&fmt) {
+                    Ok(descs) => descs,
+                    Err(_) => {
+                        drop(state);
+                        store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
+                        return;
+                    }
+                };
                 let input = u
                     .formatted_read_record
                     .as_ref()
@@ -6175,7 +6186,13 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
     iostat: *mut i32,
 ) {
     let fmt = unsafe_str(fmt_str, fmt_len);
-    let descs = parse_format(&fmt);
+    let descs = match parse_format(&fmt) {
+        Ok(descs) => descs,
+        Err(_) => {
+            store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
+            return;
+        }
+    };
 
     let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let Some(u) = state.get_unit(unit) else {
@@ -8386,6 +8403,96 @@ mod tests {
     }
 
     #[test]
+    fn malformed_dynamic_format_sets_write_status_without_touching_target() {
+        let mut buffer = [b'?'; 16];
+        let mut iostat = -99;
+        let mut iomsg = [b'?'; 32];
+        let format = "(F8)";
+
+        afs_fmt_begin_internal_ex(
+            buffer.as_mut_ptr(),
+            buffer.len() as i64,
+            format.as_ptr(),
+            format.len() as i64,
+            &mut iostat,
+            iomsg.as_mut_ptr(),
+            iomsg.len() as i64,
+        );
+        afs_fmt_push_real(1.25);
+        afs_fmt_end(0);
+
+        assert_eq!(iostat, 1);
+        assert_eq!(buffer, [b'?'; 16]);
+        assert_eq!(
+            std::str::from_utf8(&iomsg).unwrap().trim_end(),
+            "invalid format"
+        );
+    }
+
+    #[test]
+    fn malformed_dynamic_format_sets_read_status_without_touching_value() {
+        let input = b" 42";
+        let format = "(I)";
+        let mut value = 1234;
+        let mut iostat = -99;
+
+        afs_fmt_read_int_internal(
+            input.as_ptr(),
+            input.len() as i64,
+            format.as_ptr(),
+            format.len() as i64,
+            0,
+            &mut value,
+            &mut iostat,
+        );
+
+        assert_eq!(iostat, 1);
+        assert_eq!(value, 1234);
+    }
+
+    #[test]
+    fn malformed_dynamic_format_does_not_consume_external_input() {
+        let path = "/tmp/afs_malformed_dynamic_format_read.dat";
+        std::fs::write(path, " 42\n").unwrap();
+        afs_open_simple(
+            829,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut value = 1234;
+        let mut iostat = -99;
+        let malformed = "(I)";
+        afs_fmt_read_int(
+            829,
+            malformed.as_ptr(),
+            malformed.len() as i64,
+            0,
+            &mut value,
+            &mut iostat,
+        );
+        assert_eq!((value, iostat), (1234, 1));
+
+        let valid = "(I3)";
+        afs_fmt_read_int(
+            829,
+            valid.as_ptr(),
+            valid.len() as i64,
+            0,
+            &mut value,
+            &mut iostat,
+        );
+        assert_eq!((value, iostat), (42, 0));
+
+        afs_close(829, std::ptr::null_mut());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn formatted_unit_write_reverts_format_across_records() {
         let path = "/tmp/afs_fmt_reversion_test.dat";
         afs_open_simple(
@@ -8639,10 +8746,25 @@ mod tests {
         let mut first = 0i128;
         let mut second = 0i32;
         let mut iostat = -99i32;
-        afs_fmt_read_int128(93, "(I40,1X,I4)".as_ptr(), 10, 0, &mut first, &mut iostat);
+        let format = "(I40,1X,I4)";
+        afs_fmt_read_int128(
+            93,
+            format.as_ptr(),
+            format.len() as i64,
+            0,
+            &mut first,
+            &mut iostat,
+        );
         assert_eq!(iostat, 0);
 
-        afs_fmt_read_int(93, "(I40,1X,I4)".as_ptr(), 10, 1, &mut second, &mut iostat);
+        afs_fmt_read_int(
+            93,
+            format.as_ptr(),
+            format.len() as i64,
+            1,
+            &mut second,
+            &mut iostat,
+        );
         afs_close(93, std::ptr::null_mut());
 
         assert_eq!(iostat, 0);
