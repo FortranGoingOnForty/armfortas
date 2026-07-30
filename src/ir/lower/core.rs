@@ -36198,17 +36198,13 @@ pub(super) fn lower_read_into_addr(
                     iostat,
                     ..
                 } => {
-                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
-                        FuncRef::External("afs_fmt_read_real".into()),
-                        vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        FuncRef::External("afs_fmt_read_real32".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
                     finish_read_item(b, mode);
-                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                    let narrow = b.float_trunc(wide, FloatWidth::F32);
-                    b.store(narrow, addr);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -36219,17 +36215,21 @@ pub(super) fn lower_read_into_addr(
                     iostat,
                     ..
                 } => {
-                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
-                        FuncRef::External("afs_fmt_read_real_internal".into()),
-                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        FuncRef::External("afs_fmt_read_real32_internal".into()),
+                        vec![
+                            buf_ptr,
+                            buf_len,
+                            fmt_ptr,
+                            fmt_len,
+                            current_idx,
+                            addr,
+                            iostat,
+                        ],
                         IrType::Void,
                     );
                     finish_read_item(b, mode);
-                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                    let narrow = b.float_trunc(wide, FloatWidth::F32);
-                    b.store(narrow, addr);
                 }
             }
             true

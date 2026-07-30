@@ -4729,7 +4729,7 @@ pub extern "C" fn afs_io_finalize() {
 
 use crate::format::{
     format_reversion_descriptors, parse_format, BlankInterpretation, DecimalSep, FormatDesc,
-    FormatEngine, FormatError, IoValue, LeadingZeroMode,
+    FormatEngine, FormatError, IoValue, LeadingZeroMode, RoundMode,
 };
 use std::cell::RefCell;
 
@@ -5526,6 +5526,7 @@ struct FormattedInputState {
     blank_mode: BlankInterpretation,
     scale_factor: i32,
     decimal_sep: DecimalSep,
+    round_mode: RoundMode,
 }
 
 impl Default for FormattedInputState {
@@ -5534,6 +5535,7 @@ impl Default for FormattedInputState {
             blank_mode: BlankInterpretation::Null,
             scale_factor: 0,
             decimal_sep: DecimalSep::Point,
+            round_mode: RoundMode::ProcessorDefined,
         }
     }
 }
@@ -5543,6 +5545,7 @@ fn update_formatted_input_state(desc: &FormatDesc, state: &mut FormattedInputSta
         FormatDesc::BlankMode(mode) => state.blank_mode = *mode,
         FormatDesc::ScaleFactor(scale) => state.scale_factor = *scale,
         FormatDesc::DecimalMode(sep) => state.decimal_sep = *sep,
+        FormatDesc::RoundingMode(mode) => state.round_mode = *mode,
         _ => {}
     }
 }
@@ -6048,6 +6051,24 @@ fn parse_formatted_real_field(
     field: &[u8],
     state: FormattedInputState,
 ) -> Option<f64> {
+    let (normalized, decimals) = normalize_formatted_real_field(desc, field, state)?;
+    crate::decimal_input::parse_f64(&normalized, decimals, state.scale_factor, state.round_mode)
+}
+
+fn parse_formatted_real32_field(
+    desc: &FormatDesc,
+    field: &[u8],
+    state: FormattedInputState,
+) -> Option<f32> {
+    let (normalized, decimals) = normalize_formatted_real_field(desc, field, state)?;
+    crate::decimal_input::parse_f32(&normalized, decimals, state.scale_factor, state.round_mode)
+}
+
+fn normalize_formatted_real_field(
+    desc: &FormatDesc,
+    field: &[u8],
+    state: FormattedInputState,
+) -> Option<(String, usize)> {
     let decimals = formatted_real_decimals(desc)?;
     let field = String::from_utf8_lossy(field);
     let mut numeric = match state.blank_mode {
@@ -6073,23 +6094,8 @@ fn parse_formatted_real_field(
         }
     }
 
-    let has_decimal = numeric.contains('.');
     let normalized = normalize_fortran_real_input(&numeric, false);
-    let has_exponent = normalized.bytes().any(|byte| matches!(byte, b'e' | b'E'));
-    let mut value = normalized.parse::<f64>().ok()?;
-    if !value.is_finite() {
-        return Some(value);
-    }
-
-    if !has_decimal {
-        let decimal_power = i32::try_from(decimals).unwrap_or(i32::MAX).saturating_neg();
-        value *= 10f64.powi(decimal_power);
-    }
-    if !has_exponent {
-        value *= 10f64.powi(state.scale_factor.saturating_neg());
-    }
-
-    Some(value)
+    Some((normalized, decimals))
 }
 
 #[no_mangle]
@@ -6454,6 +6460,40 @@ pub extern "C" fn afs_fmt_read_real(
 }
 
 #[no_mangle]
+pub extern "C" fn afs_fmt_read_real32(
+    unit: i32,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut f32,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_unit_field_with_state(unit, fmt_str, fmt_len, data_index) {
+        Ok((desc, field, input_state)) if formatted_real_decimals(&desc).is_some() => {
+            match parse_formatted_real32_field(&desc, &field, input_state) {
+                Some(v) => {
+                    write_f32_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                None => {
+                    set_read_status_or_exit(iostat, 1);
+                }
+            }
+        }
+        Ok(_) => {
+            set_read_status_or_exit(iostat, 1);
+        }
+        Err(code) => {
+            set_read_status_or_exit(iostat, code);
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn afs_fmt_read_string_internal(
     buf: *const u8,
     buf_len: i64,
@@ -6629,6 +6669,42 @@ pub extern "C" fn afs_fmt_read_real_internal(
             match parse_formatted_real_field(&desc, &field, input_state) {
                 Some(v) => {
                     write_f64_ptr(val, v);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                None => {
+                    set_read_status_or_exit(iostat, 1);
+                }
+            }
+        }
+        Ok(_) => {
+            set_read_status_or_exit(iostat, 1);
+        }
+        Err(code) => {
+            set_read_status_or_exit(iostat, code);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_fmt_read_real32_internal(
+    buf: *const u8,
+    buf_len: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    data_index: i64,
+    val: *mut f32,
+    iostat: *mut i32,
+) {
+    match parse_nth_formatted_internal_field_with_state(buf, buf_len, fmt_str, fmt_len, data_index)
+    {
+        Ok((desc, field, input_state)) if formatted_real_decimals(&desc).is_some() => {
+            match parse_formatted_real32_field(&desc, &field, input_state) {
+                Some(v) => {
+                    write_f32_ptr(val, v);
                     if !iostat.is_null() {
                         unsafe {
                             *iostat = 0;
@@ -6985,6 +7061,36 @@ mod tests {
                 "input={input:?} fmt={fmt:?} index={index} actual={actual} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn formatted_real_input_applies_directed_rounding_state() {
+        let read = |input: &[u8], fmt: &str| {
+            let (desc, field, state) =
+                parse_nth_formatted_record_with_state(input, fmt.as_ptr(), fmt.len() as i64, 0)
+                    .expect("formatted field");
+            parse_formatted_real_field(&desc, &field, state).expect("formatted real")
+        };
+
+        let positive = b"1.00000000000000011102230246251565404236316680908203125";
+        let negative = b"-1.00000000000000011102230246251565404236316680908203125";
+
+        assert_eq!(
+            read(positive, "(RU,F55.53)").to_bits(),
+            0x3ff0_0000_0000_0001
+        );
+        assert_eq!(
+            read(positive, "(RD,F55.53)").to_bits(),
+            0x3ff0_0000_0000_0000
+        );
+        assert_eq!(
+            read(negative, "(RU,F56.53)").to_bits(),
+            0xbff0_0000_0000_0000
+        );
+        assert_eq!(
+            read(negative, "(RD,F56.53)").to_bits(),
+            0xbff0_0000_0000_0001
+        );
     }
 
     #[test]

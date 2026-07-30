@@ -19,6 +19,7 @@ mod bundle;
 pub use bundle::bundled_archive;
 
 pub mod array;
+mod decimal_input;
 pub mod descriptor;
 pub mod format;
 pub mod ieee;
