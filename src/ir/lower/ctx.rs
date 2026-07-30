@@ -146,7 +146,8 @@ pub(super) const MAX_RANK: usize = 15;
 
 /// Loop context for EXIT/CYCLE targeting.
 pub(super) struct LoopScope {
-    pub(super) name: Option<String>,
+    pub(super) cycle_name: Option<String>,
+    pub(super) exit_name: Option<String>,
     pub(super) header: BlockId, // CYCLE target
     pub(super) exit: BlockId,   // EXIT target
 }
@@ -477,8 +478,19 @@ impl<'a> LowerCtx<'a> {
         );
     }
 
-    pub(super) fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
-        self.loops.push(LoopScope { name, header, exit });
+    pub(super) fn push_loop(
+        &mut self,
+        cycle_name: Option<String>,
+        exit_name: Option<String>,
+        header: BlockId,
+        exit: BlockId,
+    ) {
+        self.loops.push(LoopScope {
+            cycle_name,
+            exit_name,
+            header,
+            exit,
+        });
     }
 
     pub(super) fn pop_loop(&mut self) {
@@ -512,11 +524,25 @@ impl<'a> LowerCtx<'a> {
         self.st.lookup_statement_function(scope_id, name)
     }
 
-    /// Find loop by construct name (or innermost if None).
-    pub(super) fn find_loop(&self, name: &Option<String>) -> Option<&LoopScope> {
+    /// Find the CYCLE target by construct name (or the innermost loop).
+    pub(super) fn find_cycle_loop(&self, name: &Option<String>) -> Option<&LoopScope> {
         if let Some(n) = name {
             self.loops.iter().rev().find(|l| {
-                l.name
+                l.cycle_name
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case(n))
+                    .unwrap_or(false)
+            })
+        } else {
+            self.loops.last()
+        }
+    }
+
+    /// Find the EXIT target by construct name (or the innermost loop).
+    pub(super) fn find_exit_loop(&self, name: &Option<String>) -> Option<&LoopScope> {
+        if let Some(n) = name {
+            self.loops.iter().rev().find(|l| {
+                l.exit_name
                     .as_deref()
                     .map(|s| s.eq_ignore_ascii_case(n))
                     .unwrap_or(false)

@@ -30463,13 +30463,26 @@ impl DoConcurrentLocalityState {
 }
 
 /// DO loop fields bundled for passing without too many args.
+pub(super) enum DoLoopBody<'a> {
+    Statements(&'a [SpannedStmt]),
+    ConcurrentTail {
+        source_name: &'a Option<String>,
+        controls: &'a [ConcurrentControl],
+        mask: Option<&'a crate::ast::expr::SpannedExpr>,
+        locality: &'a [LocalitySpec],
+        source_body: &'a [SpannedStmt],
+        span: crate::lexer::Span,
+    },
+}
+
 pub(super) struct DoLoopFields<'a> {
-    pub(super) name: &'a Option<String>,
+    pub(super) cycle_name: &'a Option<String>,
+    pub(super) exit_name: &'a Option<String>,
     pub(super) var: &'a Option<String>,
     pub(super) start: &'a Option<crate::ast::expr::SpannedExpr>,
     pub(super) end: &'a Option<crate::ast::expr::SpannedExpr>,
     pub(super) step: &'a Option<crate::ast::expr::SpannedExpr>,
-    pub(super) body: &'a [SpannedStmt],
+    pub(super) body: DoLoopBody<'a>,
     pub(super) concurrent: bool,
     pub(super) locality: &'a [LocalitySpec],
     pub(super) span: crate::lexer::Span,
@@ -30519,6 +30532,21 @@ pub(super) fn lower_do_concurrent(
         return;
     }
 
+    lower_do_concurrent_controls(b, ctx, name, controls, mask, locality, body, span, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_do_concurrent_controls(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    source_name: &Option<String>,
+    controls: &[ConcurrentControl],
+    mask: Option<&crate::ast::expr::SpannedExpr>,
+    locality: &[LocalitySpec],
+    source_body: &[SpannedStmt],
+    span: crate::lexer::Span,
+    outermost: bool,
+) {
     let Some((ctrl, rest)) = controls.split_first() else {
         return;
     };
@@ -30527,7 +30555,6 @@ pub(super) fn lower_do_concurrent(
     let start_opt = Some(ctrl.start.clone());
     let end_opt = Some(ctrl.end.clone());
 
-    let nested_body_storage;
     let masked_body_storage;
     let lowered_body = if rest.is_empty() {
         if let Some(mask_expr) = mask {
@@ -30535,35 +30562,38 @@ pub(super) fn lower_do_concurrent(
                 Stmt::IfConstruct {
                     name: None,
                     condition: mask_expr.clone(),
-                    then_body: body.to_vec(),
+                    then_body: source_body.to_vec(),
                     else_ifs: vec![],
                     else_body: None,
                 },
                 mask_expr.span,
             )];
-            masked_body_storage.as_slice()
+            DoLoopBody::Statements(masked_body_storage.as_slice())
         } else {
-            body
+            DoLoopBody::Statements(source_body)
         }
     } else {
-        nested_body_storage = vec![crate::ast::Spanned::new(
-            Stmt::DoConcurrent {
-                name: None,
-                controls: rest.to_vec(),
-                mask: mask.cloned(),
-                locality: locality.to_vec(),
-                body: body.to_vec(),
-            },
+        DoLoopBody::ConcurrentTail {
+            source_name,
+            controls: rest,
+            mask,
+            locality,
+            source_body,
             span,
-        )];
-        nested_body_storage.as_slice()
+        }
     };
 
+    let unnamed = None;
     lower_do_loop(
         b,
         ctx,
         DoLoopFields {
-            name,
+            cycle_name: if rest.is_empty() {
+                source_name
+            } else {
+                &unnamed
+            },
+            exit_name: if outermost { source_name } else { &unnamed },
             var: &var_opt,
             start: &start_opt,
             end: &end_opt,
@@ -30579,7 +30609,8 @@ pub(super) fn lower_do_concurrent(
 /// Lower DO loop (counted loop with variable, start, end, step).
 pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) {
     let DoLoopFields {
-        name,
+        cycle_name,
+        exit_name,
         var,
         start,
         end,
@@ -30589,7 +30620,7 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         locality,
         span,
     } = fields;
-    let (check_name, body_name, incr_name, exit_name, neg_check_name, pos_check_name) =
+    let (check_name, body_name, incr_name, exit_block_name, neg_check_name, pos_check_name) =
         if concurrent {
             (
                 "doconc_check",
@@ -30675,7 +30706,7 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         let bb_check = b.create_block(check_name);
         let bb_body = b.create_block(body_name);
         let bb_incr = b.create_block(incr_name);
-        let bb_exit = b.create_block(exit_name);
+        let bb_exit = b.create_block(exit_block_name);
         let bb_zero_step = b.create_block("do_zero_step");
 
         b.branch(bb_check, vec![]);
@@ -30722,13 +30753,13 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         b.branch(bb_exit, vec![]);
 
         // Body.
-        ctx.push_loop(name.clone(), bb_incr, bb_exit);
+        ctx.push_loop(cycle_name.clone(), exit_name.clone(), bb_incr, bb_exit);
         b.set_block(bb_body);
         let saved_locality_bindings = locality_state.as_ref().map(|state| {
             state.initialize_iteration(b, ctx);
             state.install_private_bindings(ctx)
         });
-        super::stmt::lower_stmts(b, ctx, body);
+        lower_do_loop_body(b, ctx, body);
         if let (Some(state), Some(saved)) = (locality_state.as_ref(), saved_locality_bindings) {
             state.restore_outside_bindings(ctx, saved);
         }
@@ -30752,18 +30783,42 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
     } else {
         // Infinite DO (no variable) — `do ... end do` without loop control.
         let bb_body = b.create_block(body_name);
-        let bb_exit = b.create_block(exit_name);
+        let bb_exit = b.create_block(exit_block_name);
         b.branch(bb_body, vec![]);
 
-        ctx.push_loop(name.clone(), bb_body, bb_exit);
+        ctx.push_loop(cycle_name.clone(), exit_name.clone(), bb_body, bb_exit);
         b.set_block(bb_body);
-        super::stmt::lower_stmts(b, ctx, body);
+        lower_do_loop_body(b, ctx, body);
         if b.func().block(b.current_block()).terminator.is_none() {
             b.branch(bb_body, vec![]);
         }
         ctx.pop_loop();
 
         b.set_block(bb_exit);
+    }
+}
+
+fn lower_do_loop_body(b: &mut FuncBuilder, ctx: &mut LowerCtx, body: DoLoopBody<'_>) {
+    match body {
+        DoLoopBody::Statements(stmts) => super::stmt::lower_stmts(b, ctx, stmts),
+        DoLoopBody::ConcurrentTail {
+            source_name,
+            controls,
+            mask,
+            locality,
+            source_body,
+            span,
+        } => lower_do_concurrent_controls(
+            b,
+            ctx,
+            source_name,
+            controls,
+            mask,
+            locality,
+            source_body,
+            span,
+            false,
+        ),
     }
 }
 
@@ -64284,6 +64339,56 @@ end program
 ",
         );
         assert!(ir.matches("doconc_check").count() >= 2);
+    }
+
+    #[test]
+    fn lower_named_cycle_in_multi_control_do_concurrent_targets_next_tuple() {
+        let (module, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: i, j, seen(3, 4)
+  seen = 0
+tuples: do concurrent (i = 1:3, j = 1:4)
+    if (j == 2) cycle tuples
+    seen(i, j) = 10 * i + j
+  end do tuples
+end program
+",
+        );
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("__prog_"))
+            .expect("missing lowered program function");
+        let increments: Vec<_> = function
+            .blocks
+            .iter()
+            .filter(|block| block.name.starts_with("doconc_incr"))
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(
+            increments.len(),
+            2,
+            "two controls must produce two sequential loop increments:\n{ir}"
+        );
+        let cycle_target = function
+            .blocks
+            .iter()
+            .find(|block| block.name.starts_with("if_then"))
+            .and_then(|block| match &block.terminator {
+                Some(crate::ir::inst::Terminator::Branch(target, _)) => Some(*target),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing named CYCLE branch:\n{ir}"));
+        assert_eq!(
+            cycle_target, increments[1],
+            "named CYCLE must advance the innermost control and therefore the next tuple:\n{ir}"
+        );
+        assert_ne!(
+            cycle_target, increments[0],
+            "named CYCLE must not skip the remaining inner-control values:\n{ir}"
+        );
     }
 
     #[test]

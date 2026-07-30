@@ -6162,12 +6162,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b,
                 ctx,
                 DoLoopFields {
-                    name,
+                    cycle_name: name,
+                    exit_name: name,
                     var,
                     start,
                     end,
                     step,
-                    body,
+                    body: super::core::DoLoopBody::Statements(body),
                     concurrent: false,
                     locality: &[],
                     span: stmt.span,
@@ -6204,7 +6205,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let bb_exit = b.create_block("do_while_exit");
             b.branch(bb_header, vec![]);
 
-            ctx.push_loop(name.clone(), bb_header, bb_exit);
+            ctx.push_loop(name.clone(), name.clone(), bb_header, bb_exit);
 
             b.set_block(bb_header);
             lower_condition_branch(b, ctx, condition, bb_body, bb_exit);
@@ -6914,7 +6915,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Exit { name } => {
-            if let Some(lp) = ctx.find_loop(name) {
+            if let Some(lp) = ctx.find_exit_loop(name) {
                 let exit = lp.exit;
                 b.branch(exit, vec![]);
             } else if let Some((exit, cleanup_depth)) = ctx.find_construct_exit(name) {
@@ -6930,7 +6931,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::Cycle { name } => {
-            if let Some(lp) = ctx.find_loop(name) {
+            if let Some(lp) = ctx.find_cycle_loop(name) {
                 let header = lp.header;
                 b.branch(header, vec![]);
             }

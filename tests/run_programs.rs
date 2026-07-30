@@ -4506,6 +4506,28 @@ fn ar43_do_concurrent_default_none_missing_fixture_is_rejected() {
 }
 
 #[test]
+fn ar43_do_concurrent_named_cycle_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_do_concurrent_named_cycle_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_named_cycle.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_named_cycle.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_named_cycle.f90 should advance named and unnamed CYCLE to identical control tuples at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;
