@@ -45,7 +45,7 @@ fn require_clang() -> PathBuf {
     // whole suite with a count, exactly like run_programs.
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
-            "\nHARNESS_SKIP suite=c_interop_differential test=all count=10 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=c_interop_differential test=all count=11 reason=\"{}\"",
             reason
         );
         std::process::exit(0);
@@ -59,7 +59,7 @@ fn require_clang() -> PathBuf {
             }
             // Non-ELF host without clang: counted skip (x01 convention).
             eprintln!(
-                "\nHARNESS_SKIP suite=c_interop_differential test=all count=10 reason=\"clang not found on this host\""
+                "\nHARNESS_SKIP suite=c_interop_differential test=all count=11 reason=\"clang not found on this host\""
             );
             std::process::exit(0);
         }
@@ -921,4 +921,26 @@ end program commonarraytu
 {}",
         out
     );
+}
+
+/// A C_PTR value is ABI-lowered as i64, but it still carries the address
+/// provenance of C_LOC for optimizer call barriers. Cover a direct expression,
+/// a scalar C_PTR local, and a derived-type component so SSA/load indirection
+/// cannot erase the fact that the C callee may mutate each target.
+#[test]
+fn c_ptr_value_call_invalidates_local_memory_facts_at_every_opt_level() {
+    let wb = Workbench::new("cptr_alias");
+    let c = wb.c_obj("mutate", include_str!("fixtures/ar42_c_ptr_alias_mutate.c"));
+    let source = include_str!("fixtures/ar42_c_ptr_alias_main.f90");
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let tag = opt.trim_start_matches('-').to_ascii_lowercase();
+        let fortran = wb.fortran_obj_at(&format!("main_{tag}"), source, opt);
+        let out = wb.link_and_run(&format!("cptr_alias_{tag}"), &[&fortran, &c]);
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            ["2", "2", "2"],
+            "{opt}: a C_PTR call must invalidate local memory facts"
+        );
+    }
 }

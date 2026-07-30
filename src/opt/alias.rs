@@ -43,6 +43,19 @@ enum ProvenLocationKind {
     Opaque(ValueId),
 }
 
+/// Pointer provenance carried by a call argument.
+///
+/// `C_PTR` is represented as `i64` in the IR for ABI purposes, but a value
+/// produced by `PtrToInt` still gives the callee access to the source
+/// allocation. Call-side memory optimizations must classify that value like
+/// the original pointer without treating unrelated integer arguments as
+/// addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallArgPointer {
+    pub(crate) pointer: ValueId,
+    pub(crate) may_carry_indirect_pointer: bool,
+}
+
 /// True if `entry_ptr` may be reachable through `call_arg` when
 /// a call passes `call_arg` across a function boundary.
 ///
@@ -231,6 +244,36 @@ impl<'a> AliasOracle<'a> {
 
     pub fn value_is_pointer(&self, value: ValueId) -> bool {
         matches!(self.value_type(value), Some(IrType::Ptr(_)))
+    }
+
+    /// Recover pointer provenance carried across a call boundary.
+    ///
+    /// Direct pointer operands and address-preserving `PtrToInt` results are
+    /// recognized. Ordinary integers deliberately return `None`.
+    pub(crate) fn call_arg_pointer(&self, value: ValueId) -> Option<CallArgPointer> {
+        let pointer = if self.value_is_pointer(value) {
+            value
+        } else {
+            match &self.find_inst(value)?.kind {
+                InstKind::PtrToInt(pointer) if self.value_is_pointer(*pointer) => *pointer,
+                _ => return None,
+            }
+        };
+        let may_carry_indirect_pointer = matches!(
+            self.value_type(pointer),
+            Some(IrType::Ptr(inner))
+                if matches!(
+                    inner.as_ref(),
+                    IrType::Array(..)
+                        | IrType::Struct(_)
+                        | IrType::Ptr(_)
+                        | IrType::FuncPtr(_)
+                )
+        );
+        Some(CallArgPointer {
+            pointer,
+            may_carry_indirect_pointer,
+        })
     }
 
     pub(crate) fn value_type(&self, value: ValueId) -> Option<&'a IrType> {
@@ -774,6 +817,55 @@ mod tests {
         assert_eq!(
             query(&f, load_a, load_b, crate::target::TargetLayout::LP64),
             AliasResult::NoAlias
+        );
+    }
+
+    #[test]
+    fn ptr_to_int_call_arg_retains_pointer_provenance() {
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let pointer = f.next_value_id();
+        f.register_type(pointer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: pointer,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span: span(),
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+        });
+        let c_ptr = f.next_value_id();
+        f.register_type(c_ptr, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: c_ptr,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::PtrToInt(pointer),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        assert_eq!(
+            AliasOracle::new(&f, crate::target::TargetLayout::LP64).call_arg_pointer(c_ptr),
+            Some(CallArgPointer {
+                pointer,
+                may_carry_indirect_pointer: false,
+            })
+        );
+    }
+
+    #[test]
+    fn ordinary_i64_call_arg_has_no_pointer_provenance() {
+        let mut f = Function::new("test".into(), vec![], IrType::Void);
+        let integer = f.next_value_id();
+        f.register_type(integer, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: integer,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(42, IntWidth::I64),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+
+        assert_eq!(
+            AliasOracle::new(&f, crate::target::TargetLayout::LP64).call_arg_pointer(integer),
+            None
         );
     }
 }
