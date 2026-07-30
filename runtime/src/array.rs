@@ -1433,6 +1433,25 @@ pub extern "C" fn afs_copy_array_result_to_fixed_convert(
     }
 }
 
+fn descriptor_payload_requires_zero_bytes(desc: &ArrayDescriptor) -> bool {
+    let Ok(rank) = usize::try_from(desc.rank) else {
+        return false;
+    };
+    if rank > MAX_RANK || desc.elem_size < 0 {
+        return false;
+    }
+
+    let mut has_zero_extent = false;
+    for dim in desc.dims.iter().copied().take(rank) {
+        let Some(extent) = checked_dim_extent(dim) else {
+            return false;
+        };
+        has_zero_extent |= extent == 0;
+    }
+
+    desc.elem_size == 0 || has_zero_extent
+}
+
 /// Validate `ALLOCATE(..., SOURCE=...)` array conformance after the destination
 /// has already been allocated with its final shape.
 ///
@@ -1463,11 +1482,13 @@ pub extern "C" fn afs_prepare_array_copy(
     // Common case: `allocate(amat(...), source=a)` where `a` is an
     // assumed-shape dummy `a(:,:)`.  Such dummies have flags=CONTIGUOUS
     // (no DESC_ALLOCATED) since they're bound to the caller's data, not
-    // owned.  Treat the source as valid as long as it has a non-null
-    // base_addr; require DESC_ALLOCATED only on the freshly-allocated
-    // destination.
+    // owned. A null base_addr is also valid when the descriptor's shape
+    // or element size requires zero storage. Require DESC_ALLOCATED only
+    // on the freshly-allocated destination.
+    let source_has_defined_storage =
+        !source.base_addr.is_null() || descriptor_payload_requires_zero_bytes(source);
     let ok = dest.is_allocated()
-        && !source.base_addr.is_null()
+        && source_has_defined_storage
         && dest.elem_size == source.elem_size
         && dest.rank == source.rank
         && (0..dest.rank as usize).all(|i| dest.dims[i].extent() == source.dims[i].extent());
@@ -2899,6 +2920,78 @@ mod tests {
         assert!(dest.base_addr.is_null());
 
         afs_deallocate_array(&mut source, ptr::null_mut());
+    }
+
+    #[test]
+    fn copy_array_data_accepts_zero_byte_source_descriptors() {
+        let empty_dims = [DimDescriptor {
+            lower_bound: -4,
+            upper_bound: -5,
+            stride: 1,
+        }];
+        let nonempty_dims = [DimDescriptor {
+            lower_bound: 3,
+            upper_bound: 5,
+            stride: 1,
+        }];
+
+        for (elem_size, dims) in [(4, &empty_dims), (0, &nonempty_dims)] {
+            let mut source = ArrayDescriptor::zeroed();
+            let mut dest = ArrayDescriptor::zeroed();
+            let mut stat = -1;
+            afs_allocate_array(&mut source, elem_size, 1, dims.as_ptr(), ptr::null_mut());
+            afs_allocate_array(&mut dest, elem_size, 1, dims.as_ptr(), ptr::null_mut());
+            assert!(source.is_allocated());
+            assert!(source.base_addr.is_null());
+            assert_eq!(source.total_bytes(), 0);
+
+            afs_copy_array_data(&mut dest, &source, &mut stat);
+
+            assert_eq!(stat, 0);
+            assert!(dest.is_allocated());
+            assert!(dest.base_addr.is_null());
+            afs_deallocate_array(&mut source, ptr::null_mut());
+            afs_deallocate_array(&mut dest, ptr::null_mut());
+        }
+
+        let mut source = ArrayDescriptor::zeroed();
+        source.elem_size = 4;
+        source.rank = 1;
+        source.flags = DESC_CONTIGUOUS;
+        source.dims[0] = empty_dims[0];
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+        afs_allocate_array(&mut dest, 4, 1, empty_dims.as_ptr(), ptr::null_mut());
+
+        afs_copy_array_data(&mut dest, &source, &mut stat);
+
+        assert_eq!(stat, 0);
+        assert!(dest.is_allocated());
+        assert!(dest.base_addr.is_null());
+        afs_deallocate_array(&mut dest, ptr::null_mut());
+    }
+
+    #[test]
+    fn copy_array_data_rejects_null_nonzero_source_payload() {
+        let dims = [DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 1,
+        }];
+        let mut source = ArrayDescriptor::zeroed();
+        source.elem_size = 4;
+        source.rank = 1;
+        source.flags = DESC_CONTIGUOUS;
+        source.dims[0] = dims[0];
+        let mut dest = ArrayDescriptor::zeroed();
+        let mut stat = -1;
+        afs_allocate_array(&mut dest, 4, 1, dims.as_ptr(), ptr::null_mut());
+
+        afs_copy_array_data(&mut dest, &source, &mut stat);
+
+        assert_eq!(stat, 4);
+        assert!(!dest.is_allocated());
+        assert!(dest.base_addr.is_null());
     }
 
     #[test]
