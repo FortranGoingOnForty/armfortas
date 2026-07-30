@@ -623,7 +623,7 @@ pub extern "C" fn afs_execute_command_line(
 }
 
 // Shared RNG state for RANDOM_NUMBER / RANDOM_SEED.
-use crate::descriptor::ArrayDescriptor;
+use crate::descriptor::{ArrayDescriptor, MAX_RANK};
 use std::cell::Cell;
 use std::ptr;
 thread_local! {
@@ -685,6 +685,14 @@ fn next_random_u64() -> u64 {
     })
 }
 
+fn random_unit_f32(bits: u64) -> f32 {
+    ((bits >> 40) as f32) / (1u32 << 24) as f32
+}
+
+fn random_unit_f64(bits: u64) -> f64 {
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
 unsafe fn read_seed_element(addr: *const u8, elem_size: i64) -> u64 {
     match elem_size {
         1 => ptr::read_unaligned(addr as *const i8) as i64 as u64,
@@ -727,7 +735,7 @@ pub extern "C" fn afs_random_number_f32(harvest: *mut f32) {
     }
     let x = next_random_u64();
     unsafe {
-        *harvest = ((x >> 40) as f32) / (1u32 << 24) as f32;
+        *harvest = random_unit_f32(x);
     }
 }
 
@@ -739,40 +747,161 @@ pub extern "C" fn afs_random_number_f64(harvest: *mut f64) {
     }
     let x = next_random_u64();
     unsafe {
-        *harvest = (x >> 11) as f64 / (1u64 << 53) as f64;
+        *harvest = random_unit_f64(x);
     }
 }
 
-/// RANDOM_NUMBER on an N-element f32 array: every element gets an
-/// independent draw in [0, 1).  The scalar entry only fills one slot,
-/// so the IR dispatches to this when HARVEST is an array — without it,
-/// LAPACK / QR / EIG run on uninitialized stack data and segfault
-/// nondeterministically.
+/// Compatibility entry for older objects whose f32 HARVEST is contiguous.
+/// New compiler output uses the descriptor entry below.
 #[no_mangle]
 pub extern "C" fn afs_random_number_array_f32(harvest: *mut f32, n: i64) {
     if harvest.is_null() || n <= 0 {
         return;
     }
     for i in 0..n {
-        let x = next_random_u64();
-        let v = ((x >> 40) as f32) / (1u32 << 24) as f32;
+        let value = random_unit_f32(next_random_u64());
         unsafe {
-            *harvest.offset(i as isize) = v;
+            *harvest.offset(i as isize) = value;
         }
     }
 }
 
+/// Compatibility entry for older objects whose f64 HARVEST is contiguous.
+/// New compiler output uses the descriptor entry below.
 #[no_mangle]
 pub extern "C" fn afs_random_number_array_f64(harvest: *mut f64, n: i64) {
     if harvest.is_null() || n <= 0 {
         return;
     }
     for i in 0..n {
-        let x = next_random_u64();
-        let v = (x >> 11) as f64 / (1u64 << 53) as f64;
+        let value = random_unit_f64(next_random_u64());
         unsafe {
-            *harvest.offset(i as isize) = v;
+            *harvest.offset(i as isize) = value;
         }
+    }
+}
+
+fn fill_random_number_descriptor(harvest: *mut ArrayDescriptor) -> Result<(), &'static str> {
+    if harvest.is_null() {
+        return Err("HARVEST descriptor is null");
+    }
+
+    let descriptor = unsafe { &*harvest };
+    let rank = usize::try_from(descriptor.rank)
+        .ok()
+        .filter(|rank| (1..=MAX_RANK).contains(rank))
+        .ok_or("HARVEST descriptor rank is invalid")?;
+    if !matches!(descriptor.elem_size, 4 | 8) {
+        return Err("HARVEST has an unsupported REAL kind");
+    }
+
+    let mut extents = [0_i64; MAX_RANK];
+    let mut total = 1_usize;
+    let mut min_element_offset = 0_i128;
+    let mut max_element_offset = 0_i128;
+    for (index, dim) in descriptor.dims.iter().copied().take(rank).enumerate() {
+        let extent = if dim.upper_bound < dim.lower_bound {
+            0
+        } else {
+            dim.upper_bound
+                .checked_sub(dim.lower_bound)
+                .and_then(|span| span.checked_add(1))
+                .ok_or("HARVEST extent overflows the descriptor ABI")?
+        };
+        extents[index] = extent;
+        total = total
+            .checked_mul(
+                usize::try_from(extent).map_err(|_| "HARVEST extent exceeds the address space")?,
+            )
+            .ok_or("HARVEST element count exceeds the address space")?;
+        if extent > 1 && dim.stride == 0 {
+            return Err("HARVEST has a zero element stride");
+        }
+
+        let last_offset = i128::from(extent.saturating_sub(1))
+            .checked_mul(i128::from(dim.stride))
+            .ok_or("HARVEST stride span overflows the descriptor ABI")?;
+        if last_offset < 0 {
+            min_element_offset = min_element_offset
+                .checked_add(last_offset)
+                .ok_or("HARVEST offset overflows the descriptor ABI")?;
+        } else {
+            max_element_offset = max_element_offset
+                .checked_add(last_offset)
+                .ok_or("HARVEST offset overflows the descriptor ABI")?;
+        }
+    }
+
+    if total == 0 {
+        return Ok(());
+    }
+    if descriptor.base_addr.is_null() {
+        return Err("HARVEST has no storage");
+    }
+
+    for boundary in [min_element_offset, max_element_offset] {
+        let byte_offset = boundary
+            .checked_mul(i128::from(descriptor.elem_size))
+            .ok_or("HARVEST byte offset overflows the descriptor ABI")?;
+        isize::try_from(byte_offset)
+            .map_err(|_| "HARVEST byte offset exceeds the address space")?;
+    }
+
+    let mut byte_strides = [0_isize; MAX_RANK];
+    let mut byte_rewinds = [0_isize; MAX_RANK];
+    for dimension in 0..rank {
+        if extents[dimension] <= 1 {
+            continue;
+        }
+        let byte_stride = i128::from(descriptor.dims[dimension].stride)
+            .checked_mul(i128::from(descriptor.elem_size))
+            .ok_or("HARVEST byte stride overflows the descriptor ABI")?;
+        byte_strides[dimension] = isize::try_from(byte_stride)
+            .map_err(|_| "HARVEST byte stride exceeds the address space")?;
+        let byte_rewind = byte_stride
+            .checked_mul(i128::from(extents[dimension] - 1))
+            .ok_or("HARVEST byte rewind overflows the descriptor ABI")?;
+        byte_rewinds[dimension] = isize::try_from(byte_rewind)
+            .map_err(|_| "HARVEST byte rewind exceeds the address space")?;
+    }
+
+    let mut indices = [0_i64; MAX_RANK];
+    let mut byte_offset = 0_isize;
+    for linear in 0..total {
+        let destination = descriptor.base_addr.wrapping_offset(byte_offset);
+        let bits = next_random_u64();
+        unsafe {
+            match descriptor.elem_size {
+                4 => ptr::write_unaligned(destination as *mut f32, random_unit_f32(bits)),
+                8 => ptr::write_unaligned(destination as *mut f64, random_unit_f64(bits)),
+                _ => unreachable!("RANDOM_NUMBER element size was validated before storage"),
+            }
+        }
+
+        if linear + 1 == total {
+            break;
+        }
+        for dimension in 0..rank {
+            indices[dimension] += 1;
+            if indices[dimension] < extents[dimension] {
+                byte_offset += byte_strides[dimension];
+                break;
+            }
+            indices[dimension] = 0;
+            byte_offset -= byte_rewinds[dimension];
+        }
+    }
+    Ok(())
+}
+
+/// RANDOM_NUMBER on an array descriptor. New compiler output uses this entry
+/// so noncontiguous and reverse sections retain every dimension's memory
+/// stride. The raw pointer-and-count entries remain for older objects.
+#[no_mangle]
+pub extern "C" fn afs_random_number_array_desc(harvest: *mut ArrayDescriptor) {
+    if let Err(message) = fill_random_number_descriptor(harvest) {
+        eprintln!("Fortran runtime error: RANDOM_NUMBER {message}");
+        std::process::exit(1);
     }
 }
 
@@ -1141,6 +1270,103 @@ mod tests {
             afs_random_number_f64(&mut x);
             assert!((0.0..1.0).contains(&x), "random out of range: {}", x);
         }
+    }
+
+    #[test]
+    fn random_number_descriptor_walks_signed_multidimensional_strides() {
+        let mut forward = [-1.0_f32; 16];
+        let mut forward_desc = ArrayDescriptor::zeroed();
+        forward_desc.base_addr = forward.as_mut_ptr() as *mut u8;
+        forward_desc.elem_size = std::mem::size_of::<f32>() as i64;
+        forward_desc.rank = 2;
+        forward_desc.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 3,
+            stride: 2,
+        };
+        forward_desc.dims[1] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 8,
+        };
+
+        set_random_seed(11);
+        fill_random_number_descriptor(&mut forward_desc)
+            .expect("valid positive-stride descriptor should be filled");
+        for (index, value) in forward.iter().copied().enumerate() {
+            if [0, 2, 4, 8, 10, 12].contains(&index) {
+                assert!((0.0..1.0).contains(&value), "forward[{index}]={value}");
+            } else {
+                assert_eq!(value, -1.0, "forward guard {index} was overwritten");
+            }
+        }
+
+        let mut reverse = [-1.0_f64; 18];
+        let mut reverse_desc = ArrayDescriptor::zeroed();
+        reverse_desc.base_addr = unsafe { reverse.as_mut_ptr().add(14) as *mut u8 };
+        reverse_desc.elem_size = std::mem::size_of::<f64>() as i64;
+        reverse_desc.rank = 2;
+        reverse_desc.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: -2,
+        };
+        reverse_desc.dims[1] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: -5,
+        };
+
+        set_random_seed(17);
+        fill_random_number_descriptor(&mut reverse_desc)
+            .expect("valid negative-stride descriptor should be filled");
+        for (index, value) in reverse.iter().copied().enumerate() {
+            if [7, 9, 12, 14].contains(&index) {
+                assert!((0.0..1.0).contains(&value), "reverse[{index}]={value}");
+            } else {
+                assert_eq!(value, -1.0, "reverse guard {index} was overwritten");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_random_number_descriptor_consumes_no_random_values() {
+        let mut empty = ArrayDescriptor::zeroed();
+        empty.elem_size = std::mem::size_of::<f64>() as i64;
+        empty.rank = 1;
+        empty.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+
+        set_random_seed(23);
+        fill_random_number_descriptor(&mut empty)
+            .expect("zero-extent HARVEST should be a successful no-op");
+        let after_empty = next_random_u64();
+        set_random_seed(23);
+        let without_empty = next_random_u64();
+        assert_eq!(after_empty, without_empty);
+    }
+
+    #[test]
+    fn random_number_descriptor_rejects_repeated_storage() {
+        let mut values = [-1.0_f64; 2];
+        let mut descriptor = ArrayDescriptor::zeroed();
+        descriptor.base_addr = values.as_mut_ptr() as *mut u8;
+        descriptor.elem_size = std::mem::size_of::<f64>() as i64;
+        descriptor.rank = 1;
+        descriptor.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 0,
+        };
+
+        assert_eq!(
+            fill_random_number_descriptor(&mut descriptor),
+            Err("HARVEST has a zero element stride")
+        );
+        assert_eq!(values, [-1.0, -1.0]);
     }
 
     #[test]

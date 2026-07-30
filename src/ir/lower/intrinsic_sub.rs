@@ -635,14 +635,10 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "random_number" => {
-            // F2018 §16.9.171: RANDOM_NUMBER(harvest) accepts both
-            // scalar and array harvest. The scalar runtime fills only
-            // one element; routing array actuals to it left N-1 slots
-            // as stack garbage, which surfaced as denormal/NaN values
-            // throughout stdlib examples (e.g. sparse_spmv: count() on
-            // the resulting matrix returned 1 instead of m*n, malloc
-            // sized COO%index(2,1), and the next assign ran past dim 0).
-            let harvest = nth_arg_ref(b, ctx, args, 0);
+            // F2018 §16.9.171: an array HARVEST is described by its
+            // rank, extents, and signed memory strides. Passing only
+            // its first address plus SIZE makes every section look
+            // contiguous and defines storage outside the actual.
             let harvest_expr = nth_arg_expr(args, 0);
             let kind_is_f32 = harvest_expr
                 .and_then(|expr| {
@@ -659,36 +655,36 @@ pub(crate) fn lower_intrinsic_subroutine(
                 .map(|e| expr_returns_array(e, &ctx.locals, ctx.st))
                 .unwrap_or(false);
             if is_array {
-                if let Some(expr) = harvest_expr {
-                    if let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
-                        b,
-                        &ctx.locals,
-                        expr,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                        Some(ctx.internal_funcs),
-                        Some(ctx.contained_host_refs),
-                        Some(ctx.descriptor_params),
-                    ) {
-                        let n = b.call(
-                            FuncRef::External("afs_array_size".into()),
-                            vec![desc],
-                            IrType::Int(IntWidth::I64),
-                        );
-                        let runtime = if kind_is_f32 {
-                            "afs_random_number_array_f32"
-                        } else {
-                            "afs_random_number_array_f64"
-                        };
-                        b.call(
-                            FuncRef::External(runtime.into()),
-                            vec![harvest, n],
-                            IrType::Void,
-                        );
-                        return true;
-                    }
+                let Some(expr) = harvest_expr else {
+                    unreachable!("array classification requires a present RANDOM_NUMBER HARVEST");
+                };
+                let Some((descriptor, elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) else {
+                    eprintln!(
+                        "armfortas: error: RANDOM_NUMBER HARVEST array requires a descriptor"
+                    );
+                    std::process::exit(1);
+                };
+                if !matches!(elem_ty, IrType::Float(_)) {
+                    eprintln!("armfortas: error: RANDOM_NUMBER HARVEST must be REAL");
+                    std::process::exit(1);
                 }
+                b.call(
+                    FuncRef::External("afs_random_number_array_desc".into()),
+                    vec![descriptor],
+                    IrType::Void,
+                );
+                return true;
             }
+            let harvest = nth_arg_ref(b, ctx, args, 0);
             let runtime = if kind_is_f32 {
                 "afs_random_number_f32"
             } else {
