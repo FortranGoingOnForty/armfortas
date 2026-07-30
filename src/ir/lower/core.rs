@@ -13130,7 +13130,7 @@ pub(super) fn find_named_interface_symbol<'a>(
         }
     }
 
-    if let Some(sym) = use_associated_named_interface_symbols(st, &key)
+    if let Some(sym) = lexically_visible_named_interface_symbols(st, &key)
         .into_iter()
         .next()
     {
@@ -13182,32 +13182,58 @@ fn named_interface_symbol_in_scope_chain<'a>(
     }
 }
 
-fn use_associated_named_interface_symbols<'a>(
+fn lexically_visible_named_interface_symbols<'a>(
     st: &'a SymbolTable,
     key: &str,
 ) -> Vec<&'a crate::sema::symtab::Symbol> {
-    use crate::sema::symtab::ScopeKind;
-
-    let mut symbols = Vec::new();
-    let mut seen = HashSet::new();
+    // Lowering runs after semantic resolution, when SymbolTable::current may
+    // name an unrelated unit. The procedure guard is the authoritative caller
+    // scope. Preserve every owner in a merged generic, but root the traversal
+    // at the first lexical binding instead of scanning sibling program units.
+    let Some(mut scope_id) = current_proc_scope() else {
+        return Vec::new();
+    };
+    let mut symbols = st.named_interface_symbols_in(scope_id, key);
+    if symbols.is_empty() {
+        return symbols;
+    }
+    let mut seen: HashSet<_> = symbols
+        .iter()
+        .map(|symbol| (symbol.scope, symbol.name.to_ascii_lowercase()))
+        .collect();
     let mut visited = HashSet::new();
-    for scope in st.all_scopes() {
-        if matches!(scope.kind, ScopeKind::Submodule(_) | ScopeKind::Block) {
-            continue;
-        }
-        for assoc in &scope.use_associations {
-            if assoc.local_name != key {
+    loop {
+        let scope = st.scope(scope_id);
+        let has_local_interface = st.named_interface_symbol_in_scope(scope_id, key).is_some();
+        let has_local_symbol = scope.symbols.contains_key(key);
+        let mut has_use_binding = false;
+        for association in &scope.use_associations {
+            if association.local_name != key {
                 continue;
             }
+            has_use_binding = true;
             collect_named_interface_symbols_from_scope(
                 st,
-                assoc.source_scope,
-                &assoc.original_name,
+                association.source_scope,
+                &association.original_name,
                 &mut visited,
                 &mut symbols,
                 &mut seen,
             );
         }
+        if has_local_interface || has_local_symbol || has_use_binding {
+            break;
+        }
+        let Some(parent) = scope.parent else {
+            break;
+        };
+        if matches!(
+            st.scope(parent).kind,
+            crate::sema::symtab::ScopeKind::Global
+        ) {
+            break;
+        }
+        scope_id = parent;
     }
     symbols
 }
@@ -13218,7 +13244,7 @@ fn collect_named_interface_symbols_from_scope<'a>(
     key: &str,
     visited: &mut HashSet<(crate::sema::symtab::ScopeId, String)>,
     symbols: &mut Vec<&'a crate::sema::symtab::Symbol>,
-    seen: &mut HashSet<(String, crate::sema::symtab::ScopeId)>,
+    seen: &mut HashSet<(crate::sema::symtab::ScopeId, String)>,
 ) {
     let visit_key = (scope_id, key.to_ascii_lowercase());
     if !visited.insert(visit_key) {
@@ -13226,22 +13252,23 @@ fn collect_named_interface_symbols_from_scope<'a>(
     }
     let scope = st.scope(scope_id);
 
-    if let Some(sym) = st.named_interface_symbol_in_scope(scope_id, key) {
-        if sym.attrs.access != crate::sema::symtab::Access::Private && is_named_interface_like(sym)
+    if let Some(symbol) = st.named_interface_symbol_in_scope(scope_id, key) {
+        if symbol.attrs.access != crate::sema::symtab::Access::Private
+            && is_named_interface_like(symbol)
         {
-            let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
-            if seen.insert(sym_key) {
-                symbols.push(sym);
+            let identity = (symbol.scope, symbol.name.to_ascii_lowercase());
+            if seen.insert(identity) {
+                symbols.push(symbol);
             }
         }
     }
 
-    for assoc in &scope.use_associations {
-        if assoc.local_name == key {
+    for association in &scope.use_associations {
+        if association.local_name == key {
             collect_named_interface_symbols_from_scope(
                 st,
-                assoc.source_scope,
-                &assoc.original_name,
+                association.source_scope,
+                &association.original_name,
                 visited,
                 symbols,
                 seen,
@@ -13250,20 +13277,17 @@ fn collect_named_interface_symbols_from_scope<'a>(
     }
 
     let mut seen_use_scopes = Vec::new();
-    for assoc in &scope.use_associations {
-        if !assoc.from_bare_use {
+    for association in &scope.use_associations {
+        if !association.from_bare_use
+            || association.local_name != association.original_name
+            || seen_use_scopes.contains(&association.source_scope)
+        {
             continue;
         }
-        if assoc.local_name != assoc.original_name {
-            continue;
-        }
-        if seen_use_scopes.contains(&assoc.source_scope) {
-            continue;
-        }
-        seen_use_scopes.push(assoc.source_scope);
+        seen_use_scopes.push(association.source_scope);
         collect_named_interface_symbols_from_scope(
             st,
-            assoc.source_scope,
+            association.source_scope,
             key,
             visited,
             symbols,
@@ -13560,7 +13584,7 @@ pub(super) fn named_interface_specific_candidates(
     }
 
     if !defined_operator {
-        for sym in use_associated_named_interface_symbols(st, &key) {
+        for sym in lexically_visible_named_interface_symbols(st, &key) {
             append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
         }
     }
@@ -13651,7 +13675,7 @@ fn operator_interface_specific_candidates(
             &mut seen_candidates,
         );
     }
-    for sym in use_associated_named_interface_symbols(st, &iface_key) {
+    for sym in lexically_visible_named_interface_symbols(st, &iface_key) {
         append_named_interface_specific_candidates(
             st,
             sym,
