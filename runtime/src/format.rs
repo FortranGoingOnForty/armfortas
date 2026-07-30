@@ -989,15 +989,14 @@ impl FormatEngine {
                     return Ok(self.apply_decimal_sep(&fit_field(&s, *width)));
                 }
                 // Engineering: exponent is multiple of 3.
-                let (mantissa, exp) = to_engineering(v.abs());
+                let (mantissa, mut exp) = to_engineering(v.abs());
                 let rounded = self.apply_explicit_rounding(mantissa, *decimals);
-                let s = format!(
-                    "{}{:.*}E{:+03}",
-                    self.real_sign(*v),
-                    *decimals,
-                    rounded,
-                    exp
-                );
+                let mut mantissa_text = format!("{:.*}", *decimals, rounded);
+                if rounded_mantissa_reached_upper_bound(&mantissa_text, "1000") {
+                    mantissa_text = format!("{:.*}", *decimals, 1.0);
+                    exp += 3;
+                }
+                let s = format!("{}{}E{:+03}", self.real_sign(*v), mantissa_text, exp);
                 Ok(self.apply_decimal_sep(&fit_field(&s, *width)))
             }
             (FormatDesc::RealD { width, decimals }, IoValue::Real(v) | IoValue::Real32(v)) => {
@@ -1432,9 +1431,14 @@ impl FormatEngine {
         }
 
         let abs_v = v.abs();
-        let base_exp = abs_v.log10().floor() as i32;
+        let mut base_exp = abs_v.log10().floor() as i32;
         let mantissa = abs_v / 10f64.powi(base_exp);
         let rounded = self.apply_explicit_rounding(mantissa, decimals);
+        let mut mantissa_text = format!("{:.*}", decimals, rounded);
+        if rounded_mantissa_reached_upper_bound(&mantissa_text, "10") {
+            mantissa_text = format!("{:.*}", decimals, 1.0);
+            base_exp += 1;
+        }
 
         let ew = exp_width.unwrap_or(2);
         let sign = if v < 0.0 {
@@ -1444,14 +1448,7 @@ impl FormatEngine {
         } else {
             ""
         };
-        format!(
-            "{}{:.*}E{:+0ew$}",
-            sign,
-            decimals,
-            rounded,
-            base_exp,
-            ew = ew + 1
-        )
+        format!("{}{}E{:+0ew$}", sign, mantissa_text, base_exp, ew = ew + 1)
     }
 
     /// Replace '.' with ',' when decimal mode is DC (comma).
@@ -1714,6 +1711,10 @@ fn to_engineering(v: f64) -> (f64, i32) {
     let exp = decimal_exp.div_euclid(3) * 3;
     let mantissa = v / 10f64.powi(exp);
     (mantissa, exp)
+}
+
+fn rounded_mantissa_reached_upper_bound(text: &str, upper_bound: &str) -> bool {
+    text.split_once('.').map_or(text, |(integer, _)| integer) == upper_bound
 }
 
 fn skip_spaces(chars: &mut std::iter::Peekable<std::str::Chars>) {
@@ -2563,6 +2564,34 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(value)]);
         assert_eq!(out.trim().parse::<f64>().unwrap(), value);
+    }
+
+    #[test]
+    fn format_es_renormalizes_rounding_carry() {
+        let format = |descriptor, value| {
+            FormatEngine::new(parse_format(descriptor)).format_values(&[IoValue::Real(value)])
+        };
+
+        assert_eq!(format("(RU,ES13.3)", 9.9991), "    1.000E+01");
+        assert_eq!(format("(RN,ES13.3)", 9.9996), "    1.000E+01");
+        assert_eq!(format("(RZ,ES13.3)", 9.9996), "    9.999E+00");
+        assert_eq!(format("(RU,ES14.3E3)", 9.9991), "    1.000E+001");
+        assert_eq!(format("(RU,ES13.3)", 0.99991), "    1.000E+00");
+    }
+
+    #[test]
+    fn format_en_renormalizes_rounding_carry() {
+        let format = |descriptor, value| {
+            FormatEngine::new(parse_format(descriptor)).format_values(&[IoValue::Real(value)])
+        };
+
+        assert_eq!(format("(RU,EN14.3)", 999.9991), "     1.000E+03");
+        assert_eq!(format("(RN,EN14.3)", 999.9996), "     1.000E+03");
+        assert_eq!(format("(EN14.3)", 999.9996), "     1.000E+03");
+        assert_eq!(format("(RZ,EN14.3)", 999.9996), "   999.999E+00");
+        assert_eq!(format("(RU,EN14.3)", 0.9999991), "     1.000E+00");
+        assert_eq!(format("(RU,EN14.3)", 0.0009999991), "     1.000E-03");
+        assert_eq!(format("(RU,EN14.3)", 999999.9), "     1.000E+06");
     }
 
     #[test]
