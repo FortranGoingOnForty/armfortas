@@ -29780,6 +29780,688 @@ fn known_logical_condition(
     }
 }
 
+#[derive(Clone)]
+enum DoConcurrentLocalityKind {
+    Local,
+    LocalInit,
+    Reduce(String),
+}
+
+#[derive(Clone, Copy)]
+enum DoConcurrentPrivateCleanup {
+    None,
+    ArrayDescriptor { desc: ValueId, stat: ValueId },
+    Heap { ptr: ValueId },
+}
+
+struct DoConcurrentLocalityBinding {
+    name: String,
+    outside: LocalInfo,
+    private: LocalInfo,
+    kind: DoConcurrentLocalityKind,
+    outside_array_desc: Option<ValueId>,
+    cleanup: DoConcurrentPrivateCleanup,
+}
+
+struct DoConcurrentLocalityState {
+    bindings: Vec<DoConcurrentLocalityBinding>,
+    span: crate::lexer::Span,
+}
+
+fn zero_byte_storage(b: &mut FuncBuilder, bytes: u64) -> ValueId {
+    let addr = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        bytes.max(1),
+    ));
+    let zero = b.const_i32(0);
+    let size = b.const_i64(bytes.max(1) as i64);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![addr, zero, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    addr
+}
+
+fn concurrent_scalar_storage_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.by_ref {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn allocate_do_concurrent_private(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    outside: &LocalInfo,
+    reduction: bool,
+) -> (LocalInfo, Option<ValueId>, DoConcurrentPrivateCleanup) {
+    if local_is_array_like(outside) {
+        let outside_desc = if local_uses_array_descriptor(outside) {
+            array_descriptor_addr(b, outside)
+        } else {
+            materialize_array_descriptor_for_info(b, outside)
+        };
+        let private_desc = zero_byte_storage(b, 392);
+        let mut private = outside.clone();
+        private.addr = private_desc;
+        private.by_ref = false;
+        private.inline_const = None;
+
+        if outside.is_pointer && !reduction {
+            // A pointer construct entity owns only its association, never the
+            // target. LOCAL_INIT copies the descriptor and LOCAL clears it.
+            private.allocatable = true;
+            private.descriptor_arg = false;
+            return (
+                private,
+                Some(outside_desc),
+                DoConcurrentPrivateCleanup::None,
+            );
+        }
+
+        let stat = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, stat);
+        b.call(
+            FuncRef::External("afs_allocate_like".into()),
+            vec![private_desc, outside_desc, stat],
+            IrType::Void,
+        );
+        // The construct entity has fixed bounds for the lifetime of this
+        // invocation. Keep descriptor addressing without exposing allocatable
+        // assignment semantics to its body.
+        private.allocatable = false;
+        private.descriptor_arg = true;
+        private.is_pointer = false;
+        return (
+            private,
+            Some(outside_desc),
+            DoConcurrentPrivateCleanup::ArrayDescriptor {
+                desc: private_desc,
+                stat,
+            },
+        );
+    }
+
+    if matches!(outside.char_kind, CharKind::Deferred) {
+        // Deferred-length scalar locality is only valid for a POINTER (an
+        // allocatable is excluded by the locality constraints). Its 32-byte
+        // descriptor is the association value.
+        let private_addr = zero_byte_storage(b, 32);
+        let mut private = outside.clone();
+        private.addr = private_addr;
+        private.by_ref = false;
+        private.inline_const = None;
+        if reduction {
+            private.is_pointer = false;
+        }
+        return (private, None, DoConcurrentPrivateCleanup::None);
+    }
+
+    if outside.is_class && local_uses_array_descriptor(outside) {
+        // Rank-zero polymorphic POINTERs use the array descriptor record for
+        // their dynamic type and association.
+        let private_addr = zero_byte_storage(b, 392);
+        let mut private = outside.clone();
+        private.addr = private_addr;
+        private.by_ref = false;
+        private.inline_const = None;
+        return (private, None, DoConcurrentPrivateCleanup::None);
+    }
+
+    if let CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } =
+        outside.char_kind
+    {
+        let private_addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let mut private = outside.clone();
+        private.addr = private_addr;
+        private.by_ref = false;
+        private.inline_const = None;
+        if outside.is_pointer && !reduction {
+            let zero = b.const_i32(0);
+            let bytes = b.const_i64(8);
+            b.call(
+                FuncRef::External("memset".into()),
+                vec![private_addr, zero, bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            return (private, None, DoConcurrentPrivateCleanup::None);
+        }
+        if reduction {
+            private.is_pointer = false;
+        }
+
+        let len = b.load(len_addr);
+        let one = b.const_i64(1);
+        let bytes = b.iadd(len, one);
+        let ptr = b.runtime_call(
+            RuntimeFunc::Allocate,
+            vec![bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        b.store(ptr, private_addr);
+        let zero = b.const_i32(0);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![ptr, zero, bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return (private, None, DoConcurrentPrivateCleanup::Heap { ptr });
+    }
+
+    let private_addr = if outside.is_pointer && !reduction {
+        if outside.derived_type.is_some() {
+            b.alloca(outside.ty.clone())
+        } else {
+            b.alloca(IrType::Ptr(Box::new(outside.ty.clone())))
+        }
+    } else if let CharKind::Fixed(len) = outside.char_kind {
+        zero_byte_storage(b, (len.max(0) + 1) as u64)
+    } else if let Some(type_name) = outside.derived_type.as_deref() {
+        let bytes = ctx
+            .type_layouts
+            .get(type_name)
+            .map(|layout| layout.size as u64)
+            .unwrap_or_else(|| outside.ty.size_bytes(&ctx.layout).max(1));
+        zero_byte_storage(b, bytes)
+    } else {
+        b.alloca(outside.ty.clone())
+    };
+
+    let mut private = outside.clone();
+    private.addr = private_addr;
+    private.by_ref = false;
+    private.allocatable = false;
+    private.descriptor_arg = false;
+    private.inline_const = None;
+    if reduction {
+        private.is_pointer = false;
+    }
+    (private, None, DoConcurrentPrivateCleanup::None)
+}
+
+fn emit_do_concurrent_local_init(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    binding: &DoConcurrentLocalityBinding,
+) {
+    let outside = &binding.outside;
+    let private = &binding.private;
+
+    if local_is_array_like(outside) {
+        let source_desc = binding
+            .outside_array_desc
+            .expect("array locality binding should retain its source descriptor");
+        if outside.is_pointer {
+            emit_memcpy_bytes(b, private.addr, source_desc, 392);
+        } else {
+            let null_stat = b.const_i64(0);
+            b.call(
+                FuncRef::External("afs_copy_array_data_no_realloc".into()),
+                vec![private.addr, source_desc, null_stat],
+                IrType::Void,
+            );
+        }
+        return;
+    }
+
+    if matches!(outside.char_kind, CharKind::Deferred) {
+        let source = concurrent_scalar_storage_addr(b, outside);
+        emit_memcpy_bytes(b, private.addr, source, 32);
+        return;
+    }
+
+    if outside.is_class && local_uses_array_descriptor(outside) {
+        let source = array_descriptor_addr(b, outside);
+        emit_memcpy_bytes(b, private.addr, source, 392);
+        return;
+    }
+
+    if matches!(
+        outside.char_kind,
+        CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+    ) {
+        if outside.is_pointer {
+            let source = concurrent_scalar_storage_addr(b, outside);
+            emit_memcpy_bytes(b, private.addr, source, 8);
+        } else {
+            let source = b.load(outside.addr);
+            let dest = b.load(private.addr);
+            let len = match outside.char_kind {
+                CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
+                    b.load(len_addr)
+                }
+                _ => unreachable!(),
+            };
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dest, source, len],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+        }
+        return;
+    }
+
+    let source = concurrent_scalar_storage_addr(b, outside);
+    if outside.is_pointer {
+        emit_memcpy_bytes(b, private.addr, source, 8);
+    } else if let CharKind::Fixed(len) = outside.char_kind {
+        emit_memcpy_bytes(b, private.addr, source, len.max(0));
+    } else if let Some(type_name) = outside.derived_type.as_deref() {
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, private.addr, source);
+    } else {
+        let bytes = local_storage_size_bytes(outside, ctx.type_layouts, ctx.layout);
+        emit_memcpy_bytes(b, private.addr, source, bytes);
+    }
+}
+
+fn emit_do_concurrent_local_reset(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    binding: &DoConcurrentLocalityBinding,
+) {
+    let outside = &binding.outside;
+    let private = &binding.private;
+
+    if outside.is_pointer {
+        let bytes = if local_is_array_like(outside)
+            || (outside.is_class && local_uses_array_descriptor(outside))
+        {
+            392
+        } else if matches!(outside.char_kind, CharKind::Deferred) {
+            32
+        } else {
+            8
+        };
+        let zero = b.const_i32(0);
+        let size = b.const_i64(bytes);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![private.addr, zero, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
+
+    let Some(type_name) = private.derived_type.as_deref() else {
+        return;
+    };
+    let Some(layout) = ctx.type_layouts.get(type_name) else {
+        return;
+    };
+    if local_is_array_like(private) {
+        let base = array_base_addr(b, private);
+        let count = array_total_elems_value(b, private);
+        initialize_derived_array_storage_dynamic(b, base, layout, count, ctx.type_layouts);
+    } else {
+        initialize_derived_storage(b, private.addr, layout, ctx.type_layouts);
+    }
+}
+
+fn synth_call_expr(
+    name: &str,
+    args: Vec<crate::ast::expr::SpannedExpr>,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr(name, span)),
+            args: args
+                .into_iter()
+                .map(|value| crate::ast::expr::Argument {
+                    keyword: None,
+                    value: crate::ast::expr::SectionSubscript::Element(value),
+                })
+                .collect(),
+        },
+        span,
+    )
+}
+
+fn normalized_reduce_op(op: &str) -> String {
+    op.trim().trim_matches('.').to_ascii_lowercase()
+}
+
+fn synth_typed_integer_expr(
+    value: i128,
+    ty: &IrType,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    let kind = match ty {
+        IrType::Int(width) => Some(width.bytes().to_string()),
+        _ => None,
+    };
+    crate::ast::Spanned::new(
+        Expr::IntegerLiteral {
+            text: value.to_string(),
+            kind,
+        },
+        span,
+    )
+}
+
+fn integer_type_bounds(ty: &IrType) -> Option<(i128, i128)> {
+    let IrType::Int(width) = ty else {
+        return None;
+    };
+    let bits = width.bits();
+    if bits == 128 {
+        Some((i128::MIN, i128::MAX))
+    } else {
+        let magnitude = 1_i128 << (bits - 1);
+        Some((-magnitude, magnitude - 1))
+    }
+}
+
+fn synth_character_reduction_identity(
+    code: i64,
+    name: &str,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    let character = synth_call_expr("char", vec![synth_int_expr(code, span)], span);
+    let len = synth_call_expr("len", vec![synth_name_expr(name, span)], span);
+    synth_call_expr("repeat", vec![character, len], span)
+}
+
+fn synth_do_concurrent_reduction_identity(
+    op: &str,
+    name: &str,
+    info: &LocalInfo,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    match normalized_reduce_op(op).as_str() {
+        "+" | "or" | "neqv" | "ior" | "ieor" => synth_typed_integer_expr(0, &info.ty, span),
+        "*" => synth_typed_integer_expr(1, &info.ty, span),
+        "and" | "eqv" => crate::ast::Spanned::new(
+            Expr::LogicalLiteral {
+                value: true,
+                kind: None,
+            },
+            span,
+        ),
+        "max" => {
+            if info.char_kind != CharKind::None {
+                return synth_character_reduction_identity(0, name, span);
+            }
+            if let Some((least, _)) = integer_type_bounds(&info.ty) {
+                return synth_typed_integer_expr(least, &info.ty, span);
+            }
+            let huge = synth_call_expr("huge", vec![synth_name_expr(name, span)], span);
+            crate::ast::Spanned::new(
+                Expr::UnaryOp {
+                    op: UnaryOp::Minus,
+                    operand: Box::new(huge),
+                },
+                span,
+            )
+        }
+        "min" => {
+            if info.char_kind != CharKind::None {
+                return synth_character_reduction_identity(u8::MAX.into(), name, span);
+            }
+            if let Some((_, greatest)) = integer_type_bounds(&info.ty) {
+                return synth_typed_integer_expr(greatest, &info.ty, span);
+            }
+            synth_call_expr("huge", vec![synth_name_expr(name, span)], span)
+        }
+        "iand" => synth_typed_integer_expr(-1, &info.ty, span),
+        _ => lower_stmt_error(
+            span,
+            &format!("unsupported DO CONCURRENT REDUCE operator '{op}'"),
+        ),
+    }
+}
+
+fn synth_do_concurrent_reduction_merge(
+    op: &str,
+    outside_name: &str,
+    private_name: &str,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    let left = synth_name_expr(outside_name, span);
+    let right = synth_name_expr(private_name, span);
+    match normalized_reduce_op(op).as_str() {
+        "+" => crate::ast::Spanned::new(
+            Expr::BinaryOp {
+                op: BinaryOp::Add,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        ),
+        "*" => crate::ast::Spanned::new(
+            Expr::BinaryOp {
+                op: BinaryOp::Mul,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        ),
+        "and" | "or" | "eqv" | "neqv" => {
+            let op = match normalized_reduce_op(op).as_str() {
+                "and" => BinaryOp::And,
+                "or" => BinaryOp::Or,
+                "eqv" => BinaryOp::Eqv,
+                "neqv" => BinaryOp::Neqv,
+                _ => unreachable!(),
+            };
+            crate::ast::Spanned::new(
+                Expr::BinaryOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }
+        "max" | "min" | "iand" | "ior" | "ieor" => {
+            synth_call_expr(&normalized_reduce_op(op), vec![left, right], span)
+        }
+        _ => lower_stmt_error(
+            span,
+            &format!("unsupported DO CONCURRENT REDUCE operator '{op}'"),
+        ),
+    }
+}
+
+fn emit_synthetic_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    target_name: &str,
+    value: crate::ast::expr::SpannedExpr,
+    span: crate::lexer::Span,
+) {
+    let stmt = crate::ast::Spanned::new(
+        Stmt::Assignment {
+            target: synth_name_expr(target_name, span),
+            value,
+        },
+        span,
+    );
+    super::stmt::lower_stmt(b, ctx, &stmt);
+}
+
+impl DoConcurrentLocalityState {
+    fn prepare(
+        b: &mut FuncBuilder,
+        ctx: &mut LowerCtx,
+        locality: &[LocalitySpec],
+        span: crate::lexer::Span,
+    ) -> Self {
+        let mut bindings = Vec::new();
+        let mut bound_names = HashSet::new();
+
+        for spec in locality {
+            let (kind, names): (Option<DoConcurrentLocalityKind>, &[String]) = match spec {
+                LocalitySpec::Local(names) => (Some(DoConcurrentLocalityKind::Local), names),
+                LocalitySpec::LocalInit(names) => {
+                    (Some(DoConcurrentLocalityKind::LocalInit), names)
+                }
+                LocalitySpec::Reduce { op, vars } => {
+                    (Some(DoConcurrentLocalityKind::Reduce(op.clone())), vars)
+                }
+                LocalitySpec::Shared(_) | LocalitySpec::DefaultNone => (None, &[]),
+            };
+            let Some(kind) = kind else {
+                continue;
+            };
+            for name in names {
+                let key = name.to_lowercase();
+                // Duplicate locality-specs are diagnosed by semantic
+                // validation. Avoid manufacturing two construct entities if
+                // malformed input reaches lowering.
+                if !bound_names.insert(key.clone()) {
+                    continue;
+                }
+                let outside = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                    lower_stmt_error(
+                        span,
+                        &format!("DO CONCURRENT locality variable '{name}' has no visible binding"),
+                    )
+                });
+                let reduction = matches!(kind, DoConcurrentLocalityKind::Reduce(_));
+                let (private, outside_array_desc, cleanup) =
+                    allocate_do_concurrent_private(b, ctx, &outside, reduction);
+                bindings.push(DoConcurrentLocalityBinding {
+                    name: key,
+                    outside,
+                    private,
+                    kind: kind.clone(),
+                    outside_array_desc,
+                    cleanup,
+                });
+            }
+        }
+
+        let state = Self { bindings, span };
+        state.initialize_reductions(b, ctx);
+        state
+    }
+
+    fn initialize_reductions(&self, b: &mut FuncBuilder, ctx: &mut LowerCtx) {
+        for binding in &self.bindings {
+            let DoConcurrentLocalityKind::Reduce(op) = &binding.kind else {
+                continue;
+            };
+            let saved = ctx
+                .locals
+                .insert(binding.name.clone(), binding.private.clone());
+            let identity = synth_do_concurrent_reduction_identity(
+                op,
+                &binding.name,
+                &binding.private,
+                self.span,
+            );
+            emit_synthetic_assignment(b, ctx, &binding.name, identity, self.span);
+            match saved {
+                Some(info) => {
+                    ctx.locals.insert(binding.name.clone(), info);
+                }
+                None => {
+                    ctx.locals.remove(&binding.name);
+                }
+            }
+        }
+    }
+
+    fn initialize_iteration(&self, b: &mut FuncBuilder, ctx: &LowerCtx) {
+        for binding in &self.bindings {
+            match binding.kind {
+                DoConcurrentLocalityKind::Local => {
+                    emit_do_concurrent_local_reset(b, ctx, binding);
+                }
+                DoConcurrentLocalityKind::LocalInit => {
+                    emit_do_concurrent_local_init(b, ctx, binding);
+                }
+                DoConcurrentLocalityKind::Reduce(_) => {}
+            }
+        }
+    }
+
+    fn install_private_bindings(&self, ctx: &mut LowerCtx) -> Vec<Option<LocalInfo>> {
+        self.bindings
+            .iter()
+            .map(|binding| {
+                ctx.locals
+                    .insert(binding.name.clone(), binding.private.clone())
+            })
+            .collect()
+    }
+
+    fn restore_outside_bindings(&self, ctx: &mut LowerCtx, saved: Vec<Option<LocalInfo>>) {
+        for (binding, saved) in self.bindings.iter().zip(saved) {
+            match saved {
+                Some(info) => {
+                    ctx.locals.insert(binding.name.clone(), info);
+                }
+                None => {
+                    ctx.locals.remove(&binding.name);
+                }
+            }
+        }
+    }
+
+    fn merge_reductions(&self, b: &mut FuncBuilder, ctx: &mut LowerCtx) {
+        let mut temp_ordinal = 0usize;
+        for binding in &self.bindings {
+            let DoConcurrentLocalityKind::Reduce(op) = &binding.kind else {
+                continue;
+            };
+            let private_name = loop {
+                let candidate = format!("afs_doconc_reduce_private_{temp_ordinal}");
+                temp_ordinal += 1;
+                if !ctx.locals.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            let saved_outside_view =
+                if binding.outside.is_pointer && local_is_array_like(&binding.outside) {
+                    // REDUCE strips POINTER from the construct entity, and the
+                    // final intrinsic assignment defines the associated target;
+                    // it must not invoke allocatable-style descriptor
+                    // replacement on the outside pointer.
+                    let mut target_view = binding.outside.clone();
+                    target_view.allocatable = false;
+                    target_view.descriptor_arg = true;
+                    ctx.locals.insert(binding.name.clone(), target_view)
+                } else {
+                    None
+                };
+            ctx.locals
+                .insert(private_name.clone(), binding.private.clone());
+            let merged =
+                synth_do_concurrent_reduction_merge(op, &binding.name, &private_name, self.span);
+            emit_synthetic_assignment(b, ctx, &binding.name, merged, self.span);
+            ctx.locals.remove(&private_name);
+            if let Some(outside) = saved_outside_view {
+                ctx.locals.insert(binding.name.clone(), outside);
+            }
+        }
+    }
+
+    fn cleanup(&self, b: &mut FuncBuilder) {
+        for binding in &self.bindings {
+            match binding.cleanup {
+                DoConcurrentPrivateCleanup::None => {}
+                DoConcurrentPrivateCleanup::ArrayDescriptor { desc, stat } => {
+                    let zero = b.const_i32(0);
+                    b.store(zero, stat);
+                    b.call(
+                        FuncRef::External("afs_deallocate_array".into()),
+                        vec![desc, stat],
+                        IrType::Void,
+                    );
+                }
+                DoConcurrentPrivateCleanup::Heap { ptr } => {
+                    b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                }
+            }
+        }
+    }
+}
+
 /// DO loop fields bundled for passing without too many args.
 pub(super) struct DoLoopFields<'a> {
     pub(super) name: &'a Option<String>,
@@ -29789,6 +30471,8 @@ pub(super) struct DoLoopFields<'a> {
     pub(super) step: &'a Option<crate::ast::expr::SpannedExpr>,
     pub(super) body: &'a [SpannedStmt],
     pub(super) concurrent: bool,
+    pub(super) locality: &'a [LocalitySpec],
+    pub(super) span: crate::lexer::Span,
 }
 
 pub(super) fn try_lower_bulk_do_concurrent(
@@ -29825,10 +30509,13 @@ pub(super) fn lower_do_concurrent(
     name: &Option<String>,
     controls: &[ConcurrentControl],
     mask: Option<&crate::ast::expr::SpannedExpr>,
+    locality: &[LocalitySpec],
     body: &[SpannedStmt],
     span: crate::lexer::Span,
 ) {
-    if try_lower_bulk_do_concurrent(b, ctx, controls, mask, body) {
+    // The bulk map recognizes only the assignment expression. It cannot
+    // manufacture the construct entities required by a locality-spec.
+    if locality.is_empty() && try_lower_bulk_do_concurrent(b, ctx, controls, mask, body) {
         return;
     }
 
@@ -29864,7 +30551,7 @@ pub(super) fn lower_do_concurrent(
                 name: None,
                 controls: rest.to_vec(),
                 mask: mask.cloned(),
-                locality: vec![],
+                locality: locality.to_vec(),
                 body: body.to_vec(),
             },
             span,
@@ -29883,6 +30570,8 @@ pub(super) fn lower_do_concurrent(
             step: &ctrl.step,
             body: lowered_body,
             concurrent: true,
+            locality: if rest.is_empty() { locality } else { &[] },
+            span,
         },
     );
 }
@@ -29897,6 +30586,8 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         step,
         body,
         concurrent,
+        locality,
+        span,
     } = fields;
     let (check_name, body_name, incr_name, exit_name, neg_check_name, pos_check_name) =
         if concurrent {
@@ -29972,6 +30663,14 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
             let one = b.const_i32(1);
             coerce_to_type(b, one, &var_ty)
         };
+        // Header expressions are evaluated in the enclosing scope. Only
+        // after they have been captured may locality construct entities be
+        // created and substituted into the loop body.
+        let locality_state = if concurrent && !locality.is_empty() {
+            Some(DoConcurrentLocalityState::prepare(b, ctx, locality, span))
+        } else {
+            None
+        };
 
         let bb_check = b.create_block(check_name);
         let bb_body = b.create_block(body_name);
@@ -30025,7 +30724,14 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         // Body.
         ctx.push_loop(name.clone(), bb_incr, bb_exit);
         b.set_block(bb_body);
+        let saved_locality_bindings = locality_state.as_ref().map(|state| {
+            state.initialize_iteration(b, ctx);
+            state.install_private_bindings(ctx)
+        });
         super::stmt::lower_stmts(b, ctx, body);
+        if let (Some(state), Some(saved)) = (locality_state.as_ref(), saved_locality_bindings) {
+            state.restore_outside_bindings(ctx, saved);
+        }
         if b.func().block(b.current_block()).terminator.is_none() {
             b.branch(bb_incr, vec![]);
         }
@@ -30039,6 +30745,10 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         b.branch(bb_check, vec![]);
 
         b.set_block(bb_exit);
+        if let Some(state) = locality_state {
+            state.merge_reductions(b, ctx);
+            state.cleanup(b);
+        }
     } else {
         // Infinite DO (no variable) — `do ... end do` without loop control.
         let bb_body = b.create_block(body_name);
@@ -41649,7 +42359,7 @@ pub(super) fn try_lower_scalarized_subscript_array_assign(
         end: synth_size_expr(dest_name, value.span),
         step: None,
     }];
-    lower_do_concurrent(b, ctx, &None, &controls, None, &body, value.span);
+    lower_do_concurrent(b, ctx, &None, &controls, None, &[], &body, value.span);
     true
 }
 
@@ -41737,7 +42447,7 @@ pub(super) fn try_lower_elemental_array_assign(
         end: synth_int_expr(dest_upper, value.span),
         step: None,
     }];
-    lower_do_concurrent(b, ctx, &None, &controls, None, &body, value.span);
+    lower_do_concurrent(b, ctx, &None, &controls, None, &[], &body, value.span);
     true
 }
 
@@ -41909,7 +42619,7 @@ pub(super) fn try_lower_defined_operator_array_assign(
         end: synth_int_expr(dest_upper, span),
         step: None,
     }];
-    lower_do_concurrent(b, ctx, &None, &controls, None, &body, span);
+    lower_do_concurrent(b, ctx, &None, &controls, None, &[], &body, span);
     true
 }
 
@@ -63574,6 +64284,39 @@ end program
 ",
         );
         assert!(ir.matches("doconc_check").count() >= 2);
+    }
+
+    #[test]
+    fn lower_do_concurrent_locality_uses_private_construct_entities() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: i, j, seed, scratch, total
+  integer :: seen(2, 2)
+  seed = 10
+  scratch = 77
+  total = 5
+  seen = 0
+  do concurrent (i = 1:2, j = 1:2) &
+      local_init(seed) local(scratch) shared(seen) reduce(+:total) default(none)
+    scratch = 100 * i + j
+    seen(i, j) = seed + scratch
+    seed = seed + 1
+    total = total + i + j
+  end do
+end program
+",
+        );
+        assert!(ir.matches("doconc_check").count() >= 2);
+        assert!(
+            ir.matches("alloca i32").count() >= 8,
+            "LOCAL, LOCAL_INIT, and REDUCE need storage distinct from the five source scalars:\n{ir}"
+        );
+        assert!(
+            ir.contains("call @memcpy"),
+            "LOCAL_INIT should copy the enclosing value into its construct entity:\n{ir}"
+        );
     }
 
     #[test]

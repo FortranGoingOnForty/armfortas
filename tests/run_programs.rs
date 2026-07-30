@@ -4412,6 +4412,100 @@ fn ar43_block_return_shadow_cleanup_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar43_do_concurrent_locality_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_do_concurrent_locality_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_locality.f90");
+    assert!(source.exists(), "ar43_do_concurrent_locality.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_locality.f90 should preserve every locality contract at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_locality_array_pointer_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar43_do_concurrent_locality_array_pointer_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_locality_array_pointer.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_locality_array_pointer.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_locality_array_pointer.f90 should preserve rank and pointer association at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_reduction_identities_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar43_do_concurrent_reduction_identities_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_reduction_identities.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_reduction_identities.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_reduction_identities.f90 should apply every supported reduction identity at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_default_none_missing_fixture_is_rejected() {
+    if skip_native_e2e(
+        "ar43_do_concurrent_default_none_missing_fixture_is_rejected",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_default_none_missing.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_default_none_missing.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_default_none_missing.f90 should fail with the required locality diagnostic, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;

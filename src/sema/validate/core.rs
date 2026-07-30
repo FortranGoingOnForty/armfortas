@@ -2168,6 +2168,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             controls,
             mask,
             locality,
+            body,
             ..
         } => {
             for control in controls {
@@ -2210,6 +2211,12 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                         }
                     }
                 }
+            }
+            if locality
+                .iter()
+                .any(|spec| matches!(spec, LocalitySpec::DefaultNone))
+            {
+                validate_do_concurrent_default_none(ctx, controls, locality, body);
             }
         }
         Stmt::WhereConstruct {
@@ -3311,6 +3318,206 @@ fn collect_reference_stmts(
 ) {
     for stmt in stmts {
         collect_reference_stmt(stmt, shadowed, facts);
+    }
+}
+
+/// `collect_reference_stmt` deliberately leaves BLOCK bodies to the lexical
+/// validation pass. DEFAULT(NONE), however, governs the complete
+/// do-concurrent-block, including a BLOCK nested under another executable
+/// construct. Walk just those skipped lexical islands here while carrying
+/// every intervening construct entity that can shadow an outer variable.
+fn collect_default_none_nested_block_references(
+    st: &SymbolTable,
+    stmts: &[SpannedStmt],
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Block {
+                uses,
+                ifaces,
+                decls,
+                body,
+                ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                collect_block_use_binding_names(st, uses, &mut nested_shadowed);
+                collect_block_binding_names(decls, &mut nested_shadowed);
+                extend_declared_names_from_ifaces(&mut nested_shadowed, ifaces);
+                for decl in decls {
+                    collect_reference_decl(decl, &nested_shadowed, facts);
+                }
+                collect_reference_stmts(body, &nested_shadowed, facts);
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_default_none_nested_block_references(st, then_body, shadowed, facts);
+                for (_, body) in else_ifs {
+                    collect_default_none_nested_block_references(st, body, shadowed, facts);
+                }
+                if let Some(body) = else_body {
+                    collect_default_none_nested_block_references(st, body, shadowed, facts);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::Labeled { stmt: action, .. } => {
+                collect_default_none_nested_block_references(
+                    st,
+                    std::slice::from_ref(action.as_ref()),
+                    shadowed,
+                    facts,
+                );
+            }
+            Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } => {
+                collect_default_none_nested_block_references(st, body, shadowed, facts);
+            }
+            Stmt::DoConcurrent {
+                controls,
+                locality,
+                body,
+                ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(controls.iter().map(|control| control.var.to_lowercase()));
+                for spec in locality {
+                    match spec {
+                        LocalitySpec::Local(names)
+                        | LocalitySpec::LocalInit(names)
+                        | LocalitySpec::Reduce { vars: names, .. } => {
+                            nested_shadowed.extend(names.iter().map(|name| name.to_lowercase()));
+                        }
+                        LocalitySpec::Shared(_) | LocalitySpec::DefaultNone => {}
+                    }
+                }
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_default_none_nested_block_references(st, &case.body, shadowed, facts);
+                }
+            }
+            Stmt::SelectType {
+                assoc_name, guards, ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                if let Some(name) = assoc_name {
+                    nested_shadowed.insert(name.to_lowercase());
+                }
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+                }
+            }
+            Stmt::SelectRank {
+                assoc_name, guards, ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                if let Some(name) = assoc_name {
+                    nested_shadowed.insert(name.to_lowercase());
+                }
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_default_none_nested_block_references(st, body, shadowed, facts);
+                for (_, body) in elsewhere {
+                    collect_default_none_nested_block_references(st, body, shadowed, facts);
+                }
+            }
+            Stmt::ForallConstruct { specs, body, .. } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            Stmt::ForallStmt { specs, stmt, .. } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+                collect_default_none_nested_block_references(
+                    st,
+                    std::slice::from_ref(stmt.as_ref()),
+                    &nested_shadowed,
+                    facts,
+                );
+            }
+            Stmt::Associate { assocs, body, .. } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(assocs.iter().map(|(name, _)| name.to_lowercase()));
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_do_concurrent_default_none(
+    ctx: &mut Ctx<'_>,
+    controls: &[ConcurrentControl],
+    locality: &[LocalitySpec],
+    body: &[SpannedStmt],
+) {
+    let mut explicitly_localized: HashSet<String> = controls
+        .iter()
+        .map(|control| control.var.to_lowercase())
+        .collect();
+    for spec in locality {
+        match spec {
+            LocalitySpec::Local(names)
+            | LocalitySpec::LocalInit(names)
+            | LocalitySpec::Shared(names)
+            | LocalitySpec::Reduce { vars: names, .. } => {
+                explicitly_localized.extend(names.iter().map(|name| name.to_lowercase()));
+            }
+            LocalitySpec::DefaultNone => {}
+        }
+    }
+
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_stmts(body, &explicitly_localized, &mut facts);
+    collect_default_none_nested_block_references(ctx.st, body, &explicitly_localized, &mut facts);
+
+    let mut missing = HashMap::<String, Span>::new();
+    for reference in facts.references {
+        let Some(symbol) = ctx.lookup_lexical(&reference.name) else {
+            continue;
+        };
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Variable | SymbolKind::ProcedurePointer
+        ) {
+            continue;
+        }
+        missing.entry(reference.name).or_insert(reference.span);
+    }
+
+    let mut missing: Vec<_> = missing.into_iter().collect();
+    missing.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, span) in missing {
+        ctx.error(
+            span,
+            format!(
+                "variable '{name}' referenced in a DO CONCURRENT with DEFAULT(NONE) \
+                 must appear in a locality-spec (F2023 C1134)"
+            ),
+        );
     }
 }
 
@@ -9349,9 +9556,12 @@ fn extend_declared_names_from_ifaces(
     use crate::ast::unit::{InterfaceBody, ProgramUnit};
 
     for iface in ifaces {
-        let ProgramUnit::InterfaceBlock { bodies, .. } = &iface.node else {
+        let ProgramUnit::InterfaceBlock { name, bodies, .. } = &iface.node else {
             continue;
         };
+        if let Some(name) = name.as_ref().filter(|name| !name.is_empty()) {
+            declared.insert(name.to_lowercase());
+        }
         for body in bodies {
             match body {
                 InterfaceBody::Subprogram(sub) => match &sub.node {
@@ -15684,6 +15894,142 @@ end program
 ",
         );
         assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_default_none_requires_locality_for_outer_variables() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, seed, result(2)
+  do concurrent (i = 1:2) default(none)
+    result(i) = seed + i
+  end do
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("'result'") && e.contains("DEFAULT(NONE)")),
+            "missing DEFAULT(NONE) diagnostic for result: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("'seed'") && e.contains("DEFAULT(NONE)")),
+            "missing DEFAULT(NONE) diagnostic for seed: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_accepts_explicit_and_block_local_variables() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, seed, result(2)
+  seed = 10
+  result = 0
+  do concurrent (i = 1:2) shared(seed, result) default(none)
+    block
+      integer :: local_value
+      local_value = seed + i
+      result(i) = local_value
+    end block
+  end do
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("DEFAULT(NONE)")),
+            "explicit locality and BLOCK-local entities should satisfy DEFAULT(NONE): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_reaches_outer_references_in_nested_block() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, seed
+  do concurrent (i = 1:2) default(none)
+    if (i > 0) then
+      block
+        integer :: local_value
+        local_value = seed
+      end block
+    end if
+  end do
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("'seed'") && e.contains("DEFAULT(NONE)")),
+            "DEFAULT(NONE) must cover references in nested BLOCKs: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("'local_value'")),
+            "a BLOCK-local entity must not require an outer locality-spec: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_accepts_use_shadowing_in_nested_block() {
+        let errs = errors_from(
+            "\
+module imported_values
+  implicit none
+  integer, parameter :: value = 7
+end module imported_values
+
+program test
+  implicit none
+  integer :: i, value, result
+  value = 100
+  result = 0
+  do concurrent (i = 1:2) shared(result) default(none)
+    block
+      use imported_values, only: value
+      result = result + value
+    end block
+  end do
+end program test
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("DEFAULT(NONE)")),
+            "a BLOCK use-associated entity must shadow an outer local entity: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_accepts_interface_shadowing_in_nested_block() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, handler, result
+  handler = 100
+  result = 0
+  do concurrent (i = 1:2) shared(result) default(none)
+    block
+      interface handler
+        pure integer function local_handler(value)
+          integer, intent(in) :: value
+        end function local_handler
+      end interface handler
+      result = result + handler(i)
+    end block
+  end do
+end program test
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("DEFAULT(NONE)")),
+            "a BLOCK interface must shadow an outer local entity: {errs:?}"
+        );
     }
 
     #[test]

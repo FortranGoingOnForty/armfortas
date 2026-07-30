@@ -2932,7 +2932,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.type_layouts,
                                     );
                                     deallocate_owned_string_bases(b, &owned_bases);
-                                } else if !info.dims.is_empty() || info.allocatable {
+                                } else if local_is_array_like(&info) || info.allocatable {
                                     if try_lower_elemental_array_assign(b, ctx, name, &info, value)
                                     {
                                         return;
@@ -6169,6 +6169,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     step,
                     body,
                     concurrent: false,
+                    locality: &[],
+                    span: stmt.span,
                 },
             );
         }
@@ -6177,10 +6179,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             name,
             controls,
             mask,
+            locality,
             body,
-            ..
         } => {
-            lower_do_concurrent(b, ctx, name, controls, mask.as_ref(), body, stmt.span);
+            lower_do_concurrent(
+                b,
+                ctx,
+                name,
+                controls,
+                mask.as_ref(),
+                locality,
+                body,
+                stmt.span,
+            );
         }
 
         Stmt::DoWhile {
