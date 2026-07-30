@@ -2432,6 +2432,183 @@ mod tests {
         desc
     }
 
+    fn strided_descriptor<T>(
+        data: &mut [T],
+        base_index: usize,
+        extents: &[i64],
+        strides: &[i64],
+    ) -> ArrayDescriptor {
+        assert_eq!(extents.len(), strides.len());
+        assert!(base_index < data.len());
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.base_addr = unsafe { data.as_mut_ptr().add(base_index) as *mut u8 };
+        desc.elem_size = std::mem::size_of::<T>() as i64;
+        desc.rank = extents.len() as i32;
+        for (i, (&extent, &stride)) in extents.iter().zip(strides).enumerate() {
+            desc.dims[i] = DimDescriptor {
+                lower_bound: 1,
+                upper_bound: extent,
+                stride,
+            };
+        }
+        desc
+    }
+
+    fn assert_rank_two_scalar_reductions(
+        real8: &ArrayDescriptor,
+        real4: &ArrayDescriptor,
+        ints: &ArrayDescriptor,
+        mask: &ArrayDescriptor,
+        norm2: f64,
+        sum: f64,
+        product: f64,
+        minval: f64,
+        maxval: f64,
+    ) {
+        assert!((afs_array_norm2_real8(real8) - norm2).abs() < 1.0e-12);
+        assert!((f64::from(afs_array_norm2_real4(real4)) - norm2).abs() < 1.0e-5);
+
+        assert_eq!(afs_array_sum_real8_mask(real8, mask), sum);
+        assert_eq!(afs_array_sum_real8_mask(real4, mask), sum);
+        assert_eq!(afs_array_sum_int_mask(ints, mask), sum as i64);
+
+        assert_eq!(afs_array_product_real8_mask(real8, mask), product);
+        assert_eq!(afs_array_product_real8_mask(real4, mask), product);
+        assert_eq!(afs_array_product_int_mask(ints, mask), product as i64);
+
+        assert_eq!(afs_array_minval_real8_mask(real8, mask), minval);
+        assert_eq!(afs_array_minval_real8_mask(real4, mask), minval);
+        assert_eq!(afs_array_minval_int_mask(ints, mask), minval as i64);
+
+        assert_eq!(afs_array_maxval_real8_mask(real8, mask), maxval);
+        assert_eq!(afs_array_maxval_real8_mask(real4, mask), maxval);
+        assert_eq!(afs_array_maxval_int_mask(ints, mask), maxval as i64);
+    }
+
+    #[test]
+    fn scalar_reductions_walk_contiguous_rank_two_descriptors() {
+        let mut real8_data = [2.0_f64, 3.0, 5.0, 7.0];
+        let mut real4_data = [2.0_f32, 3.0, 5.0, 7.0];
+        let mut int_data = [2_i32, 3, 5, 7];
+        let mut mask_data = [1_u32, 0, 1, 1];
+        let extents = [2, 2];
+        let strides = [1, 2];
+        let real8 = strided_descriptor(&mut real8_data, 0, &extents, &strides);
+        let real4 = strided_descriptor(&mut real4_data, 0, &extents, &strides);
+        let ints = strided_descriptor(&mut int_data, 0, &extents, &strides);
+        let mask = strided_descriptor(&mut mask_data, 0, &extents, &strides);
+
+        assert_rank_two_scalar_reductions(
+            &real8,
+            &real4,
+            &ints,
+            &mask,
+            87.0_f64.sqrt(),
+            14.0,
+            70.0,
+            2.0,
+            7.0,
+        );
+    }
+
+    #[test]
+    fn scalar_reductions_walk_noncontiguous_rank_two_descriptors() {
+        let mut real8_data = [101.0_f64; 12];
+        let mut real4_data = [101.0_f32; 12];
+        let mut int_data = [101_i32; 12];
+        for (index, value) in [(0, 2), (2, 3), (5, 5), (7, 7)] {
+            real8_data[index] = f64::from(value);
+            real4_data[index] = value as f32;
+            int_data[index] = value;
+        }
+        let mut mask_data = [0_u32; 12];
+        for index in [0, 4, 7] {
+            mask_data[index] = 1;
+        }
+        let extents = [2, 2];
+        let real8 = strided_descriptor(&mut real8_data, 0, &extents, &[2, 5]);
+        let real4 = strided_descriptor(&mut real4_data, 0, &extents, &[2, 5]);
+        let ints = strided_descriptor(&mut int_data, 0, &extents, &[2, 5]);
+        let mask = strided_descriptor(&mut mask_data, 0, &extents, &[3, 4]);
+
+        assert_rank_two_scalar_reductions(
+            &real8,
+            &real4,
+            &ints,
+            &mask,
+            87.0_f64.sqrt(),
+            14.0,
+            70.0,
+            2.0,
+            7.0,
+        );
+    }
+
+    #[test]
+    fn scalar_reductions_preserve_negative_rank_two_strides() {
+        let mut real8_data = [101.0_f64; 16];
+        let mut real4_data = [101.0_f32; 16];
+        let mut int_data = [101_i32; 16];
+        for (index, value) in [(8, 2), (6, 3), (3, 5), (1, 7)] {
+            real8_data[index] = f64::from(value);
+            real4_data[index] = value as f32;
+            int_data[index] = value;
+        }
+        let mut mask_data = [0_u32; 16];
+        for index in [8, 4, 1] {
+            mask_data[index] = 1;
+        }
+        let extents = [2, 2];
+        let real8 = strided_descriptor(&mut real8_data, 8, &extents, &[-2, -5]);
+        let real4 = strided_descriptor(&mut real4_data, 8, &extents, &[-2, -5]);
+        let ints = strided_descriptor(&mut int_data, 8, &extents, &[-2, -5]);
+        let mask = strided_descriptor(&mut mask_data, 8, &extents, &[-3, -4]);
+
+        assert_rank_two_scalar_reductions(
+            &real8,
+            &real4,
+            &ints,
+            &mask,
+            87.0_f64.sqrt(),
+            14.0,
+            70.0,
+            2.0,
+            7.0,
+        );
+    }
+
+    #[test]
+    fn scalar_reductions_return_identities_for_zero_extent_descriptors() {
+        let mut real8_data = [9.0_f64];
+        let mut real4_data = [9.0_f32];
+        let mut int_data = [9_i32];
+        let mut mask_data = [1_u32];
+        let extents = [2, 0];
+        let strides = [1, 2];
+        let real8 = strided_descriptor(&mut real8_data, 0, &extents, &strides);
+        let real4 = strided_descriptor(&mut real4_data, 0, &extents, &strides);
+        let ints = strided_descriptor(&mut int_data, 0, &extents, &strides);
+        let mask = strided_descriptor(&mut mask_data, 0, &extents, &strides);
+
+        assert_eq!(afs_array_norm2_real8(&real8), 0.0);
+        assert_eq!(afs_array_norm2_real4(&real4), 0.0);
+        assert_eq!(afs_array_sum_real8_mask(&real8, &mask), 0.0);
+        assert_eq!(afs_array_sum_real8_mask(&real4, &mask), 0.0);
+        assert_eq!(afs_array_sum_int_mask(&ints, &mask), 0);
+        assert_eq!(afs_array_product_real8_mask(&real8, &mask), 1.0);
+        assert_eq!(afs_array_product_real8_mask(&real4, &mask), 1.0);
+        assert_eq!(afs_array_product_int_mask(&ints, &mask), 1);
+        assert_eq!(afs_array_maxval_real8_mask(&real8, &mask), -f64::MAX);
+        assert_eq!(
+            afs_array_maxval_real8_mask(&real4, &mask),
+            -(f32::MAX as f64)
+        );
+        assert_eq!(afs_array_maxval_int_mask(&ints, &mask), i32::MIN as i64);
+        assert_eq!(afs_array_minval_real8_mask(&real8, &mask), f64::MAX);
+        assert_eq!(afs_array_minval_real8_mask(&real4, &mask), f32::MAX as f64);
+        assert_eq!(afs_array_minval_int_mask(&ints, &mask), i32::MAX as i64);
+    }
+
     #[test]
     fn allocate_1d() {
         let mut desc = ArrayDescriptor::zeroed();
@@ -3964,14 +4141,12 @@ pub extern "C" fn afs_array_norm2_real8(desc: *const ArrayDescriptor) -> f64 {
     if d.base_addr.is_null() {
         return 0.0;
     }
-    let n = d.total_elements() as usize;
-    let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f64;
     let mut acc = 0.0_f64;
-    for i in 0..n {
-        let v = unsafe { *ptr.add(i * stride) };
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| {
+        let v = unsafe { *(src.offset(byte_off) as *const f64) };
         acc += v * v;
-    }
+    });
     acc.sqrt()
 }
 
@@ -3985,14 +4160,12 @@ pub extern "C" fn afs_array_norm2_real4(desc: *const ArrayDescriptor) -> f32 {
     if d.base_addr.is_null() {
         return 0.0;
     }
-    let n = d.total_elements() as usize;
-    let stride = d.dims[0].stride.max(1) as usize;
-    let ptr = d.base_addr as *const f32;
     let mut acc = 0.0_f64;
-    for i in 0..n {
-        let v = unsafe { *ptr.add(i * stride) } as f64;
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset(d, |byte_off| {
+        let v = unsafe { *(src.offset(byte_off) as *const f32) } as f64;
         acc += v * v;
-    }
+    });
     acc.sqrt() as f32
 }
 
@@ -5966,22 +6139,6 @@ pub extern "C" fn afs_array_sum_complex8(out: *mut f64, desc: *const ArrayDescri
     });
 }
 
-/// Read one logical element from `mask` at logical index `i` (zero-based)
-/// honoring `mask.elem_size` (kind 1, 4, or any bit-width). Fortran maps
-/// `.true.` to a non-zero stored value; we treat any non-zero byte as true.
-unsafe fn mask_at(mask: &ArrayDescriptor, i: usize, stride: usize) -> bool {
-    let off = i * stride * mask.elem_size.max(1) as usize;
-    let p = mask.base_addr.add(off);
-    let es = mask.elem_size as usize;
-    match es {
-        1 => *p != 0,
-        2 => *(p as *const u16) != 0,
-        4 => *(p as *const u32) != 0,
-        8 => *(p as *const u64) != 0,
-        _ => *p != 0,
-    }
-}
-
 fn int_maxval_identity(elem_size: i64) -> i64 {
     match elem_size {
         1 => i8::MIN as i64,
@@ -6032,25 +6189,11 @@ pub extern "C" fn afs_array_sum_real8_mask(
     if d.base_addr.is_null() || m.base_addr.is_null() {
         return 0.0;
     }
-    let n = d.total_elements() as usize;
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = m.dims[0].stride.max(1) as usize;
     let mut sum: f64 = 0.0;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                sum += unsafe { *ptr.add(i * stride_d) } as f64;
-            }
-        }
-    } else {
-        let ptr = d.base_addr as *const f64;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                sum += unsafe { *ptr.add(i * stride_d) };
-            }
-        }
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        sum += read_real_as_f64(src, byte_off, d.elem_size);
+    });
     sum
 }
 
@@ -6069,26 +6212,11 @@ pub extern "C" fn afs_array_sum_int_mask(
     if d.base_addr.is_null() || mk.base_addr.is_null() {
         return 0;
     }
-    let n = d.total_elements() as usize;
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = mk.dims[0].stride.max(1) as usize;
     let mut sum: i64 = 0;
-    macro_rules! sum_kind {
-        ($t:ty) => {{
-            let ptr = d.base_addr as *const $t;
-            for i in 0..n {
-                if unsafe { mask_at(mk, i, stride_m) } {
-                    sum = sum.wrapping_add(unsafe { *ptr.add(i * stride_d) } as i64);
-                }
-            }
-        }};
-    }
-    match d.elem_size {
-        1 => sum_kind!(i8),
-        2 => sum_kind!(i16),
-        8 => sum_kind!(i64),
-        _ => sum_kind!(i32),
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, mk, |byte_off| unsafe {
+        sum = sum.wrapping_add(read_int_as_i64(src, byte_off, d.elem_size));
+    });
     sum
 }
 
@@ -6393,7 +6521,7 @@ pub extern "C" fn afs_array_product_int_dim_mask(
 }
 
 /// PRODUCT(array, mask=mask) — masked product (real). Dispatches on
-/// elem_size and reads mask via `mask_at` for any logical kind.
+/// elem_size and reads the mask using its own descriptor strides.
 #[no_mangle]
 pub extern "C" fn afs_array_product_real8_mask(
     desc: *const ArrayDescriptor,
@@ -6407,25 +6535,11 @@ pub extern "C" fn afs_array_product_real8_mask(
     if d.base_addr.is_null() || m.base_addr.is_null() {
         return 1.0;
     }
-    let n = d.total_elements() as usize;
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = m.dims[0].stride.max(1) as usize;
     let mut prod: f64 = 1.0;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                prod *= unsafe { *ptr.add(i * stride_d) } as f64;
-            }
-        }
-    } else {
-        let ptr = d.base_addr as *const f64;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                prod *= unsafe { *ptr.add(i * stride_d) };
-            }
-        }
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        prod *= read_real_as_f64(src, byte_off, d.elem_size);
+    });
     prod
 }
 
@@ -6444,26 +6558,11 @@ pub extern "C" fn afs_array_product_int_mask(
     if d.base_addr.is_null() || mk.base_addr.is_null() {
         return 1;
     }
-    let n = d.total_elements() as usize;
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = mk.dims[0].stride.max(1) as usize;
     let mut prod: i64 = 1;
-    macro_rules! prod_kind {
-        ($t:ty) => {{
-            let ptr = d.base_addr as *const $t;
-            for i in 0..n {
-                if unsafe { mask_at(mk, i, stride_m) } {
-                    prod = prod.wrapping_mul(unsafe { *ptr.add(i * stride_d) } as i64);
-                }
-            }
-        }};
-    }
-    match d.elem_size {
-        1 => prod_kind!(i8),
-        2 => prod_kind!(i16),
-        8 => prod_kind!(i64),
-        _ => prod_kind!(i32),
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, mk, |byte_off| unsafe {
+        prod = prod.wrapping_mul(read_int_as_i64(src, byte_off, d.elem_size));
+    });
     prod
 }
 
@@ -6485,34 +6584,14 @@ pub extern "C" fn afs_array_maxval_real8_mask(
     if d.base_addr.is_null() || m.base_addr.is_null() {
         return identity;
     }
-    let n = d.total_elements() as usize;
-    if n == 0 {
-        return identity;
-    }
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = m.dims[0].stride.max(1) as usize;
     let mut best = identity;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                let v = unsafe { *ptr.add(i * stride_d) } as f64;
-                if v > best {
-                    best = v;
-                }
-            }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        let value = read_real_as_f64(src, byte_off, d.elem_size);
+        if value > best {
+            best = value;
         }
-    } else {
-        let ptr = d.base_addr as *const f64;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                let v = unsafe { *ptr.add(i * stride_d) };
-                if v > best {
-                    best = v;
-                }
-            }
-        }
-    }
+    });
     best
 }
 
@@ -6534,34 +6613,14 @@ pub extern "C" fn afs_array_minval_real8_mask(
     if d.base_addr.is_null() || m.base_addr.is_null() {
         return identity;
     }
-    let n = d.total_elements() as usize;
-    if n == 0 {
-        return identity;
-    }
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = m.dims[0].stride.max(1) as usize;
     let mut best = identity;
-    if d.elem_size == 4 {
-        let ptr = d.base_addr as *const f32;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                let v = unsafe { *ptr.add(i * stride_d) } as f64;
-                if v < best {
-                    best = v;
-                }
-            }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, m, |byte_off| unsafe {
+        let value = read_real_as_f64(src, byte_off, d.elem_size);
+        if value < best {
+            best = value;
         }
-    } else {
-        let ptr = d.base_addr as *const f64;
-        for i in 0..n {
-            if unsafe { mask_at(m, i, stride_m) } {
-                let v = unsafe { *ptr.add(i * stride_d) };
-                if v < best {
-                    best = v;
-                }
-            }
-        }
-    }
+    });
     best
 }
 
@@ -6583,32 +6642,14 @@ pub extern "C" fn afs_array_maxval_int_mask(
     if d.base_addr.is_null() || mk.base_addr.is_null() {
         return identity;
     }
-    let n = d.total_elements() as usize;
-    if n == 0 {
-        return identity;
-    }
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = mk.dims[0].stride.max(1) as usize;
     let mut best = identity;
-    macro_rules! max_kind {
-        ($t:ty) => {{
-            let ptr = d.base_addr as *const $t;
-            for i in 0..n {
-                if unsafe { mask_at(mk, i, stride_m) } {
-                    let v = unsafe { *ptr.add(i * stride_d) } as i64;
-                    if v > best {
-                        best = v;
-                    }
-                }
-            }
-        }};
-    }
-    match d.elem_size {
-        1 => max_kind!(i8),
-        2 => max_kind!(i16),
-        8 => max_kind!(i64),
-        _ => max_kind!(i32),
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, mk, |byte_off| unsafe {
+        let value = read_int_as_i64(src, byte_off, d.elem_size);
+        if value > best {
+            best = value;
+        }
+    });
     best
 }
 
@@ -6630,32 +6671,14 @@ pub extern "C" fn afs_array_minval_int_mask(
     if d.base_addr.is_null() || mk.base_addr.is_null() {
         return identity;
     }
-    let n = d.total_elements() as usize;
-    if n == 0 {
-        return identity;
-    }
-    let stride_d = d.dims[0].stride.max(1) as usize;
-    let stride_m = mk.dims[0].stride.max(1) as usize;
     let mut best = identity;
-    macro_rules! min_kind {
-        ($t:ty) => {{
-            let ptr = d.base_addr as *const $t;
-            for i in 0..n {
-                if unsafe { mask_at(mk, i, stride_m) } {
-                    let v = unsafe { *ptr.add(i * stride_d) } as i64;
-                    if v < best {
-                        best = v;
-                    }
-                }
-            }
-        }};
-    }
-    match d.elem_size {
-        1 => min_kind!(i8),
-        2 => min_kind!(i16),
-        8 => min_kind!(i64),
-        _ => min_kind!(i32),
-    }
+    let src = d.base_addr as *const u8;
+    for_each_element_byte_offset_with_mask(d, mk, |byte_off| unsafe {
+        let value = read_int_as_i64(src, byte_off, d.elem_size);
+        if value < best {
+            best = value;
+        }
+    });
     best
 }
 
