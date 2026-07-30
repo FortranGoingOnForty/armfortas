@@ -2320,6 +2320,87 @@ end program
 }
 
 #[test]
+fn imported_interface_preserves_procedure_pointer_array_result_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=imported_interface_preserves_procedure_pointer_array_result_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_f90 = dir.join("array_factory_provider.f90");
+    let consumer_f90 = dir.join("array_factory_consumer.f90");
+    let provider_o = dir.join("array_factory_provider.o");
+    let consumer_o = dir.join("array_factory_consumer.o");
+    let binary = dir.join("array_factory_bin");
+
+    std::fs::write(
+        &provider_f90,
+        r#"module array_factory_provider
+  implicit none
+  abstract interface
+    function array_factory(n) result(values)
+      integer, intent(in) :: n
+      integer :: values(2, n)
+    end function array_factory
+  end interface
+contains
+  function build_values(n) result(values)
+    integer, intent(in) :: n
+    integer :: values(2, n)
+    values(1, 1) = 11
+    values(2, 1) = 12
+    values(1, 2) = 21
+    values(2, 2) = 22
+    values(1, 3) = 31
+    values(2, 3) = 32
+  end function build_values
+end module array_factory_provider
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_f90,
+        r#"program p
+  use array_factory_provider, only: array_factory, build_values
+  implicit none
+  procedure(array_factory), pointer :: make_values
+  integer :: got(2, 3)
+
+  make_values => build_values
+  got = make_values(3)
+  if (any(got /= reshape([11, 12, 21, 22, 31, 32], [2, 3]))) error stop 1
+  print *, "ok"
+end program p
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &provider_f90, &provider_o, None);
+    let amod = std::fs::read_to_string(dir.join("array_factory_provider.amod"))
+        .expect("missing provider module artifact");
+    assert!(
+        amod.contains(
+            "@function array_factory -> integer, result_rank=2, result_name=values, result_array_bounds=\"(2; n)\""
+        ),
+        "abstract interface array-result metadata missing from .amod:\n{}",
+        amod
+    );
+    compile_file(&compiler, &consumer_f90, &consumer_o, Some(&dir));
+    link_files(&[&provider_o, &consumer_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "imported procedure-pointer array result returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cross_tu_submodule_allocatable_array_result_preserves_amod_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

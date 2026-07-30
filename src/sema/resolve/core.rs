@@ -466,7 +466,15 @@ pub fn resolve_file(
 }
 
 pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
-    let updates: Vec<(String, Option<TypeInfo>, Vec<String>)> = st
+    struct InterfaceUpdate {
+        key: String,
+        type_info: Option<TypeInfo>,
+        arg_names: Vec<String>,
+        result_rank: u8,
+        result_array_spec: Vec<decl::ArraySpec>,
+    }
+
+    let updates: Vec<InterfaceUpdate> = st
         .scope(scope_id)
         .symbols
         .iter()
@@ -478,20 +486,24 @@ pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_
                 return None;
             };
             let iface_sym = st.find_symbol_any_scope(&iface_name.to_lowercase())?;
-            Some((
-                key.clone(),
-                iface_sym.type_info.clone(),
-                iface_sym.arg_names.clone(),
-            ))
+            Some(InterfaceUpdate {
+                key: key.clone(),
+                type_info: iface_sym.type_info.clone(),
+                arg_names: iface_sym.arg_names.clone(),
+                result_rank: iface_sym.attrs.result_rank,
+                result_array_spec: iface_sym.attrs.array_spec.clone(),
+            })
         })
         .collect();
 
-    for (key, type_info, arg_names) in updates {
-        if let Some(sym) = st.scope_mut(scope_id).symbols.get_mut(&key) {
-            if let Some(type_info) = type_info {
+    for update in updates {
+        if let Some(sym) = st.scope_mut(scope_id).symbols.get_mut(&update.key) {
+            if let Some(type_info) = update.type_info {
                 sym.type_info = Some(type_info);
             }
-            sym.arg_names = arg_names;
+            sym.arg_names = update.arg_names;
+            sym.attrs.result_rank = update.result_rank;
+            sym.attrs.array_spec = update.result_array_spec;
         }
     }
 }
@@ -3075,6 +3087,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                                 .clone()
                                 .unwrap_or_else(|| type_info.clone());
                             arg_names = iface_sym.arg_names.clone();
+                            sym_attrs.result_rank = iface_sym.attrs.result_rank;
+                            sym_attrs.array_spec = iface_sym.attrs.array_spec.clone();
                         }
                     }
                 }
@@ -3816,18 +3830,21 @@ fn function_result_attrs(
                     .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
                 if let Some(entity) = matching_entity {
                     let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
-                    // Capture result rank: prefer the entity-local array_spec
-                    // (e.g. `real :: w(:)`), falling back to a
+                    // Preserve the full result shape: prefer the entity-local
+                    // array spec (e.g. `real :: w(:)`), falling back to a
                     // `dimension(...)` attribute on the type declaration.
-                    let rank_from_entity = entity.array_spec.as_ref().map(|specs| specs.len());
-                    let rank_from_attrs = attrs.iter().find_map(|a| match a {
-                        crate::ast::decl::Attribute::Dimension(specs) => Some(specs.len()),
-                        _ => None,
+                    let array_spec = entity.array_spec.clone().or_else(|| {
+                        attrs.iter().find_map(|a| match a {
+                            crate::ast::decl::Attribute::Dimension(specs) => Some(specs.clone()),
+                            _ => None,
+                        })
                     });
-                    sym_attrs.result_rank = rank_from_entity
-                        .or(rank_from_attrs)
+                    sym_attrs.result_rank = array_spec
+                        .as_ref()
+                        .map(|specs| specs.len())
                         .unwrap_or(0)
                         .min(u8::MAX as usize) as u8;
+                    sym_attrs.array_spec = array_spec.unwrap_or_default();
                     return sym_attrs;
                 }
             }
@@ -4011,6 +4028,44 @@ end module result_parent
             .get("values")
             .expect("contained function symbol");
         assert_eq!(function.attrs.result_rank, 1);
+    }
+
+    #[test]
+    fn procedure_pointer_inherits_array_result_shape_from_interface() {
+        let st = resolve_source(
+            "program array_factory_user\n\
+               implicit none\n\
+               abstract interface\n\
+                 function array_factory(n) result(values)\n\
+                   integer, intent(in) :: n\n\
+                   integer, dimension(n) :: values\n\
+                 end function array_factory\n\
+               end interface\n\
+               procedure(array_factory), pointer :: make_values\n\
+             end program array_factory_user\n",
+        );
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    &scope.kind,
+                    ScopeKind::Program(name) if name == "array_factory_user"
+                )
+            })
+            .expect("program scope");
+        let procedure_pointer = program_scope
+            .symbols
+            .get("make_values")
+            .expect("procedure pointer symbol");
+
+        assert_eq!(procedure_pointer.kind, SymbolKind::ProcedurePointer);
+        assert_eq!(
+            procedure_pointer.attrs.procedure_iface.as_deref(),
+            Some("array_factory")
+        );
+        assert_eq!(procedure_pointer.attrs.result_rank, 1);
+        assert_eq!(procedure_pointer.attrs.array_spec.len(), 1);
     }
 
     #[test]

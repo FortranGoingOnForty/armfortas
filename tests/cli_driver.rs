@@ -27667,6 +27667,55 @@ fn proc_pointer_component_explicit_shape_intent_in_accepts_array_expression_actu
 }
 
 #[test]
+fn procedure_pointer_array_result_uses_hidden_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_array_result_uses_hidden_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  abstract interface\n    function array_factory(n) result(values)\n      integer, intent(in) :: n\n      integer :: values(n)\n    end function array_factory\n  end interface\n  procedure(array_factory), pointer :: make_values\n  integer :: got(3)\n\n  make_values => build_values\n  got = make_values(3)\n  if (any(got /= [11, 22, 33])) error stop 1\n  print *, 'ok'\ncontains\n  function build_values(n) result(values)\n    integer, intent(in) :: n\n    integer :: values(n)\n    values(1) = 11\n    values(2) = 22\n    values(3) = 33\n  end function build_values\nend program p\n",
+        "f90",
+    );
+    for level in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let out = unique_path(
+            &format!("procedure_pointer_array_result_{}", &level[1..]),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), level, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("procedure-pointer array-result compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "procedure-pointer array-result compile failed at {level}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("procedure-pointer array-result run failed");
+        assert!(
+            run.status.success(),
+            "procedure-pointer array-result run failed at {level}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected procedure-pointer array-result output at {level}: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn merge_intrinsic_routes_array_operands_through_descriptor_path() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
