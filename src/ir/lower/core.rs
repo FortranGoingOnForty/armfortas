@@ -29314,6 +29314,22 @@ pub(super) fn lexical_cleanup_edge_to_depth(
     let source = b.current_block();
     let cleanup = b.create_block(cleanup_name);
     b.set_block(cleanup);
+    emit_lexical_cleanups_to_depth(b, ctx, retained_cleanup_depth);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(target, vec![]);
+    }
+    b.set_block(source);
+    cleanup
+}
+
+/// Finalize and deallocate each active lexical scope exited by a control
+/// transfer, from innermost to outermost.
+pub(super) fn emit_lexical_cleanups_to_depth(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    retained_cleanup_depth: usize,
+) {
+    debug_assert!(retained_cleanup_depth <= ctx.lexical_cleanups.len());
     for scope in ctx.lexical_cleanups[retained_cleanup_depth..].iter().rev() {
         insert_implicit_dealloc(
             b,
@@ -29327,11 +29343,6 @@ pub(super) fn lexical_cleanup_edge_to_depth(
             true,
         );
     }
-    if b.func().block(b.current_block()).terminator.is_none() {
-        b.branch(target, vec![]);
-    }
-    b.set_block(source);
-    cleanup
 }
 
 pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
@@ -59079,7 +59090,7 @@ pub(super) fn lower_hidden_string_result_copy(b: &mut FuncBuilder, ctx: &LowerCt
         .as_ref()
         .expect("hidden string result must have a result variable name");
     let info = ctx
-        .locals
+        .procedure_locals
         .get(result_name)
         .unwrap_or_else(|| panic!("missing hidden string result local '{}'", result_name));
     if info.is_pointer && matches!(info.char_kind, CharKind::Deferred) {

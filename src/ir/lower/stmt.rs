@@ -6929,6 +6929,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if ctx.hidden_result_abi == HiddenResultAbi::StringDescriptor {
                 lower_hidden_string_result_copy(b, ctx);
             }
+            // RETURN exits every active lexical construct before it exits the
+            // procedure. Clean those owners from inner to outer, then use the
+            // stable program-unit binding snapshot for procedure teardown.
+            // The visible `ctx.locals` map may currently contain a BLOCK local
+            // in place of a same-named procedure local.
+            emit_lexical_cleanups_to_depth(b, ctx, 0);
             let skip = if matches!(
                 ctx.hidden_result_abi,
                 HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
@@ -6939,8 +6945,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             insert_implicit_dealloc(
                 b,
-                &ctx.locals,
-                &ctx.locals,
+                &ctx.procedure_locals,
+                &ctx.procedure_locals,
                 ctx.type_layouts,
                 ctx.st,
                 ctx.internal_funcs,
@@ -6955,7 +6961,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 let returns_derived_buffer = ctx
                     .result_name
                     .as_ref()
-                    .and_then(|name| ctx.locals.get(name))
+                    .and_then(|name| ctx.procedure_locals.get(name))
                     .map(|info| !info.is_pointer && info.derived_type.is_some())
                     .unwrap_or(false);
                 if returns_derived_buffer {

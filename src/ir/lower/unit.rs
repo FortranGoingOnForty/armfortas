@@ -274,6 +274,7 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
+                ctx.capture_procedure_locals();
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
@@ -830,6 +831,7 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
+                ctx.capture_procedure_locals();
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
@@ -1743,6 +1745,7 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
+                ctx.capture_procedure_locals();
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);

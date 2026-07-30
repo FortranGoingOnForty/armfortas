@@ -271,6 +271,13 @@ pub(super) struct LowerCtx<'a> {
     /// Target layout of the module under construction (x02).
     pub(super) layout: crate::target::TargetLayout,
     pub(super) locals: HashMap<String, LocalInfo>,
+    /// Stable bindings owned by the current program unit.
+    ///
+    /// Lexical constructs temporarily replace entries in `locals` when a
+    /// BLOCK declaration or associate name shadows an outer entity. Explicit
+    /// RETURN still has to finalize and deallocate the program-unit owners,
+    /// so procedure teardown must not depend on the currently visible map.
+    pub(super) procedure_locals: HashMap<String, LocalInfo>,
     /// Lowercase names of OPTIONAL dummy arguments in the current subprogram.
     /// Hidden character-length forwarding must treat an absent optional
     /// character dummy as length zero instead of dereferencing its null slot.
@@ -380,6 +387,7 @@ impl<'a> LowerCtx<'a> {
         Self {
             layout,
             locals: HashMap::new(),
+            procedure_locals: HashMap::new(),
             optional_locals: HashSet::new(),
             loops: Vec::new(),
             construct_exits: Vec::new(),
@@ -419,6 +427,10 @@ impl<'a> LowerCtx<'a> {
         // separator cannot collide with a procedure local such as
         // `block_0_value` when save_global_name appends the entity name.
         format!("{}.block.{}", self.save_owner, ordinal)
+    }
+
+    pub(super) fn capture_procedure_locals(&mut self) {
+        self.procedure_locals.clone_from(&self.locals);
     }
 
     pub(super) fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
