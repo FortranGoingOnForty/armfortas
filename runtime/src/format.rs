@@ -1172,16 +1172,78 @@ impl FormatEngine {
         if width == 0 && decimals == 0 {
             return Ok(self.apply_decimal_sep(&self.format_g0(v, significant_digits)));
         }
-        // G format: use F if magnitude fits, else E.
-        let abs_v = v.abs();
-        if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(decimals as i32)) {
-            let rounded = self.apply_explicit_rounding(v, decimals);
-            let s = self.apply_leading_zero(&self.format_fixed(rounded, decimals));
-            Ok(self.apply_decimal_sep(&fit_field(&s, width)))
-        } else {
+
+        // Preserve the separate minimal-width G0.d behavior. Nonzero-width
+        // Gw.d follows the significant-digit selection and field layout below.
+        if width == 0 {
+            let abs_v = v.abs();
+            if abs_v == 0.0 || (abs_v >= 0.1 && abs_v < 10f64.powi(decimals as i32)) {
+                let rounded = self.apply_explicit_rounding(v, decimals);
+                let s = self.apply_leading_zero(&self.format_fixed(rounded, decimals));
+                return Ok(self.apply_decimal_sep(&s));
+            }
             let s = self.format_e_style(v, decimals, exp_width, 'E');
-            Ok(self.apply_decimal_sep(&fit_exponential_field(&s, width)))
+            return Ok(self.apply_decimal_sep(&s));
         }
+
+        // For Gw.d, first round the internal value to d significant digits.
+        // The resulting decimal scale s decides between E and F editing.
+        let scale = self.g_rounded_decimal_scale(v, decimals);
+        if decimals == 0 || scale < 0 || scale as usize > decimals {
+            let s = self.format_e_style(v, decimals, exp_width, 'E');
+            return Ok(self.apply_decimal_sep(&fit_exponential_field(&s, width)));
+        }
+
+        // F-style G output is F(w-n).(d-s) followed by n blanks. The
+        // reserved suffix has the size of the exponent field that the
+        // exponential form would have used.
+        let reserved = exp_width
+            .filter(|width| *width > 0)
+            .map_or(4, |width| width.saturating_add(2));
+        let Some(fixed_width) = width
+            .checked_sub(reserved)
+            .filter(|fixed_width| *fixed_width > 0)
+        else {
+            return Ok("*".repeat(width));
+        };
+
+        let fractional_digits = decimals - scale as usize;
+        let rounded = self.apply_explicit_rounding(v, fractional_digits);
+        let fixed = self.apply_leading_zero(&self.format_fixed(rounded, fractional_digits));
+        if fixed.len() > fixed_width {
+            return Ok("*".repeat(width));
+        }
+
+        let mut field = format!("{fixed:>fixed_width$}");
+        field.extend(std::iter::repeat_n(' ', reserved));
+        Ok(self.apply_decimal_sep(&field))
+    }
+
+    /// Return the decimal scale `s` after rounding `v` to `digits`
+    /// significant digits, as required for nonzero-width G editing.
+    fn g_rounded_decimal_scale(&self, v: f64, digits: usize) -> i32 {
+        if v == 0.0 {
+            return 1;
+        }
+
+        let raw_scale = decimal_scale(v);
+        // Rounding can increase the scale by at most one. Values below
+        // scale -1 therefore cannot cross into the fixed-form range.
+        if raw_scale < -1 || (raw_scale > 0 && raw_scale as usize > digits) {
+            return raw_scale;
+        }
+
+        let fractional_digits = if raw_scale >= 0 {
+            digits - raw_scale as usize
+        } else {
+            digits.saturating_add(raw_scale.unsigned_abs() as usize)
+        };
+        let rounded = self.apply_explicit_rounding(v, fractional_digits);
+        if !rounded.is_finite() {
+            return raw_scale;
+        }
+        let fixed = format!("{:.*}", fractional_digits, rounded.abs());
+        decimal_scale_from_fixed(&fixed)
     }
 
     fn format_g0(&self, v: f64, significant_digits: usize) -> String {
@@ -1517,6 +1579,29 @@ fn format_radix_integer(
         format!("-{}", padded)
     } else {
         padded
+    }
+}
+
+fn decimal_scale(value: f64) -> i32 {
+    debug_assert!(value.is_finite() && value != 0.0);
+    let scientific = format!("{:E}", value.abs());
+    let exponent = scientific
+        .rsplit_once('E')
+        .and_then(|(_, exponent)| exponent.parse::<i32>().ok())
+        .expect("Rust scientific formatting always includes a decimal exponent");
+    exponent.saturating_add(1)
+}
+
+fn decimal_scale_from_fixed(fixed: &str) -> i32 {
+    let (integer, fraction) = fixed.split_once('.').unwrap_or((fixed, ""));
+    let integer = integer.trim_start_matches('0');
+    if !integer.is_empty() {
+        return i32::try_from(integer.len()).unwrap_or(i32::MAX);
+    }
+
+    match fraction.bytes().position(|digit| digit != b'0') {
+        Some(position) => -i32::try_from(position).unwrap_or(i32::MAX),
+        None => 1,
     }
 }
 
@@ -2280,6 +2365,70 @@ mod tests {
             IoValue::Real(std::f64::consts::PI),
         ]);
         assert_eq!(out, "0.333333343 0.33333333333333331 3.1415926535897931");
+    }
+
+    #[test]
+    fn format_nonzero_width_g_uses_significant_digits_and_reserved_columns() {
+        let format = |value| {
+            FormatEngine::new(parse_format("(G12.4)")).format_values(&[IoValue::Real(value)])
+        };
+
+        assert_eq!(format(0.0), "   0.000    ");
+        assert_eq!(format(0.1), "  0.1000    ");
+        assert_eq!(format(1.2345), "   1.234    ");
+        assert_eq!(format(12.345), "   12.35    ");
+        assert_eq!(format(1234.5), "   1234.    ");
+        assert_eq!(format(-12.345), "  -12.35    ");
+        assert_eq!(format(0.012345), "  0.1235E-01");
+    }
+
+    #[test]
+    fn format_nonzero_width_g_selects_style_after_significant_rounding() {
+        let format = |value| {
+            FormatEngine::new(parse_format("(G12.4)")).format_values(&[IoValue::Real(value)])
+        };
+
+        assert_eq!(format(0.099995), "  0.1000    ");
+        assert_eq!(format(9999.5), "  0.1000E+05");
+    }
+
+    #[test]
+    fn format_nonzero_width_g_honors_explicit_exponent_reservation_and_overflow() {
+        let out =
+            FormatEngine::new(parse_format("(G14.4E3)")).format_values(&[IoValue::Real(12.345)]);
+        assert_eq!(out, "    12.35     ");
+
+        let out =
+            FormatEngine::new(parse_format("(G14.4E3)")).format_values(&[IoValue::Real(0.012345)]);
+        assert_eq!(out, "   0.1235E-001");
+
+        let out = FormatEngine::new(parse_format("(G8.4)")).format_values(&[IoValue::Real(12.345)]);
+        assert_eq!(out, "********");
+    }
+
+    #[test]
+    fn format_nonzero_width_g_rounding_modes_control_boundary_selection() {
+        let format = |descriptor, value| {
+            FormatEngine::new(parse_format(descriptor)).format_values(&[IoValue::Real(value)])
+        };
+
+        assert_eq!(format("(RU,G12.4)", 0.099991), "  0.1000    ");
+        assert_eq!(format("(RD,G12.4)", 0.099991), "  0.9999E-01");
+        assert_eq!(format("(RD,G12.4)", 9999.1), "   9999.    ");
+
+        let rounded_up = format("(RU,G12.4)", 9999.1);
+        assert!(rounded_up.contains('E'), "{rounded_up:?}");
+        let rounded_up = format("(RU,G12.4)", -0.099991);
+        assert!(rounded_up.contains('E'), "{rounded_up:?}");
+        let rounded_down = format("(RD,G12.4)", -0.099991);
+        assert!(!rounded_down.contains('E'), "{rounded_down:?}");
+        assert!(rounded_down.ends_with("    "), "{rounded_down:?}");
+
+        let rounded_up = format("(RU,G12.4)", -9999.1);
+        assert!(!rounded_up.contains('E'), "{rounded_up:?}");
+        assert!(rounded_up.ends_with("    "), "{rounded_up:?}");
+        let rounded_down = format("(RD,G12.4)", -9999.1);
+        assert!(rounded_down.contains('E'), "{rounded_down:?}");
     }
 
     #[test]
