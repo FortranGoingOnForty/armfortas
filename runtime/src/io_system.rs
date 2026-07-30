@@ -3009,9 +3009,10 @@ pub extern "C" fn afs_read_namelist(
                     let trimmed = line.trim().to_lowercase();
                     if trimmed.starts_with('&') && trimmed[1..].starts_with(&gname) {
                         all_lines.push_str(&line);
-                        // Keep reading until we find '/'.
+                        // Keep reading until we find a group terminator outside
+                        // a character literal.
                         let mut terminal_status = 0;
-                        while !all_lines.contains('/') {
+                        while find_unquoted_namelist_terminator(&all_lines).is_none() {
                             match u.read_line() {
                                 Ok(cont) if cont.is_empty() => {
                                     terminal_status = IOSTAT_END;
@@ -3063,13 +3064,34 @@ pub extern "C" fn afs_read_namelist_internal(
     }
 }
 
+fn find_unquoted_namelist_terminator(text: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    let _ = chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == '/' {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 fn namelist_content<'a>(text: &'a str, group_name: &str) -> Option<&'a str> {
     let lower = text.to_lowercase();
     let marker = format!("&{}", group_name.to_lowercase());
     let start = lower.find(&marker)?;
     let after_start = start + marker.len();
     let after_name = &text[after_start..];
-    if let Some(end) = after_name.find('/') {
+    if let Some(end) = find_unquoted_namelist_terminator(after_name) {
         Some(&after_name[..end])
     } else {
         Some(after_name)
@@ -7553,6 +7575,87 @@ mod tests {
 
         afs_close_ex(785, "delete".as_ptr(), 6, &mut iostat);
         assert_eq!(iostat, 0, "expected stream close/delete to succeed");
+    }
+
+    #[test]
+    fn namelist_content_ignores_slashes_inside_character_literals() {
+        let text = concat!(
+            "&cfg ",
+            "single='left/right', ",
+            "double=\"up/down\", ",
+            "escaped='say ''/'' now', ",
+            "value=42 /\n",
+        );
+
+        assert_eq!(
+            namelist_content(text, "cfg"),
+            Some(
+                " single='left/right', double=\"up/down\", \
+                 escaped='say ''/'' now', value=42 "
+            ),
+        );
+    }
+
+    #[test]
+    fn namelist_external_read_collects_past_a_quoted_slash() {
+        let path = format!(
+            "/tmp/afs_namelist_quoted_slash_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        std::fs::write(&path, b"&cfg\n path='left/right'\n value=42\n/\n")
+            .expect("create quoted-slash NAMELIST input");
+        afs_open_simple(
+            1794,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let path_name = b"path";
+        let value_name = b"value";
+        let mut path_value = [b'?'; 16];
+        let mut value = -7i32;
+        let entries = [
+            NamelistEntry {
+                name: path_name.as_ptr(),
+                name_len: path_name.len() as i64,
+                data: path_value.as_mut_ptr(),
+                data_type: 2,
+                data_len: path_value.len() as i64,
+                elem_count: 1,
+            },
+            NamelistEntry {
+                name: value_name.as_ptr(),
+                name_len: value_name.len() as i64,
+                data: (&mut value as *mut i32).cast(),
+                data_type: 0,
+                data_len: 0,
+                elem_count: 1,
+            },
+        ];
+        let mut iostat = -99;
+
+        afs_read_namelist(
+            1794,
+            "cfg".as_ptr(),
+            3,
+            entries.as_ptr(),
+            entries.len() as i32,
+            &mut iostat,
+        );
+
+        assert_eq!(iostat, 0);
+        assert_eq!(
+            std::str::from_utf8(&path_value).unwrap().trim_end(),
+            "left/right"
+        );
+        assert_eq!(value, 42);
+        afs_close_ex(1794, "delete".as_ptr(), 6, &mut iostat);
+        assert_eq!(iostat, 0);
     }
 
     #[test]
