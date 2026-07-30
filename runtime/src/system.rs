@@ -83,17 +83,16 @@ pub extern "C" fn afs_cpu_time(time: *mut f64) {
     }
 }
 
-/// DATE_AND_TIME: returns date, time, timezone, and 8-element values array.
-#[no_mangle]
-pub extern "C" fn afs_date_and_time(
+/// Capture DATE_AND_TIME once, write any present character results, and
+/// return the eight integer values from the same snapshot.
+fn date_and_time_snapshot(
     date_buf: *mut u8,
     date_len: i64,
     time_buf: *mut u8,
     time_len: i64,
     zone_buf: *mut u8,
     zone_len: i64,
-    values: *mut i32,
-) {
+) -> [i32; 8] {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -180,18 +179,120 @@ pub extern "C" fn afs_date_and_time(
         }
     }
 
-    // VALUES(8): year, month, day, tz_minutes, hour, minute, second, milliseconds
+    [
+        year,
+        month,
+        day,
+        tz_offset_min as i32,
+        hour,
+        minute,
+        second,
+        millis,
+    ]
+}
+
+unsafe fn write_date_and_time_integer(addr: *mut u8, elem_size: i64, value: i32) {
+    match elem_size {
+        1 => ptr::write_unaligned(addr as *mut i8, value as i8),
+        2 => ptr::write_unaligned(addr as *mut i16, value as i16),
+        4 => ptr::write_unaligned(addr as *mut i32, value),
+        8 => ptr::write_unaligned(addr as *mut i64, value as i64),
+        16 => ptr::write_unaligned(addr as *mut i128, value as i128),
+        _ => unreachable!("DATE_AND_TIME integer kind was validated before storage"),
+    }
+}
+
+fn write_date_and_time_values_descriptor(
+    values: *mut ArrayDescriptor,
+    snapshot: &[i32; 8],
+) -> Result<(), &'static str> {
+    if values.is_null() {
+        return Ok(());
+    }
+
+    let descriptor = unsafe { &*values };
+    if descriptor.rank != 1 {
+        return Err("VALUES must be a rank-one array");
+    }
+    if !matches!(descriptor.elem_size, 1 | 2 | 4 | 8 | 16) {
+        return Err("VALUES has an unsupported integer kind");
+    }
+    if descriptor.base_addr.is_null() {
+        return Err("VALUES has no storage");
+    }
+
+    let dim = descriptor.dims[0];
+    let extent = if dim.upper_bound < dim.lower_bound {
+        0
+    } else {
+        dim.upper_bound
+            .checked_sub(dim.lower_bound)
+            .and_then(|span| span.checked_add(1))
+            .ok_or("VALUES extent overflows the descriptor ABI")?
+    };
+    if extent < snapshot.len() as i64 {
+        return Err("VALUES must contain at least eight elements");
+    }
+    if dim.stride == 0 {
+        return Err("VALUES has a zero element stride");
+    }
+
+    let byte_stride = dim
+        .stride
+        .checked_mul(descriptor.elem_size)
+        .and_then(|stride| isize::try_from(stride).ok())
+        .ok_or("VALUES stride overflows the address space")?;
+    for (index, value) in snapshot.iter().copied().enumerate() {
+        let byte_offset = byte_stride
+            .checked_mul(index as isize)
+            .ok_or("VALUES offset overflows the address space")?;
+        let destination = unsafe { descriptor.base_addr.offset(byte_offset) };
+        unsafe {
+            write_date_and_time_integer(destination, descriptor.elem_size, value);
+        }
+    }
+    Ok(())
+}
+
+/// DATE_AND_TIME compatibility entry point for objects whose VALUES actual is
+/// a contiguous default-INTEGER array. New code uses the descriptor ABI below.
+#[no_mangle]
+pub extern "C" fn afs_date_and_time(
+    date_buf: *mut u8,
+    date_len: i64,
+    time_buf: *mut u8,
+    time_len: i64,
+    zone_buf: *mut u8,
+    zone_len: i64,
+    values: *mut i32,
+) {
+    let snapshot =
+        date_and_time_snapshot(date_buf, date_len, time_buf, time_len, zone_buf, zone_len);
     if !values.is_null() {
         unsafe {
-            *values.add(0) = year;
-            *values.add(1) = month;
-            *values.add(2) = day;
-            *values.add(3) = tz_offset_min as i32;
-            *values.add(4) = hour;
-            *values.add(5) = minute;
-            *values.add(6) = second;
-            *values.add(7) = millis;
+            std::ptr::copy_nonoverlapping(snapshot.as_ptr(), values, snapshot.len());
         }
+    }
+}
+
+/// DATE_AND_TIME with descriptor-aware VALUES storage. Element kind and
+/// positive or negative section strides are honored without temporary
+/// contiguous writes or raw-address copyback.
+#[no_mangle]
+pub extern "C" fn afs_date_and_time_desc(
+    date_buf: *mut u8,
+    date_len: i64,
+    time_buf: *mut u8,
+    time_len: i64,
+    zone_buf: *mut u8,
+    zone_len: i64,
+    values: *mut ArrayDescriptor,
+) {
+    let snapshot =
+        date_and_time_snapshot(date_buf, date_len, time_buf, time_len, zone_buf, zone_len);
+    if let Err(message) = write_date_and_time_values_descriptor(values, &snapshot) {
+        eprintln!("Fortran runtime error: DATE_AND_TIME {message}");
+        std::process::exit(1);
     }
 }
 
@@ -869,6 +970,52 @@ mod tests {
     #[test]
     fn cpu_time_converts_one_second_of_native_ticks() {
         assert_eq!(process_clock_seconds(PROCESS_CLOCKS_PER_SECOND), 1.0);
+    }
+
+    #[test]
+    fn date_and_time_values_honor_integer_kind_and_negative_stride() {
+        let snapshot = [2026, 7, 30, -240, 12, 34, 56, 789];
+        let sentinel = i64::MIN;
+        let mut storage = [sentinel; 17];
+        let mut descriptor = ArrayDescriptor::zeroed();
+        descriptor.base_addr = unsafe { storage.as_mut_ptr().add(15) }.cast();
+        descriptor.elem_size = std::mem::size_of::<i64>() as i64;
+        descriptor.rank = 1;
+        descriptor.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 8,
+            stride: -2,
+        };
+
+        write_date_and_time_values_descriptor(&mut descriptor, &snapshot).unwrap();
+
+        for (index, expected) in snapshot.iter().copied().enumerate() {
+            assert_eq!(storage[15 - index * 2], expected as i64);
+        }
+        for index in (0..storage.len()).filter(|index| index % 2 == 0) {
+            assert_eq!(storage[index], sentinel);
+        }
+    }
+
+    #[test]
+    fn date_and_time_values_reject_short_descriptors_without_writing() {
+        let snapshot = [2026, 7, 30, -240, 12, 34, 56, 789];
+        let mut storage = [i32::MIN; 7];
+        let mut descriptor = ArrayDescriptor::zeroed();
+        descriptor.base_addr = storage.as_mut_ptr().cast();
+        descriptor.elem_size = std::mem::size_of::<i32>() as i64;
+        descriptor.rank = 1;
+        descriptor.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 7,
+            stride: 1,
+        };
+
+        assert_eq!(
+            write_date_and_time_values_descriptor(&mut descriptor, &snapshot),
+            Err("VALUES must contain at least eight elements")
+        );
+        assert_eq!(storage, [i32::MIN; 7]);
     }
 
     #[cfg(target_os = "freebsd")]

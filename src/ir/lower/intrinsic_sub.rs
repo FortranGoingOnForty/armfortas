@@ -549,14 +549,40 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "date_and_time" => {
-            // call date_and_time(date, time, zone, values) — all optional strings/array
-            // Runtime: afs_date_and_time(date_buf, date_len, time_buf, time_len, zone_buf, zone_len, values)
+            // DATE_AND_TIME(date, time, zone, values): strings are optional,
+            // while a present VALUES actual is always passed as an array
+            // descriptor so integer kind and section stride remain explicit.
             let (date_ptr, date_len) = nth_arg_str(b, ctx, args, 0);
             let (time_ptr, time_len) = nth_arg_str(b, ctx, args, 1);
             let (zone_ptr, zone_len) = nth_arg_str(b, ctx, args, 2);
-            let values = nth_arg_ref(b, ctx, args, 3);
+            let values = if let Some(expr) = nth_arg_expr(args, 3) {
+                let Some((descriptor, elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) else {
+                    eprintln!(
+                        "armfortas: error: DATE_AND_TIME VALUES must be a rank-one INTEGER array"
+                    );
+                    std::process::exit(1);
+                };
+                if !matches!(elem_ty, IrType::Int(_)) {
+                    eprintln!(
+                        "armfortas: error: DATE_AND_TIME VALUES must be a rank-one INTEGER array"
+                    );
+                    std::process::exit(1);
+                }
+                descriptor
+            } else {
+                b.const_i64(0)
+            };
             b.call(
-                FuncRef::External("afs_date_and_time".into()),
+                FuncRef::External("afs_date_and_time_desc".into()),
                 vec![
                     date_ptr, date_len, time_ptr, time_len, zone_ptr, zone_len, values,
                 ],
