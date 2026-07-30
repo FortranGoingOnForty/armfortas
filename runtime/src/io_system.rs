@@ -3025,8 +3025,18 @@ pub extern "C" fn afs_read_namelist(
                                 }
                             }
                         }
-                        let _ = namelist_assign_from_text(&all_lines, &gname, entries, n_entries);
-                        break 'find_group terminal_status;
+                        let assignment_status =
+                            match namelist_assign_from_text(&all_lines, &gname, entries, n_entries)
+                            {
+                                Ok(true) => 0,
+                                Ok(false) => IOSTAT_END,
+                                Err(_) => 1,
+                            };
+                        break 'find_group if terminal_status == 0 {
+                            assignment_status
+                        } else {
+                            terminal_status
+                        };
                     }
                 }
                 Err(error) => break 'find_group error.raw_os_error().unwrap_or(1),
@@ -3056,11 +3066,10 @@ pub extern "C" fn afs_read_namelist_internal(
 ) {
     let gname = unsafe_str(group_name, group_name_len).to_lowercase();
     let text = unsafe_str(buf, buf_len);
-    let found = namelist_assign_from_text(&text, &gname, entries, n_entries);
-    if found {
-        write_i32_ptr(iostat, 0);
-    } else {
-        set_read_status_or_exit(iostat, IOSTAT_END);
+    match namelist_assign_from_text(&text, &gname, entries, n_entries) {
+        Ok(true) => write_i32_ptr(iostat, 0),
+        Ok(false) => set_read_status_or_exit(iostat, IOSTAT_END),
+        Err(_) => set_read_status_or_exit(iostat, 1),
     }
 }
 
@@ -3098,17 +3107,23 @@ fn namelist_content<'a>(text: &'a str, group_name: &str) -> Option<&'a str> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamelistAssignError {
+    InvalidValue,
+    UnsupportedEntryType,
+}
+
 fn namelist_assign_from_text(
     text: &str,
     group_name: &str,
     entries: *const NamelistEntry,
     n_entries: i32,
-) -> bool {
+) -> Result<bool, NamelistAssignError> {
     let Some(content) = namelist_content(text, group_name) else {
-        return false;
+        return Ok(false);
     };
     if entries.is_null() || n_entries <= 0 {
-        return true;
+        return Ok(true);
     }
     let entries_slice = unsafe { std::slice::from_raw_parts(entries, n_entries as usize) };
 
@@ -3153,18 +3168,18 @@ fn namelist_assign_from_text(
         start_component: usize,
         val_str: &str,
         repeat: usize,
-    ) -> usize {
+    ) -> Result<usize, NamelistAssignError> {
         let mut next = start_component;
         for _ in 0..repeat.max(1) {
             let Some(entry_index) = entry_indices.get(next).copied() else {
                 break;
             };
             if let Some(entry) = entries.get(entry_index) {
-                namelist_assign_value(entry, val_str, None, 1);
+                namelist_assign_value(entry, val_str, None, 1)?;
             }
             next += 1;
         }
-        next
+        Ok(next)
     }
 
     let mut continuation: Option<Continuation> = None;
@@ -3196,7 +3211,7 @@ fn namelist_assign_from_text(
                 }
                 let ename = unsafe_str(entry.name, entry.name_len).to_lowercase();
                 if ename == var_name {
-                    namelist_assign_value(entry, actual_val, array_index, repeat_count);
+                    namelist_assign_value(entry, actual_val, array_index, repeat_count)?;
                     let next_index = array_index.unwrap_or(1).saturating_add(repeat_count);
                     if next_index <= entry.elem_count.max(1) as usize {
                         continuation = Some(Continuation::Array {
@@ -3217,7 +3232,7 @@ fn namelist_assign_from_text(
                         0,
                         actual_val,
                         repeat_count,
-                    );
+                    )?;
                     if next_component < entry_indices.len() {
                         continuation = Some(Continuation::Components {
                             entry_indices,
@@ -3234,7 +3249,7 @@ fn namelist_assign_from_text(
                     next_index,
                 } => {
                     if let Some(entry) = entries_slice.get(entry_index) {
-                        namelist_assign_value(entry, actual_val, Some(next_index), repeat_count);
+                        namelist_assign_value(entry, actual_val, Some(next_index), repeat_count)?;
                         let next_index = next_index.saturating_add(repeat_count);
                         continuation = if next_index <= entry.elem_count.max(1) as usize {
                             Some(Continuation::Array {
@@ -3256,7 +3271,7 @@ fn namelist_assign_from_text(
                         next_component,
                         actual_val,
                         repeat_count,
-                    );
+                    )?;
                     continuation = if next_component < entry_indices.len() {
                         Some(Continuation::Components {
                             entry_indices,
@@ -3269,7 +3284,7 @@ fn namelist_assign_from_text(
             }
         }
     }
-    true
+    Ok(true)
 }
 
 fn split_namelist_fields(content: &str) -> Vec<&str> {
@@ -3338,7 +3353,7 @@ fn namelist_assign_value(
     val_str: &str,
     index: Option<usize>,
     repeat: usize,
-) {
+) -> Result<(), NamelistAssignError> {
     // For array elements, compute byte offset from 1-based index.
     let elem_size = match entry.data_type {
         0 => 4,                              // integer (i32)
@@ -3361,19 +3376,21 @@ fn namelist_assign_value(
         match entry.data_type {
             0 => {
                 // integer
-                if let Ok(v) = val_str.parse::<i32>() {
-                    unsafe {
-                        *(ptr as *mut i32) = v;
-                    }
+                let value = val_str
+                    .parse::<i32>()
+                    .map_err(|_| NamelistAssignError::InvalidValue)?;
+                unsafe {
+                    *(ptr as *mut i32) = value;
                 }
             }
             1 => {
                 // real
                 let normalized = normalize_fortran_real_input(val_str, false);
-                if let Ok(v) = normalized.parse::<f64>() {
-                    unsafe {
-                        *(ptr as *mut f64) = v;
-                    }
+                let value = normalized
+                    .parse::<f64>()
+                    .map_err(|_| NamelistAssignError::InvalidValue)?;
+                unsafe {
+                    *(ptr as *mut f64) = value;
                 }
             }
             2 => {
@@ -3395,10 +3412,10 @@ fn namelist_assign_value(
             }
             3 => {
                 // logical
-                let lower = val_str.to_lowercase();
-                let v = lower.starts_with(".t") || lower.starts_with("t");
+                let value =
+                    parse_logical_token(val_str).ok_or(NamelistAssignError::InvalidValue)?;
                 unsafe {
-                    *(ptr as *mut i32) = v as i32;
+                    *(ptr as *mut i32) = value as i32;
                 }
             }
             4 => {
@@ -3409,19 +3426,20 @@ fn namelist_assign_value(
                     s.as_ptr(),
                     s.len() as i64,
                 );
-                return;
+                return Ok(());
             }
             5 => {
                 // bool-backed logical
-                let lower = val_str.to_lowercase();
-                let v = lower.starts_with(".t") || lower.starts_with("t");
+                let value =
+                    parse_logical_token(val_str).ok_or(NamelistAssignError::InvalidValue)?;
                 unsafe {
-                    *ptr = v as u8;
+                    *ptr = value as u8;
                 }
             }
-            _ => {}
+            _ => return Err(NamelistAssignError::UnsupportedEntryType),
         }
     }
+    Ok(())
 }
 
 // ---- Internal I/O (read/write to character variables) ----
@@ -7594,6 +7612,89 @@ mod tests {
                  escaped='say ''/'' now', value=42 "
             ),
         );
+    }
+
+    fn read_internal_namelist_test_entry(
+        record: &[u8],
+        name: &[u8],
+        data: *mut u8,
+        data_type: i32,
+    ) -> i32 {
+        let entry = NamelistEntry {
+            name: name.as_ptr(),
+            name_len: name.len() as i64,
+            data,
+            data_type,
+            data_len: 0,
+            elem_count: 1,
+        };
+        let mut iostat = -99;
+        afs_read_namelist_internal(
+            record.as_ptr(),
+            record.len() as i64,
+            "cfg".as_ptr(),
+            3,
+            &entry,
+            1,
+            &mut iostat,
+        );
+        iostat
+    }
+
+    #[test]
+    fn namelist_conversion_failures_report_error_without_overwriting_values() {
+        let mut integer = 17i32;
+        let integer_status = read_internal_namelist_test_entry(
+            b"&cfg integer_value=not_an_integer /",
+            b"integer_value",
+            (&mut integer as *mut i32).cast(),
+            0,
+        );
+
+        let mut real = 2.5f64;
+        let real_status = read_internal_namelist_test_entry(
+            b"&cfg real_value=not_a_real /",
+            b"real_value",
+            (&mut real as *mut f64).cast(),
+            1,
+        );
+
+        let mut logical = 1i32;
+        let logical_status = read_internal_namelist_test_entry(
+            b"&cfg logical_value=maybe /",
+            b"logical_value",
+            (&mut logical as *mut i32).cast(),
+            3,
+        );
+
+        let mut bool_logical = 1u8;
+        let bool_status = read_internal_namelist_test_entry(
+            b"&cfg bool_value=perhaps /",
+            b"bool_value",
+            &mut bool_logical,
+            5,
+        );
+
+        assert!(
+            [integer_status, real_status, logical_status, bool_status]
+                .into_iter()
+                .all(|status| status != 0),
+            "invalid NAMELIST values reported statuses: integer={integer_status}, \
+             real={real_status}, logical={logical_status}, bool={bool_status}"
+        );
+        assert_eq!(integer, 17);
+        assert_eq!(real, 2.5);
+        assert_eq!(logical, 1);
+        assert_eq!(bool_logical, 1);
+
+        let retry_status = read_internal_namelist_test_entry(
+            b"&cfg integer_value=42 /",
+            b"integer_value",
+            (&mut integer as *mut i32).cast(),
+            0,
+        );
+        assert_eq!(retry_status, 0);
+        assert_eq!(integer, 42);
     }
 
     #[test]
