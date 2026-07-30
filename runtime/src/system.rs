@@ -600,23 +600,37 @@ fn spawn_async_command(command: &str) -> std::io::Result<u32> {
     Ok(pid)
 }
 
-#[no_mangle]
-pub extern "C" fn afs_execute_command_line(
+fn store_execute_command_failure(
+    cmdstat: *mut i32,
+    cmdmsg: *mut u8,
+    cmdmsg_len: i64,
+    status: i32,
+    message: &str,
+) {
+    store_optional_i32(cmdstat, status);
+    write_character_result(cmdmsg, cmdmsg_len, message.as_bytes());
+}
+
+fn execute_command_line(
     command: *const u8,
     cmd_len: i64,
     wait: i32,
     exitstat: *mut i32,
     cmdstat: *mut i32,
+    cmdmsg: *mut u8,
+    cmdmsg_len: i64,
 ) {
     let cmd = if !command.is_null() && cmd_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(command, cmd_len as usize) };
         String::from_utf8_lossy(slice).trim().to_string()
     } else {
-        if !cmdstat.is_null() {
-            unsafe {
-                *cmdstat = 1;
-            }
-        }
+        store_execute_command_failure(
+            cmdstat,
+            cmdmsg,
+            cmdmsg_len,
+            1,
+            "command argument is absent or has zero length",
+        );
         return;
     };
 
@@ -629,38 +643,69 @@ pub extern "C" fn afs_execute_command_line(
                         *exitstat = status.code().unwrap_or(-1);
                     }
                 }
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = 0;
-                    }
-                }
+                store_optional_i32(cmdstat, 0);
             }
-            Err(_) => {
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = -1;
-                    }
-                }
+            Err(error) => {
+                store_execute_command_failure(
+                    cmdstat,
+                    cmdmsg,
+                    cmdmsg_len,
+                    -1,
+                    &format!("could not execute command: {error}"),
+                );
             }
         }
     } else {
         match spawn_async_command(&cmd) {
             Ok(_) => {
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = 0;
-                    }
-                }
+                store_optional_i32(cmdstat, 0);
             }
-            Err(_) => {
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = -1;
-                    }
-                }
+            Err(error) => {
+                store_execute_command_failure(
+                    cmdstat,
+                    cmdmsg,
+                    cmdmsg_len,
+                    -1,
+                    &format!("could not start asynchronous command: {error}"),
+                );
             }
         }
     }
+}
+
+/// Compatibility entry point for compiler output predating CMDMSG support.
+#[no_mangle]
+pub extern "C" fn afs_execute_command_line(
+    command: *const u8,
+    cmd_len: i64,
+    wait: i32,
+    exitstat: *mut i32,
+    cmdstat: *mut i32,
+) {
+    execute_command_line(
+        command,
+        cmd_len,
+        wait,
+        exitstat,
+        cmdstat,
+        std::ptr::null_mut(),
+        0,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn afs_execute_command_line_cmdmsg(
+    command: *const u8,
+    cmd_len: i64,
+    wait: i32,
+    exitstat: *mut i32,
+    cmdstat: *mut i32,
+    cmdmsg: *mut u8,
+    cmdmsg_len: i64,
+) {
+    execute_command_line(
+        command, cmd_len, wait, exitstat, cmdstat, cmdmsg, cmdmsg_len,
+    );
 }
 
 // Shared RNG state for RANDOM_NUMBER / RANDOM_SEED.
@@ -1237,6 +1282,58 @@ mod tests {
     fn command_argument_count_nonneg() {
         let c = afs_command_argument_count();
         assert!(c >= 0);
+    }
+
+    #[test]
+    fn execute_command_line_cmdmsg_reports_padded_and_truncated_failures() {
+        let invalid_command = [0u8];
+        let mut cmdstat = 0;
+        let mut full_message = [b'?'; 96];
+        afs_execute_command_line_cmdmsg(
+            std::ptr::null(),
+            0,
+            1,
+            std::ptr::null_mut(),
+            &mut cmdstat,
+            full_message.as_mut_ptr(),
+            full_message.len() as i64,
+        );
+        assert_ne!(cmdstat, 0);
+        assert_ne!(full_message[0], b'?');
+        assert_eq!(full_message[full_message.len() - 1], b' ');
+
+        let mut short_message = [b'?'; 8];
+        afs_execute_command_line_cmdmsg(
+            invalid_command.as_ptr(),
+            invalid_command.len() as i64,
+            0,
+            std::ptr::null_mut(),
+            &mut cmdstat,
+            short_message.as_mut_ptr(),
+            short_message.len() as i64,
+        );
+        assert_ne!(cmdstat, 0);
+        assert!(!short_message.contains(&b'?'));
+    }
+
+    #[test]
+    fn execute_command_line_cmdmsg_is_unchanged_after_successful_start() {
+        let command = b"exit 0";
+        let mut exitstat = i32::MIN;
+        let mut cmdstat = i32::MIN;
+        let mut message = *b"unchanged";
+        afs_execute_command_line_cmdmsg(
+            command.as_ptr(),
+            command.len() as i64,
+            1,
+            &mut exitstat,
+            &mut cmdstat,
+            message.as_mut_ptr(),
+            message.len() as i64,
+        );
+        assert_eq!(exitstat, 0);
+        assert_eq!(cmdstat, 0);
+        assert_eq!(&message, b"unchanged");
     }
 
     #[test]

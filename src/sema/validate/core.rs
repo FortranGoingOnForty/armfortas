@@ -5706,6 +5706,11 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     ctx.require_std(stmt.span, FortranStandard::F2018, "RANDOM_INIT");
                     validate_random_init_args(ctx, args, stmt.span);
                 }
+                if name.eq_ignore_ascii_case("execute_command_line")
+                    && !intrinsic_name_is_shadowed(ctx, "execute_command_line")
+                {
+                    validate_execute_command_line_cmdmsg(ctx, args);
+                }
             }
             if let Some(name) = call_target_function_name(ctx, callee) {
                 ctx.error(
@@ -7939,6 +7944,23 @@ fn validate_random_init_args(ctx: &mut Ctx, args: &[Argument], span: Span) {
                 ),
             );
         }
+    }
+}
+
+fn validate_execute_command_line_cmdmsg(ctx: &mut Ctx<'_>, args: &[Argument]) {
+    let Some(cmdmsg) = call_rank_argument_expr(args, 4, &["cmdmsg"]) else {
+        return;
+    };
+    let is_scalar_character = matches!(
+        validation_expr_type_info(ctx, cmdmsg),
+        Some(TypeInfo::Character { .. })
+    ) && validation_expr_rank(ctx, cmdmsg).is_none_or(|rank| rank == 0);
+    let is_definable = actual_is_definable(ctx, cmdmsg, false).is_none_or(|value| value);
+    if !is_scalar_character || !is_definable {
+        ctx.error(
+            cmdmsg.span,
+            "EXECUTE_COMMAND_LINE CMDMSG must be a scalar CHARACTER variable",
+        );
     }
 }
 
@@ -12648,6 +12670,49 @@ program p
 end program
 ",
             FortranStandard::F2008,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn execute_command_line_cmdmsg_requires_a_scalar_character_variable() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: status, wrong_type
+  character(len=32) :: messages(2)
+  call execute_command_line('', cmdstat=status, cmdmsg=wrong_type)
+  call execute_command_line('', cmdstat=status, cmdmsg=messages)
+  call execute_command_line('', cmdstat=status, cmdmsg='literal')
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .filter(|err| err.contains("CMDMSG") && err.contains("scalar CHARACTER variable"))
+                .count()
+                >= 3,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_execute_command_line_shadows_intrinsic_cmdmsg_validation() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface
+    subroutine execute_command_line(value, cmdmsg)
+      integer, intent(in) :: value
+      integer, intent(out) :: cmdmsg
+    end subroutine
+  end interface
+  integer :: output
+  call execute_command_line(7, cmdmsg=output)
+end program
+",
         );
         assert!(errs.is_empty(), "{errs:?}");
     }

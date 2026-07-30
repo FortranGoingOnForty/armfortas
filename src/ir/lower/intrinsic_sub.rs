@@ -802,11 +802,22 @@ pub(crate) fn lower_intrinsic_subroutine(
             let wait = nth_arg_val(b, ctx, args, 1, 1);
             let (exitstat, exitstat_writeback) = nth_arg_i32_out(b, ctx, args, 2);
             let (cmdstat, cmdstat_writeback) = nth_arg_i32_out(b, ctx, args, 3);
-            b.call(
-                FuncRef::External("afs_execute_command_line".into()),
-                vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
-                IrType::Void,
-            );
+            if nth_arg_expr(args, 4).is_some() {
+                let (cmdmsg, cmdmsg_len) = nth_arg_str(b, ctx, args, 4);
+                b.call(
+                    FuncRef::External("afs_execute_command_line_cmdmsg".into()),
+                    vec![
+                        cmd_ptr, cmd_len, wait, exitstat, cmdstat, cmdmsg, cmdmsg_len,
+                    ],
+                    IrType::Void,
+                );
+            } else {
+                b.call(
+                    FuncRef::External("afs_execute_command_line".into()),
+                    vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
+                    IrType::Void,
+                );
+            }
             for writeback in [exitstat_writeback, cmdstat_writeback]
                 .into_iter()
                 .flatten()
