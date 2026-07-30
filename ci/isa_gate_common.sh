@@ -3,7 +3,7 @@
 #
 # The counts are deliberate evidence contracts. Update them in the same change
 # as any test_programs/*.f90 addition/removal or ERROR_EXPECTED reclassification.
-isa_gate_expected_sources=817
+isa_gate_expected_sources=818
 isa_gate_expected_diagnostics=117
 
 isa_gate_validate_assembly() {
@@ -134,17 +134,25 @@ isa_gate_run() {
         for isa_gate_level in $isa_gate_levels; do
             isa_gate_out="$isa_gate_tmpdir/$isa_gate_base$isa_gate_level.s"
             isa_gate_err="$isa_gate_tmpdir/$isa_gate_base$isa_gate_level.stderr"
+            isa_gate_module_dir="$isa_gate_tmpdir/modules/$isa_gate_base$isa_gate_level"
             isa_gate_attempted=$((isa_gate_attempted + 1))
+            if ! mkdir -p "$isa_gate_module_dir"; then
+                echo "$isa_gate_name: could not create isolated module directory for $isa_gate_base at $isa_gate_level" >&2
+                isa_gate_setup_failures=$((isa_gate_setup_failures + 1))
+                continue
+            fi
 
             if [ -n "$isa_gate_source_flag" ]; then
                 if "$isa_gate_compiler" -S "$isa_gate_level" "$isa_gate_source_flag" \
-                    "$isa_gate_source" -o "$isa_gate_out" 2>"$isa_gate_err"; then
+                    -J "$isa_gate_module_dir" "$isa_gate_source" \
+                    -o "$isa_gate_out" 2>"$isa_gate_err"; then
                     isa_gate_compile_status=0
                 else
                     isa_gate_compile_status=$?
                 fi
             elif "$isa_gate_compiler" -S "$isa_gate_level" \
-                "$isa_gate_source" -o "$isa_gate_out" 2>"$isa_gate_err"; then
+                -J "$isa_gate_module_dir" "$isa_gate_source" \
+                -o "$isa_gate_out" 2>"$isa_gate_err"; then
                 isa_gate_compile_status=0
             else
                 isa_gate_compile_status=$?

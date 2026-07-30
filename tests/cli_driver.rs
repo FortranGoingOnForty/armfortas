@@ -27309,21 +27309,23 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // We split the test across two compilation invocations so the
     // submodule must rehydrate the parent's renames from the .amod
     // alone (no in-memory symbol table carryover).
-    let parent_src = write_program(
+    let dir = unique_dir("amod_use_rename");
+    let parent_src = write_program_in(
+        &dir,
+        "parent.f90",
         "module reexport3\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  public :: int32, int64\nend module\n\nmodule mb_amod\n  use reexport3, only: bits_kind => int32, block_kind => int64\n  type :: ts\n    integer(bits_kind) :: n = 0_bits_kind\n    integer(block_kind) :: blk = 0_block_kind\n  end type\n  interface\n    module subroutine setbit(self, pos)\n      type(ts), intent(inout) :: self\n      integer(bits_kind), intent(in) :: pos\n    end subroutine\n  end interface\nend module\n",
-        "f90",
     );
-    let parent_dir = parent_src.parent().unwrap().to_path_buf();
-    let parent_obj = unique_path("mb_amod_parent", "o");
+    let parent_obj = dir.join("parent.o");
     let compile_parent = Command::new(compiler("armfortas"))
         .args([
             "-c",
             parent_src.to_str().unwrap(),
             "-J",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-o",
             parent_obj.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("compile parent failed");
     assert!(
@@ -27332,22 +27334,24 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         String::from_utf8_lossy(&compile_parent.stderr)
     );
 
-    let sub_src = write_program(
+    let sub_src = write_program_in(
+        &dir,
+        "submodule.f90",
         "submodule(mb_amod) sub\ncontains\n  module subroutine setbit(self, pos)\n    type(ts), intent(inout) :: self\n    integer(bits_kind), intent(in) :: pos\n    integer(block_kind) :: dummy\n    dummy = ibset(self%blk, pos)\n    self%blk = dummy\n  end subroutine\nend submodule\n",
-        "f90",
     );
-    let sub_obj = unique_path("amod_use_rename_sub", "o");
+    let sub_obj = dir.join("submodule.o");
     let compile_sub = Command::new(compiler("armfortas"))
         .args([
             "-c",
             sub_src.to_str().unwrap(),
             "-I",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-J",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-o",
             sub_obj.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("compile sub failed");
     assert!(
@@ -27356,20 +27360,22 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         String::from_utf8_lossy(&compile_sub.stderr)
     );
 
-    let prog_src = write_program(
+    let prog_src = write_program_in(
+        &dir,
+        "program.f90",
         "program t\n  use mb_amod\n  type(ts) :: s\n  s%n = 33\n  s%blk = 0_8\n  call setbit(s, 32)\n  if (s%blk /= 4294967296_8) error stop 1\n  print *, 'ok'\nend program\n",
-        "f90",
     );
-    let prog_obj = unique_path("amod_use_rename_prog", "o");
+    let prog_obj = dir.join("program.o");
     let compile_prog = Command::new(compiler("armfortas"))
         .args([
             "-c",
             prog_src.to_str().unwrap(),
             "-I",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-o",
             prog_obj.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("compile prog failed");
     assert!(
@@ -27378,7 +27384,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         String::from_utf8_lossy(&compile_prog.stderr)
     );
 
-    let out = unique_path("amod_use_rename_roundtrip", "bin");
+    let out = dir.join("roundtrip");
     let link = Command::new(compiler("armfortas"))
         .args([
             prog_obj.to_str().unwrap(),
@@ -27387,6 +27393,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
             "-o",
             out.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("link failed");
     assert!(
@@ -27406,15 +27413,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
 
-    let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&parent_obj);
-    let _ = std::fs::remove_file(&sub_obj);
-    let _ = std::fs::remove_file(&prog_obj);
-    let _ = std::fs::remove_file(&parent_src);
-    let _ = std::fs::remove_file(&sub_src);
-    let _ = std::fs::remove_file(&prog_src);
-    let _ = std::fs::remove_file(parent_dir.join("mb_amod.amod"));
-    let _ = std::fs::remove_file(parent_dir.join("reexport3.amod"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

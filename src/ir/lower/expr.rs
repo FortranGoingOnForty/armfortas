@@ -1421,6 +1421,12 @@ pub(crate) fn lower_expr_full(
                     && (find_named_interface_symbol(st, &key).is_some()
                         || crate::ir::lower::core::named_interface_specific_candidates(st, &key)
                             .is_some());
+                let user_shadows_intrinsic = user_callable_shadows_intrinsic(
+                    st,
+                    current_proc_scope(),
+                    b.func().name.as_str(),
+                    &key,
+                );
 
                 // Check if this is an array element or section access.
                 if let Some(info) = locals.get(&key) {
@@ -2334,32 +2340,34 @@ pub(crate) fn lower_expr_full(
                         return result;
                     }
                 }
-                let intrinsic_result =
-                    if !has_named_interface && crate::sema::validate::is_intrinsic_name(&key) {
-                        let intrinsic_arg_slots =
-                            reorder_args_by_keyword_slots(original_args, &key, st);
-                        let intrinsic_args: Vec<crate::ast::expr::Argument> =
-                            intrinsic_arg_slots.iter().flatten().cloned().collect();
-                        let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
-                            .iter()
-                            .map(|a| match &a.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
-                                    b,
-                                    locals,
-                                    e,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                ),
-                                _ => b.const_i32(0),
-                            })
-                            .collect();
-                        super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals)
-                    } else {
-                        None
-                    };
+                let intrinsic_result = if !has_named_interface
+                    && !user_shadows_intrinsic
+                    && crate::sema::validate::is_intrinsic_name(&key)
+                {
+                    let intrinsic_arg_slots =
+                        reorder_args_by_keyword_slots(original_args, &key, st);
+                    let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                        intrinsic_arg_slots.iter().flatten().cloned().collect();
+                    let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
+                        .iter()
+                        .map(|a| match &a.value {
+                            crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
+                                b,
+                                locals,
+                                e,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            ),
+                            _ => b.const_i32(0),
+                        })
+                        .collect();
+                    super::intrinsic::lower_intrinsic(b, &key, &intrinsic_arg_vals)
+                } else {
+                    None
+                };
                 if !has_named_interface {
                     if let Some(result) = intrinsic_result {
                         let coerced = operator_expr_type_info(expr, Some(locals), st, type_layouts)

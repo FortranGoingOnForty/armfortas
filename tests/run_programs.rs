@@ -4254,6 +4254,25 @@ fn ar43_unrelated_use_generic_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar43_block_use_nature_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_block_use_nature_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_block_use_nature.f90");
+    assert!(source.exists(), "ar43_block_use_nature.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_block_use_nature.f90 should preserve BLOCK USE nature at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;

@@ -8652,17 +8652,25 @@ pub(super) fn install_globals_as_locals_in(
     respect_host_association_policy: bool,
 ) {
     use crate::ast::decl::OnlyItem;
+    use crate::sema::symtab::ScopeId;
+
+    struct PendingGlobalImport {
+        local_key: String,
+        module_key: String,
+        symbol_key: String,
+        source_scope: Option<ScopeId>,
+    }
 
     // Sorted per-use iteration so the emitted global_addr
     // instructions land in deterministic order. Audit B-3 holds
     // across this path too.
     //
     // The two-pass pattern:
-    //   1. Enumerate the (use statement, key-in-local-scope, module_key)
-    //      triples this function imports.
+    //   1. Enumerate each local key with its module key, original symbol key,
+    //      and exact source scope when USE resolution supplied one.
     //   2. Sort by local-scope key.
     //   3. Install in order, checking for collision before inserting.
-    let mut pending: Vec<(String, (String, String))> = Vec::new();
+    let mut pending: Vec<PendingGlobalImport> = Vec::new();
 
     if let Some(module_name) = host_module {
         let mod_key = module_name.to_lowercase();
@@ -8707,8 +8715,13 @@ pub(super) fn install_globals_as_locals_in(
         }
         for host_lc in &host_chain {
             for (mk, var) in globals.keys() {
-                if *mk == *host_lc && !pending.iter().any(|(k, _)| k == var) {
-                    pending.push((var.clone(), (host_lc.clone(), var.clone())));
+                if *mk == *host_lc && !pending.iter().any(|binding| binding.local_key == *var) {
+                    pending.push(PendingGlobalImport {
+                        local_key: var.clone(),
+                        module_key: host_lc.clone(),
+                        symbol_key: var.clone(),
+                        source_scope: None,
+                    });
                 }
             }
             // F2018 §11.2.3: a submodule sees every entity its host module
@@ -8737,20 +8750,30 @@ pub(super) fn install_globals_as_locals_in(
                     let var_lc = assoc.original_name.to_lowercase();
                     let local_lc = assoc.local_name.to_lowercase();
                     if globals.contains_key(&(src_mod_key.clone(), var_lc.clone()))
-                        && !pending.iter().any(|(k, _)| k == &local_lc)
+                        && !pending.iter().any(|binding| binding.local_key == local_lc)
                     {
-                        pending.push((local_lc, (src_mod_key, var_lc)));
+                        pending.push(PendingGlobalImport {
+                            local_key: local_lc,
+                            module_key: src_mod_key,
+                            symbol_key: var_lc,
+                            source_scope: Some(assoc.source_scope),
+                        });
                     }
                 }
                 if let Some(required) = required_names {
                     for local_lc in required {
-                        if pending.iter().any(|(k, _)| k == local_lc) {
+                        if pending.iter().any(|binding| binding.local_key == *local_lc) {
                             continue;
                         }
                         if let Some(resolved_key) =
                             resolve_visible_global_key(st, globals, host_scope_id, local_lc)
                         {
-                            pending.push((local_lc.clone(), resolved_key));
+                            pending.push(PendingGlobalImport {
+                                local_key: local_lc.clone(),
+                                module_key: resolved_key.0,
+                                symbol_key: resolved_key.1,
+                                source_scope: None,
+                            });
                         }
                     }
                 }
@@ -8761,7 +8784,7 @@ pub(super) fn install_globals_as_locals_in(
     for decl in uses {
         let Decl::UseStmt {
             module,
-            nature: _,
+            nature,
             renames,
             only,
         } = &decl.node
@@ -8769,22 +8792,37 @@ pub(super) fn install_globals_as_locals_in(
             continue;
         };
         let mod_key = module.to_lowercase();
+        let source_scope = resolved_use_module_scope(st, module, *nature);
+        let source_is_intrinsic =
+            source_scope.is_some_and(|scope_id| st.scope(scope_id).intrinsic_module);
         if let Some(only_list) = only {
             for item in only_list {
                 match item {
                     OnlyItem::Name(n) => {
                         let n_lc = n.to_lowercase();
-                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
+                        pending.push(PendingGlobalImport {
+                            local_key: n_lc.clone(),
+                            module_key: mod_key.clone(),
+                            symbol_key: n_lc,
+                            source_scope,
+                        });
                     }
                     OnlyItem::Generic(n) => {
                         let n_lc = n.to_lowercase();
-                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
+                        pending.push(PendingGlobalImport {
+                            local_key: n_lc.clone(),
+                            module_key: mod_key.clone(),
+                            symbol_key: n_lc,
+                            source_scope,
+                        });
                     }
                     OnlyItem::Rename(rn) => {
-                        pending.push((
-                            rn.local.to_lowercase(),
-                            (mod_key.clone(), rn.remote.to_lowercase()),
-                        ));
+                        pending.push(PendingGlobalImport {
+                            local_key: rn.local.to_lowercase(),
+                            module_key: mod_key.clone(),
+                            symbol_key: rn.remote.to_lowercase(),
+                            source_scope,
+                        });
                     }
                 }
             }
@@ -8794,7 +8832,7 @@ pub(super) fn install_globals_as_locals_in(
             let rename_targets: std::collections::HashSet<String> =
                 renames.iter().map(|r| r.remote.to_lowercase()).collect();
             for (mk, var) in globals.keys() {
-                if *mk != mod_key {
+                if *mk != mod_key || source_is_intrinsic {
                     continue;
                 }
                 if rename_targets.contains(var) {
@@ -8802,21 +8840,26 @@ pub(super) fn install_globals_as_locals_in(
                 }
                 // Skip PRIVATE symbols — only PUBLIC symbols are accessible
                 // via USE without ONLY.
-                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+                if let Some(mod_scope_id) = source_scope {
                     if let Some(sym) = st.scope(mod_scope_id).symbols.get(var) {
                         if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
                             continue;
                         }
                     }
                 }
-                pending.push((var.clone(), (mod_key.clone(), var.clone())));
+                pending.push(PendingGlobalImport {
+                    local_key: var.clone(),
+                    module_key: mod_key.clone(),
+                    symbol_key: var.clone(),
+                    source_scope,
+                });
             }
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+            if let Some(mod_scope_id) = source_scope {
                 for (_, var) in globals.keys() {
                     if rename_targets.contains(var) {
                         continue;
                     }
-                    if pending.iter().any(|(k, _)| k == var) {
+                    if pending.iter().any(|binding| binding.local_key == *var) {
                         continue;
                     }
                     if !st.scope_exports_name(mod_scope_id, var) {
@@ -8825,14 +8868,19 @@ pub(super) fn install_globals_as_locals_in(
                     if let Some(resolved_key) =
                         resolve_exported_global_key(st, globals, &mod_key, var)
                     {
-                        pending.push((var.clone(), resolved_key));
+                        pending.push(PendingGlobalImport {
+                            local_key: var.clone(),
+                            module_key: resolved_key.0,
+                            symbol_key: resolved_key.1,
+                            source_scope,
+                        });
                     }
                 }
             }
             // Also scan the SymbolTable module scope for symbols not
             // in the globals map (e.g., PARAMETERs, which are inlined
             // and don't generate globals).
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+            if let Some(mod_scope_id) = source_scope {
                 for (sym_key, sym) in &st.scope(mod_scope_id).symbols {
                     if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
                         continue;
@@ -8841,24 +8889,39 @@ pub(super) fn install_globals_as_locals_in(
                         continue;
                     }
                     let pair = (mod_key.clone(), sym_key.clone());
-                    if !globals.contains_key(&pair) && !pending.iter().any(|(k, _)| k == sym_key) {
-                        pending.push((sym_key.clone(), pair));
+                    if !globals.contains_key(&pair)
+                        && !pending.iter().any(|binding| binding.local_key == *sym_key)
+                    {
+                        pending.push(PendingGlobalImport {
+                            local_key: sym_key.clone(),
+                            module_key: pair.0,
+                            symbol_key: pair.1,
+                            source_scope: Some(mod_scope_id),
+                        });
                     }
                 }
             }
             for rn in renames {
-                pending.push((
-                    rn.local.to_lowercase(),
-                    (mod_key.clone(), rn.remote.to_lowercase()),
-                ));
+                pending.push(PendingGlobalImport {
+                    local_key: rn.local.to_lowercase(),
+                    module_key: mod_key.clone(),
+                    symbol_key: rn.remote.to_lowercase(),
+                    source_scope,
+                });
             }
         }
     }
 
-    pending.sort_by(|a, b| a.0.cmp(&b.0));
+    pending.sort_by(|a, b| a.local_key.cmp(&b.local_key));
 
     let mut installed_from: HashMap<String, (String, String)> = HashMap::new();
-    for (local_key, (mod_key, var_key)) in pending {
+    for binding in pending {
+        let PendingGlobalImport {
+            local_key,
+            module_key: mod_key,
+            symbol_key: var_key,
+            source_scope,
+        } = binding;
         if let Some(required) = required_names {
             if !required.contains(&local_key) {
                 continue;
@@ -8873,9 +8936,14 @@ pub(super) fn install_globals_as_locals_in(
                 }
             }
         }
-        let visible_intrinsic_parameter = current_proc_scope()
-            .and_then(|scope_id| st.lookup_in(scope_id, &local_key))
-            .filter(|symbol| st.scope(symbol.scope).intrinsic_module);
+        let visible_intrinsic_parameter = match source_scope {
+            Some(scope_id) => st
+                .lookup_in(scope_id, &var_key)
+                .filter(|symbol| st.scope(symbol.scope).intrinsic_module),
+            None => current_proc_scope()
+                .and_then(|scope_id| st.lookup_in(scope_id, &local_key))
+                .filter(|symbol| st.scope(symbol.scope).intrinsic_module),
+        };
         if visible_intrinsic_parameter.is_some_and(|symbol| {
             install_parameter_inline_const(b, locals, local_key.clone(), symbol)
         }) {
@@ -8883,7 +8951,14 @@ pub(super) fn install_globals_as_locals_in(
         }
         let resolved_global_key = resolve_exported_global_key(st, globals, &mod_key, &var_key)
             .unwrap_or_else(|| (mod_key.clone(), var_key.clone()));
-        if let Some(info) = globals.get(&resolved_global_key) {
+        let source_is_intrinsic =
+            source_scope.is_some_and(|scope_id| st.scope(scope_id).intrinsic_module);
+        let global_info = if source_is_intrinsic {
+            None
+        } else {
+            globals.get(&resolved_global_key)
+        };
+        if let Some(info) = global_info {
             // Collision check: two modules exporting the same local key.
             let resolved_mod = resolved_global_key.0.clone();
             if let Some(previous_key) = installed_from.get(&local_key) {
@@ -8906,8 +8981,8 @@ pub(super) fn install_globals_as_locals_in(
                 // deferred-shape allocatable/pointer array has no bounds in
                 // `info.dims`, so the installed LocalInfo would otherwise be
                 // rank 0 (mis-read as a scalar by generic dispatch).
-                let rank = st
-                    .find_module_scope(&resolved_global_key.0)
+                let rank = source_scope
+                    .or_else(|| st.find_module_scope(&resolved_global_key.0))
                     .and_then(|sid| st.lookup_in(sid, &resolved_global_key.1))
                     .map(|sym| sym.attrs.array_spec.len())
                     .unwrap_or(0);
@@ -8917,7 +8992,7 @@ pub(super) fn install_globals_as_locals_in(
             // Not an IR global — check if it's an intrinsic module parameter constant
             // (iso_c_binding, iso_fortran_env). These are registered in the symbol
             // table but never emitted as IR globals; install them as inline_const locals.
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
+            if let Some(mod_scope_id) = source_scope.or_else(|| st.find_module_scope(&mod_key)) {
                 if let Some(sym) = st
                     .scope(mod_scope_id)
                     .symbols
@@ -13307,14 +13382,14 @@ fn active_block_use_bindings(
         for use_decl in uses {
             let Decl::UseStmt {
                 module,
+                nature,
                 renames,
                 only,
-                ..
             } = &use_decl.node
             else {
                 continue;
             };
-            let Some(source_scope) = st.find_module_scope(module) else {
+            let Some(source_scope) = resolved_use_module_scope(st, module, *nature) else {
                 continue;
             };
             let mut original_names = Vec::new();
@@ -13357,6 +13432,18 @@ fn active_block_use_bindings(
         }
     }
     Vec::new()
+}
+
+fn resolved_use_module_scope(
+    st: &SymbolTable,
+    module: &str,
+    nature: crate::ast::decl::UseNature,
+) -> Option<crate::sema::symtab::ScopeId> {
+    match nature {
+        crate::ast::decl::UseNature::Normal => st.find_module_scope(module),
+        crate::ast::decl::UseNature::Intrinsic => st.find_intrinsic_module_scope(module),
+        crate::ast::decl::UseNature::NonIntrinsic => st.find_non_intrinsic_module_scope(module),
+    }
 }
 
 fn active_block_use_named_interface_symbols<'a>(
@@ -13442,12 +13529,15 @@ pub(super) fn user_callable_shadows_intrinsic(
     let key = name.to_ascii_lowercase();
     let caller_scope_id =
         caller_scope_id.or_else(|| callee_scope_id_for_lookup(st, caller_link_name));
+    // A BLOCK USE binding is the innermost lexical binding. In particular,
+    // an explicit INTRINSIC import must not fall through to a same-named
+    // user procedure visible in a host or unrelated program unit.
+    if let Some(symbol) = active_block_use_linkable_symbol(st, &key) {
+        return is_user_callable(symbol);
+    }
     if let Some(scope_id) = caller_scope_id {
-        if let Some(sym) = st.lookup_in(scope_id, &key) {
-            if is_user_callable(sym) {
-                return true;
-            }
-        }
+        return st.lookup_in(scope_id, &key).is_some_and(is_user_callable)
+            || find_named_interface_symbol(st, &key).is_some();
     }
     if let Some(sym) = st.lookup(&key) {
         if is_user_callable(sym) {
