@@ -132,52 +132,22 @@ fn date_and_time_snapshot(
     let second = tm.tm_sec;
     let tz_offset_min = tm.tm_gmtoff / 60;
 
-    // DATE: YYYYMMDD
-    if !date_buf.is_null() && date_len >= 8 {
-        let s = format!("{:04}{:02}{:02}", year, month, day);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(date_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), date_buf, n);
-        }
-        if n < date_len as usize {
-            unsafe {
-                std::ptr::write_bytes(date_buf.add(n), b' ', date_len as usize - n);
-            }
-        }
-    }
+    // Character assignment truncates or blank-pads to the actual length.
+    let date = format!("{:04}{:02}{:02}", year, month, day);
+    write_character_result(date_buf, date_len, date.as_bytes());
 
-    // TIME: hhmmss.sss
-    if !time_buf.is_null() && time_len >= 10 {
-        let s = format!("{:02}{:02}{:02}.{:03}", hour, minute, second, millis);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(time_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), time_buf, n);
-        }
-        if n < time_len as usize {
-            unsafe {
-                std::ptr::write_bytes(time_buf.add(n), b' ', time_len as usize - n);
-            }
-        }
-    }
+    let time = format!("{:02}{:02}{:02}.{:03}", hour, minute, second, millis);
+    write_character_result(time_buf, time_len, time.as_bytes());
 
-    // ZONE: +hhmm or -hhmm
-    if !zone_buf.is_null() && zone_len >= 5 {
-        let sign = if tz_offset_min >= 0 { '+' } else { '-' };
-        let abs_min = tz_offset_min.unsigned_abs();
-        let s = format!("{}{:02}{:02}", sign, abs_min / 60, abs_min % 60);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(zone_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), zone_buf, n);
-        }
-        if n < zone_len as usize {
-            unsafe {
-                std::ptr::write_bytes(zone_buf.add(n), b' ', zone_len as usize - n);
-            }
-        }
-    }
+    let zone_sign = if tz_offset_min >= 0 { '+' } else { '-' };
+    let zone_minutes = tz_offset_min.unsigned_abs();
+    let zone = format!(
+        "{}{:02}{:02}",
+        zone_sign,
+        zone_minutes / 60,
+        zone_minutes % 60
+    );
+    write_character_result(zone_buf, zone_len, zone.as_bytes());
 
     [
         year,
@@ -1209,6 +1179,54 @@ mod tests {
     #[test]
     fn cpu_time_converts_one_second_of_native_ticks() {
         assert_eq!(process_clock_seconds(PROCESS_CLOCKS_PER_SECOND), 1.0);
+    }
+
+    #[test]
+    fn date_and_time_character_results_truncate_without_overwriting_guards() {
+        const GUARD: u8 = 0xa5;
+
+        let mut date = [GUARD; 9];
+        let mut time = [GUARD; 11];
+        let mut zone = [GUARD; 6];
+        let snapshot = date_and_time_snapshot(
+            unsafe { date.as_mut_ptr().add(1) },
+            7,
+            unsafe { time.as_mut_ptr().add(1) },
+            9,
+            unsafe { zone.as_mut_ptr().add(1) },
+            4,
+        );
+
+        let expected_date = format!("{:04}{:02}{:02}", snapshot[0], snapshot[1], snapshot[2]);
+        let expected_time = format!(
+            "{:02}{:02}{:02}.{:03}",
+            snapshot[4], snapshot[5], snapshot[6], snapshot[7]
+        );
+        let zone_minutes = snapshot[3].unsigned_abs();
+        let expected_zone = format!(
+            "{}{:02}{:02}",
+            if snapshot[3] >= 0 { '+' } else { '-' },
+            zone_minutes / 60,
+            zone_minutes % 60
+        );
+
+        assert_eq!(&date[1..8], &expected_date.as_bytes()[..7]);
+        assert_eq!(&time[1..10], &expected_time.as_bytes()[..9]);
+        assert_eq!(&zone[1..5], &expected_zone.as_bytes()[..4]);
+        assert_eq!((date[0], date[8]), (GUARD, GUARD));
+        assert_eq!((time[0], time[10]), (GUARD, GUARD));
+        assert_eq!((zone[0], zone[5]), (GUARD, GUARD));
+
+        let mut zero_length = [GUARD; 3];
+        date_and_time_snapshot(
+            unsafe { zero_length.as_mut_ptr().add(1) },
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+        );
+        assert_eq!(zero_length, [GUARD; 3]);
     }
 
     #[test]
