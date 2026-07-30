@@ -1,7 +1,8 @@
 //! Fortran I/O subsystem — unit management, list-directed and formatted I/O.
 //!
-//! The I/O state is global (Fortran I/O units are program-wide). Access
-//! is protected by a mutex for future thread safety (DO CONCURRENT).
+//! The I/O registry is global (Fortran I/O units are program-wide).
+//! Registry changes and individual unit operations have separate locks,
+//! so a blocking operation cannot stall unrelated units.
 //!
 //! Preconnected units:
 //! - Unit 5 → stdin
@@ -188,6 +189,8 @@ enum UnitStream {
     FileWrite(BufWriter<File>),
     /// Raw file handle for direct/stream access (supports both read and write + seeking).
     FileRaw(File),
+    #[cfg(test)]
+    TestRead(Box<dyn BufRead + Send>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +449,10 @@ impl Unit {
             UnitStream::FileRead(r) => {
                 r.read_until(b'\n', &mut line)?;
             }
+            #[cfg(test)]
+            UnitStream::TestRead(r) => {
+                r.read_until(b'\n', &mut line)?;
+            }
             UnitStream::FileRaw(f) => {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -590,9 +597,59 @@ fn mantissa_allows_implicit_exponent(prefix: &[u8]) -> bool {
 
 // ---- I/O State ----
 
+struct UnitConnection {
+    // CLOSE/OPEN removes the handle from the registry, then takes this value.
+    // An operation that cloned the handle before removal therefore either
+    // finishes first or observes a disconnected connection after taking the lock.
+    unit: Mutex<Option<Unit>>,
+    filename: Vec<u8>,
+    scratch_path: Option<Vec<u8>>,
+}
+
+impl UnitConnection {
+    fn new(unit: Unit) -> Arc<Self> {
+        let filename = unit.filename.clone();
+        let scratch_path =
+            (unit.scratch && !unit.filename.is_empty()).then(|| unit.filename.clone());
+        Arc::new(Self {
+            unit: Mutex::new(Some(unit)),
+            filename,
+            scratch_path,
+        })
+    }
+}
+
+type SharedUnit = Arc<UnitConnection>;
+
 struct IoState {
-    units: HashMap<i32, Unit>,
+    units: HashMap<i32, SharedUnit>,
     next_newunit: i32,
+}
+
+fn connected_unit(unit_num: i32) -> Option<SharedUnit> {
+    io_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .units
+        .get(&unit_num)
+        .cloned()
+}
+
+fn with_unit<R>(unit_num: i32, operation: impl FnOnce(&mut Unit) -> R) -> Option<R> {
+    let connection = connected_unit(unit_num)?;
+    let mut guard = connection
+        .unit
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard.as_mut().map(operation)
+}
+
+fn disconnect_unit(connection: SharedUnit) -> Option<Unit> {
+    connection
+        .unit
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
 }
 
 impl IoState {
@@ -602,7 +659,7 @@ impl IoState {
         // Preconnected units.
         units.insert(
             5,
-            Unit {
+            UnitConnection::new(Unit {
                 _number: 5,
                 stream: UnitStream::Stdin,
                 filename: b"stdin".to_vec(),
@@ -622,11 +679,11 @@ impl IoState {
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
-            },
+            }),
         );
         units.insert(
             6,
-            Unit {
+            UnitConnection::new(Unit {
                 _number: 6,
                 stream: UnitStream::Stdout,
                 filename: b"stdout".to_vec(),
@@ -646,11 +703,11 @@ impl IoState {
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
-            },
+            }),
         );
         units.insert(
             0,
-            Unit {
+            UnitConnection::new(Unit {
                 _number: 0,
                 stream: UnitStream::Stderr,
                 filename: b"stderr".to_vec(),
@@ -670,17 +727,13 @@ impl IoState {
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
-            },
+            }),
         );
 
         Self {
             units,
             next_newunit: -10,
         }
-    }
-
-    fn get_unit(&mut self, unit_num: i32) -> Option<&mut Unit> {
-        self.units.get_mut(&unit_num)
     }
 
     fn alloc_newunit(&mut self) -> i32 {
@@ -811,27 +864,35 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         std::process::exit(1);
     }
 
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-
-    // NEWUNIT: allocate a new unit number.
-    let actual_unit = if !newunit.is_null() {
-        let u = state.alloc_newunit();
-        unsafe {
-            *newunit = u;
-        }
-        u
-    } else {
-        unit
+    let (actual_unit, existing_connection) = {
+        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+        // NEWUNIT: allocate a new unit number.
+        let actual_unit = if !newunit.is_null() {
+            let u = state.alloc_newunit();
+            unsafe {
+                *newunit = u;
+            }
+            u
+        } else {
+            unit
+        };
+        (actual_unit, state.units.get(&actual_unit).cloned())
     };
 
-    let existing_unit = state.units.get(&actual_unit).map(|u| {
-        (
-            u.filename.clone(),
-            u.access,
-            u.form.clone(),
-            u.action,
-            u.recl,
-        )
+    let existing_unit = existing_connection.as_ref().and_then(|connection| {
+        let guard = connection
+            .unit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.as_ref().map(|unit| {
+            (
+                unit.filename.clone(),
+                unit.access,
+                unit.form.clone(),
+                unit.action,
+                unit.recl,
+            )
+        })
     });
     let fname = if missing_filename {
         if is_scratch {
@@ -857,7 +918,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         && recl <= 0
         && newunit.is_null();
     if update_existing_in_place {
-        if let Some(unit) = state.get_unit(actual_unit) {
+        with_unit(actual_unit, |unit| {
             match position_str.trim() {
                 "append" => match &mut unit.stream {
                     UnitStream::FileRaw(f) => {
@@ -888,7 +949,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
             if leading_zero_specified {
                 unit.leading_zero = leading_zero_mode;
             }
-        }
+        });
         if !iostat.is_null() {
             unsafe {
                 *iostat = 0;
@@ -956,8 +1017,14 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         }
     }
 
-    // Flush and close existing unit if re-opening.
-    if let Some(mut existing) = state.units.remove(&actual_unit) {
+    // Disconnect before waiting for an in-flight operation on this same unit.
+    // New operations then fail the registry lookup while unrelated units remain free.
+    let displaced = io_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .units
+        .remove(&actual_unit);
+    if let Some(mut existing) = displaced.and_then(disconnect_unit) {
         let _ = existing.flush();
         // Drop closes the file handle.
     }
@@ -1004,36 +1071,33 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                     Action::ReadWrite => UnitStream::FileRaw(file),
                 },
             };
-            state.units.insert(
-                actual_unit,
-                Unit {
-                    _number: actual_unit,
-                    stream,
-                    filename: fname,
-                    _status: UnitStatus::Open,
-                    access: file_access,
-                    form: file_form,
-                    action: file_action,
-                    recl: if recl > 0 {
-                        Some(recl)
-                    } else {
-                        existing_unit
-                            .as_ref()
-                            .and_then(|(_, _, _, _, existing_recl)| *existing_recl)
-                    },
-                    read_tokens: VecDeque::new(),
-                    formatted_read_record: None,
-                    formatted_read_cursor: 0,
-                    terminal_nonadvancing_open_record: false,
-                    last_list_output_char: false,
-                    list_write_active: false,
-                    list_write_error: None,
-                    scratch: is_scratch,
-                    leading_zero: leading_zero_mode,
-                    pending_record: None,
-                    pending_read: None,
+            let mut opened_unit = Unit {
+                _number: actual_unit,
+                stream,
+                filename: fname,
+                _status: UnitStatus::Open,
+                access: file_access,
+                form: file_form,
+                action: file_action,
+                recl: if recl > 0 {
+                    Some(recl)
+                } else {
+                    existing_unit
+                        .as_ref()
+                        .and_then(|(_, _, _, _, existing_recl)| *existing_recl)
                 },
-            );
+                read_tokens: VecDeque::new(),
+                formatted_read_record: None,
+                formatted_read_cursor: 0,
+                terminal_nonadvancing_open_record: false,
+                last_list_output_char: false,
+                list_write_active: false,
+                list_write_error: None,
+                scratch: is_scratch,
+                leading_zero: leading_zero_mode,
+                pending_record: None,
+                pending_read: None,
+            };
 
             // Apply POSITION specifier.
             // Default: REWIND for sequential, ASIS for direct/stream.
@@ -1048,20 +1112,26 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 _ => None,
             };
             if let Some(seek) = pos {
-                if let Some(u) = state.get_unit(actual_unit) {
-                    match &mut u.stream {
-                        UnitStream::FileRaw(f) => {
-                            let _ = f.seek(seek);
-                        }
-                        UnitStream::FileRead(r) => {
-                            let _ = r.seek(seek);
-                        }
-                        UnitStream::FileWrite(w) => {
-                            let _ = w.seek(seek);
-                        }
-                        _ => {}
+                match &mut opened_unit.stream {
+                    UnitStream::FileRaw(f) => {
+                        let _ = f.seek(seek);
                     }
+                    UnitStream::FileRead(r) => {
+                        let _ = r.seek(seek);
+                    }
+                    UnitStream::FileWrite(w) => {
+                        let _ = w.seek(seek);
+                    }
+                    _ => {}
                 }
+            }
+            let replaced = io_state()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .units
+                .insert(actual_unit, UnitConnection::new(opened_unit));
+            if let Some(mut replaced) = replaced.and_then(disconnect_unit) {
+                let _ = replaced.flush();
             }
 
             if !iostat.is_null() {
@@ -1079,13 +1149,6 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 }
                 assign_iomsg(iomsg, iomsg_len, &message);
             } else {
-                // Release the io_state mutex before exit. process::exit invokes
-                // libc atexit handlers — including afs_io_finalize, which locks
-                // io_state to flush units. Holding the lock here while exiting
-                // deadlocked on macOS where the atexit thread re-entered the
-                // same mutex (sample-trace: pthread_mutex_firstfit_lock_wait
-                // → __psynch_mutexwait, hangs forever).
-                drop(state);
                 eprintln!("{message}");
                 std::process::exit(1);
             }
@@ -1111,8 +1174,12 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
             .unwrap_or(false)
     };
 
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(mut u) = state.units.remove(&unit) {
+    let connection = io_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .units
+        .remove(&unit);
+    if let Some(mut u) = connection.and_then(disconnect_unit) {
         let _ = u.flush();
         let filename = u.filename.clone();
         // STATUS='SCRATCH' units always delete on close (F2018 §12.5.6.13).
@@ -1132,8 +1199,6 @@ pub extern "C" fn afs_close_ex(unit: i32, status: *const u8, status_len: i64, io
         if !iostat.is_null() {
             unsafe { *iostat = close_status };
         } else if close_status != 0 {
-            // Release lock before exit (afs_io_finalize atexit re-locks). See afs_open.
-            drop(state);
             eprintln!(
                 "CLOSE: {}: {}",
                 display_filename(&filename),
@@ -1169,99 +1234,92 @@ fn mark_list_output_nonchar(u: &mut Unit) {
 /// Write an 8-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int8(unit: i32, val: i8) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&list_directed_integer_field(val, LIST_INT8_WIDTH));
         }
-    }
+    });
 }
 
 /// Write a 16-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int16(unit: i32, val: i16) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&list_directed_integer_field(val, LIST_INT16_WIDTH));
         }
-    }
+    });
 }
 
 /// Write an integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int(unit: i32, val: i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&list_directed_integer_field(val, LIST_INT32_WIDTH));
         }
-    }
+    });
 }
 
 /// Write a 64-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int64(unit: i32, val: i64) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&list_directed_integer_field(val, LIST_INT64_WIDTH));
         }
-    }
+    });
 }
 
 /// Write a 128-bit integer value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_int128(unit: i32, val: i128) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&list_directed_integer_field(val, LIST_INT128_WIDTH));
         }
-    }
+    });
 }
 
 /// Write a real value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_real(unit: i32, val: f32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&format!("  {:14.7E}", val));
         }
-    }
+    });
 }
 
 /// Write a double value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&val.to_ne_bytes());
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(&format!("  {:22.15E}", val));
         }
-    }
+    });
 }
 
 /// Write a complex(4) value (list-directed): " (re,im)".
@@ -1269,8 +1327,7 @@ pub extern "C" fn afs_write_real64(unit: i32, val: f64) {
 #[no_mangle]
 pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&re.to_ne_bytes());
             u.list_write_raw_or_buffer(&im.to_ne_bytes());
@@ -1278,7 +1335,7 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
             mark_list_output_nonchar(u);
             u.list_write_str(&format!(" ({:14.7E},{:14.7E})", re, im));
         }
-    }
+    });
 }
 
 /// Write a complex(8) value (list-directed): " (re,im)".
@@ -1286,8 +1343,7 @@ pub extern "C" fn afs_write_complex_f32(unit: i32, ptr: *const f32) {
 #[no_mangle]
 pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
     let (re, im) = unsafe { (*ptr, *ptr.add(1)) };
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             u.list_write_raw_or_buffer(&re.to_ne_bytes());
             u.list_write_raw_or_buffer(&im.to_ne_bytes());
@@ -1295,14 +1351,13 @@ pub extern "C" fn afs_write_complex_f64(unit: i32, ptr: *const f64) {
             mark_list_output_nonchar(u);
             u.list_write_str(&format!(" ({:22.15E},{:22.15E})", re, im));
         }
-    }
+    });
 }
 
 /// Write a character string (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             if !ptr.is_null() && len > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
@@ -1318,7 +1373,7 @@ pub extern "C" fn afs_write_string(unit: i32, ptr: *const u8, len: i64) {
             }
             u.last_list_output_char = true;
         }
-    }
+    });
 }
 
 fn logical_transfer_width(kind_bytes: i32) -> Option<usize> {
@@ -1347,15 +1402,14 @@ pub extern "C" fn afs_write_logical_kind(unit: i32, val: i32, kind_bytes: i32) {
         eprintln!("WRITE: invalid logical kind width {kind_bytes}");
         std::process::exit(1);
     };
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             write_unformatted_logical(u, val, width);
         } else {
             mark_list_output_nonchar(u);
             u.list_write_str(if val != 0 { " T" } else { " F" });
         }
-    }
+    });
 }
 
 /// Write a default-kind logical value (list-directed or unformatted).
@@ -1367,8 +1421,7 @@ pub extern "C" fn afs_write_logical(unit: i32, val: i32) {
 /// End a write statement (newline).
 #[no_mangle]
 pub extern "C" fn afs_write_newline(unit: i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if u.is_unformatted() {
             // Sequential unformatted: a pending record buffer means
             // afs_list_write_end was not called — flush nothing here.
@@ -1379,7 +1432,7 @@ pub extern "C" fn afs_write_newline(unit: i32) {
         u.list_write_str("\n");
         u.list_write_flush();
         u.last_list_output_char = false;
-    }
+    });
 }
 
 /// Like `afs_write_newline` but no-ops when `advance == 0`. The
@@ -1389,10 +1442,9 @@ pub extern "C" fn afs_write_newline(unit: i32) {
 #[no_mangle]
 pub extern "C" fn afs_write_newline_if(unit: i32, advance: i32) {
     if advance == 0 {
-        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(u) = state.get_unit(unit) {
+        with_unit(unit, |u| {
             u.list_write_flush();
-        }
+        });
         return;
     }
     afs_write_newline(unit);
@@ -1470,15 +1522,17 @@ pub extern "C" fn afs_list_write_begin(
             *b = b' ';
         }
     }
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    if with_unit(unit, |u| {
         u.last_list_output_char = false;
         u.list_write_active = true;
         u.list_write_error = None;
         if u.form == Form::Unformatted && u.access == Access::Sequential {
             u.pending_record = Some(Vec::new());
         }
-    } else if !iostat.is_null() {
+    })
+    .is_none()
+        && !iostat.is_null()
+    {
         unsafe {
             *iostat = 1;
         }
@@ -1500,8 +1554,7 @@ pub extern "C" fn afs_list_write_end(
     iomsg: *mut u8,
     iomsg_len: i64,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let err = if let Some(u) = state.get_unit(unit) {
+    let err = with_unit(unit, |u| {
         if let Some(buf) = u.pending_record.take() {
             let len_bytes = (buf.len() as u32).to_ne_bytes();
             u.list_write_raw_or_buffer(&len_bytes);
@@ -1514,10 +1567,8 @@ pub extern "C" fn afs_list_write_end(
         let err = u.list_write_error.take();
         u.list_write_active = false;
         err
-    } else {
-        Some("unit not connected".to_string())
-    };
-    drop(state);
+    })
+    .unwrap_or_else(|| Some("unit not connected".to_string()));
 
     if let Some(msg) = err {
         write_i32_ptr(iostat, 1);
@@ -1597,8 +1648,7 @@ pub extern "C" fn afs_read_logical_kind(
         set_read_iostat_or_exit(iostat, 1, "invalid logical kind width");
         return;
     };
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(width) {
             write_i32_ptr(val, i32::from(bytes.iter().any(|byte| *byte != 0)));
             set_read_success(iostat);
@@ -1631,7 +1681,7 @@ pub extern "C" fn afs_read_logical_kind(
                 set_read_iostat_or_exit(iostat, 1, &e.to_string());
             }
         }
-    }
+    });
 }
 
 /// Read a default-kind logical value (list-directed or unformatted).
@@ -1643,8 +1693,7 @@ pub extern "C" fn afs_read_logical(unit: i32, val: *mut i32, iostat: *mut i32) {
 /// Read an i8 value (list-directed) from a unit.
 #[no_mangle]
 pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(1) {
             write_i8_ptr(val, i8::from_ne_bytes([bytes[0]]));
             if !iostat.is_null() {
@@ -1707,14 +1756,13 @@ pub extern "C" fn afs_read_int8(unit: i32, val: *mut i8, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an i16 value (list-directed) from a unit.
 #[no_mangle]
 pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(2) {
             let mut b = [0u8; 2];
             b.copy_from_slice(&bytes);
@@ -1779,15 +1827,14 @@ pub extern "C" fn afs_read_int16(unit: i32, val: *mut i16, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an i32 value (list-directed) from a unit.
 /// Uses token buffer: multiple values on one line are consumed left-to-right.
 #[no_mangle]
 pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(4) {
             let mut b = [0u8; 4];
             b.copy_from_slice(&bytes);
@@ -1852,14 +1899,13 @@ pub extern "C" fn afs_read_int(unit: i32, val: *mut i32, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an i64 value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(8) {
             let mut b = [0u8; 8];
             b.copy_from_slice(&bytes);
@@ -1918,14 +1964,13 @@ pub extern "C" fn afs_read_int64(unit: i32, val: *mut i64, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an i128 value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(16) {
             let mut b = [0u8; 16];
             b.copy_from_slice(&bytes);
@@ -1984,14 +2029,13 @@ pub extern "C" fn afs_read_int128(unit: i32, val: *mut i128, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an f32 value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(4) {
             let mut b = [0u8; 4];
             b.copy_from_slice(&bytes);
@@ -2056,14 +2100,13 @@ pub extern "C" fn afs_read_real(unit: i32, val: *mut f32, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an f64 value (list-directed).
 #[no_mangle]
 pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Some(bytes) = u.read_buffer_take(8) {
             let mut b = [0u8; 8];
             b.copy_from_slice(&bytes);
@@ -2125,7 +2168,7 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                 }
             }
         }
-    }
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2170,52 +2213,49 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
             *b = b' ';
         }
     }
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(u) = state.get_unit(unit) else {
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 1;
-            }
-        }
-        return;
-    };
-    if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
-        return;
-    }
-    u.pending_read = None;
-
-    let mut len_buf = [0u8; 4];
-    match read_raw_exact(u, &mut len_buf) {
-        Ok(ExactRawRead::Complete) => {}
-        Ok(ExactRawRead::EndOfFile) => {
-            set_read_status_or_exit(iostat, IOSTAT_END);
+    if with_unit(unit, |u| {
+        if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
             return;
         }
-        _ => {
+        u.pending_read = None;
+
+        let mut len_buf = [0u8; 4];
+        match read_raw_exact(u, &mut len_buf) {
+            Ok(ExactRawRead::Complete) => {}
+            Ok(ExactRawRead::EndOfFile) => {
+                set_read_status_or_exit(iostat, IOSTAT_END);
+                return;
+            }
+            _ => {
+                set_read_status_or_exit(iostat, 1);
+                return;
+            }
+        }
+        let record_len = u32::from_ne_bytes(len_buf) as usize;
+        let mut data = Vec::new();
+        if data.try_reserve_exact(record_len).is_err() {
             set_read_status_or_exit(iostat, 1);
             return;
         }
-    }
-    let record_len = u32::from_ne_bytes(len_buf) as usize;
-    let mut data = Vec::new();
-    if data.try_reserve_exact(record_len).is_err() {
-        set_read_status_or_exit(iostat, 1);
-        return;
-    }
-    data.resize(record_len, 0);
-    if !matches!(read_raw_exact(u, &mut data), Ok(ExactRawRead::Complete)) {
-        set_read_status_or_exit(iostat, 1);
-        return;
-    }
+        data.resize(record_len, 0);
+        if !matches!(read_raw_exact(u, &mut data), Ok(ExactRawRead::Complete)) {
+            set_read_status_or_exit(iostat, 1);
+            return;
+        }
 
-    let mut trailer = [0u8; 4];
-    if !matches!(read_raw_exact(u, &mut trailer), Ok(ExactRawRead::Complete))
-        || u32::from_ne_bytes(trailer) as usize != record_len
+        let mut trailer = [0u8; 4];
+        if !matches!(read_raw_exact(u, &mut trailer), Ok(ExactRawRead::Complete))
+            || u32::from_ne_bytes(trailer) as usize != record_len
+        {
+            set_read_status_or_exit(iostat, 1);
+            return;
+        }
+        u.pending_read = Some((data, 0));
+    })
+    .is_none()
     {
-        set_read_status_or_exit(iostat, 1);
-        return;
+        write_i32_ptr(iostat, 1);
     }
-    u.pending_read = Some((data, 0));
 }
 
 /// End a list-directed READ statement. Drops any unread bytes left in
@@ -2228,10 +2268,9 @@ pub extern "C" fn afs_list_read_end(
     _iomsg: *mut u8,
     _iomsg_len: i64,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         u.pending_read = None;
-    }
+    });
 }
 
 /// Advance the file position past one record on a list-directed READ
@@ -2242,112 +2281,111 @@ pub extern "C" fn afs_list_read_end(
 /// infinite because the unit never advances and iostat is never set.
 #[no_mangle]
 pub extern "C" fn afs_read_skip_record(unit: i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(u) = state.get_unit(unit) else {
-        if !iostat.is_null() {
-            unsafe { *iostat = 1 };
-        }
-        return;
-    };
-    // Drain any pre-tokenized values from the previous list-directed
-    // read so the next iteration genuinely consumes a new record.
-    u.read_tokens.clear();
-    match u.read_line() {
-        Ok(s) if s.is_empty() => {
-            if !iostat.is_null() {
-                unsafe { *iostat = IOSTAT_END };
+    if with_unit(unit, |u| {
+        // Drain any pre-tokenized values from the previous list-directed
+        // read so the next iteration genuinely consumes a new record.
+        u.read_tokens.clear();
+        match u.read_line() {
+            Ok(s) if s.is_empty() => {
+                if !iostat.is_null() {
+                    unsafe { *iostat = IOSTAT_END };
+                }
+            }
+            Ok(_) => {
+                if !iostat.is_null() {
+                    unsafe { *iostat = 0 };
+                }
+            }
+            Err(_) => {
+                if !iostat.is_null() {
+                    unsafe { *iostat = 1 };
+                }
             }
         }
-        Ok(_) => {
-            if !iostat.is_null() {
-                unsafe { *iostat = 0 };
-            }
-        }
-        Err(_) => {
-            if !iostat.is_null() {
-                unsafe { *iostat = 1 };
-            }
-        }
+    })
+    .is_none()
+    {
+        write_i32_ptr(iostat, 1);
     }
 }
 
 #[no_mangle]
 pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(u) = state.get_unit(unit) else {
-        set_read_status_or_exit(iostat, 1);
-        return;
-    };
-
-    if dest_len < 0 {
-        set_read_status_or_exit(iostat, 1);
-        return;
-    }
-
-    if let Some(bytes) = u.read_buffer_take(dest_len as usize) {
-        crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), dest_len);
-        if !iostat.is_null() {
-            unsafe {
-                *iostat = 0;
-            }
+    if with_unit(unit, |u| {
+        if dest_len < 0 {
+            set_read_status_or_exit(iostat, 1);
+            return;
         }
-        return;
-    }
 
-    if report_short_pending_read_record(u, iostat) {
-        return;
-    }
-
-    if u.form == Form::Unformatted && u.access == Access::Stream {
-        let mut bytes = vec![b' '; dest_len as usize];
-        match u.read_raw(&mut bytes) {
-            Ok(0) => {
-                crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-                set_read_status_or_exit(iostat, IOSTAT_END);
+        if let Some(bytes) = u.read_buffer_take(dest_len as usize) {
+            crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), dest_len);
+            if !iostat.is_null() {
+                unsafe {
+                    *iostat = 0;
+                }
             }
-            Ok(n) => {
-                crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), n as i64);
+            return;
+        }
+
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
+
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut bytes = vec![b' '; dest_len as usize];
+            match u.read_raw(&mut bytes) {
+                Ok(0) => {
+                    crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+                    set_read_status_or_exit(iostat, IOSTAT_END);
+                }
+                Ok(n) => {
+                    crate::string::afs_assign_char_fixed(dest, dest_len, bytes.as_ptr(), n as i64);
+                    if !iostat.is_null() {
+                        unsafe {
+                            *iostat = 0;
+                        }
+                    }
+                }
+                Err(_) => {
+                    crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+                    set_read_status_or_exit(iostat, 1);
+                }
+            }
+            return;
+        }
+
+        match u.next_read_token() {
+            Ok(Some(ListReadToken::Value(token))) => {
+                let Ok(value) = decode_list_directed_character_value(&token) else {
+                    set_read_status_or_exit(iostat, 1);
+                    return;
+                };
+                crate::string::afs_assign_char_fixed(
+                    dest,
+                    dest_len,
+                    value.as_ptr(),
+                    value.len() as i64,
+                );
                 if !iostat.is_null() {
                     unsafe {
                         *iostat = 0;
                     }
                 }
             }
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(None) => {
+                crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
+                set_read_status_or_exit(iostat, IOSTAT_END);
+            }
             Err(_) => {
                 crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
                 set_read_status_or_exit(iostat, 1);
             }
         }
-        return;
-    }
-
-    match u.next_read_token() {
-        Ok(Some(ListReadToken::Value(token))) => {
-            let Ok(value) = decode_list_directed_character_value(&token) else {
-                set_read_status_or_exit(iostat, 1);
-                return;
-            };
-            crate::string::afs_assign_char_fixed(
-                dest,
-                dest_len,
-                value.as_ptr(),
-                value.len() as i64,
-            );
-            if !iostat.is_null() {
-                unsafe {
-                    *iostat = 0;
-                }
-            }
-        }
-        Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
-        Ok(None) => {
-            crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-            set_read_status_or_exit(iostat, IOSTAT_END);
-        }
-        Err(_) => {
-            crate::string::afs_assign_char_fixed(dest, dest_len, std::ptr::null(), 0);
-            set_read_status_or_exit(iostat, 1);
-        }
+    })
+    .is_none()
+    {
+        set_read_status_or_exit(iostat, 1);
     }
 }
 
@@ -2536,8 +2574,7 @@ pub extern "C" fn afs_write_direct(
     data_len: i64,
     iostat: *mut i32,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Err(e) = u.seek_to_record(rec) {
             if !iostat.is_null() {
                 unsafe {
@@ -2573,7 +2610,7 @@ pub extern "C" fn afs_write_direct(
                 *iostat = 0;
             }
         }
-    }
+    });
 }
 
 /// Read a direct-access record.
@@ -2585,8 +2622,7 @@ pub extern "C" fn afs_read_direct(
     data_len: i64,
     iostat: *mut i32,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if let Err(e) = u.seek_to_record(rec) {
             if !iostat.is_null() {
                 unsafe {
@@ -2635,7 +2671,7 @@ pub extern "C" fn afs_read_direct(
                 }
             }
         }
-    }
+    });
 }
 
 // ---- Unformatted sequential I/O ----
@@ -2648,8 +2684,7 @@ pub extern "C" fn afs_write_unformatted(
     data_len: i64,
     iostat: *mut i32,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if data_len < 0 || data_len > u32::MAX as i64 {
             if !iostat.is_null() {
                 unsafe {
@@ -2687,7 +2722,7 @@ pub extern "C" fn afs_write_unformatted(
                 }
             }
         }
-    }
+    });
 }
 
 /// Read an unformatted record with 4-byte length markers.
@@ -2699,8 +2734,7 @@ pub extern "C" fn afs_read_unformatted(
     actual_len: *mut i64,
     iostat: *mut i32,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         // Read leading length marker.
         let mut len_buf = [0u8; 4];
         match u.read_raw(&mut len_buf) {
@@ -2749,7 +2783,7 @@ pub extern "C" fn afs_read_unformatted(
                 *iostat = 0;
             }
         }
-    }
+    });
 }
 
 // ---- Stream access helpers ----
@@ -2757,8 +2791,7 @@ pub extern "C" fn afs_read_unformatted(
 /// Write raw bytes at the current stream position.
 #[no_mangle]
 pub extern "C" fn afs_write_stream(unit: i32, data: *const u8, data_len: i64, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    with_unit(unit, |u| {
         if !data.is_null() && data_len > 0 {
             let slice = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
             match u.write_raw(slice) {
@@ -2778,7 +2811,7 @@ pub extern "C" fn afs_write_stream(unit: i32, data: *const u8, data_len: i64, io
                 }
             }
         }
-    }
+    });
 }
 
 /// Seek to an absolute byte position in a stream unit.
@@ -2793,8 +2826,7 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
         return;
     }
     let offset = (pos - 1) as u64;
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = state.get_unit(unit) {
+    if with_unit(unit, |u| {
         if u.access != Access::Stream {
             if !iostat.is_null() {
                 unsafe {
@@ -2829,7 +2861,10 @@ pub extern "C" fn afs_seek_stream(unit: i32, pos: i64, iostat: *mut i32) {
                 }
             }
         }
-    } else if !iostat.is_null() {
+    })
+    .is_none()
+        && !iostat.is_null()
+    {
         unsafe {
             *iostat = 1;
         }
@@ -2881,10 +2916,9 @@ pub extern "C" fn afs_write_namelist(
     iomsg_len: i64,
 ) {
     let gname = unsafe_str(group_name, group_name_len);
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
     let mut status = 0;
     let mut error_message = None;
-    if let Some(u) = state.get_unit(unit) {
+    if with_unit(unit, |u| {
         remember_io_status(
             &mut status,
             &mut error_message,
@@ -2970,7 +3004,9 @@ pub extern "C" fn afs_write_namelist(
         }
         remember_io_status(&mut status, &mut error_message, u.write_str(" /\n"));
         remember_io_status(&mut status, &mut error_message, u.flush());
-    } else {
+    })
+    .is_none()
+    {
         status = 1;
         error_message = Some("unit not open for writing".to_string());
     }
@@ -2998,8 +3034,7 @@ pub extern "C" fn afs_read_namelist(
     iostat: *mut i32,
 ) {
     let gname = unsafe_str(group_name, group_name_len).to_lowercase();
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let status = if let Some(u) = state.get_unit(unit) {
+    let status = with_unit(unit, |u| {
         // Read lines until we find &groupname.
         let mut all_lines = String::new();
         'find_group: loop {
@@ -3042,10 +3077,8 @@ pub extern "C" fn afs_read_namelist(
                 Err(error) => break 'find_group error.raw_os_error().unwrap_or(1),
             }
         }
-    } else {
-        1
-    };
-    drop(state);
+    })
+    .unwrap_or(1);
     if status == 0 {
         write_i32_ptr(iostat, 0);
     } else {
@@ -4154,13 +4187,8 @@ pub extern "C" fn afs_backspace(unit: i32, iostat: *mut i32) {
 
 #[no_mangle]
 pub extern "C" fn afs_backspace_ex(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
-    let result = {
-        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .get_unit(unit)
-            .ok_or_else(|| invalid_positioning_error("unit is not connected"))
-            .and_then(Unit::backspace)
-    };
+    let result = with_unit(unit, Unit::backspace)
+        .unwrap_or_else(|| Err(invalid_positioning_error("unit is not connected")));
     finish_positioning_result("BACKSPACE", result, iostat, iomsg, iomsg_len);
 }
 
@@ -4172,13 +4200,8 @@ pub extern "C" fn afs_endfile(unit: i32, iostat: *mut i32) {
 
 #[no_mangle]
 pub extern "C" fn afs_endfile_ex(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
-    let result = {
-        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .get_unit(unit)
-            .ok_or_else(|| invalid_positioning_error("unit is not connected"))
-            .and_then(Unit::endfile)
-    };
+    let result = with_unit(unit, Unit::endfile)
+        .unwrap_or_else(|| Err(invalid_positioning_error("unit is not connected")));
     finish_positioning_result("ENDFILE", result, iostat, iomsg, iomsg_len);
 }
 
@@ -4229,12 +4252,56 @@ fn unit_current_fortran_pos(u: &mut Unit) -> i64 {
 /// connection reports its current mode (`PRINT`/`SUPPRESS`/
 /// `PROCESSOR_DEFINED`); no connection or an unformatted connection is
 /// `UNDEFINED` — not `PROCESSOR_DEFINED`.
-fn write_leading_zero_capability(unit: Option<&Unit>, buf: *mut u8, buf_len: i64) {
+fn write_leading_zero_capability(
+    unit: Option<(&Form, LeadingZeroMode)>,
+    buf: *mut u8,
+    buf_len: i64,
+) {
     let s = match unit {
-        Some(u) if u.form == Form::Formatted => u.leading_zero.inquire_str(),
+        Some((Form::Formatted, mode)) => mode.inquire_str(),
         _ => "UNDEFINED",
     };
     write_inquire_string(buf, buf_len, s);
+}
+
+struct UnitInquiry {
+    access: Access,
+    form: Form,
+    action: Action,
+    recl: Option<i64>,
+    leading_zero: LeadingZeroMode,
+}
+
+impl UnitInquiry {
+    fn from_unit(unit: &Unit) -> Self {
+        Self {
+            access: unit.access,
+            form: unit.form.clone(),
+            action: unit.action,
+            recl: unit.recl,
+            leading_zero: unit.leading_zero,
+        }
+    }
+}
+
+fn find_connected_file(filename: &[u8]) -> Option<UnitInquiry> {
+    let connections: Vec<SharedUnit> = io_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .units
+        .values()
+        .cloned()
+        .collect();
+    connections
+        .into_iter()
+        .filter(|connection| connection.filename == filename)
+        .find_map(|connection| {
+            let guard = connection
+                .unit
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard.as_ref().map(UnitInquiry::from_unit)
+        })
 }
 
 /// INQUIRE by file: check if a file exists, report its properties.
@@ -4287,8 +4354,7 @@ pub extern "C" fn afs_inquire_file(
     }
 
     // Find unit connected to this file (if any).
-    let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let connected_unit = state.units.values().find(|u| u.filename == fname);
+    let connected_unit = find_connected_file(&fname);
 
     if !opened.is_null() {
         unsafe {
@@ -4298,9 +4364,12 @@ pub extern "C" fn afs_inquire_file(
 
     write_inquire_bytes(name_buf, name_buf_len, &fname);
 
-    if let Some(u) = connected_unit {
+    if let Some(u) = connected_unit.as_ref() {
         write_unit_properties(
-            u,
+            u.access,
+            &u.form,
+            u.action,
+            u.recl,
             access_buf,
             access_buf_len,
             form_buf,
@@ -4334,7 +4403,11 @@ pub extern "C" fn afs_inquire_file(
             unformatted_buf,
             unformatted_buf_len,
         );
-        write_leading_zero_capability(Some(u), leading_zero_buf, leading_zero_buf_len);
+        write_leading_zero_capability(
+            Some((&u.form, u.leading_zero)),
+            leading_zero_buf,
+            leading_zero_buf_len,
+        );
     } else {
         write_inquire_string(access_buf, access_buf_len, "UNDEFINED");
         write_inquire_string(form_buf, form_buf_len, "UNDEFINED");
@@ -4427,8 +4500,14 @@ pub extern "C" fn afs_inquire_unit(
     leading_zero_buf: *mut u8,
     leading_zero_buf_len: i64,
 ) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let unit_entry = state.units.get_mut(&unit);
+    let connection = connected_unit(unit);
+    let mut unit_guard = connection.as_ref().map(|connection| {
+        connection
+            .unit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    });
+    let unit_entry = unit_guard.as_mut().and_then(|guard| guard.as_mut());
 
     if !exist.is_null() {
         unsafe {
@@ -4444,7 +4523,10 @@ pub extern "C" fn afs_inquire_unit(
     if let Some(u) = unit_entry {
         write_inquire_bytes(name_buf, name_buf_len, &u.filename);
         write_unit_properties(
-            u,
+            u.access,
+            &u.form,
+            u.action,
+            u.recl,
             access_buf,
             access_buf_len,
             form_buf,
@@ -4478,7 +4560,11 @@ pub extern "C" fn afs_inquire_unit(
             unformatted_buf,
             unformatted_buf_len,
         );
-        write_leading_zero_capability(Some(u), leading_zero_buf, leading_zero_buf_len);
+        write_leading_zero_capability(
+            Some((&u.form, u.leading_zero)),
+            leading_zero_buf,
+            leading_zero_buf_len,
+        );
 
         if !size_out.is_null() {
             let sz = if !u.filename.is_empty() {
@@ -4614,7 +4700,10 @@ fn write_form_capabilities(
 /// Write ACCESS, FORM, ACTION, RECL for a connected unit.
 #[allow(clippy::too_many_arguments)]
 fn write_unit_properties(
-    u: &Unit,
+    access: Access,
+    form: &Form,
+    action: Action,
+    recl: Option<i64>,
     access_buf: *mut u8,
     access_buf_len: i64,
     form_buf: *mut u8,
@@ -4623,20 +4712,20 @@ fn write_unit_properties(
     action_buf_len: i64,
     recl_out: *mut i64,
 ) {
-    let access_str = match u.access {
+    let access_str = match access {
         Access::Sequential => "SEQUENTIAL",
         Access::Direct => "DIRECT",
         Access::Stream => "STREAM",
     };
     write_inquire_string(access_buf, access_buf_len, access_str);
 
-    let form_str = match u.form {
+    let form_str = match form {
         Form::Formatted => "FORMATTED",
         Form::Unformatted => "UNFORMATTED",
     };
     write_inquire_string(form_buf, form_buf_len, form_str);
 
-    let action_str = match u.action {
+    let action_str = match action {
         Action::Read => "READ",
         Action::Write => "WRITE",
         Action::ReadWrite => "READWRITE",
@@ -4645,7 +4734,7 @@ fn write_unit_properties(
 
     if !recl_out.is_null() {
         unsafe {
-            *recl_out = u.recl.unwrap_or(-1);
+            *recl_out = recl.unwrap_or(-1);
         }
     }
 }
@@ -4655,11 +4744,10 @@ fn write_unit_properties(
 /// Flush a unit's output buffer.
 #[no_mangle]
 pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let status = match state.get_unit(unit) {
-        Some(u) => u.flush().err().map_or(0, |e| e.raw_os_error().unwrap_or(1)),
-        None => 1,
-    };
+    let status = with_unit(unit, |u| {
+        u.flush().err().map_or(0, |e| e.raw_os_error().unwrap_or(1))
+    })
+    .unwrap_or(1);
     if !iostat.is_null() {
         unsafe {
             *iostat = status;
@@ -4672,13 +4760,8 @@ pub extern "C" fn afs_flush(unit: i32, iostat: *mut i32) {
 /// Rewind a unit to the beginning.
 #[no_mangle]
 pub extern "C" fn afs_rewind(unit: i32, iostat: *mut i32) {
-    let result = {
-        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .get_unit(unit)
-            .ok_or_else(|| invalid_positioning_error("unit is not connected"))
-            .and_then(Unit::rewind)
-    };
+    let result = with_unit(unit, Unit::rewind)
+        .unwrap_or_else(|| Err(invalid_positioning_error("unit is not connected")));
     finish_positioning_result("REWIND", result, iostat, std::ptr::null_mut(), 0);
 }
 
@@ -4694,25 +4777,34 @@ pub extern "C" fn afs_io_init() {
 /// Finalize the I/O subsystem. Flush and close all open units.
 #[no_mangle]
 pub extern "C" fn afs_io_finalize() {
-    // Use try_lock instead of lock: process::exit invokes libc atexit handlers,
-    // and any I/O routine that exited while holding io_state would deadlock here.
-    // If the caller is already holding the lock during exit, their drop has already
-    // unwound or process::exit released their mutex first; in the rare case where
-    // the lock is genuinely contested, skip flush rather than hang the program.
-    if let Ok(mut state) = io_state().try_lock() {
-        for unit in state.units.values_mut() {
+    let connections: Vec<SharedUnit> = io_state()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .units
+        .values()
+        .cloned()
+        .collect();
+
+    // A connection may be inside an input system call at process exit. Never let
+    // that one unit suppress flushing and scratch cleanup for every other unit.
+    for connection in &connections {
+        let mut guard = match connection.unit.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if let Some(unit) = guard.as_mut() {
             let _ = unit.flush();
         }
-        // Delete any STATUS='SCRATCH' backing files left open at exit.
-        let scratch_paths: Vec<Vec<u8>> = state
-            .units
-            .values()
-            .filter(|u| u.scratch && !u.filename.is_empty())
-            .map(|u| u.filename.clone())
-            .collect();
-        for path in scratch_paths {
-            let _ = std::fs::remove_file(path_from_filename(&path));
-        }
+    }
+
+    // Cleanup identity is immutable connection metadata, so it remains available
+    // even when the unit itself is occupied by a blocking read.
+    for path in connections
+        .iter()
+        .filter_map(|connection| connection.scratch_path.as_ref())
+    {
+        let _ = std::fs::remove_file(path_from_filename(path));
     }
 }
 
@@ -5236,7 +5328,6 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                 Ok(descriptors) => {
                     match c.sink {
                     FmtSink::Unit(unit) => {
-                    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
                     let fast_character = if c.stmt_leading_zero.is_none()
                         && is_simple_character_format(&c.format_str)
                     {
@@ -5247,8 +5338,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     } else {
                         None
                     };
-                    if let Some(bytes) = fast_character {
-                        if let Some(u) = state.get_unit(unit) {
+                    if with_unit(unit, |u| {
+                        if let Some(bytes) = fast_character {
                             if u.write_bytes(bytes).is_err()
                                 || (advance != 0 && u.write_bytes(b"\n").is_err())
                             {
@@ -5256,41 +5347,33 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                 io_msg = Some("write failed");
                             }
                         } else {
-                            io_status = 1;
-                            io_msg = Some("unit not connected");
-                        }
-                    } else {
-                        let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
-                        // Seed the leading-zero mode: the statement override
-                        // (LEADING_ZERO= on WRITE) beats the connection mode
-                        // (LEADING_ZERO= on OPEN); format LZ/LZS/LZP descriptors
-                        // still override mid-string via apply_descriptors.
-                        let conn_mode = state
-                            .units
-                            .get(&unit)
-                            .map(|u| u.leading_zero)
-                            .unwrap_or(LeadingZeroMode::Default);
-                        engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(conn_mode));
-                        match engine.format_values_reverting_bytes_checked(&c.values) {
-                            Ok(mut output) => {
-                                if advance != 0 {
-                                    output.push(b'\n');
-                                }
-                                if let Some(u) = state.get_unit(unit) {
+                            let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
+                            // The statement override beats the connection mode;
+                            // format descriptors can still override it mid-string.
+                            engine.set_leading_zero(
+                                c.stmt_leading_zero.unwrap_or(u.leading_zero),
+                            );
+                            match engine.format_values_reverting_bytes_checked(&c.values) {
+                                Ok(mut output) => {
+                                    if advance != 0 {
+                                        output.push(b'\n');
+                                    }
                                     if u.write_bytes(&output).is_err() {
                                         io_status = 1;
                                         io_msg = Some("write failed");
                                     }
-                                } else {
+                                }
+                                Err(_) => {
                                     io_status = 1;
-                                    io_msg = Some("unit not connected");
+                                    io_msg = Some("format error");
                                 }
                             }
-                            Err(_) => {
-                                io_status = 1;
-                                io_msg = Some("format error");
-                            }
                         }
+                    })
+                    .is_none()
+                    {
+                        io_status = 1;
+                        io_msg = Some("unit not connected");
                     }
                     }
                     FmtSink::Internal { buf, buf_len } => {
@@ -5911,27 +5994,25 @@ fn read_nonadvancing_chunk(
 }
 
 fn formatted_read_record_for_unit(unit: i32, starts_new_record: bool) -> Result<Vec<u8>, i32> {
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(u) = state.get_unit(unit) else {
-        return Err(1);
-    };
-
-    if starts_new_record || u.formatted_read_record.is_none() {
-        u.formatted_read_record = None;
-        u.formatted_read_cursor = 0;
-        match u.read_line_bytes() {
-            Ok(line) if !line.is_empty() => {
-                u.formatted_read_record = Some(line);
+    with_unit(unit, |u| {
+        if starts_new_record || u.formatted_read_record.is_none() {
+            u.formatted_read_record = None;
+            u.formatted_read_cursor = 0;
+            match u.read_line_bytes() {
+                Ok(line) if !line.is_empty() => {
+                    u.formatted_read_record = Some(line);
+                }
+                Ok(_) => return Err(IOSTAT_END),
+                Err(_) => return Err(1),
             }
-            Ok(_) => return Err(IOSTAT_END),
-            Err(_) => return Err(1),
         }
-    }
 
-    u.formatted_read_record
-        .as_ref()
-        .map(|line| trim_record_newline(line.clone()))
-        .ok_or(IOSTAT_END)
+        u.formatted_read_record
+            .as_ref()
+            .map(|line| trim_record_newline(line.clone()))
+            .ok_or(IOSTAT_END)
+    })
+    .unwrap_or(Err(1))
 }
 
 fn parse_nth_formatted_unit_field_with_state(
@@ -6118,8 +6199,14 @@ pub extern "C" fn afs_fmt_read_string(
     // `read_line` and discard the cursor, returning the wrong char or
     // EOF for files with a single physical record.
     {
-        let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(u) = state.get_unit(unit) {
+        let connection = connected_unit(unit);
+        let mut unit_guard = connection.as_ref().map(|connection| {
+            connection
+                .unit
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
+        if let Some(u) = unit_guard.as_mut().and_then(|guard| guard.as_mut()) {
             // Only treat the in-flight record as partial when the
             // cursor has actually advanced past 0 — i.e. a previous
             // `read(...,advance='NO')` consumed some chars. A cursor
@@ -6139,7 +6226,7 @@ pub extern "C" fn afs_fmt_read_string(
                 let descs = match parse_format(&fmt) {
                     Ok(descs) => descs,
                     Err(_) => {
-                        drop(state);
+                        drop(unit_guard);
                         store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
                         return;
                     }
@@ -6155,7 +6242,7 @@ pub extern "C" fn afs_fmt_read_string(
                     extract_nth_formatted_field(&descs, &input, &mut cursor, &mut remaining);
                 u.formatted_read_record = None;
                 u.formatted_read_cursor = 0;
-                drop(state);
+                drop(unit_guard);
                 match outcome {
                     Some((FormatDesc::Character { .. }, field)) => {
                         store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
@@ -6200,97 +6287,97 @@ pub extern "C" fn afs_fmt_read_string_noadvance(
         }
     };
 
-    let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(u) = state.get_unit(unit) else {
-        store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
-        return;
-    };
-
-    let mut terminal_chunk_without_newline = false;
-    if u.formatted_read_record.is_none() {
-        let bounded_nonadvancing = matches!(&u.stream, UnitStream::Stdin) || u.is_terminal();
-        let read_result = if bounded_nonadvancing {
-            read_nonadvancing_chunk(u, &descs, dest_len)
-        } else {
-            u.read_line_bytes()
-        };
-        match read_result {
-            Ok(line) if !line.is_empty() => {
-                terminal_chunk_without_newline =
-                    bounded_nonadvancing && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
-                if bounded_nonadvancing {
-                    u.terminal_nonadvancing_open_record = terminal_chunk_without_newline;
-                }
-                u.formatted_read_record = Some(trim_record_newline(line));
-                u.formatted_read_cursor = 0;
-            }
-            Ok(_) => {
-                let code = if bounded_nonadvancing && u.terminal_nonadvancing_open_record {
-                    u.terminal_nonadvancing_open_record = false;
-                    IOSTAT_EOR
-                } else {
-                    IOSTAT_END
-                };
-                store_formatted_char_error(dest, dest_len, size_out, code, iostat);
-                return;
-            }
-            Err(_) => {
-                store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
-                return;
-            }
-        }
-    }
-
-    let input = u
-        .formatted_read_record
-        .as_ref()
-        .cloned()
-        .unwrap_or_default();
-    if u.formatted_read_cursor >= input.len() {
-        store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
-        u.formatted_read_record = None;
-        u.formatted_read_cursor = 0;
-        return;
-    }
-    let mut cursor = u.formatted_read_cursor;
-    let mut remaining = 0usize;
-
-    match extract_nth_nonadvancing_formatted_field(
-        &descs,
-        &input,
-        &mut cursor,
-        &mut remaining,
-        dest_len,
-    ) {
-        Some((desc @ FormatDesc::Character { .. }, field)) => {
-            store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
-            if cursor >= input.len() {
-                if nonadvancing_char_field_hit_eor(&desc, &field, dest_len) {
-                    if !iostat.is_null() {
-                        unsafe {
-                            *iostat = IOSTAT_EOR;
-                        }
-                    }
-                    u.formatted_read_record = None;
-                    u.formatted_read_cursor = 0;
-                } else if terminal_chunk_without_newline {
-                    u.formatted_read_record = None;
-                    u.formatted_read_cursor = 0;
-                } else {
-                    u.formatted_read_cursor = cursor;
-                }
+    if with_unit(unit, |u| {
+        let mut terminal_chunk_without_newline = false;
+        if u.formatted_read_record.is_none() {
+            let bounded_nonadvancing = matches!(&u.stream, UnitStream::Stdin) || u.is_terminal();
+            let read_result = if bounded_nonadvancing {
+                read_nonadvancing_chunk(u, &descs, dest_len)
             } else {
-                u.formatted_read_cursor = cursor;
+                u.read_line_bytes()
+            };
+            match read_result {
+                Ok(line) if !line.is_empty() => {
+                    terminal_chunk_without_newline =
+                        bounded_nonadvancing && !line.iter().any(|&b| matches!(b, b'\n' | b'\r'));
+                    if bounded_nonadvancing {
+                        u.terminal_nonadvancing_open_record = terminal_chunk_without_newline;
+                    }
+                    u.formatted_read_record = Some(trim_record_newline(line));
+                    u.formatted_read_cursor = 0;
+                }
+                Ok(_) => {
+                    let code = if bounded_nonadvancing && u.terminal_nonadvancing_open_record {
+                        u.terminal_nonadvancing_open_record = false;
+                        IOSTAT_EOR
+                    } else {
+                        IOSTAT_END
+                    };
+                    store_formatted_char_error(dest, dest_len, size_out, code, iostat);
+                    return;
+                }
+                Err(_) => {
+                    store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
+                    return;
+                }
             }
         }
-        Some(_) => {
-            store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
-        }
-        None => {
+
+        let input = u
+            .formatted_read_record
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        if u.formatted_read_cursor >= input.len() {
             store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
             u.formatted_read_record = None;
             u.formatted_read_cursor = 0;
+            return;
         }
+        let mut cursor = u.formatted_read_cursor;
+        let mut remaining = 0usize;
+
+        match extract_nth_nonadvancing_formatted_field(
+            &descs,
+            &input,
+            &mut cursor,
+            &mut remaining,
+            dest_len,
+        ) {
+            Some((desc @ FormatDesc::Character { .. }, field)) => {
+                store_formatted_char_result(&field, dest, dest_len, size_out, iostat);
+                if cursor >= input.len() {
+                    if nonadvancing_char_field_hit_eor(&desc, &field, dest_len) {
+                        if !iostat.is_null() {
+                            unsafe {
+                                *iostat = IOSTAT_EOR;
+                            }
+                        }
+                        u.formatted_read_record = None;
+                        u.formatted_read_cursor = 0;
+                    } else if terminal_chunk_without_newline {
+                        u.formatted_read_record = None;
+                        u.formatted_read_cursor = 0;
+                    } else {
+                        u.formatted_read_cursor = cursor;
+                    }
+                } else {
+                    u.formatted_read_cursor = cursor;
+                }
+            }
+            Some(_) => {
+                store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
+            }
+            None => {
+                store_formatted_char_error(dest, dest_len, size_out, IOSTAT_EOR, iostat);
+                u.formatted_read_record = None;
+                u.formatted_read_cursor = 0;
+            }
+        }
+    })
+    .is_none()
+    {
+        store_formatted_char_error(dest, dest_len, size_out, 1, iostat);
     }
 }
 
@@ -6728,6 +6815,208 @@ pub extern "C" fn afs_fmt_read_real32_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct BlockingReader {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<Vec<u8>>,
+        buffer: Vec<u8>,
+        position: usize,
+    }
+
+    impl Read for BlockingReader {
+        fn read(&mut self, dest: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            let count = available.len().min(dest.len());
+            dest[..count].copy_from_slice(&available[..count]);
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    impl BufRead for BlockingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.position == self.buffer.len() {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "test reader lost observer")
+                    })?;
+                }
+                self.buffer = self.release.recv().map_err(|_| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "test reader was not released")
+                })?;
+                self.position = 0;
+            }
+            Ok(&self.buffer[self.position..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.position = (self.position + amount).min(self.buffer.len());
+        }
+    }
+
+    fn test_unit(number: i32, stream: UnitStream, filename: Vec<u8>, scratch: bool) -> Unit {
+        Unit {
+            _number: number,
+            stream,
+            filename,
+            _status: UnitStatus::Open,
+            access: Access::Sequential,
+            form: Form::Formatted,
+            action: Action::ReadWrite,
+            recl: None,
+            read_tokens: VecDeque::new(),
+            formatted_read_record: None,
+            formatted_read_cursor: 0,
+            terminal_nonadvancing_open_record: false,
+            last_list_output_char: false,
+            list_write_active: false,
+            list_write_error: None,
+            scratch,
+            leading_zero: LeadingZeroMode::Default,
+            pending_record: None,
+            pending_read: None,
+        }
+    }
+
+    #[test]
+    fn blocked_read_does_not_stall_unrelated_flush_or_finalizer_cleanup() {
+        const READ_UNIT: i32 = 901;
+        const SCRATCH_UNIT: i32 = 902;
+        const DEADLINE: Duration = Duration::from_secs(1);
+
+        let scratch_path = std::env::temp_dir().join(format!(
+            "afs_blocked_read_scratch_{}_{}.tmp",
+            std::process::id(),
+            line!()
+        ));
+        let scratch_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&scratch_path)
+            .expect("create scratch witness");
+        let scratch_name = os_string_to_bytes(scratch_path.clone().into_os_string());
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = BlockingReader {
+            entered: Some(entered_tx),
+            release: release_rx,
+            buffer: Vec::new(),
+            position: 0,
+        };
+
+        {
+            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+            state.units.insert(
+                READ_UNIT,
+                UnitConnection::new(test_unit(
+                    READ_UNIT,
+                    UnitStream::TestRead(Box::new(reader)),
+                    b"blocking-reader".to_vec(),
+                    false,
+                )),
+            );
+            state.units.insert(
+                SCRATCH_UNIT,
+                UnitConnection::new(test_unit(
+                    SCRATCH_UNIT,
+                    UnitStream::FileWrite(BufWriter::new(scratch_file)),
+                    scratch_name,
+                    true,
+                )),
+            );
+        }
+
+        let read_thread = std::thread::spawn(|| {
+            let mut status = -99;
+            afs_read_skip_record(READ_UNIT, &mut status);
+            status
+        });
+        entered_rx
+            .recv_timeout(DEADLINE)
+            .expect("reader never reached the blocking operation");
+
+        let (flush_tx, flush_rx) = mpsc::channel();
+        let flush_thread = std::thread::spawn(move || {
+            let mut status = -99;
+            afs_flush(SCRATCH_UNIT, &mut status);
+            let _ = flush_tx.send(status);
+        });
+
+        let (finalize_tx, finalize_rx) = mpsc::channel();
+        let finalize_thread = std::thread::spawn(move || {
+            afs_io_finalize();
+            let _ = finalize_tx.send(());
+        });
+
+        let flush_before_release = flush_rx.recv_timeout(DEADLINE);
+        let finalize_before_release = finalize_rx.recv_timeout(DEADLINE);
+        let scratch_removed_before_release = !scratch_path.exists();
+
+        let (close_started_tx, close_started_rx) = mpsc::channel();
+        let (close_tx, close_rx) = mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            let _ = close_started_tx.send(());
+            let mut status = -99;
+            afs_close(READ_UNIT, &mut status);
+            let _ = close_tx.send(status);
+        });
+        close_started_rx
+            .recv_timeout(DEADLINE)
+            .expect("close thread did not start");
+        let registry_deadline = std::time::Instant::now() + DEADLINE;
+        while connected_unit(READ_UNIT).is_some() && std::time::Instant::now() < registry_deadline {
+            std::thread::yield_now();
+        }
+        let disconnected_before_release = connected_unit(READ_UNIT).is_none();
+        let close_before_release = close_rx.try_recv();
+
+        release_tx
+            .send(b"released\n".to_vec())
+            .expect("release blocking reader");
+        let read_status = read_thread.join().expect("join reader");
+        flush_thread.join().expect("join flush");
+        finalize_thread.join().expect("join finalizer");
+        close_thread.join().expect("join close");
+
+        {
+            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
+            state.units.remove(&SCRATCH_UNIT);
+        }
+        let _ = std::fs::remove_file(&scratch_path);
+
+        assert_eq!(read_status, 0, "released record read must succeed");
+        assert_eq!(
+            flush_before_release,
+            Ok(0),
+            "FLUSH on an unrelated unit exceeded {DEADLINE:?}"
+        );
+        assert!(
+            finalize_before_release.is_ok(),
+            "I/O finalization exceeded {DEADLINE:?}"
+        );
+        assert!(
+            scratch_removed_before_release,
+            "finalization skipped unrelated scratch cleanup"
+        );
+        assert_eq!(
+            close_before_release,
+            Err(mpsc::TryRecvError::Empty),
+            "same-unit CLOSE bypassed the in-flight read"
+        );
+        assert!(
+            disconnected_before_release,
+            "same-unit CLOSE did not detach the connection before waiting"
+        );
+        assert_eq!(
+            close_rx.recv_timeout(DEADLINE),
+            Ok(0),
+            "same-unit CLOSE did not complete after the read"
+        );
+    }
 
     #[test]
     fn flush_reports_an_unconnected_unit() {
@@ -7433,12 +7722,11 @@ mod tests {
 
         afs_open(&cb);
         assert_eq!(iostat, 0, "expected replace OPEN to succeed");
-        {
-            let state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-            let unit = state.units.get(&787).expect("unit must be connected");
-            assert_eq!(unit.action, Action::ReadWrite);
-            assert!(matches!(unit.stream, UnitStream::FileRaw(_)));
-        }
+        let properties = with_unit(787, |unit| {
+            (unit.action, matches!(unit.stream, UnitStream::FileRaw(_)))
+        })
+        .expect("unit must be connected");
+        assert_eq!(properties, (Action::ReadWrite, true));
 
         afs_close_ex(787, "delete".as_ptr(), 6, &mut iostat);
         assert_eq!(iostat, 0, "expected close/delete to succeed");
@@ -7510,14 +7798,12 @@ mod tests {
 
             afs_list_read_begin(unit, &mut iostat, std::ptr::null_mut(), 0);
             assert_ne!(iostat, 0, "{name}: malformed record was accepted");
-            {
-                let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-                let connected = state.get_unit(unit).expect("test unit must remain open");
-                assert!(
-                    connected.pending_read.is_none(),
-                    "{name}: malformed record payload was published"
-                );
-            }
+            let pending_read = with_unit(unit, |connected| connected.pending_read.clone())
+                .expect("test unit must remain open");
+            assert!(
+                pending_read.is_none(),
+                "{name}: malformed record payload was published"
+            );
 
             afs_close(unit, &mut iostat);
             assert_eq!(iostat, 0, "{name}: CLOSE failed");
@@ -7576,11 +7862,9 @@ mod tests {
 
         afs_list_read_begin(809, &mut iostat, std::ptr::null_mut(), 0);
         assert_eq!(iostat, 0, "empty record framing must be accepted");
-        {
-            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-            let connected = state.get_unit(809).expect("test unit must remain open");
-            assert_eq!(connected.pending_read, Some((Vec::new(), 0)));
-        }
+        let pending_read = with_unit(809, |connected| connected.pending_read.clone())
+            .expect("test unit must remain open");
+        assert_eq!(pending_read, Some((Vec::new(), 0)));
         afs_list_read_end(809, &mut iostat, std::ptr::null_mut(), 0);
 
         afs_list_read_begin(809, &mut iostat, std::ptr::null_mut(), 0);
@@ -7593,14 +7877,12 @@ mod tests {
 
         afs_list_read_begin(809, &mut iostat, std::ptr::null_mut(), 0);
         assert_eq!(iostat, IOSTAT_END, "clean record boundary EOF expected");
-        {
-            let mut state = io_state().lock().unwrap_or_else(|e| e.into_inner());
-            let connected = state.get_unit(809).expect("test unit must remain open");
-            assert!(
-                connected.pending_read.is_none(),
-                "EOF must not retain a completed record"
-            );
-        }
+        let pending_read = with_unit(809, |connected| connected.pending_read.clone())
+            .expect("test unit must remain open");
+        assert!(
+            pending_read.is_none(),
+            "EOF must not retain a completed record"
+        );
 
         afs_close(809, &mut iostat);
         assert_eq!(iostat, 0, "CLOSE failed");
