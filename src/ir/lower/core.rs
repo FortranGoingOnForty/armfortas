@@ -39277,6 +39277,7 @@ pub(super) fn actual_is_descriptor_backed(
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
+const DESC_ASSUMED_SIZE: i32 = armfortas_rt::descriptor::DESC_ASSUMED_SIZE as i32;
 
 pub(super) fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     if info.by_ref {
@@ -39687,6 +39688,14 @@ pub(super) fn descriptor_flags(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
     b.load_typed(ptr, IrType::Int(IntWidth::I32))
 }
 
+pub(super) fn descriptor_is_assumed_size(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    let flags = descriptor_flags(b, desc);
+    let marker = b.const_i32(DESC_ASSUMED_SIZE);
+    let bits = b.bit_and(flags, marker);
+    let zero = b.const_i32(0);
+    b.icmp(CmpOp::Ne, bits, zero)
+}
+
 pub(super) fn materialize_array_descriptor_for_info(
     b: &mut FuncBuilder,
     info: &LocalInfo,
@@ -39705,14 +39714,38 @@ pub(super) fn materialize_array_descriptor_for_info(
     let fallback_elem_size = ir_scalar_byte_size(&info.ty, b.layout);
     let elem_size = allocated_array_elem_size(b, info, fallback_elem_size, None);
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
-    let rank = b.const_i32(info.dims.len() as i32);
+    // F2018 15.5.2.4: when an assumed-size dummy is forwarded to an
+    // assumed-rank dummy, the latter is associated with a rank-one
+    // assumed-size sequence regardless of the former dummy's declared
+    // rank (for example, `a(2, *)`). Preserve that view in the descriptor
+    // instead of exposing the explicit leading dimensions as a concrete
+    // rank.
+    let descriptor_rank = if info.last_dim_assumed_size {
+        1
+    } else {
+        info.dims.len() as i32
+    };
+    let rank = b.const_i32(descriptor_rank);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
     let mut flags = 2;
     if local_uses_char_slot_table(info) {
         flags |= DESC_CHAR_SLOT_TABLE;
     }
+    if info.last_dim_assumed_size {
+        flags |= DESC_ASSUMED_SIZE;
+    }
     let flags = b.const_i32(flags);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+
+    if info.last_dim_assumed_size {
+        let lower = b.const_i64(1);
+        let upper = b.const_i64(0);
+        let stride = b.const_i64(1);
+        store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), lower);
+        store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), upper);
+        store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), stride);
+        return desc;
+    }
 
     // Per F2018 column-major layout: dim[k].stride is the memory step
     // (in elements) between adjacent logical positions along dim k.

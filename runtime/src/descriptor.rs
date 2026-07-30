@@ -20,6 +20,10 @@ pub const MAX_RANK: usize = 15;
 pub const DESC_ALLOCATED: u32 = 1 << 0;
 pub const DESC_CONTIGUOUS: u32 = 1 << 1;
 pub const DESC_POINTER: u32 = 1 << 2;
+/// Descriptor view originated from an assumed-size actual passed to an
+/// assumed-rank dummy. The ordinary rank remains available in `rank`, while
+/// SELECT RANK uses this bit to distinguish RANK(*) from RANK(n).
+pub const DESC_ASSUMED_SIZE: u32 = 1 << 4;
 /// Compiler-private array CLASS(*) dynamic type bits stored above flags.
 pub const DESC_TYPE_TAG_MASK: u32 = 0xffff_ff00;
 
@@ -48,7 +52,7 @@ pub struct ArrayDescriptor {
     pub elem_size: i64,
     /// Number of dimensions (1-15).
     pub rank: i32,
-    /// Status flags: allocated, contiguous, pointer.
+    /// Status flags: allocated, contiguous, pointer, assumed-size view.
     pub flags: u32,
     /// Per-dimension information (lower bound, upper bound, stride).
     pub dims: [DimDescriptor; MAX_RANK],

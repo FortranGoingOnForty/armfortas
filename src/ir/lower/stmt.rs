@@ -10738,17 +10738,24 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // declared rank.
             let bb_end = b.create_block("select_rank_end");
             let selector_info = associate_alias_local_info(b, ctx, selector);
-            let runtime_rank: ValueId = if let Some(info) = selector_info.as_ref() {
-                if local_uses_array_descriptor(info) {
-                    let desc = array_descriptor_addr(b, info);
-                    let rank32 = load_array_desc_i32_field(b, desc, 16);
-                    b.int_extend(rank32, IntWidth::I64, true)
+            let (runtime_rank, runtime_assumed_size): (ValueId, ValueId) =
+                if let Some(info) = selector_info.as_ref() {
+                    if local_uses_array_descriptor(info) {
+                        let desc = array_descriptor_addr(b, info);
+                        let rank32 = load_array_desc_i32_field(b, desc, 16);
+                        (
+                            b.int_extend(rank32, IntWidth::I64, true),
+                            descriptor_is_assumed_size(b, desc),
+                        )
+                    } else {
+                        (
+                            b.const_i64(local_declared_rank(info) as i64),
+                            b.const_bool(info.last_dim_assumed_size),
+                        )
+                    }
                 } else {
-                    b.const_i64(local_declared_rank(info) as i64)
-                }
-            } else {
-                b.const_i64(0)
-            };
+                    (b.const_i64(0), b.const_bool(false))
+                };
 
             // Install `v` as an alias for the selector inside each guard.
             let saved_alias = assoc_name.as_ref().and_then(|name| {
@@ -10769,24 +10776,39 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
             for guard in guards {
                 use crate::ast::stmt::RankGuard;
-                match guard {
+                let (matches, body, match_name, next_name) = match guard {
                     RankGuard::Rank { rank, body } => {
                         let want = b.const_i64(*rank);
-                        let matches = b.icmp(CmpOp::Eq, runtime_rank, want);
-                        let bb_match = b.create_block("rank_match");
-                        let bb_next = b.create_block("rank_next");
-                        b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
-                        b.set_block(bb_match);
-                        lower_stmts(b, ctx, body);
-                        if b.func().block(b.current_block()).terminator.is_none() {
-                            b.branch(bb_end, vec![]);
-                        }
-                        b.set_block(bb_next);
+                        let rank_matches = b.icmp(CmpOp::Eq, runtime_rank, want);
+                        let has_concrete_rank = b.not(runtime_assumed_size);
+                        (
+                            b.and(rank_matches, has_concrete_rank),
+                            body,
+                            "rank_match",
+                            "rank_next",
+                        )
                     }
-                    RankGuard::RankStar { .. } | RankGuard::RankDefault { .. } => {
-                        // Defaults handled after specific ranks.
+                    RankGuard::RankStar { body } => (
+                        runtime_assumed_size,
+                        body,
+                        "rank_star_match",
+                        "rank_star_next",
+                    ),
+                    RankGuard::RankDefault { .. } => {
+                        // Default is the final fallthrough after every
+                        // numeric and assumed-size guard has been tested.
+                        continue;
                     }
+                };
+                let bb_match = b.create_block(match_name);
+                let bb_next = b.create_block(next_name);
+                b.cond_branch(matches, bb_match, vec![], bb_next, vec![]);
+                b.set_block(bb_match);
+                lower_stmts(b, ctx, body);
+                if b.func().block(b.current_block()).terminator.is_none() {
+                    b.branch(bb_end, vec![]);
                 }
+                b.set_block(bb_next);
             }
             if let Some(body) = default_body {
                 lower_stmts(b, ctx, body);
