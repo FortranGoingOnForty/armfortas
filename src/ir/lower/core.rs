@@ -55540,6 +55540,22 @@ fn lower_minmaxloc_rank1_scalar(
     Some(b.load(result_addr))
 }
 
+fn static_array_lbound(lower: i64, extent: i64) -> i64 {
+    if extent <= 0 {
+        1
+    } else {
+        lower
+    }
+}
+
+fn static_array_ubound(lower: i64, extent: i64) -> i64 {
+    if extent <= 0 {
+        0
+    } else {
+        lower + extent - 1
+    }
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -55728,8 +55744,8 @@ pub(super) fn lower_array_intrinsic(
                 "lbound" => {
                     if let Some(dim) = dim_arg_const() {
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
-                            let lower = info.dims[dim as usize - 1].0;
-                            let r64 = b.const_i64(lower);
+                            let (lower, extent) = info.dims[dim as usize - 1];
+                            let r64 = b.const_i64(static_array_lbound(lower, extent));
                             return Some(b.int_trunc(r64, IntWidth::I32));
                         }
                     }
@@ -55738,7 +55754,7 @@ pub(super) fn lower_array_intrinsic(
                     if let Some(dim) = dim_arg_const() {
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
                             let (lower, extent) = info.dims[dim as usize - 1];
-                            let r64 = b.const_i64(lower + extent - 1);
+                            let r64 = b.const_i64(static_array_ubound(lower, extent));
                             return Some(b.int_trunc(r64, IntWidth::I32));
                         }
                     }
@@ -55884,10 +55900,10 @@ pub(super) fn lower_array_intrinsic(
                             let default = b.const_i64(1);
                             let idx0 = b.isub(raw_dim, one);
                             let mut result = default;
-                            for (idx, (lower, _extent)) in info.dims.iter().enumerate() {
+                            for (idx, (lower, extent)) in info.dims.iter().enumerate() {
                                 let cond_idx = b.const_i32(idx as i32);
                                 let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                                let lower_val = b.const_i64(*lower);
+                                let lower_val = b.const_i64(static_array_lbound(*lower, *extent));
                                 result = b.select(is_match, lower_val, result);
                             }
                             result
@@ -55932,7 +55948,7 @@ pub(super) fn lower_array_intrinsic(
                             for (idx, (lower, extent)) in info.dims.iter().enumerate() {
                                 let cond_idx = b.const_i32(idx as i32);
                                 let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                                let upper_val = b.const_i64(lower + extent - 1);
+                                let upper_val = b.const_i64(static_array_ubound(*lower, *extent));
                                 result = b.select(is_match, upper_val, result);
                             }
                             result

@@ -2610,6 +2610,27 @@ mod tests {
     }
 
     #[test]
+    fn array_bounds_canonicalize_only_the_zero_extent_dimension() {
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.rank = 2;
+        desc.dims[0] = DimDescriptor {
+            lower_bound: -4,
+            upper_bound: -5,
+            stride: 1,
+        };
+        desc.dims[1] = DimDescriptor {
+            lower_bound: 7,
+            upper_bound: 9,
+            stride: 1,
+        };
+
+        assert_eq!(afs_array_lbound(&desc, 1), 1);
+        assert_eq!(afs_array_ubound(&desc, 1), 0);
+        assert_eq!(afs_array_lbound(&desc, 2), 7);
+        assert_eq!(afs_array_ubound(&desc, 2), 9);
+    }
+
+    #[test]
     fn allocate_1d() {
         let mut desc = ArrayDescriptor::zeroed();
         afs_allocate_1d(&mut desc, 4, 10);
@@ -3826,7 +3847,12 @@ pub extern "C" fn afs_array_lbound(desc: *const ArrayDescriptor, dim: i32) -> i6
     let d = unsafe { &*desc };
     let idx = (dim - 1) as usize;
     if idx < d.rank as usize {
-        d.dims[idx].lower_bound
+        let dimension = d.dims[idx];
+        if dimension.extent() == 0 {
+            1
+        } else {
+            dimension.lower_bound
+        }
     } else {
         1
     }
@@ -3841,7 +3867,12 @@ pub extern "C" fn afs_array_ubound(desc: *const ArrayDescriptor, dim: i32) -> i6
     let d = unsafe { &*desc };
     let idx = (dim - 1) as usize;
     if idx < d.rank as usize {
-        d.dims[idx].upper_bound
+        let dimension = d.dims[idx];
+        if dimension.extent() == 0 {
+            0
+        } else {
+            dimension.upper_bound
+        }
     } else {
         0
     }
