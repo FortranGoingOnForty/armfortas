@@ -3,7 +3,7 @@
 #
 # The counts are deliberate evidence contracts. Update them in the same change
 # as any test_programs/*.f90 addition/removal or ERROR_EXPECTED reclassification.
-isa_gate_expected_sources=852
+isa_gate_expected_sources=853
 isa_gate_expected_diagnostics=119
 
 isa_gate_validate_assembly() {

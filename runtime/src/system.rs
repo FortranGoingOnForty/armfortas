@@ -513,8 +513,19 @@ pub extern "C" fn afs_get_environment_variable_trim(
 /// EXECUTE_COMMAND_LINE: run a shell command.
 const ASYNC_COMMAND_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const ASYNC_COMMAND_RECEIVE_BATCH: usize = 64;
+// Launch the Unix command processor independently of the caller's PATH.
+#[cfg(unix)]
+const COMMAND_PROCESSOR: &str = "/bin/sh";
+#[cfg(not(unix))]
+const COMMAND_PROCESSOR: &str = "sh";
 
 type AsyncCommandSender = std::sync::mpsc::Sender<std::process::Child>;
+
+fn command_process(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new(COMMAND_PROCESSOR);
+    process.arg("-c").arg(command);
+    process
+}
 
 fn async_command_sender() -> Option<&'static AsyncCommandSender> {
     static SENDER: std::sync::OnceLock<AsyncCommandSender> = std::sync::OnceLock::new();
@@ -581,10 +592,7 @@ fn reap_async_commands(receiver: std::sync::mpsc::Receiver<std::process::Child>)
 fn spawn_async_command(command: &str) -> std::io::Result<u32> {
     let sender = async_command_sender()
         .ok_or_else(|| std::io::Error::other("could not start asynchronous command reaper"))?;
-    let child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .spawn()?;
+    let child = command_process(command).spawn()?;
     let pid = child.id();
 
     if let Err(error) = sender.send(child) {
@@ -634,9 +642,8 @@ fn execute_command_line(
         return;
     };
 
-    use std::process::Command;
     if wait != 0 {
-        match Command::new("sh").arg("-c").arg(&cmd).status() {
+        match command_process(&cmd).status() {
             Ok(status) => {
                 if !exitstat.is_null() {
                     unsafe {
@@ -1334,6 +1341,27 @@ mod tests {
         assert_eq!(exitstat, 0);
         assert_eq!(cmdstat, 0);
         assert_eq!(&message, b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_processor_does_not_depend_on_path() {
+        const MISSING_PATH: &str = "/armfortas-command-path-does-not-exist";
+
+        let sync_status = command_process("exit 0")
+            .env("PATH", MISSING_PATH)
+            .status()
+            .expect("synchronous command processor should start outside PATH");
+        assert!(sync_status.success());
+
+        let mut child = command_process("exit 0")
+            .env("PATH", MISSING_PATH)
+            .spawn()
+            .expect("asynchronous command processor should start outside PATH");
+        let async_status = child
+            .wait()
+            .expect("asynchronous command processor should be waitable");
+        assert!(async_status.success());
     }
 
     #[test]
