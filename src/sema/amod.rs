@@ -7,9 +7,7 @@
 //! enough information for full ABI-correct separate compilation.
 //!
 //! Innovations over gfortran/flang/ifort:
-//!   - Optimization hints (@hint leaf, no_globals, cost)
 //!   - Linker symbol names (@ir) for direct FFI
-//!   - Source checksum for staleness detection
 //!   - Polymorphic type tags (@tag)
 //!   - Human-editable for hand-written FFI descriptions
 
@@ -18,7 +16,7 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::ast::decl::UseNature;
-use crate::ir::inst::{FuncRef, Function, InstKind, Module as IrModule};
+use crate::ir::inst::Module as IrModule;
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
@@ -306,7 +304,6 @@ fn format_module_reference(module_name: &str, nature: UseNature) -> String {
 pub fn write_amod(
     module_name: &str,
     source_path: &str,
-    source_content: &[u8],
     st: &SymbolTable,
     mod_scope_id: ScopeId,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
@@ -356,7 +353,6 @@ pub fn write_amod(
         }
     }
     writeln!(out, "# source: {}", source_path).unwrap();
-    writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex_bytes(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
     writeln!(out, "# compiler: armfortas 0.1.0").unwrap();
     writeln!(out).unwrap();
@@ -1218,47 +1214,8 @@ fn emit_procedure(
         writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
     }
 
-    // @hint line.
-    if let Some(func) = ir_func {
-        let mut hints = Vec::new();
-        if is_leaf(func) {
-            hints.push("leaf".to_string());
-        }
-        if !touches_globals(func) {
-            hints.push("no_globals".to_string());
-        }
-        let cost: usize = func.blocks.iter().map(|b| b.insts.len()).sum();
-        hints.push(format!("cost={}", cost));
-        writeln!(out, "  @hint {}", hints.join(" ")).unwrap();
-    }
-
     writeln!(out, "@end {}", kind_str).unwrap();
     writeln!(out).unwrap();
-}
-
-fn is_leaf(func: &Function) -> bool {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::Call(..) | InstKind::RuntimeCall(..) => return false,
-                _ => {}
-            }
-        }
-    }
-    true
-}
-
-fn touches_globals(func: &Function) -> bool {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::GlobalAddr(_) => return true,
-                InstKind::Call(FuncRef::External(_), _) => return true,
-                _ => {}
-            }
-        }
-    }
-    false
 }
 
 fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLayoutRegistry) {
@@ -1508,7 +1465,7 @@ pub(crate) fn artifact_fingerprint(content: &str) -> String {
 }
 
 fn fnv1a_hex_bytes(content: &[u8]) -> String {
-    // FNV-1a 64-bit hash for source and .amod content fingerprinting.
+    // FNV-1a 64-bit hash for .amod content fingerprinting.
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in content {
         hash ^= byte as u64;
@@ -2381,8 +2338,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         if trimmed.starts_with("@arg ") {
             args.push(parse_arg(trimmed));
         }
-        // Skip @abi and @hint lines (informational; reader uses
-        // them for optimization but not for correctness).
+        // Skip @abi and legacy @hint lines; explicit @arg records carry the
+        // ABI-relevant metadata used by the reader.
     }
 
     let result_array_bounds = attr_chunks

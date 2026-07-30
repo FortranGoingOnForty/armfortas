@@ -2349,7 +2349,6 @@ fn compile_with_bundled_runtime_inner(
         units: &units,
         symbol_table: &st,
         source_provenance: &source_provenance,
-        source_content: &raw,
         module_globals: &module_globals,
         type_layouts: &type_layouts,
         ir_module: &ir_module,
@@ -2570,7 +2569,6 @@ struct ModuleArtifactContext<'a> {
     units: &'a [crate::ast::unit::SpannedUnit],
     symbol_table: &'a crate::sema::symtab::SymbolTable,
     source_provenance: &'a str,
-    source_content: &'a [u8],
     module_globals:
         &'a std::collections::HashMap<(String, String), crate::ir::lower::ModuleGlobalInfo>,
     type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
@@ -2618,7 +2616,6 @@ fn write_module_artifacts(
                 let amod_text = crate::sema::amod::write_amod(
                     name,
                     context.source_provenance,
-                    context.source_content,
                     context.symbol_table,
                     mod_scope_id,
                     context.module_globals,
@@ -2670,7 +2667,6 @@ fn write_module_artifacts(
             let interface_text = crate::sema::amod::write_amod(
                 name,
                 context.source_provenance,
-                context.source_content,
                 context.symbol_table,
                 submodule_scope_id,
                 context.module_globals,
@@ -2706,6 +2702,13 @@ fn write_module_artifacts(
 }
 
 fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    // Build systems use a module artifact's timestamp as the dependency
+    // invalidation signal. Preserve its identity when the interface bytes did
+    // not change, while retaining atomic replacement for changed interfaces.
+    if fs::read(path).is_ok_and(|published| published == contents.as_bytes()) {
+        return Ok(());
+    }
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
