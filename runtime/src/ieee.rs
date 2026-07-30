@@ -408,8 +408,8 @@ fn round_integral_bits(
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
-    let use_current = !(0..=4).contains(&round);
-    let mode = if use_current {
+    let uses_ambient_mode = !(0..=4).contains(&round);
+    let mode = if uses_ambient_mode {
         fpenv::get_rounding()
     } else {
         round
@@ -422,7 +422,9 @@ pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
         return f64::from_bits(bits | (1u64 << 51));
     }
     let result_bits = round_integral_bits(bits, 11, 52, 1023, mode);
-    if use_current && exponent != 0x7ff && result_bits != bits {
+    // With ROUND, IEEE_RINT is quiet roundToIntegral{rounding}. Without
+    // ROUND, it is roundToIntegralExact and signals when a finite value changes.
+    if uses_ambient_mode && exponent != 0x7ff && result_bits != bits {
         fpenv::set_flag(5, true);
     }
     f64::from_bits(result_bits)
@@ -430,8 +432,8 @@ pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_rint_r4_round(x: f32, round: i32) -> f32 {
-    let use_current = !(0..=4).contains(&round);
-    let mode = if use_current {
+    let uses_ambient_mode = !(0..=4).contains(&round);
+    let mode = if uses_ambient_mode {
         fpenv::get_rounding()
     } else {
         round
@@ -444,7 +446,7 @@ pub extern "C" fn afs_ieee_rint_r4_round(x: f32, round: i32) -> f32 {
         return f32::from_bits(bits | (1u32 << 22));
     }
     let result_bits = round_integral_bits(bits as u64, 8, 23, 127, mode) as u32;
-    if use_current && exponent != 0xff && result_bits != bits {
+    if uses_ambient_mode && exponent != 0xff && result_bits != bits {
         fpenv::set_flag(5, true);
     }
     f32::from_bits(result_bits)
@@ -1238,6 +1240,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn rint_round_argument_is_quiet_but_ambient_form_is_exact() {
+        let saved = fpenv::get_status();
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8_round(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r4_round(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8_round(2.0, 0), 2.0);
+        assert_eq!(
+            afs_ieee_rint_r4_round(-0.0, 4).to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        assert_eq!(afs_ieee_rint_r8_round(f64::INFINITY, 3), f64::INFINITY);
+        let quiet_nan = f32::from_bits(0x7fc0_0123);
+        assert_eq!(
+            afs_ieee_rint_r4_round(quiet_nan, 1).to_bits(),
+            quiet_nan.to_bits()
+        );
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(1, 0);
+        let signaling_nan = f64::from_bits(0x7ff0_0000_0000_0123);
+        assert_eq!(
+            afs_ieee_rint_r8_round(signaling_nan, 2).to_bits(),
+            0x7ff8_0000_0000_0123
+        );
+        assert_eq!(afs_ieee_test_flag(1), 1);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(5, 1);
+        assert_eq!(afs_ieee_rint_r4_round(3.0, 0), 3.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        afs_ieee_set_rounding(3);
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8_round(1.9, -1), 1.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r4_round(-1.1, -1), -2.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        fpenv::set_status(saved);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
