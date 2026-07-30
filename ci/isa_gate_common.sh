@@ -3,7 +3,7 @@
 #
 # The counts are deliberate evidence contracts. Update them in the same change
 # as any test_programs/*.f90 addition/removal or ERROR_EXPECTED reclassification.
-isa_gate_expected_sources=847
+isa_gate_expected_sources=848
 isa_gate_expected_diagnostics=119
 
 isa_gate_validate_assembly() {
@@ -123,7 +123,7 @@ isa_gate_run() {
             ' "$isa_gate_source"
         )
         case "$isa_gate_source_flag" in
-            "" | --std=f2018 | --std=f2023 | -fcheck=bounds) ;;
+            "" | --std=f2018 | --std=f2023 | -fcheck=bounds | -fdefault-integer-8) ;;
             *)
                 echo "$isa_gate_name: unsupported or repeated FLAGS annotation in $isa_gate_base: $isa_gate_source_flag" >&2
                 isa_gate_setup_failures=$((isa_gate_setup_failures + 1))

@@ -125,14 +125,15 @@ pub(crate) fn lower_intrinsic_subroutine(
         (z, z)
     }
 
-    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
-    /// through an i64 slot. Non-i64 destinations get a temporary i64
-    /// alloca followed by an explicit writeback after the runtime call.
-    fn nth_arg_i64_out(
+    /// Adapt an intrinsic out-arg to a fixed-width runtime ABI. A destination
+    /// with a different kind gets a temporary of the ABI type followed by an
+    /// explicit writeback after the runtime call.
+    fn nth_arg_typed_out(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
         args: &[Option<crate::ast::expr::Argument>],
         n: usize,
+        runtime_ty: IrType,
     ) -> (ValueId, Option<RuntimeOutWriteback>) {
         if let Some(Some(arg)) = args.get(n) {
             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
@@ -145,10 +146,10 @@ pub(crate) fn lower_intrinsic_subroutine(
                     _ => None,
                 };
                 if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
-                    if dest_ty == IrType::Int(IntWidth::I64) {
+                    if dest_ty == runtime_ty {
                         return (dest_ptr, None);
                     }
-                    let tmp_ptr = b.alloca(IrType::Int(IntWidth::I64));
+                    let tmp_ptr = b.alloca(runtime_ty);
                     return (
                         tmp_ptr,
                         Some(RuntimeOutWriteback {
@@ -164,43 +165,40 @@ pub(crate) fn lower_intrinsic_subroutine(
         (b.const_i64(0), None)
     }
 
-    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
-    /// through an f64 slot. Non-f64 destinations get a temporary f64
-    /// alloca followed by an explicit writeback after the runtime call.
+    /// Adapt an intrinsic out-arg to a runtime ABI that writes through i32.
+    fn nth_arg_i32_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        nth_arg_typed_out(b, ctx, args, n, IrType::Int(IntWidth::I32))
+    }
+
+    /// Adapt an intrinsic out-arg to a runtime ABI that writes through i64.
+    fn nth_arg_i64_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        nth_arg_typed_out(b, ctx, args, n, IrType::Int(IntWidth::I64))
+    }
+
+    /// Adapt an intrinsic out-arg to a runtime ABI that writes through f64.
     fn nth_arg_f64_out(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
         args: &[Option<crate::ast::expr::Argument>],
         n: usize,
     ) -> (ValueId, Option<RuntimeOutWriteback>) {
-        if let Some(Some(arg)) = args.get(n) {
-            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
-                let semantic_dest_ty =
-                    generic_actual_expr_type_info(e, &ctx.locals, ctx.st, Some(ctx.type_layouts))
-                        .map(|ti| type_info_to_ir_type(&ti));
-                let pointer_dest_ty = match b.func().value_type(dest_ptr) {
-                    Some(IrType::Ptr(inner)) => Some((*inner).clone()),
-                    _ => None,
-                };
-                if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
-                    if dest_ty == IrType::Float(FloatWidth::F64) {
-                        return (dest_ptr, None);
-                    }
-                    let tmp_ptr = b.alloca(IrType::Float(FloatWidth::F64));
-                    return (
-                        tmp_ptr,
-                        Some(RuntimeOutWriteback {
-                            dest_ptr,
-                            dest_ty,
-                            tmp_ptr,
-                        }),
-                    );
-                }
-                return (dest_ptr, None);
-            }
-        }
-        (b.const_i64(0), None)
+        nth_arg_typed_out(b, ctx, args, n, IrType::Float(FloatWidth::F64))
+    }
+
+    fn emit_runtime_out_writeback(b: &mut FuncBuilder, writeback: RuntimeOutWriteback) {
+        let raw = b.load(writeback.tmp_ptr);
+        let coerced = coerce_to_type(b, raw, &writeback.dest_ty);
+        b.store(coerced, writeback.dest_ptr);
     }
 
     let arg_slots = reorder_args_by_keyword_slots(args, name, ctx.st);
@@ -595,13 +593,16 @@ pub(crate) fn lower_intrinsic_subroutine(
             // Runtime: afs_get_command_argument(number, value, value_len, length, status)
             let number = nth_arg_val(b, ctx, args, 0, 0);
             let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
-            let length = nth_arg_ref(b, ctx, args, 2);
-            let status = nth_arg_ref(b, ctx, args, 3);
+            let (length, length_writeback) = nth_arg_i32_out(b, ctx, args, 2);
+            let (status, status_writeback) = nth_arg_i32_out(b, ctx, args, 3);
             b.call(
                 FuncRef::External("afs_get_command_argument".into()),
                 vec![number, val_ptr, val_len, length, status],
                 IrType::Void,
             );
+            for writeback in [length_writeback, status_writeback].into_iter().flatten() {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "command_argument_count" => {
@@ -611,13 +612,16 @@ pub(crate) fn lower_intrinsic_subroutine(
         "get_command" => {
             // call get_command(command, length, status)
             let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
-            let length = nth_arg_ref(b, ctx, args, 1);
-            let status = nth_arg_ref(b, ctx, args, 2);
+            let (length, length_writeback) = nth_arg_i32_out(b, ctx, args, 1);
+            let (status, status_writeback) = nth_arg_i32_out(b, ctx, args, 2);
             b.call(
                 FuncRef::External("afs_get_command".into()),
                 vec![cmd_ptr, cmd_len, length, status],
                 IrType::Void,
             );
+            for writeback in [length_writeback, status_writeback].into_iter().flatten() {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "get_environment_variable" => {
@@ -626,8 +630,8 @@ pub(crate) fn lower_intrinsic_subroutine(
             //     name, name_len, value, value_len, length, status, trim_name)
             let (name_ptr, name_len) = nth_arg_str(b, ctx, args, 0);
             let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
-            let length = nth_arg_ref(b, ctx, args, 2);
-            let status = nth_arg_ref(b, ctx, args, 3);
+            let (length, length_writeback) = nth_arg_i32_out(b, ctx, args, 2);
+            let (status, status_writeback) = nth_arg_i32_out(b, ctx, args, 3);
             let trim_name = nth_arg_val(b, ctx, args, 4, 1);
             let trim_name = coerce_to_type(b, trim_name, &IrType::Int(IntWidth::I32));
             b.call(
@@ -637,6 +641,9 @@ pub(crate) fn lower_intrinsic_subroutine(
                 ],
                 IrType::Void,
             );
+            for writeback in [length_writeback, status_writeback].into_iter().flatten() {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "random_number" => {
@@ -780,13 +787,19 @@ pub(crate) fn lower_intrinsic_subroutine(
         "execute_command_line" => {
             let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
             let wait = nth_arg_val(b, ctx, args, 1, 1);
-            let exitstat = nth_arg_ref(b, ctx, args, 2);
-            let cmdstat = nth_arg_ref(b, ctx, args, 3);
+            let (exitstat, exitstat_writeback) = nth_arg_i32_out(b, ctx, args, 2);
+            let (cmdstat, cmdstat_writeback) = nth_arg_i32_out(b, ctx, args, 3);
             b.call(
                 FuncRef::External("afs_execute_command_line".into()),
                 vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
                 IrType::Void,
             );
+            for writeback in [exitstat_writeback, cmdstat_writeback]
+                .into_iter()
+                .flatten()
+            {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "flush" => {
