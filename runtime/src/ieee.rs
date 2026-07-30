@@ -53,6 +53,10 @@ unsafe extern "C" {
     fn c_scalbn(x: f64, exponent: i32) -> f64;
     #[link_name = "scalbnf"]
     fn c_scalbnf(x: f32, exponent: i32) -> f32;
+    #[link_name = "nextafter"]
+    fn c_nextafter(x: f64, y: f64) -> f64;
+    #[link_name = "nextafterf"]
+    fn c_nextafterf(x: f32, y: f32) -> f32;
 }
 
 fn class_f64(bits: u64) -> i32 {
@@ -470,36 +474,12 @@ pub extern "C" fn afs_ieee_scalb_r4(x: f32, i: i32) -> f32 {
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_next_after_r8(x: f64, y: f64) -> f64 {
-    if x.is_nan() || y.is_nan() {
-        return f64::NAN;
-    }
-    if x == y {
-        return y;
-    }
-    if x == 0.0 {
-        return f64::from_bits(1).copysign(y);
-    }
-    let bits = x.to_bits();
-    let up = (y > x) == (x > 0.0);
-    let next = if up { bits + 1 } else { bits - 1 };
-    f64::from_bits(next)
+    unsafe { c_nextafter(x, y) }
 }
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_next_after_r4(x: f32, y: f32) -> f32 {
-    if x.is_nan() || y.is_nan() {
-        return f32::NAN;
-    }
-    if x == y {
-        return y;
-    }
-    if x == 0.0 {
-        return f32::from_bits(1).copysign(y);
-    }
-    let bits = x.to_bits();
-    let up = (y > x) == (x > 0.0);
-    let next = if up { bits + 1 } else { bits - 1 };
-    f32::from_bits(next)
+    unsafe { c_nextafterf(x, y) }
 }
 
 // ---- F2023 / ISO/IEC 60559:2020 maximum/minimum family ----
@@ -1078,6 +1058,54 @@ mod tests {
         assert!(afs_ieee_next_after_r8(1.0, 0.0) < 1.0);
         assert_eq!(afs_ieee_copy_sign_r8(3.0, -1.0), -3.0);
         assert_eq!(afs_ieee_scalb_r8(1.5, 3), 12.0);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn next_after_raises_boundary_flags_only() {
+        let saved = fpenv::get_status();
+        let clear_range_flags = || {
+            afs_ieee_set_flag(3, 0);
+            afs_ieee_set_flag(4, 0);
+            afs_ieee_set_flag(5, 0);
+        };
+
+        clear_range_flags();
+        let overflow64 = afs_ieee_next_after_r8(f64::MAX, f64::INFINITY);
+        assert_eq!(overflow64.to_bits(), f64::INFINITY.to_bits());
+        assert_eq!(afs_ieee_test_flag(3), 1);
+        assert_eq!(afs_ieee_test_flag(4), 0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let underflow64 = afs_ieee_next_after_r8(f64::MIN_POSITIVE, 0.0);
+        assert_eq!(underflow64.to_bits(), 0x000f_ffff_ffff_ffff);
+        assert_eq!(afs_ieee_test_flag(3), 0);
+        assert_eq!(afs_ieee_test_flag(4), 1);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let overflow32 = afs_ieee_next_after_r4(f32::MAX, f32::INFINITY);
+        assert_eq!(overflow32.to_bits(), f32::INFINITY.to_bits());
+        assert_eq!(afs_ieee_test_flag(3), 1);
+        assert_eq!(afs_ieee_test_flag(4), 0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let underflow32 = afs_ieee_next_after_r4(0.0, 1.0);
+        assert_eq!(underflow32.to_bits(), 1);
+        assert_eq!(afs_ieee_test_flag(3), 0);
+        assert_eq!(afs_ieee_test_flag(4), 1);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let ordinary = afs_ieee_next_after_r8(1.0, 2.0);
+        assert_eq!(ordinary.to_bits(), 1.0f64.to_bits() + 1);
+        assert_eq!(afs_ieee_test_flag(3), 0);
+        assert_eq!(afs_ieee_test_flag(4), 0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        fpenv::set_status(saved);
     }
 
     #[test]
