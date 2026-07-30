@@ -268,6 +268,28 @@ fn emit_block_cleanups_for_goto(b: &mut FuncBuilder, ctx: &LowerCtx<'_>, label: 
     }
 }
 
+fn goto_edge_block(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    label: u64,
+    cleanup_name: &str,
+) -> Option<BlockId> {
+    let target = *ctx.label_blocks.get(&label)?;
+    if !goto_exits_active_block(ctx, label) {
+        return Some(target);
+    }
+
+    let source = b.current_block();
+    let cleanup = b.create_block(cleanup_name);
+    b.set_block(cleanup);
+    emit_block_cleanups_for_goto(b, ctx, label);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(target, vec![]);
+    }
+    b.set_block(source);
+    Some(cleanup)
+}
+
 fn copy_array_result_to_fixed_dest(
     b: &mut FuncBuilder,
     info: &LocalInfo,
@@ -8810,6 +8832,53 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
             // Falling out of the loop, current block is the post-chain
             // block — execution continues into whatever statement follows.
+        }
+
+        Stmt::ArithmeticIf {
+            expr,
+            neg,
+            zero,
+            pos,
+        } => {
+            // F2018 §11.1.10: evaluate the scalar numeric expression once,
+            // then transfer to the negative, zero, or positive label.
+            let value = super::expr::lower_expr_ctx(b, ctx, expr);
+            let Some(value_ty) = b.func().value_type(value) else {
+                return;
+            };
+            if !matches!(value_ty, IrType::Int(_) | IrType::Float(_)) {
+                return;
+            }
+            let zero_value = zero_value_for_ir_type(b, &value_ty);
+            let is_negative = match &value_ty {
+                IrType::Int(_) => b.icmp(CmpOp::Lt, value, zero_value),
+                IrType::Float(_) => b.fcmp(CmpOp::Lt, value, zero_value),
+                _ => unreachable!("arithmetic IF type checked above"),
+            };
+            let is_zero = match &value_ty {
+                IrType::Int(_) => b.icmp(CmpOp::Eq, value, zero_value),
+                IrType::Float(_) => b.fcmp(CmpOp::Eq, value, zero_value),
+                _ => unreachable!("arithmetic IF type checked above"),
+            };
+
+            let nonnegative = b.create_block("arithmetic_if_nonnegative");
+            let negative_edge = goto_edge_block(b, ctx, *neg, "arithmetic_if_negative_cleanup");
+            if let Some(negative_edge) = negative_edge {
+                b.cond_branch(is_negative, negative_edge, vec![], nonnegative, vec![]);
+            } else {
+                b.branch(nonnegative, vec![]);
+            }
+
+            b.set_block(nonnegative);
+            let zero_edge = goto_edge_block(b, ctx, *zero, "arithmetic_if_zero_cleanup");
+            let positive_edge = goto_edge_block(b, ctx, *pos, "arithmetic_if_positive_cleanup");
+            match (zero_edge, positive_edge) {
+                (Some(zero_edge), Some(positive_edge)) => {
+                    b.cond_branch(is_zero, zero_edge, vec![], positive_edge, vec![]);
+                }
+                (Some(edge), None) | (None, Some(edge)) => b.branch(edge, vec![]),
+                (None, None) => {}
+            }
         }
 
         Stmt::Labeled { label, stmt: inner } => {

@@ -5105,6 +5105,23 @@ fn validate_stop_quiet(ctx: &mut Ctx<'_>, quiet: Option<&SpannedExpr>) {
     }
 }
 
+fn validate_arithmetic_if_expr(ctx: &mut Ctx<'_>, expr: &SpannedExpr) {
+    let metadata = validation_expr_metadata(ctx, expr);
+    let wrong_type = metadata.type_info.as_ref().is_some_and(|ty| {
+        !matches!(
+            ty,
+            TypeInfo::Integer { .. } | TypeInfo::Real { .. } | TypeInfo::DoublePrecision
+        )
+    });
+    let wrong_rank = metadata.rank.is_some_and(|rank| rank != 0);
+    if wrong_type || wrong_rank {
+        ctx.error(
+            expr.span,
+            "arithmetic IF expression must be a scalar INTEGER or REAL",
+        );
+    }
+}
+
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
     validate_stmt_enum_usage(ctx, stmt);
@@ -5233,8 +5250,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 ctx.labels_referenced.push((*label, stmt.span));
             }
         }
-        Stmt::ArithmeticIf { neg, zero, pos, .. } => {
+        Stmt::ArithmeticIf {
+            expr,
+            neg,
+            zero,
+            pos,
+        } => {
             warn_legacy_feature(ctx, stmt.span, "arithmetic IF");
+            validate_arithmetic_if_expr(ctx, expr);
             ctx.labels_referenced.push((*neg, stmt.span));
             ctx.labels_referenced.push((*zero, stmt.span));
             ctx.labels_referenced.push((*pos, stmt.span));
@@ -15267,6 +15290,75 @@ end program
     }
 
     // ---- Label validation ----
+
+    #[test]
+    fn arithmetic_if_requires_scalar_integer_or_real_expression() {
+        let logical_errors = errors_from(
+            "\
+program test
+  implicit none
+  if (.true.) 10, 20, 30
+10 continue
+20 continue
+30 continue
+end program
+",
+        );
+        assert!(
+            logical_errors
+                .iter()
+                .any(|error| error
+                    .contains("arithmetic IF expression must be a scalar INTEGER or REAL")),
+            "expected logical arithmetic IF rejection, got {logical_errors:?}"
+        );
+
+        let array_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: values(2)
+  values = [1, 2]
+  if (values) 10, 20, 30
+10 continue
+20 continue
+30 continue
+end program
+",
+        );
+        assert!(
+            array_errors
+                .iter()
+                .any(|error| error
+                    .contains("arithmetic IF expression must be a scalar INTEGER or REAL")),
+            "expected array arithmetic IF rejection, got {array_errors:?}"
+        );
+    }
+
+    #[test]
+    fn arithmetic_if_accepts_scalar_integer_and_real_expressions() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i
+  real :: x
+  i = 0
+  x = 0.0
+  if (i) 10, 20, 30
+10 continue
+  if (x) 20, 30, 40
+20 continue
+30 continue
+40 continue
+end program
+",
+        );
+        assert!(
+            errors.is_empty(),
+            "scalar integer and real arithmetic IF should be valid, got {errors:?}"
+        );
+    }
+
     // Note: the parser does not yet assign labels to statements (labels are
     // separate tokens consumed but not attached). Full GOTO-target validation
     // requires a parser enhancement to track statement labels. The validation
