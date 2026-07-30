@@ -22,6 +22,80 @@ use super::ctx::{
 };
 use super::helpers::clamp_nonnegative_i64;
 
+fn dummy_has_required_data_storage(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    let mut declared = false;
+    let mut nullable_or_nondata = false;
+    for decl in decls {
+        match &decl.node {
+            crate::ast::decl::Decl::TypeDecl {
+                attrs, entities, ..
+            } if entities
+                .iter()
+                .any(|entity| entity.name.eq_ignore_ascii_case(name)) =>
+            {
+                declared = true;
+                nullable_or_nondata |= attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        crate::ast::decl::Attribute::Optional
+                            | crate::ast::decl::Attribute::Pointer
+                            | crate::ast::decl::Attribute::Value
+                            | crate::ast::decl::Attribute::Procedure
+                            | crate::ast::decl::Attribute::External
+                            | crate::ast::decl::Attribute::Intrinsic
+                    )
+                });
+            }
+            crate::ast::decl::Decl::AttributeStmt { attr, entities }
+                if entities
+                    .iter()
+                    .any(|entity| entity.eq_ignore_ascii_case(name)) =>
+            {
+                nullable_or_nondata |= matches!(
+                    attr,
+                    crate::ast::decl::Attribute::Optional
+                        | crate::ast::decl::Attribute::Pointer
+                        | crate::ast::decl::Attribute::Value
+                        | crate::ast::decl::Attribute::Procedure
+                        | crate::ast::decl::Attribute::External
+                        | crate::ast::decl::Attribute::Intrinsic
+                );
+            }
+            _ => {}
+        }
+    }
+    declared && !nullable_or_nondata
+}
+
+fn mark_directly_dereferenceable_params(
+    func: &mut Function,
+    args: &[DummyArg],
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    let required_data_dummies: HashSet<String> = args
+        .iter()
+        .filter_map(|arg| {
+            let DummyArg::Name(name) = arg else {
+                return None;
+            };
+            dummy_has_required_data_storage(name, decls).then(|| name.to_lowercase())
+        })
+        .collect();
+    // Host-closure parameters remain deliberately unmarked: a capture may
+    // forward an absent OPTIONAL or a disassociated POINTER from its host.
+    let ids: Vec<ValueId> = func
+        .params
+        .iter()
+        .filter(|param| {
+            param.name == "_sret" || required_data_dummies.contains(&param.name.to_lowercase())
+        })
+        .map(|param| param.id)
+        .collect();
+    for id in ids {
+        func.mark_param_directly_dereferenceable(id);
+    }
+}
+
 fn install_procedure_dummy_closure_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
@@ -470,6 +544,7 @@ pub(crate) fn lower_unit(
             );
 
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
+            mark_directly_dereferenceable_params(&mut func, args, decls);
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
@@ -1079,6 +1154,7 @@ pub(crate) fn lower_unit(
             );
 
             let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
+            mark_directly_dereferenceable_params(&mut func, args, decls);
             // Propagate PURE/ELEMENTAL from AST prefix.
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));

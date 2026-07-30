@@ -35,8 +35,11 @@
 //!
 //! ## Memory operations
 //!
-//! `Load` is hoisted only when its address is loop-invariant and every
-//! loop `Store` is proven `NoAlias` against that address. Any
+//! `Load` is hoisted only when its address is loop-invariant, every loop
+//! `Store` is proven `NoAlias` against that address, and moving the read
+//! cannot introduce a fault on a path that skipped it. The last condition
+//! requires either execution in the loop header (which the preheader always
+//! enters) or an address with a direct dereferenceability guarantee. Any
 //! `Call`/`RuntimeCall` in the loop still blocks hoisting for now.
 //!
 //! `Alloca` is also not hoisted: each iteration's stack slot might be
@@ -110,6 +113,27 @@ fn load_is_loop_invariant(
         }
     }
     true
+}
+
+fn address_is_directly_dereferenceable(func: &Function, ptr: ValueId) -> bool {
+    if func.param_is_directly_dereferenceable(ptr) {
+        return true;
+    }
+    func.find_defining_inst(ptr)
+        .is_some_and(|inst| matches!(inst.kind, InstKind::Alloca(..) | InstKind::GlobalAddr(..)))
+}
+
+fn load_is_safe_to_move_to_preheader(
+    func: &Function,
+    lp: &NaturalLoop,
+    load_block: BlockId,
+    load_ptr: ValueId,
+) -> bool {
+    // `find_preheader` accepts only an unconditional preheader → header edge,
+    // so the header executes whenever the destination preheader does. A load
+    // in any other loop block may be guarded by the trip check or an IF and
+    // needs an independent dereferenceability proof before speculation.
+    load_block == lp.header || address_is_directly_dereferenceable(func, load_ptr)
 }
 
 /// Delegate to shared loop utility.
@@ -203,6 +227,7 @@ fn licm_function(func: &mut Function, layout: crate::target::TargetLayout) -> bo
                     let hoistable = match &inst.kind {
                         InstKind::Load(ptr) => {
                             load_is_loop_invariant(layout, func, lp, inst.id, *ptr)
+                                && load_is_safe_to_move_to_preheader(func, lp, block.id, *ptr)
                         }
                         _ => is_non_memory_hoist_candidate(&inst.kind),
                     };
@@ -309,6 +334,36 @@ mod tests {
         });
         f.register_type(id, ty);
         id
+    }
+
+    fn add_zero_trip_load_loop(f: &mut Function, ptr: ValueId) -> (BlockId, ValueId) {
+        let enter_loop = push(f, InstKind::ConstBool(false), IrType::Bool);
+        let header = f.create_block("header");
+        let body = f.create_block("body");
+        let latch = f.create_block("latch");
+        let exit = f.create_block("exit");
+
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(header, vec![]));
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: enter_loop,
+            true_dest: body,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let loaded = f.next_value_id();
+        f.register_type(loaded, IrType::Int(IntWidth::I32));
+        f.block_mut(body).insts.push(Inst {
+            id: loaded,
+            kind: InstKind::Load(ptr),
+            ty: IrType::Int(IntWidth::I32),
+            span: dummy_span(),
+        });
+        f.block_mut(body).terminator = Some(Terminator::Branch(latch, vec![]));
+        f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+        (body, loaded)
     }
 
     /// Build a tiny loop:
@@ -935,6 +990,96 @@ mod tests {
         assert!(
             iadd_in_header,
             "loop-dependent IAdd(i_param, prod) should still be in the header"
+        );
+    }
+
+    #[test]
+    fn does_not_speculate_null_load_before_zero_trip_loop() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+
+        let null_addr = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I64),
+            IrType::Int(IntWidth::I64),
+        );
+        let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let null_ptr = push(
+            &mut f,
+            InstKind::IntToPtr(null_addr, ptr_ty.clone()),
+            ptr_ty,
+        );
+        let (body, loaded) = add_zero_trip_load_loop(&mut f, null_ptr);
+
+        m.add_function(f);
+        Licm.run(&mut m);
+
+        let f = &m.functions[0];
+        assert!(
+            f.block(body)
+                .insts
+                .iter()
+                .any(|inst| inst.id == loaded && matches!(inst.kind, InstKind::Load(_))),
+            "a load in a skippable loop body must remain guarded by the trip check"
+        );
+        assert!(
+            !f.block(f.entry).insts.iter().any(|inst| inst.id == loaded),
+            "LICM must not move a potentially faulting load into the preheader"
+        );
+    }
+
+    #[test]
+    fn noalias_parameter_is_not_implicitly_safe_to_dereference() {
+        let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let params = vec![Param {
+            name: "optional_value".into(),
+            ty: ptr_ty,
+            id: ValueId(0),
+            fortran_noalias: true,
+        }];
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), params, IrType::Void);
+        let (body, loaded) = add_zero_trip_load_loop(&mut f, ValueId(0));
+        m.add_function(f);
+
+        Licm.run(&mut m);
+
+        let f = &m.functions[0];
+        assert!(
+            f.block(body).insts.iter().any(|inst| inst.id == loaded),
+            "alias metadata alone must not make an absent parameter safe to read"
+        );
+        assert!(
+            !f.block(f.entry).insts.iter().any(|inst| inst.id == loaded),
+            "LICM must require separate dereferenceability metadata"
+        );
+    }
+
+    #[test]
+    fn directly_dereferenceable_parameter_can_hoist_from_zero_trip_body() {
+        let ptr_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+        let params = vec![Param {
+            name: "required_value".into(),
+            ty: ptr_ty,
+            id: ValueId(0),
+            fortran_noalias: true,
+        }];
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), params, IrType::Void);
+        f.mark_param_directly_dereferenceable(ValueId(0));
+        let (body, loaded) = add_zero_trip_load_loop(&mut f, ValueId(0));
+        m.add_function(f);
+
+        assert!(Licm.run(&mut m));
+
+        let f = &m.functions[0];
+        assert!(
+            !f.block(body).insts.iter().any(|inst| inst.id == loaded),
+            "a direct load from required valid storage should still hoist"
+        );
+        assert!(
+            f.block(f.entry).insts.iter().any(|inst| inst.id == loaded),
+            "the safe load should land in the preheader"
         );
     }
 }

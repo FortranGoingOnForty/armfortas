@@ -5,7 +5,7 @@
 
 use super::types::{FloatWidth, IntWidth, IrType};
 use crate::lexer::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A value identifier — unique within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +272,14 @@ pub struct Function {
     /// Dense `BlockId` to `blocks` position index. Removed block IDs retain an
     /// empty slot so normal lookup stays O(1) after pruning.
     block_positions: Vec<Option<usize>>,
+    /// Pointer-valued parameters whose ABI contract guarantees that a direct
+    /// load of the pointee is valid whenever the function is entered.
+    ///
+    /// This is deliberately distinct from alias metadata: OPTIONAL Fortran
+    /// dummies may retain normal no-alias semantics while still being null
+    /// when absent. The guarantee applies only to the parameter itself, not
+    /// to pointers loaded from it or arbitrary derived GEP addresses.
+    directly_dereferenceable_params: HashSet<ValueId>,
     pub entry: BlockId,
     next_value: u32,
     next_block: u32,
@@ -306,6 +314,7 @@ impl Function {
             return_type,
             blocks: vec![entry_block],
             block_positions: vec![Some(0)],
+            directly_dereferenceable_params: HashSet::new(),
             entry,
             next_value,
             next_block: 1,
@@ -489,6 +498,23 @@ impl Function {
             }
         }
         None
+    }
+
+    /// Record that a pointer parameter is valid for one direct pointee load.
+    pub fn mark_param_directly_dereferenceable(&mut self, id: ValueId) {
+        if self
+            .params
+            .iter()
+            .any(|param| param.id == id && param.ty.is_ptr())
+        {
+            self.directly_dereferenceable_params.insert(id);
+        }
+    }
+
+    /// Whether the function ABI permits a direct pointee load from `id`.
+    pub fn param_is_directly_dereferenceable(&self, id: ValueId) -> bool {
+        self.directly_dereferenceable_params.contains(&id)
+            && self.params.iter().any(|param| param.id == id)
     }
 }
 
