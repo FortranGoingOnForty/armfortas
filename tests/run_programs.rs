@@ -4651,6 +4651,31 @@ fn ar44_unformatted_record_framing_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar44_list_directed_character_quotes_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar44_list_directed_character_quotes_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_list_directed_character_quotes.f90");
+    assert!(
+        source.exists(),
+        "ar44_list_directed_character_quotes.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_list_directed_character_quotes.f90 should preserve quoted separators, unescape delimiters, and reject quoted numerics, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;

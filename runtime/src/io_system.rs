@@ -244,23 +244,102 @@ struct Unit {
     pending_read: Option<(Vec<u8>, usize)>,
 }
 
-fn tokenize_list_directed_record(line: &str) -> VecDeque<ListReadToken> {
-    let mut tokens = VecDeque::new();
-    let mut fields = line.split(',').peekable();
-
-    while let Some(field) = fields.next() {
-        let before = tokens.len();
-        tokens.extend(
-            field
-                .split_whitespace()
-                .map(|value| ListReadToken::Value(value.to_string())),
-        );
-        if tokens.len() == before && fields.peek().is_some() {
-            tokens.push_back(ListReadToken::Null);
-        }
+fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken, usize)> {
+    let mut cursor = start.min(input.len());
+    while cursor < input.len() && input[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor == input.len() {
+        return None;
     }
 
+    if input[cursor] == b',' {
+        return Some((ListReadToken::Null, cursor + 1));
+    }
+
+    let token_start = cursor;
+    if matches!(input[cursor], b'\'' | b'"') {
+        let delimiter = input[cursor];
+        cursor += 1;
+        while cursor < input.len() {
+            if input[cursor] != delimiter {
+                cursor += 1;
+                continue;
+            }
+            if cursor + 1 < input.len() && input[cursor + 1] == delimiter {
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+            break;
+        }
+        // Keep any non-separator suffix in the same raw token. The
+        // character decoder will reject it instead of silently treating
+        // the suffix as a second list item.
+        while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
+        {
+            cursor += 1;
+        }
+    } else {
+        while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
+        {
+            cursor += 1;
+        }
+    }
+    let token_end = cursor;
+
+    while cursor < input.len() && input[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor < input.len() && input[cursor] == b',' {
+        cursor += 1;
+    }
+
+    Some((
+        ListReadToken::Value(String::from_utf8_lossy(&input[token_start..token_end]).into_owned()),
+        cursor,
+    ))
+}
+
+fn tokenize_list_directed_record(line: &str) -> VecDeque<ListReadToken> {
+    let mut tokens = VecDeque::new();
+    let mut cursor = 0usize;
+    while let Some((token, next_cursor)) = scan_list_directed_token(line.as_bytes(), cursor) {
+        tokens.push_back(token);
+        cursor = next_cursor;
+    }
     tokens
+}
+
+fn decode_list_directed_character_value(token: &str) -> Result<String, ()> {
+    let bytes = token.as_bytes();
+    let Some(&delimiter) = bytes.first() else {
+        return Ok(String::new());
+    };
+    if !matches!(delimiter, b'\'' | b'"') {
+        return Ok(token.to_string());
+    }
+    if bytes.len() < 2 || bytes.last().copied() != Some(delimiter) {
+        return Err(());
+    }
+
+    let mut decoded = Vec::with_capacity(bytes.len().saturating_sub(2));
+    let mut cursor = 1usize;
+    let content_end = bytes.len() - 1;
+    while cursor < content_end {
+        if bytes[cursor] != delimiter {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+            continue;
+        }
+        if cursor + 1 >= content_end || bytes[cursor + 1] != delimiter {
+            return Err(());
+        }
+        decoded.push(delimiter);
+        cursor += 2;
+    }
+
+    String::from_utf8(decoded).map_err(|_| ())
 }
 
 impl Unit {
@@ -2244,11 +2323,15 @@ pub extern "C" fn afs_read_string(unit: i32, dest: *mut u8, dest_len: i64, iosta
 
     match u.next_read_token() {
         Ok(Some(ListReadToken::Value(token))) => {
+            let Ok(value) = decode_list_directed_character_value(&token) else {
+                set_read_status_or_exit(iostat, 1);
+                return;
+            };
             crate::string::afs_assign_char_fixed(
                 dest,
                 dest_len,
-                token.as_ptr(),
-                token.len() as i64,
+                value.as_ptr(),
+                value.len() as i64,
             );
             if !iostat.is_null() {
                 unsafe {
@@ -3556,57 +3639,30 @@ fn next_internal_token(buf: *const u8, buf_len: i64, pos: *mut i64) -> Option<Li
     }
 
     let slice = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
-    let mut idx = if !pos.is_null() {
+    let cursor = if !pos.is_null() {
         unsafe { (*pos).clamp(0, buf_len) as usize }
     } else {
         0
     };
 
-    while idx < slice.len() && slice[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-
-    if idx >= slice.len() {
-        if !pos.is_null() {
-            unsafe {
-                *pos = idx as i64;
+    match scan_list_directed_token(slice, cursor) {
+        Some((token, next_cursor)) => {
+            if !pos.is_null() {
+                unsafe {
+                    *pos = next_cursor as i64;
+                }
             }
+            Some(token)
         }
-        return None;
-    }
-
-    if slice[idx] == b',' {
-        idx += 1;
-        if !pos.is_null() {
-            unsafe {
-                *pos = idx as i64;
+        None => {
+            if !pos.is_null() {
+                unsafe {
+                    *pos = slice.len() as i64;
+                }
             }
-        }
-        return Some(ListReadToken::Null);
-    }
-
-    let start = idx;
-    while idx < slice.len() && !slice[idx].is_ascii_whitespace() && slice[idx] != b',' {
-        idx += 1;
-    }
-    let end = idx;
-
-    while idx < slice.len() && slice[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-    if idx < slice.len() && slice[idx] == b',' {
-        idx += 1;
-    }
-
-    if !pos.is_null() {
-        unsafe {
-            *pos = idx as i64;
+            None
         }
     }
-
-    Some(ListReadToken::Value(
-        String::from_utf8_lossy(&slice[start..end]).into_owned(),
-    ))
 }
 
 /// Read an integer from a character buffer (internal I/O).
@@ -3691,8 +3747,12 @@ pub extern "C" fn afs_read_internal_string(
 
     match next_internal_token(buf, buf_len, pos) {
         Some(ListReadToken::Value(token)) => {
+            let Ok(value) = decode_list_directed_character_value(&token) else {
+                set_read_status_or_exit(iostat, 1);
+                return;
+            };
             dest_slice.fill(b' ');
-            let bytes = token.as_bytes();
+            let bytes = value.as_bytes();
             let n = bytes.len().min(dest_slice.len());
             dest_slice[..n].copy_from_slice(&bytes[..n]);
             if !iostat.is_null() {
@@ -6642,6 +6702,110 @@ mod tests {
                 ListReadToken::Value("8".into()),
             ]
         );
+    }
+
+    #[test]
+    fn list_directed_tokenizer_preserves_delimited_character_values() {
+        let tokens: Vec<_> =
+            tokenize_list_directed_record(" 'alpha beta', \"gamma,delta\", 'don''t', plain\n")
+                .into_iter()
+                .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ListReadToken::Value("'alpha beta'".into()),
+                ListReadToken::Value("\"gamma,delta\"".into()),
+                ListReadToken::Value("'don''t'".into()),
+                ListReadToken::Value("plain".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_directed_character_read_unquotes_and_unescapes_delimiters() {
+        let path = format!(
+            "/tmp/afs_list_character_quotes_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        std::fs::write(
+            &path,
+            " 'alpha beta', \"gamma,delta\", 'don''t', ' spaced ', '', plain\n",
+        )
+        .expect("create quoted list-directed input");
+        afs_open_simple(
+            807,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut iostat = -99;
+        for expected in [
+            "alpha beta",
+            "gamma,delta",
+            "don't",
+            " spaced ",
+            "",
+            "plain",
+        ] {
+            let mut actual = [b'?'; 16];
+            afs_read_string(807, actual.as_mut_ptr(), actual.len() as i64, &mut iostat);
+            assert_eq!(iostat, 0, "failed to read {expected:?}");
+
+            let mut padded = [b' '; 16];
+            padded[..expected.len()].copy_from_slice(expected.as_bytes());
+            assert_eq!(actual, padded, "incorrect value for {expected:?}");
+        }
+
+        afs_close(807, &mut iostat);
+        assert_eq!(iostat, 0, "CLOSE failed");
+        std::fs::remove_file(path).expect("remove quoted list-directed input");
+    }
+
+    #[test]
+    fn list_directed_character_decoder_rejects_malformed_delimiters() {
+        assert_eq!(
+            decode_list_directed_character_value("\"say \"\"hi\"\"\""),
+            Ok("say \"hi\"".into())
+        );
+        assert_eq!(
+            decode_list_directed_character_value("''"),
+            Ok(String::new())
+        );
+        assert_eq!(
+            decode_list_directed_character_value("plain"),
+            Ok("plain".into())
+        );
+        assert!(decode_list_directed_character_value("'unterminated").is_err());
+        assert!(decode_list_directed_character_value("'a'b'").is_err());
+    }
+
+    #[test]
+    fn internal_list_directed_character_read_uses_quote_aware_cursor() {
+        let input = b"'left,right', \"two words\", 'say ''hello'''";
+        let mut position = 0;
+        let mut iostat = -99;
+
+        for expected in ["left,right", "two words", "say 'hello'"] {
+            let mut actual = [b'?'; 16];
+            afs_read_internal_string(
+                input.as_ptr(),
+                input.len() as i64,
+                &mut position,
+                actual.as_mut_ptr(),
+                actual.len() as i64,
+                &mut iostat,
+            );
+            assert_eq!(iostat, 0, "failed to read {expected:?}");
+
+            let mut padded = [b' '; 16];
+            padded[..expected.len()].copy_from_slice(expected.as_bytes());
+            assert_eq!(actual, padded, "incorrect value for {expected:?}");
+        }
     }
 
     #[test]
