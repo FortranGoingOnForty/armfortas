@@ -6126,13 +6126,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
 
         // ---- Control flow ----
         Stmt::IfConstruct {
+            name,
             condition,
             then_body,
             else_ifs,
             else_body,
-            ..
         } => {
-            lower_if(b, ctx, condition, then_body, else_ifs, else_body);
+            lower_if(b, ctx, name, condition, then_body, else_ifs, else_body);
         }
 
         Stmt::IfStmt { condition, action } => {
@@ -6209,9 +6209,11 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
         }
 
         Stmt::SelectCase {
-            selector, cases, ..
+            name,
+            selector,
+            cases,
         } => {
-            lower_select_case(b, ctx, selector, cases);
+            lower_select_case(b, ctx, name, selector, cases);
         }
 
         Stmt::WhereConstruct {
@@ -6904,8 +6906,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             if let Some(lp) = ctx.find_loop(name) {
                 let exit = lp.exit;
                 b.branch(exit, vec![]);
-            } else if let Some(exit) = ctx.find_construct_exit(name) {
-                b.branch(exit, vec![]);
+            } else if let Some((exit, cleanup_depth)) = ctx.find_construct_exit(name) {
+                let exit_edge = lexical_cleanup_edge_to_depth(
+                    b,
+                    ctx,
+                    exit,
+                    cleanup_depth,
+                    "construct_exit_cleanup",
+                );
+                b.branch(exit_edge, vec![]);
             }
         }
 

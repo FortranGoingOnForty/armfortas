@@ -29278,21 +29278,43 @@ pub(super) fn lexical_cleanup_edge_for_label(
     cleanup_name: &str,
 ) -> Option<BlockId> {
     let target = *ctx.label_blocks.get(&label)?;
-    if ctx
+    let retained_cleanup_depth = ctx
         .lexical_cleanups
-        .last()
-        .is_none_or(|scope| scope.labels.contains(&label))
-    {
-        return Some(target);
+        .iter()
+        .rposition(|scope| scope.labels.contains(&label))
+        .map_or(0, |index| index + 1);
+    Some(lexical_cleanup_edge_to_depth(
+        b,
+        ctx,
+        target,
+        retained_cleanup_depth,
+        cleanup_name,
+    ))
+}
+
+/// Return an edge to `target` that cleans every lexical scope entered after
+/// `retained_cleanup_depth`.
+///
+/// Construct destinations capture the active depth when the construct starts.
+/// A transfer to that destination retains enclosing scopes and tears down only
+/// scopes nested inside the construct. Label transfers derive the same depth
+/// from the innermost active scope containing the destination label.
+pub(super) fn lexical_cleanup_edge_to_depth(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    target: BlockId,
+    retained_cleanup_depth: usize,
+    cleanup_name: &str,
+) -> BlockId {
+    debug_assert!(retained_cleanup_depth <= ctx.lexical_cleanups.len());
+    if retained_cleanup_depth >= ctx.lexical_cleanups.len() {
+        return target;
     }
 
     let source = b.current_block();
     let cleanup = b.create_block(cleanup_name);
     b.set_block(cleanup);
-    for scope in ctx.lexical_cleanups.iter().rev() {
-        if scope.labels.contains(&label) {
-            break;
-        }
+    for scope in ctx.lexical_cleanups[retained_cleanup_depth..].iter().rev() {
         insert_implicit_dealloc(
             b,
             &scope.owned_locals,
@@ -29309,7 +29331,7 @@ pub(super) fn lexical_cleanup_edge_for_label(
         b.branch(target, vec![]);
     }
     b.set_block(source);
-    Some(cleanup)
+    cleanup
 }
 
 pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
@@ -29552,13 +29574,18 @@ pub(super) fn try_lower_select(
 pub(super) fn lower_if(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    name: &Option<String>,
     condition: &crate::ast::expr::SpannedExpr,
     then_body: &[SpannedStmt],
     else_ifs: &[(crate::ast::expr::SpannedExpr, Vec<SpannedStmt>)],
     else_body: &Option<Vec<SpannedStmt>>,
 ) {
-    if else_ifs.is_empty() {
-        if let Some(value) = known_logical_condition(condition, &ctx.locals, ctx.st) {
+    let known_condition = else_ifs
+        .is_empty()
+        .then(|| known_logical_condition(condition, &ctx.locals, ctx.st))
+        .flatten();
+    if name.is_none() {
+        if let Some(value) = known_condition {
             if value {
                 super::stmt::lower_stmts(b, ctx, then_body);
             } else if let Some(eb) = else_body {
@@ -29574,6 +29601,21 @@ pub(super) fn lower_if(
     }
 
     let bb_end = b.create_block("if_end");
+    ctx.push_construct_exit(name.clone(), bb_end);
+
+    if let Some(value) = known_condition {
+        if value {
+            super::stmt::lower_stmts(b, ctx, then_body);
+        } else if let Some(eb) = else_body {
+            super::stmt::lower_stmts(b, ctx, eb);
+        }
+        if b.func().block(b.current_block()).terminator.is_none() {
+            b.branch(bb_end, vec![]);
+        }
+        ctx.pop_construct_exit(name);
+        b.set_block(bb_end);
+        return;
+    }
 
     let bb_then = b.create_block("if_then");
     let bb_next = if !else_ifs.is_empty() || else_body.is_some() {
@@ -29620,6 +29662,7 @@ pub(super) fn lower_if(
         }
     }
 
+    ctx.pop_construct_exit(name);
     b.set_block(bb_end);
 }
 
@@ -30007,6 +30050,7 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
 pub(super) fn lower_select_case(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    name: &Option<String>,
     selector: &crate::ast::expr::SpannedExpr,
     cases: &[CaseBlock],
 ) {
@@ -30018,6 +30062,7 @@ pub(super) fn lower_select_case(
         .unwrap_or_default();
     let sel_val = (!selector_is_char).then(|| super::expr::lower_expr_ctx(b, ctx, selector));
     let bb_end = b.create_block("select_end");
+    ctx.push_construct_exit(name.clone(), bb_end);
 
     // For simplicity, lower as a chain of if-else comparisons.
     // (Switch terminator would be ideal for integer constants, but the
@@ -30197,6 +30242,7 @@ pub(super) fn lower_select_case(
         }
     }
 
+    ctx.pop_construct_exit(name);
     b.set_block(bb_end);
 }
 

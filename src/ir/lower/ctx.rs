@@ -155,6 +155,9 @@ pub(super) struct LoopScope {
 pub(super) struct ConstructExitScope {
     pub(super) name: String,
     pub(super) exit: BlockId,
+    /// Number of active lexical cleanup scopes owned outside this construct.
+    /// A named EXIT must clean every later scope before reaching `exit`.
+    pub(super) cleanup_depth: usize,
 }
 
 /// Runtime cleanup owned by an active lexical construct.
@@ -448,6 +451,7 @@ impl<'a> LowerCtx<'a> {
             self.construct_exits.push(ConstructExitScope {
                 name: name.to_ascii_lowercase(),
                 exit,
+                cleanup_depth: self.lexical_cleanups.len(),
             });
         }
     }
@@ -483,12 +487,12 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    pub(super) fn find_construct_exit(&self, name: &Option<String>) -> Option<BlockId> {
+    pub(super) fn find_construct_exit(&self, name: &Option<String>) -> Option<(BlockId, usize)> {
         let name = name.as_ref()?;
         self.construct_exits
             .iter()
             .rev()
             .find(|scope| scope.name.eq_ignore_ascii_case(name))
-            .map(|scope| scope.exit)
+            .map(|scope| (scope.exit, scope.cleanup_depth))
     }
 }

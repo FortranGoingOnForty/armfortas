@@ -4330,6 +4330,25 @@ fn ar43_io_branch_cleanup_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar43_named_if_select_exit_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_named_if_select_exit_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_named_if_select_exit.f90");
+    assert!(source.exists(), "ar43_named_if_select_exit.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_named_if_select_exit.f90 should honor every named IF/SELECT CASE EXIT and clean owning scopes crossed by the transfer, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;
