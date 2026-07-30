@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::const_scalar::ConstScalar;
-use super::core::ModuleGlobalInfo;
+use super::core::{ModuleGlobalInfo, PendingGlobal};
 
 pub(super) type AmbiguousUseWarnings = Rc<RefCell<HashSet<(String, String, String)>>>;
 
@@ -278,6 +278,17 @@ pub(super) struct LowerCtx<'a> {
     pub(super) loops: Vec<LoopScope>,
     pub(super) construct_exits: Vec<ConstructExitScope>,
     pub(super) lexical_cleanups: Vec<LexicalCleanupScope>,
+    /// SAVE-promoted locals collected while lowering this procedure,
+    /// including declarations nested in BLOCK constructs. The owning
+    /// program-unit lowerer flushes these into the IR module after the
+    /// function body is complete.
+    pub(super) pending_globals: Vec<PendingGlobal>,
+    /// Stable procedure-specific prefix used for SAVE global symbols.
+    pub(super) save_owner: String,
+    /// Lexical BLOCK ordinal within this procedure. Ordinals are assigned
+    /// by deterministic AST traversal, so symbol names do not depend on
+    /// source paths, temporary directories, or compilation-unit order.
+    next_block_save_scope: u64,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -363,6 +374,7 @@ impl<'a> LowerCtx<'a> {
         char_len_star_params: &'a HashMap<String, Vec<bool>>,
         contained_host_refs: &'a HashMap<String, Vec<String>>,
         ambiguous_use_warnings: AmbiguousUseWarnings,
+        save_owner: String,
         layout: crate::target::TargetLayout,
     ) -> Self {
         Self {
@@ -372,6 +384,9 @@ impl<'a> LowerCtx<'a> {
             loops: Vec::new(),
             construct_exits: Vec::new(),
             lexical_cleanups: Vec::new(),
+            pending_globals: Vec::new(),
+            save_owner,
+            next_block_save_scope: 0,
             st,
             globals,
             type_layouts,
@@ -392,6 +407,18 @@ impl<'a> LowerCtx<'a> {
             ambiguous_use_warnings,
             proc_scope_id: None,
         }
+    }
+
+    pub(super) fn next_block_save_owner(&mut self) -> String {
+        let ordinal = self.next_block_save_scope;
+        self.next_block_save_scope = self
+            .next_block_save_scope
+            .checked_add(1)
+            .expect("BLOCK SAVE scope ordinal overflow");
+        // Dots cannot appear in a Fortran identifier, so this scope
+        // separator cannot collide with a procedure local such as
+        // `block_0_value` when save_global_name appends the entity name.
+        format!("{}.block.{}", self.save_owner, ordinal)
     }
 
     pub(super) fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {

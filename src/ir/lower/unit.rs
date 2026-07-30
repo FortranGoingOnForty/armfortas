@@ -194,6 +194,7 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                fname.clone(),
                 module.layout,
             );
             ctx.proc_scope_id = {
@@ -208,8 +209,6 @@ pub(crate) fn lower_unit(
                     }
                 })
             };
-            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
-
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
@@ -243,7 +242,7 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     type_layouts,
-                    &mut pending_globals,
+                    &mut ctx.pending_globals,
                     &fname,
                     st,
                 );
@@ -297,7 +296,7 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
-            for pg in pending_globals {
+            for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
 
@@ -561,10 +560,10 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                func_name.clone(),
                 module.layout,
             );
             ctx.proc_scope_id = proc_scope_id;
-            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
@@ -799,7 +798,7 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     type_layouts,
-                    &mut pending_globals,
+                    &mut ctx.pending_globals,
                     &func_name,
                     st,
                 );
@@ -854,7 +853,7 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
-            for pg in pending_globals {
+            for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
 
@@ -1172,10 +1171,10 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                func_name.clone(),
                 module.layout,
             );
             ctx.proc_scope_id = proc_scope_id;
-            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
@@ -1699,7 +1698,7 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     type_layouts,
-                    &mut pending_globals,
+                    &mut ctx.pending_globals,
                     &func_name,
                     st,
                 );
@@ -1815,7 +1814,7 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
-            for pg in pending_globals {
+            for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
 

@@ -8739,14 +8739,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 for k in &block_keys {
                     ctx.locals.remove(k);
                 }
+                let block_save_owner = ctx.next_block_save_owner();
                 super::alloc::alloc_decls(
                     b,
                     &mut ctx.locals,
                     &effective_decls,
                     &HashMap::new(),
                     ctx.type_layouts,
-                    &mut Vec::new(),
-                    "",
+                    &mut ctx.pending_globals,
+                    &block_save_owner,
                     ctx.st,
                 );
                 super::init::init_decls(
