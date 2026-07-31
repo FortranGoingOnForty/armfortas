@@ -61135,18 +61135,6 @@ pub(super) fn emit_runtime_errmsg_on_failure(
     b.set_block(done_bb);
 }
 
-pub(super) fn allocate_char_source_value(
-    b: &mut FuncBuilder,
-    ctx: &LowerCtx,
-    opts: &[IoControl],
-) -> Option<(ValueId, ValueId)> {
-    let expr = allocate_keyword_expr(opts, "source")?;
-    if !expr_is_character_expr(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts)) {
-        return None;
-    }
-    Some(lower_string_expr_ctx(b, ctx, expr))
-}
-
 pub(super) fn allocate_char_mold_len(
     b: &mut FuncBuilder,
     ctx: &LowerCtx,
@@ -62050,7 +62038,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
     dest_base: ValueId,
     dest_ty: &IrType,
     derived_type: Option<&str>,
-    source_expr: &SpannedExpr,
+    source_value: ValueId,
 ) {
     let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
     let zero = b.const_i32(0);
@@ -62061,10 +62049,8 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
 
     b.set_block(init_bb);
     if let Some(type_name) = derived_type {
-        let src = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
-        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, src);
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, source_value);
     } else {
-        let raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
         // Complex(sp/dp) results returned via the ComplexBuffer ABI
         // come back as a pointer to a fresh 8/16-byte buffer holding
         // the lane pair.  Depending on the call site that pointer is
@@ -62079,7 +62065,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
         // `allocate(mean_, source = mean(x, 1, mask))` where mean
         // returns scalar complex(sp).
         if is_complex_ty(dest_ty) {
-            let raw_ty = b.func().value_type(raw);
+            let raw_ty = b.func().value_type(source_value);
             let raw_is_complex_buffer = matches!(
                 raw_ty,
                 Some(IrType::Ptr(ref inner)) if matches!(
@@ -62094,7 +62080,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
                 let bytes = b.const_i64(complex_byte_size(dest_ty));
                 b.call(
                     FuncRef::External("memcpy".into()),
-                    vec![dest_base, raw, bytes],
+                    vec![dest_base, source_value, bytes],
                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 );
                 b.branch(done_bb, vec![]);
@@ -62102,7 +62088,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
                 return;
             }
         }
-        let coerced = coerce_to_type(b, raw, dest_ty);
+        let coerced = coerce_to_type(b, source_value, dest_ty);
         b.store(coerced, dest_base);
     }
     b.branch(done_bb, vec![]);
@@ -62116,7 +62102,7 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     dest_desc: ValueId,
     dest_ty: &IrType,
     derived_type: Option<&str>,
-    source_expr: &SpannedExpr,
+    source_value: ValueId,
 ) {
     let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
@@ -62133,8 +62119,6 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     );
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
-    let scalar_raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
-
     let elem_bytes = if let Some(type_name) = derived_type {
         ctx.type_layouts
             .get(type_name)
@@ -62148,9 +62132,9 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     let elem_bytes_val = b.const_i64(elem_bytes);
 
     let complex_scalar_src = if is_complex_ty(dest_ty) {
-        let raw_ty = b.func().value_type(scalar_raw);
+        let raw_ty = b.func().value_type(source_value);
         Some(match raw_ty {
-            Some(IrType::Ptr(ref inner)) if inner.as_ref() == dest_ty => scalar_raw,
+            Some(IrType::Ptr(ref inner)) if inner.as_ref() == dest_ty => source_value,
             Some(IrType::Ptr(ref inner))
                 if matches!(
                     inner.as_ref(),
@@ -62160,15 +62144,15 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
                                 && (*n == 8 || *n == 16))
                 ) || matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) =>
             {
-                scalar_raw
+                source_value
             }
-            _ => materialize_complex_operand(b, scalar_raw, complex_float_width(dest_ty)),
+            _ => materialize_complex_operand(b, source_value, complex_float_width(dest_ty)),
         })
     } else {
         None
     };
     let scalar = if derived_type.is_none() && complex_scalar_src.is_none() {
-        Some(coerce_to_type(b, scalar_raw, dest_ty))
+        Some(coerce_to_type(b, source_value, dest_ty))
     } else {
         None
     };
@@ -62193,7 +62177,7 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     let dest_off = b.imul(dest_index, elem_bytes_val);
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
     if let Some(type_name) = derived_type {
-        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, scalar_raw);
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, source_value);
     } else if let Some(src_ptr) = complex_scalar_src {
         b.call(
             FuncRef::External("memcpy".into()),

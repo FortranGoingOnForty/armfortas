@@ -21,6 +21,23 @@ use super::ctx::{
 };
 use super::helpers::coerce_to_type;
 
+#[derive(Clone, Copy)]
+enum MaterializedAllocateSource {
+    Absent,
+    Descriptor,
+    Scalar(ValueId),
+    Character { ptr: ValueId, len: ValueId },
+}
+
+impl MaterializedAllocateSource {
+    fn character(self) -> Option<(ValueId, ValueId)> {
+        match self {
+            Self::Character { ptr, len } => Some((ptr, len)),
+            _ => None,
+        }
+    }
+}
+
 fn is_unlimited_polymorphic_local(info: &LocalInfo) -> bool {
     info.is_class && info.derived_type.is_none()
 }
@@ -7324,8 +7341,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let typed_vtable = typed_allocate_vtable_value(b, type_spec.as_ref(), ctx.type_layouts);
             let typed_layout = typed_allocate_layout(type_spec.as_ref(), ctx.type_layouts);
             let source_expr = allocate_keyword_expr(opts, "source");
+            let source_rank = source_expr
+                .and_then(|expr| {
+                    actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                })
+                .unwrap_or(0);
+            let source_is_character = source_expr.is_some_and(|expr| {
+                expr_is_character_expr(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts))
+            });
             let source_scalar_desc = allocate_scalar_source_descriptor(b, ctx, opts);
             let source_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "source");
+            let materialized_source = match source_expr {
+                None => MaterializedAllocateSource::Absent,
+                Some(expr) => {
+                    if source_is_character && source_rank == 0 {
+                        let (ptr, len) = lower_string_expr_ctx(b, ctx, expr);
+                        MaterializedAllocateSource::Character { ptr, len }
+                    } else if source_desc.is_some() || source_scalar_desc.is_some() {
+                        MaterializedAllocateSource::Descriptor
+                    } else {
+                        MaterializedAllocateSource::Scalar(super::expr::lower_expr_ctx_tl(
+                            b, ctx, expr,
+                        ))
+                    }
+                }
+            };
+            let source_char = materialized_source.character();
             let mold_desc = allocate_descriptor_keyword_expr(b, ctx, opts, "mold");
             let mold_expr = allocate_keyword_expr(opts, "mold");
             let mold_static_layout = static_concrete_expr_type_layout(ctx, mold_expr);
@@ -7344,6 +7385,16 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 mold_desc
             };
             let shape_desc = source_desc.or(mold_shape_desc).or(source_scalar_desc);
+            let char_alloc_len = typed_char_len
+                .or_else(|| source_char.as_ref().map(|(_, len)| *len))
+                .or_else(|| {
+                    if source_is_character && source_rank > 0 {
+                        source_desc.map(|desc| descriptor_elem_size(b, desc))
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| allocate_char_mold_len(b, ctx, opts));
             let allocate_done_bb = b.create_block("allocate_done");
 
             for (item_idx, item) in items.iter().enumerate() {
@@ -7355,10 +7406,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     b.cond_branch(item_ok, allocate_item_bb, vec![], allocate_done_bb, vec![]);
                     b.set_block(allocate_item_bb);
                 }
-                let source_char = allocate_char_source_value(b, ctx, opts);
-                let char_alloc_len = typed_char_len
-                    .or_else(|| source_char.as_ref().map(|(_, len)| *len))
-                    .or_else(|| allocate_char_mold_len(b, ctx, opts));
                 let component_alloc = match &item.node {
                     Expr::ComponentAccess { .. } => Some((item, &[][..])),
                     Expr::FunctionCall { callee, args }
@@ -7642,65 +7689,61 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
-                                } else if let Some(source_expr) = source_expr {
-                                    if !expr_is_character_expr(
-                                        b,
-                                        &ctx.locals,
-                                        source_expr,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                    ) {
-                                        let init_ty =
-                                            source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
-                                        let dest_base = b.load_typed(
-                                            field_ptr,
-                                            IrType::Ptr(Box::new(init_ty.clone())),
-                                        );
-                                        emit_scalar_allocate_source_init_on_success(
-                                            b,
-                                            ctx,
-                                            stat_addr,
-                                            dest_base,
-                                            init_ty,
-                                            source_scalar_type
-                                                .as_deref()
-                                                .or(field_derived_type_name(&field).as_deref()),
-                                            source_expr,
-                                        );
-                                    } else if field_is_class_star {
-                                        if let Some((src_ptr, src_len)) = source_char {
+                                } else {
+                                    match materialized_source {
+                                        MaterializedAllocateSource::Scalar(source_value) => {
+                                            let init_ty = source_intrinsic_elem_ty
+                                                .as_ref()
+                                                .unwrap_or(&elem_ty);
+                                            let dest_base = b.load_typed(
+                                                field_ptr,
+                                                IrType::Ptr(Box::new(init_ty.clone())),
+                                            );
+                                            emit_scalar_allocate_source_init_on_success(
+                                                b,
+                                                ctx,
+                                                stat_addr,
+                                                dest_base,
+                                                init_ty,
+                                                source_scalar_type
+                                                    .as_deref()
+                                                    .or(field_derived_type_name(&field).as_deref()),
+                                                source_value,
+                                            );
+                                        }
+                                        MaterializedAllocateSource::Character {
+                                            ptr: src_ptr,
+                                            len: src_len,
+                                        } if field_is_class_star => {
                                             emit_scalar_class_star_char_source_copy_on_success(
                                                 b, stat_addr, field_ptr, src_ptr, src_len,
                                             );
                                         }
-                                    } else if let Some((src_ptr, src_len)) = source_char {
-                                        emit_scalar_fixed_char_source_copy_on_success(
+                                        MaterializedAllocateSource::Character {
+                                            ptr: src_ptr,
+                                            len: src_len,
+                                        } => emit_scalar_fixed_char_source_copy_on_success(
                                             b, stat_addr, field_ptr, src_ptr, src_len,
-                                        );
+                                        ),
+                                        MaterializedAllocateSource::Absent
+                                        | MaterializedAllocateSource::Descriptor => {}
                                     }
                                 }
-                            } else if let Some(source_expr) = source_expr {
-                                if !expr_is_character_expr(
+                            } else if let MaterializedAllocateSource::Scalar(source_value) =
+                                materialized_source
+                            {
+                                let init_ty = source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
+                                emit_array_allocate_scalar_source_init_on_success(
                                     b,
-                                    &ctx.locals,
-                                    source_expr,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                ) {
-                                    let init_ty =
-                                        source_intrinsic_elem_ty.as_ref().unwrap_or(&elem_ty);
-                                    emit_array_allocate_scalar_source_init_on_success(
-                                        b,
-                                        ctx,
-                                        stat_addr,
-                                        field_ptr,
-                                        init_ty,
-                                        source_scalar_type
-                                            .as_deref()
-                                            .or(field_derived_type_name(&field).as_deref()),
-                                        source_expr,
-                                    );
-                                }
+                                    ctx,
+                                    stat_addr,
+                                    field_ptr,
+                                    init_ty,
+                                    source_scalar_type
+                                        .as_deref()
+                                        .or(field_derived_type_name(&field).as_deref()),
+                                    source_value,
+                                );
                             }
                             // Polymorphic metadata (tag + vtable) for both
                             // scalars and arrays; a polymorphic array
@@ -8133,65 +8176,61 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         ctx.type_layouts,
                                         errmsg_target.as_ref(),
                                     );
-                                } else if let Some(source_expr) = source_expr {
-                                    if !expr_is_character_expr(
-                                        b,
-                                        &ctx.locals,
-                                        source_expr,
-                                        ctx.st,
-                                        Some(ctx.type_layouts),
-                                    ) {
-                                        let init_ty =
-                                            source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
-                                        let dest_base = b.load_typed(
-                                            desc,
-                                            IrType::Ptr(Box::new(init_ty.clone())),
-                                        );
-                                        emit_scalar_allocate_source_init_on_success(
-                                            b,
-                                            ctx,
-                                            stat_addr,
-                                            dest_base,
-                                            init_ty,
-                                            source_scalar_type
-                                                .as_deref()
-                                                .or(info.derived_type.as_deref()),
-                                            source_expr,
-                                        );
-                                    } else if local_is_class_star {
-                                        if let Some((src_ptr, src_len)) = source_char {
+                                } else {
+                                    match materialized_source {
+                                        MaterializedAllocateSource::Scalar(source_value) => {
+                                            let init_ty = source_intrinsic_elem_ty
+                                                .as_ref()
+                                                .unwrap_or(&info.ty);
+                                            let dest_base = b.load_typed(
+                                                desc,
+                                                IrType::Ptr(Box::new(init_ty.clone())),
+                                            );
+                                            emit_scalar_allocate_source_init_on_success(
+                                                b,
+                                                ctx,
+                                                stat_addr,
+                                                dest_base,
+                                                init_ty,
+                                                source_scalar_type
+                                                    .as_deref()
+                                                    .or(info.derived_type.as_deref()),
+                                                source_value,
+                                            );
+                                        }
+                                        MaterializedAllocateSource::Character {
+                                            ptr: src_ptr,
+                                            len: src_len,
+                                        } if local_is_class_star => {
                                             emit_scalar_class_star_char_source_copy_on_success(
                                                 b, stat_addr, desc, src_ptr, src_len,
                                             );
                                         }
-                                    } else if let Some((src_ptr, src_len)) = source_char {
-                                        emit_scalar_fixed_char_source_copy_on_success(
+                                        MaterializedAllocateSource::Character {
+                                            ptr: src_ptr,
+                                            len: src_len,
+                                        } => emit_scalar_fixed_char_source_copy_on_success(
                                             b, stat_addr, desc, src_ptr, src_len,
-                                        );
+                                        ),
+                                        MaterializedAllocateSource::Absent
+                                        | MaterializedAllocateSource::Descriptor => {}
                                     }
                                 }
-                            } else if let Some(source_expr) = source_expr {
-                                if !expr_is_character_expr(
+                            } else if let MaterializedAllocateSource::Scalar(source_value) =
+                                materialized_source
+                            {
+                                let init_ty = source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
+                                emit_array_allocate_scalar_source_init_on_success(
                                     b,
-                                    &ctx.locals,
-                                    source_expr,
-                                    ctx.st,
-                                    Some(ctx.type_layouts),
-                                ) {
-                                    let init_ty =
-                                        source_intrinsic_elem_ty.as_ref().unwrap_or(&info.ty);
-                                    emit_array_allocate_scalar_source_init_on_success(
-                                        b,
-                                        ctx,
-                                        stat_addr,
-                                        desc,
-                                        init_ty,
-                                        source_scalar_type
-                                            .as_deref()
-                                            .or(info.derived_type.as_deref()),
-                                        source_expr,
-                                    );
-                                }
+                                    ctx,
+                                    stat_addr,
+                                    desc,
+                                    init_ty,
+                                    source_scalar_type
+                                        .as_deref()
+                                        .or(info.derived_type.as_deref()),
+                                    source_value,
+                                );
                             }
                             // Polymorphic metadata (dynamic type tag and
                             // vtable pointer) is set for both scalars and
@@ -8385,6 +8424,25 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.branch(allocate_done_bb, vec![]);
             }
             b.set_block(allocate_done_bb);
+            if let (Some(source_expr), Some((source_ptr, _))) = (source_expr, source_char) {
+                deallocate_owned_string_expr_temp(
+                    b,
+                    &ctx.locals,
+                    source_expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    source_ptr,
+                );
+            }
+            if let (Some(source_expr), Some(source_desc)) = (source_expr, source_desc) {
+                deallocate_array_expr_descriptor_if_temp(
+                    b,
+                    &ctx.locals,
+                    source_expr,
+                    ctx.st,
+                    source_desc,
+                );
+            }
             super::core::emit_allocate_status_writeback(b, &stat_target);
         }
 
