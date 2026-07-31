@@ -1182,6 +1182,34 @@ enum FixedLine {
     },
 }
 
+fn is_fixed_comment_record(line: &str) -> bool {
+    matches!(
+        line.as_bytes().first().copied(),
+        Some(b'C' | b'c' | b'*' | b'!')
+    )
+}
+
+fn fixed_comment_record(line: &str, file_id: u32, line_num: u32) -> FixedLine {
+    FixedLine::Comment {
+        text: line.to_string(),
+        span: Span {
+            file_id,
+            start: Position {
+                line: line_num,
+                col: 1,
+            },
+            end: Position {
+                line: line_num,
+                col: line.len() as u32,
+            },
+        },
+    }
+}
+
+fn is_fixed_continuation_gap(line: &str) -> bool {
+    line.trim().is_empty() || is_fixed_comment_record(line)
+}
+
 /// Preprocess fixed-form lines: identify comments, extract labels, join
 /// continuations, strip columns 73+, handle tab-form.
 fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine> {
@@ -1212,24 +1240,9 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
             continue;
         }
 
-        let first_byte = line.as_bytes().first().copied().unwrap_or(0);
-
         // Comment line: C, c, *, or ! in column 1.
-        if matches!(first_byte, b'C' | b'c' | b'*' | b'!') {
-            result.push(FixedLine::Comment {
-                text: line.to_string(),
-                span: Span {
-                    file_id,
-                    start: Position {
-                        line: line_num,
-                        col: 1,
-                    },
-                    end: Position {
-                        line: line_num,
-                        col: line.len() as u32,
-                    },
-                },
-            });
+        if is_fixed_comment_record(line) {
+            result.push(fixed_comment_record(line, file_id, line_num));
             i += 1;
             continue;
         }
@@ -1243,46 +1256,32 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
         i += 1;
 
         while i < lines.len() {
-            let next = lines[i];
-
-            // Blank lines between continuations: skip them only if the line
-            // after the blank is actually a continuation. Otherwise, the blank
-            // terminates the statement and should be emitted by the outer loop.
-            if next.trim().is_empty() {
-                // Peek ahead: is the line after this blank a continuation?
-                let lookahead = i + 1;
-                if lookahead < lines.len()
-                    && is_continuation_line_impl(lines[lookahead], source_view)
-                {
-                    i += 1;
-                    continue;
-                }
-                break; // blank line ends the statement
+            // Decide a complete blank/comment run before consuming any of it:
+            // it belongs to this statement only when a continuation follows.
+            let gap_start = i;
+            let mut gap_end = gap_start;
+            while gap_end < lines.len() && is_fixed_continuation_gap(lines[gap_end]) {
+                gap_end += 1;
             }
-
-            let next_first = next.as_bytes().first().copied().unwrap_or(0);
-            // Comment lines between continuations: skip them.
-            if matches!(next_first, b'C' | b'c' | b'*' | b'!') {
-                // Emit the comment but don't break the continuation.
-                result.push(FixedLine::Comment {
-                    text: next.to_string(),
-                    span: Span {
-                        file_id,
-                        start: Position {
-                            line: (i + 1) as u32,
-                            col: 1,
-                        },
-                        end: Position {
-                            line: (i + 1) as u32,
-                            col: next.len() as u32,
-                        },
-                    },
-                });
-                i += 1;
-                continue;
+            if gap_end > gap_start {
+                if gap_end == lines.len() || !is_continuation_line_impl(lines[gap_end], source_view)
+                {
+                    break;
+                }
+                for (offset, gap) in lines[gap_start..gap_end].iter().enumerate() {
+                    if is_fixed_comment_record(gap) {
+                        result.push(fixed_comment_record(
+                            gap,
+                            file_id,
+                            (gap_start + offset + 1) as u32,
+                        ));
+                    }
+                }
+                i = gap_end;
             }
 
             // Check column 6 for continuation marker.
+            let next = lines[i];
             if is_continuation_line_impl(next, source_view) {
                 let (_, cont_body, cont_col) = extract_fixed_columns(next, source_view);
                 full_body.append(MappedFixedText::from_piece(
@@ -2069,6 +2068,80 @@ C     Hello World
             int_count, 2,
             "blank line should not break continuation, got: {:?}",
             kinds
+        );
+    }
+
+    #[test]
+    fn continuation_crosses_complete_blank_and_comment_gap_run() {
+        let src = concat!(
+            "      X = 1 +\n",
+            "\n",
+            "C first gap comment\n",
+            "\n",
+            "! second gap comment\n",
+            "\n",
+            "     +  2\n",
+        );
+        let lines = preprocess_lines(src, 0, false);
+        let statements = lines
+            .iter()
+            .filter(|line| matches!(line, FixedLine::Statement { .. }))
+            .count();
+
+        assert_eq!(
+            statements, 1,
+            "the continuation body became a standalone statement"
+        );
+        let two = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::IntegerLiteral && token.text == "2")
+            .expect("missing continued integer literal");
+        assert_eq!(two.span.start, Position { line: 7, col: 9 });
+    }
+
+    #[test]
+    fn noncontinuation_after_gap_run_preserves_physical_order() {
+        let src = "      X = 1\nC boundary comment\n\n      Y = 2\n";
+        let lines = preprocess_lines(src, 0, false);
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| match line {
+                FixedLine::Statement { .. } => "statement",
+                FixedLine::Comment { .. } => "comment",
+                FixedLine::Blank { .. } => "blank",
+            })
+            .collect();
+
+        assert_eq!(kinds, ["statement", "comment", "blank", "statement"]);
+    }
+
+    #[test]
+    fn continuation_crosses_large_gap_run_iteratively() {
+        const GAP_LINES: usize = 20_000;
+        let mut src = String::from("      X = 1 +\n");
+        for index in 0..GAP_LINES {
+            if index % 2 == 0 {
+                src.push('\n');
+            } else {
+                src.push_str("C gap comment\n");
+            }
+        }
+        src.push_str("     +  2\n");
+
+        let lines = preprocess_lines(&src, 0, false);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line, FixedLine::Statement { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line, FixedLine::Comment { .. }))
+                .count(),
+            GAP_LINES / 2
         );
     }
 
