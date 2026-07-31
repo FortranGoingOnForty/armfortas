@@ -33622,6 +33622,26 @@ fn orphan_fixed_form_continuation_diagnostic_points_to_marker() {
 }
 
 #[test]
+fn unterminated_fixed_dot_operator_diagnostic_points_to_opening_dot() {
+    let source = write_program("      X=A.EQ\n", "f");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:10: error:", source.display())),
+        "dot-operator diagnostic used the wrong location: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected closing '.' after .EQ"),
+        "dot-operator diagnostic used the wrong message: {stderr}"
+    );
+    assert_diagnostic_caret(&stderr, "      X=A.EQ", '.');
+
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
 fn garbage_text_is_rejected_as_parse_error() {
     let src = write_program("this is garbage\n", "f90");
     let out = unique_path("garbage", "bin");

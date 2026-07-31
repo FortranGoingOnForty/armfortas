@@ -535,16 +535,55 @@ fn lex_fixed_dot_op(
         end += 1;
     }
 
-    if end < bytes.len() && bytes[end] == b'.' {
-        end += 1; // closing dot
+    let col = (pos as u32) + 7;
+    let start = Position { line, col };
+
+    if name.is_empty() {
+        if end < bytes.len() && bytes[end] == b'.' {
+            end += 1;
+            return Ok((
+                Token {
+                    kind: TokenKind::Identifier,
+                    text: "..".into(),
+                    span: Span {
+                        file_id,
+                        start,
+                        end: Position {
+                            line,
+                            col: col + (end - pos) as u32,
+                        },
+                    },
+                },
+                end - pos,
+            ));
+        }
+        return Err(LexError {
+            span: Span {
+                file_id,
+                start,
+                end: start,
+            },
+            msg: "unexpected '.'".into(),
+        });
     }
 
+    if end == bytes.len() || bytes[end] != b'.' {
+        return Err(LexError {
+            span: Span {
+                file_id,
+                start,
+                end: start,
+            },
+            msg: format!("expected closing '.' after .{name}"),
+        });
+    }
+    end += 1;
+
     let lower = name.to_lowercase();
-    let col = (pos as u32) + 7;
     let tok_text = format!(".{}.", name);
     let span = Span {
         file_id,
-        start: Position { line, col },
+        start,
         end: Position {
             line,
             col: col + (end - pos) as u32,
@@ -2062,6 +2101,34 @@ C     Hello World
                 TokenKind::Identifier,
             ]
         );
+    }
+
+    #[test]
+    fn fixed_dot_operator_requires_a_closing_dot() {
+        let err = tokenize_fixed("      X=A.EQ\n", 0).unwrap_err();
+
+        assert_eq!(err.span.start, Position { line: 1, col: 10 });
+        assert_eq!(err.msg, "expected closing '.' after .EQ");
+    }
+
+    #[test]
+    fn lone_dot_is_not_synthesized_into_assumed_rank() {
+        let err = tokenize_fixed("      X=.\n", 0).unwrap_err();
+
+        assert_eq!(err.span.start, Position { line: 1, col: 9 });
+        assert_eq!(err.msg, "unexpected '.'");
+    }
+
+    #[test]
+    fn double_dot_preserves_assumed_rank_token() {
+        let token = fixed_toks("      X=..\n")
+            .into_iter()
+            .find(|token| token.text == "..")
+            .expect("missing assumed-rank token");
+
+        assert_eq!(token.kind, TokenKind::Identifier);
+        assert_eq!(token.span.start, Position { line: 1, col: 9 });
+        assert_eq!(token.span.end, Position { line: 1, col: 11 });
     }
 
     #[test]
