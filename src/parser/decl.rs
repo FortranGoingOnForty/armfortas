@@ -1174,10 +1174,8 @@ impl<'a> Parser<'a> {
                         let ptr_init = if self.eat(&TokenKind::Arrow) {
                             if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                if self.peek() == &TokenKind::LParen {
-                                    self.advance();
-                                    self.expect(&TokenKind::RParen)?;
-                                }
+                                self.expect(&TokenKind::LParen)?;
+                                self.expect(&TokenKind::RParen)?;
                                 // Leave ptr_init as None for `=> null()`
                                 // (matches the legacy behaviour, where
                                 // the field is zero-initialised).

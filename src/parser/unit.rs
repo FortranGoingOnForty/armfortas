@@ -978,10 +978,8 @@ impl<'a> Parser<'a> {
                         let ptr_init = if self.eat(&TokenKind::Arrow) {
                             if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                if self.peek() == &TokenKind::LParen {
-                                    self.advance();
-                                    self.expect(&TokenKind::RParen)?;
-                                }
+                                self.expect(&TokenKind::LParen)?;
+                                self.expect(&TokenKind::RParen)?;
                                 None
                             } else {
                                 Some(self.parse_expr()?)
@@ -1828,6 +1826,94 @@ end program test
         ));
         assert!(entities[1].ptr_init.is_none());
         assert!(entities[2].ptr_init.is_none());
+    }
+
+    #[test]
+    fn procedure_pointer_null_initializer_requires_an_opening_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+program malformed
+  procedure(callback), pointer :: handler => null
+end program malformed
+",
+            ),
+            parse_fixed_error(concat!(
+                "      PROGRAM MALFORMED\n",
+                "      PROCEDURE(CALLBACK),POINTER::HANDLER=>NULL\n",
+                "      ENDPROGRAMMALFORMED\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected ("), "{error}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_null_initializer_requires_a_closing_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+program malformed
+  procedure(callback), pointer :: handler => null(
+end program malformed
+",
+            ),
+            parse_fixed_error(concat!(
+                "      PROGRAM MALFORMED\n",
+                "      PROCEDURE(CALLBACK),POINTER::HANDLER=>NULL(\n",
+                "      ENDPROGRAMMALFORMED\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected )"), "{error}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_component_null_initializer_requires_an_opening_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+module malformed_m
+  type :: holder
+    procedure(callback), pointer, nopass :: handler => null
+  end type holder
+end module malformed_m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE MALFORMED_M\n",
+                "      TYPE HOLDER\n",
+                "      PROCEDURE(CALLBACK),POINTER,NOPASS::HANDLER=>NULL\n",
+                "      ENDTYPEHOLDER\n",
+                "      ENDMODULEMALFORMED_M\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected ("), "{error}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_component_null_initializer_requires_a_closing_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+module malformed_m
+  type :: holder
+    procedure(callback), pointer, nopass :: handler => null(
+  end type holder
+end module malformed_m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE MALFORMED_M\n",
+                "      TYPE HOLDER\n",
+                "      PROCEDURE(CALLBACK),POINTER,NOPASS::HANDLER=>NULL(\n",
+                "      ENDTYPEHOLDER\n",
+                "      ENDMODULEMALFORMED_M\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected )"), "{error}");
+        }
     }
 
     #[test]
