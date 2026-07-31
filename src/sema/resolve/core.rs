@@ -3184,6 +3184,68 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     }
                 }
             }
+            Decl::AttributeStmt {
+                attr: Attribute::Volatile,
+                entities,
+            } => {
+                for entity in entities {
+                    let key = entity.to_ascii_lowercase();
+                    let implicit_type = st.implicit_type(entity).map(implicit_type_to_type_info);
+                    let current_scope = st.current_scope();
+                    if let Some(symbol) = st.scope_mut(current_scope).symbols.get_mut(&key) {
+                        if symbol.kind != SymbolKind::Variable {
+                            return Err(SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "'{}' in a VOLATILE statement is not a variable",
+                                    entity
+                                ),
+                            });
+                        }
+                        if symbol.type_info.is_none() {
+                            symbol.type_info = Some(implicit_type.ok_or_else(|| SemaError {
+                                span: decl.span,
+                                msg: format!("VOLATILE entity '{}' has no implicit type", entity),
+                            })?);
+                        }
+                        symbol.attrs.volatile = true;
+                    } else if let Some(symbol) = st.lookup(entity) {
+                        if symbol.kind != SymbolKind::Variable {
+                            return Err(SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "'{}' in a VOLATILE statement is not a variable",
+                                    entity
+                                ),
+                            });
+                        }
+                        // A USE- or host-associated object can acquire
+                        // VOLATILE in this scope. The standalone AST node is
+                        // the scope-local overlay; do not invent shadow
+                        // storage or mutate the defining scope's symbol.
+                    } else {
+                        let type_info = implicit_type.ok_or_else(|| SemaError {
+                            span: decl.span,
+                            msg: format!("VOLATILE entity '{}' has no implicit type", entity),
+                        })?;
+                        st.define(Symbol {
+                            name: entity.clone(),
+                            kind: SymbolKind::Variable,
+                            type_info: Some(type_info),
+                            attrs: SymbolAttrs {
+                                access: st.default_access(current_scope),
+                                volatile: true,
+                                ..Default::default()
+                            },
+                            defined_at: decl.span,
+                            scope: current_scope,
+                            arg_names: vec![],
+                            const_value: None,
+                            const_char_value: None,
+                        })?;
+                    }
+                }
+            }
             Decl::DimensionStmt { entities } => {
                 for entity in entities {
                     let key = entity.name.to_ascii_lowercase();
@@ -3990,6 +4052,41 @@ end module result_parent
             "program test\n\
                implicit none\n\
                dimension :: x(3)\n\
+             end program test\n",
+        );
+        assert!(
+            error.msg.contains("has no implicit type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn standalone_volatile_declares_an_implicitly_typed_entity() {
+        let st = resolve_source(
+            "program test\n\
+               implicit integer (w-w)\n\
+               volatile :: watched\n\
+             end program test\n",
+        );
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap();
+        let symbol = program_scope
+            .symbols
+            .get("watched")
+            .expect("VOLATILE entity should be declared");
+        assert_eq!(symbol.type_info, Some(TypeInfo::Integer { kind: None }));
+        assert!(symbol.attrs.volatile);
+    }
+
+    #[test]
+    fn standalone_volatile_obeys_implicit_none() {
+        let error = resolve_error(
+            "program test\n\
+               implicit none\n\
+               volatile :: watched\n\
              end program test\n",
         );
         assert!(

@@ -2232,7 +2232,11 @@ fn unit_needs_resolved_decl_normalization(unit: &SpannedUnit) -> bool {
             Decl::TypeDecl { type_spec, .. } => {
                 matches!(type_spec, TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_))
             }
-            Decl::DimensionStmt { .. } => true,
+            Decl::DimensionStmt { .. }
+            | Decl::AttributeStmt {
+                attr: crate::ast::decl::Attribute::Volatile,
+                ..
+            } => true,
             _ => false,
         })
     }
@@ -2270,9 +2274,9 @@ fn unit_needs_resolved_decl_normalization(unit: &SpannedUnit) -> bool {
 /// resolution, recursing through CONTAINS.
 ///
 /// TYPEOF/CLASSOF specs become their resolved concrete type. Remaining
-/// standalone DIMENSION nodes denote implicitly typed entities and become
-/// ordinary TypeDecl nodes, keeping every lowering pre-pass and allocation
-/// site on the canonical typed-declaration path.
+/// standalone DIMENSION and VOLATILE nodes denote implicitly typed entities
+/// and become ordinary TypeDecl nodes, keeping every lowering pre-pass and
+/// allocation site on the canonical typed-declaration path.
 fn normalize_resolved_decls(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
     for unit in units {
         normalize_resolved_decls_in_unit(&mut unit.node, st, 0);
@@ -2373,11 +2377,100 @@ fn normalize_resolved_decls_in_unit(
 
     rewrite_typeof_decls(decls, st, Some(scope_id));
     rewrite_dimension_decls(decls, st, Some(scope_id));
+    rewrite_implicit_volatile_decls(decls, st, Some(scope_id));
     if let Some(contains) = contains {
         for contained in contains {
             normalize_resolved_decls_in_unit(&mut contained.node, st, scope_id);
         }
     }
+}
+
+fn rewrite_implicit_volatile_decls(
+    decls: &mut Vec<crate::ast::decl::SpannedDecl>,
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+) {
+    use crate::ast::decl::{Attribute, Decl, EntityDecl, LenSpec};
+
+    let Some(scope_id) = scope_id else {
+        return;
+    };
+    let mut volatile_entities = Vec::new();
+    let mut rewritten = Vec::with_capacity(decls.len());
+    for decl in std::mem::take(decls) {
+        let crate::ast::Spanned { node, span } = decl;
+        let Decl::AttributeStmt {
+            attr: Attribute::Volatile,
+            entities,
+        } = node
+        else {
+            rewritten.push(crate::ast::Spanned::new(node, span));
+            continue;
+        };
+
+        for entity in entities {
+            volatile_entities.push((entity, span));
+        }
+    }
+
+    for (entity, span) in volatile_entities {
+        if crate::ast::decl::fold_attribute_into_type_decl(
+            &mut rewritten,
+            &entity,
+            &Attribute::Volatile,
+        ) {
+            continue;
+        }
+
+        let key = entity.to_ascii_lowercase();
+        let Some(symbol) = st.scope(scope_id).symbols.get(&key) else {
+            if st.lookup_in(scope_id, &key).is_some() {
+                rewritten.push(crate::ast::Spanned::new(
+                    Decl::AttributeStmt {
+                        attr: Attribute::Volatile,
+                        entities: vec![entity],
+                    },
+                    span,
+                ));
+                continue;
+            }
+            panic!(
+                "resolved VOLATILE entity '{}' is missing from scope {}",
+                entity, scope_id
+            );
+        };
+        let type_info = symbol.type_info.as_ref().unwrap_or_else(|| {
+            panic!("resolved VOLATILE entity '{}' has no concrete type", entity)
+        });
+        let type_spec = type_info_to_type_spec(Some(type_info));
+        let char_len = match type_info {
+            crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
+                Some(LenSpec::Expr(synth_int_literal_expr(*len)))
+            }
+            crate::sema::symtab::TypeInfo::Character { len: None, .. } => Some(LenSpec::Star),
+            _ => None,
+        };
+        let array_spec = if symbol.attrs.array_spec.is_empty() {
+            None
+        } else {
+            Some(symbol.attrs.array_spec.clone())
+        };
+        rewritten.push(crate::ast::Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs: sym_attrs_to_decl_attrs(&symbol.attrs),
+                entities: vec![EntityDecl {
+                    name: entity,
+                    array_spec,
+                    char_len,
+                    init: None,
+                    ptr_init: None,
+                }],
+            },
+            span,
+        ));
+    }
+    *decls = rewritten;
 }
 
 fn rewrite_dimension_decls(
@@ -4643,6 +4736,15 @@ pub(super) fn collect_decl_spec_import_names(
 ) -> HashSet<String> {
     let mut refs = Vec::new();
     collect_name_refs_decls(decls, &mut refs);
+    for decl in decls {
+        if let Decl::AttributeStmt {
+            attr: crate::ast::decl::Attribute::Volatile,
+            entities,
+        } = &decl.node
+        {
+            refs.extend(entities.iter().cloned());
+        }
+    }
 
     let mut declared = HashSet::new();
     for decl in decls {

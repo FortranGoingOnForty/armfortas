@@ -193,6 +193,68 @@ pub enum Attribute {
     Private,
 }
 
+/// Apply `attr` to the type declaration of entity `name`, splitting a
+/// multi-entity declaration so only `name` acquires the attribute.
+///
+/// Returns `false` when no type declaration in `decls` declares `name`.
+/// Parser folding and post-sema declaration normalization share this
+/// transform so their entity-level attribute behavior cannot drift.
+pub(crate) fn fold_attribute_into_type_decl(
+    decls: &mut Vec<SpannedDecl>,
+    name: &str,
+    attr: &Attribute,
+) -> bool {
+    let mut found: Option<(usize, usize, usize)> = None;
+    for (decl_index, decl) in decls.iter().enumerate() {
+        if let Decl::TypeDecl { entities, .. } = &decl.node {
+            if let Some(entity_index) = entities
+                .iter()
+                .position(|entity| entity.name.eq_ignore_ascii_case(name))
+            {
+                found = Some((decl_index, entity_index, entities.len()));
+                break;
+            }
+        }
+    }
+    let Some((decl_index, entity_index, entity_count)) = found else {
+        return false;
+    };
+
+    if entity_count == 1 {
+        if let Decl::TypeDecl { attrs, .. } = &mut decls[decl_index].node {
+            if !attrs.iter().any(|existing| existing == attr) {
+                attrs.push(attr.clone());
+            }
+        }
+    } else {
+        let span = decls[decl_index].span;
+        let (type_spec, mut attrs, entity) = match &mut decls[decl_index].node {
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities,
+            } => (
+                type_spec.clone(),
+                attrs.clone(),
+                entities.remove(entity_index),
+            ),
+            _ => unreachable!(),
+        };
+        if !attrs.iter().any(|existing| existing == attr) {
+            attrs.push(attr.clone());
+        }
+        decls.push(Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities: vec![entity],
+            },
+            span,
+        ));
+    }
+    true
+}
+
 /// Intent specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {

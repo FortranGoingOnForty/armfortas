@@ -9284,7 +9284,7 @@ fn volatile_scalar_accesses_survive_every_optimization_level() {
     let src = write_program_in(
         &dir,
         "volatile_scalar.f90",
-        "subroutine touch_volatile()\n  implicit none\n  integer, volatile :: watched\n  integer :: sink\n\n  watched = 41\n  sink = watched\nend subroutine touch_volatile\n\nsubroutine touch_standalone()\n  implicit none\n  integer :: watched\n  integer :: sink\n  volatile :: watched\n\n  watched = 42\n  sink = watched\nend subroutine touch_standalone\n\nsubroutine touch_dummy(watched)\n  implicit none\n  integer, volatile, intent(inout) :: watched\n  integer :: sink\n\n  sink = watched\n  watched = sink + 1\nend subroutine touch_dummy\n\nsubroutine touch_array()\n  implicit none\n  integer, volatile :: watched(2)\n  integer :: sink\n\n  watched(1) = 43\n  sink = watched(1)\nend subroutine touch_array\n\nsubroutine touch_loop()\n  implicit none\n  integer, volatile :: watched(4)\n  integer :: sink\n  integer :: i\n\n  do i = 1, 4\n    watched(i) = i\n    sink = watched(i)\n  end do\nend subroutine touch_loop\n\nsubroutine touch_nonvolatile()\n  implicit none\n  integer :: ordinary\n  integer :: sink\n\n  ordinary = 44\n  sink = ordinary\nend subroutine touch_nonvolatile\n",
+        "subroutine touch_volatile()\n  implicit none\n  integer, volatile :: watched\n  integer :: sink\n\n  watched = 41\n  sink = watched\nend subroutine touch_volatile\n\nsubroutine touch_standalone()\n  implicit none\n  integer :: watched\n  integer :: sink\n  volatile :: watched\n\n  watched = 42\n  sink = watched\nend subroutine touch_standalone\n\nsubroutine touch_implicit()\n  volatile :: watched\n  integer :: sink\n\n  watched = 42.5\n  sink = int(watched)\nend subroutine touch_implicit\n\nsubroutine touch_dummy(watched)\n  implicit none\n  integer, volatile, intent(inout) :: watched\n  integer :: sink\n\n  sink = watched\n  watched = sink + 1\nend subroutine touch_dummy\n\nsubroutine touch_array()\n  implicit none\n  integer, volatile :: watched(2)\n  integer :: sink\n\n  watched(1) = 43\n  sink = watched(1)\nend subroutine touch_array\n\nsubroutine touch_loop()\n  implicit none\n  integer, volatile :: watched(4)\n  integer :: sink\n  integer :: i\n\n  do i = 1, 4\n    watched(i) = i\n    sink = watched(i)\n  end do\nend subroutine touch_loop\n\nsubroutine touch_nonvolatile()\n  implicit none\n  integer :: ordinary\n  integer :: sink\n\n  ordinary = 44\n  sink = ordinary\nend subroutine touch_nonvolatile\n",
     );
 
     for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
@@ -9313,12 +9313,62 @@ fn volatile_scalar_accesses_survive_every_optimization_level() {
         let volatile_stores = ir_text.matches("volatile_store").count();
         let volatile_loads = ir_text.matches("volatile_load").count();
         assert_eq!(
-            volatile_stores, 5,
-            "{optimization}: each scalar, dummy, array, and loop-body VOLATILE store must remain exactly once in static IR while the ordinary boundary stays nonvolatile:\n{ir_text}"
+            volatile_stores, 6,
+            "{optimization}: each explicit, standalone, implicitly typed, dummy, array, and loop-body VOLATILE store must remain exactly once in static IR while the ordinary boundary stays nonvolatile:\n{ir_text}"
         );
         assert_eq!(
-            volatile_loads, 5,
-            "{optimization}: each scalar, dummy, array, and loop-body VOLATILE load must remain exactly once in static IR even when its result is dead, while the ordinary boundary stays nonvolatile:\n{ir_text}"
+            volatile_loads, 6,
+            "{optimization}: each explicit, standalone, implicitly typed, dummy, array, and loop-body VOLATILE load must remain exactly once in static IR even when its result is dead, while the ordinary boundary stays nonvolatile:\n{ir_text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn standalone_dimension_and_volatile_share_one_module_global() {
+    let dir = unique_dir("volatile_dimension_global");
+    let src = write_program_in(
+        &dir,
+        "provider.f90",
+        "module implicit_volatile_array\n  dimension :: watched(2)\n  volatile :: watched\nend module implicit_volatile_array\n",
+    );
+
+    for optimization in ["-O0", "-O3", "-Ofast"] {
+        let ir = dir.join(format!(
+            "provider_{}.ir",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "--emit-ir",
+                src.to_str().unwrap(),
+                "-o",
+                ir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("standalone DIMENSION/VOLATILE IR compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: standalone DIMENSION/VOLATILE module should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let ir_text =
+            std::fs::read_to_string(&ir).expect("cannot read DIMENSION/VOLATILE module IR");
+        let global = "global @afs_mod_implicit_volatile_array_watched:";
+        assert_eq!(
+            ir_text.matches(global).count(),
+            1,
+            "{optimization}: standalone attributes must normalize to one module global:\n{ir_text}"
+        );
+        assert!(
+            ir_text.contains(
+                "global @afs_mod_implicit_volatile_array_watched: [f32 x 2] = zeroinit"
+            ),
+            "{optimization}: the sole module global must retain its implicit type and DIMENSION shape:\n{ir_text}"
         );
     }
 

@@ -1488,8 +1488,10 @@ impl<'a> Parser<'a> {
 /// on only its entity: `integer :: y, z` + `allocatable :: y` becomes
 /// `integer :: z` and `integer, allocatable :: y`. An entity with no type
 /// declaration in this scope — e.g. a function result typed by its function
-/// statement — has no fold target; its statement is left in place (inert),
-/// and the allocatable-result ABI remains a separate concern.
+/// statement — has no fold target, so its statement remains available for
+/// semantic resolution. Lowering normalizes semantically typed standalone
+/// VOLATILE entities later; other result-attribute ABIs remain separate
+/// concerns.
 fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
     use crate::ast::decl::{Attribute, Decl};
     let mut i = 0;
@@ -1513,7 +1515,7 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
         };
         let unfolded: Vec<String> = entities
             .into_iter()
-            .filter(|name| !fold_one_attribute(decls, name, &attr))
+            .filter(|name| !crate::ast::decl::fold_attribute_into_type_decl(decls, name, &attr))
             .collect();
         if unfolded.is_empty() {
             decls.remove(i); // fully folded — drop the now-redundant statement
@@ -1524,64 +1526,6 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
             i += 1;
         }
     }
-}
-
-/// Apply `attr` to the type declaration of entity `name`, splitting a
-/// multi-entity declaration so only `name` gets it. Returns false if no type
-/// declaration in `decls` declares `name`.
-fn fold_one_attribute(
-    decls: &mut Vec<SpannedDecl>,
-    name: &str,
-    attr: &crate::ast::decl::Attribute,
-) -> bool {
-    use crate::ast::decl::Decl;
-    let mut found: Option<(usize, usize, usize)> = None;
-    for (di, d) in decls.iter().enumerate() {
-        if let Decl::TypeDecl { entities, .. } = &d.node {
-            if let Some(ei) = entities
-                .iter()
-                .position(|e| e.name.eq_ignore_ascii_case(name))
-            {
-                found = Some((di, ei, entities.len()));
-                break;
-            }
-        }
-    }
-    let Some((di, ei, count)) = found else {
-        return false;
-    };
-    if count == 1 {
-        if let Decl::TypeDecl { attrs, .. } = &mut decls[di].node {
-            if !attrs.iter().any(|a| a == attr) {
-                attrs.push(attr.clone());
-            }
-        }
-    } else {
-        let span = decls[di].span;
-        let (type_spec, mut new_attrs, ent) = match &mut decls[di].node {
-            Decl::TypeDecl {
-                type_spec,
-                attrs,
-                entities,
-            } => {
-                let ent = entities.remove(ei);
-                (type_spec.clone(), attrs.clone(), ent)
-            }
-            _ => unreachable!(),
-        };
-        if !new_attrs.iter().any(|a| a == attr) {
-            new_attrs.push(attr.clone());
-        }
-        decls.push(Spanned::new(
-            Decl::TypeDecl {
-                type_spec,
-                attrs: new_attrs,
-                entities: vec![ent],
-            },
-            span,
-        ));
-    }
-    true
 }
 
 /// Fold standalone DIMENSION entities into matching type declarations.

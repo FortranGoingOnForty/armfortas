@@ -181,12 +181,12 @@ fn volatile_module_variable_survives_amod_round_trip() {
 
     std::fs::write(
         &module_source,
-        "module volatile_provider\n  implicit none\n  integer, volatile :: watched\nend module volatile_provider\n",
+        "module volatile_provider\n  integer, volatile :: watched\n  volatile :: observed\n  integer :: consumer_marked\nend module volatile_provider\n",
     )
     .unwrap();
     std::fs::write(
         &consumer_source,
-        "subroutine observe_volatile()\n  use volatile_provider, only: watched\n  implicit none\n  integer :: sink\n\n  sink = watched\n  watched = sink + 1\nend subroutine observe_volatile\n",
+        "subroutine observe_volatile()\n  use volatile_provider, only: watched, observed, consumer_marked\n  implicit none\n  volatile :: consumer_marked\n  integer :: sink\n  real :: real_sink\n\n  sink = watched\n  watched = sink + 1\n  real_sink = observed\n  observed = real_sink + 1.0\n  sink = consumer_marked\n  consumer_marked = sink + 2\nend subroutine observe_volatile\n",
     )
     .unwrap();
 
@@ -197,6 +197,23 @@ fn volatile_module_variable_survives_amod_round_trip() {
         amod.lines()
             .any(|line| line.starts_with("@var watched :") && line.contains("volatile")),
         "VOLATILE module-variable metadata must survive serialization:\n{amod}"
+    );
+    assert!(
+        amod.lines()
+            .any(|line| line.starts_with("@var observed :") && line.contains("volatile")),
+        "implicitly typed VOLATILE module-variable metadata must survive serialization:\n{amod}"
+    );
+    let consumer_marked_line = amod
+        .lines()
+        .find(|line| line.starts_with("@var consumer_marked :"))
+        .expect("ordinary module variable should be serialized");
+    let consumer_marked_attrs = consumer_marked_line
+        .split_once(" @ir ")
+        .map(|(attrs, _)| attrs)
+        .expect("module variable metadata should include an IR binding");
+    assert!(
+        !consumer_marked_attrs.contains("volatile"),
+        "a consumer-local VOLATILE overlay must not mutate provider metadata:\n{amod}"
     );
 
     for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
@@ -223,9 +240,15 @@ fn volatile_module_variable_survives_amod_round_trip() {
         );
         let ir_text =
             std::fs::read_to_string(&ir).expect("cannot read volatile consumer IR output");
-        assert!(
-            ir_text.contains("volatile_load") && ir_text.contains("volatile_store"),
-            "{optimization}: imported VOLATILE storage must retain both observable accesses:\n{ir_text}"
+        assert_eq!(
+            ir_text.matches("volatile_load").count(),
+            3,
+            "{optimization}: provider and consumer-local VOLATILE loads must remain observable:\n{ir_text}"
+        );
+        assert_eq!(
+            ir_text.matches("volatile_store").count(),
+            3,
+            "{optimization}: provider and consumer-local VOLATILE stores must remain observable:\n{ir_text}"
         );
     }
 
