@@ -1990,7 +1990,7 @@ impl Preprocessor {
         while bi < body_bytes.len() {
             if body_bytes[bi] == b'#' && bi + 1 < body_bytes.len() && body_bytes[bi + 1] != b'#' {
                 let mut id_start = bi + 1;
-                while id_start < body_bytes.len() && body_bytes[id_start] == b' ' {
+                while id_start < body_bytes.len() && body_bytes[id_start].is_ascii_whitespace() {
                     id_start += 1;
                 }
                 let mut id_end = id_start;
@@ -2001,13 +2001,16 @@ impl Preprocessor {
                 }
                 if id_end > id_start {
                     let id = std::str::from_utf8(&body_bytes[id_start..id_end]).unwrap_or("");
-                    if let Some(&pi) = param_map.get(id) {
-                        let raw = args.get(pi).map(|arg| arg.text.as_str()).unwrap_or("");
-                        body.push_text(
-                            &format!("\"{}\"", raw),
-                            invocation.clone(),
-                            SourceRunKind::Anchor,
-                        );
+                    let raw = if let Some(&pi) = param_map.get(id) {
+                        args.get(pi)
+                    } else if id == "__VA_ARGS__" && def.is_variadic {
+                        Some(&va_args_raw)
+                    } else {
+                        None
+                    };
+                    if let Some(raw) = raw {
+                        let stringified = stringify_macro_argument(&raw.text);
+                        body.push_text(&stringified, invocation.clone(), SourceRunKind::Anchor);
                         bi = id_end;
                         continue;
                     }
@@ -2098,6 +2101,66 @@ fn join_mapped_args(args: &[MappedText], fallback: SourceOrigin) -> MappedText {
         joined.append(arg);
     }
     joined
+}
+
+fn stringify_macro_argument(argument: &str) -> String {
+    let mut stringified = String::with_capacity(argument.len() + 2);
+    stringified.push('"');
+
+    let mut chars = argument.chars().peekable();
+    let mut quote = None;
+    let mut pending_space = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                push_escaped_stringification_char(&mut stringified, ch);
+                if let Some(escaped) = chars.next() {
+                    push_escaped_stringification_char(&mut stringified, escaped);
+                }
+                continue;
+            }
+
+            push_escaped_stringification_char(&mut stringified, ch);
+            if ch == delimiter {
+                if chars.peek() == Some(&delimiter) {
+                    let doubled = chars
+                        .next()
+                        .expect("peeked doubled quote must remain available");
+                    push_escaped_stringification_char(&mut stringified, doubled);
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && stringified.len() > 1 {
+            stringified.push(' ');
+        }
+        pending_space = false;
+
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            push_escaped_stringification_char(&mut stringified, ch);
+        } else {
+            stringified.push(ch);
+        }
+    }
+
+    stringified.push('"');
+    stringified
+}
+
+fn push_escaped_stringification_char(stringified: &mut String, ch: char) {
+    if matches!(ch, '"' | '\\') {
+        stringified.push('\\');
+    }
+    stringified.push(ch);
 }
 
 fn macro_param_is_pasted_left(body: &[u8], start: usize) -> bool {
@@ -4169,14 +4232,67 @@ end program
 
     #[test]
     fn stringification() {
-        let out = pp("#define STR(x) #x\ny = STR(hello)\n");
+        let out = pp("#define STR(x) #x\ny = STR(hello)\nz = STR(   )\n");
         assert!(out.contains("y = \"hello\""));
+        assert!(out.contains("z = \"\""));
     }
 
     #[test]
     fn stringification_with_spaces() {
         let out = pp("#define STR(x) #x\ny = STR(a + b)\n");
         assert!(out.contains("y = \"a + b\""));
+    }
+
+    #[test]
+    fn stringification_normalizes_only_inter_token_whitespace() {
+        let out = pp("#define STR(x) #x\n\
+             y = STR(  alpha\t  +    beta  )\n\
+             z = STR(\"a   b\"    +   gamma)\n");
+        assert!(out.contains("y = \"alpha + beta\""), "got: {out}");
+        assert!(out.contains("z = \"\\\"a   b\\\" + gamma\""), "got: {out}");
+    }
+
+    #[test]
+    fn stringification_escapes_quotes_and_backslashes_in_literals() {
+        let out = pp(r#"#define STR(x) #x
+y = STR("a\b")
+z = STR("a""b")
+w = STR('a\b')
+"#);
+        assert!(out.contains("y = \"\\\"a\\\\b\\\"\""), "got: {out}");
+        assert!(out.contains("z = \"\\\"a\\\"\\\"b\\\"\""), "got: {out}");
+        assert!(out.contains("w = \"'a\\\\b'\""), "got: {out}");
+    }
+
+    #[test]
+    fn variadic_arguments_can_be_stringified() {
+        let out = pp("#define STRV(...) #__VA_ARGS__\n\
+             y = STRV(alpha,    beta +   gamma)\n\
+             z = STRV()\n");
+        assert!(out.contains("y = \"alpha, beta + gamma\""), "got: {out}");
+        assert!(out.contains("z = \"\""), "got: {out}");
+    }
+
+    #[test]
+    fn stringification_operator_accepts_tab_before_parameter() {
+        let out = pp("#define STR(x) #\tx\ny = STR(hello)\n");
+        assert!(out.contains("y = \"hello\""), "got: {out}");
+    }
+
+    #[test]
+    fn large_stringification_is_iterative_and_normalizes_whitespace() {
+        const TOKENS: usize = 20_000;
+        let raw = std::iter::repeat_n("token", TOKENS)
+            .collect::<Vec<_>>()
+            .join(" \t  ");
+        let expected = format!(
+            "\"{}\"",
+            std::iter::repeat_n("token", TOKENS)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        assert_eq!(stringify_macro_argument(&raw), expected);
     }
 
     #[test]
