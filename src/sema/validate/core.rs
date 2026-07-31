@@ -11315,6 +11315,59 @@ end program block_consumers
     }
 
     #[test]
+    fn select_type_and_rank_validate_every_guard_body() {
+        let errors = errors_from(
+            "\
+module guard_validation
+  implicit none
+
+  type :: base_t
+  end type base_t
+
+  type, extends(base_t) :: child_t
+  end type child_t
+contains
+  pure subroutine check_type(value)
+    class(base_t), intent(in) :: value
+
+    select type (value)
+    type is (child_t)
+      stop
+    class is (base_t)
+      stop
+    class default
+      stop
+    end select
+  end subroutine check_type
+
+  pure subroutine check_rank(values)
+    integer, intent(in) :: values(..)
+
+    select rank (values)
+    rank (0)
+      stop
+    rank (*)
+      stop
+    rank default
+      stop
+    end select
+  end subroutine check_rank
+end module guard_validation
+",
+        );
+
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.as_str() == "STOP not allowed in pure procedure")
+                .count(),
+            6,
+            "every SELECT TYPE and SELECT RANK guard body must be validated: {errors:?}"
+        );
+        assert_eq!(errors.len(), 6, "unexpected diagnostics: {errors:?}");
+    }
+
+    #[test]
     fn private_components_are_visible_only_to_their_defining_module() {
         let errors = errors_from(
             "\
