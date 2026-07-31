@@ -10100,6 +10100,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     }
                     if let Expr::Name { name: src_name } = &value.node {
                         let src_key = src_name.to_lowercase();
+                        if let Some(wrapper) = specific_intrinsic_procedure_target_symbol(
+                            ctx.st,
+                            ctx.proc_scope_id,
+                            &src_key,
+                        ) {
+                            let addr = b.global_addr(wrapper, IrType::Int(IntWidth::I8));
+                            store_procedure_pointer_component_record(b, *tgt_field_ptr, addr, &[]);
+                            return;
+                        }
                         if let Some(src_info) = ctx.locals.get(&src_key) {
                             let closure_args =
                                 procedure_dummy_closure_args_from_locals(b, &ctx.locals, &src_key);
@@ -10618,6 +10627,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 return;
             };
             let src_key = src_name.to_lowercase();
+            if let Some(wrapper) =
+                specific_intrinsic_procedure_target_symbol(ctx.st, ctx.proc_scope_id, &src_key)
+            {
+                let addr =
+                    b.global_addr(wrapper, procedure_pointer_symbol_addr_elem_type(&tgt_info));
+                store_scalar_pointer_slot_value(b, &tgt_info, addr);
+                return;
+            }
             let Some(src_info) = ctx.locals.get(&src_key).cloned() else {
                 if let Some(sym) = ctx.st.lookup_local_then_any(ctx.proc_scope_id, &src_key) {
                     if matches!(

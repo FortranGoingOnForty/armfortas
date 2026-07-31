@@ -189,6 +189,31 @@ pub(super) fn validate_procedure_pointer_initializer(
     validate_pointer_target(ctx, &pointer, target, span);
 }
 
+/// Reject a procedure-pointer declaration whose declared interface is
+/// ELEMENTAL. A procedure pointer is never itself elemental; the separate
+/// association exception for an elemental intrinsic does not change the
+/// pointer's characteristics or permit elemental array calls through it.
+pub(super) fn validate_procedure_pointer_interface(
+    ctx: &mut Ctx<'_>,
+    pointer_name: &str,
+    owner_scope: ScopeId,
+    interface_name: &str,
+    span: Span,
+) {
+    let Some(interface) = ctx.st.lookup_in(owner_scope, interface_name) else {
+        return;
+    };
+    if interface.attrs.elemental {
+        ctx.error(
+            span,
+            format!(
+                "procedure pointer '{}' may not have an ELEMENTAL interface",
+                pointer_name
+            ),
+        );
+    }
+}
+
 /// Validate an actual argument associated with a procedure dummy.
 ///
 /// F2018 15.5.2.9 requires every such actual to denote a procedure. When the
@@ -632,48 +657,16 @@ fn callable_characteristics(
     }
 }
 
-#[derive(Clone, Copy)]
-enum IntrinsicType {
-    Integer,
-    Real,
-    DoublePrecision,
-    Complex,
-    Character,
-}
-
 fn specific_intrinsic_characteristics(name: &str) -> Option<ProcedureCharacteristics> {
-    use IntrinsicType::{Character, Complex, DoublePrecision, Integer, Real};
-
-    let key = name.to_ascii_lowercase();
-    let (arguments, result): (&[IntrinsicType], IntrinsicType) = match key.as_str() {
-        "abs" | "acos" | "aint" | "alog" | "alog10" | "anint" | "asin" | "atan" | "cos"
-        | "cosh" | "exp" | "sin" | "sinh" | "sqrt" | "tan" | "tanh" => (&[Real], Real),
-        "amod" | "atan2" | "dim" | "sign" => (&[Real, Real], Real),
-        "aimag" | "cabs" => (&[Complex], Real),
-        "ccos" | "cexp" | "clog" | "conjg" | "csin" | "csqrt" => (&[Complex], Complex),
-        "dabs" | "dacos" | "dasin" | "datan" | "dcos" | "dcosh" | "dexp" | "dint" | "dlog"
-        | "dlog10" | "dnint" | "dsin" | "dsinh" | "dsqrt" | "dtan" | "dtanh" => {
-            (&[DoublePrecision], DoublePrecision)
-        }
-        "datan2" | "ddim" | "dmod" | "dsign" => {
-            (&[DoublePrecision, DoublePrecision], DoublePrecision)
-        }
-        "dprod" => (&[Real, Real], DoublePrecision),
-        "iabs" => (&[Integer], Integer),
-        "idim" | "isign" | "mod" => (&[Integer, Integer], Integer),
-        "idnint" => (&[DoublePrecision], Integer),
-        "nint" => (&[Real], Integer),
-        "index" => (&[Character, Character], Integer),
-        "len" => (&[Character], Integer),
-        _ => return None,
-    };
+    let definition = crate::sema::specific_intrinsic::specific_intrinsic(name)?;
 
     Some(ProcedureCharacteristics {
         nature: ProcedureNature::Function,
         pure: true,
         elemental: true,
         bind_c: false,
-        dummies: arguments
+        dummies: definition
+            .arguments
             .iter()
             .copied()
             .map(|argument| DummyCharacteristics {
@@ -683,21 +676,25 @@ fn specific_intrinsic_characteristics(name: &str) -> Option<ProcedureCharacteris
             })
             .collect(),
         result: Some(ProcedureResultCharacteristics::Data(
-            intrinsic_data_characteristics(result, false),
+            intrinsic_data_characteristics(definition.result, false),
         )),
     })
 }
 
 fn intrinsic_data_characteristics(
-    intrinsic_type: IntrinsicType,
+    intrinsic_type: crate::sema::specific_intrinsic::SpecificIntrinsicType,
     dummy: bool,
 ) -> DataCharacteristics {
+    use crate::sema::specific_intrinsic::SpecificIntrinsicType::{
+        Character, Complex, DoublePrecision, Integer, Real,
+    };
+
     let type_info = match intrinsic_type {
-        IntrinsicType::Integer => TypeInfo::Integer { kind: None },
-        IntrinsicType::Real => TypeInfo::Real { kind: None },
-        IntrinsicType::DoublePrecision => TypeInfo::DoublePrecision,
-        IntrinsicType::Complex => TypeInfo::Complex { kind: None },
-        IntrinsicType::Character => TypeInfo::Character {
+        Integer => TypeInfo::Integer { kind: None },
+        Real => TypeInfo::Real { kind: None },
+        DoublePrecision => TypeInfo::DoublePrecision,
+        Complex => TypeInfo::Complex { kind: None },
+        Character => TypeInfo::Character {
             len: None,
             kind: None,
         },

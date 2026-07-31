@@ -22614,6 +22614,22 @@ fn procedure_code_ptr_ir_type() -> IrType {
     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
 }
 
+pub(super) fn specific_intrinsic_procedure_target_symbol(
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+    name: &str,
+) -> Option<&'static str> {
+    let key = name.to_ascii_lowercase();
+    let symbol = st.lookup_local_then_any(proc_scope_id, &key);
+    if symbol.is_none_or(|symbol| {
+        symbol.kind == crate::sema::symtab::SymbolKind::IntrinsicProc || symbol.attrs.intrinsic
+    }) {
+        crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(&key)
+    } else {
+        None
+    }
+}
+
 fn procedure_dummy_symbol_in_scope<'a>(
     st: &'a SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,

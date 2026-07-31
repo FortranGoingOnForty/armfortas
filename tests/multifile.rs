@@ -3606,3 +3606,111 @@ fn generic_dispatch_block_local_scalar_not_shadowed_by_foreign_dummy_rank() {
         "105",
     );
 }
+
+#[test]
+fn elemental_procedure_pointer_interfaces_are_rejected_before_artifact_publication() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=elemental_procedure_pointer_interfaces_are_rejected_before_artifact_publication count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let invalid_source = dir.join("invalid_elemental_pointer.f90");
+    let invalid_object = dir.join("invalid_elemental_pointer.o");
+    let invalid_amod = dir.join("invalid_elemental_pointer.amod");
+    std::fs::write(
+        &invalid_source,
+        r#"module invalid_elemental_pointer
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+end module invalid_elemental_pointer
+"#,
+    )
+    .unwrap();
+
+    let invalid = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg(&invalid_source)
+        .args(["-c", "-o"])
+        .arg(&invalid_object)
+        .output()
+        .expect("invalid elemental procedure-pointer compile failed to spawn");
+    assert!(!invalid.status.success(), "invalid declaration compiled");
+    let invalid_stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        invalid_stderr.contains("procedure pointer 'handler' may not have an ELEMENTAL interface"),
+        "invalid declaration produced the wrong diagnostic:\n{invalid_stderr}"
+    );
+    assert!(
+        !invalid_object.exists() && !invalid_amod.exists(),
+        "failed module declaration published an object or .amod"
+    );
+
+    let provider_source = dir.join("elemental_api.f90");
+    let provider_object = dir.join("elemental_api.o");
+    std::fs::write(
+        &provider_source,
+        r#"module elemental_api
+  implicit none
+  private
+  public :: callback
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+end module elemental_api
+"#,
+    )
+    .unwrap();
+    compile_file(&compiler, &provider_source, &provider_object, None);
+    assert!(
+        dir.join("elemental_api.amod").exists(),
+        "provider did not publish its module interface"
+    );
+
+    let consumer_source = dir.join("elemental_consumer.f90");
+    let consumer_object = dir.join("elemental_consumer.o");
+    std::fs::write(
+        &consumer_source,
+        r#"program elemental_consumer
+  use elemental_api, only: callback
+  implicit none
+  procedure(callback), pointer :: handler
+end program elemental_consumer
+"#,
+    )
+    .unwrap();
+    let consumer = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg(&consumer_source)
+        .args(["-c", "-o"])
+        .arg(&consumer_object)
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("elemental .amod consumer compile failed to spawn");
+    assert!(
+        !consumer.status.success(),
+        "consumer accepted an imported elemental procedure-pointer interface"
+    );
+    let consumer_stderr = String::from_utf8_lossy(&consumer.stderr);
+    assert!(
+        consumer_stderr.contains("procedure pointer 'handler' may not have an ELEMENTAL interface"),
+        "imported interface produced the wrong diagnostic:\n{consumer_stderr}"
+    );
+    assert!(
+        !consumer_object.exists(),
+        "failed .amod consumer published an object"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

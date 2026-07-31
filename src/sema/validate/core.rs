@@ -15,7 +15,10 @@ use super::allocatable::{
     validate_allocatable_item,
 };
 use super::pointer::validate_pointer_assignment;
-use super::procedure::{validate_procedure_dummy_actual, validate_procedure_pointer_initializer};
+use super::procedure::{
+    validate_procedure_dummy_actual, validate_procedure_pointer_initializer,
+    validate_procedure_pointer_interface,
+};
 use super::pure_elemental::{
     check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
@@ -4788,6 +4791,13 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                 if let TypeSpec::Type(interface_name) = type_spec {
                     let owner_scope = ctx.scope_id;
                     for entity in entities {
+                        validate_procedure_pointer_interface(
+                            ctx,
+                            &entity.name,
+                            owner_scope,
+                            interface_name,
+                            decl.span,
+                        );
                         if let Some(initial_target) = entity.ptr_init.as_ref() {
                             validate_procedure_pointer_initializer(
                                 ctx,
@@ -5146,6 +5156,13 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
                         if let TypeSpec::Type(interface_name) = type_spec {
                             let owner_scope = ctx.scope_id;
                             for entity in entities {
+                                validate_procedure_pointer_interface(
+                                    ctx,
+                                    &entity.name,
+                                    owner_scope,
+                                    interface_name,
+                                    component.span,
+                                );
                                 if let Some(initial_target) = entity.ptr_init.as_ref() {
                                     validate_procedure_pointer_initializer(
                                         ctx,
@@ -10639,6 +10656,9 @@ pub(super) fn check_intrinsic_call_arity(
 }
 
 pub fn is_intrinsic_name(name: &str) -> bool {
+    if crate::sema::specific_intrinsic::specific_intrinsic(name).is_some() {
+        return true;
+    }
     matches!(
         name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
@@ -14298,6 +14318,154 @@ end program
 ",
         );
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+
+    #[test]
+    fn procedure_pointer_declaration_rejects_elemental_interface() {
+        let cases = [
+            (
+                "local",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+end program test
+",
+            ),
+            (
+                "component",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  type :: holder
+    procedure(callback), pointer, nopass :: handler
+  end type holder
+end program test
+",
+            ),
+            (
+                "dummy",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+contains
+  subroutine consume(handler)
+    procedure(callback), pointer, intent(in) :: handler
+  end subroutine consume
+end program test
+",
+            ),
+            (
+                "function result",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+contains
+  function make_handler() result(handler)
+    procedure(callback), pointer :: handler
+    handler => null()
+  end function make_handler
+end program test
+",
+            ),
+            (
+                "use-associated interface",
+                "\
+module callback_api
+  implicit none
+  private
+  public :: callback
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+end module callback_api
+
+program test
+  use callback_api, only: callback
+  implicit none
+  procedure(callback), pointer :: handler
+end program test
+",
+            ),
+        ];
+
+        for (label, source) in cases {
+            let errs = errors_from(source);
+            assert_eq!(
+                errs,
+                ["procedure pointer 'handler' may not have an ELEMENTAL interface"],
+                "unexpected diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_to_elemental_intrinsic_remains_nonelemental() {
+        let accepted = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    real function callback(value)
+      real, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: handler
+  real :: result
+  handler => sin
+  result = handler(0.0)
+end program test
+",
+        );
+        assert!(
+            accepted.is_empty(),
+            "scalar call through compatible intrinsic target should be accepted: {accepted:?}"
+        );
+
+        let rejected = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    real function callback(value)
+      real, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: handler
+  real :: result(2)
+  handler => sin
+  result = handler([0.0, 1.0])
+end program test
+",
+        );
+        assert_eq!(
+            rejected,
+            ["argument 'value' rank mismatch: expected rank 0, got rank 1"]
+        );
     }
 
     #[test]

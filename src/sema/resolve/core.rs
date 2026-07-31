@@ -2797,7 +2797,9 @@ fn resolve_proc_pointer_link_symbol(st: &SymbolTable, from_scope: ScopeId, targe
         break;
     }
 
-    target.to_string()
+    crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(&key)
+        .unwrap_or(target)
+        .to_string()
 }
 
 fn mangle_link_symbol_for(
@@ -2806,6 +2808,11 @@ fn mangle_link_symbol_for(
     name_in_scope: &str,
 ) -> String {
     use crate::sema::symtab::{ScopeKind, SymbolKind};
+    if sym.kind == SymbolKind::IntrinsicProc || sym.attrs.intrinsic {
+        return crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(name_in_scope)
+            .unwrap_or(name_in_scope)
+            .to_string();
+    }
     match sym.kind {
         SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
             ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
