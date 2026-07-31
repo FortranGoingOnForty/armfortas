@@ -35244,6 +35244,21 @@ fn resolve_defined_io_item_specific(
     })
 }
 
+fn resolve_defined_io_item_plan(
+    ctx: &LowerCtx,
+    interface_name: &str,
+    items: &[crate::ast::expr::SpannedExpr],
+) -> Vec<Option<SpecificProcCandidate>> {
+    items
+        .iter()
+        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
+        .collect()
+}
+
+fn is_mixed_defined_io_plan(candidates: &[Option<SpecificProcCandidate>]) -> bool {
+    candidates.iter().any(Option::is_some) && candidates.iter().any(Option::is_none)
+}
+
 pub(super) fn scratch_char_buffer_arg(b: &mut FuncBuilder) -> (ValueId, ValueId, ValueId) {
     const SCRATCH_LEN: u64 = 256;
 
@@ -35502,13 +35517,10 @@ pub(super) fn try_lower_defined_io_write_items(
     } else {
         "write(unformatted)"
     };
-    let Some(candidates) = items
-        .iter()
-        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if candidates.iter().any(Option::is_none) {
         return false;
-    };
+    }
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
     let done = b.create_block("defined_write_done");
     lower_io_status_continue_or_exit(b, iostat, done);
@@ -35517,7 +35529,9 @@ pub(super) fn try_lower_defined_io_write_items(
         emit_defined_io_call(
             b,
             ctx,
-            candidate,
+            candidate
+                .as_ref()
+                .expect("all-defined I/O plan lost a candidate"),
             item,
             unit,
             formatted_iotype,
@@ -35527,6 +35541,93 @@ pub(super) fn try_lower_defined_io_write_items(
         );
         lower_io_status_continue_or_exit(b, iostat, done);
     }
+    b.branch(done, vec![]);
+    b.set_block(done);
+    true
+}
+
+pub(super) fn try_lower_mixed_defined_io_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    advance: ValueId,
+    iostat: ValueId,
+    iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
+) -> bool {
+    // Explicit DT editing needs descriptor-to-item positioning plus IOTYPE and
+    // V_LIST propagation; keep that path with LOW-029 rather than pretending
+    // the list-directed dispatcher has enough format information.
+    if items.is_empty() || formatted_iotype == Some("DT") {
+        return false;
+    }
+    let interface_name = if formatted_iotype.is_some() {
+        "write(formatted)"
+    } else {
+        "write(unformatted)"
+    };
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if !is_mixed_defined_io_plan(&candidates) {
+        return false;
+    }
+
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    b.call(
+        FuncRef::External("afs_list_write_begin".into()),
+        vec![unit, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+
+    let failed = b.create_block("mixed_defined_write_failed");
+    let done = b.create_block("mixed_defined_write_done");
+    lower_io_status_continue_or_exit(b, iostat, failed);
+
+    for (item, candidate) in items.iter().zip(candidates.iter()) {
+        if let Some(candidate) = candidate {
+            emit_defined_io_call(
+                b,
+                ctx,
+                candidate,
+                item,
+                unit,
+                formatted_iotype,
+                Some(iostat),
+                iomsg_arg,
+                iomsg_len,
+            );
+            lower_io_status_continue_or_exit(b, iostat, failed);
+        } else {
+            lower_write_items_adv(b, ctx, std::slice::from_ref(item), unit, false);
+            b.call(
+                FuncRef::External("afs_list_write_check".into()),
+                vec![unit, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+                IrType::Void,
+            );
+            lower_io_status_continue_or_exit(b, iostat, failed);
+        }
+    }
+
+    b.call(
+        FuncRef::External("afs_write_newline_if".into()),
+        vec![unit, advance],
+        IrType::Void,
+    );
+    b.call(
+        FuncRef::External("afs_list_write_end".into()),
+        vec![unit, advance, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+    b.branch(done, vec![]);
+
+    b.set_block(failed);
+    b.call(
+        FuncRef::External("afs_list_write_end".into()),
+        vec![unit, advance, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
     b.branch(done, vec![]);
     b.set_block(done);
     true
@@ -35549,13 +35650,10 @@ pub(super) fn try_lower_defined_io_read_items(
     } else {
         "read(unformatted)"
     };
-    let Some(candidates) = items
-        .iter()
-        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if candidates.iter().any(Option::is_none) {
         return false;
-    };
+    }
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
 
     let owns_iostat = iostat.is_none();
@@ -35571,7 +35669,9 @@ pub(super) fn try_lower_defined_io_read_items(
         emit_defined_io_call(
             b,
             ctx,
-            candidate,
+            candidate
+                .as_ref()
+                .expect("all-defined I/O plan lost a candidate"),
             item,
             unit,
             formatted_iotype,
@@ -35587,6 +35687,106 @@ pub(super) fn try_lower_defined_io_read_items(
         lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
     }
     true
+}
+
+pub(super) fn try_lower_mixed_defined_io_read_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    iostat: Option<ValueId>,
+    iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
+) -> bool {
+    // Explicit DT editing needs descriptor-to-item positioning plus IOTYPE and
+    // V_LIST propagation; keep that path with LOW-029 rather than pretending
+    // the list-directed dispatcher has enough format information.
+    if items.is_empty() || formatted_iotype == Some("DT") {
+        return false;
+    }
+    let interface_name = if formatted_iotype.is_some() {
+        "read(formatted)"
+    } else {
+        "read(unformatted)"
+    };
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if !is_mixed_defined_io_plan(&candidates) {
+        return false;
+    }
+
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let owns_iostat = iostat.is_none();
+    let statement_iostat = iostat.unwrap_or_else(|| {
+        let tmp = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, tmp);
+        tmp
+    });
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    b.call(
+        FuncRef::External("afs_list_read_begin".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+
+    let done = b.create_block("mixed_defined_read_done");
+    let mode = ReadMode::Unit {
+        unit,
+        iostat: statement_iostat,
+        error_exit: done,
+    };
+    lower_read_continue_or_exit(b, mode);
+    for (item, candidate) in items.iter().zip(candidates.iter()) {
+        if let Some(candidate) = candidate {
+            emit_defined_io_call(
+                b,
+                ctx,
+                candidate,
+                item,
+                unit,
+                formatted_iotype,
+                Some(statement_iostat),
+                iomsg_arg,
+                iomsg_len,
+            );
+            lower_read_continue_or_exit(b, mode);
+        } else {
+            lower_list_read_item(b, ctx, item, mode);
+        }
+    }
+    b.branch(done, vec![]);
+    b.set_block(done);
+    b.call(
+        FuncRef::External("afs_list_read_end".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+    if owns_iostat {
+        lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
+    }
+    true
+}
+
+fn lower_list_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+) {
+    if lower_array_read_item(b, ctx, item, mode) {
+        return;
+    }
+    if lower_derived_unit_read_item(b, ctx, item, mode) {
+        return;
+    }
+    if lower_list_char_read_item(b, ctx, item, mode) {
+        return;
+    }
+    let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
+        return;
+    };
+    let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
 }
 
 pub(super) fn lower_list_read_items(
@@ -35619,19 +35819,7 @@ pub(super) fn lower_list_read_items(
     lower_read_continue_or_exit(b, mode);
 
     for item in items {
-        if lower_array_read_item(b, ctx, item, mode) {
-            continue;
-        }
-        if lower_derived_unit_read_item(b, ctx, item, mode) {
-            continue;
-        }
-        if lower_list_char_read_item(b, ctx, item, mode) {
-            continue;
-        }
-        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
-            continue;
-        };
-        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
+        lower_list_read_item(b, ctx, item, mode);
     }
     b.branch(done, vec![]);
     b.set_block(done);

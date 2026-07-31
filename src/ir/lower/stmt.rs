@@ -4897,6 +4897,33 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             }
 
             if is_list_directed {
+                let adv =
+                    advance_runtime.unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
+                if try_lower_mixed_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    defined_iotype,
+                    adv,
+                    iostat_ptr,
+                    dtio_iomsg,
+                    (iomsg_ptr, iomsg_len),
+                ) {
+                    finish_external_write_positioning(b, positioning_done);
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        err_label,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        iostat_ctrl.is_some(),
+                    );
+                    return;
+                }
+
                 // Wrap the per-item writes in begin/end so the runtime
                 // can (a) emit sequential-unformatted record markers,
                 // and (b) thread iostat=/iomsg= through. Pass
@@ -4911,8 +4938,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     IrType::Void,
                 );
                 lower_write_items_adv(b, ctx, items, unit, false);
-                let adv =
-                    advance_runtime.unwrap_or_else(|| b.const_i32(if advance { 1 } else { 0 }));
                 b.call(
                     FuncRef::External("afs_write_newline_if".into()),
                     vec![unit, adv],
@@ -9705,6 +9730,30 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 return;
             }
             if is_list_directed {
+                if try_lower_mixed_defined_io_read_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    defined_iotype,
+                    dtio_iostat_addr,
+                    dtio_iomsg,
+                    (read_iomsg_ptr, read_iomsg_len),
+                ) {
+                    finish_external_read_positioning(b, positioning_done);
+                    lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+                    lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
+                    lower_read_status_branches(
+                        b,
+                        ctx,
+                        end_label,
+                        err_label,
+                        iostat_addr,
+                        user_iostat,
+                    );
+                    return;
+                }
+
                 // Wrap the per-item reads in begin/end so the runtime
                 // can slurp a sequential-unformatted record up front
                 // and let the typed helpers consume binary bytes.

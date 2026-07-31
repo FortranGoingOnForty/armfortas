@@ -225,6 +225,10 @@ struct Unit {
     last_list_output_char: bool,
     /// True between `afs_list_write_begin` and `afs_list_write_end`.
     list_write_active: bool,
+    /// Nesting depth for child data transfers on the same unit. Defined I/O
+    /// procedures must append to their parent's record rather than replacing
+    /// or prematurely draining it.
+    list_write_depth: usize,
     /// First error raised while emitting the current list-directed WRITE.
     list_write_error: Option<String>,
     /// True for STATUS='SCRATCH' units: backing file is deleted on close or exit.
@@ -245,6 +249,9 @@ struct Unit {
     /// cleared by `afs_list_read_end`. The cursor tracks how many
     /// bytes the per-item helpers have consumed so far.
     pending_read: Option<(Vec<u8>, usize)>,
+    /// Nesting depth for sequential-unformatted child reads sharing
+    /// `pending_read` with their parent transfer statement.
+    list_read_depth: usize,
 }
 
 fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken, usize)> {
@@ -356,6 +363,7 @@ impl Unit {
         self.formatted_read_cursor = 0;
         self.terminal_nonadvancing_open_record = false;
         self.pending_read = None;
+        self.list_read_depth = 0;
     }
 
     fn remember_list_write_result(&mut self, result: io::Result<()>) {
@@ -674,11 +682,13 @@ impl IoState {
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 list_write_active: false,
+                list_write_depth: 0,
                 list_write_error: None,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
+                list_read_depth: 0,
             }),
         );
         units.insert(
@@ -698,11 +708,13 @@ impl IoState {
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 list_write_active: false,
+                list_write_depth: 0,
                 list_write_error: None,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
+                list_read_depth: 0,
             }),
         );
         units.insert(
@@ -722,11 +734,13 @@ impl IoState {
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 list_write_active: false,
+                list_write_depth: 0,
                 list_write_error: None,
                 scratch: false,
                 leading_zero: LeadingZeroMode::Default,
                 pending_record: None,
                 pending_read: None,
+                list_read_depth: 0,
             }),
         );
 
@@ -1092,11 +1106,13 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 terminal_nonadvancing_open_record: false,
                 last_list_output_char: false,
                 list_write_active: false,
+                list_write_depth: 0,
                 list_write_error: None,
                 scratch: is_scratch,
                 leading_zero: leading_zero_mode,
                 pending_record: None,
                 pending_read: None,
+                list_read_depth: 0,
             };
 
             // Apply POSITION specifier.
@@ -1502,7 +1518,8 @@ pub extern "C" fn afs_fmt_read_string_dyn(
 ///
 /// For formatted units this only resets iostat. For sequential
 /// unformatted units it opens a fresh per-statement record buffer that
-/// the per-item helpers will append into. Stream-unformatted units skip
+/// the per-item helpers will append into. A nested child transfer on the
+/// same unit shares the parent's buffer. Stream-unformatted units skip
 /// the buffer (each helper writes raw bytes directly).
 #[no_mangle]
 pub extern "C" fn afs_list_write_begin(
@@ -1522,20 +1539,51 @@ pub extern "C" fn afs_list_write_begin(
             *b = b' ';
         }
     }
-    if with_unit(unit, |u| {
+    let err = with_unit(unit, |u| {
+        if u.list_write_depth > 0 {
+            let Some(depth) = u.list_write_depth.checked_add(1) else {
+                let message = "defined I/O child write nesting depth overflow".to_string();
+                if u.list_write_error.is_none() {
+                    u.list_write_error = Some(message.clone());
+                }
+                return Some(message);
+            };
+            u.list_write_depth = depth;
+            return None;
+        }
+
         u.last_list_output_char = false;
         u.list_write_active = true;
+        u.list_write_depth = 1;
         u.list_write_error = None;
         if u.form == Form::Unformatted && u.access == Access::Sequential {
             u.pending_record = Some(Vec::new());
         }
+        None
     })
-    .is_none()
-        && !iostat.is_null()
-    {
-        unsafe {
-            *iostat = 1;
-        }
+    .unwrap_or_else(|| Some("unit not connected".to_string()));
+
+    if let Some(message) = err {
+        write_i32_ptr(iostat, 1);
+        assign_iomsg(iomsg, iomsg_len, &message);
+    }
+}
+
+/// Report an error accumulated by the current WRITE without closing its
+/// record. Mixed intrinsic/defined transfer lists use this between items so
+/// an intrinsic runtime failure prevents later defined-I/O calls.
+#[no_mangle]
+pub extern "C" fn afs_list_write_check(
+    unit: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let err = with_unit(unit, |u| u.list_write_error.clone())
+        .unwrap_or_else(|| Some("unit not connected".to_string()));
+    if let Some(message) = err {
+        write_i32_ptr(iostat, 1);
+        assign_iomsg(iomsg, iomsg_len, &message);
     }
 }
 
@@ -1544,6 +1592,8 @@ pub extern "C" fn afs_list_write_begin(
 /// `[len][bytes][len]` to the stream. For formatted units the trailing
 /// newline is left to the per-item path's `afs_write_newline` so we
 /// don't double-newline; this only flushes and forwards iostat/iomsg.
+/// A nested child transfer only releases its depth and reports the
+/// current statement error; the outermost transfer owns record drain.
 /// `advance` is accepted for symmetry with `afs_fmt_end` but is unused
 /// by the formatted path here.
 #[no_mangle]
@@ -1555,6 +1605,12 @@ pub extern "C" fn afs_list_write_end(
     iomsg_len: i64,
 ) {
     let err = with_unit(unit, |u| {
+        if u.list_write_depth > 1 {
+            u.list_write_depth -= 1;
+            return u.list_write_error.clone();
+        }
+        u.list_write_depth = 0;
+
         if let Some(buf) = u.pending_record.take() {
             let len_bytes = (buf.len() as u32).to_ne_bytes();
             u.list_write_raw_or_buffer(&len_bytes);
@@ -2200,8 +2256,9 @@ fn read_raw_exact(u: &mut Unit, buf: &mut [u8]) -> io::Result<ExactRawRead> {
 /// For formatted units this only resets iostat. For sequential
 /// unformatted units it reads `[u32 len][len bytes][u32 trailer]`,
 /// stashes the data in `pending_read`, and the per-item helpers will
-/// consume from there. Stream-unformatted reads continue using their
-/// existing per-helper raw-byte path.
+/// consume from there. A nested child transfer on the same unit shares
+/// the parent's buffer and cursor. Stream-unformatted reads continue
+/// using their existing per-helper raw-byte path.
 #[no_mangle]
 pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u8, iomsg_len: i64) {
     if !iostat.is_null() && unsafe { *iostat != 0 } {
@@ -2217,16 +2274,28 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
         if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
             return;
         }
+        if u.list_read_depth > 0 {
+            let Some(depth) = u.list_read_depth.checked_add(1) else {
+                set_read_status_or_exit(iostat, 1);
+                return;
+            };
+            u.list_read_depth = depth;
+            return;
+        }
+
         u.pending_read = None;
+        u.list_read_depth = 1;
 
         let mut len_buf = [0u8; 4];
         match read_raw_exact(u, &mut len_buf) {
             Ok(ExactRawRead::Complete) => {}
             Ok(ExactRawRead::EndOfFile) => {
+                u.list_read_depth = 0;
                 set_read_status_or_exit(iostat, IOSTAT_END);
                 return;
             }
             _ => {
+                u.list_read_depth = 0;
                 set_read_status_or_exit(iostat, 1);
                 return;
             }
@@ -2234,11 +2303,13 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
         let record_len = u32::from_ne_bytes(len_buf) as usize;
         let mut data = Vec::new();
         if data.try_reserve_exact(record_len).is_err() {
+            u.list_read_depth = 0;
             set_read_status_or_exit(iostat, 1);
             return;
         }
         data.resize(record_len, 0);
         if !matches!(read_raw_exact(u, &mut data), Ok(ExactRawRead::Complete)) {
+            u.list_read_depth = 0;
             set_read_status_or_exit(iostat, 1);
             return;
         }
@@ -2247,6 +2318,7 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
         if !matches!(read_raw_exact(u, &mut trailer), Ok(ExactRawRead::Complete))
             || u32::from_ne_bytes(trailer) as usize != record_len
         {
+            u.list_read_depth = 0;
             set_read_status_or_exit(iostat, 1);
             return;
         }
@@ -2258,9 +2330,10 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
     }
 }
 
-/// End a list-directed READ statement. Drops any unread bytes left in
-/// the in-flight unformatted record buffer (the standard does not
-/// require the program to consume the entire record).
+/// End a list-directed READ statement. The outermost sequential
+/// unformatted transfer drops any unread bytes left in the in-flight
+/// record buffer (the standard does not require the program to consume
+/// the entire record). Nested child transfers only release their depth.
 #[no_mangle]
 pub extern "C" fn afs_list_read_end(
     unit: i32,
@@ -2269,6 +2342,14 @@ pub extern "C" fn afs_list_read_end(
     _iomsg_len: i64,
 ) {
     with_unit(unit, |u| {
+        if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
+            return;
+        }
+        if u.list_read_depth > 1 {
+            u.list_read_depth -= 1;
+            return;
+        }
+        u.list_read_depth = 0;
         u.pending_read = None;
     });
 }
@@ -6872,11 +6953,13 @@ mod tests {
             terminal_nonadvancing_open_record: false,
             last_list_output_char: false,
             list_write_active: false,
+            list_write_depth: 0,
             list_write_error: None,
             scratch,
             leading_zero: LeadingZeroMode::Default,
             pending_record: None,
             pending_read: None,
+            list_read_depth: 0,
         }
     }
 
@@ -7068,11 +7151,13 @@ mod tests {
             terminal_nonadvancing_open_record: false,
             last_list_output_char: false,
             list_write_active: false,
+            list_write_depth: 0,
             list_write_error: None,
             scratch: false,
             leading_zero: LeadingZeroMode::Default,
             pending_record: None,
             pending_read: None,
+            list_read_depth: 0,
         };
 
         let error = unit.backspace().unwrap_err();
@@ -7887,6 +7972,176 @@ mod tests {
         afs_close(809, &mut iostat);
         assert_eq!(iostat, 0, "CLOSE failed");
         std::fs::remove_file(path).expect("remove valid unformatted records");
+    }
+
+    #[test]
+    fn nested_sequential_unformatted_write_shares_parent_record() {
+        let path = format!(
+            "/tmp/afs_seq_unformatted_nested_write_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let mut outer_iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 830,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "readwrite".as_ptr(),
+            action_len: 9,
+            access: "sequential".as_ptr(),
+            access_len: 10,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 0,
+            iostat: &mut outer_iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
+        };
+        afs_open(&cb);
+        assert_eq!(outer_iostat, 0, "OPEN failed");
+
+        afs_list_write_begin(830, &mut outer_iostat, std::ptr::null_mut(), 0);
+        afs_write_int(830, 11);
+
+        let mut child_iostat = -99i32;
+        afs_list_write_begin(830, &mut child_iostat, std::ptr::null_mut(), 0);
+        afs_write_int(830, 22);
+        afs_list_write_end(830, 1, &mut child_iostat, std::ptr::null_mut(), 0);
+        assert_eq!(child_iostat, 0, "nested child WRITE failed");
+        let nested_state = with_unit(830, |unit| {
+            (
+                unit.list_write_depth,
+                unit.pending_record.as_ref().map(Vec::len),
+            )
+        })
+        .expect("test unit must remain open");
+        assert_eq!(
+            nested_state,
+            (1, Some(8)),
+            "child WRITE must leave the parent record open"
+        );
+
+        afs_write_int(830, 33);
+        afs_list_write_end(830, 1, &mut outer_iostat, std::ptr::null_mut(), 0);
+        assert_eq!(outer_iostat, 0, "outer WRITE failed");
+        let final_state = with_unit(830, |unit| {
+            (
+                unit.list_write_active,
+                unit.list_write_depth,
+                unit.pending_record.is_none(),
+            )
+        })
+        .expect("test unit must remain open");
+        assert_eq!(final_state, (false, 0, true));
+
+        afs_close(830, &mut outer_iostat);
+        assert_eq!(outer_iostat, 0, "CLOSE failed");
+        let marker = 12u32.to_ne_bytes();
+        let expected = [
+            marker.as_slice(),
+            11i32.to_ne_bytes().as_slice(),
+            22i32.to_ne_bytes().as_slice(),
+            33i32.to_ne_bytes().as_slice(),
+            marker.as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            std::fs::read(&path).expect("read nested WRITE output"),
+            expected
+        );
+        std::fs::remove_file(path).expect("remove nested WRITE output");
+    }
+
+    #[test]
+    fn nested_sequential_unformatted_read_shares_parent_cursor() {
+        let path = format!(
+            "/tmp/afs_seq_unformatted_nested_read_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let marker = 12u32.to_ne_bytes();
+        std::fs::write(
+            &path,
+            [
+                marker.as_slice(),
+                11i32.to_ne_bytes().as_slice(),
+                22i32.to_ne_bytes().as_slice(),
+                33i32.to_ne_bytes().as_slice(),
+                marker.as_slice(),
+            ]
+            .concat(),
+        )
+        .expect("create nested READ input");
+
+        let mut outer_iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 831,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "old".as_ptr(),
+            status_len: 3,
+            action: "read".as_ptr(),
+            action_len: 4,
+            access: "sequential".as_ptr(),
+            access_len: 10,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 0,
+            iostat: &mut outer_iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
+        };
+        afs_open(&cb);
+        assert_eq!(outer_iostat, 0, "OPEN failed");
+
+        afs_list_read_begin(831, &mut outer_iostat, std::ptr::null_mut(), 0);
+        let mut first = -1i32;
+        afs_read_int(831, &mut first, &mut outer_iostat);
+        assert_eq!((outer_iostat, first), (0, 11));
+
+        let mut child_iostat = 0i32;
+        afs_list_read_begin(831, &mut child_iostat, std::ptr::null_mut(), 0);
+        let mut second = -1i32;
+        afs_read_int(831, &mut second, &mut child_iostat);
+        afs_list_read_end(831, &mut child_iostat, std::ptr::null_mut(), 0);
+        assert_eq!((child_iostat, second), (0, 22));
+        let nested_state = with_unit(831, |unit| {
+            (
+                unit.list_read_depth,
+                unit.pending_read.as_ref().map(|(_, cursor)| *cursor),
+            )
+        })
+        .expect("test unit must remain open");
+        assert_eq!(
+            nested_state,
+            (1, Some(8)),
+            "child READ must preserve the parent record cursor"
+        );
+
+        let mut third = -1i32;
+        afs_read_int(831, &mut third, &mut outer_iostat);
+        afs_list_read_end(831, &mut outer_iostat, std::ptr::null_mut(), 0);
+        assert_eq!((outer_iostat, third), (0, 33));
+        let final_state = with_unit(831, |unit| {
+            (unit.list_read_depth, unit.pending_read.is_none())
+        })
+        .expect("test unit must remain open");
+        assert_eq!(final_state, (0, true));
+
+        afs_close_ex(831, "delete".as_ptr(), 6, &mut outer_iostat);
+        assert_eq!(outer_iostat, 0, "CLOSE failed");
     }
 
     #[test]
