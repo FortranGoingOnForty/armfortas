@@ -6520,45 +6520,25 @@ fn eval_const_char_bytes_with_context(
             };
             let intrinsic = name.to_lowercase();
             if intrinsic == "new_line" {
-                if args.len() != 1 || args[0].keyword.is_some() {
-                    return None;
-                }
+                character_intrinsic_argument_expr_slots(&intrinsic, args)?;
                 return Some(vec![b'\n']);
             }
             if intrinsic == "repeat" {
-                if args.len() != 2 {
-                    return None;
-                }
-                let mut pattern_arg = None;
-                let mut copies_arg = None;
-                for (i, arg) in args.iter().enumerate() {
-                    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
-                        return None;
-                    };
-                    match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
-                        Some(keyword) if keyword == "string" && pattern_arg.is_none() => {
-                            pattern_arg = Some(expr);
-                        }
-                        Some(keyword) if keyword == "ncopies" && copies_arg.is_none() => {
-                            copies_arg = Some(expr);
-                        }
-                        None if i == 0 && pattern_arg.is_none() => pattern_arg = Some(expr),
-                        None if i == 1 && copies_arg.is_none() => copies_arg = Some(expr),
-                        _ => return None,
-                    }
-                }
+                let slots = character_intrinsic_argument_expr_slots(&intrinsic, args)?;
+                let pattern_arg = slots.first()?.as_ref().copied()?;
+                let copies_arg = slots.get(1)?.as_ref().copied()?;
                 let pattern = eval_const_char_bytes_with_context(
-                    pattern_arg?,
+                    pattern_arg,
                     param_consts,
                     param_chars,
                     st,
                     scope_id,
                     type_layouts,
                 )?;
-                let copies = eval_const_char_int_expr(copies_arg?, param_consts, param_chars)
+                let copies = eval_const_char_int_expr(copies_arg, param_consts, param_chars)
                     .or_else(|| {
                         st.and_then(|st| {
-                            eval_const_int_in_scope_or_any_scope(copies_arg?, param_consts, st)
+                            eval_const_int_in_scope_or_any_scope(copies_arg, param_consts, st)
                                 .map(i128::from)
                         })
                     })?;
@@ -6576,28 +6556,8 @@ fn eval_const_char_bytes_with_context(
             if intrinsic != "char" && intrinsic != "achar" {
                 return None;
             }
-
-            let mut code_arg = None;
-            for (i, arg) in args.iter().enumerate() {
-                match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
-                    Some(keyword) if keyword == "kind" => continue,
-                    Some(keyword) if keyword == "i" && code_arg.is_none() => {
-                        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
-                            return None;
-                        };
-                        code_arg = Some(expr);
-                    }
-                    None if i == 0 && code_arg.is_none() => {
-                        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
-                            return None;
-                        };
-                        code_arg = Some(expr);
-                    }
-                    None if i == 1 => continue,
-                    _ => return None,
-                }
-            }
-            let arg_expr = code_arg?;
+            let slots = character_intrinsic_argument_expr_slots(&intrinsic, args)?;
+            let arg_expr = slots.first()?.as_ref().copied()?;
             let code = eval_const_char_int_expr(arg_expr, param_consts, param_chars)?;
             if !(0..=255).contains(&code) {
                 return None;
@@ -6696,19 +6656,13 @@ fn eval_const_char_expr_len(
             };
             let intrinsic = name.to_lowercase();
             match intrinsic.as_str() {
-                "char" | "achar" | "new_line" => Some(1),
-                "repeat" if args.len() >= 2 => {
-                    if args[0].keyword.is_some() || args[1].keyword.is_some() {
-                        return None;
-                    }
-                    let crate::ast::expr::SectionSubscript::Element(str_expr) = &args[0].value
-                    else {
-                        return None;
-                    };
-                    let crate::ast::expr::SectionSubscript::Element(copies_expr) = &args[1].value
-                    else {
-                        return None;
-                    };
+                "char" | "achar" | "new_line" => {
+                    character_intrinsic_argument_expr_slots(&intrinsic, args).map(|_| 1)
+                }
+                "repeat" => {
+                    let slots = character_intrinsic_argument_expr_slots(&intrinsic, args)?;
+                    let str_expr = slots.first()?.as_ref().copied()?;
+                    let copies_expr = slots.get(1)?.as_ref().copied()?;
                     let str_len =
                         eval_const_char_expr_len(str_expr, param_consts, param_chars, st)?;
                     let copies = eval_const_char_int_expr(copies_expr, param_consts, param_chars)?;
@@ -6765,12 +6719,11 @@ fn eval_const_char_int_expr(
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
-            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+            if !name.eq_ignore_ascii_case("len") {
                 return None;
             }
-            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
-                return None;
-            };
+            let slots = character_intrinsic_argument_expr_slots(name, args)?;
+            let arg_expr = slots.first()?.as_ref().copied()?;
             eval_const_char_bytes(arg_expr, param_consts, param_chars)
                 .and_then(|bytes| i128::try_from(bytes.len()).ok())
         }
@@ -9357,7 +9310,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 else {
                     return None;
                 };
-                return selected_kind_const_value(&key, arg).map(ConstScalar::Int);
+                return crate::sema::types::selected_kind_value(&key, arg).map(ConstScalar::Int);
             }
             if key == "int" {
                 let value = const_call_arg_expr(args.first()?)
@@ -9626,45 +9579,6 @@ fn eval_const_transfer_with_any_scope(
         &source_bytes,
         target_bytes,
     )))
-}
-
-fn selected_kind_const_value(name: &str, arg: i128) -> Option<i128> {
-    match name {
-        "selected_int_kind" => Some(if arg <= 2 {
-            1
-        } else if arg <= 4 {
-            2
-        } else if arg <= 9 {
-            4
-        } else if arg <= 18 {
-            8
-        } else if arg <= 38 {
-            16
-        } else {
-            -1
-        }),
-        "selected_real_kind" => Some(if arg <= 6 {
-            4
-        } else if arg <= 15 {
-            8
-        } else {
-            -1
-        }),
-        "selected_logical_kind" => Some(if arg <= 8 {
-            1
-        } else if arg <= 16 {
-            2
-        } else if arg <= 32 {
-            4
-        } else if arg <= 64 {
-            8
-        } else if arg <= 128 {
-            16
-        } else {
-            -1
-        }),
-        _ => None,
-    }
 }
 
 fn eval_const_transfer_with_decl_scope(
@@ -10261,7 +10175,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     else {
                         return None;
                     };
-                    selected_kind_const_value(&key, arg).map(ConstScalar::Int)
+                    crate::sema::types::selected_kind_value(&key, arg).map(ConstScalar::Int)
                 }
                 "selected_char_kind" => {
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
@@ -11396,22 +11310,15 @@ pub(super) fn fixed_char_expr_len(
         }
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
-                if name.eq_ignore_ascii_case("repeat")
-                    && args.len() >= 2
-                    && args[0].keyword.is_none()
-                    && args[1].keyword.is_none()
-                {
-                    if let (
-                        crate::ast::expr::SectionSubscript::Element(source),
-                        crate::ast::expr::SectionSubscript::Element(copies),
-                    ) = (&args[0].value, &args[1].value)
-                    {
-                        let source_len = fixed_char_expr_len(b, source, locals, st, type_layouts)?;
-                        let copies =
-                            fixed_char_int_expr_len_context(b, copies, locals, st, type_layouts)?;
-                        if copies >= 0 {
-                            return source_len.checked_mul(copies);
-                        }
+                if name.eq_ignore_ascii_case("repeat") {
+                    let slots = character_intrinsic_argument_expr_slots(name, args)?;
+                    let source = slots.first()?.as_ref().copied()?;
+                    let copies = slots.get(1)?.as_ref().copied()?;
+                    let source_len = fixed_char_expr_len(b, source, locals, st, type_layouts)?;
+                    let copies =
+                        fixed_char_int_expr_len_context(b, copies, locals, st, type_layouts)?;
+                    if copies >= 0 {
+                        return source_len.checked_mul(copies);
                     }
                 }
                 if let Some(info) = locals.get(&name.to_lowercase()) {
@@ -11481,12 +11388,11 @@ fn fixed_char_int_expr_len_context(
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
-            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+            if !name.eq_ignore_ascii_case("len") {
                 return None;
             }
-            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
-                return None;
-            };
+            let slots = character_intrinsic_argument_expr_slots(name, args)?;
+            let arg_expr = slots.first()?.as_ref().copied()?;
             fixed_char_expr_len(b, arg_expr, locals, st, type_layouts)
         }
         _ => None,
@@ -11837,6 +11743,60 @@ fn lower_character_minmax_string_expr(
     Some((best_ptr, best_len))
 }
 
+fn character_intrinsic_argument_expr_slots<'a>(
+    name: &str,
+    args: &'a [crate::ast::expr::Argument],
+) -> Option<Vec<Option<&'a crate::ast::expr::SpannedExpr>>> {
+    let (formals, required) = crate::sema::types::character_intrinsic_signature(name)?;
+    let mut slots = vec![None; formals.len()];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            formals
+                .iter()
+                .position(|formal| formal.eq_ignore_ascii_case(keyword))?
+        } else {
+            if saw_keyword {
+                return None;
+            }
+            let index = positional;
+            positional += 1;
+            if index >= formals.len() {
+                return None;
+            }
+            index
+        };
+        if slots[index].is_some() {
+            return None;
+        }
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        slots[index] = Some(expr);
+    }
+
+    slots
+        .iter()
+        .take(required)
+        .all(Option::is_some)
+        .then_some(slots)
+}
+
+fn character_intrinsic_integer_result_type(
+    kind_expr: Option<&crate::ast::expr::SpannedExpr>,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> Option<IrType> {
+    let kind = match kind_expr {
+        Some(expr) => intrinsic_kind_arg_width(expr, Some(locals), st)?,
+        None => crate::driver::defaults::default_int_kind(),
+    };
+    int_width_from_kind_value(i64::from(kind)).map(IrType::Int)
+}
+
 pub(super) fn lower_char_intrinsic(
     b: &mut FuncBuilder,
     name: &str,
@@ -11848,17 +11808,12 @@ pub(super) fn lower_char_intrinsic(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
-    use crate::ast::expr::SectionSubscript;
-
-    // Extract the SpannedExpr from argument i.
+    let argument_slots = character_intrinsic_argument_expr_slots(name, args);
     let arg_spanned = |i: usize| -> Option<&crate::ast::expr::SpannedExpr> {
-        args.get(i).and_then(|a| {
-            if let SectionSubscript::Element(e) = &a.value {
-                Some(e)
-            } else {
-                None
-            }
-        })
+        argument_slots
+            .as_ref()?
+            .get(i)
+            .and_then(|slot| slot.as_ref().copied())
     };
     let lower_string_arg =
         |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr| -> (ValueId, ValueId) {
@@ -11877,6 +11832,20 @@ pub(super) fn lower_char_intrinsic(
         |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr, ptr: ValueId| {
             deallocate_owned_string_expr_temp(b, locals, expr, st, type_layouts, ptr);
         };
+    let lower_back_arg = |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr| -> ValueId {
+        let raw = super::expr::lower_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let logical = coerce_to_type(b, raw, &IrType::Bool);
+        coerce_to_type(b, logical, &IrType::Int(IntWidth::I32))
+    };
 
     match name {
         "max" | "min" => lower_character_minmax_string_expr(
@@ -11892,10 +11861,8 @@ pub(super) fn lower_char_intrinsic(
         )
         .map(|(ptr, _)| ptr),
         "len" => {
-            // F2018 §16.9.108: LEN returns default integer. Descriptor
-            // length is stored as I64; truncate to I32 so generic
-            // dispatch can match `integer` formals (kind=4).
             let arg = arg_spanned(0)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
             let (ptr_to_release, len) =
                 if actual_expr_rank(arg, locals, st, type_layouts).is_some_and(|rank| rank > 0) {
                     if let Some(len) = actual_char_arg_runtime_len(
@@ -11918,18 +11885,15 @@ pub(super) fn lower_char_intrinsic(
                     let (ptr, len) = lower_string_arg(b, arg);
                     (Some(ptr), len)
                 };
-            let truncated = match b.func().value_type(len) {
-                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(len, IntWidth::I32),
-                _ => len,
-            };
+            let result = coerce_to_type(b, len, &result_type);
             if let Some(ptr) = ptr_to_release {
                 release_string_arg(b, arg, ptr);
             }
-            Some(truncated)
+            Some(result)
         }
         "len_trim" => {
-            // F2018 §16.9.109: LEN_TRIM returns default integer.
             let arg = arg_spanned(0)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
             let (ptr, len_val) = lower_string_arg(b, arg);
             let raw = b.call(
                 FuncRef::External("afs_len_trim".into()),
@@ -11937,31 +11901,32 @@ pub(super) fn lower_char_intrinsic(
                 IrType::Int(IntWidth::I64),
             );
             release_string_arg(b, arg, ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "ichar" | "iachar" => {
             let arg = arg_spanned(0)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
             let (ptr, _) = lower_string_arg(b, arg);
-            let result = b.call(
+            let raw = b.call(
                 FuncRef::External("afs_ichar_ptr".into()),
                 vec![ptr],
                 IrType::Int(IntWidth::I32),
             );
             release_string_arg(b, arg, ptr);
-            Some(result)
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "char" | "achar" => {
-            let int_arg = args.first().and_then(|a| {
-                if let SectionSubscript::Element(e) = &a.value {
-                    Some(super::expr::lower_expr(b, locals, e, st))
-                } else {
-                    None
-                }
-            })?;
-            let i32_arg = match b.func().value_type(int_arg) {
-                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(int_arg, IntWidth::I32),
-                _ => int_arg,
-            };
+            let int_arg = super::expr::lower_expr_full(
+                b,
+                locals,
+                arg_spanned(0)?,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let i32_arg = coerce_to_type(b, int_arg, &IrType::Int(IntWidth::I32));
             let byte_val = b.call(
                 FuncRef::External("afs_char".into()),
                 vec![i32_arg],
@@ -11975,15 +11940,18 @@ pub(super) fn lower_char_intrinsic(
             b.store(byte_val, byte_ptr);
             Some(buf)
         }
-        "new_line" => Some(b.const_string(b"\n")),
+        "new_line" => {
+            let _ = arg_spanned(0)?;
+            Some(b.const_string(b"\n"))
+        }
         "index" => {
-            // F2018 §16.9.93: INDEX returns default integer.
             let hay = arg_spanned(0)?;
             let needle = arg_spanned(1)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
             let (hay_ptr, hay_len_val) = lower_string_arg(b, hay);
             let (needle_ptr, needle_len_val) = lower_string_arg(b, needle);
             let back_val = arg_spanned(2)
-                .map(|e| super::expr::lower_expr(b, locals, e, st))
+                .map(|e| lower_back_arg(b, e))
                 .unwrap_or_else(|| b.const_i32(0));
             let raw = b.call(
                 FuncRef::External("afs_index".into()),
@@ -11992,16 +11960,16 @@ pub(super) fn lower_char_intrinsic(
             );
             release_string_arg(b, hay, hay_ptr);
             release_string_arg(b, needle, needle_ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "scan" => {
-            // F2018 §16.9.169: SCAN returns default integer.
             let src = arg_spanned(0)?;
             let set = arg_spanned(1)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
             let (src_ptr, src_len_val) = lower_string_arg(b, src);
             let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
-                .map(|e| super::expr::lower_expr(b, locals, e, st))
+                .map(|e| lower_back_arg(b, e))
                 .unwrap_or_else(|| b.const_i32(0));
             let raw = b.call(
                 FuncRef::External("afs_scan".into()),
@@ -12010,16 +11978,16 @@ pub(super) fn lower_char_intrinsic(
             );
             release_string_arg(b, src, src_ptr);
             release_string_arg(b, set, set_ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "verify" => {
-            // F2018 §16.9.213: VERIFY returns default integer.
             let src = arg_spanned(0)?;
             let set = arg_spanned(1)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
             let (src_ptr, src_len_val) = lower_string_arg(b, src);
             let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
-                .map(|e| super::expr::lower_expr(b, locals, e, st))
+                .map(|e| lower_back_arg(b, e))
                 .unwrap_or_else(|| b.const_i32(0));
             let raw = b.call(
                 FuncRef::External("afs_verify".into()),
@@ -12028,7 +11996,7 @@ pub(super) fn lower_char_intrinsic(
             );
             release_string_arg(b, src, src_ptr);
             release_string_arg(b, set, set_ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "lge" | "lgt" | "lle" | "llt" => {
             let lhs = arg_spanned(0)?;
@@ -12127,7 +12095,16 @@ pub(super) fn lower_char_intrinsic(
         "repeat" => {
             let arg = arg_spanned(0)?;
             let (src_ptr, src_len) = lower_string_arg(b, arg);
-            let raw_copies = super::expr::lower_expr(b, locals, arg_spanned(1)?, st);
+            let raw_copies = super::expr::lower_expr_full(
+                b,
+                locals,
+                arg_spanned(1)?,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             let copies = widen_to_i64(b, raw_copies);
             let copies = clamp_nonnegative_i64(b, copies);
             let total_len = b.imul(src_len, copies);
@@ -17037,10 +17014,9 @@ pub(super) fn intrinsic_kind_arg_width(
     st: &SymbolTable,
 ) -> Option<u8> {
     match &expr.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
-        Expr::Name { name } => named_kind_value(name, locals, None, Some(st)),
-        Expr::ParenExpr { inner } => intrinsic_kind_arg_width(inner, locals, st),
-        _ => None,
+        Expr::Name { name } => named_kind_value(name, locals, None, Some(st))
+            .or_else(|| crate::sema::types::resolve_intrinsic_kind_arg(expr, st)),
+        _ => crate::sema::types::resolve_intrinsic_kind_arg(expr, st),
     }
 }
 
@@ -17457,13 +17433,15 @@ pub(super) fn local_intrinsic_call_type_info(
     };
     let lower_name = name.to_ascii_lowercase();
     let has_keyword = args.iter().any(|arg| arg.keyword.is_some());
-    let integer_inquiry_kind_pos = match lower_name.as_str() {
-        "size" | "lbound" | "ubound" => Some(2),
-        "shape" | "len" | "len_trim" => Some(1),
-        "count" => Some(2),
-        "index" | "scan" | "verify" => Some(3),
-        _ => None,
-    };
+    let integer_inquiry_kind_pos =
+        crate::sema::types::character_integer_result_kind_position(&lower_name).or({
+            match lower_name.as_str() {
+                "size" | "lbound" | "ubound" => Some(2),
+                "shape" => Some(1),
+                "count" => Some(2),
+                _ => None,
+            }
+        });
     if let Some(positional_index) = integer_inquiry_kind_pos {
         if let Some(kind) =
             intrinsic_kind_call_arg_width(args, positional_index, "kind", locals, st)
@@ -26783,13 +26761,21 @@ pub(super) fn lower_string_expr_full(
             }
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
-                let first_char_arg = args.first().and_then(|a| {
+                let source_first_arg = args.first().and_then(|a| {
                     if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                         Some(e)
                     } else {
                         None
                     }
                 });
+                let canonical_character_args = character_intrinsic_argument_expr_slots(&key, args);
+                let canonical_arg = |position: usize| {
+                    canonical_character_args
+                        .as_ref()
+                        .and_then(|slots| slots.get(position))
+                        .and_then(|slot| slot.as_ref().copied())
+                };
+                let first_arg = canonical_arg(0).or(source_first_arg);
                 // F2008 §13.7: a user-defined function or generic
                 // interface with the same name as an intrinsic
                 // procedure shadows the intrinsic. The integer-context
@@ -26820,7 +26806,7 @@ pub(super) fn lower_string_expr_full(
                 // = repeat(char, n) downstream of `use stdlib_strings`).
                 let user_named_interface_shadows_intrinsic = find_named_interface_symbol(st, &key)
                     .is_some()
-                    && !first_char_arg
+                    && !first_arg
                         .map(|arg| expr_is_character_expr(b, locals, arg, st, type_layouts))
                         .unwrap_or(false);
                 let intrinsic_key = if user_named_interface_shadows_intrinsic {
@@ -26845,7 +26831,7 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "trim" => {
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = first_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -26868,33 +26854,8 @@ pub(super) fn lower_string_expr_full(
                         // F2023 18.2.3.4: F_C_STRING(STRING [, ASIS]) returns
                         // TRIM(STRING)//C_NULL_CHAR, or STRING//C_NULL_CHAR when
                         // ASIS is true. The result length includes the NUL.
-                        fn elem(
-                            a: &crate::ast::expr::Argument,
-                        ) -> Option<&crate::ast::expr::SpannedExpr> {
-                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                                Some(e)
-                            } else {
-                                None
-                            }
-                        }
-                        let string_arg = args
-                            .iter()
-                            .find(|a| {
-                                a.keyword
-                                    .as_deref()
-                                    .is_some_and(|k| k.eq_ignore_ascii_case("string"))
-                            })
-                            .or_else(|| args.iter().find(|a| a.keyword.is_none()))
-                            .and_then(elem);
-                        let asis_arg = args
-                            .iter()
-                            .find(|a| {
-                                a.keyword
-                                    .as_deref()
-                                    .is_some_and(|k| k.eq_ignore_ascii_case("asis"))
-                            })
-                            .or_else(|| args.iter().filter(|a| a.keyword.is_none()).nth(1))
-                            .and_then(elem);
+                        let string_arg = canonical_arg(0);
+                        let asis_arg = canonical_arg(1);
                         if let Some(s) = string_arg {
                             let (src_ptr, src_len) = lower_string_expr_full(
                                 b,
@@ -26960,15 +26921,8 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "repeat" => {
-                        let second_int_arg = args.get(1).and_then(|a| {
-                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                                Some(e)
-                            } else {
-                                None
-                            }
-                        });
                         if let (Some(src_expr), Some(copies_expr)) =
-                            (first_char_arg, second_int_arg)
+                            (canonical_arg(0), canonical_arg(1))
                         {
                             let (src_ptr, src_len) = lower_string_expr_full(
                                 b,
@@ -26980,7 +26934,16 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
-                            let raw_copies = super::expr::lower_expr(b, locals, copies_expr, st);
+                            let raw_copies = super::expr::lower_expr_full(
+                                b,
+                                locals,
+                                copies_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let copies = widen_to_i64(b, raw_copies);
                             let copies = clamp_nonnegative_i64(b, copies);
                             let total_len = b.imul(src_len, copies);
@@ -27015,7 +26978,7 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "adjustl" => {
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = first_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -27049,7 +27012,7 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "adjustr" => {
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = first_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -27092,7 +27055,7 @@ pub(super) fn lower_string_expr_full(
                         // available — otherwise the substring fast
                         // path is skipped and a const-zero pointer
                         // gets fed into afs_ichar_ptr.
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = canonical_arg(0) {
                             let int_val = super::expr::lower_expr_full(
                                 b,
                                 locals,
@@ -27103,12 +27066,7 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
-                            let i32_val = match b.func().value_type(int_val) {
-                                Some(IrType::Int(IntWidth::I64)) => {
-                                    b.int_trunc(int_val, IntWidth::I32)
-                                }
-                                _ => int_val,
-                            };
+                            let i32_val = coerce_to_type(b, int_val, &IrType::Int(IntWidth::I32));
                             let byte_val = b.call(
                                 FuncRef::External("afs_char".into()),
                                 vec![i32_val],
@@ -27124,9 +27082,11 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "new_line" => {
-                        let ptr = b.const_string(b"\n");
-                        let len = b.const_i64(1);
-                        return (ptr, len);
+                        if canonical_arg(0).is_some() {
+                            let ptr = b.const_string(b"\n");
+                            let len = b.const_i64(1);
+                            return (ptr, len);
+                        }
                     }
                     "merge" => {
                         let second_char_arg = args.get(1).and_then(|a| {
@@ -27144,7 +27104,7 @@ pub(super) fn lower_string_expr_full(
                             }
                         });
                         if let (Some(tsrc), Some(fsrc), Some(mask_expr)) =
-                            (first_char_arg, second_char_arg, mask_arg)
+                            (first_arg, second_char_arg, mask_arg)
                         {
                             let (t_ptr, t_len) = lower_string_expr_full(
                                 b,
@@ -66850,6 +66810,76 @@ end module
             9,
             "each scalar intrinsic must release its owned character argument:\n{}",
             consume_ir
+        );
+    }
+
+    #[test]
+    fn character_intrinsics_lower_canonical_keyword_slots_and_result_kinds() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_intrinsic_keyword_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(6) :: value
+    value = 'banana'
+  end function
+  subroutine consume()
+    integer(2) :: short
+    integer(8) :: wide
+    integer(16) :: widest
+    character(6) :: text
+    logical(1) :: back
+    back = .true.
+    wide = index(kind=8, substring='na', string=make_text())
+    wide = index(kind=selected_int_kind(18), substring='na', string='banana')
+    short = scan(kind=2, back=back, set='ab', string='cabca')
+    widest = verify(kind=16, set='ab', string='abXba')
+    wide = ichar(kind=kind(0_8), c='A')
+    text = repeat(ncopies=3, string='xy')
+    text = char(kind=1, i=65)
+    back = lge(string_b='A', string_a='B')
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_intrinsic_keyword_m_consume")
+            .expect("missing keyword intrinsic consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_intrinsic_keyword_m_make_text")
+                .count(),
+            1,
+            "keyword actuals must be associated and evaluated exactly once:\n{consume_ir}"
+        );
+        for runtime in [
+            "call @afs_index",
+            "call @afs_scan",
+            "call @afs_verify",
+            "call @afs_ichar_ptr",
+            "call @afs_repeat",
+            "call @afs_char",
+            "call @afs_lge",
+        ] {
+            assert!(
+                consume_ir.contains(runtime),
+                "missing {runtime} in:\n{consume_ir}"
+            );
+        }
+        assert!(
+            consume_ir.contains(": i16 : i16"),
+            "kind=2 result must truncate to i16:\n{consume_ir}"
+        );
+        assert!(
+            consume_ir.contains(": i128 signed : i128"),
+            "kind=16 result must extend to i128:\n{consume_ir}"
         );
     }
 

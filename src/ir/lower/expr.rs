@@ -2376,27 +2376,45 @@ pub(crate) fn lower_expr_full(
                 }
                 let intrinsic_result = if !has_named_interface && !user_shadows_intrinsic {
                     if let Some(intrinsic_name) = resolved_intrinsic_name.as_deref() {
-                        let intrinsic_arg_slots =
-                            reorder_args_by_keyword_slots(original_args, intrinsic_name, st);
-                        let intrinsic_args: Vec<crate::ast::expr::Argument> =
-                            intrinsic_arg_slots.iter().flatten().cloned().collect();
-                        let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
-                            .iter()
-                            .map(|a| match &a.value {
-                                crate::ast::expr::SectionSubscript::Element(e) => lower_expr_full(
-                                    b,
-                                    locals,
-                                    e,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                ),
-                                _ => b.const_i32(0),
-                            })
-                            .collect();
-                        super::intrinsic::lower_intrinsic(b, intrinsic_name, &intrinsic_arg_vals)
+                        if crate::sema::types::character_intrinsic_signature(intrinsic_name)
+                            .is_some()
+                        {
+                            // These intrinsics need the original character AST
+                            // for lengths, descriptors, ownership, and canonical
+                            // keyword association.  Pre-lowering here both lost
+                            // that metadata and evaluated side-effecting actuals
+                            // a second time before lower_char_intrinsic handled
+                            // the real call.
+                            None
+                        } else {
+                            let intrinsic_arg_slots =
+                                reorder_args_by_keyword_slots(original_args, intrinsic_name, st);
+                            let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                                intrinsic_arg_slots.iter().flatten().cloned().collect();
+                            let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
+                                .iter()
+                                .map(|a| match &a.value {
+                                    crate::ast::expr::SectionSubscript::Element(e) => {
+                                        lower_expr_full(
+                                            b,
+                                            locals,
+                                            e,
+                                            st,
+                                            type_layouts,
+                                            internal_funcs,
+                                            contained_host_refs,
+                                            descriptor_params,
+                                        )
+                                    }
+                                    _ => b.const_i32(0),
+                                })
+                                .collect();
+                            super::intrinsic::lower_intrinsic(
+                                b,
+                                intrinsic_name,
+                                &intrinsic_arg_vals,
+                            )
+                        }
                     } else {
                         None
                     }

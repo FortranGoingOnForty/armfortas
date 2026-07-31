@@ -730,15 +730,6 @@ fn character_literal_kind(ctx: &Ctx<'_>, kind: &str) -> Option<i128> {
     })
 }
 
-fn selected_character_kind(name: &str) -> i128 {
-    let name = name.trim_end_matches(' ');
-    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
-        1
-    } else {
-        -1
-    }
-}
-
 fn checked_int_value(value: i128, kind: u8, span: Span) -> Result<ConstIntValue, ConstIntError> {
     let Some((min, max)) = int_kind_bounds(kind) else {
         return Ok(ConstIntValue { value, kind });
@@ -861,29 +852,9 @@ fn eval_const_int_expr_checked(
             checked_int_value(value, kind, expr.span).map(Some)
         }
         Expr::ParenExpr { inner } => eval_const_int_expr_checked(ctx, inner),
-        Expr::FunctionCall { callee, args } => {
-            let Expr::Name { name } = &callee.node else {
+        Expr::FunctionCall { .. } => {
+            let Some(value) = crate::sema::types::resolve_intrinsic_kind_value(expr, ctx.st) else {
                 return Ok(None);
-            };
-            let Some(first) = call_rank_argument_expr(args, 0, &["name", "x"]) else {
-                return Ok(None);
-            };
-            let value = match name.to_ascii_lowercase().as_str() {
-                "selected_char_kind" => match &first.node {
-                    Expr::StringLiteral { value, .. } => {
-                        selected_character_kind(value.to_string_lossy().as_ref())
-                    }
-                    _ => return Ok(None),
-                },
-                "kind" => match validation_expr_type_info(ctx, first) {
-                    Some(TypeInfo::Integer { kind })
-                    | Some(TypeInfo::Real { kind })
-                    | Some(TypeInfo::Complex { kind })
-                    | Some(TypeInfo::Logical { kind })
-                    | Some(TypeInfo::Character { kind, .. }) => i128::from(kind.unwrap_or(1)),
-                    _ => return Ok(None),
-                },
-                _ => return Ok(None),
             };
             checked_int_value(
                 value,
@@ -6517,12 +6488,15 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     .collect();
                 if let Some(arg_types) = arg_types {
                     let key = name.to_ascii_lowercase();
-                    let kind_position = match key.as_str() {
+                    let kind_position = crate::sema::types::character_integer_result_kind_position(
+                        &key,
+                    )
+                    .or(match key.as_str() {
                         "cmplx" => Some(2),
                         "int" | "nint" | "floor" | "ceiling" | "real" | "logical" | "char"
-                        | "achar" | "ichar" | "iachar" => Some(1),
+                        | "achar" => Some(1),
                         _ => None,
-                    };
+                    });
                     let requested_kind = kind_position
                         .and_then(|position| call_rank_argument_expr(args, position, &["kind"]))
                         .and_then(|kind_expr| {
@@ -6531,7 +6505,8 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                         .and_then(|value| u8::try_from(value.value).ok());
                     if let Some(kind) = requested_kind {
                         let type_info = match key.as_str() {
-                            "int" | "nint" | "floor" | "ceiling" | "ichar" | "iachar" => {
+                            "int" | "nint" | "floor" | "ceiling" | "len" | "len_trim" | "index"
+                            | "scan" | "verify" | "ichar" | "iachar" => {
                                 TypeInfo::Integer { kind: Some(kind) }
                             }
                             "real" => TypeInfo::Real { kind: Some(kind) },
@@ -10937,14 +10912,18 @@ fn intrinsic_not_implemented(name: &str) -> bool {
 
 #[derive(Clone, Copy)]
 enum IntrinsicArgumentType {
+    Character,
     Integer,
+    Logical,
     Real,
 }
 
 impl IntrinsicArgumentType {
     fn name(self) -> &'static str {
         match self {
+            Self::Character => "CHARACTER",
             Self::Integer => "INTEGER",
+            Self::Logical => "LOGICAL",
             Self::Real => "REAL",
         }
     }
@@ -10952,7 +10931,10 @@ impl IntrinsicArgumentType {
     fn matches(self, info: &TypeInfo) -> bool {
         matches!(
             (self, info),
-            (Self::Integer, TypeInfo::Integer { .. }) | (Self::Real, TypeInfo::Real { .. })
+            (Self::Character, TypeInfo::Character { .. })
+                | (Self::Integer, TypeInfo::Integer { .. })
+                | (Self::Logical, TypeInfo::Logical { .. })
+                | (Self::Real, TypeInfo::Real { .. })
         )
     }
 }
@@ -11081,6 +11063,141 @@ fn intrinsic_real_kind(info: &TypeInfo) -> Option<u8> {
     }
 }
 
+fn validate_character_intrinsic_kind(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    position: usize,
+    character_result: bool,
+) {
+    let Some(kind_expr) = call_rank_argument_expr(args, position, &["kind"]) else {
+        return;
+    };
+    let integer = validation_expr_type_info(ctx, kind_expr)
+        .is_some_and(|info| matches!(info, TypeInfo::Integer { .. }));
+    let scalar = validation_expr_rank(ctx, kind_expr).is_none_or(|rank| rank == 0);
+    if !integer || !scalar {
+        return;
+    }
+
+    let kind = match eval_const_int_expr_checked(ctx, kind_expr) {
+        Ok(Some(kind)) => kind.value,
+        Ok(None) => {
+            ctx.error(
+                kind_expr.span,
+                format!(
+                    "intrinsic '{intrinsic}' argument KIND must be a scalar INTEGER constant expression"
+                ),
+            );
+            return;
+        }
+        Err(error) => {
+            ctx.error(error.span, error.msg);
+            return;
+        }
+    };
+
+    if character_result {
+        if kind != 1 {
+            ctx.error(
+                span,
+                format!(
+                    "CHARACTER(kind={kind}) data is not supported: the backend and runtime support only CHARACTER(kind=1)"
+                ),
+            );
+        }
+    } else if !matches!(kind, 1 | 2 | 4 | 8 | 16) {
+        ctx.error(
+            kind_expr.span,
+            format!(
+                "intrinsic '{intrinsic}' requests unsupported INTEGER result kind {kind}; supported kinds are 1, 2, 4, 8, and 16"
+            ),
+        );
+    }
+}
+
+fn validate_character_intrinsic_call(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+) {
+    let Some((formals, required)) = crate::sema::types::character_intrinsic_signature(intrinsic)
+    else {
+        return;
+    };
+    validate_intrinsic_argument_associations(ctx, span, intrinsic, args, formals, required);
+
+    let require_type = |ctx: &mut Ctx<'_>, position, formal, expected| {
+        require_intrinsic_argument_type(ctx, span, intrinsic, args, position, formal, expected);
+    };
+    let require_scalar = |ctx: &mut Ctx<'_>, position, formal| {
+        require_intrinsic_scalar_argument(ctx, span, intrinsic, args, position, formal);
+    };
+
+    match intrinsic {
+        "len" | "len_trim" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+        }
+        "ichar" | "iachar" => {
+            require_type(ctx, 0, "c", IntrinsicArgumentType::Character);
+        }
+        "char" | "achar" => {
+            require_type(ctx, 0, "i", IntrinsicArgumentType::Integer);
+        }
+        "index" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "substring", IntrinsicArgumentType::Character);
+            require_type(ctx, 2, "back", IntrinsicArgumentType::Logical);
+            require_scalar(ctx, 2, "back");
+        }
+        "scan" | "verify" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "set", IntrinsicArgumentType::Character);
+            require_type(ctx, 2, "back", IntrinsicArgumentType::Logical);
+            require_scalar(ctx, 2, "back");
+        }
+        "adjustl" | "adjustr" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+        }
+        "trim" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_scalar(ctx, 0, "string");
+        }
+        "repeat" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "ncopies", IntrinsicArgumentType::Integer);
+            require_scalar(ctx, 0, "string");
+            require_scalar(ctx, 1, "ncopies");
+        }
+        "lge" | "lgt" | "lle" | "llt" => {
+            require_type(ctx, 0, "string_a", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "string_b", IntrinsicArgumentType::Character);
+        }
+        "new_line" => {
+            require_type(ctx, 0, "a", IntrinsicArgumentType::Character);
+        }
+        "f_c_string" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "asis", IntrinsicArgumentType::Logical);
+            require_scalar(ctx, 0, "string");
+            require_scalar(ctx, 1, "asis");
+        }
+        _ => unreachable!(),
+    }
+
+    if let Some(position) = crate::sema::types::character_integer_result_kind_position(intrinsic) {
+        require_type(ctx, position, "kind", IntrinsicArgumentType::Integer);
+        require_scalar(ctx, position, "kind");
+        validate_character_intrinsic_kind(ctx, span, intrinsic, args, position, false);
+    } else if matches!(intrinsic, "char" | "achar") {
+        require_type(ctx, 1, "kind", IntrinsicArgumentType::Integer);
+        require_scalar(ctx, 1, "kind");
+        validate_character_intrinsic_kind(ctx, span, intrinsic, args, 1, true);
+    }
+}
+
 pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
     let key = name.to_ascii_lowercase();
     if let Some(symbol) = ctx.lookup_lexical(&key) {
@@ -11107,6 +11224,7 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
         ctx.require_std(span, FortranStandard::F2023, "IEEE_FMA");
     }
     validate_elemental_intrinsic_rank_conformance(ctx, span, &key, args);
+    validate_character_intrinsic_call(ctx, span, &key, args);
 
     match key.as_str() {
         "fraction" | "exponent" => {
@@ -11199,23 +11317,6 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                     IntrinsicArgumentType::Integer,
                 );
                 require_intrinsic_scalar_argument(ctx, span, &key, args, position, formal);
-            }
-        }
-        "char" | "achar" => {
-            let Some(kind_expr) = call_rank_argument_expr(args, 1, &["kind"]) else {
-                return;
-            };
-            let Ok(Some(kind)) = eval_const_int_expr_checked(ctx, kind_expr) else {
-                return;
-            };
-            if kind.value != 1 {
-                ctx.error(
-                    span,
-                    format!(
-                        "CHARACTER(kind={}) data is not supported: the backend and runtime support only CHARACTER(kind=1)",
-                        kind.value
-                    ),
-                );
             }
         }
         _ => {}
@@ -13323,6 +13424,79 @@ end program
 ",
         );
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_canonical_character_intrinsic_keyword_association() {
+        let errs = errors_from(
+            "\
+program p
+  use iso_fortran_env, only: int8, int16, int64
+  implicit none
+  integer(int64) :: i
+  character(8) :: text
+  logical(int8) :: back
+  back = .true.
+  i = index(kind=int64, substring='na', string='banana')
+  i = scan(kind=int16, back=back, set='ab', string='cabca')
+  i = verify(kind=int8, set='ab', string='abXba')
+  i = len(kind=int64, string='abcd')
+  i = len_trim(kind=int16, string='ab  ')
+  i = ichar(kind=kind(0_int64), c='A')
+  i = iachar(kind=int8, c='B')
+  i = index(kind=selected_int_kind(18), substring='na', string='banana')
+  i = verify(kind=selected_real_kind(r=300, p=15), set='ab', string='abXba')
+  text = repeat(ncopies=3, string='xy')
+  text = adjustl(string='  xy    ')
+  text = adjustr(string='xy      ')
+  text = trim(string='xy      ')
+  text = char(kind=1, i=65)
+  text = achar(kind=1, i=66)
+  text = new_line(a='x')
+  if (lge(string_b='A', string_a='B')) continue
+end program p
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_character_intrinsic_association_and_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: runtime_kind
+  print *, index(string='a', substring='a', reverse=.true.)
+  print *, scan('abc', string='abc', set='a')
+  print *, verify(string='abc', set='a', back=1)
+  print *, len(string='a', kind=runtime_kind)
+  print *, ichar(c='a', kind=3)
+  print *, repeat(string='a', ncopies=.true.)
+  print *, trim(string=1)
+  print *, new_line(a=1)
+  print *, index(string='a', back=.true.)
+  print *, index(string='a', 'a')
+end program p
+",
+        );
+        for expected in [
+            "unknown keyword argument 'reverse' in call to 'index'",
+            "argument 'string' is associated more than once in call to 'scan'",
+            "BACK must be LOGICAL",
+            "KIND must be a scalar INTEGER constant expression",
+            "unsupported INTEGER result kind 3",
+            "NCOPIES must be INTEGER",
+            "STRING must be CHARACTER",
+            "A must be CHARACTER",
+            "required argument 'substring' is absent in call to 'index'",
+            "positional argument follows a keyword argument in call to 'index'",
+        ] {
+            assert!(
+                errs.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} in {errs:?}"
+            );
+        }
     }
 
     #[test]
