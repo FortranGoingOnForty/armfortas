@@ -5317,6 +5317,160 @@ fn validate_allocation_options(
     presence
 }
 
+fn allocation_names_designate_same_entity(ctx: &Ctx<'_>, left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    match (ctx.lookup_lexical(left), ctx.lookup_lexical(right)) {
+        (Some(left), Some(right)) => {
+            left.scope == right.scope && left.name.eq_ignore_ascii_case(&right.name)
+        }
+        _ => false,
+    }
+}
+
+fn stable_array_reference_callee(ctx: &Ctx<'_>, callee: &SpannedExpr) -> bool {
+    if validation_expr_rank(ctx, callee).is_none_or(|rank| rank == 0) {
+        return false;
+    }
+
+    match &callee.node {
+        Expr::Name { name } => {
+            if ctx
+                .block_binding_attrs(name)
+                .and_then(|binding| binding.rank)
+                .is_some_and(|rank| rank > 0)
+            {
+                return true;
+            }
+            ctx.lookup_lexical(name).is_some_and(|symbol| {
+                matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && !symbol.attrs.array_spec.is_empty()
+            })
+        }
+        Expr::ComponentAccess { .. } => {
+            leaf_field_layout(ctx, callee).is_some_and(|leaf| !leaf.field.procedure_pointer)
+        }
+        Expr::ParenExpr { inner } => stable_array_reference_callee(ctx, inner),
+        _ => false,
+    }
+}
+
+fn stable_subscript_exprs_are_equal(
+    ctx: &Ctx<'_>,
+    left: &SpannedExpr,
+    right: &SpannedExpr,
+) -> bool {
+    if let (Ok(Some(left)), Ok(Some(right))) = (
+        eval_const_int_expr_checked(ctx, left),
+        eval_const_int_expr_checked(ctx, right),
+    ) {
+        return left.value == right.value;
+    }
+
+    allocation_designators_are_equal(ctx, left, right)
+}
+
+// This is deliberately proof-oriented rather than ordinary AST equality.
+// Procedure calls can return a different subscript on each evaluation, while
+// resolved aliases and side-effect-free array references can identify the same
+// object even when their source spellings differ.
+fn stable_section_subscripts_are_equal(
+    ctx: &Ctx<'_>,
+    left: &SectionSubscript,
+    right: &SectionSubscript,
+) -> bool {
+    match (left, right) {
+        (SectionSubscript::Element(left), SectionSubscript::Element(right)) => {
+            stable_subscript_exprs_are_equal(ctx, left, right)
+        }
+        _ => false,
+    }
+}
+
+fn allocation_designators_are_equal(
+    ctx: &Ctx<'_>,
+    left: &SpannedExpr,
+    right: &SpannedExpr,
+) -> bool {
+    match (&left.node, &right.node) {
+        (Expr::ParenExpr { inner: left }, _) => allocation_designators_are_equal(ctx, left, right),
+        (_, Expr::ParenExpr { inner: right }) => allocation_designators_are_equal(ctx, left, right),
+        (Expr::Name { name: left }, Expr::Name { name: right }) => {
+            allocation_names_designate_same_entity(ctx, left, right)
+        }
+        (
+            Expr::ComponentAccess {
+                base: left_base,
+                component: left_component,
+            },
+            Expr::ComponentAccess {
+                base: right_base,
+                component: right_component,
+            },
+        ) => {
+            left_component.eq_ignore_ascii_case(right_component)
+                && allocation_designators_are_equal(ctx, left_base, right_base)
+        }
+        (
+            Expr::FunctionCall {
+                callee: left_callee,
+                args: left_args,
+            },
+            Expr::FunctionCall {
+                callee: right_callee,
+                args: right_args,
+            },
+        ) => {
+            stable_array_reference_callee(ctx, left_callee)
+                && stable_array_reference_callee(ctx, right_callee)
+                && allocation_designators_are_equal(ctx, left_callee, right_callee)
+                && left_args.len() == right_args.len()
+                && left_args.iter().zip(right_args).all(|(left, right)| {
+                    left.keyword.is_none()
+                        && right.keyword.is_none()
+                        && stable_section_subscripts_are_equal(ctx, &left.value, &right.value)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn allocation_object_designator(item: &SpannedExpr, has_allocation_shape: bool) -> &SpannedExpr {
+    if has_allocation_shape {
+        if let Expr::FunctionCall { callee, .. } = &item.node {
+            return callee;
+        }
+    }
+    item
+}
+
+fn validate_distinct_allocation_objects(ctx: &mut Ctx<'_>, items: &[SpannedExpr], statement: &str) {
+    let has_allocation_shape = statement == "ALLOCATE";
+    for (index, item) in items.iter().enumerate().skip(1) {
+        let item_designator = allocation_object_designator(item, has_allocation_shape);
+        let earlier = items[..index].iter().find(|earlier| {
+            allocation_designators_are_equal(
+                ctx,
+                allocation_object_designator(earlier, has_allocation_shape),
+                item_designator,
+            )
+        });
+        let Some(earlier) = earlier else {
+            continue;
+        };
+        let earlier = earlier.to_sexpr();
+        ctx.error(
+            item.span,
+            format!(
+                "{statement} object '{}' designates the same entity as an earlier {statement} object '{earlier}'",
+                item.to_sexpr()
+            ),
+        );
+    }
+}
+
 fn validate_stop_quiet(ctx: &mut Ctx<'_>, quiet: Option<&SpannedExpr>) {
     let Some(quiet) = quiet else {
         return;
@@ -5441,6 +5595,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             if has_source && has_mold {
                 ctx.error(stmt.span, "ALLOCATE cannot specify both SOURCE= and MOLD=");
             }
+            validate_distinct_allocation_objects(ctx, items, "ALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
@@ -5460,6 +5615,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
         Stmt::Deallocate { items, opts } => {
             validate_allocation_options(ctx, stmt.span, "DEALLOCATE", opts, false);
+            validate_distinct_allocation_objects(ctx, items, "DEALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
             }
@@ -14473,6 +14629,68 @@ end program
 ",
         );
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_allocate_and_deallocate_objects() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  type :: box_t
+    integer, allocatable :: value
+  end type
+  type(box_t) :: boxes(2)
+  integer, allocatable :: values(:)
+  integer :: index
+
+  allocate(values(2), values(3))
+  allocate(boxes(1)%value, boxes(1)%value)
+  deallocate(values, values)
+  deallocate(boxes(index)%value, boxes(index)%value)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| { err.contains("same entity as an earlier ALLOCATE object") })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| { err.contains("same entity as an earlier DEALLOCATE object") })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_distinct_and_side_effect_selected_allocation_objects() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  type :: box_t
+    integer, allocatable :: value
+  end type
+  type(box_t) :: boxes(2)
+
+  allocate(boxes(1)%value, boxes(2)%value)
+  deallocate(boxes(1)%value, boxes(2)%value)
+  allocate(boxes(next_index())%value, boxes(next_index())%value)
+contains
+  integer function next_index()
+    integer, save :: index = 0
+    index = index + 1
+    next_index = index
+  end function
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
