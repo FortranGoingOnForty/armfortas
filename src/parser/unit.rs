@@ -349,13 +349,16 @@ impl<'a> Parser<'a> {
         shape_matches.then_some(prefix_len)
     }
 
+    fn expect_program_unit_name(&mut self, context: &str) -> Result<String, ParseError> {
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!("expected {context} name, got {}", self.peek())));
+        }
+        Ok(self.advance().text.clone())
+    }
+
     fn parse_program(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'program'
-        let name = if self.peek() == &TokenKind::Identifier {
-            Some(self.advance().clone().text)
-        } else {
-            None
-        };
+        let name = Some(self.expect_program_unit_name("program")?);
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
@@ -424,7 +427,7 @@ impl<'a> Parser<'a> {
 
     fn parse_module(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'module'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("module")?;
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, _body, ifaces) = self.parse_unit_body(&["module"])?;
@@ -449,14 +452,14 @@ impl<'a> Parser<'a> {
     fn parse_submodule(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'submodule'
         self.expect(&TokenKind::LParen)?;
-        let parent = self.advance().clone().text;
+        let parent = self.expect_program_unit_name("submodule ancestor module")?;
         let ancestor = if self.eat(&TokenKind::Colon) {
-            Some(self.advance().clone().text)
+            Some(self.expect_program_unit_name("submodule parent")?)
         } else {
             None
         };
         self.expect(&TokenKind::RParen)?;
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("submodule")?;
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, _body, ifaces) =
@@ -492,7 +495,7 @@ impl<'a> Parser<'a> {
         prefix: Vec<Prefix>,
     ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'subroutine'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("subroutine")?;
 
         let args = if self.eat(&TokenKind::LParen) {
             let a = self.parse_dummy_arg_list()?;
@@ -536,7 +539,7 @@ impl<'a> Parser<'a> {
         return_type: Option<crate::ast::decl::TypeSpec>,
     ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'function'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("function")?;
 
         self.expect(&TokenKind::LParen)?;
         let args = self.parse_dummy_arg_list()?;
@@ -602,7 +605,7 @@ impl<'a> Parser<'a> {
         prefix: Vec<Prefix>,
     ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'procedure'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("module procedure")?;
         self.skip_newlines();
 
         // Body is parsed normally; declarations may appear (e.g. local
@@ -1740,6 +1743,84 @@ mod tests {
     }
 
     #[test]
+    fn required_program_unit_names_must_be_present() {
+        let cases = [
+            ("program\nend program\n", "program name"),
+            ("module\nend module\n", "module name"),
+            ("subroutine\nend subroutine\n", "subroutine name"),
+            ("function()\nend function\n", "function name"),
+            ("module procedure\nend procedure\n", "module procedure name"),
+            ("submodule(parent)\nend submodule\n", "submodule name"),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_error(source);
+            assert!(
+                error.msg.contains(&format!("expected {expected}")),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_program_unit_names_must_be_identifiers() {
+        let cases = [
+            ("program 1\nend program\n", "program name"),
+            ("module 1\nend module\n", "module name"),
+            ("subroutine 1\nend subroutine\n", "subroutine name"),
+            ("function 1()\nend function\n", "function name"),
+            (
+                "module procedure 1\nend procedure\n",
+                "module procedure name",
+            ),
+            (
+                "submodule(1) child\nend submodule child\n",
+                "submodule ancestor module name",
+            ),
+            (
+                "submodule(parent:1) child\nend submodule child\n",
+                "submodule parent name",
+            ),
+            ("submodule(parent) 1\nend submodule\n", "submodule name"),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_error(source);
+            assert!(
+                error.msg.contains(&format!("expected {expected}")),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_form_program_unit_names_must_be_present() {
+        let cases = [
+            (concat!("      PROGRAM\n", "      END\n"), "program name"),
+            (
+                concat!("      MODULE\n", "      ENDMODULE\n"),
+                "module name",
+            ),
+            (
+                concat!("      SUBROUTINE\n", "      ENDSUBROUTINE\n"),
+                "subroutine name",
+            ),
+            (
+                concat!("      FUNCTION()\n", "      ENDFUNCTION\n"),
+                "function name",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_fixed_error(source);
+            assert!(
+                error.msg.contains(&format!("expected {expected}")),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn standalone_double_is_an_identifier_in_free_and_fixed_form() {
         let free = parse_unit(
             "\
@@ -1989,7 +2070,6 @@ end module malformed_m
     #[test]
     fn closing_name_requires_an_opening_name() {
         let sources = [
-            "program\nend program alpha\n",
             "value = 1\nend program alpha\n",
             "block data\nend block data alpha\n",
         ];
