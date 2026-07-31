@@ -1096,8 +1096,17 @@ impl<'a> Parser<'a> {
             // from a same-named external procedure and PURE validation can
             // require an explicit purity contract for external calls.
             if (text == "intrinsic" || text == "external")
-                && (next_tok.as_ref() == Some(&TokenKind::ColonColon)
-                    || next_tok.as_ref() == Some(&TokenKind::Identifier))
+                && matches!(
+                    next_tok.as_ref(),
+                    Some(
+                        TokenKind::ColonColon
+                            | TokenKind::Identifier
+                            | TokenKind::Newline
+                            | TokenKind::Comment
+                            | TokenKind::Semicolon
+                            | TokenKind::Eof
+                    )
+                )
             {
                 let start = self.current_span();
                 let attr = if text == "intrinsic" {
@@ -1107,18 +1116,24 @@ impl<'a> Parser<'a> {
                 };
                 self.advance(); // consume keyword
                 let _ = self.eat(&TokenKind::ColonColon);
-                let mut entities = Vec::new();
-                while self.peek() == &TokenKind::Identifier {
-                    entities.push(self.advance().clone().text);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-                if entities.is_empty() {
+                if self.peek() != &TokenKind::Identifier {
                     return Err(self.error(format!(
                         "{} statement requires at least one procedure name",
                         text.to_ascii_uppercase()
                     )));
+                }
+                let mut entities = Vec::new();
+                loop {
+                    entities.push(self.advance().clone().text);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.peek() != &TokenKind::Identifier {
+                        return Err(self.error(format!(
+                            "expected procedure name after ',' in {} statement",
+                            text.to_ascii_uppercase()
+                        )));
+                    }
                 }
                 self.skip_newlines();
                 let span = span_from_to(start, self.prev_span());
@@ -2142,55 +2157,108 @@ end module malformed_m
     fn standalone_external_and_intrinsic_statements_are_preserved() {
         use crate::ast::decl::{Attribute, Decl};
 
-        let unit = parse_unit(
-            "program p\n\
-               real :: typed_external\n\
-               external :: typed_external\n\
-               external :: external_work\n\
-               intrinsic :: sin\n\
-             end program p\n",
-        );
-        let ProgramUnit::Program { decls, .. } = &unit.node else {
-            panic!("not Program");
-        };
+        let units = [
+            parse_unit(
+                "program p\n\
+                   real :: typed_external\n\
+                   external :: typed_external\n\
+                   external :: external_work\n\
+                   intrinsic :: sin\n\
+                 end program p\n",
+            ),
+            parse_fixed_unit(concat!(
+                "      PROGRAM P\n",
+                "      REAL TYPED_EXTERNAL\n",
+                "      EXTERNAL TYPED_EXTERNAL\n",
+                "      EXTERNAL EXTERNAL_WORK\n",
+                "      INTRINSIC SIN\n",
+                "      END\n",
+            )),
+        ];
 
-        assert!(decls.iter().any(|decl| {
-            matches!(
-                &decl.node,
-                Decl::TypeDecl { attrs, entities, .. }
-                    if entities.iter().any(|entity| entity.name == "typed_external")
-                        && attrs.iter().any(|attr| matches!(attr, Attribute::External))
-            )
-        }));
-        assert!(decls.iter().any(|decl| {
-            matches!(
-                &decl.node,
-                Decl::AttributeStmt {
-                    attr: Attribute::External,
-                    entities,
-                } if entities == &["external_work"]
-            )
-        }));
-        assert!(decls.iter().any(|decl| {
-            matches!(
-                &decl.node,
-                Decl::AttributeStmt {
-                    attr: Attribute::Intrinsic,
-                    entities,
-                } if entities == &["sin"]
-            )
-        }));
+        for unit in units {
+            let ProgramUnit::Program { decls, .. } = &unit.node else {
+                panic!("not Program");
+            };
+
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::TypeDecl { attrs, entities, .. }
+                        if entities
+                            .iter()
+                            .any(|entity| entity.name.eq_ignore_ascii_case("typed_external"))
+                            && attrs.iter().any(|attr| matches!(attr, Attribute::External))
+                )
+            }));
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::AttributeStmt {
+                        attr: Attribute::External,
+                        entities,
+                    } if entities.len() == 1
+                        && entities[0].eq_ignore_ascii_case("external_work")
+                )
+            }));
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::AttributeStmt {
+                        attr: Attribute::Intrinsic,
+                        entities,
+                    } if entities.len() == 1 && entities[0].eq_ignore_ascii_case("sin")
+                )
+            }));
+        }
     }
 
     #[test]
     fn standalone_procedure_attribute_statements_require_a_name() {
         for keyword in ["external", "intrinsic"] {
-            let error = parse_error(&format!("program p\n  {keyword} ::\nend program p\n"));
+            for separator in ["", " ::"] {
+                let source = format!("program p\n  {keyword}{separator}\nend program p\n");
+                let error = parse_error(&source);
+                assert!(
+                    error
+                        .msg
+                        .contains("statement requires at least one procedure name"),
+                    "unexpected error for {source:?}: {error}"
+                );
+
+                let fixed_source = format!(
+                    "      {}\n      END\n",
+                    keyword.to_ascii_uppercase() + separator
+                );
+                let error = parse_fixed_error(&fixed_source);
+                assert!(
+                    error
+                        .msg
+                        .contains("statement requires at least one procedure name"),
+                    "unexpected error for {fixed_source:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_procedure_attribute_statements_reject_trailing_commas() {
+        for keyword in ["external", "intrinsic"] {
+            let source = format!("program p\n  {keyword} :: work,\nend program p\n");
+            let error = parse_error(&source);
             assert!(
-                error
-                    .msg
-                    .contains("statement requires at least one procedure name"),
-                "unexpected error for {keyword}: {error}"
+                error.msg.contains("expected procedure name after ','"),
+                "unexpected error for {source:?}: {error}"
+            );
+
+            let fixed_source = format!(
+                "      {} :: WORK,\n      END\n",
+                keyword.to_ascii_uppercase()
+            );
+            let error = parse_fixed_error(&fixed_source);
+            assert!(
+                error.msg.contains("expected procedure name after ','"),
+                "unexpected error for {fixed_source:?}: {error}"
             );
         }
     }
