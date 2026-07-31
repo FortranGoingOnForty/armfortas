@@ -11,6 +11,22 @@ use crate::lexer::TokenKind;
 impl<'a> Parser<'a> {
     // ---- Type specifier parsing ----
 
+    /// Parse the two-token `DOUBLE PRECISION` / `DOUBLE COMPLEX` spellings
+    /// without consuming a standalone contextual identifier named `double`.
+    fn try_parse_spaced_double_type_spec(&mut self) -> Option<TypeSpec> {
+        let suffix = &self.tokens.get(self.pos + 1)?.text;
+        let type_spec = if suffix.eq_ignore_ascii_case("precision") {
+            TypeSpec::DoublePrecision
+        } else if suffix.eq_ignore_ascii_case("complex") {
+            TypeSpec::DoubleComplex
+        } else {
+            return None;
+        };
+        self.advance();
+        self.advance();
+        Some(type_spec)
+    }
+
     /// Try to parse a type specifier. Returns None if current token isn't a type keyword.
     pub fn try_parse_type_spec(&mut self) -> Option<Result<TypeSpec, ParseError>> {
         let text = self.peek_text().to_lowercase();
@@ -23,19 +39,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(self.parse_kind_selector().map(TypeSpec::Real))
             }
-            "doubleprecision" | "double" => {
+            "doubleprecision" => {
                 self.advance();
-                // Handle "double precision" / "double complex" as two tokens.
-                if self.peek_text().eq_ignore_ascii_case("precision") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoublePrecision))
-                } else if self.peek_text().eq_ignore_ascii_case("complex") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoubleComplex))
-                } else {
-                    Some(Ok(TypeSpec::DoublePrecision))
-                }
+                Some(Ok(TypeSpec::DoublePrecision))
             }
+            "double" => self.try_parse_spaced_double_type_spec().map(Ok),
             "complex" => {
                 self.advance();
                 Some(self.parse_kind_selector().map(TypeSpec::Complex))
@@ -117,18 +125,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(Ok(TypeSpec::Real(None)))
             }
-            "doubleprecision" | "double" => {
+            "doubleprecision" => {
                 self.advance();
-                if self.peek_text().eq_ignore_ascii_case("precision") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoublePrecision))
-                } else if self.peek_text().eq_ignore_ascii_case("complex") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoubleComplex))
-                } else {
-                    Some(Ok(TypeSpec::DoublePrecision))
-                }
+                Some(Ok(TypeSpec::DoublePrecision))
             }
+            "double" => self.try_parse_spaced_double_type_spec().map(Ok),
             "complex" => {
                 self.advance();
                 Some(Ok(TypeSpec::Complex(None)))
@@ -2184,6 +2185,16 @@ end type item",
         let d = parse_decl("double precision :: x");
         if let Decl::TypeDecl { type_spec, .. } = &d.node {
             assert!(matches!(type_spec, TypeSpec::DoublePrecision));
+        } else {
+            panic!("not TypeDecl");
+        }
+    }
+
+    #[test]
+    fn double_complex() {
+        let d = parse_decl("double complex :: x");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::DoubleComplex));
         } else {
             panic!("not TypeDecl");
         }

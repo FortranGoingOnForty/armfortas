@@ -1678,6 +1678,7 @@ mod tests {
     use super::*;
     use crate::ast::decl::Decl;
     use crate::ast::expr::Expr;
+    use crate::ast::stmt::Stmt;
     use crate::lexer::{fixed::tokenize_fixed, Lexer};
 
     fn parse_units(src: &str) -> Vec<SpannedUnit> {
@@ -1732,6 +1733,62 @@ mod tests {
         } else {
             panic!("not Program");
         }
+    }
+
+    #[test]
+    fn standalone_double_is_an_identifier_in_free_and_fixed_form() {
+        let free = parse_unit(
+            "\
+program contextual_name
+  integer :: double
+  double = 41
+end program contextual_name
+",
+        );
+        let fixed = parse_fixed_unit(concat!(
+            "      PROGRAM P\n",
+            "      INTEGER DOUBLE\n",
+            "      DOUBLE = 41\n",
+            "      END\n",
+        ));
+
+        for unit in [free, fixed] {
+            let ProgramUnit::Program { body, .. } = unit.node else {
+                panic!("not Program");
+            };
+            assert!(matches!(
+                body.as_slice(),
+                [stmt]
+                    if matches!(
+                        &stmt.node,
+                        Stmt::Assignment {
+                            target,
+                            value: _,
+                        } if matches!(
+                            &target.node,
+                            Expr::Name { name } if name.eq_ignore_ascii_case("double")
+                        )
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn bare_double_declaration_is_rejected() {
+        parse_error(
+            "\
+program malformed
+  double :: value
+end program malformed
+",
+        );
+        parse_error(
+            "\
+program malformed
+  implicit double (a-h)
+end program malformed
+",
+        );
     }
 
     #[test]
