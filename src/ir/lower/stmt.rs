@@ -9840,7 +9840,21 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
         }
 
-        Stmt::Inquire { specs, .. } => {
+        Stmt::Inquire { specs, items } => {
+            if let Some(iolength) = specs.iter().find(|spec| {
+                spec.keyword
+                    .as_deref()
+                    .map(|keyword| keyword.eq_ignore_ascii_case("iolength"))
+                    .unwrap_or(false)
+            }) {
+                let dest_addr = lower_arg_by_ref_ctx(b, ctx, &iolength.value);
+                let dest_ty = integer_storeback_type(b, ctx, &iolength.value, dest_addr);
+                let total = lower_inquire_iolength_items(b, ctx, items);
+                let result = coerce_to_type(b, total, &dest_ty);
+                b.store(result, dest_addr);
+                return;
+            }
+
             let null = b.const_i64(0);
             let zero_len = b.const_i64(0);
             let spec_by_keyword = |needle: &str| {

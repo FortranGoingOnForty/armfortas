@@ -3958,9 +3958,114 @@ mod tests {
         afs_array_mul_scalar_f64(out.as_mut_ptr(), src.as_ptr(), 2.0, out.len() as i64);
         assert_eq!(out, [3.0, 5.0, 7.0, 9.0]);
     }
+
+    #[test]
+    fn iolength_accumulation_is_checked() {
+        assert_eq!(checked_iolength_accumulate(3, 4, 8), Some(35));
+        assert_eq!(checked_iolength_accumulate(7, 0, i64::MAX), Some(7));
+        assert_eq!(checked_iolength_accumulate(-1, 1, 1), None);
+        assert_eq!(checked_iolength_accumulate(0, -1, 1), None);
+        assert_eq!(checked_iolength_accumulate(0, 1, -1), None);
+        assert_eq!(checked_iolength_accumulate(i64::MAX, 1, 1), None);
+        assert_eq!(checked_iolength_accumulate(0, i64::MAX, 2), None);
+    }
+
+    #[test]
+    fn iolength_array_accumulation_checks_rank_and_extent_products() {
+        let mut desc = ArrayDescriptor::zeroed();
+        desc.rank = 2;
+        desc.dims[0] = DimDescriptor {
+            lower_bound: -2,
+            upper_bound: 2,
+            stride: 1,
+        };
+        desc.dims[1] = DimDescriptor {
+            lower_bound: 4,
+            upper_bound: 6,
+            stride: 5,
+        };
+        assert_eq!(checked_iolength_array_accumulate(11, &desc, 8), Some(131));
+
+        desc.dims[1].upper_bound = 3;
+        assert_eq!(
+            checked_iolength_array_accumulate(11, &desc, i64::MAX),
+            Some(11)
+        );
+
+        desc.rank = (MAX_RANK + 1) as i32;
+        assert_eq!(checked_iolength_array_accumulate(0, &desc, 1), None);
+
+        desc.rank = 2;
+        desc.dims[0] = DimDescriptor {
+            lower_bound: 0,
+            upper_bound: i64::MAX,
+            stride: 1,
+        };
+        assert_eq!(checked_iolength_array_accumulate(0, &desc, 1), None);
+    }
 }
 
 // ---- Array query intrinsics ----
+
+fn checked_iolength_accumulate(total: i64, count: i64, elem_size: i64) -> Option<i64> {
+    if total < 0 || count < 0 || elem_size < 0 {
+        return None;
+    }
+    count
+        .checked_mul(elem_size)
+        .and_then(|bytes| total.checked_add(bytes))
+}
+
+fn checked_iolength_array_accumulate(
+    total: i64,
+    desc: &ArrayDescriptor,
+    elem_size: i64,
+) -> Option<i64> {
+    if desc.rank < 0 || desc.rank as usize > MAX_RANK {
+        return None;
+    }
+    let mut count = 1i64;
+    for dim in desc.dims.iter().copied().take(desc.rank as usize) {
+        let extent = checked_dim_extent(dim)?;
+        count = count.checked_mul(extent)?;
+    }
+    checked_iolength_accumulate(total, count, elem_size)
+}
+
+fn report_iolength_overflow() -> ! {
+    eprintln!("INQUIRE(IOLENGTH=): result size overflows INTEGER(8)");
+    std::process::exit(1);
+}
+
+/// Add `count * elem_size` file-storage units to an IOLENGTH accumulator.
+///
+/// The compiler uses this entry point even for statically shaped objects so
+/// target-independent lowering never relies on wrapping machine arithmetic.
+#[no_mangle]
+pub extern "C" fn afs_iolength_add(total: i64, count: i64, elem_size: i64) -> i64 {
+    checked_iolength_accumulate(total, count, elem_size)
+        .unwrap_or_else(|| report_iolength_overflow())
+}
+
+/// Add the transfer size of every logical element in an array descriptor.
+///
+/// `elem_size` is the unformatted transfer width, which can intentionally
+/// differ from the descriptor's storage stride (default LOGICAL is the
+/// important case). Bounds are multiplied with checked arithmetic.
+#[no_mangle]
+pub extern "C" fn afs_iolength_add_array(
+    total: i64,
+    desc: *const ArrayDescriptor,
+    elem_size: i64,
+) -> i64 {
+    if desc.is_null() {
+        eprintln!("INQUIRE(IOLENGTH=): missing array descriptor");
+        std::process::exit(1);
+    }
+    let desc = unsafe { &*desc };
+    checked_iolength_array_accumulate(total, desc, elem_size)
+        .unwrap_or_else(|| report_iolength_overflow())
+}
 
 /// SIZE(array) — total number of elements.
 #[no_mangle]

@@ -34014,6 +34014,423 @@ pub(super) fn lower_array_store(
     b.store(coerced, elem_ptr);
 }
 
+fn iolength_intrinsic_transfer_bytes(type_info: &crate::sema::symtab::TypeInfo) -> Option<i64> {
+    use crate::sema::symtab::TypeInfo;
+
+    match type_info {
+        TypeInfo::Integer { kind } => Some(i64::from(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+        )),
+        TypeInfo::Real { kind } => {
+            let kind = kind.unwrap_or_else(crate::driver::defaults::default_real_kind);
+            matches!(kind, 4 | 8).then_some(i64::from(kind))
+        }
+        TypeInfo::DoublePrecision => Some(8),
+        TypeInfo::Complex { kind } => {
+            let kind = kind.unwrap_or_else(crate::driver::defaults::default_real_kind);
+            matches!(kind, 4 | 8).then_some(i64::from(kind) * 2)
+        }
+        TypeInfo::Logical { kind } => Some(i64::from(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+        )),
+        TypeInfo::Enumeration(_) => Some(i64::from(crate::driver::defaults::default_int_kind())),
+        TypeInfo::Character { .. }
+        | TypeInfo::Derived(_)
+        | TypeInfo::Class(_)
+        | TypeInfo::ClassStar
+        | TypeInfo::TypeStar => None,
+    }
+}
+
+fn lower_iolength_add(
+    b: &mut FuncBuilder,
+    total_addr: ValueId,
+    count: ValueId,
+    elem_size: ValueId,
+) {
+    let total = b.load_typed(total_addr, IrType::Int(IntWidth::I64));
+    let next = b.call(
+        FuncRef::External("afs_iolength_add".into()),
+        vec![total, count, elem_size],
+        IrType::Int(IntWidth::I64),
+    );
+    b.store(next, total_addr);
+}
+
+fn lower_iolength_add_const(b: &mut FuncBuilder, total_addr: ValueId, count: i64, elem_size: i64) {
+    let count = b.const_i64(count);
+    let elem_size = b.const_i64(elem_size);
+    lower_iolength_add(b, total_addr, count, elem_size);
+}
+
+fn lower_iolength_add_array(
+    b: &mut FuncBuilder,
+    total_addr: ValueId,
+    desc: ValueId,
+    elem_size: ValueId,
+) {
+    let total = b.load_typed(total_addr, IrType::Int(IntWidth::I64));
+    let next = b.call(
+        FuncRef::External("afs_iolength_add_array".into()),
+        vec![total, desc, elem_size],
+        IrType::Int(IntWidth::I64),
+    );
+    b.store(next, total_addr);
+}
+
+fn derived_layout_iolength_bytes(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    layout: &crate::sema::type_layout::TypeLayout,
+    span: crate::lexer::Span,
+) -> i64 {
+    let mut total = 0i64;
+    for field in &layout.fields {
+        if field.procedure_pointer
+            || field.pointer
+            || field.allocatable
+            || field_uses_array_descriptor(field)
+        {
+            lower_stmt_error(
+                span,
+                &format!(
+                    "INQUIRE(IOLENGTH=) derived item has allocatable or pointer component '{}'",
+                    field.name
+                ),
+            );
+        }
+
+        let count = field.dims.iter().try_fold(1i64, |count, (_, extent)| {
+            count.checked_mul((*extent).max(0))
+        });
+        let Some(count) = count else {
+            lower_stmt_error(
+                span,
+                &format!(
+                    "INQUIRE(IOLENGTH=) component '{}' element count overflows INTEGER(8)",
+                    field.name
+                ),
+            );
+        };
+
+        let scalar_bytes = if let Some(nested_type) = field_derived_type_name(field) {
+            let Some(nested_layout) = derived_io_layout_for_type(b, ctx, &nested_type) else {
+                unsupported_derived_io_field(span, field);
+            };
+            derived_layout_iolength_bytes(b, ctx, &nested_layout, span)
+        } else {
+            match field_char_kind(field) {
+                CharKind::Fixed(len) => len,
+                CharKind::Deferred
+                | CharKind::FixedRuntime { .. }
+                | CharKind::AssumedLen { .. } => unsupported_derived_io_field(span, field),
+                CharKind::None => {
+                    if let crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } =
+                        &field.type_info
+                    {
+                        *len
+                    } else {
+                        let Some(bytes) = iolength_intrinsic_transfer_bytes(&field.type_info)
+                        else {
+                            unsupported_derived_io_field(span, field);
+                        };
+                        bytes
+                    }
+                }
+            }
+        };
+        if scalar_bytes < 0 {
+            unsupported_derived_io_field(span, field);
+        }
+
+        total = count
+            .checked_mul(scalar_bytes)
+            .and_then(|bytes| total.checked_add(bytes))
+            .unwrap_or_else(|| {
+                lower_stmt_error(
+                    span,
+                    &format!(
+                        "INQUIRE(IOLENGTH=) component '{}' transfer size overflows INTEGER(8)",
+                        field.name
+                    ),
+                )
+            });
+    }
+    total
+}
+
+fn lower_iolength_array_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    type_info: &crate::sema::symtab::TypeInfo,
+    total_addr: ValueId,
+) {
+    let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        lower_stmt_error(
+            item.span,
+            "unsupported array expression in INQUIRE(IOLENGTH=)",
+        );
+    };
+
+    match type_info {
+        crate::sema::symtab::TypeInfo::Character { .. } => {
+            let elem_size = descriptor_elem_size(b, desc);
+            lower_iolength_add_array(b, total_addr, desc, elem_size);
+        }
+        crate::sema::symtab::TypeInfo::Derived(type_name) => {
+            if resolve_defined_io_type_specific(ctx, "write(unformatted)", type_info).is_some() {
+                lower_stmt_error(
+                    item.span,
+                    "INQUIRE(IOLENGTH=) item may not require defined I/O",
+                );
+            }
+            let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+                lower_stmt_error(item.span, "unknown derived type in INQUIRE(IOLENGTH=)");
+            };
+            let transfer_bytes = derived_layout_iolength_bytes(b, ctx, &layout, item.span);
+            let elem_size = b.const_i64(transfer_bytes);
+            lower_iolength_add_array(b, total_addr, desc, elem_size);
+        }
+        crate::sema::symtab::TypeInfo::Class(_)
+        | crate::sema::symtab::TypeInfo::ClassStar
+        | crate::sema::symtab::TypeInfo::TypeStar => {
+            lower_stmt_error(
+                item.span,
+                "polymorphic INQUIRE(IOLENGTH=) items are not implemented",
+            );
+        }
+        _ => {
+            let Some(bytes) = iolength_intrinsic_transfer_bytes(type_info) else {
+                lower_stmt_error(item.span, "unsupported type in INQUIRE(IOLENGTH=)");
+            };
+            let elem_size = b.const_i64(bytes);
+            lower_iolength_add_array(b, total_addr, desc, elem_size);
+        }
+    }
+
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, item, ctx.st, desc);
+}
+
+fn lower_iolength_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    total_addr: ValueId,
+) {
+    if let Expr::ArrayConstructor { values, type_spec } = &item.node {
+        if type_spec.is_none()
+            && values
+                .iter()
+                .any(|value| matches!(value, AcValue::ImpliedDo(_)))
+        {
+            lower_iolength_ac_values(b, ctx, values, total_addr);
+            return;
+        }
+    }
+
+    let Some(type_info) =
+        operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+    else {
+        lower_stmt_error(item.span, "cannot determine INQUIRE(IOLENGTH=) item type");
+    };
+    let rank = actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts)).unwrap_or(0);
+    if rank > 0 {
+        lower_iolength_array_item(b, ctx, item, &type_info, total_addr);
+        return;
+    }
+
+    match type_info {
+        crate::sema::symtab::TypeInfo::Character { .. } => {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            let one = b.const_i64(1);
+            lower_iolength_add(b, total_addr, one, len);
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
+        }
+        crate::sema::symtab::TypeInfo::Derived(ref type_name) => {
+            if resolve_defined_io_type_specific(ctx, "write(unformatted)", &type_info).is_some() {
+                lower_stmt_error(
+                    item.span,
+                    "INQUIRE(IOLENGTH=) item may not require defined I/O",
+                );
+            }
+            let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+                lower_stmt_error(item.span, "unknown derived type in INQUIRE(IOLENGTH=)");
+            };
+            let _base_addr = lower_arg_by_ref_ctx(b, ctx, item);
+            let transfer_bytes = derived_layout_iolength_bytes(b, ctx, &layout, item.span);
+            lower_iolength_add_const(b, total_addr, 1, transfer_bytes);
+        }
+        crate::sema::symtab::TypeInfo::Class(_)
+        | crate::sema::symtab::TypeInfo::ClassStar
+        | crate::sema::symtab::TypeInfo::TypeStar => {
+            lower_stmt_error(
+                item.span,
+                "polymorphic INQUIRE(IOLENGTH=) items are not implemented",
+            );
+        }
+        _ => {
+            let Some(bytes) = iolength_intrinsic_transfer_bytes(&type_info) else {
+                lower_stmt_error(item.span, "unsupported type in INQUIRE(IOLENGTH=)");
+            };
+            let _value = super::expr::lower_expr_ctx_tl(b, ctx, item);
+            lower_iolength_add_const(b, total_addr, 1, bytes);
+        }
+    }
+}
+
+fn lower_iolength_ac_values(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    values: &[AcValue],
+    total_addr: ValueId,
+) {
+    for value in values {
+        match value {
+            AcValue::Expr(expr) => lower_iolength_item(b, ctx, expr, total_addr),
+            AcValue::ImpliedDo(implied_do) => {
+                lower_iolength_ac_implied_do(b, ctx, implied_do, total_addr)
+            }
+        }
+    }
+}
+
+fn lower_iolength_ac_implied_do(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    implied_do: &crate::ast::expr::ImpliedDoLoop,
+    total_addr: ValueId,
+) {
+    if implied_do.step.as_ref().and_then(eval_const_int) == Some(0) {
+        lower_stmt_error(
+            implied_do.start.span,
+            "INQUIRE(IOLENGTH=) implied-DO step may not be zero",
+        );
+    }
+
+    let var_key = implied_do.var.to_lowercase();
+    let var_ty = ctx
+        .locals
+        .get(&var_key)
+        .map(|local| local.ty.clone())
+        .filter(|ty| matches!(ty, IrType::Int(_)))
+        .unwrap_or(IrType::Int(IntWidth::I32));
+    let var_addr = b.alloca(var_ty.clone());
+    let start_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.start);
+    let start = coerce_to_type(b, start_raw, &var_ty);
+    b.store(start, var_addr);
+    let end_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.end);
+    let end = coerce_to_type(b, end_raw, &var_ty);
+    let step_raw = match &implied_do.step {
+        Some(step) => super::expr::lower_expr_ctx(b, ctx, step),
+        None => b.const_i32(1),
+    };
+    let step = coerce_to_type(b, step_raw, &var_ty);
+
+    let old_local = ctx.locals.insert(
+        var_key.clone(),
+        LocalInfo {
+            addr: var_addr,
+            ty: var_ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let check = b.create_block("iolength_impdo_check");
+    let body = b.create_block("iolength_impdo_body");
+    let exit = b.create_block("iolength_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let current = b.load(var_addr);
+    let const_step = implied_do.step.as_ref().and_then(eval_const_int);
+    if let Some(step_value) = const_step {
+        let op = if step_value < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let keep_going = b.icmp(op, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    } else {
+        let zero_raw = b.const_i32(0);
+        let zero = coerce_to_type(b, zero_raw, &var_ty);
+        let is_zero = b.icmp(CmpOp::Eq, step, zero);
+        let negative = b.icmp(CmpOp::Lt, step, zero);
+        let zero_step = b.create_block("iolength_impdo_zero_step");
+        let sign_check = b.create_block("iolength_impdo_sign_check");
+        let negative_check = b.create_block("iolength_impdo_negative_check");
+        let positive_check = b.create_block("iolength_impdo_positive_check");
+        b.cond_branch(is_zero, zero_step, vec![], sign_check, vec![]);
+
+        b.set_block(sign_check);
+        b.cond_branch(negative, negative_check, vec![], positive_check, vec![]);
+
+        b.set_block(negative_check);
+        let keep_going = b.icmp(CmpOp::Ge, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+
+        b.set_block(positive_check);
+        let keep_going = b.icmp(CmpOp::Le, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+
+        b.set_block(zero_step);
+        b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+        b.branch(exit, vec![]);
+    }
+
+    b.set_block(body);
+    lower_iolength_ac_values(b, ctx, &implied_do.values, total_addr);
+    let current = b.load(var_addr);
+    let next = b.iadd(current, step);
+    b.store(next, var_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
+    if let Some(previous) = old_local {
+        ctx.locals.insert(var_key.clone(), previous);
+    } else {
+        ctx.locals.remove(&var_key);
+    }
+}
+
+pub(super) fn lower_inquire_iolength_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+) -> ValueId {
+    let total_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, total_addr);
+    for item in items {
+        lower_iolength_item(b, ctx, item, total_addr);
+    }
+    b.load_typed(total_addr, IrType::Int(IntWidth::I64))
+}
+
 /// Lower the items of a PRINT/WRITE statement to unit-based I/O calls.
 pub(super) fn lower_write_items(
     b: &mut FuncBuilder,
@@ -35222,8 +35639,6 @@ fn resolve_defined_io_item_specific(
     interface_name: &str,
     item: &crate::ast::expr::SpannedExpr,
 ) -> Option<SpecificProcCandidate> {
-    use crate::sema::symtab::TypeInfo;
-
     if actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
         .is_some_and(|rank| rank != 0)
     {
@@ -35232,6 +35647,16 @@ fn resolve_defined_io_item_specific(
 
     let actual_type =
         generic_actual_expr_type_info(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))?;
+    resolve_defined_io_type_specific(ctx, interface_name, &actual_type)
+}
+
+fn resolve_defined_io_type_specific(
+    ctx: &LowerCtx,
+    interface_name: &str,
+    actual_type: &crate::sema::symtab::TypeInfo,
+) -> Option<SpecificProcCandidate> {
+    use crate::sema::symtab::TypeInfo;
+
     if !matches!(actual_type, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
         return None;
     }
@@ -35252,7 +35677,7 @@ fn resolve_defined_io_item_specific(
             ctx.st,
             ctx.proc_scope_id,
             declared_type,
-            Some(&actual_type),
+            Some(actual_type),
             Some(ctx.type_layouts),
         )
     })
@@ -64204,6 +64629,31 @@ end program
         assert!(ir.contains("afs_write_internal_int"));
         assert!(ir.contains("afs_lst_ia_int"));
         assert!(ir.contains("afs_deallocate_array"));
+    }
+
+    #[test]
+    fn lower_inquire_iolength_uses_checked_scalar_and_array_accumulators() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  type :: record_t
+    integer(1) :: tag
+    integer(8) :: payload
+    character(3) :: code
+  end type record_t
+  integer :: n
+  integer(2) :: values(2, 3)
+  character(5) :: text
+  type(record_t) :: records(2)
+  inquire(iolength=n) values, text, records
+end program
+",
+        );
+        assert!(ir.matches("afs_iolength_add_array").count() >= 2);
+        assert!(ir.contains("afs_iolength_add"));
+        assert!(!ir.contains("afs_inquire_unit"));
+        assert!(!ir.contains("iolength_derived_array"));
     }
 
     #[test]

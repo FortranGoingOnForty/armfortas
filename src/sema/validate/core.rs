@@ -5504,6 +5504,51 @@ fn validate_arithmetic_if_expr(ctx: &mut Ctx<'_>, expr: &SpannedExpr) {
     }
 }
 
+fn validate_inquire_stmt(
+    ctx: &mut Ctx<'_>,
+    stmt_span: Span,
+    specs: &[IoControl],
+    items: &[SpannedExpr],
+) {
+    let iolength_specs: Vec<_> = specs
+        .iter()
+        .filter(|spec| {
+            spec.keyword
+                .as_deref()
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case("iolength"))
+        })
+        .collect();
+
+    if iolength_specs.is_empty() {
+        if !items.is_empty() {
+            ctx.error(stmt_span, "INQUIRE output-item-list requires IOLENGTH=");
+        }
+        return;
+    }
+
+    if specs.len() != 1 || iolength_specs.len() != 1 {
+        ctx.error(
+            stmt_span,
+            "INQUIRE(IOLENGTH=) may not be combined with other specifiers",
+        );
+    }
+    if items.is_empty() {
+        ctx.error(stmt_span, "INQUIRE(IOLENGTH=) requires an output-item-list");
+    }
+
+    let result = &iolength_specs[0].value;
+    let metadata = validation_expr_metadata(ctx, result);
+    let scalar_integer = matches!(metadata.type_info, Some(TypeInfo::Integer { .. }))
+        && metadata.rank.is_none_or(|rank| rank == 0);
+    let definable = actual_is_definable(ctx, result, false).is_none_or(|value| value);
+    if !scalar_integer || !definable {
+        ctx.error(
+            result.span,
+            "INQUIRE(IOLENGTH=) result must be a definable scalar INTEGER variable",
+        );
+    }
+}
+
 fn visit_io_branch_labels(stmt: &Stmt, mut visit: impl FnMut(u64)) {
     let controls = match stmt {
         Stmt::Write { controls, .. } | Stmt::Read { controls, .. } => controls,
@@ -5630,7 +5675,6 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::Print { .. }
         | Stmt::Open { .. }
         | Stmt::Close { .. }
-        | Stmt::Inquire { .. }
         | Stmt::Rewind { .. }
         | Stmt::Backspace { .. }
         | Stmt::Endfile { .. }
@@ -5639,6 +5683,12 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             if ctx.in_pure =>
         {
             ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+        }
+        Stmt::Inquire { specs, items } => {
+            if ctx.in_pure {
+                ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+            }
+            validate_inquire_stmt(ctx, stmt.span, specs, items);
         }
 
         // ---- STOP / ERROR STOP in pure ----
@@ -17473,6 +17523,92 @@ end program
         assert!(
             errors.is_empty(),
             "scalar integer and real arithmetic IF should be valid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn inquire_iolength_requires_an_isolated_definable_scalar_integer_result() {
+        for invalid_result in [
+            "character :: result",
+            "integer :: result(2)",
+            "integer, parameter :: result = 1",
+        ] {
+            let errors = errors_from(&format!(
+                "\
+program test
+  implicit none
+  {invalid_result}
+  inquire(iolength=result) 1
+end program
+"
+            ));
+            assert!(
+                errors.iter().any(|error| error.contains(
+                    "INQUIRE(IOLENGTH=) result must be a definable scalar INTEGER variable"
+                )),
+                "expected invalid IOLENGTH result rejection for '{invalid_result}', got {errors:?}"
+            );
+        }
+
+        let mixed_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(iolength=result, unit=6) 1
+end program
+",
+        );
+        assert!(
+            mixed_errors.iter().any(|error| error
+                .contains("INQUIRE(IOLENGTH=) may not be combined with other specifiers")),
+            "expected mixed INQUIRE form rejection, got {mixed_errors:?}"
+        );
+
+        let wrong_form_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(unit=6) result
+end program
+",
+        );
+        assert!(
+            wrong_form_errors
+                .iter()
+                .any(|error| error.contains("INQUIRE output-item-list requires IOLENGTH=")),
+            "expected output-list form rejection, got {wrong_form_errors:?}"
+        );
+
+        let empty_list_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(iolength=result)
+end program
+",
+        );
+        assert!(
+            empty_list_errors
+                .iter()
+                .any(|error| error.contains("INQUIRE(IOLENGTH=) requires an output-item-list")),
+            "expected empty IOLENGTH list rejection, got {empty_list_errors:?}"
+        );
+
+        let valid_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(iolength=result) 1
+end program
+",
+        );
+        assert!(
+            valid_errors.is_empty(),
+            "valid IOLENGTH form should remain accepted, got {valid_errors:?}"
         );
     }
 
