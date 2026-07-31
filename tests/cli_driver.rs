@@ -20071,13 +20071,396 @@ fn fcheck_all_warns_about_partial_support() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains(
-            "-fcheck=all is accepted, but only array bounds checks are implemented today"
+            "-fcheck=all is accepted, but only array bounds and derived-array assignment conformance checks are implemented today"
         ),
         "expected -fcheck=all warning: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn fcheck_all_controls_derived_array_assignment_conformance_checks() {
+    let src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(3), rhs(2)\n\
+         call assign_items(lhs, rhs)\n\
+         contains\n\
+         subroutine assign_items(dest, source)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           dest = source\n\
+         end subroutine assign_items\n\
+         end program p\n",
+        "f90",
+    );
+    let unchecked_ir = unique_path("derived_shape_unchecked", "ir");
+    let bounds_only_ir = unique_path("derived_shape_bounds_only", "ir");
+    let checked_ir = unique_path("derived_shape_checked", "ir");
+
+    let unchecked = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            unchecked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("unchecked derived-array emit-ir spawn failed");
+    assert!(
+        unchecked.status.success(),
+        "unchecked derived-array IR should compile: {}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+    let unchecked_text = fs::read_to_string(&unchecked_ir).expect("read unchecked IR");
+    assert!(
+        !unchecked_text.contains("rt_call @__afs_check_array_assignment_conformance"),
+        "default CLI IR should not retain array-assignment conformance checks:\n{}",
+        unchecked_text
+    );
+
+    let bounds_only = Command::new(compiler("armfortas"))
+        .args([
+            "-fcheck=bounds",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            bounds_only_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bounds-only derived-array emit-ir spawn failed");
+    assert!(
+        bounds_only.status.success(),
+        "bounds-only derived-array IR should compile: {}",
+        String::from_utf8_lossy(&bounds_only.stderr)
+    );
+    let bounds_only_text = fs::read_to_string(&bounds_only_ir).expect("read bounds-only IR");
+    assert!(
+        !bounds_only_text.contains("rt_call @__afs_check_array_assignment_conformance"),
+        "-fcheck=bounds must not enable broader assignment checks:\n{}",
+        bounds_only_text
+    );
+
+    let checked = Command::new(compiler("armfortas"))
+        .args([
+            "-fcheck=all",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            checked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("checked derived-array emit-ir spawn failed");
+    assert!(
+        checked.status.success(),
+        "checked derived-array IR should compile: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked_text = fs::read_to_string(&checked_ir).expect("read checked IR");
+    let check_position = checked_text
+        .find("rt_call @__afs_check_array_assignment_conformance")
+        .unwrap_or_else(|| {
+            panic!(
+                "-fcheck=all IR must retain an array-assignment conformance check:\n{}",
+                checked_text
+            )
+        });
+    let loop_position = checked_text
+        .find("br derived_array_assign_check")
+        .expect("derived-array assignment IR must contain the copy loop");
+    assert!(
+        check_position < loop_position,
+        "-fcheck=all IR must retain an array-assignment conformance check before the copy:\n{}",
+        checked_text
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&unchecked_ir);
+    let _ = std::fs::remove_file(&bounds_only_ir);
+    let _ = std::fs::remove_file(&checked_ir);
+}
+
+#[test]
+fn derived_array_assignment_rejects_provable_shape_mismatch() {
+    let whole_array_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         integer, parameter :: rows = 2, cols = 3\n\
+         type(item) :: lhs(rows, cols), rhs(cols, rows)\n\
+         lhs = rhs\n\
+         end program p\n",
+        "f90",
+    );
+    let section_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(4), rhs(4)\n\
+         lhs(1:3) = rhs(1:2)\n\
+         end program p\n",
+        "f90",
+    );
+
+    for (source, expected) in [
+        (
+            whole_array_src.as_path(),
+            "intrinsic assignment shape mismatch in dimension 1: target extent 2, value extent 3",
+        ),
+        (
+            section_src.as_path(),
+            "intrinsic assignment shape mismatch in dimension 1: target extent 3, value extent 2",
+        ),
+    ] {
+        let result = diagnostic_output(source, &[]);
+        assert!(
+            !result.status.success(),
+            "provably nonconforming derived-array assignment must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "missing static shape diagnostic: {}",
+            stderr
+        );
+    }
+
+    let _ = std::fs::remove_file(&whole_array_src);
+    let _ = std::fs::remove_file(&section_src);
+}
+
+#[test]
+fn fcheck_all_rejects_derived_array_assignment_shape_mismatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fcheck_all_rejects_derived_array_assignment_shape_mismatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let mismatch_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(3), rhs(2)\n\
+         lhs%value = -1\n\
+         rhs(1)%value = 10\n\
+         rhs(2)%value = 20\n\
+         call assign_items(lhs, rhs)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_items(dest, source)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           dest = source\n\
+         end subroutine assign_items\n\
+         end program p\n",
+        "f90",
+    );
+    let matching_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(2), rhs(2)\n\
+         lhs%value = -1\n\
+         rhs(1)%value = 10\n\
+         rhs(2)%value = 20\n\
+         call assign_items(lhs, rhs)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_items(dest, source)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           dest = source\n\
+         end subroutine assign_items\n\
+         end program p\n",
+        "f90",
+    );
+    let section_mismatch_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(4), rhs(4)\n\
+         lhs%value = -1\n\
+         rhs%value = 7\n\
+         call assign_sections(lhs, rhs, 3, 2)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_sections(dest, source, dest_count, source_count)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           integer, intent(in) :: dest_count, source_count\n\
+           dest(1:dest_count) = source(1:source_count)\n\
+         end subroutine assign_sections\n\
+         end program p\n",
+        "f90",
+    );
+    let equal_count_mismatch_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(2, 3), rhs(3, 2)\n\
+         lhs%value = -1\n\
+         rhs%value = 7\n\
+         call assign_matrices(lhs, rhs)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_matrices(dest, source)\n\
+           type(item), intent(inout) :: dest(:, :)\n\
+           type(item), intent(in) :: source(:, :)\n\
+           dest = source\n\
+         end subroutine assign_matrices\n\
+         end program p\n",
+        "f90",
+    );
+    let checked_mismatch = unique_path("derived_shape_checked_mismatch", "bin");
+    let unchecked_mismatch = unique_path("derived_shape_unchecked_mismatch", "bin");
+    let checked_match = unique_path("derived_shape_checked_match", "bin");
+    let checked_section_mismatch = unique_path("derived_shape_checked_section_mismatch", "bin");
+    let checked_equal_count_mismatch =
+        unique_path("derived_shape_checked_equal_count_mismatch", "bin");
+
+    for (source, output, flags) in [
+        (
+            mismatch_src.as_path(),
+            checked_mismatch.as_path(),
+            &["-fcheck=all"][..],
+        ),
+        (
+            mismatch_src.as_path(),
+            unchecked_mismatch.as_path(),
+            &[][..],
+        ),
+        (
+            matching_src.as_path(),
+            checked_match.as_path(),
+            &["-fcheck=all"][..],
+        ),
+        (
+            section_mismatch_src.as_path(),
+            checked_section_mismatch.as_path(),
+            &["-fcheck=all"][..],
+        ),
+        (
+            equal_count_mismatch_src.as_path(),
+            checked_equal_count_mismatch.as_path(),
+            &["-fcheck=all"][..],
+        ),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .args(flags)
+            .arg(source)
+            .args(["-o", output.to_str().unwrap()])
+            .output()
+            .expect("derived-array conformance compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "derived-array conformance witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let checked_failure = Command::new(&checked_mismatch)
+        .output()
+        .expect("checked mismatch run spawn failed");
+    assert!(
+        !checked_failure.status.success(),
+        "-fcheck=all must reject a derived-array shape mismatch; stdout={} stderr={}",
+        String::from_utf8_lossy(&checked_failure.stdout),
+        String::from_utf8_lossy(&checked_failure.stderr)
+    );
+    let checked_stderr = String::from_utf8_lossy(&checked_failure.stderr);
+    assert!(
+        checked_stderr.contains("Array assignment: destination shape does not conform to source"),
+        "checked mismatch should explain the conformance failure: {}",
+        checked_stderr
+    );
+
+    let unchecked = Command::new(&unchecked_mismatch)
+        .output()
+        .expect("unchecked mismatch run spawn failed");
+    assert!(
+        unchecked.status.success(),
+        "unchecked mismatch preserves the existing no-check policy: {}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&unchecked.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["10", "20", "-1"]
+    );
+
+    let matching = Command::new(&checked_match)
+        .output()
+        .expect("checked matching-shape run spawn failed");
+    assert!(
+        matching.status.success(),
+        "matching derived-array shapes must remain valid: {}",
+        String::from_utf8_lossy(&matching.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&matching.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["10", "20"]
+    );
+
+    for (label, executable) in [
+        ("array-section mismatch", &checked_section_mismatch),
+        (
+            "equal-element-count mismatch",
+            &checked_equal_count_mismatch,
+        ),
+    ] {
+        let failure = Command::new(executable)
+            .output()
+            .unwrap_or_else(|error| panic!("{label} run spawn failed: {error}"));
+        assert!(
+            !failure.status.success(),
+            "-fcheck=all must reject {label}; stdout={} stderr={}",
+            String::from_utf8_lossy(&failure.stdout),
+            String::from_utf8_lossy(&failure.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&failure.stderr)
+                .contains("Array assignment: destination shape does not conform to source"),
+            "{label} should explain the conformance failure: {}",
+            String::from_utf8_lossy(&failure.stderr)
+        );
+    }
+
+    for path in [
+        mismatch_src,
+        matching_src,
+        section_mismatch_src,
+        equal_count_mismatch_src,
+        checked_mismatch,
+        unchecked_mismatch,
+        checked_match,
+        checked_section_mismatch,
+        checked_equal_count_mismatch,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[test]

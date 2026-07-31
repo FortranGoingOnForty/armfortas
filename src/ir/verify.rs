@@ -946,6 +946,7 @@ fn runtime_signature(runtime_func: &RuntimeFunc) -> (&'static [RuntimeAbiType], 
         RuntimeFunc::StringCompare => (&[BytePtr, I64, BytePtr, I64], I32),
         RuntimeFunc::Stop | RuntimeFunc::ErrorStop => (&[], Void),
         RuntimeFunc::CheckBounds => (&[I64, I64, I64], Void),
+        RuntimeFunc::CheckArrayAssignmentConformance => (&[DataPtr, DataPtr], Void),
     }
 }
 

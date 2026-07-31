@@ -1885,10 +1885,8 @@ pub extern "C" fn afs_copy_array_data_no_realloc(
 
     let dest_ref = unsafe { &mut *dest };
     let source_ref = unsafe { &*source };
-    let shapes_match = dest_ref.rank == source_ref.rank
-        && dest_ref.elem_size == source_ref.elem_size
-        && (0..dest_ref.rank as usize)
-            .all(|i| dest_ref.dims[i].extent() == source_ref.dims[i].extent());
+    let shapes_match = array_assignment_shapes_conform(dest_ref, source_ref)
+        && dest_ref.elem_size == source_ref.elem_size;
     let valid_source = descriptor_has_payload_or_zero_size_array(source_ref);
     let valid_dest = !dest_ref.base_addr.is_null() || descriptor_is_zero_size_array(dest_ref);
 
@@ -1931,6 +1929,55 @@ pub extern "C" fn afs_copy_array_data_no_realloc(
         unsafe {
             *stat = 0;
         }
+    }
+}
+
+fn array_assignment_shapes_conform(dest: &ArrayDescriptor, source: &ArrayDescriptor) -> bool {
+    if dest.rank != source.rank || dest.rank < 0 || dest.rank as usize > MAX_RANK {
+        return false;
+    }
+
+    (0..dest.rank as usize).all(|i| {
+        checked_dim_extent(dest.dims[i])
+            .zip(checked_dim_extent(source.dims[i]))
+            .is_some_and(|(dest_extent, source_extent)| dest_extent == source_extent)
+    })
+}
+
+/// Abort when intrinsic array-assignment operands are not conformable.
+///
+/// This operation deliberately validates only rank and per-dimension extents:
+/// semantic validation has already established assignment-compatible element
+/// types, and deep-copy lowering must remain responsible for component
+/// ownership rather than asking the runtime to copy descriptor payload bytes.
+#[no_mangle]
+pub extern "C" fn afs_check_array_assignment_conformance(
+    dest: *const ArrayDescriptor,
+    source: *const ArrayDescriptor,
+) {
+    if dest.is_null() || source.is_null() {
+        eprintln!("Array assignment: null descriptor");
+        std::process::exit(1);
+    }
+
+    let dest = unsafe { &*dest };
+    let source = unsafe { &*source };
+    if !array_assignment_shapes_conform(dest, source) {
+        eprintln!(
+            "Array assignment: destination shape does not conform to source \
+             (dest rank={} extents={:?}; source rank={} extents={:?})",
+            dest.rank,
+            (0..dest.rank.max(0) as usize)
+                .take(MAX_RANK)
+                .filter_map(|i| checked_dim_extent(dest.dims[i]))
+                .collect::<Vec<_>>(),
+            source.rank,
+            (0..source.rank.max(0) as usize)
+                .take(MAX_RANK)
+                .filter_map(|i| checked_dim_extent(source.dims[i]))
+                .collect::<Vec<_>>()
+        );
+        std::process::exit(1);
     }
 }
 
@@ -3483,6 +3530,52 @@ mod tests {
         afs_deallocate_array(&mut dest, ptr::null_mut());
         afs_deallocate_array(&mut source, ptr::null_mut());
         afs_deallocate_array(&mut mismatch, ptr::null_mut());
+    }
+
+    #[test]
+    fn array_assignment_conformance_compares_rank_and_each_extent() {
+        let mut dest = ArrayDescriptor::zeroed();
+        dest.rank = 2;
+        dest.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 1,
+        };
+        dest.dims[1] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 3,
+            stride: 2,
+        };
+
+        let mut matching = ArrayDescriptor::zeroed();
+        matching.rank = 2;
+        matching.dims[0] = DimDescriptor {
+            lower_bound: -3,
+            upper_bound: -2,
+            stride: 1,
+        };
+        matching.dims[1] = DimDescriptor {
+            lower_bound: 7,
+            upper_bound: 9,
+            stride: 2,
+        };
+        assert!(array_assignment_shapes_conform(&dest, &matching));
+
+        let mut transposed_shape = matching;
+        transposed_shape.dims[0].upper_bound = -1;
+        transposed_shape.dims[1].upper_bound = 8;
+        assert_eq!(transposed_shape.total_elements(), dest.total_elements());
+        assert!(!array_assignment_shapes_conform(&dest, &transposed_shape));
+
+        let mut different_rank = ArrayDescriptor::zeroed();
+        different_rank.rank = 1;
+        different_rank.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 6,
+            stride: 1,
+        };
+        assert_eq!(different_rank.total_elements(), dest.total_elements());
+        assert!(!array_assignment_shapes_conform(&dest, &different_rank));
     }
 
     #[test]

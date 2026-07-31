@@ -45,6 +45,11 @@ pub enum RuntimeFunc {
     /// Aborts if index < lower or index > upper. Inserted at array access
     /// sites; eliminated at O2+ when provably safe.
     CheckBounds,
+    /// Array-assignment conformance check:
+    /// `afs_check_array_assignment_conformance(destination, source)`.
+    /// Aborts when ranks or per-dimension extents differ. Inserted at
+    /// descriptor-backed assignment sites and retained only by `-fcheck=all`.
+    CheckArrayAssignmentConformance,
 }
 
 /// Comparison operations.

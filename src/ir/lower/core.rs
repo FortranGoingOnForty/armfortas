@@ -50922,7 +50922,7 @@ pub(super) fn lower_1d_section_assign(
                 }
                 let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
                 lower_derived_array_copy_from_desc(
-                    b, ctx, type_name, tmp_base, tmp_n, tmp_stride, desc,
+                    b, ctx, type_name, tmp_base, tmp_n, tmp_stride, None, desc,
                 );
                 src_snapshot = Some((tmp_desc, Some(type_name.to_string())));
             } else {
@@ -50969,11 +50969,21 @@ pub(super) fn lower_1d_section_assign(
                 dest_base,
                 dest_n,
                 dest_stride,
+                Some(dest_desc),
                 desc,
             );
             deallocate_section_snapshot_descriptor(b, ctx.type_layouts, src_snapshot);
         } else {
-            lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+            lower_derived_array_copy_loop(
+                b,
+                ctx,
+                type_name,
+                dest_base,
+                dest_n,
+                dest_stride,
+                dest_desc,
+                value,
+            );
         }
         return true;
     }
@@ -52560,6 +52570,7 @@ pub(super) fn lower_array_assign(
                                 dest_base,
                                 dest_n,
                                 dest_stride,
+                                None,
                                 src_desc,
                             );
                             let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -52879,7 +52890,7 @@ pub(super) fn lower_array_assign(
                         }
                         let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
                         lower_derived_array_copy_from_desc(
-                            b, ctx, type_name, tmp_base, tmp_n, tmp_stride, src_desc,
+                            b, ctx, type_name, tmp_base, tmp_n, tmp_stride, None, src_desc,
                         );
                         assign_src_desc = tmp_desc;
                         Some(tmp_desc)
@@ -52927,6 +52938,7 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
+                        None,
                         assign_src_desc,
                     );
                     if let Some(tmp_desc) = tmp_src_desc {
@@ -53016,6 +53028,7 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
+                        None,
                         src_desc,
                     );
                     deallocate_array_expr_descriptor_if_temp(
@@ -53163,6 +53176,11 @@ pub(super) fn lower_array_assign(
         let zero = b.const_i64(0);
         let dest_base = b.gep(dest_base_typed, vec![zero], IrType::Int(IntWidth::I8));
         let dest_n = array_total_elems_value(b, dest_info);
+        let dest_shape_desc = if local_uses_array_descriptor(dest_info) {
+            array_descriptor_addr(b, dest_info)
+        } else {
+            materialize_array_descriptor_for_info(b, dest_info)
+        };
         let dest_stride = if local_uses_array_descriptor(dest_info) {
             let dest_desc = array_descriptor_addr(b, dest_info);
             load_array_desc_i64_field(b, dest_desc, 24 + 16)
@@ -53200,7 +53218,7 @@ pub(super) fn lower_array_assign(
                     }
                     let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
                     lower_derived_array_copy_from_desc(
-                        b, ctx, type_name, tmp_base, tmp_n, tmp_stride, src_desc,
+                        b, ctx, type_name, tmp_base, tmp_n, tmp_stride, None, src_desc,
                     );
                     lower_derived_array_copy_from_desc(
                         b,
@@ -53209,6 +53227,7 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
+                        Some(dest_shape_desc),
                         tmp_desc,
                     );
                     let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -53238,7 +53257,16 @@ pub(super) fn lower_array_assign(
                 }
             }
         }
-        lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+        lower_derived_array_copy_loop(
+            b,
+            ctx,
+            type_name,
+            dest_base,
+            dest_n,
+            dest_stride,
+            dest_shape_desc,
+            value,
+        );
         return;
     }
 
@@ -59732,6 +59760,7 @@ pub(super) fn lower_derived_array_copy_loop(
     dest_base: ValueId,
     dest_n: ValueId,
     dest_stride: ValueId,
+    dest_shape_desc: ValueId,
     value: &crate::ast::expr::SpannedExpr,
 ) {
     let elem_bytes = ctx
@@ -59750,6 +59779,13 @@ pub(super) fn lower_derived_array_copy_loop(
         Some(ctx.contained_host_refs),
         Some(ctx.descriptor_params),
     );
+    if let Some((source_desc, _)) = src_desc.as_ref() {
+        b.runtime_call(
+            RuntimeFunc::CheckArrayAssignmentConformance,
+            vec![dest_shape_desc, *source_desc],
+            IrType::Void,
+        );
+    }
     let src_n = src_desc.as_ref().map(|(desc, _)| {
         b.call(
             FuncRef::External("afs_array_size".into()),
@@ -59816,6 +59852,7 @@ pub(super) fn lower_derived_array_copy_from_desc(
     dest_base: ValueId,
     dest_n: ValueId,
     dest_stride: ValueId,
+    dest_shape_desc: Option<ValueId>,
     src_desc: ValueId,
 ) {
     let elem_bytes = ctx
@@ -59824,6 +59861,13 @@ pub(super) fn lower_derived_array_copy_from_desc(
         .map(|layout| layout.size as i64)
         .unwrap_or(8);
     let elem_bytes_val = b.const_i64(elem_bytes);
+    if let Some(dest_shape_desc) = dest_shape_desc {
+        b.runtime_call(
+            RuntimeFunc::CheckArrayAssignmentConformance,
+            vec![dest_shape_desc, src_desc],
+            IrType::Void,
+        );
+    }
     let src_n = b.call(
         FuncRef::External("afs_array_size".into()),
         vec![src_desc],

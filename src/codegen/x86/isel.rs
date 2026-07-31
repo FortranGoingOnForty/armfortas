@@ -3722,6 +3722,9 @@ fn runtime_func_symbol(rf: &RuntimeFunc, args: &[ValueId], func: &Function) -> S
         RuntimeFunc::Stop => "afs_stop".into(),
         RuntimeFunc::ErrorStop => "afs_error_stop".into(),
         RuntimeFunc::CheckBounds => "afs_check_bounds".into(),
+        RuntimeFunc::CheckArrayAssignmentConformance => {
+            "afs_check_array_assignment_conformance".into()
+        }
     }
 }
 

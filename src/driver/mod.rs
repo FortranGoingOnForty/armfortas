@@ -1181,7 +1181,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
 
     if opts.check_all {
         opts.cli_warnings.push(
-            "-fcheck=all is accepted, but only array bounds checks are implemented today".into(),
+            "-fcheck=all is accepted, but only array bounds and derived-array assignment conformance checks are implemented today".into(),
         );
     }
 
@@ -1262,7 +1262,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
 }
 
-fn strip_bounds_check_calls(module: &mut Module) {
+fn strip_disabled_runtime_check_calls(module: &mut Module, check_bounds: bool, check_all: bool) {
     for func in &mut module.functions {
         let mut changed = false;
         for block in &mut func.blocks {
@@ -1270,7 +1270,13 @@ fn strip_bounds_check_calls(module: &mut Module) {
             block.insts.retain(|inst| {
                 !matches!(
                     inst.kind,
-                    InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+                    InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _) if !check_bounds
+                ) && !matches!(
+                    inst.kind,
+                    InstKind::RuntimeCall(
+                        RuntimeFunc::CheckArrayAssignmentConformance,
+                        _
+                    ) if !check_all
                 )
             });
             changed |= block.insts.len() != before;
@@ -2269,9 +2275,7 @@ fn compile_with_bundled_runtime_inner(
         external_char_len_star,
         target_layout,
     );
-    if !opts.check_bounds {
-        strip_bounds_check_calls(&mut ir_module);
-    }
+    strip_disabled_runtime_check_calls(&mut ir_module, opts.check_bounds, opts.check_all);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         if std::env::var_os("AFS_DUMP_BAD_IR").is_some() {

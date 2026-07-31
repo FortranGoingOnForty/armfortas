@@ -479,6 +479,7 @@ fn runtime_func_name(rf: &RuntimeFunc) -> &'static str {
         RuntimeFunc::Stop => "__afs_stop",
         RuntimeFunc::ErrorStop => "__afs_error_stop",
         RuntimeFunc::CheckBounds => "__afs_check_bounds",
+        RuntimeFunc::CheckArrayAssignmentConformance => "__afs_check_array_assignment_conformance",
     }
 }
 

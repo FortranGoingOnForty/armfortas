@@ -6684,6 +6684,149 @@ fn intrinsic_assignment_types_compatible(
     }
 }
 
+fn validation_const_int_value(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<i128> {
+    eval_const_int_expr_checked(ctx, expr)
+        .ok()
+        .flatten()
+        .map(|value| value.value)
+}
+
+fn validation_explicit_dim_bounds(
+    ctx: &Ctx<'_>,
+    spec: &crate::ast::decl::ArraySpec,
+) -> Option<(i128, i128)> {
+    let crate::ast::decl::ArraySpec::Explicit { lower, upper } = spec else {
+        return None;
+    };
+    let lower = lower
+        .as_ref()
+        .map(|lower| validation_const_int_value(ctx, lower))
+        .unwrap_or(Some(1))?;
+    Some((lower, validation_const_int_value(ctx, upper)?))
+}
+
+fn validation_extent(lower: i128, upper: i128) -> Option<i128> {
+    if upper < lower {
+        Some(0)
+    } else {
+        upper.checked_sub(lower)?.checked_add(1)
+    }
+}
+
+fn validation_section_extent(start: i128, end: i128, stride: i128) -> Option<i128> {
+    if stride > 0 {
+        if end < start {
+            Some(0)
+        } else {
+            end.checked_sub(start)?.checked_div(stride)?.checked_add(1)
+        }
+    } else if stride < 0 {
+        if end > start {
+            Some(0)
+        } else {
+            start
+                .checked_sub(end)?
+                .checked_div(stride.checked_neg()?)?
+                .checked_add(1)
+        }
+    } else {
+        None
+    }
+}
+
+fn validation_provable_array_shape(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<Vec<i128>> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => validation_provable_array_shape(ctx, inner),
+        Expr::Name { name } => {
+            let symbol = ctx.lookup_lexical(name)?;
+            if symbol.attrs.array_spec.is_empty() {
+                return None;
+            }
+            symbol
+                .attrs
+                .array_spec
+                .iter()
+                .map(|spec| {
+                    let (lower, upper) = validation_explicit_dim_bounds(ctx, spec)?;
+                    validation_extent(lower, upper)
+                })
+                .collect()
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let symbol = ctx.lookup_lexical(name)?;
+            if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                || symbol.attrs.array_spec.len() != args.len()
+            {
+                return None;
+            }
+
+            let mut shape = Vec::new();
+            for (arg, spec) in args.iter().zip(&symbol.attrs.array_spec) {
+                match &arg.value {
+                    SectionSubscript::Element(index) => {
+                        if validation_expr_rank(ctx, index).is_some_and(|rank| rank > 0) {
+                            return None;
+                        }
+                    }
+                    SectionSubscript::Range { start, end, stride } => {
+                        let stride = stride
+                            .as_ref()
+                            .map(|stride| validation_const_int_value(ctx, stride))
+                            .unwrap_or(Some(1))?;
+                        let declared_bounds = validation_explicit_dim_bounds(ctx, spec);
+                        let start = start
+                            .as_ref()
+                            .map(|start| validation_const_int_value(ctx, start))
+                            .unwrap_or_else(|| {
+                                declared_bounds.map(
+                                    |(lower, upper)| {
+                                        if stride > 0 {
+                                            lower
+                                        } else {
+                                            upper
+                                        }
+                                    },
+                                )
+                            })?;
+                        let end = end
+                            .as_ref()
+                            .map(|end| validation_const_int_value(ctx, end))
+                            .unwrap_or_else(|| {
+                                declared_bounds.map(
+                                    |(lower, upper)| {
+                                        if stride > 0 {
+                                            upper
+                                        } else {
+                                            lower
+                                        }
+                                    },
+                                )
+                            })?;
+                        shape.push(validation_section_extent(start, end, stride)?);
+                    }
+                }
+            }
+            Some(shape)
+        }
+        _ => None,
+    }
+}
+
+fn intrinsic_assignment_target_reallocates(ctx: &Ctx<'_>, target: &SpannedExpr) -> bool {
+    match &target.node {
+        Expr::Name { name } => ctx
+            .lookup_lexical(name)
+            .is_some_and(|symbol| symbol.attrs.allocatable),
+        Expr::ComponentAccess { .. } => {
+            leaf_field_layout(ctx, target).is_some_and(|leaf| leaf.field.allocatable)
+        }
+        _ => false,
+    }
+}
+
 fn validate_intrinsic_assignment(
     ctx: &mut Ctx<'_>,
     target: &SpannedExpr,
@@ -6695,10 +6838,9 @@ fn validate_intrinsic_assignment(
         return;
     }
 
-    if let (Some(target_rank), Some(value_rank)) = (
-        validation_expr_rank(ctx, target),
-        validation_expr_rank(ctx, value),
-    ) {
+    let target_rank = validation_expr_rank(ctx, target);
+    let value_rank = validation_expr_rank(ctx, value);
+    if let (Some(target_rank), Some(value_rank)) = (target_rank, value_rank) {
         if value_rank != 0 && target_rank != value_rank {
             ctx.error(
                 span,
@@ -6715,7 +6857,8 @@ fn validate_intrinsic_assignment(
     let Some(value_type) = validation_expr_type_info(ctx, value) else {
         return;
     };
-    if !intrinsic_assignment_types_compatible(ctx, &target_type, &value_type) {
+    let types_compatible = intrinsic_assignment_types_compatible(ctx, &target_type, &value_type);
+    if !types_compatible {
         ctx.error(
             value.span,
             format!(
@@ -6724,6 +6867,35 @@ fn validate_intrinsic_assignment(
                 intrinsic_assignment_type_name(&target_type)
             ),
         );
+    }
+
+    let target_is_derived = matches!(target_type, TypeInfo::Derived(_) | TypeInfo::Class(_));
+    if types_compatible
+        && target_is_derived
+        && value_rank.is_some_and(|rank| rank > 0)
+        && !intrinsic_assignment_target_reallocates(ctx, target)
+    {
+        if let (Some(target_shape), Some(value_shape)) = (
+            validation_provable_array_shape(ctx, target),
+            validation_provable_array_shape(ctx, value),
+        ) {
+            if let Some((dimension, (target_extent, value_extent))) = target_shape
+                .iter()
+                .zip(&value_shape)
+                .enumerate()
+                .find(|(_, (target_extent, value_extent))| target_extent != value_extent)
+            {
+                ctx.error(
+                    value.span,
+                    format!(
+                        "intrinsic assignment shape mismatch in dimension {}: target extent {}, value extent {}",
+                        dimension + 1,
+                        target_extent,
+                        value_extent
+                    ),
+                );
+            }
+        }
     }
 }
 
