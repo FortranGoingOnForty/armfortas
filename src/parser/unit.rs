@@ -1173,7 +1173,7 @@ impl<'a> Parser<'a> {
                             if self.peek() == &TokenKind::Identifier {
                                 entities.push(self.advance().clone().text);
                             }
-                            let _ = self.eat(&TokenKind::Slash);
+                            self.expect(&TokenKind::Slash)?;
                         } else if self.peek() == &TokenKind::Identifier {
                             entities.push(self.advance().clone().text);
                         } else {
@@ -2259,6 +2259,62 @@ end module malformed_m
             assert!(
                 error.msg.contains("expected procedure name after ','"),
                 "unexpected error for {fixed_source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_common_block_entries_parse_with_a_closing_slash() {
+        use crate::ast::decl::{Attribute, Decl};
+
+        let units = [
+            parse_unit("program p\n  save /state/, value\nend program p\n"),
+            parse_fixed_unit(concat!(
+                "      PROGRAM P\n",
+                "      SAVE /STATE/, VALUE\n",
+                "      END\n",
+            )),
+        ];
+
+        for unit in units {
+            let ProgramUnit::Program { decls, .. } = &unit.node else {
+                panic!("not Program");
+            };
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::AttributeStmt {
+                        attr: Attribute::Save,
+                        entities,
+                    } if entities.len() == 2
+                        && entities[0].eq_ignore_ascii_case("state")
+                        && entities[1].eq_ignore_ascii_case("value")
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn save_common_block_entries_require_a_closing_slash() {
+        let errors = [
+            parse_error("program p\n  save /state\nend program p\n"),
+            parse_error("program p\n  save /state, value\nend program p\n"),
+            parse_fixed_error(concat!(
+                "      PROGRAM P\n",
+                "      SAVE /STATE\n",
+                "      END\n",
+            )),
+            parse_fixed_error(concat!(
+                "      PROGRAM P\n",
+                "      SAVE /STATE, VALUE\n",
+                "      END\n",
+            )),
+        ];
+
+        for error in errors {
+            assert!(
+                error.msg.contains("expected /"),
+                "unexpected error: {error}"
             );
         }
     }
