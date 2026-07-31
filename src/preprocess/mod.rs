@@ -2191,11 +2191,44 @@ impl<'a> ConditionExprParser<'a> {
     }
 
     fn parse_logical_and(&mut self, evaluate: bool) -> Result<i64, String> {
-        let mut left = self.parse_equality(evaluate)?;
+        let mut left = self.parse_bitwise_or(evaluate)?;
         while self.consume("&&") {
-            let right = self.parse_equality(evaluate && left != 0)?;
+            let right = self.parse_bitwise_or(evaluate && left != 0)?;
             if evaluate {
                 left = i64::from(left != 0 && right != 0);
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_or(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_bitwise_xor(evaluate)?;
+        while self.consume_single(b'|') {
+            let right = self.parse_bitwise_xor(evaluate)?;
+            if evaluate {
+                left |= right;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_xor(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_bitwise_and(evaluate)?;
+        while self.consume("^") {
+            let right = self.parse_bitwise_and(evaluate)?;
+            if evaluate {
+                left ^= right;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_and(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_equality(evaluate)?;
+        while self.consume_single(b'&') {
+            let right = self.parse_equality(evaluate)?;
+            if evaluate {
+                left &= right;
             }
         }
         Ok(left)
@@ -2221,27 +2254,48 @@ impl<'a> ConditionExprParser<'a> {
     }
 
     fn parse_relational(&mut self, evaluate: bool) -> Result<i64, String> {
-        let mut left = self.parse_additive(evaluate)?;
+        let mut left = self.parse_shift(evaluate)?;
         loop {
             if self.consume("<=") {
-                let right = self.parse_additive(evaluate)?;
+                let right = self.parse_shift(evaluate)?;
                 if evaluate {
                     left = i64::from(left <= right);
                 }
             } else if self.consume(">=") {
-                let right = self.parse_additive(evaluate)?;
+                let right = self.parse_shift(evaluate)?;
                 if evaluate {
                     left = i64::from(left >= right);
                 }
             } else if self.consume("<") {
-                let right = self.parse_additive(evaluate)?;
+                let right = self.parse_shift(evaluate)?;
                 if evaluate {
                     left = i64::from(left < right);
                 }
             } else if self.consume(">") {
-                let right = self.parse_additive(evaluate)?;
+                let right = self.parse_shift(evaluate)?;
                 if evaluate {
                     left = i64::from(left > right);
+                }
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_shift(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_additive(evaluate)?;
+        loop {
+            if self.consume("<<") {
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    let count = shift_count(right)?;
+                    left = left.wrapping_shl(count);
+                }
+            } else if self.consume(">>") {
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    let count = shift_count(right)?;
+                    left = left.wrapping_shr(count);
                 }
             } else {
                 return Ok(left);
@@ -2311,6 +2365,10 @@ impl<'a> ConditionExprParser<'a> {
             let value = self.parse_unary(evaluate)?;
             return Ok(if evaluate { i64::from(value == 0) } else { 0 });
         }
+        if self.consume("~") {
+            let value = self.parse_unary(evaluate)?;
+            return Ok(if evaluate { !value } else { 0 });
+        }
         if self.consume("-") {
             let value = self.parse_unary(evaluate)?;
             return Ok(if evaluate { value.wrapping_neg() } else { 0 });
@@ -2361,6 +2419,7 @@ impl<'a> ConditionExprParser<'a> {
                 return Ok(if evaluate { value } else { 0 });
             }
 
+            let radix = if bytes[self.pos] == b'0' { 8 } else { 10 };
             while self
                 .input
                 .as_bytes()
@@ -2369,8 +2428,16 @@ impl<'a> ConditionExprParser<'a> {
             {
                 self.pos += 1;
             }
-            let value = self.input[start..self.pos]
-                .parse::<i64>()
+            let digits = &self.input[start..self.pos];
+            if radix == 8 {
+                if let Some(invalid) = digits.bytes().find(|digit| matches!(digit, b'8' | b'9')) {
+                    return Err(format!(
+                        "invalid digit '{}' in octal integer in #if expression",
+                        invalid as char
+                    ));
+                }
+            }
+            let value = i64::from_str_radix(digits, radix)
                 .map_err(|err| format!("invalid integer in #if: {}", err))?;
             return Ok(if evaluate { value } else { 0 });
         }
@@ -2401,6 +2468,17 @@ impl<'a> ConditionExprParser<'a> {
         }
     }
 
+    fn consume_single(&mut self, token: u8) -> bool {
+        self.skip_whitespace();
+        let bytes = self.input.as_bytes();
+        if bytes.get(self.pos) == Some(&token) && bytes.get(self.pos + 1) != Some(&token) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn skip_whitespace(&mut self) {
         while self
             .input
@@ -2418,6 +2496,13 @@ impl<'a> ConditionExprParser<'a> {
             self.input[self.pos..].trim()
         )
     }
+}
+
+fn shift_count(value: i64) -> Result<u32, String> {
+    u32::try_from(value)
+        .ok()
+        .filter(|count| *count < i64::BITS)
+        .ok_or_else(|| format!("invalid shift count {value} in #if expression"))
 }
 
 /// Replace remaining identifiers with "0" in a #if expression.
@@ -3823,6 +3908,77 @@ end program
     fn eval_precedence() {
         // 2 + 3 * 4 = 14 (not 20)
         assert!(eval_expr("2 + 3 * 4 == 14").unwrap());
+    }
+
+    #[test]
+    fn eval_cpp_shift_and_bitwise_precedence() {
+        assert_eq!(ConditionExprParser::new("1 << 3 + 1").parse().unwrap(), 16);
+        assert_eq!(ConditionExprParser::new("32 >> 2 + 1").parse().unwrap(), 4);
+        assert_eq!(ConditionExprParser::new("16 >> 1 >> 2").parse().unwrap(), 2);
+        assert_eq!(ConditionExprParser::new("1 << 2 < 5").parse().unwrap(), 1);
+        assert_eq!(ConditionExprParser::new("2 ^ 3 & 1").parse().unwrap(), 3);
+        assert_eq!(
+            ConditionExprParser::new("1 | 2 ^ 3 & 1").parse().unwrap(),
+            3
+        );
+        assert_eq!(ConditionExprParser::new("2 & 3 == 2").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("1 | 0 && 0").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("~0").parse().unwrap(), -1);
+        assert_eq!(ConditionExprParser::new("~~42").parse().unwrap(), 42);
+        assert_eq!(ConditionExprParser::new("~1 + 2").parse().unwrap(), 0);
+    }
+
+    #[test]
+    fn eval_cpp_shifts_reject_invalid_live_counts_but_skip_dead_counts() {
+        assert_eq!(
+            ConditionExprParser::new("1 << -1").parse().unwrap_err(),
+            "invalid shift count -1 in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 >> 64").parse().unwrap_err(),
+            "invalid shift count 64 in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 << -1)").parse().unwrap(),
+            0
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || (1 >> 64)").parse().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn eval_cpp_integer_literals_use_their_spelled_radix() {
+        assert_eq!(ConditionExprParser::new("0").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("010").parse().unwrap(), 8);
+        assert_eq!(ConditionExprParser::new("077").parse().unwrap(), 63);
+        assert_eq!(ConditionExprParser::new("0x10 + 010").parse().unwrap(), 24);
+        assert_eq!(
+            ConditionExprParser::new("08").parse().unwrap_err(),
+            "invalid digit '8' in octal integer in #if expression"
+        );
+
+        let error = pp_err("#if 08\nunexpected\n#endif\n");
+        assert_eq!(error.line, 1);
+        assert!(
+            error
+                .msg
+                .contains("invalid digit '8' in octal integer in #if expression"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn if_cpp_shift_bitwise_and_octal_semantics_select_the_true_branch() {
+        let out = pp(
+            "#if (~0 == -1) && ((1 << 4) == 16) && ((0x0f & 017) == 15)\n\
+             selected\n\
+             #else\n\
+             #error cpp integer semantics broken\n\
+             #endif\n",
+        );
+        assert!(lines(&out).contains(&"selected"));
     }
 
     #[test]
