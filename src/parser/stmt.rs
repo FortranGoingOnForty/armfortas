@@ -1851,7 +1851,7 @@ impl<'a> Parser<'a> {
     // ---- Helpers ----
 
     pub(crate) fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
-        self.consume_end_prefix(keyword)?;
+        self.consume_end_prefix(keyword, false)?;
 
         // Skip optional construct name after end, but only on the same line.
         // For END INTERFACE, Fortran also permits a trailing generic-spec such
@@ -1877,7 +1877,9 @@ impl<'a> Parser<'a> {
         keyword: &str,
         expected_name: Option<&str>,
     ) -> Result<(), ParseError> {
-        self.consume_end_prefix(keyword)?;
+        // A bare END is a conforming terminator for a program unit. Structured
+        // constructs use consume_end(), which requires END <keyword>.
+        self.consume_end_prefix(keyword, true)?;
 
         if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
             let actual = self.peek_text();
@@ -1902,7 +1904,11 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn consume_end_prefix(&mut self, keyword: &str) -> Result<(), ParseError> {
+    fn consume_end_prefix(
+        &mut self,
+        keyword: &str,
+        allow_bare_end: bool,
+    ) -> Result<(), ParseError> {
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
         let joined_keyword: String = keyword.split_ascii_whitespace().collect();
@@ -1924,7 +1930,12 @@ impl<'a> Parser<'a> {
                                 matched_parts.join(" ")
                             )));
                         }
-                        break;
+                        if allow_bare_end && self.at_stmt_end() {
+                            return Ok(());
+                        }
+                        return Err(
+                            self.error(format!("expected '{}' after 'end'", joined_keyword))
+                        );
                     }
                 }
             }

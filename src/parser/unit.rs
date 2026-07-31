@@ -1707,6 +1707,12 @@ mod tests {
         parser.parse_file().unwrap_err()
     }
 
+    fn parse_fixed_error(src: &str) -> ParseError {
+        let tokens = tokenize_fixed(src, 0).unwrap();
+        let mut parser = Parser::new_for_form(&tokens, crate::lexer::SourceForm::FixedForm);
+        parser.parse_file().unwrap_err()
+    }
+
     #[test]
     fn compact_fixed_unit_recognition_is_iterative_for_long_prefix_runs() {
         let header = format!("{}functionf", "pure".repeat(20_000));
@@ -2414,6 +2420,64 @@ end program test
                 .any(|decl| matches!(decl.node, crate::ast::decl::Decl::DerivedTypeDef { .. })));
         } else {
             panic!("not Module");
+        }
+    }
+
+    #[test]
+    fn derived_type_requires_end_type() {
+        for error in [
+            parse_error(
+                "\
+module m
+  type :: item
+    integer :: value
+  end
+end module m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE M\n",
+                "      TYPE ITEM\n",
+                "      INTEGER VALUE\n",
+                "      END\n",
+                "      ENDMODULEM\n",
+            )),
+        ] {
+            assert!(
+                error.to_string().contains("expected 'type' after 'end'"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_requires_end_interface() {
+        for error in [
+            parse_error(
+                "\
+module m
+  interface
+    subroutine ext()
+    end subroutine ext
+  end
+end module m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE M\n",
+                "      INTERFACE\n",
+                "      SUBROUTINE EXT\n",
+                "      ENDSUBROUTINEEXT\n",
+                "      END\n",
+                "      ENDMODULEM\n",
+            )),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected 'interface' after 'end'"),
+                "{error}"
+            );
         }
     }
 

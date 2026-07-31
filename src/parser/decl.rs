@@ -1233,13 +1233,9 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Consume 'end type [name]'.
-        if self.peek_text().eq_ignore_ascii_case("endtype") {
-            self.advance();
-        } else if self.peek_text().eq_ignore_ascii_case("end") {
-            self.advance();
-            self.eat_ident("type");
-        }
+        // Consume 'end type [name]'. A bare END belongs only to program-unit
+        // termination; accepting one here silently completes a malformed type.
+        self.consume_end("type")?;
         // Optional name after end type.
         if self.peek() == &TokenKind::Identifier {
             self.advance();
