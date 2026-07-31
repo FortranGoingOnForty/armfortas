@@ -2024,6 +2024,83 @@ end submodule component_child
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// AR54-05 / semantics-modules-031: a constructor for an extended type
+// associates an explicit parent value with the whole immediate-parent
+// component. The physical layout remains flattened, so this must be recovered
+// from the imported semantic layout rather than by indexing its field vector;
+// ordinary positional values must still traverse the inherited fields.
+#[test]
+fn extension_constructor_parent_component_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=extension_constructor_parent_component_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let provider = r#"
+module extension_constructor_types
+  implicit none
+
+  type :: base_t
+    integer :: left = 1
+    integer :: right = 2
+  end type base_t
+
+  type, extends(base_t) :: child_t
+    integer :: own = 3
+  end type child_t
+
+  type, extends(child_t) :: grand_t
+    integer :: tail = 4
+  end type grand_t
+contains
+  function make_base(left, right) result(value)
+    integer, intent(in) :: left, right
+    type(base_t) :: value
+    value = base_t(left, right)
+  end function make_base
+end module extension_constructor_types
+"#;
+    let consumer = r#"
+module extension_constructor_state
+  use extension_constructor_types, only: base_t, child_t
+  implicit none
+  type(child_t), save :: frozen = child_t(base_t(101, 102), 103)
+end module extension_constructor_state
+
+program exercise_extension_constructor
+  use extension_constructor_types
+  use extension_constructor_state, only: frozen
+  implicit none
+  type(child_t) :: positional, keyword, flattened, individual, omitted, middle
+  type(grand_t) :: grand
+
+  positional = child_t(make_base(11, 22), 33)
+  keyword = child_t(base_t=make_base(21, 32), own=43)
+  flattened = child_t(left=51, right=62, own=73)
+  individual = child_t(81, 82, 83)
+  omitted = child_t(own=84)
+  middle = child_t(base_t(91, 92), 93)
+  grand = grand_t(middle, 94)
+
+  if (positional%left /= 11 .or. positional%right /= 22 .or. positional%own /= 33) error stop 1
+  if (keyword%left /= 21 .or. keyword%right /= 32 .or. keyword%own /= 43) error stop 2
+  if (flattened%left /= 51 .or. flattened%right /= 62 .or. flattened%own /= 73) error stop 3
+  if (individual%left /= 81 .or. individual%right /= 82 .or. individual%own /= 83) error stop 4
+  if (omitted%left /= 1 .or. omitted%right /= 2 .or. omitted%own /= 84) error stop 5
+  if (grand%left /= 91 .or. grand%right /= 92 .or. grand%own /= 93 .or. grand%tail /= 94) error stop 6
+  if (frozen%left /= 101 .or. frozen%right /= 102 .or. frozen%own /= 103) error stop 7
+  print *, 'AR54-05 PASS'
+end program exercise_extension_constructor
+"#;
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        multifile_test_flags(provider, consumer, "AR54-05 PASS", &[opt]);
+    }
+}
+
 // AR40-01: a separate module function's RESULT identity is declared by its
 // interface. Unrelated locals and named constants must not affect same-TU
 // lowering or the identity serialized for cross-TU compilation.

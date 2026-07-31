@@ -151,11 +151,11 @@ impl TypeLayout {
 ///
 /// Extended types expose their immediate parent as one whole component in a
 /// constructor even though `TypeLayout::fields` stores the inherited fields
-/// flattened at the start of the child's physical layout. Positional
-/// arguments map to `[whole parent, own fields...]` when the first argument
-/// has the parent's type; otherwise a default-initialized parent is omitted
-/// and association begins with the child's own fields. A keyword matching the
-/// parent type names that same whole-parent view.
+/// flattened at the start of the child's physical layout. When the first
+/// positional argument has the parent's type, arguments map to
+/// `[whole parent, own fields...]`. Otherwise they map to the ordinary
+/// flattened source-component sequence `[inherited fields..., own fields...]`.
+/// A keyword matching the parent type names that same whole-parent view.
 pub fn structure_constructor_field<'a>(
     layout: &'a TypeLayout,
     registry: &'a TypeLayoutRegistry,
@@ -182,17 +182,20 @@ pub fn structure_constructor_field<'a>(
     let Some(parent) = parent_layout else {
         return layout.fields.get(positional_index).map(Cow::Borrowed);
     };
-    if positional_parent && positional_index == 0 {
+    if !positional_parent {
+        return layout.fields.get(positional_index).map(Cow::Borrowed);
+    }
+    if positional_index == 0 {
         return Some(Cow::Owned(whole_parent_component_field(parent)));
     }
     let inherited = parent.fields.len().min(layout.fields.len());
-    let own_index = positional_index.checked_sub(usize::from(positional_parent))?;
+    let own_index = positional_index.checked_sub(1)?;
     layout.fields.get(inherited + own_index).map(Cow::Borrowed)
 }
 
 /// Decide whether the first positional constructor argument supplies the
-/// whole parent component or whether that default-initialized component was
-/// omitted and positional association begins with the child's own fields.
+/// whole parent component or whether positional association uses the
+/// individual inherited components followed by the child's own fields.
 pub fn structure_constructor_uses_positional_parent(
     layout: &TypeLayout,
     registry: &TypeLayoutRegistry,
@@ -2319,6 +2322,12 @@ mod tests {
         ));
         assert_eq!(
             structure_constructor_field(&child_layout, &reg, None, 0, false)
+                .unwrap()
+                .name,
+            "x"
+        );
+        assert_eq!(
+            structure_constructor_field(&child_layout, &reg, None, 1, false)
                 .unwrap()
                 .name,
             "y"
