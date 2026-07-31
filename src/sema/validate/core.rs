@@ -20,7 +20,7 @@ use super::procedure::{
     validate_procedure_pointer_interface,
 };
 use super::pure_elemental::{
-    check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
+    check_pure_stmt_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
 use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature};
@@ -5535,6 +5535,9 @@ fn visit_io_branch_labels(stmt: &Stmt, mut visit: impl FnMut(u64)) {
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
     validate_stmt_enum_usage(ctx, stmt);
+    if ctx.in_pure {
+        check_pure_stmt_expr_calls(ctx, stmt);
+    }
     visit_io_branch_labels(&stmt.node, |label| {
         ctx.labels_referenced.push((label, stmt.span));
     });
@@ -5553,9 +5556,6 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 stmt.span,
                 resolves_defined_assignment,
             );
-            if ctx.in_pure {
-                check_pure_expr_calls(ctx, value);
-            }
             if polymorphic_allocatable_target(ctx, target)
                 && !assignment_uses_defined_assignment(ctx, target, value)
             {
@@ -8048,24 +8048,8 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
     }
 }
 
-/// Validate pointer assignment: LHS must be pointer, RHS must be target/pointer.
-/// Validate that an ALLOCATE/DEALLOCATE item is allocatable or pointer.
-///
-/// For a component access like `pools(i)%tokens(n)`, the target is
-/// the `tokens` field — not the `pools` base.  Resolve the leaf
-/// component through the type-layout registry and check its own
-/// attributes.  Bare-name targets still get the symbol attribute
-/// check.  If the chain can't be resolved (registry missing, cross-
-/// TU stale .amod, etc.) we skip rather than produce a misleading
-/// error.
-/// Check if a call in a pure procedure is to a known impure procedure.
-/// Symbol-level pure tracking isn't yet wired into the symbol table,
-/// so this is conservative: we warn if the callee resolves to an
-/// external procedure (whose body we cannot inspect).  I/O, STOP,
-/// and SAVE violations are caught statement-level in validate_stmt.
-/// Walk an expression tree and check any function calls against the
-/// pure-call constraint.  Catches `r = impure_fn()` which is an
-/// expression-level call, not a `Stmt::Call`.
+/// Whether an I/O control list selects a character expression as its internal
+/// file instead of an external unit.
 fn uses_internal_character_file(ctx: &Ctx, controls: &[IoControl]) -> bool {
     let Some(unit) = controls.iter().find(|control| {
         control
@@ -16704,6 +16688,230 @@ end function
 ",
         );
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn pure_control_expressions_reject_impure_function_calls() {
+        let errs = errors_from(
+            "\
+module m
+contains
+  logical function impure_predicate()
+    impure_predicate = .true.
+  end function
+
+  integer function impure_bound()
+    impure_bound = 1
+  end function
+
+  pure subroutine exercise()
+    integer :: i
+
+    if (impure_predicate()) continue
+    do while (impure_predicate())
+      exit
+    end do
+    do i = impure_bound(), 1
+    end do
+    select case (impure_bound())
+    case (1)
+    end select
+  end subroutine
+end module
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("callee is not pure"))
+                .count(),
+            4,
+            "every control expression must enforce PURE call constraints: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_statement_expression_fields_are_checked_exhaustively() {
+        fn errors_for_statement(statement: &str) -> Vec<String> {
+            errors_from(&format!(
+                "\
+module m
+  implicit none
+contains
+  logical function impure_predicate()
+    impure_predicate = .true.
+  end function
+
+  integer function impure_bound()
+    impure_bound = 1
+  end function
+
+  function impure_mask() result(mask)
+    logical :: mask(2)
+    mask = .true.
+  end function
+
+  pure subroutine take_scalar(value)
+    integer, intent(in) :: value
+  end subroutine
+
+  pure subroutine take_vector(value)
+    integer, intent(in) :: value(:)
+  end subroutine
+
+  pure subroutine exercise()
+    integer :: i, values(2)
+    integer, allocatable :: allocated_values(:)
+    character(32) :: buffer
+    values = 0
+{statement}
+  end subroutine
+end module
+"
+            ))
+        }
+
+        let cases = [
+            (
+                "IF/ELSE IF conditions",
+                "    if (impure_predicate()) then\n\
+                     continue\n\
+                   else if (impure_predicate()) then\n\
+                     continue\n\
+                   end if",
+                2,
+            ),
+            (
+                "single-line IF condition",
+                "    if (impure_predicate()) continue",
+                1,
+            ),
+            (
+                "DO WHILE condition",
+                "    do while (impure_predicate())\n\
+                     exit\n\
+                   end do",
+                1,
+            ),
+            (
+                "counted DO header",
+                "    do i = impure_bound(), impure_bound(), impure_bound()\n\
+                   end do",
+                3,
+            ),
+            (
+                "DO CONCURRENT header",
+                "    do concurrent (i = impure_bound():impure_bound():impure_bound(), impure_predicate())\n\
+                   end do",
+                4,
+            ),
+            (
+                "SELECT CASE selector",
+                "    select case (impure_bound())\n\
+                   case (1)\n\
+                   end select",
+                1,
+            ),
+            (
+                "WHERE and ELSEWHERE masks",
+                "    where (impure_mask())\n\
+                     values = 1\n\
+                   elsewhere (impure_mask())\n\
+                     values = 2\n\
+                   end where",
+                2,
+            ),
+            (
+                "FORALL header",
+                "    forall (i = impure_bound():impure_bound():impure_bound(), impure_predicate())\n\
+                     values(i) = i\n\
+                   end forall",
+                4,
+            ),
+            (
+                "ASSOCIATE selector",
+                "    associate (value => impure_bound())\n\
+                     if (value < 0) return\n\
+                   end associate",
+                1,
+            ),
+            (
+                "internal I/O item",
+                "    write(buffer, *) impure_bound()",
+                1,
+            ),
+            (
+                "CALL argument",
+                "    call take_scalar(impure_bound())",
+                1,
+            ),
+            (
+                "ALLOCATE bounds and SOURCE",
+                "    allocate(allocated_values(impure_bound()), source=[impure_bound()])",
+                2,
+            ),
+            (
+                "conditional-expression arms",
+                "    i = (impure_predicate() ? impure_bound() : impure_bound())",
+                3,
+            ),
+            (
+                "array-constructor implied-DO bounds",
+                "    values = [(i, i = impure_bound(), impure_bound(), impure_bound())]",
+                3,
+            ),
+            (
+                "array-section triplet in CALL argument",
+                "    call take_vector(values(impure_bound():impure_bound():impure_bound()))",
+                3,
+            ),
+        ];
+
+        for (context, statement, expected) in cases {
+            let errs = errors_for_statement(statement);
+            assert_eq!(
+                errs.iter()
+                    .filter(|err| err.contains("callee is not pure"))
+                    .count(),
+                expected,
+                "{context} must inspect every nested function call: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_control_expressions_accept_pure_and_intrinsic_calls() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+contains
+  pure logical function pure_predicate()
+    pure_predicate = .true.
+  end function
+
+  pure integer function pure_bound()
+    pure_bound = 1
+  end function
+
+  pure subroutine take_scalar(value)
+    integer, intent(in) :: value
+  end subroutine
+
+  pure subroutine exercise()
+    integer :: i
+    if (pure_predicate()) then
+      do i = abs(pure_bound()), pure_bound()
+        call take_scalar(max(i, pure_bound()))
+      end do
+    end if
+  end subroutine
+end module
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "PURE and intrinsic callees must remain valid in control expressions: {errs:?}"
+        );
     }
 
     #[test]
