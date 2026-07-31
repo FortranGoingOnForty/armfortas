@@ -3926,6 +3926,58 @@ fn fixed_form_program_compiles_and_runs() {
 }
 
 #[test]
+fn fixed_form_inline_comments_preserve_later_continuations() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_inline_comments_preserve_later_continuations count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        concat!(
+            "      PROGRAM P\n",
+            "      INTEGER X\n",
+            "      X = 39 ! ignored ' 99H\n",
+            "     +    + 1 ! ignored \" 77H\n",
+            "     +    + 2\n",
+            "      PRINT *, X\n",
+            "      END\n",
+        ),
+        "f",
+    );
+    let out = unique_path("fixed_inline_comment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed inline-comment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed inline-comment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed inline-comment run failed");
+    assert!(
+        run.status.success(),
+        "fixed inline-comment run failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).trim().ends_with("42"),
+        "unexpected fixed inline-comment output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_char_read_with_size_from_redirected_stdin_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

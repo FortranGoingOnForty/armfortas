@@ -153,6 +153,17 @@ impl MappedFixedText {
         self.end = other.end;
     }
 
+    fn physical_line_end(&self, start: usize) -> usize {
+        let Some(line) = self.positions.get(start).map(|position| position.line) else {
+            return self.text.len();
+        };
+        self.positions[start..]
+            .iter()
+            .position(|position| position.line != line)
+            .map(|offset| start + offset)
+            .unwrap_or(self.text.len())
+    }
+
     fn span(&self, file_id: u32, start: usize, end: usize) -> Span {
         let start_pos = self.positions.get(start).copied().unwrap_or_else(|| {
             self.positions
@@ -234,10 +245,15 @@ fn tokenize_body(body: &MappedFixedText, file_id: u32) -> Result<Vec<Token>, Lex
 
         // Comment (! to end).
         if ch == b'!' {
+            let end = stripped.physical_line_end(pos);
+            if end < bytes.len() {
+                pos = end;
+                continue;
+            }
             tokens.push(Token {
                 kind: TokenKind::Comment,
-                text: stripped.text[pos..].to_string(),
-                span: stripped.span(file_id, pos, bytes.len()),
+                text: stripped.text[pos..end].to_string(),
+                span: stripped.span(file_id, pos, end),
             });
             break;
         }
@@ -325,6 +341,19 @@ fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
     let mut i = 0;
 
     while i < bytes.len() {
+        // An inline comment ends at its physical record, not at the end of the
+        // concatenated logical statement. Discard comments followed by another
+        // continuation before their contents can look like strings or Hollerith.
+        if bytes[i] == b'!' {
+            let end = body.physical_line_end(i);
+            if end == bytes.len() {
+                result.push_str(&body.text[i..end]);
+                positions.extend_from_slice(&body.positions[i..end]);
+            }
+            i = end;
+            continue;
+        }
+
         // Inside a string literal: copy verbatim.
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
@@ -352,8 +381,10 @@ fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
 
         // Check for Hollerith: digits followed by H, not preceded by a letter/digit.
         if bytes[i].is_ascii_digit() {
-            let preceded_by_alnum =
-                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let preceded_by_alnum = result
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
             if !preceded_by_alnum {
                 let digit_start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -423,7 +454,12 @@ fn strip_whitespace_outside_strings_mapped(body: &MappedFixedText) -> MappedFixe
     let bytes = body.text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\'' || bytes[i] == b'"' {
+        if bytes[i] == b'!' {
+            let end = body.physical_line_end(i);
+            result.push_str(&body.text[i..end]);
+            positions.extend_from_slice(&body.positions[i..end]);
+            i = end;
+        } else if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             result.push(quote as char);
             positions.push(body.positions[i]);
@@ -1624,6 +1660,88 @@ mod tests {
             .filter(|k| **k == TokenKind::IntegerLiteral)
             .count();
         assert_eq!(int_count, 2);
+    }
+
+    #[test]
+    fn inline_comment_does_not_swallow_continuation_body() {
+        let src = "      X = 1 ! ignored ' 99H\n     +    + 2\n";
+
+        assert_eq!(fixed_texts(src), ["X", "=", "1", "+", "2"]);
+        let two = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.text == "2")
+            .expect("continuation body was swallowed by the inline comment");
+        assert_eq!(two.span.start, Position { line: 2, col: 13 });
+    }
+
+    #[test]
+    fn inline_comment_on_continuation_does_not_swallow_the_next_record() {
+        let src = "      X = 1\n     +    + 2 ! ignored\n     +    + 3\n";
+
+        assert_eq!(fixed_texts(src), ["X", "=", "1", "+", "2", "+", "3"]);
+    }
+
+    #[test]
+    fn exclamation_in_string_before_inline_comment_is_not_a_comment() {
+        let src = "      X = 'A!B' // ! ignored\n     + 'C!D'\n";
+        let literals: Vec<_> = fixed_toks(src)
+            .into_iter()
+            .filter(|token| token.kind == TokenKind::StringLiteral)
+            .collect();
+
+        assert_eq!(literals.len(), 2);
+        assert_eq!(literals[0].text, "'A!B'");
+        assert_eq!(literals[0].span.start, Position { line: 1, col: 11 });
+        assert_eq!(literals[0].span.end, Position { line: 1, col: 16 });
+        assert_eq!(literals[1].text, "'C!D'");
+        assert_eq!(literals[1].span.start, Position { line: 2, col: 8 });
+        assert_eq!(literals[1].span.end, Position { line: 2, col: 13 });
+    }
+
+    #[test]
+    fn exclamation_in_hollerith_after_inline_comment_is_not_a_comment() {
+        let src = "      X = ! ignoredZ\n     +3HA!B\n";
+        let literal = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .expect("missing continued Hollerith literal");
+
+        assert_eq!(literal.text, "'A!B'");
+        assert_eq!(literal.span.start, Position { line: 2, col: 7 });
+        assert_eq!(literal.span.end, Position { line: 2, col: 12 });
+    }
+
+    #[test]
+    fn tab_form_inline_comment_does_not_swallow_continuation_body() {
+        let src = "\tX = 40 ! ignored\n\t1+ 2\n";
+
+        assert_eq!(fixed_texts(src), ["X", "=", "40", "+", "2"]);
+    }
+
+    #[test]
+    fn large_inline_comment_continuation_chain_is_processed_iteratively() {
+        const CONTINUATIONS: usize = 20_000;
+        let mut src = String::from("      X = 0 ! ignored ' 999H\n");
+        for _ in 1..CONTINUATIONS {
+            src.push_str("     +    + 1 ! ignored \" 999H\n");
+        }
+        src.push_str("     +    + 1\n");
+
+        let tokens = fixed_toks(&src);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Plus)
+                .count(),
+            CONTINUATIONS
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::IntegerLiteral)
+                .count(),
+            CONTINUATIONS + 1
+        );
     }
 
     #[test]
