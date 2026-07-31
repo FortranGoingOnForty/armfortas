@@ -450,6 +450,14 @@ pub fn resolve_file(
     for unit in units {
         resolve_unit(&mut st, unit, module_search_paths, &mut layouts)?;
     }
+    // Some procedure(interface) entities are resolved before a later
+    // interface block publishes its callable symbol. Revisit every completed
+    // scope once, after the whole file has been registered, so purity and
+    // result characteristics come from lexical interface lookup rather than
+    // whichever same-named symbol happened to be created first.
+    for scope_id in 0..st.scopes.len() {
+        backfill_procedure_interfaces(&mut st, scope_id);
+    }
     let external_modules = LOADED_EXTERNAL_MODULES.with(|cell| {
         let v = cell.borrow();
         v.iter().cloned().collect::<Vec<_>>()
@@ -465,11 +473,13 @@ pub fn resolve_file(
     })
 }
 
-pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
+pub(super) fn backfill_procedure_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
     struct InterfaceUpdate {
         key: String,
         type_info: Option<TypeInfo>,
         arg_names: Vec<String>,
+        pure: bool,
+        elemental: bool,
         result_rank: u8,
         result_array_spec: Vec<decl::ArraySpec>,
     }
@@ -479,17 +489,14 @@ pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_
         .symbols
         .iter()
         .filter_map(|(key, sym)| {
-            if sym.kind != SymbolKind::ProcedurePointer {
-                return None;
-            }
-            let TypeInfo::Derived(iface_name) = sym.type_info.as_ref()? else {
-                return None;
-            };
-            let iface_sym = st.find_symbol_any_scope(&iface_name.to_lowercase())?;
+            let iface_name = sym.attrs.procedure_iface.as_deref()?;
+            let iface_sym = st.lookup_in(scope_id, iface_name)?;
             Some(InterfaceUpdate {
                 key: key.clone(),
                 type_info: iface_sym.type_info.clone(),
                 arg_names: iface_sym.arg_names.clone(),
+                pure: iface_sym.attrs.pure,
+                elemental: iface_sym.attrs.elemental,
                 result_rank: iface_sym.attrs.result_rank,
                 result_array_spec: iface_sym.attrs.array_spec.clone(),
             })
@@ -502,6 +509,8 @@ pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_
                 sym.type_info = Some(type_info);
             }
             sym.arg_names = update.arg_names;
+            sym.attrs.pure = update.pure;
+            sym.attrs.elemental = update.elemental;
             sym.attrs.result_rank = update.result_rank;
             sym.attrs.array_spec = update.result_array_spec;
         }
@@ -817,7 +826,7 @@ pub(super) fn resolve_unit(
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts, unit.span)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::Module {
@@ -837,7 +846,7 @@ pub(super) fn resolve_unit(
                 process_implicit(st, implicit)?;
                 process_decls(st, decls)?;
                 process_contains(st, contains, module_search_paths, layouts, unit.span)?;
-                backfill_procedure_pointer_interfaces(st, mod_id);
+                backfill_procedure_interfaces(st, mod_id);
 
                 st.enter_scope(saved);
             }
@@ -928,7 +937,7 @@ pub(super) fn resolve_unit(
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts, unit.span)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::Function {
@@ -1014,7 +1023,7 @@ pub(super) fn resolve_unit(
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
             process_contains(st, contains, module_search_paths, layouts, unit.span)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::BlockData { name, uses, decls } => {
@@ -1113,7 +1122,7 @@ pub(super) fn resolve_unit(
             }
             process_decls(st, decls)?;
             process_contains(st, contains, module_search_paths, layouts, unit.span)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::InterfaceBlock {
@@ -3135,14 +3144,14 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         if sym_attrs.pointer {
                             kind = SymbolKind::ProcedurePointer;
                         }
-                        if let Some(iface_sym) =
-                            st.find_symbol_any_scope(&iface_name.to_lowercase())
-                        {
+                        if let Some(iface_sym) = st.lookup(iface_name) {
                             type_info = iface_sym
                                 .type_info
                                 .clone()
                                 .unwrap_or_else(|| type_info.clone());
                             arg_names = iface_sym.arg_names.clone();
+                            sym_attrs.pure = iface_sym.attrs.pure;
+                            sym_attrs.elemental = iface_sym.attrs.elemental;
                             sym_attrs.result_rank = iface_sym.attrs.result_rank;
                             sym_attrs.array_spec = iface_sym.attrs.array_spec.clone();
                         }
@@ -3293,6 +3302,73 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             const_char_value: None,
                         })?;
                     }
+                }
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::External,
+                entities,
+            } => {
+                let current_scope = st.current_scope();
+                for entity in entities {
+                    let key = entity.to_ascii_lowercase();
+                    let is_dummy = st
+                        .scope(current_scope)
+                        .arg_order
+                        .iter()
+                        .any(|argument| argument.eq_ignore_ascii_case(&key));
+                    if is_dummy {
+                        let symbol = st
+                            .scope_mut(current_scope)
+                            .symbols
+                            .get_mut(&key)
+                            .expect("procedure dummy placeholder must exist");
+                        symbol.attrs.external = true;
+                        continue;
+                    }
+                    st.define(Symbol {
+                        name: entity.clone(),
+                        kind: SymbolKind::ExternalProc,
+                        type_info: None,
+                        attrs: SymbolAttrs {
+                            access: st.default_access(current_scope),
+                            external: true,
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: current_scope,
+                        arg_names: vec![],
+                        const_value: None,
+                        const_char_value: None,
+                    })?;
+                }
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::Intrinsic,
+                entities,
+            } => {
+                let current_scope = st.current_scope();
+                for entity in entities {
+                    let already_intrinsic = st.lookup(entity).is_some_and(|symbol| {
+                        symbol.kind == SymbolKind::IntrinsicProc || symbol.attrs.intrinsic
+                    });
+                    if already_intrinsic {
+                        continue;
+                    }
+                    st.define(Symbol {
+                        name: entity.clone(),
+                        kind: SymbolKind::IntrinsicProc,
+                        type_info: None,
+                        attrs: SymbolAttrs {
+                            access: st.default_access(current_scope),
+                            intrinsic: true,
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: current_scope,
+                        arg_names: vec![],
+                        const_value: None,
+                        const_char_value: None,
+                    })?;
                 }
             }
             Decl::DimensionStmt { entities } => {
@@ -5595,6 +5671,99 @@ end subroutine invoke
         assert!(callback.attrs.pointer);
         assert!(callback.attrs.optional);
         assert_eq!(callback.arg_names, ["value"]);
+    }
+
+    #[test]
+    fn standalone_external_and_intrinsic_statements_define_procedure_symbols() {
+        let st = resolve_source(
+            "\
+program declarations
+  external :: external_work
+  intrinsic :: sin
+end program declarations
+",
+        );
+        let program = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Program(name) if name == "declarations"))
+            .expect("missing program scope");
+
+        let external = program
+            .symbols
+            .get("external_work")
+            .expect("standalone EXTERNAL symbol");
+        assert_eq!(external.kind, SymbolKind::ExternalProc);
+        assert!(external.attrs.external);
+
+        let intrinsic = program
+            .symbols
+            .get("sin")
+            .expect("standalone INTRINSIC symbol");
+        assert_eq!(intrinsic.kind, SymbolKind::IntrinsicProc);
+        assert!(intrinsic.attrs.intrinsic);
+    }
+
+    #[test]
+    fn standalone_intrinsic_accepts_an_identical_use_associated_intrinsic() {
+        let st = resolve_source(
+            "\
+module intrinsic_provider
+  intrinsic :: sin
+end module intrinsic_provider
+
+program consumer
+  use intrinsic_provider
+  intrinsic :: sin
+end program consumer
+",
+        );
+        let consumer = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Program(name) if name == "consumer"))
+            .expect("missing consumer scope");
+        assert!(
+            !consumer.symbols.contains_key("sin"),
+            "an identical USE-associated intrinsic must not be shadowed locally"
+        );
+    }
+
+    #[test]
+    fn procedure_entities_inherit_purity_from_their_explicit_interface() {
+        let st = resolve_source(
+            "\
+module callbacks
+  abstract interface
+    pure integer function pure_callback(value)
+      integer, intent(in) :: value
+    end function pure_callback
+  end interface
+contains
+  subroutine invoke(callback)
+    procedure(pure_callback) :: callback
+  end subroutine invoke
+end module callbacks
+",
+        );
+        let invoke = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "invoke"))
+            .expect("missing invoke scope");
+        let callback = invoke
+            .symbols
+            .get("callback")
+            .expect("missing procedure dummy");
+        assert!(callback.attrs.external);
+        assert_eq!(
+            callback.attrs.procedure_iface.as_deref(),
+            Some("pure_callback")
+        );
+        assert!(
+            callback.attrs.pure,
+            "procedure dummy did not inherit PURE from its explicit interface"
+        );
     }
 
     #[test]

@@ -1090,28 +1090,41 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // INTRINSIC / EXTERNAL :: name-list — informational
-            // declarations that mark functions as intrinsic or external.
-            // We consume and discard them; sema already knows which names
-            // are intrinsic.
+            // INTRINSIC / EXTERNAL statements establish procedure identity.
+            // Preserve them so resolution can distinguish a default intrinsic
+            // from a same-named external procedure and PURE validation can
+            // require an explicit purity contract for external calls.
             if (text == "intrinsic" || text == "external")
                 && (next_tok.as_ref() == Some(&TokenKind::ColonColon)
                     || next_tok.as_ref() == Some(&TokenKind::Identifier))
             {
+                let start = self.current_span();
+                let attr = if text == "intrinsic" {
+                    crate::ast::decl::Attribute::Intrinsic
+                } else {
+                    crate::ast::decl::Attribute::External
+                };
                 self.advance(); // consume keyword
                 let _ = self.eat(&TokenKind::ColonColon);
-                // Eat the name list.
-                loop {
-                    if self.peek() == &TokenKind::Identifier {
-                        self.advance();
-                    } else {
-                        break;
-                    }
+                let mut entities = Vec::new();
+                while self.peek() == &TokenKind::Identifier {
+                    entities.push(self.advance().clone().text);
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
                 }
+                if entities.is_empty() {
+                    return Err(self.error(format!(
+                        "{} statement requires at least one procedure name",
+                        text.to_ascii_uppercase()
+                    )));
+                }
                 self.skip_newlines();
+                let span = span_from_to(start, self.prev_span());
+                decls.push(crate::ast::Spanned::new(
+                    crate::ast::decl::Decl::AttributeStmt { attr, entities },
+                    span,
+                ));
                 continue;
             }
 
@@ -1479,10 +1492,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Fold standalone ALLOCATABLE/POINTER/TARGET/VOLATILE attribute statements
-/// into the type declaration of each named entity, so every downstream
-/// consumer (resolve plus all lowering storage sites) sees the attribute
-/// through the normal `Decl::TypeDecl` path with no extra plumbing.
+/// Fold standalone entity attribute statements into the type declaration of
+/// each named entity, so every downstream consumer sees the attribute through
+/// the normal `Decl::TypeDecl` path with no extra plumbing.
 ///
 /// A declaration that names several entities is split so the attribute lands
 /// on only its entity: `integer :: y, z` + `allocatable :: y` becomes
@@ -1504,6 +1516,8 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
                         | Attribute::Pointer
                         | Attribute::Target
                         | Attribute::Volatile
+                        | Attribute::External
+                        | Attribute::Intrinsic
                 ) =>
             {
                 (attr.clone(), entities.clone())
@@ -1893,6 +1907,63 @@ end program test
                         && attrs.iter().any(|attr| matches!(attr, Attribute::Volatile))
             )
         }));
+    }
+
+    #[test]
+    fn standalone_external_and_intrinsic_statements_are_preserved() {
+        use crate::ast::decl::{Attribute, Decl};
+
+        let unit = parse_unit(
+            "program p\n\
+               real :: typed_external\n\
+               external :: typed_external\n\
+               external :: external_work\n\
+               intrinsic :: sin\n\
+             end program p\n",
+        );
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::TypeDecl { attrs, entities, .. }
+                    if entities.iter().any(|entity| entity.name == "typed_external")
+                        && attrs.iter().any(|attr| matches!(attr, Attribute::External))
+            )
+        }));
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::AttributeStmt {
+                    attr: Attribute::External,
+                    entities,
+                } if entities == &["external_work"]
+            )
+        }));
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::AttributeStmt {
+                    attr: Attribute::Intrinsic,
+                    entities,
+                } if entities == &["sin"]
+            )
+        }));
+    }
+
+    #[test]
+    fn standalone_procedure_attribute_statements_require_a_name() {
+        for keyword in ["external", "intrinsic"] {
+            let error = parse_error(&format!("program p\n  {keyword} ::\nend program p\n"));
+            assert!(
+                error
+                    .msg
+                    .contains("statement requires at least one procedure name"),
+                "unexpected error for {keyword}: {error}"
+            );
+        }
     }
 
     #[test]

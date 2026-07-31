@@ -10128,6 +10128,12 @@ fn extend_declared_names_from_decls(
                     declared.insert(entity.name.to_lowercase());
                 }
             }
+            Decl::AttributeStmt {
+                attr: Attribute::External | Attribute::Intrinsic,
+                entities,
+            } => {
+                declared.extend(entities.iter().map(|entity| entity.to_lowercase()));
+            }
             // COMMON block variables are also declared.
             Decl::CommonBlock { vars, .. } => {
                 for v in vars {
@@ -10853,10 +10859,12 @@ fn intrinsic_real_kind(info: &TypeInfo) -> Option<u8> {
     }
 }
 
-fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
+pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
     let key = name.to_ascii_lowercase();
     if let Some(symbol) = ctx.lookup_lexical(&key) {
-        if symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc) {
+        if !symbol.attrs.external
+            && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
+        {
             let canonical = symbol.name.to_ascii_lowercase();
             return is_intrinsic_name(&canonical).then_some(canonical);
         }
@@ -16911,6 +16919,103 @@ end module
         assert!(
             errs.is_empty(),
             "PURE and intrinsic callees must remain valid in control expressions: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_calls_require_an_explicit_pure_contract_for_unknown_and_external_procedures() {
+        let errs = errors_from(
+            "\
+pure subroutine exercise()
+  integer :: value
+  real, external :: external_value
+  real, external :: sin
+  external :: external_work
+
+  call unknown_work()
+  call external_work()
+  value = unknown_value()
+  value = int(external_value())
+  value = int(sin(0.0))
+end subroutine exercise
+",
+        );
+        let contract_errors: Vec<_> = errs
+            .iter()
+            .filter(|err| err.contains("requires an explicit PURE or ELEMENTAL interface"))
+            .collect();
+        assert_eq!(
+            contract_errors.len(),
+            5,
+            "every unresolved or EXTERNAL call must require a positive purity contract: {errs:?}"
+        );
+        for name in [
+            "unknown_work",
+            "external_work",
+            "unknown_value",
+            "external_value",
+            "sin",
+        ] {
+            assert!(
+                contract_errors.iter().any(|err| err.contains(name)),
+                "missing PURE contract diagnostic for {name}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_calls_accept_explicit_pure_interfaces_intrinsics_and_array_subscripts() {
+        let errs = errors_from(
+            "\
+module callbacks
+  abstract interface
+    pure integer function pure_callback(value)
+      integer, intent(in) :: value
+    end function pure_callback
+  end interface
+contains
+  pure subroutine exercise(callback, values)
+    procedure(pure_callback) :: callback
+    integer, intent(inout) :: values(2)
+    intrinsic :: abs
+
+    values(1) = callback(values(2))
+    values(2) = abs(values(1))
+  end subroutine exercise
+end module callbacks
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "positive PURE contracts and data subscripts must remain valid: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_calls_reject_procedure_dummies_with_impure_interfaces() {
+        let errs = errors_from(
+            "\
+module callbacks
+  abstract interface
+    integer function impure_callback(value)
+      integer, intent(in) :: value
+    end function impure_callback
+  end interface
+contains
+  pure integer function exercise(callback, value)
+    procedure(impure_callback) :: callback
+    integer, intent(in) :: value
+    exercise = callback(value)
+  end function exercise
+end module callbacks
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("requires an explicit PURE or ELEMENTAL interface"))
+                .count(),
+            1,
+            "an impure procedure interface is not a positive PURE contract: {errs:?}"
         );
     }
 

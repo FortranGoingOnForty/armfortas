@@ -13,7 +13,7 @@ use crate::ast::unit::DummyArg;
 use crate::lexer::Span;
 use crate::sema::symtab::{ScopeId, Symbol, SymbolKind, SymbolTable};
 
-use super::core::{extract_base_name, Ctx};
+use super::core::{extract_base_name, resolved_intrinsic_name, Ctx};
 
 fn check_pure_subscript_calls(ctx: &mut Ctx, subscript: &SectionSubscript) {
     match subscript {
@@ -261,26 +261,38 @@ pub(super) fn check_pure_stmt_expr_calls(ctx: &mut Ctx, stmt: &SpannedStmt) {
     }
 }
 
+fn reject_missing_pure_contract(ctx: &mut Ctx, span: Span, name: &str) {
+    ctx.error(
+        span,
+        format!(
+            "call to '{}' inside a pure procedure requires an explicit PURE or ELEMENTAL interface (F2018 15.7)",
+            name
+        ),
+    );
+}
+
 pub(super) fn validate_pure_call(
     ctx: &mut Ctx,
     callee: &crate::ast::expr::SpannedExpr,
     span: Span,
 ) {
-    // F2018 15.7: a PURE procedure may only call PURE, ELEMENTAL,
-    // or intrinsic procedures.  If the callee resolves to a known
-    // symbol that is NOT marked pure/elemental/intrinsic, reject.
-    // Unknown callees (external without an interface) are left
-    // alone — the programmer's responsibility per F2018 §15.4.
+    // F2018 15.7: a PURE procedure may only call a procedure with a
+    // positive PURE/ELEMENTAL contract, or an intrinsic procedure.
     let Some(name) = extract_base_name(callee) else {
         return;
     };
-    let Some(sym) = ctx.lookup(&name) else {
+    if resolved_intrinsic_name(ctx, &name).is_some() {
+        return;
+    }
+    let Some(sym) = ctx.lookup_lexical(&name) else {
+        reject_missing_pure_contract(ctx, span, &name);
         return;
     };
+    if sym.attrs.pure || sym.attrs.elemental {
+        return;
+    }
     match sym.kind {
-        SymbolKind::Function | SymbolKind::Subroutine
-            if !sym.attrs.pure && !sym.attrs.elemental && !sym.attrs.intrinsic =>
-        {
+        SymbolKind::Function | SymbolKind::Subroutine => {
             ctx.error(
                 span,
                 format!(
@@ -289,8 +301,16 @@ pub(super) fn validate_pure_call(
                 ),
             );
         }
-        SymbolKind::IntrinsicProc => {} // always OK
-        _ => {}                         // external / unknown — can't check
+        SymbolKind::ExternalProc | SymbolKind::IntrinsicProc | SymbolKind::ProcedurePointer => {
+            reject_missing_pure_contract(ctx, span, &sym.name);
+        }
+        _ if sym.attrs.external || sym.attrs.intrinsic || sym.attrs.procedure_iface.is_some() => {
+            reject_missing_pure_contract(ctx, span, &sym.name);
+        }
+        _ => {
+            // A resolved data object with parenthesized subscripts is represented
+            // by the same AST shape as a function reference. It is not a call.
+        }
     }
 }
 

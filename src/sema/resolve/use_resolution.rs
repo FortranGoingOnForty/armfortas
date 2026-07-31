@@ -11,8 +11,8 @@ use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
 
 use super::core::{
-    backfill_procedure_pointer_interfaces, merge_specific_names, resolve_unit,
-    LOADED_EXTERNAL_MODULES, LOADING_EXTERNAL_SUBMODULES,
+    backfill_procedure_interfaces, merge_specific_names, resolve_unit, LOADED_EXTERNAL_MODULES,
+    LOADING_EXTERNAL_SUBMODULES,
 };
 
 fn add_use_association(
@@ -1072,7 +1072,7 @@ fn install_external_interface(
         }
         st.pop_scope();
     }
-    backfill_procedure_pointer_interfaces(st, scope_id);
+    backfill_procedure_interfaces(st, scope_id);
 
     // Register type layouts.
     for amod_type in &iface.types {
