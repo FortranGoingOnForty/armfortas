@@ -256,6 +256,75 @@ fn volatile_module_variable_survives_amod_round_trip() {
 }
 
 #[test]
+fn move_alloc_type_identity_survives_amod_round_trip() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_source = dir.join("move_alloc_types.f90");
+    let provider_object = dir.join("move_alloc_types.o");
+    let valid_source = dir.join("valid_consumer.f90");
+    let valid_object = dir.join("valid_consumer.o");
+    let valid_binary = dir.join("valid_consumer.bin");
+    let invalid_source = dir.join("invalid_consumer.f90");
+    let invalid_object = dir.join("invalid_consumer.o");
+
+    std::fs::write(
+        &provider_source,
+        "module move_alloc_types\n  implicit none\n  type :: payload_t\n    integer :: value = 0\n  end type payload_t\n  type :: other_t\n    integer :: value = 0\n  end type other_t\nend module move_alloc_types\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &provider_source, &provider_object, None);
+
+    std::fs::write(
+        &valid_source,
+        "program valid_consumer\n  use move_alloc_types, only: source_t => payload_t, target_t => payload_t\n  implicit none\n  type(source_t), allocatable :: source\n  type(target_t), allocatable :: target\n  allocate(source)\n  source%value = 42\n  call move_alloc(source, target)\n  if (allocated(source)) error stop 1\n  if (.not. allocated(target)) error stop 2\n  print *, target%value\nend program valid_consumer\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &valid_source, &valid_object, Some(&dir));
+    link_files(&[&provider_object, &valid_object], &valid_binary);
+    let output = run_binary(&valid_binary);
+    assert!(
+        output_contains_expected(&output, "42"),
+        "renamed aliases of one exported type must remain MOVE_ALLOC-compatible: {output}"
+    );
+
+    std::fs::write(
+        &invalid_source,
+        "subroutine invalid_consumer()\n  use move_alloc_types, only: payload_t, other_t\n  implicit none\n  type(payload_t), allocatable :: source\n  type(other_t), allocatable :: target\n  call move_alloc(source, target)\nend subroutine invalid_consumer\n",
+    )
+    .unwrap();
+    let invalid = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            invalid_source.to_str().unwrap(),
+            "-c",
+            "-o",
+            invalid_object.to_str().unwrap(),
+        ])
+        .arg(format!("-I{}", dir.display()))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("invalid MOVE_ALLOC consumer compile failed to spawn");
+    assert!(
+        !invalid.status.success(),
+        "distinct exported derived types must be rejected by MOVE_ALLOC"
+    );
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.contains(
+            "MOVE_ALLOC FROM and TO arguments must have compatible declared type and kind"
+        ) && stderr.contains("TYPE(payload_t)")
+            && stderr.contains("TYPE(other_t)"),
+        "cross-TU MOVE_ALLOC diagnostic lost exported type identity:\n{stderr}"
+    );
+    assert!(
+        !invalid_object.exists(),
+        "rejected MOVE_ALLOC consumer left an object artifact"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn serialized_intrinsic_use_keeps_provider_nature() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

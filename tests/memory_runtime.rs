@@ -1128,6 +1128,49 @@ fn move_alloc_success_sets_status_for_all_descriptor_families() {
 }
 
 #[test]
+fn move_alloc_accepts_same_unallocated_variable() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=move_alloc_accepts_same_unallocated_variable count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("move_alloc_same_unallocated");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, allocatable :: value\n  character(len=:), allocatable :: text\n  call move_alloc(value, value)\n  call move_alloc(text, text)\n  if (allocated(value)) error stop 1\n  if (allocated(text)) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+    let exe = dir.join("move_alloc_same_unallocated.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("same-variable MOVE_ALLOC runtime failed");
+    assert!(
+        run.status.success(),
+        "same-variable MOVE_ALLOC runtime failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected same-variable MOVE_ALLOC output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn repeated_scalar_pointer_allocation_reports_status_and_preserves_target() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

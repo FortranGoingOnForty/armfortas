@@ -178,6 +178,7 @@ pub(super) struct Ctx<'a> {
 struct BlockBindingAttrs {
     intent_in: bool,
     parameter: bool,
+    allocatable: bool,
     pointer: bool,
     type_info: Option<TypeInfo>,
     rank: Option<usize>,
@@ -5712,7 +5713,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     });
                 if intrinsic_move_alloc {
                     ctx.require_std(stmt.span, FortranStandard::F2003, "MOVE_ALLOC");
-                    validate_move_alloc_polymorphic_ownership(ctx, args);
+                    validate_move_alloc_arguments(ctx, args);
                 }
                 if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
                     validate_system_clock_args(ctx, args, stmt.span);
@@ -7508,16 +7509,135 @@ fn call_argument_expr<'a>(
     Some(expr)
 }
 
-fn validate_move_alloc_polymorphic_ownership(
+struct MoveAllocCharacteristics {
+    type_info: TypeInfo,
+    rank: usize,
+    polymorphic: bool,
+}
+
+fn move_alloc_characteristics(
     ctx: &mut Ctx<'_>,
-    args: &[crate::ast::expr::Argument],
-) {
+    expr: &SpannedExpr,
+    role: &str,
+) -> Option<MoveAllocCharacteristics> {
+    let (allocatable, type_info) = match &expr.node {
+        Expr::Name { name } => {
+            if ctx.is_associate_name(name) {
+                (false, ctx.associate_binding_type_info(name).cloned())
+            } else if let Some(binding) = ctx.block_binding_attrs(name) {
+                (binding.allocatable, binding.type_info.clone())
+            } else {
+                let symbol = ctx.lookup_lexical(name)?;
+                (
+                    symbol.kind == SymbolKind::Variable && symbol.attrs.allocatable,
+                    symbol.type_info.clone(),
+                )
+            }
+        }
+        Expr::ComponentAccess { base, .. } => {
+            let leaf = leaf_field_layout(ctx, expr)?;
+            let scalar_base = validation_expr_rank(ctx, base).is_none_or(|rank| rank == 0);
+            (
+                leaf.field.allocatable && scalar_base,
+                Some(leaf.field.type_info.clone()),
+            )
+        }
+        _ => (false, validation_expr_type_info(ctx, expr)),
+    };
+
+    let definable = actual_is_definable(ctx, expr, true).unwrap_or(true);
+    if !allocatable || !definable {
+        ctx.error(
+            expr.span,
+            format!("MOVE_ALLOC {role} argument must be a definable allocatable variable"),
+        );
+        return None;
+    }
+
+    let type_info = type_info?;
+    let rank = validation_expr_rank(ctx, expr)?;
+    let polymorphic = matches!(type_info, TypeInfo::Class(_) | TypeInfo::ClassStar);
+    Some(MoveAllocCharacteristics {
+        type_info,
+        rank,
+        polymorphic,
+    })
+}
+
+fn move_alloc_nondeferred_type_parameters_match(source: &TypeInfo, target: &TypeInfo) -> bool {
+    match (source, target) {
+        (
+            TypeInfo::Character {
+                len: Some(source), ..
+            },
+            TypeInfo::Character {
+                len: Some(target), ..
+            },
+        ) => source == target,
+        _ => true,
+    }
+}
+
+fn move_alloc_type_name(type_info: &TypeInfo) -> String {
+    match type_info {
+        TypeInfo::Character { len, kind } => format!(
+            "CHARACTER(kind={},len={})",
+            kind.unwrap_or(1),
+            len.map_or_else(|| ":".to_string(), |len| len.to_string())
+        ),
+        _ => intrinsic_assignment_type_name(type_info),
+    }
+}
+
+fn validate_move_alloc_arguments(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) {
     let Some(source) = call_argument_expr(args, 0, "from") else {
         return;
     };
     let Some(target) = call_argument_expr(args, 1, "to") else {
         return;
     };
+
+    let source_characteristics = move_alloc_characteristics(ctx, source, "FROM");
+    let target_characteristics = move_alloc_characteristics(ctx, target, "TO");
+
+    if let (Some(source_info), Some(target_info)) =
+        (&source_characteristics, &target_characteristics)
+    {
+        if source_info.rank != target_info.rank {
+            ctx.error(
+                target.span,
+                format!(
+                    "MOVE_ALLOC FROM and TO arguments must have the same rank (got rank-{} and rank-{})",
+                    source_info.rank, target_info.rank
+                ),
+            );
+        }
+        if source_info.polymorphic && !target_info.polymorphic {
+            ctx.error(
+                target.span,
+                "MOVE_ALLOC TO argument must be polymorphic when FROM is polymorphic",
+            );
+        } else if !generic_type_compatible(
+            ctx,
+            ctx.scope_id,
+            &target_info.type_info,
+            ctx.scope_id,
+            &source_info.type_info,
+        ) || !move_alloc_nondeferred_type_parameters_match(
+            &source_info.type_info,
+            &target_info.type_info,
+        ) {
+            ctx.error(
+                target.span,
+                format!(
+                    "MOVE_ALLOC FROM and TO arguments must have compatible declared type and kind with matching nondeferred type parameters (got {} and {})",
+                    move_alloc_type_name(&source_info.type_info),
+                    move_alloc_type_name(&target_info.type_info)
+                ),
+            );
+        }
+    }
+
     if !polymorphic_allocatable_target(ctx, target) {
         return;
     }
@@ -9761,6 +9881,7 @@ fn block_attrs_from_decl(attrs: &[Attribute]) -> BlockBindingAttrs {
     let mut out = BlockBindingAttrs::default();
     for attr in attrs {
         match attr {
+            Attribute::Allocatable => out.allocatable = true,
             Attribute::Parameter => out.parameter = true,
             Attribute::Pointer => out.pointer = true,
             Attribute::Intent(crate::ast::decl::Intent::In) => out.intent_in = true,
@@ -13135,6 +13256,136 @@ end program
                 .any(|err| err.contains("cannot preserve its local FINAL procedure")),
             "{:?}",
             errs
+        );
+    }
+
+    #[test]
+    fn rejects_move_alloc_type_kind_and_rank_mismatches() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: first_t
+    integer :: value = 0
+  end type
+  type :: second_t
+    integer :: value = 0
+  end type
+  integer, allocatable :: scalar, vector(:)
+  integer(kind=8), allocatable :: wide
+  real, allocatable :: real_value
+  character(len=5), allocatable :: short
+  character(len=9), allocatable :: long
+  type(first_t), allocatable :: first
+  type(second_t), allocatable :: second
+
+  call move_alloc(scalar, real_value)
+  call move_alloc(scalar, wide)
+  call move_alloc(scalar, vector)
+  call move_alloc(short, long)
+  call move_alloc(first, second)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("type and kind"))
+                .count(),
+            4,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("same rank"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_move_alloc_nonallocatable_designators() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer, allocatable :: value, target
+  integer, pointer :: pointer_value
+  integer :: plain
+
+  call move_alloc(plain, target)
+  call move_alloc(pointer_value, target)
+  call move_alloc((value), target)
+  call move_alloc(value, plain)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("allocatable variable"))
+                .count(),
+            4,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_move_alloc_deferred_length_polymorphic_widening_and_same_variable() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: base_t
+  end type
+  type, extends(base_t) :: child_t
+  end type
+  character(len=5), allocatable :: fixed
+  character(len=:), allocatable :: deferred
+  integer, allocatable :: same
+  type(child_t), allocatable :: concrete_child
+  class(child_t), allocatable :: polymorphic_child
+  class(base_t), allocatable :: polymorphic_base
+  class(*), allocatable :: anything, anything_else
+
+  call move_alloc(fixed, deferred)
+  call move_alloc(same, same)
+  call move_alloc(concrete_child, polymorphic_base)
+  call move_alloc(polymorphic_child, polymorphic_base)
+  call move_alloc(polymorphic_base, anything)
+  call move_alloc(anything, anything_else)
+  block
+    integer, allocatable :: local_from, local_to
+    call move_alloc(local_from, local_to)
+  end block
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("MOVE_ALLOC")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_move_alloc_polymorphic_source_to_nonpolymorphic_destination() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+  end type
+  class(payload_t), allocatable :: source
+  type(payload_t), allocatable :: target
+  call move_alloc(source, target)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("polymorphic"))
+                .count(),
+            1,
+            "{errs:?}"
         );
     }
 

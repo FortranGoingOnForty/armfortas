@@ -436,6 +436,56 @@ fn incompatible_intrinsic_assignment_is_rejected() {
 }
 
 #[test]
+fn move_alloc_rejects_incompatible_and_nonallocatable_arguments_before_codegen() {
+    let src = write_program(
+        "program move_alloc_invalid\n\
+         implicit none\n\
+         integer, allocatable :: scalar, vector(:), target\n\
+         real, allocatable :: real_value\n\
+         character(len=5), allocatable :: short\n\
+         character(len=9), allocatable :: long\n\
+         integer :: plain\n\
+         call move_alloc(scalar, real_value)\n\
+         call move_alloc(scalar, vector)\n\
+         call move_alloc(short, long)\n\
+         call move_alloc(plain, target)\n\
+         end program move_alloc_invalid\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-std=f2018"]);
+    assert!(
+        !result.status.success(),
+        "invalid MOVE_ALLOC calls must fail before lowering"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(
+        stderr
+            .matches("must have compatible declared type and kind")
+            .count(),
+        2,
+        "missing or duplicated MOVE_ALLOC type/kind diagnostic:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("must have the same rank").count(),
+        1,
+        "missing or duplicated MOVE_ALLOC rank diagnostic:\n{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("must be a definable allocatable variable")
+            .count(),
+        1,
+        "missing or duplicated MOVE_ALLOC allocatable diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CHARACTER(kind=1,len=5)") && stderr.contains("CHARACTER(kind=1,len=9)"),
+        "missing MOVE_ALLOC character type-parameter details:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_file(src);
+}
+
+#[test]
 fn incompatible_explicit_interface_actual_is_rejected() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

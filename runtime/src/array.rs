@@ -2139,7 +2139,9 @@ pub extern "C" fn afs_assign_allocatable_convert(
 /// `from` is cleared (becomes unallocated).
 #[no_mangle]
 pub extern "C" fn afs_move_alloc(from: *mut ArrayDescriptor, to: *mut ArrayDescriptor) {
-    if from.is_null() || to.is_null() {
+    // F2018 permits the same variable only while it is unallocated. Avoid
+    // creating aliased Rust references even if an invalid caller violates it.
+    if from.is_null() || to.is_null() || std::ptr::eq(from, to) {
         return;
     }
 
@@ -3022,6 +3024,21 @@ mod tests {
         assert_eq!(from.scalar_type_tag(), 0);
 
         afs_deallocate_array(&mut to, ptr::null_mut());
+    }
+
+    #[test]
+    fn move_alloc_same_descriptor_is_a_safe_noop() {
+        let mut desc = ArrayDescriptor::zeroed();
+        afs_allocate_1d(&mut desc, 4, 3);
+        let original_base = desc.base_addr;
+        let same = &mut desc as *mut ArrayDescriptor;
+
+        afs_move_alloc(same, same);
+
+        assert!(desc.is_allocated());
+        assert_eq!(desc.base_addr, original_base);
+        assert_eq!(desc.total_elements(), 3);
+        afs_deallocate_array(&mut desc, ptr::null_mut());
     }
 
     #[test]
