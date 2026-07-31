@@ -909,24 +909,35 @@ impl<'a> Parser<'a> {
 
     fn parse_format(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume FORMAT
+        if self.peek() != &TokenKind::LParen {
+            return Err(self.error("FORMAT specification must begin with '('".to_string()));
+        }
+
         let mut spec = String::new();
-        if self.peek() == &TokenKind::LParen {
-            let mut depth = 0i32;
-            while self.peek() != &TokenKind::Eof && !self.at_stmt_end() {
-                let tok = self.advance().clone();
-                spec.push_str(&tok.text);
-                match tok.kind {
-                    TokenKind::LParen => depth += 1,
-                    TokenKind::RParen => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
+        let opening = self.advance().clone();
+        spec.push_str(&opening.text);
+        let mut depth = 1usize;
+        while self.peek() != &TokenKind::Eof && !self.at_stmt_end() {
+            let tok = self.advance().clone();
+            spec.push_str(&tok.text);
+            match tok.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
+        if depth != 0 {
+            return Err(self.error(
+                "unterminated FORMAT specification: expected ')' before end of statement"
+                    .to_string(),
+            ));
+        }
+
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Format { spec }, span))
     }
@@ -1952,12 +1963,24 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
+    use crate::lexer::{fixed::tokenize_fixed, Lexer};
 
     fn parse_one(src: &str) -> SpannedStmt {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         parser.parse_stmt().unwrap()
+    }
+
+    fn parse_error(src: &str) -> ParseError {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.parse_stmt().unwrap_err()
+    }
+
+    fn parse_fixed_error(src: &str) -> ParseError {
+        let tokens = tokenize_fixed(src, 0).unwrap();
+        let mut parser = Parser::new_for_form(&tokens, crate::lexer::SourceForm::FixedForm);
+        parser.parse_stmt().unwrap_err()
     }
 
     // ---- Assignment ----
@@ -2906,6 +2929,48 @@ end if
         } else {
             panic!("not Labeled, got {:?}", s.node);
         }
+    }
+
+    #[test]
+    fn format_requires_an_opening_parenthesis() {
+        for error in [
+            parse_error("100 format i5\n"),
+            parse_fixed_error("  100 FORMAT I5\n"),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("FORMAT specification must begin with '('"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_requires_balanced_parentheses() {
+        for error in [
+            parse_error("100 format(2(i5)\n"),
+            parse_fixed_error("  100 FORMAT(2(I5)\n"),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("unterminated FORMAT specification"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_format_preserves_nested_spec() {
+        let s = parse_one("100 format(2(1x, i0), *(f8.3))\n");
+        let Stmt::Labeled { stmt, .. } = &s.node else {
+            panic!("not a labeled statement");
+        };
+        let Stmt::Format { spec } = &stmt.node else {
+            panic!("labeled inner statement should be FORMAT");
+        };
+        assert_eq!(spec, "(2(1x,i0),*(f8.3))");
     }
 
     #[test]
