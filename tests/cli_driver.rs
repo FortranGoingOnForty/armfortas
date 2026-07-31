@@ -9287,6 +9287,81 @@ end program p
 }
 
 #[test]
+fn ieee_status_procedures_export_and_restore_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ieee_status_procedures_export_and_restore_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_status_procedures");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: ieee_exceptions, only : ieee_status_type, &
+       save_status => ieee_get_status, restore_status => ieee_set_status, &
+       ieee_inexact, ieee_get_flag, ieee_set_flag
+  implicit none
+  type(ieee_status_type) :: saved
+  logical :: raised
+
+  call ieee_set_flag(ieee_inexact, .false.)
+  call save_status(saved)
+  call ieee_set_flag(ieee_inexact, .true.)
+  call ieee_get_flag(ieee_inexact, raised)
+  if (.not. raised) error stop 1
+  call restore_status(saved)
+  call ieee_get_flag(ieee_inexact, raised)
+  if (raised) error stop 2
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_status_procedures_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("IEEE status procedure compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: IEEE status procedures should be exported: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("IEEE status procedure executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: IEEE status procedures must restore the saved environment: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected IEEE status procedure output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

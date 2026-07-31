@@ -13682,7 +13682,6 @@ pub(super) fn resolved_intrinsic_name_for_call(
     let intrinsic_name = |symbol: &crate::sema::symtab::Symbol| {
         (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
             .then(|| symbol.name.to_ascii_lowercase())
-            .filter(|candidate| crate::sema::validate::is_intrinsic_name(candidate))
     };
 
     let key = name.to_ascii_lowercase();
