@@ -20,7 +20,7 @@ pub(crate) fn tokenize_fixed_source_view(src: &str, file_id: u32) -> Result<Vec<
 }
 
 fn tokenize_fixed_impl(src: &str, file_id: u32, source_view: bool) -> Result<Vec<Token>, LexError> {
-    let statements = preprocess_lines(src, file_id, source_view);
+    let statements = preprocess_lines(src, file_id, source_view)?;
     let mut tokens = Vec::new();
 
     for stmt in &statements {
@@ -1212,7 +1212,11 @@ fn is_fixed_continuation_gap(line: &str) -> bool {
 
 /// Preprocess fixed-form lines: identify comments, extract labels, join
 /// continuations, strip columns 73+, handle tab-form.
-fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine> {
+fn preprocess_lines(
+    src: &str,
+    file_id: u32,
+    source_view: bool,
+) -> Result<Vec<FixedLine>, LexError> {
     let lines: Vec<&str> = src.lines().collect();
     let mut result = Vec::new();
     let mut i = 0;
@@ -1245,6 +1249,26 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
             result.push(fixed_comment_record(line, file_id, line_num));
             i += 1;
             continue;
+        }
+
+        if is_continuation_line_impl(line, source_view) {
+            let marker_col = if line.as_bytes().first() == Some(&b'\t') {
+                2
+            } else {
+                6
+            };
+            let marker = Position {
+                line: line_num,
+                col: marker_col,
+            };
+            return Err(LexError {
+                span: Span {
+                    file_id,
+                    start: marker,
+                    end: marker,
+                },
+                msg: "orphan fixed-form continuation line".into(),
+            });
         }
 
         // Extract columns from this line.
@@ -1307,7 +1331,7 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
         });
     }
 
-    result
+    Ok(result)
 }
 
 /// Check if a line is a continuation line (non-space, non-zero in column 6).
@@ -1561,6 +1585,30 @@ mod tests {
             .filter(|k| **k == TokenKind::IntegerLiteral)
             .count();
         assert_eq!(int_count, 2);
+    }
+
+    #[test]
+    fn orphan_continuation_in_column_6_is_rejected() {
+        let err = tokenize_fixed("C leading comment\n\n     + X = 1\n", 17).unwrap_err();
+
+        assert_eq!(err.span.file_id, 17);
+        assert_eq!(err.span.start, Position { line: 3, col: 6 });
+        assert_eq!(err.msg, "orphan fixed-form continuation line");
+    }
+
+    #[test]
+    fn orphan_tab_form_continuation_is_rejected() {
+        let err = tokenize_fixed("\t1X = 1\n", 0).unwrap_err();
+
+        assert_eq!(err.span.start, Position { line: 1, col: 2 });
+        assert_eq!(err.msg, "orphan fixed-form continuation line");
+    }
+
+    #[test]
+    fn zero_in_column_6_starts_an_initial_line() {
+        let texts = fixed_texts("     0X = 1\n");
+
+        assert_eq!(texts, ["X", "=", "1"]);
     }
 
     #[test]
@@ -2082,7 +2130,7 @@ C     Hello World
             "\n",
             "     +  2\n",
         );
-        let lines = preprocess_lines(src, 0, false);
+        let lines = preprocess_lines(src, 0, false).unwrap();
         let statements = lines
             .iter()
             .filter(|line| matches!(line, FixedLine::Statement { .. }))
@@ -2102,7 +2150,7 @@ C     Hello World
     #[test]
     fn noncontinuation_after_gap_run_preserves_physical_order() {
         let src = "      X = 1\nC boundary comment\n\n      Y = 2\n";
-        let lines = preprocess_lines(src, 0, false);
+        let lines = preprocess_lines(src, 0, false).unwrap();
         let kinds: Vec<&str> = lines
             .iter()
             .map(|line| match line {
@@ -2128,7 +2176,7 @@ C     Hello World
         }
         src.push_str("     +  2\n");
 
-        let lines = preprocess_lines(&src, 0, false);
+        let lines = preprocess_lines(&src, 0, false).unwrap();
         assert_eq!(
             lines
                 .iter()

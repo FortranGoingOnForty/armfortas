@@ -33602,6 +33602,26 @@ fn fixed_form_continuation_diagnostic_uses_physical_line() {
 }
 
 #[test]
+fn orphan_fixed_form_continuation_diagnostic_points_to_marker() {
+    let source = write_program("C leading comment\n\n     + X = 1\n", "f");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:3:6: error:", source.display())),
+        "orphan continuation diagnostic used the wrong location: {stderr}"
+    );
+    assert!(
+        stderr.contains("orphan fixed-form continuation line"),
+        "orphan continuation diagnostic used the wrong message: {stderr}"
+    );
+    assert_diagnostic_caret(&stderr, "     + X = 1", '+');
+
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
 fn garbage_text_is_rejected_as_parse_error() {
     let src = write_program("this is garbage\n", "f90");
     let out = unique_path("garbage", "bin");
