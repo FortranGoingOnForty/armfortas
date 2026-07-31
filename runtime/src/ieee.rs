@@ -21,7 +21,9 @@
 //! | ieee_class                       | implemented     | bit pattern              |
 //! | ieee_value                       | implemented     | bit pattern (call-opaque)|
 //! | ieee_copy_sign/logb/rint/scalb   | implemented     | libm                     |
+//! | ieee_fma/rem                     | implemented     | libm fma/remainder       |
 //! | ieee_next_after                  | implemented     | libm nextafter           |
+//! | ieee_selected_real_kind          | implemented     | compiler IR, kinds 4/8   |
 //! | ieee_max/min(_mag), *_num(_mag)  | implemented     | 60559:2020 (this file)   |
 //! | ieee_get/set_rounding_mode       | implemented     | FPCR (arm) / MXCSR (x86) |
 //! | ieee_get/set_flag, get/set_status| implemented     | FPSR/FPCR or MXCSR       |
@@ -58,6 +60,14 @@ unsafe extern "C" {
     fn c_nextafter(x: f64, y: f64) -> f64;
     #[link_name = "nextafterf"]
     fn c_nextafterf(x: f32, y: f32) -> f32;
+    #[link_name = "fma"]
+    fn c_fma(a: f64, b: f64, c: f64) -> f64;
+    #[link_name = "fmaf"]
+    fn c_fmaf(a: f32, b: f32, c: f32) -> f32;
+    #[link_name = "remainder"]
+    fn c_remainder(x: f64, y: f64) -> f64;
+    #[link_name = "remainderf"]
+    fn c_remainderf(x: f32, y: f32) -> f32;
 }
 
 fn class_f64(bits: u64) -> i32 {
@@ -236,6 +246,30 @@ pub extern "C" fn afs_ieee_copy_sign_r8(x: f64, y: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn afs_ieee_copy_sign_r4(x: f32, y: f32) -> f32 {
     x.copysign(y)
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_fma_r8(a: f64, b: f64, c: f64) -> f64 {
+    // SAFETY: C99 fma has no pointer or lifetime preconditions.
+    unsafe { c_fma(a, b, c) }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_fma_r4(a: f32, b: f32, c: f32) -> f32 {
+    // SAFETY: C99 fmaf has no pointer or lifetime preconditions.
+    unsafe { c_fmaf(a, b, c) }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_rem_r8(x: f64, y: f64) -> f64 {
+    // SAFETY: C99 remainder has no pointer or lifetime preconditions.
+    unsafe { c_remainder(x, y) }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_rem_r4(x: f32, y: f32) -> f32 {
+    // SAFETY: C99 remainderf has no pointer or lifetime preconditions.
+    unsafe { c_remainderf(x, y) }
 }
 
 #[no_mangle]
@@ -1041,6 +1075,25 @@ mod tests {
         // r4 spot checks.
         assert_eq!(afs_ieee_max_r4(1.0, 2.0), 2.0);
         assert_eq!(afs_ieee_min_num_r4(f32::NAN, 5.0), 5.0);
+    }
+
+    #[test]
+    fn fused_multiply_add_and_exact_remainder() {
+        let delta64 = 2.0f64.powi(-27);
+        assert_eq!(
+            afs_ieee_fma_r8(1.0 + delta64, 1.0 - delta64, -1.0),
+            -2.0f64.powi(-54)
+        );
+        let delta32 = 2.0f32.powi(-13);
+        assert_eq!(
+            afs_ieee_fma_r4(1.0 + delta32, 1.0 - delta32, -1.0),
+            -2.0f32.powi(-26)
+        );
+
+        assert_eq!(afs_ieee_rem_r8(7.0, 2.0), -1.0);
+        assert_eq!(afs_ieee_rem_r8(5.0, 2.0), 1.0);
+        assert_eq!(afs_ieee_rem_r8(-4.0, 2.0).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(afs_ieee_rem_r4(7.0, 2.0), -1.0);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

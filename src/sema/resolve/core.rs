@@ -2275,6 +2275,52 @@ fn eval_const_char_expr_in_scope(
     }
 }
 
+fn eval_ieee_selected_real_kind_args(
+    args: &[crate::ast::expr::Argument],
+    mut eval: impl FnMut(&crate::ast::expr::SpannedExpr) -> Option<i64>,
+) -> Option<i64> {
+    let mut values = [None, None, None];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            match keyword.to_ascii_lowercase().as_str() {
+                "p" => 0,
+                "r" => 1,
+                "radix" => 2,
+                _ => return None,
+            }
+        } else {
+            if saw_keyword || positional >= values.len() {
+                return None;
+            }
+            let index = positional;
+            positional += 1;
+            index
+        };
+        if values[index].is_some() {
+            return None;
+        }
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        values[index] = Some(eval(expr)?);
+    }
+
+    if values.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(i64::from(
+        crate::sema::types::ieee_selected_real_kind_value(
+            i128::from(values[0].unwrap_or(0)),
+            i128::from(values[1].unwrap_or(0)),
+            values[2].map(i128::from),
+        ),
+    ))
+}
+
 fn eval_const_int_expr_with_params(
     expr: &crate::ast::expr::SpannedExpr,
     const_params: &HashMap<String, i64>,
@@ -2322,6 +2368,9 @@ fn eval_const_int_expr_with_params(
                 }
             });
             match name.to_lowercase().as_str() {
+                "ieee_selected_real_kind" => eval_ieee_selected_real_kind_args(args, |expr| {
+                    eval_const_int_expr_with_params(expr, const_params, const_char_params)
+                }),
                 "selected_int_kind" => {
                     let r = first_arg_val?;
                     Some(if r <= 2 {
@@ -3690,6 +3739,9 @@ pub(super) fn eval_const_int_expr_in_scope(
                     }
                 });
                 match key.as_str() {
+                    "ieee_selected_real_kind" => eval_ieee_selected_real_kind_args(args, |expr| {
+                        eval_const_int_expr_in_scope(expr, st, scope_id)
+                    }),
                     "selected_int_kind" => {
                         let r = first_arg_val?;
                         Some(if r <= 2 {

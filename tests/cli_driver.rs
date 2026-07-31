@@ -9158,6 +9158,135 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
 }
 
 #[test]
+fn exported_ieee_functions_compile_and_run_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=exported_ieee_functions_compile_and_run_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_exported_functions");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: ieee_arithmetic, only : fused => ieee_fma, ieee_rem, &
+       ieee_selected_real_kind, ieee_copy_sign
+  implicit none
+  integer, parameter :: static_ieee_kind = ieee_selected_real_kind(p=15)
+  real(kind=4) :: delta4, a4, b4, fused4
+  real(kind=4) :: fma_a(2), fma_b(2), fma_c(2), fma_result(2)
+  real(kind=4) :: rem_x(2), rem_y(2), rem_result(2)
+  real(kind=8) :: delta8, a8, b8, fused8, rem8, zero8
+  real(kind=static_ieee_kind) :: static_value
+  integer(kind=8) :: precision, exponent_range, requested_radix
+
+  delta4 = scale(1.0_4, -13)
+  a4 = 1.0_4 + delta4
+  b4 = 1.0_4 - delta4
+  fused4 = fused(a4, b4, -1.0_4)
+  if (fused4 /= -scale(1.0_4, -26)) error stop 1
+
+  delta8 = scale(1.0_8, -27)
+  a8 = 1.0_8 + delta8
+  b8 = 1.0_8 - delta8
+  fused8 = fused(a8, b8, -1.0_8)
+  if (fused8 /= -scale(1.0_8, -54)) error stop 2
+
+  rem8 = ieee_rem(1.0_4, 1.0_8 - scale(1.0_8, -30))
+  if (rem8 /= scale(1.0_8, -30)) error stop 3
+  if (ieee_rem(5.0_4, 2.0_4) /= 1.0_4) error stop 4
+  zero8 = ieee_rem(-4.0_8, 2.0_8)
+  if (zero8 /= 0.0_8) error stop 5
+  if (ieee_copy_sign(1.0_8, zero8) > 0.0_8) error stop 6
+
+  fma_a(1) = a4
+  fma_b(1) = b4
+  fma_c(1) = -1.0_4
+  fma_a(2) = 2.0_4
+  fma_b(2) = 3.0_4
+  fma_c(2) = 4.0_4
+  fma_result = fused(fma_a, fma_b, fma_c)
+  if (fma_result(1) /= -scale(1.0_4, -26)) error stop 7
+  if (fma_result(2) /= 10.0_4) error stop 8
+
+  rem_x(1) = 7.0_4
+  rem_y(1) = 2.0_4
+  rem_x(2) = 5.0_4
+  rem_y(2) = 2.0_4
+  rem_result = ieee_rem(rem_x, rem_y)
+  if (rem_result(1) /= -1.0_4) error stop 9
+  if (rem_result(2) /= 1.0_4) error stop 10
+
+  static_value = 1.0_static_ieee_kind
+  if (kind(static_value) /= 8) error stop 11
+  precision = 6
+  exponent_range = 100
+  requested_radix = 2
+  if (ieee_selected_real_kind(p=precision) /= 4) error stop 12
+  if (ieee_selected_real_kind(r=exponent_range) /= 8) error stop 13
+  if (ieee_selected_real_kind(radix=requested_radix) /= 4) error stop 14
+  precision = 15
+  exponent_range = 307
+  if (ieee_selected_real_kind(r=exponent_range, radix=requested_radix, p=precision) /= 8) error stop 15
+  precision = 16
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -1) error stop 16
+  precision = 15
+  exponent_range = 308
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -2) error stop 17
+  precision = 16
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -3) error stop 18
+  requested_radix = 10
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -5) error stop 19
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_exported_functions_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "--std=f2023",
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("exported IEEE function compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: exported IEEE functions should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("exported IEEE function executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: exported IEEE functions must retain their specified semantics: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected exported IEEE function output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

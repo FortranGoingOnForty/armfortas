@@ -13665,6 +13665,42 @@ pub(super) fn user_callable_shadows_intrinsic(
     })
 }
 
+/// Resolve the canonical intrinsic name visible at a call site.
+///
+/// Intrinsic-module USE association can rename a procedure
+/// (`fused => ieee_fma`). The local spelling is correct for lookup, but
+/// intrinsic dispatch must use the imported symbol's original name. A
+/// visible user callable still wins and returns `None`.
+pub(super) fn resolved_intrinsic_name_for_call(
+    st: &SymbolTable,
+    caller_scope_id: Option<crate::sema::symtab::ScopeId>,
+    caller_link_name: &str,
+    name: &str,
+) -> Option<String> {
+    use crate::sema::symtab::SymbolKind;
+
+    let intrinsic_name = |symbol: &crate::sema::symtab::Symbol| {
+        (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
+            .then(|| symbol.name.to_ascii_lowercase())
+            .filter(|candidate| crate::sema::validate::is_intrinsic_name(candidate))
+    };
+
+    let key = name.to_ascii_lowercase();
+    if let Some(symbol) = active_block_use_linkable_symbol(st, &key) {
+        return intrinsic_name(symbol);
+    }
+    let caller_scope_id =
+        caller_scope_id.or_else(|| callee_scope_id_for_lookup(st, caller_link_name));
+    if let Some(scope_id) = caller_scope_id {
+        if let Some(symbol) = st.lookup_in(scope_id, &key) {
+            return intrinsic_name(symbol);
+        }
+    } else if let Some(symbol) = st.lookup(&key) {
+        return intrinsic_name(symbol);
+    }
+    crate::sema::validate::is_intrinsic_name(&key).then_some(key)
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct SpecificProcCandidate {
     name: String,
@@ -19730,6 +19766,9 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "unpack" => Some(&["vector", "mask", "field"]),
         "cshift" => Some(&["array", "shift", "dim"]),
         "eoshift" => Some(&["array", "shift", "boundary", "dim"]),
+        "ieee_fma" => Some(&["a", "b", "c"]),
+        "ieee_rem" => Some(&["x", "y"]),
+        "ieee_selected_real_kind" => Some(&["p", "r", "radix"]),
         _ => None,
     }
 }
@@ -46142,16 +46181,18 @@ pub(super) fn resolved_named_callee_is_elemental(
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> bool {
     let callee_key = callee_name.to_lowercase();
-    if crate::sema::validate::is_intrinsic_name(&callee_key)
-        && is_array_reducing_intrinsic(&callee_key)
-        && !user_callable_shadows_intrinsic(
-            st,
-            current_proc_scope(),
-            b.func().name.as_str(),
-            &callee_key,
-        )
-    {
-        return false;
+    if let Some(intrinsic_name) = resolved_intrinsic_name_for_call(
+        st,
+        current_proc_scope(),
+        b.func().name.as_str(),
+        &callee_key,
+    ) {
+        if is_array_reducing_intrinsic(&intrinsic_name) {
+            return false;
+        }
+        if is_elemental_math_intrinsic(&intrinsic_name) {
+            return true;
+        }
     }
     let actual_vals: Vec<ValueId> = args
         .iter()
@@ -46953,6 +46994,25 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             ) {
                 return None;
             }
+            // Scalarization synthesizes a second call whose actual arguments
+            // are temporary scalar names. Preserve the intrinsic's canonical
+            // identity across that rewrite: a USE-renamed call such as
+            // `fused => ieee_fma` otherwise reaches type inference and the
+            // scalar intrinsic dispatcher under the local spelling `fused`,
+            // then falls through to a bare `ieee_fma` external.
+            if let Some(intrinsic_name) = resolved_intrinsic_name_for_call(
+                st,
+                current_proc_scope(),
+                b.func().name.as_str(),
+                name,
+            ) {
+                mapped_callee = crate::ast::Spanned::new(
+                    Expr::Name {
+                        name: intrinsic_name,
+                    },
+                    callee.span,
+                );
+            }
         }
         Expr::ComponentAccess { base, component } => {
             let tl = type_layouts?;
@@ -47230,7 +47290,19 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     let control_desc = control_desc.or(fallback_control_desc)?;
     let control_rank = control_rank.or(fallback_control_rank).unwrap_or(1).max(1);
-    let result_type = operator_expr_type_info(expr, Some(locals), st, type_layouts)?;
+    let mapped_call = crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(mapped_callee.clone()),
+            args: mapped_args.clone(),
+        },
+        expr.span,
+    );
+    // The element type is the type of the scalarized call, not of the
+    // original array-valued syntax. This distinction is load-bearing for
+    // USE-renamed intrinsics: the canonicalized mapped callee and synthetic
+    // scalar locals carry enough information to select the intrinsic result,
+    // while the original local spelling can look like an untyped external.
+    let result_type = operator_expr_type_info(&mapped_call, Some(&loop_locals), st, type_layouts)?;
     let (result_elem_ty, result_char_len) = match result_type {
         crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
             (IrType::Int(IntWidth::I8), Some(len))
@@ -47349,14 +47421,6 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             b.store(elem, temp_info.addr);
         }
     }
-
-    let mapped_call = crate::ast::Spanned::new(
-        Expr::FunctionCall {
-            callee: Box::new(mapped_callee.clone()),
-            args: mapped_args.clone(),
-        },
-        expr.span,
-    );
 
     if let Some(_char_len) = result_char_len {
         let (src_ptr, src_len) = lower_string_expr_full(

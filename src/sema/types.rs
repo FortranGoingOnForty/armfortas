@@ -158,6 +158,37 @@ impl FortranType {
     }
 }
 
+/// F2023 17.11.38 kind selection over the IEC 60559 formats implemented by
+/// ARMFORTAS. Missing P/R are represented by zero; `None` for RADIX means no
+/// radix constraint.
+pub(crate) fn ieee_selected_real_kind_value(
+    precision: i128,
+    exponent_range: i128,
+    radix: Option<i128>,
+) -> i32 {
+    if radix.is_some_and(|value| value != 2) {
+        return -5;
+    }
+    if precision <= 6 && exponent_range <= 37 {
+        return 4;
+    }
+    if precision <= 15 && exponent_range <= 307 {
+        return 8;
+    }
+
+    let precision_supported = precision <= 15;
+    let range_supported = exponent_range <= 307;
+    match (precision_supported, range_supported) {
+        (false, true) => -1,
+        (true, false) => -2,
+        (false, false) => -3,
+        // With nested binary32/binary64 capabilities this cannot occur, but
+        // it is the standard result when separate kinds satisfy P and R
+        // without one kind satisfying both.
+        (true, true) => -4,
+    }
+}
+
 /// Compute the result type of a binary arithmetic operation.
 /// Implements Fortran's type promotion rules.
 pub fn arithmetic_result_type(left: &FortranType, right: &FortranType) -> Option<FortranType> {
@@ -711,7 +742,6 @@ pub fn expr_type(
         // Function call / array access — disambiguate based on callee
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
-                // Check intrinsics first
                 let arg_types: Vec<FortranType> = args
                     .iter()
                     .map(|a| match &a.value {
@@ -720,45 +750,62 @@ pub fn expr_type(
                     })
                     .collect();
 
-                if matches!(name.to_lowercase().as_str(), "real" | "float") {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
-                        return FortranType::Real { kind };
+                let lexical_symbol = symtab.lookup(name);
+                let visible_symbol = lexical_symbol.or_else(|| symtab.find_symbol_any_scope(name));
+                // A USE rename retains the imported symbol's canonical name.
+                // Dispatch and result typing must use that name, while a visible
+                // user procedure of the same local name must continue to shadow
+                // the intrinsic.
+                let intrinsic_name = match lexical_symbol {
+                    Some(sym)
+                        if sym.attrs.intrinsic
+                            || matches!(sym.kind, super::symtab::SymbolKind::IntrinsicProc) =>
+                    {
+                        Some(sym.name.as_str())
+                    }
+                    Some(_) => None,
+                    None => Some(name.as_str()),
+                };
+
+                if let Some(intrinsic_name) = intrinsic_name {
+                    let intrinsic_key = intrinsic_name.to_lowercase();
+                    if matches!(intrinsic_key.as_str(), "real" | "float") {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab)
+                        {
+                            return FortranType::Real { kind };
+                        }
+                    }
+
+                    if matches!(intrinsic_key.as_str(), "int" | "nint" | "floor" | "ceiling") {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab)
+                        {
+                            return FortranType::Integer { kind };
+                        }
+                    }
+
+                    if intrinsic_key == "cmplx" {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab)
+                        {
+                            return FortranType::Complex { kind };
+                        }
+                    }
+
+                    if matches!(intrinsic_key.as_str(), "char" | "achar") {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab)
+                        {
+                            return FortranType::Character {
+                                kind,
+                                len: CharLen::Known(1),
+                            };
+                        }
+                    }
+
+                    if let Some(result) = intrinsic_result_type(&intrinsic_key, &arg_types) {
+                        return result;
                     }
                 }
 
-                if matches!(
-                    name.to_lowercase().as_str(),
-                    "int" | "nint" | "floor" | "ceiling"
-                ) {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
-                        return FortranType::Integer { kind };
-                    }
-                }
-
-                if matches!(name.to_lowercase().as_str(), "cmplx") {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab) {
-                        return FortranType::Complex { kind };
-                    }
-                }
-
-                if matches!(name.to_lowercase().as_str(), "char" | "achar") {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
-                        return FortranType::Character {
-                            kind,
-                            len: CharLen::Known(1),
-                        };
-                    }
-                }
-
-                if let Some(result) = intrinsic_result_type(name, &arg_types) {
-                    return result;
-                }
-
-                // Look up in symbol table
-                if let Some(sym) = symtab
-                    .lookup(name)
-                    .or_else(|| symtab.find_symbol_any_scope(name))
-                {
+                if let Some(sym) = visible_symbol {
                     if matches!(sym.kind, super::symtab::SymbolKind::DerivedType)
                         && !sym.arg_names.is_empty()
                     {
@@ -1107,6 +1154,8 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "ieee_min_num"
             | "ieee_max_num_mag"
             | "ieee_min_num_mag"
+            | "ieee_fma"
+            | "ieee_rem"
             | "len_trim"
             | "index"
             | "scan"
@@ -1174,6 +1223,20 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
             }
             _ => None,
         },
+        "ieee_fma" => match args.first()? {
+            FortranType::Real { kind } => Some(FortranType::Real { kind: *kind }),
+            _ => None,
+        },
+        "ieee_rem" => {
+            let kind = args
+                .iter()
+                .filter_map(|arg| match arg {
+                    FortranType::Real { kind } => Some(*kind),
+                    _ => None,
+                })
+                .max()?;
+            Some(FortranType::Real { kind })
+        }
 
         // Real-valued math.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
@@ -1191,9 +1254,11 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),
         "len" | "len_trim" | "index" | "scan" | "verify" => Some(FortranType::default_integer()),
         "size" | "lbound" | "ubound" | "shape" | "rank" => Some(FortranType::default_integer()),
-        "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" => {
-            Some(FortranType::default_integer())
-        }
+        "kind"
+        | "selected_int_kind"
+        | "selected_real_kind"
+        | "selected_char_kind"
+        | "ieee_selected_real_kind" => Some(FortranType::default_integer()),
         "iand" | "ior" | "ieor" | "not" | "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta"
         | "ibits" | "ibset" | "ibclr" | "merge_bits" | "dshiftl" | "dshiftr" => {
             args.first().cloned()

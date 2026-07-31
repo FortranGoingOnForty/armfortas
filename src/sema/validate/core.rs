@@ -10649,20 +10649,27 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "atan2" | "atan2d" | "atan2pi" | "hypot" | "mod" | "modulo" | "sign" | "dim" | "dprod"
         | "lge" | "lgt" | "lle" | "llt" | "bge" | "bgt" | "ble" | "blt" | "ishft" | "shiftl"
         | "shiftr" | "shifta" | "ibset" | "ibclr" | "btest" | "iand" | "ior" | "ieor"
-        | "matmul" | "dot_product" | "scale" | "repeat" | "ieee_copy_sign" | "ieee_unordered" => {
-            (2, Some(2))
-        }
+        | "matmul" | "dot_product" | "scale" | "repeat" | "ieee_copy_sign" | "ieee_unordered"
+        | "ieee_rem" => (2, Some(2)),
         // Exactly three.
-        "ibits" | "merge" | "merge_bits" | "dshiftl" | "dshiftr" | "unpack" | "spread" => {
-            (3, Some(3))
-        }
+        "ibits" | "merge" | "merge_bits" | "dshiftl" | "dshiftr" | "unpack" | "spread"
+        | "ieee_fma" => (3, Some(3)),
         // Optional-argument ranges (F2023 16.9 per-procedure).
         "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real" | "logical"
         | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim" | "floor" | "ceiling"
         | "maskl" | "maskr" | "shape" | "storage_size" | "associated" | "any" | "all" | "norm2"
         | "f_c_string" | "iall" | "iany" | "iparity" | "parity" => (1, Some(2)),
-        "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval" | "minval"
-        | "count" | "selected_real_kind" => (1, Some(3)),
+        "cmplx"
+        | "size"
+        | "lbound"
+        | "ubound"
+        | "sum"
+        | "product"
+        | "maxval"
+        | "minval"
+        | "count"
+        | "selected_real_kind"
+        | "ieee_selected_real_kind" => (1, Some(3)),
         "ishftc" | "pack" | "transfer" | "c_f_strpointer" | "cshift" => (2, Some(3)),
         "index" | "scan" | "verify" | "reshape" | "eoshift" => (2, Some(4)),
         "null" => (0, Some(1)),
@@ -10764,12 +10771,127 @@ fn require_intrinsic_argument_type(
     }
 }
 
-fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
-    let key = name.to_ascii_lowercase();
-    if !is_intrinsic_name(&key) || intrinsic_name_is_shadowed(ctx, &key) {
+fn require_intrinsic_scalar_argument(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    position: usize,
+    keyword: &str,
+) {
+    let Some(actual) = call_rank_argument_expr(args, position, &[keyword]) else {
         return;
+    };
+    if validation_expr_rank(ctx, actual).is_some_and(|rank| rank > 0) {
+        ctx.error(
+            span,
+            format!(
+                "intrinsic '{intrinsic}' argument {} must be scalar",
+                keyword.to_ascii_uppercase()
+            ),
+        );
+    }
+}
+
+fn validate_intrinsic_argument_associations(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    formals: &[&str],
+    required: usize,
+) {
+    let mut associated = vec![false; formals.len()];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let arg_span = argument_span(arg, span);
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            let Some(index) = formals
+                .iter()
+                .position(|formal| formal.eq_ignore_ascii_case(keyword))
+            else {
+                ctx.error(
+                    arg_span,
+                    format!("unknown keyword argument '{keyword}' in call to '{intrinsic}'"),
+                );
+                continue;
+            };
+            index
+        } else {
+            if saw_keyword {
+                ctx.error(
+                    arg_span,
+                    format!(
+                        "positional argument follows a keyword argument in call to '{intrinsic}'"
+                    ),
+                );
+                continue;
+            }
+            let index = positional;
+            positional += 1;
+            if index >= formals.len() {
+                continue;
+            }
+            index
+        };
+
+        if associated[index] {
+            ctx.error(
+                arg_span,
+                format!(
+                    "argument '{}' is associated more than once in call to '{intrinsic}'",
+                    formals[index]
+                ),
+            );
+        } else {
+            associated[index] = true;
+        }
     }
 
+    for (index, formal) in formals.iter().enumerate().take(required) {
+        if !associated[index] {
+            ctx.error(
+                span,
+                format!("required argument '{formal}' is absent in call to '{intrinsic}'"),
+            );
+        }
+    }
+}
+
+fn intrinsic_real_kind(info: &TypeInfo) -> Option<u8> {
+    match info {
+        TypeInfo::Real { kind } => Some(default_real_kind(*kind)),
+        TypeInfo::DoublePrecision => Some(8),
+        _ => None,
+    }
+}
+
+fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
+    let key = name.to_ascii_lowercase();
+    if let Some(symbol) = ctx.lookup_lexical(&key) {
+        if symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc) {
+            let canonical = symbol.name.to_ascii_lowercase();
+            return is_intrinsic_name(&canonical).then_some(canonical);
+        }
+        return None;
+    }
+    if !ctx.lookup_lexical_named_interfaces(&key).is_empty() {
+        return None;
+    }
+    is_intrinsic_name(&key).then_some(key)
+}
+
+fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
+    let Some(key) = resolved_intrinsic_name(ctx, name) else {
+        return;
+    };
+
+    if key == "ieee_fma" {
+        ctx.require_std(span, FortranStandard::F2023, "IEEE_FMA");
+    }
     validate_elemental_intrinsic_rank_conformance(ctx, span, &key, args);
 
     match key.as_str() {
@@ -10803,6 +10925,67 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 "i",
                 IntrinsicArgumentType::Integer,
             );
+        }
+        "ieee_fma" => {
+            const FORMALS: [&str; 3] = ["a", "b", "c"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 3);
+            for (position, formal) in FORMALS.iter().enumerate() {
+                require_intrinsic_argument_type(
+                    ctx,
+                    span,
+                    &key,
+                    args,
+                    position,
+                    formal,
+                    IntrinsicArgumentType::Real,
+                );
+            }
+            let kinds: Vec<u8> = FORMALS
+                .iter()
+                .enumerate()
+                .filter_map(|(position, formal)| {
+                    call_rank_argument_expr(args, position, &[*formal])
+                        .and_then(|actual| validation_expr_type_info(ctx, actual))
+                        .and_then(|info| intrinsic_real_kind(&info))
+                })
+                .collect();
+            if kinds.len() == FORMALS.len() && kinds.iter().any(|kind| *kind != kinds[0]) {
+                ctx.error(
+                    span,
+                    "IEEE_FMA arguments A, B, and C must have the same type and kind",
+                );
+            }
+        }
+        "ieee_rem" => {
+            const FORMALS: [&str; 2] = ["x", "y"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 2);
+            for (position, formal) in FORMALS.iter().enumerate() {
+                require_intrinsic_argument_type(
+                    ctx,
+                    span,
+                    &key,
+                    args,
+                    position,
+                    formal,
+                    IntrinsicArgumentType::Real,
+                );
+            }
+        }
+        "ieee_selected_real_kind" => {
+            const FORMALS: [&str; 3] = ["p", "r", "radix"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 0);
+            for (position, formal) in FORMALS.iter().enumerate() {
+                require_intrinsic_argument_type(
+                    ctx,
+                    span,
+                    &key,
+                    args,
+                    position,
+                    formal,
+                    IntrinsicArgumentType::Integer,
+                );
+                require_intrinsic_scalar_argument(ctx, span, &key, args, position, formal);
+            }
         }
         "char" | "achar" => {
             let Some(kind_expr) = call_rank_argument_expr(args, 1, &["kind"]) else {
@@ -10878,10 +11061,9 @@ pub(super) fn check_intrinsic_call_arity(
     nargs: usize,
     is_call: bool,
 ) {
-    let key = name.to_lowercase();
-    if intrinsic_name_is_shadowed(ctx, &key) || !is_intrinsic_name(&key) {
+    let Some(key) = resolved_intrinsic_name(ctx, name) else {
         return;
-    }
+    };
     let is_sub = intrinsic_is_subroutine(&key);
     if !is_call && is_sub {
         ctx.error(
@@ -10962,6 +11144,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "ieee_support_standard" | "ieee_support_underflow_control" |
         "ieee_is_normal" | "ieee_class" | "ieee_unordered" | "ieee_copy_sign" |
         "ieee_logb" | "ieee_rint" | "ieee_scalb" | "ieee_next_after" |
+        "ieee_fma" | "ieee_rem" |
         "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag" |
         "ieee_max_num" | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" |
         "matmul" | "dot_product" | "transpose" |
@@ -12896,6 +13079,125 @@ end program
                 "missing {intrinsic} diagnostic: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn validates_exported_ieee_function_contracts() {
+        let errs = errors_from(
+            "\
+program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_fma, ieee_rem, ieee_selected_real_kind
+  implicit none
+  integer :: i
+  integer :: values(2)
+  real :: r4
+  real :: vector(2), matrix(2, 2)
+  real(kind=8) :: r8
+  r4 = ieee_fma(r4, r4)
+  r4 = ieee_fma(r4, r8, r4)
+  r4 = ieee_fma(i, r4, r4)
+  r4 = ieee_rem(r4, i)
+  r4 = ieee_rem(x=r4, unknown=r4)
+  matrix = ieee_fma(vector, matrix, matrix)
+  i = ieee_selected_real_kind()
+  i = ieee_selected_real_kind(p=r4)
+  i = ieee_selected_real_kind(r=values)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("intrinsic 'ieee_fma' takes 3 arguments")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("IEEE_FMA") && err.contains("same type and kind")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("ieee_fma") && err.contains("must be REAL")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("ieee_rem") && err.contains("must be REAL")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("unknown keyword argument 'unknown'") && err.contains("ieee_rem")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("elemental intrinsic 'ieee_fma'") && err.contains("nonconforming")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("intrinsic 'ieee_selected_real_kind' takes 1 to 3 arguments")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("ieee_selected_real_kind")
+                    && err.contains("P")
+                    && err.contains("must be INTEGER")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("ieee_selected_real_kind")
+                    && err.contains("R")
+                    && err.contains("must be scalar")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_ieee_fma_shadows_intrinsic_contract() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface
+    integer function ieee_fma(value)
+      integer, intent(in) :: value
+    end function
+  end interface
+  integer :: result
+  result = ieee_fma(1)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn ieee_fma_requires_f2023() {
+        let errs = errors_with_std(
+            "\
+program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_fma
+  implicit none
+  real :: value
+  value = ieee_fma(1.0, 2.0, 3.0)
+end program
+",
+            FortranStandard::F2018,
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("IEEE_FMA requires --std=F2023")),
+            "{errs:?}"
+        );
     }
 
     #[test]

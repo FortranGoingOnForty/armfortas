@@ -66,6 +66,70 @@ fn saturating_i32(b: &mut FuncBuilder, value: ValueId) -> ValueId {
     }
 }
 
+pub(crate) fn lower_ieee_selected_real_kind(
+    b: &mut FuncBuilder,
+    p: Option<ValueId>,
+    r: Option<ValueId>,
+    radix: Option<ValueId>,
+) -> ValueId {
+    // ARMFORTAS exposes the two IEC 60559 binary formats its backend and
+    // runtime implement: binary32 (precision=6, range=37, radix=2) and
+    // binary64 (precision=15, range=307, radix=2). Saturation preserves all
+    // comparisons relevant to those bounds for every supported INTEGER kind,
+    // including kind=16 inputs.
+    let p = p
+        .map(|value| saturating_i32(b, value))
+        .unwrap_or_else(|| b.const_i32(0));
+    let r = r
+        .map(|value| saturating_i32(b, value))
+        .unwrap_or_else(|| b.const_i32(0));
+    let radix_supported = match radix {
+        Some(value) => {
+            let value = saturating_i32(b, value);
+            let two = b.const_i32(2);
+            b.icmp(CmpOp::Eq, value, two)
+        }
+        None => b.const_bool(true),
+    };
+
+    let p6 = b.const_i32(6);
+    let r37 = b.const_i32(37);
+    let p15 = b.const_i32(15);
+    let r307 = b.const_i32(307);
+    let precision4 = b.icmp(CmpOp::Le, p, p6);
+    let range4 = b.icmp(CmpOp::Le, r, r37);
+    let precision8 = b.icmp(CmpOp::Le, p, p15);
+    let range8 = b.icmp(CmpOp::Le, r, r307);
+    let binary4_criteria = b.and(precision4, range4);
+    let binary8_criteria = b.and(precision8, range8);
+    let binary4 = b.and(radix_supported, binary4_criteria);
+    let binary8 = b.and(radix_supported, binary8_criteria);
+
+    // F2023 17.11.38 negative-result lattice. With the nested binary32 /
+    // binary64 capabilities, -4 is not reachable today, but retaining the
+    // standard branch keeps the decision complete if another IEEE kind is
+    // added later.
+    let lacks_precision = b.not(precision8);
+    let lacks_range = b.not(range8);
+    let minus1 = b.const_i32(-1);
+    let minus2 = b.const_i32(-2);
+    let minus3 = b.const_i32(-3);
+    let minus4 = b.const_i32(-4);
+    let minus5 = b.const_i32(-5);
+    let precision_failure = b.select(lacks_range, minus3, minus1);
+    let range_or_combination_failure = b.select(lacks_range, minus2, minus4);
+    let supported_radix_failure = b.select(
+        lacks_precision,
+        precision_failure,
+        range_or_combination_failure,
+    );
+    let failure = b.select(radix_supported, supported_radix_failure, minus5);
+    let kind8 = b.const_i32(8);
+    let kind4 = b.const_i32(4);
+    let binary8_or_failure = b.select(binary8, kind8, failure);
+    b.select(binary4, kind4, binary8_or_failure)
+}
+
 /// Lower a Fortran intrinsic function call to IR instructions.
 /// Returns Some(ValueId) if recognized, None for external functions.
 pub(crate) fn lower_intrinsic(
@@ -1601,6 +1665,49 @@ pub(crate) fn lower_intrinsic(
         }
 
         // ---- IEEE arithmetic intrinsics ----
+        "ieee_fma" => {
+            let [a, b_arg, c] = args else {
+                return None;
+            };
+            let width = match b.func().value_type(*a) {
+                Some(IrType::Float(width)) => width,
+                _ => return None,
+            };
+            let ty = IrType::Float(width);
+            let suffix = if width == FloatWidth::F64 { "r8" } else { "r4" };
+            let a = coerce_to_type(b, *a, &ty);
+            let b_arg = coerce_to_type(b, *b_arg, &ty);
+            let c = coerce_to_type(b, *c, &ty);
+            Some(b.call(
+                FuncRef::External(format!("afs_ieee_fma_{suffix}")),
+                vec![a, b_arg, c],
+                ty,
+            ))
+        }
+        "ieee_rem" => {
+            let [x, y] = args else {
+                return None;
+            };
+            let width = [*x, *y]
+                .into_iter()
+                .filter_map(|arg| match b.func().value_type(arg) {
+                    Some(IrType::Float(width)) => Some(width),
+                    _ => None,
+                })
+                .max_by_key(|width| match width {
+                    FloatWidth::F32 => 32,
+                    FloatWidth::F64 => 64,
+                })?;
+            let ty = IrType::Float(width);
+            let suffix = if width == FloatWidth::F64 { "r8" } else { "r4" };
+            let x = coerce_to_type(b, *x, &ty);
+            let y = coerce_to_type(b, *y, &ty);
+            Some(b.call(
+                FuncRef::External(format!("afs_ieee_rem_{suffix}")),
+                vec![x, y],
+                ty,
+            ))
+        }
         // Predicates and classification go through runtime bit-pattern
         // helpers (`runtime/src/ieee.rs`) rather than compare-based IR: a
         // call is opaque to const folding, so `x /= x`-style identities
