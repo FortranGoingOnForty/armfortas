@@ -6428,6 +6428,20 @@ pub(super) fn eval_const_char_bytes(
     eval_const_char_bytes_with_context(e, param_consts, param_chars, None, None, None)
 }
 
+pub(super) fn eval_const_char_bytes_in_ctx(
+    e: &crate::ast::expr::SpannedExpr,
+    ctx: &LowerCtx<'_>,
+) -> Option<Vec<u8>> {
+    eval_const_char_bytes_with_context(
+        e,
+        &HashMap::new(),
+        &HashMap::new(),
+        Some(ctx.st),
+        ctx.proc_scope_id.or_else(current_proc_scope),
+        Some(ctx.type_layouts),
+    )
+}
+
 fn eval_const_char_bytes_with_context(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
@@ -35296,7 +35310,13 @@ fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
     )
 }
 
-fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DefinedIoEdit {
+    pub(super) iotype: String,
+    pub(super) v_list: Vec<i32>,
+}
+
+fn materialize_i32_rank1_descriptor(b: &mut FuncBuilder, values: &[i32]) -> ValueId {
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
     let descriptor_bytes = b.const_i64(392);
@@ -35306,27 +35326,40 @@ fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let null_base = {
+    let base = if values.is_empty() {
         let zero = b.const_i64(0);
         b.int_to_ptr(zero, IrType::Int(IntWidth::I32))
+    } else {
+        let storage = b.alloca(IrType::Array(
+            Box::new(IrType::Int(IntWidth::I32)),
+            values.len() as u64,
+        ));
+        for (index, value) in values.iter().enumerate() {
+            let index = b.const_i64(index as i64);
+            let element = b.gep(storage, vec![index], IrType::Int(IntWidth::I32));
+            let value = b.const_i32(*value);
+            b.store(value, element);
+        }
+        let zero = b.const_i64(0);
+        b.gep(storage, vec![zero], IrType::Int(IntWidth::I32))
     };
     store_byte_aggregate_field(
         b,
         desc,
         0,
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
-        null_base,
+        base,
     );
     let elem_bytes = b.const_i64(4);
     let rank = b.const_i32(1);
     let flags = b.const_i32(2);
     let one = b.const_i64(1);
-    let zero = b.const_i64(0);
+    let upper = b.const_i64(values.len() as i64);
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
     store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
-    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), zero);
+    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), upper);
     store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
     desc
 }
@@ -35368,7 +35401,7 @@ fn emit_defined_io_call(
     candidate: &SpecificProcCandidate,
     item: &crate::ast::expr::SpannedExpr,
     unit: ValueId,
-    formatted_iotype: Option<&str>,
+    formatted: Option<(&str, &[i32])>,
     iostat: Option<ValueId>,
     iomsg_arg: ValueId,
     iomsg_len: ValueId,
@@ -35441,13 +35474,13 @@ fn emit_defined_io_call(
     b.store(unit_i32, unit_slot);
 
     let iostat_arg = dtio_iostat_arg(b, iostat);
-    let mut call_args = if let Some(iotype) = formatted_iotype {
+    let mut call_args = if let Some((iotype, v_list)) = formatted {
         let (iotype_arg, _iotype_len) = const_char_slot_arg(b, iotype);
         vec![
             item_arg,
             unit_slot,
             iotype_arg,
-            materialize_empty_i32_rank1_descriptor(b),
+            materialize_i32_rank1_descriptor(b, v_list),
             iostat_arg,
             iomsg_arg,
         ]
@@ -35455,7 +35488,7 @@ fn emit_defined_io_call(
         vec![item_arg, unit_slot, iostat_arg, iomsg_arg]
     };
 
-    let default_char_len_mask = if formatted_iotype.is_some() {
+    let default_char_len_mask = if formatted.is_some() {
         vec![false, false, true, false, false, true]
     } else {
         vec![false, false, false, true]
@@ -35465,16 +35498,16 @@ fn emit_defined_io_call(
             .or_else(|| callee_char_len_star_mask(ctx.st, key))
     })
     .unwrap_or(default_char_len_mask);
-    let iotype_len = formatted_iotype.map(|s| s.len() as i64).unwrap_or(0);
+    let iotype_len = formatted
+        .map(|(iotype, _)| iotype.len() as i64)
+        .unwrap_or(0);
     for (idx, flag) in char_len_mask.iter().enumerate() {
         if !*flag {
             continue;
         }
-        let len = if formatted_iotype.is_some() && idx == 2 {
+        let len = if formatted.is_some() && idx == 2 {
             b.const_i64(iotype_len)
-        } else if (formatted_iotype.is_some() && idx == 5)
-            || (formatted_iotype.is_none() && idx == 3)
-        {
+        } else if (formatted.is_some() && idx == 5) || (formatted.is_none() && idx == 3) {
             iomsg_len
         } else {
             b.const_i64(0)
@@ -35506,6 +35539,7 @@ pub(super) fn try_lower_defined_io_write_items(
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
     formatted_iotype: Option<&str>,
+    explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: ValueId,
     iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
@@ -35521,11 +35555,25 @@ pub(super) fn try_lower_defined_io_write_items(
     if candidates.iter().any(Option::is_none) {
         return false;
     }
+    let explicit_edits = if formatted_iotype == Some("DT") {
+        match explicit_edits.filter(|edits| edits.len() == items.len()) {
+            Some(edits) => Some(edits),
+            None => return false,
+        }
+    } else {
+        None
+    };
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
     let done = b.create_block("defined_write_done");
     lower_io_status_continue_or_exit(b, iostat, done);
 
-    for (item, candidate) in items.iter().zip(candidates.iter()) {
+    for (index, (item, candidate)) in items.iter().zip(candidates.iter()).enumerate() {
+        let formatted = explicit_edits
+            .map(|edits| {
+                let edit = &edits[index];
+                (edit.iotype.as_str(), edit.v_list.as_slice())
+            })
+            .or_else(|| formatted_iotype.map(|iotype| (iotype, &[] as &[i32])));
         emit_defined_io_call(
             b,
             ctx,
@@ -35534,7 +35582,7 @@ pub(super) fn try_lower_defined_io_write_items(
                 .expect("all-defined I/O plan lost a candidate"),
             item,
             unit,
-            formatted_iotype,
+            formatted,
             Some(iostat),
             iomsg_arg,
             iomsg_len,
@@ -35557,9 +35605,9 @@ pub(super) fn try_lower_mixed_defined_io_write_items(
     iomsg: Option<(ValueId, ValueId)>,
     runtime_iomsg: (ValueId, ValueId),
 ) -> bool {
-    // Explicit DT editing needs descriptor-to-item positioning plus IOTYPE and
-    // V_LIST propagation; keep that path with LOW-029 rather than pretending
-    // the list-directed dispatcher has enough format information.
+    // Mixed explicit DT editing needs stateful interleaving of intrinsic
+    // format processing and defined-I/O calls. This list-directed dispatcher
+    // has no active-descriptor state, so it must not fabricate DT metadata.
     if items.is_empty() || formatted_iotype == Some("DT") {
         return false;
     }
@@ -35587,13 +35635,14 @@ pub(super) fn try_lower_mixed_defined_io_write_items(
 
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         if let Some(candidate) = candidate {
+            let formatted = formatted_iotype.map(|iotype| (iotype, &[] as &[i32]));
             emit_defined_io_call(
                 b,
                 ctx,
                 candidate,
                 item,
                 unit,
-                formatted_iotype,
+                formatted,
                 Some(iostat),
                 iomsg_arg,
                 iomsg_len,
@@ -35639,6 +35688,7 @@ pub(super) fn try_lower_defined_io_read_items(
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
     formatted_iotype: Option<&str>,
+    explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: Option<ValueId>,
     iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
@@ -35654,6 +35704,14 @@ pub(super) fn try_lower_defined_io_read_items(
     if candidates.iter().any(Option::is_none) {
         return false;
     }
+    let explicit_edits = if formatted_iotype == Some("DT") {
+        match explicit_edits.filter(|edits| edits.len() == items.len()) {
+            Some(edits) => Some(edits),
+            None => return false,
+        }
+    } else {
+        None
+    };
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
 
     let owns_iostat = iostat.is_none();
@@ -35665,7 +35723,13 @@ pub(super) fn try_lower_defined_io_read_items(
     });
     let done = b.create_block("defined_read_done");
     lower_io_status_continue_or_exit(b, statement_iostat, done);
-    for (item, candidate) in items.iter().zip(candidates.iter()) {
+    for (index, (item, candidate)) in items.iter().zip(candidates.iter()).enumerate() {
+        let formatted = explicit_edits
+            .map(|edits| {
+                let edit = &edits[index];
+                (edit.iotype.as_str(), edit.v_list.as_slice())
+            })
+            .or_else(|| formatted_iotype.map(|iotype| (iotype, &[] as &[i32])));
         emit_defined_io_call(
             b,
             ctx,
@@ -35674,7 +35738,7 @@ pub(super) fn try_lower_defined_io_read_items(
                 .expect("all-defined I/O plan lost a candidate"),
             item,
             unit,
-            formatted_iotype,
+            formatted,
             Some(statement_iostat),
             iomsg_arg,
             iomsg_len,
@@ -35699,9 +35763,9 @@ pub(super) fn try_lower_mixed_defined_io_read_items(
     iomsg: Option<(ValueId, ValueId)>,
     runtime_iomsg: (ValueId, ValueId),
 ) -> bool {
-    // Explicit DT editing needs descriptor-to-item positioning plus IOTYPE and
-    // V_LIST propagation; keep that path with LOW-029 rather than pretending
-    // the list-directed dispatcher has enough format information.
+    // Mixed explicit DT editing needs stateful interleaving of intrinsic
+    // format processing and defined-I/O calls. This list-directed dispatcher
+    // has no active-descriptor state, so it must not fabricate DT metadata.
     if items.is_empty() || formatted_iotype == Some("DT") {
         return false;
     }
@@ -35739,13 +35803,14 @@ pub(super) fn try_lower_mixed_defined_io_read_items(
     lower_read_continue_or_exit(b, mode);
     for (item, candidate) in items.iter().zip(candidates.iter()) {
         if let Some(candidate) = candidate {
+            let formatted = formatted_iotype.map(|iotype| (iotype, &[] as &[i32]));
             emit_defined_io_call(
                 b,
                 ctx,
                 candidate,
                 item,
                 unit,
-                formatted_iotype,
+                formatted,
                 Some(statement_iostat),
                 iomsg_arg,
                 iomsg_len,

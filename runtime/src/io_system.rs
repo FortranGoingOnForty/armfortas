@@ -5730,7 +5730,9 @@ fn finite_formatted_data_count(descs: &[FormatDesc]) -> Result<Option<usize>, ()
             | FormatDesc::RealD { .. }
             | FormatDesc::RealG { .. }
             | FormatDesc::Logical { .. }
-            | FormatDesc::Character { .. } => 1,
+            | FormatDesc::Character { .. }
+            | FormatDesc::CharTrimmed
+            | FormatDesc::DerivedType { .. } => 1,
             FormatDesc::Group {
                 repeat,
                 descriptors,

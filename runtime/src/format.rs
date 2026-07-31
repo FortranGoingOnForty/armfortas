@@ -98,8 +98,10 @@ pub enum FormatDesc {
     DecimalMode(DecimalSep),
     /// LZ, LZS, LZP: leading-zero control for F/E/D/G output (F2023).
     LeadingZero(LeadingZeroMode),
-    /// DT: derived type I/O (F2003). Placeholder — requires user-defined I/O procedures.
-    DerivedType { type_name: String },
+    /// DT: user-defined derived-type I/O (F2003). `type_name` is the optional
+    /// character literal appended to `DT`; `v_list` preserves the signed
+    /// default-integer literal values supplied by the edit descriptor.
+    DerivedType { type_name: String, v_list: Vec<i32> },
 
     // ---- Character string descriptors ----
     /// Literal string in format: 'text' or "text".
@@ -488,7 +490,13 @@ impl<'a> FormatParser<'a> {
                         Some(quote @ ('\'' | '"')) => self.parse_string_literal(quote)?,
                         _ => String::new(),
                     };
-                    Ok(FormatDesc::DerivedType { type_name })
+                    self.skip_spaces();
+                    let v_list = if self.chars.peek() == Some(&'(') {
+                        self.parse_dt_v_list()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(FormatDesc::DerivedType { type_name, v_list })
                 }
                 _ => {
                     let (width, decimals) = self.parse_required_real_widths()?;
@@ -603,6 +611,50 @@ impl<'a> FormatParser<'a> {
             }
             _ => Err(FormatError::InvalidFormat),
         }
+    }
+
+    fn parse_dt_v_list(&mut self) -> Result<Vec<i32>, FormatError> {
+        if self.chars.next() != Some('(') {
+            return Err(FormatError::InvalidFormat);
+        }
+        self.skip_spaces();
+        if self.chars.peek() == Some(&')') {
+            return Err(FormatError::InvalidFormat);
+        }
+
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_signed_default_integer()?);
+            self.skip_spaces();
+            match self.chars.next() {
+                Some(',') => {
+                    self.skip_spaces();
+                    if self.chars.peek() == Some(&')') {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                }
+                Some(')') => return Ok(values),
+                _ => return Err(FormatError::InvalidFormat),
+            }
+        }
+    }
+
+    fn parse_signed_default_integer(&mut self) -> Result<i32, FormatError> {
+        self.skip_spaces();
+        let sign = match self.chars.peek().copied() {
+            Some('+') => {
+                self.chars.next();
+                1i128
+            }
+            Some('-') => {
+                self.chars.next();
+                -1i128
+            }
+            _ => 1i128,
+        };
+        self.skip_spaces();
+        let magnitude = self.parse_required_number()? as i128;
+        i32::try_from(sign * magnitude).map_err(|_| FormatError::InvalidFormat)
     }
 
     fn parse_integer_widths(&mut self) -> Result<(usize, Option<usize>), FormatError> {
@@ -889,7 +941,15 @@ impl FormatEngine {
                 FormatDesc::LeadingZero(mode) => {
                     self.leading_zero = *mode;
                 }
-                FormatDesc::DerivedType { .. } => {} // requires user-defined I/O — no-op for now
+                FormatDesc::DerivedType { .. } => {
+                    // Defined-I/O dispatch is performed by compiler lowering,
+                    // not by the intrinsic-value format engine. Reaching a DT
+                    // descriptor with an unconsumed intrinsic value is a type
+                    // mismatch, never a successful zero-byte conversion.
+                    if *val_idx < values.len() {
+                        return Err(FormatError::TypeMismatch);
+                    }
+                }
                 FormatDesc::TabTo { position } => {
                     output.tab_to(*position);
                 }
@@ -1771,12 +1831,104 @@ fn format_has_data_descriptor(descs: &[FormatDesc]) -> bool {
         | FormatDesc::RealG { .. }
         | FormatDesc::Logical { .. }
         | FormatDesc::Character { .. }
-        | FormatDesc::CharTrimmed => true,
+        | FormatDesc::CharTrimmed
+        | FormatDesc::DerivedType { .. } => true,
         FormatDesc::Group { descriptors, .. } | FormatDesc::UnlimitedRepeat { descriptors } => {
             format_has_data_descriptor(descriptors)
         }
         _ => false,
     })
+}
+
+fn append_data_descriptors(
+    descriptors: &[FormatDesc],
+    result: &mut Vec<FormatDesc>,
+    limit: usize,
+) -> Result<(), FormatError> {
+    for descriptor in descriptors {
+        if result.len() == limit {
+            break;
+        }
+        match descriptor {
+            FormatDesc::Group {
+                repeat,
+                descriptors,
+                ..
+            } => {
+                if !format_has_data_descriptor(descriptors) {
+                    continue;
+                }
+                for _ in 0..*repeat {
+                    append_data_descriptors(descriptors, result, limit)?;
+                    if result.len() == limit {
+                        break;
+                    }
+                }
+            }
+            FormatDesc::UnlimitedRepeat { descriptors } => {
+                if !format_has_data_descriptor(descriptors) {
+                    return Err(FormatError::InvalidFormat);
+                }
+                while result.len() < limit {
+                    let before = result.len();
+                    append_data_descriptors(descriptors, result, limit)?;
+                    if result.len() == before {
+                        return Err(FormatError::InvalidFormat);
+                    }
+                }
+            }
+            FormatDesc::IntegerI { .. }
+            | FormatDesc::IntegerB { .. }
+            | FormatDesc::IntegerO { .. }
+            | FormatDesc::IntegerZ { .. }
+            | FormatDesc::RealF { .. }
+            | FormatDesc::RealE { .. }
+            | FormatDesc::RealEN { .. }
+            | FormatDesc::RealES { .. }
+            | FormatDesc::RealEX { .. }
+            | FormatDesc::RealD { .. }
+            | FormatDesc::RealG { .. }
+            | FormatDesc::Logical { .. }
+            | FormatDesc::Character { .. }
+            | FormatDesc::CharTrimmed
+            | FormatDesc::DerivedType { .. } => result.push(descriptor.clone()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse a format and return the data edit descriptor corresponding to each
+/// of the first `item_count` effective items, including group expansion and
+/// format reversion. This is shared with compiler lowering so defined-I/O
+/// dispatch observes the same descriptor order as the runtime engine.
+pub fn parse_data_descriptors_for_items(
+    format: &str,
+    item_count: usize,
+) -> Result<Vec<FormatDesc>, FormatError> {
+    if item_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let descriptors = parse_format(format)?;
+    let mut result = Vec::with_capacity(item_count);
+    append_data_descriptors(&descriptors, &mut result, item_count)?;
+    if result.len() == item_count {
+        return Ok(result);
+    }
+
+    let reversion = format_reversion_descriptors(&descriptors);
+    if !format_has_data_descriptor(reversion) {
+        return Err(FormatError::InvalidFormat);
+    }
+    while result.len() < item_count {
+        let before = result.len();
+        append_data_descriptors(reversion, &mut result, item_count)?;
+        if result.len() == before {
+            return Err(FormatError::InvalidFormat);
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn format_reversion_descriptors(descs: &[FormatDesc]) -> &[FormatDesc] {
@@ -2220,8 +2372,13 @@ mod tests {
     fn parse_dt_derived_type() {
         let descs = valid_format("(DT'mytype')");
         assert_eq!(descs.len(), 1);
-        if let FormatDesc::DerivedType { ref type_name } = descs[0] {
+        if let FormatDesc::DerivedType {
+            ref type_name,
+            ref v_list,
+        } = descs[0]
+        {
             assert_eq!(type_name, "mytype");
+            assert!(v_list.is_empty());
         } else {
             panic!("expected DerivedType, got {:?}", descs[0]);
         }
@@ -2231,11 +2388,75 @@ mod tests {
     fn parse_dt_no_name() {
         let descs = valid_format("(DT)");
         assert_eq!(descs.len(), 1);
-        if let FormatDesc::DerivedType { ref type_name } = descs[0] {
+        if let FormatDesc::DerivedType {
+            ref type_name,
+            ref v_list,
+        } = descs[0]
+        {
             assert_eq!(type_name, "");
+            assert!(v_list.is_empty());
         } else {
             panic!("expected DerivedType");
         }
+    }
+
+    #[test]
+    fn intrinsic_format_engine_rejects_dt_value_dispatch() {
+        let mut engine = FormatEngine::new(valid_format("(DT'owned-by-lowering'(1))"));
+        assert!(matches!(
+            engine.format_values_checked(&[IoValue::Integer(7)]),
+            Err(FormatError::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn parse_dt_preserves_tag_and_signed_v_list() {
+        let descs = valid_format("(DT'Link List'(10, -4, +2, 0))");
+        assert_eq!(descs.len(), 1);
+        let FormatDesc::DerivedType { type_name, v_list } = &descs[0] else {
+            panic!("expected DerivedType, got {:?}", descs[0]);
+        };
+        assert_eq!(type_name, "Link List");
+        assert_eq!(v_list, &[10, -4, 2, 0]);
+    }
+
+    #[test]
+    fn reject_malformed_dt_v_lists() {
+        for format in [
+            "(DT())",
+            "(DT(1,))",
+            "(DT(,1))",
+            "(DT(2147483648))",
+            "(DT(-2147483649))",
+            "(DT(1_8))",
+        ] {
+            assert!(
+                matches!(parse_format(format), Err(FormatError::InvalidFormat)),
+                "accepted malformed DT descriptor {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_descriptor_plan_expands_groups_and_reversion() {
+        let descriptors = parse_data_descriptors_for_items("(2(DT'A'(1),I2),DT'B'(-2))", 7)
+            .expect("valid descriptor plan");
+        assert_eq!(descriptors.len(), 7);
+
+        let tags = descriptors
+            .iter()
+            .map(|descriptor| match descriptor {
+                FormatDesc::DerivedType { type_name, v_list } => {
+                    format!("DT{type_name}:{v_list:?}")
+                }
+                FormatDesc::IntegerI { width, .. } => format!("I{width}"),
+                other => panic!("unexpected data descriptor {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            ["DTA:[1]", "I2", "DTA:[1]", "I2", "DTB:[-2]", "DTA:[1]", "I2",]
+        );
     }
 
     #[test]

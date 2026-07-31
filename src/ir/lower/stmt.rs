@@ -1793,6 +1793,32 @@ fn lower_format_expr(
     lower_string_expr_ctx(b, ctx, expr)
 }
 
+fn explicit_defined_io_edits(
+    ctx: &LowerCtx<'_>,
+    format_expr: &SpannedExpr,
+    item_count: usize,
+) -> Option<Vec<DefinedIoEdit>> {
+    let format = if let Some(spec) = labeled_format_spec(ctx, format_expr) {
+        spec.to_string()
+    } else {
+        String::from_utf8(eval_const_char_bytes_in_ctx(format_expr, ctx)?).ok()?
+    };
+
+    armfortas_rt::format::parse_data_descriptors_for_items(&format, item_count)
+        .ok()?
+        .into_iter()
+        .map(|descriptor| match descriptor {
+            armfortas_rt::format::FormatDesc::DerivedType { type_name, v_list } => {
+                Some(DefinedIoEdit {
+                    iotype: format!("DT{type_name}"),
+                    v_list,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn lower_fixed_internal_list_write(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -4873,12 +4899,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(_) => Some("DT"),
                 None => None,
             };
+            let explicit_dtio_edits = if defined_iotype == Some("DT") {
+                fmt_control
+                    .and_then(|control| explicit_defined_io_edits(ctx, &control.value, items.len()))
+            } else {
+                None
+            };
             if try_lower_defined_io_write_items(
                 b,
                 ctx,
                 items,
                 unit,
                 defined_iotype,
+                explicit_dtio_edits.as_deref(),
                 iostat_ptr,
                 dtio_iomsg,
             ) {
@@ -9714,12 +9747,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 Some(_) => Some("DT"),
                 None => None,
             };
+            let explicit_dtio_edits = if defined_iotype == Some("DT") {
+                fmt_control
+                    .and_then(|control| explicit_defined_io_edits(ctx, &control.value, items.len()))
+            } else {
+                None
+            };
             if try_lower_defined_io_read_items(
                 b,
                 ctx,
                 items,
                 unit,
                 defined_iotype,
+                explicit_dtio_edits.as_deref(),
                 dtio_iostat_addr,
                 dtio_iomsg,
             ) {
