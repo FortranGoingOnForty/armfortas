@@ -62238,7 +62238,7 @@ pub(super) fn lower_sequence_array_actual(
     copy_back: bool,
     temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
-    if contiguous_sequence_section_actual(locals, expr) {
+    if proven_contiguous_sequence_section_actual(locals, expr) {
         let (source_desc, elem_ty) = lower_array_expr_descriptor(
             b,
             locals,
@@ -62332,7 +62332,7 @@ pub(super) fn lower_sequence_char_array_actual(
         return None;
     }
 
-    let desc = if contiguous_sequence_section_actual(locals, expr) {
+    let desc = if proven_contiguous_sequence_section_actual(locals, expr) {
         source_desc
     } else {
         let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
@@ -62357,7 +62357,7 @@ pub(super) fn lower_sequence_char_array_actual(
     Some(base)
 }
 
-fn contiguous_sequence_section_actual(
+fn proven_contiguous_sequence_section_actual(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
 ) -> bool {
@@ -62371,6 +62371,14 @@ fn contiguous_sequence_section_actual(
         return false;
     };
     if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+        return false;
+    }
+    // A unit triplet describes logical positions in the source descriptor;
+    // it does not prove adjacent positions are adjacent in memory. POINTER
+    // and assumed-shape/assumed-rank descriptors may carry arbitrary runtime
+    // strides, so their sections need the conservative copy path. Allocatable
+    // storage and ordinary explicit-shape locals are contiguous by contract.
+    if info.is_pointer || info.descriptor_arg {
         return false;
     }
     if args.len() == 1 {

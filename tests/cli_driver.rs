@@ -27572,6 +27572,84 @@ fn rank_remap_strided_sections_copy_in_to_explicit_shape_dummies() {
 }
 
 #[test]
+fn strided_pointer_unit_sections_copy_for_sequence_association() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=strided_pointer_unit_sections_copy_for_sequence_association count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §15.5.2.11: an explicit-shape dummy may receive a
+    // non-contiguous actual through a contiguous temporary. A unit-stride
+    // triplet is only relative to its source descriptor: `view(:)` and
+    // `view(::1)` still have memory stride two when `view` points at
+    // `backing(1:12:2)`. The same remains true after forwarding the view
+    // through an assumed-shape dummy or when the elements are CHARACTER.
+    // Each caller must copy in and, for INTENT(INOUT), copy back instead of
+    // passing the view's base directly.
+    let src = write_program(
+        include_str!("../test_programs/sequence_strided_pointer_unit_section.f90"),
+        "f90",
+    );
+    let ir = unique_path("sequence_strided_pointer_unit_section", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("strided pointer sequence-association IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "strided pointer sequence-association IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read sequence-association IR");
+    assert_eq!(
+        ir_text.matches("call @afs_copy_array_data(").count(),
+        4,
+        "numeric, character, and assumed-shape unit sections need contiguous copy-in temporaries:\n{}",
+        ir_text
+    );
+    assert_eq!(
+        ir_text
+            .matches("call @afs_copy_array_data_no_realloc(")
+            .count(),
+        4,
+        "numeric, character, and assumed-shape INTENT(INOUT) sections need copy-out:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("sequence_strided_pointer_unit_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("strided pointer sequence-association compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "strided pointer sequence-association compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("strided pointer sequence-association run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "strided pointer sequence-association run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
