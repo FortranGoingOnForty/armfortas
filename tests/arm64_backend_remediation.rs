@@ -54,6 +54,14 @@ fn compile_arm64_ir(source: &str, opt: &str) -> String {
     compile_arm64_output(source, opt, "--emit-ir", "ir")
 }
 
+fn setup_defines_fp_arg(setup: &str, register: &str) -> bool {
+    setup.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with(&format!("fmov {register},"))
+            || line.starts_with(&format!("ldr {register},"))
+    })
+}
+
 #[test]
 fn floating_point_contraction_is_ofast_only() {
     let source = r#"
@@ -664,8 +672,8 @@ end function call4
         .unwrap_or_else(|| panic!("complex(4) call missing:\n{c4}"));
     let setup4 = &c4[..call4];
     assert!(
-        setup4.contains("fmov s0,") && setup4.contains("fmov s1,"),
-        "complex(4) VALUE argument must use s0:s1:\n{c4}"
+        setup_defines_fp_arg(setup4, "s0") && setup_defines_fp_arg(setup4, "s1"),
+        "complex(4) VALUE argument must initialize s0:s1:\n{c4}"
     );
 
     let c8 = compile_arm64_asm(
@@ -689,13 +697,8 @@ end function call8
         .unwrap_or_else(|| panic!("complex(8) call missing:\n{c8}"));
     let setup8 = &c8[..call8];
     assert!(
-        setup8
-            .lines()
-            .any(|line| line.trim_start().starts_with("fmov d0,"))
-            && setup8
-                .lines()
-                .any(|line| line.trim_start().starts_with("fmov d1,")),
-        "complex(8) VALUE argument must use d0:d1:\n{c8}"
+        setup_defines_fp_arg(setup8, "d0") && setup_defines_fp_arg(setup8, "d1"),
+        "complex(8) VALUE argument must initialize d0:d1:\n{c8}"
     );
 
     let mixed = compile_arm64_asm(
@@ -738,9 +741,7 @@ end function call_mixed8
     let setup = &mixed[..call];
     for reg in ["s0", "s1", "s2", "s3"] {
         assert!(
-            setup
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("fmov {reg},"))),
+            setup_defines_fp_arg(setup, reg),
             "scalar/complex/scalar arguments must occupy s0/s1:s2/s3:\n{mixed}"
         );
     }
@@ -754,9 +755,7 @@ end function call_mixed8
     let setup8 = &mixed[call8_start..call8];
     for reg in ["d0", "d1", "d2", "d3"] {
         assert!(
-            setup8
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("fmov {reg},"))),
+            setup_defines_fp_arg(setup8, reg),
             "scalar/complex/scalar arguments must occupy d0/d1:d2/d3:\n{mixed}"
         );
     }

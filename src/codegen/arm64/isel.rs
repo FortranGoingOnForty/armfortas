@@ -630,6 +630,13 @@ fn select_call_inst(
         None
     };
 
+    if !pending_reg_arg_moves.is_empty() {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::CallArgCopyStart,
+            operands: vec![],
+            def: None,
+        });
+    }
     for (opcode, dst, src) in pending_reg_arg_moves {
         mf.block_mut(mb).insts.push(MachineInst {
             opcode,

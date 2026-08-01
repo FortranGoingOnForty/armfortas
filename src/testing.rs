@@ -734,6 +734,7 @@ pub fn capture_from_path_with_module_search_paths(
         for mf in &mut allocated {
             if request.opt_level == OptLevel::O0 {
                 crate::codegen::regalloc::regalloc_naive(mf);
+                linearscan::parallelize_call_arg_moves(mf);
             } else {
                 let liveness = crate::codegen::liveness::compute_liveness(mf);
                 let result = linearscan::linear_scan(mf, &liveness);
@@ -743,8 +744,8 @@ pub fn capture_from_path_with_module_search_paths(
                 // parallelize_call_arg_moves in particular fixes a w0/w1
                 // clobber pattern visible at high register pressure.
                 linearscan::parallelize_entry_arg_moves(mf);
-                linearscan::parallelize_call_arg_moves(mf);
                 linearscan::insert_split_bridges(mf, &result.split_records);
+                linearscan::parallelize_call_arg_moves(mf);
                 linearscan::insert_callee_saves(mf, &result.callee_saved_used);
                 linearscan::coalesce_moves(mf);
                 crate::codegen::tailcall::tail_call_opt(mf);

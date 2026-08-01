@@ -940,12 +940,9 @@ pub fn apply_allocation(
                 None
             };
 
-            // Bridge instructions for live-range splits are
-            // emitted by `insert_split_bridges`, which runs *after*
-            // `parallelize_call_arg_moves` so the canonical
-            // arg-setup mov sequence isn't fragmented by an
-            // interposed store and the parallel-copy resolver can
-            // see all the arg-setup movs as one block.
+            // Bridge instructions for live-range splits are emitted by
+            // `insert_split_bridges` above the structural call-copy marker,
+            // before parallel-copy resolution consumes that marker.
             rewritten.def = preserved_entry_arg_def;
             new_insts.push(rewritten);
 
@@ -1180,11 +1177,9 @@ pub fn coalesce_moves(mf: &mut MachineFunction) {
 }
 
 /// Emit the str/ldr pairs that bridge live-range splits across
-/// each call boundary. Runs *after* `parallelize_call_arg_moves`
-/// so the parallel-copy resolver sees an unfragmented arg-setup
-/// sequence (an interposed `str` between an arg-copy and the BL
-/// would otherwise stop the scan-back at the wrong point and the
-/// resolver would miss arg-copies that need cycle-breaking).
+/// each call boundary. Runs before `parallelize_call_arg_moves` so a marked
+/// argument-copy group still has an exact structural start; bridge stores go
+/// above that marker and therefore cannot fragment the parallel copy.
 ///
 /// For each `SplitRecord` whose `call_position` equals the
 /// position of a `Bl`/`Blr` in the function: insert a `str
@@ -1200,22 +1195,29 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
     }
     let mut call_seen: u32 = 0;
     for block_idx in 0..mf.blocks.len() {
-        let mut new_insts = Vec::with_capacity(mf.blocks[block_idx].insts.len());
+        let mut new_insts: Vec<MachineInst> = Vec::with_capacity(mf.blocks[block_idx].insts.len());
         let original = std::mem::take(&mut mf.blocks[block_idx].insts);
         for inst in original.into_iter() {
             let is_call = matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr);
             if is_call {
                 let idx = call_seen;
-                // Place bridge `str pre_phys, [fp, slot]` *above* the
-                // canonical arg-setup mov sequence. Arg-setup movs
-                // can write to caller-saved physregs that are also
-                // some split's `pre_phys` — by the time we reach the
-                // BL, those registers no longer hold the pre-half's
-                // value. Scan back over arg-setup movs and insert
-                // bridges at the top of that block.
-                let mut insert_at = new_insts.len();
-                while insert_at > 0 && is_call_arg_copy(&new_insts[insert_at - 1]) {
-                    insert_at -= 1;
+                // Place bridge `str pre_phys, [fp, slot]` above the entire
+                // argument-copy transaction. Argument setup can overwrite a
+                // split's caller-saved `pre_phys`; the structural marker is
+                // authoritative even when spill reloads separate its moves.
+                let mut insert_at = new_insts
+                    .iter()
+                    .rposition(|candidate| candidate.opcode == ArmOpcode::CallArgCopyStart)
+                    .filter(|marker| {
+                        !new_insts[*marker + 1..].iter().any(|candidate| {
+                            matches!(candidate.opcode, ArmOpcode::Bl | ArmOpcode::Blr)
+                        })
+                    })
+                    .unwrap_or(new_insts.len());
+                if insert_at == new_insts.len() {
+                    while insert_at > 0 && is_call_arg_copy(&new_insts[insert_at - 1]) {
+                        insert_at -= 1;
+                    }
                 }
                 let mut bridges: Vec<MachineInst> = Vec::new();
                 for r in splits {
@@ -1406,40 +1408,34 @@ pub fn parallelize_call_arg_moves(mf: &mut MachineFunction) {
         let mut rebuilt: Vec<MachineInst> = Vec::with_capacity(block.insts.len());
         for inst in std::mem::take(&mut block.insts) {
             if matches!(inst.opcode, ArmOpcode::Bl | ArmOpcode::Blr) {
+                if let Some(marker_index) = rebuilt
+                    .iter()
+                    .rposition(|candidate| candidate.opcode == ArmOpcode::CallArgCopyStart)
+                {
+                    let group = rebuilt.split_off(marker_index + 1);
+                    let marker = rebuilt
+                        .pop()
+                        .expect("call-argument copy marker should precede its group");
+                    assert_eq!(marker.opcode, ArmOpcode::CallArgCopyStart);
+
+                    let rewritten = rewrite_marked_call_arg_copies(group);
+                    let mut adjusted = inst;
+                    if let Some(save) = preserve_blr_target(&mut adjusted, &rewritten) {
+                        rebuilt.push(save);
+                    }
+                    rebuilt.extend(rewritten);
+                    rebuilt.push(adjusted);
+                    continue;
+                }
+
                 let mut start = rebuilt.len();
                 while start > 0 && is_call_arg_copy(&rebuilt[start - 1]) {
                     start -= 1;
                 }
                 let mut adjusted = inst;
-                if matches!(adjusted.opcode, ArmOpcode::Blr) {
-                    let target_phys = match adjusted.operands.first() {
-                        Some(MachineOperand::PhysReg(t)) => Some(*t),
-                        _ => None,
-                    };
-                    if let Some(target) = target_phys {
-                        if is_call_arg_reg(target) {
-                            let target_alias = phys_reg_alias(target);
-                            let writes_target = rebuilt[start..].iter().any(|i| {
-                                matches!(i.operands.first(),
-                                    Some(MachineOperand::PhysReg(d))
-                                        if phys_reg_alias(*d) == target_alias)
-                            });
-                            if writes_target {
-                                let scratch = blr_target_scratch(target);
-                                let save = MachineInst {
-                                    opcode: move_opcode_for_phys(target),
-                                    operands: vec![
-                                        MachineOperand::PhysReg(scratch),
-                                        MachineOperand::PhysReg(target),
-                                    ],
-                                    def: None,
-                                };
-                                rebuilt.insert(start, save);
-                                adjusted.operands[0] = MachineOperand::PhysReg(scratch);
-                                start += 1;
-                            }
-                        }
-                    }
+                if let Some(save) = preserve_blr_target(&mut adjusted, &rebuilt[start..]) {
+                    rebuilt.insert(start, save);
+                    start += 1;
                 }
                 if start < rebuilt.len() {
                     let pending = rebuilt.split_off(start);
@@ -1452,6 +1448,39 @@ pub fn parallelize_call_arg_moves(mf: &mut MachineFunction) {
         }
         block.insts = rebuilt;
     }
+}
+
+fn preserve_blr_target(
+    call: &mut MachineInst,
+    argument_setup: &[MachineInst],
+) -> Option<MachineInst> {
+    if call.opcode != ArmOpcode::Blr {
+        return None;
+    }
+    let target = match call.operands.first() {
+        Some(MachineOperand::PhysReg(target)) if is_call_arg_reg(*target) => *target,
+        _ => return None,
+    };
+    let target_alias = phys_reg_alias(target);
+    let writes_target = argument_setup.iter().any(|inst| {
+        matches!(inst.operands.first(),
+            Some(MachineOperand::PhysReg(dst))
+                if phys_reg_alias(*dst) == target_alias)
+    });
+    if !writes_target {
+        return None;
+    }
+
+    let scratch = blr_target_scratch(target);
+    call.operands[0] = MachineOperand::PhysReg(scratch);
+    Some(MachineInst {
+        opcode: move_opcode_for_phys(target),
+        operands: vec![
+            MachineOperand::PhysReg(scratch),
+            MachineOperand::PhysReg(target),
+        ],
+        def: None,
+    })
 }
 
 /// Scratch used to preserve a BLR target across parallel arg
@@ -1534,39 +1563,197 @@ fn move_opcode_for_phys(reg: PhysReg) -> ArmOpcode {
     }
 }
 
+enum CallArgCopySource {
+    Reg(PhysReg),
+    Reload(Vec<MachineInst>),
+}
+
+struct PendingCallArgCopy {
+    opcode: ArmOpcode,
+    dst: PhysReg,
+    source: CallArgCopySource,
+}
+
+impl PendingCallArgCopy {
+    fn source_reg(&self) -> Option<PhysReg> {
+        match self.source {
+            CallArgCopySource::Reg(source) => Some(source),
+            CallArgCopySource::Reload(_) => None,
+        }
+    }
+
+    fn emit(self, rewritten: &mut Vec<MachineInst>) {
+        match self.source {
+            CallArgCopySource::Reg(source) => rewritten.push(MachineInst {
+                opcode: self.opcode,
+                operands: vec![
+                    MachineOperand::PhysReg(self.dst),
+                    MachineOperand::PhysReg(source),
+                ],
+                def: None,
+            }),
+            CallArgCopySource::Reload(reload) => rewritten.extend(reload),
+        }
+    }
+}
+
 fn rewrite_call_arg_copies(pending_moves: Vec<MachineInst>) -> Vec<MachineInst> {
-    let mut pending: Vec<(ArmOpcode, PhysReg, PhysReg)> = pending_moves
+    let pending = pending_moves
         .into_iter()
         .map(|inst| match inst.operands.as_slice() {
-            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)] => {
-                (inst.opcode, *dst, *src)
-            }
+            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)] => PendingCallArgCopy {
+                opcode: inst.opcode,
+                dst: *dst,
+                source: CallArgCopySource::Reg(*src),
+            },
             _ => panic!("call-arg copy rewrite saw unexpected operand shape"),
         })
         .collect();
+    rewrite_call_arg_copy_operations(pending)
+}
+
+fn rewrite_marked_call_arg_copies(group: Vec<MachineInst>) -> Vec<MachineInst> {
+    let mut pending = Vec::new();
+    let mut reload_prefix = Vec::new();
+    for inst in group {
+        if !is_call_arg_copy(&inst) {
+            reload_prefix.push(inst);
+            continue;
+        }
+
+        let (dst, source) = match inst.operands.as_slice() {
+            [MachineOperand::PhysReg(dst), MachineOperand::PhysReg(source)] => (*dst, *source),
+            _ => panic!("marked call-argument copy has an invalid operand shape"),
+        };
+        let source = if reload_prefix.is_empty() {
+            CallArgCopySource::Reg(source)
+        } else {
+            CallArgCopySource::Reload(retarget_call_arg_reload(
+                std::mem::take(&mut reload_prefix),
+                source,
+                dst,
+            ))
+        };
+        pending.push(PendingCallArgCopy {
+            opcode: inst.opcode,
+            dst,
+            source,
+        });
+    }
+    assert!(
+        reload_prefix.is_empty(),
+        "call-argument copy group ended with an unclaimed spill reload"
+    );
+    assert!(
+        !pending.is_empty(),
+        "call-argument copy marker was not followed by any copies"
+    );
+    rewrite_call_arg_copy_operations(pending)
+}
+
+fn retarget_call_arg_reload(
+    mut reload: Vec<MachineInst>,
+    move_source: PhysReg,
+    argument_register: PhysReg,
+) -> Vec<MachineInst> {
+    assert!(
+        matches!(reload.len(), 1 | 2),
+        "call-argument spill reload must contain one load and at most one address materialization"
+    );
+    let load_index = reload.len() - 1;
+    let load = &reload[load_index];
+    let expected_load = match argument_register {
+        PhysReg::Gp(_) | PhysReg::Gp32(_) => ArmOpcode::LdrImm,
+        PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::LdrFpImm,
+        _ => panic!("call-argument spill reload targets a non-ABI register"),
+    };
+    assert_eq!(
+        load.opcode, expected_load,
+        "call-argument spill reload width must match its ABI destination"
+    );
+    assert!(
+        matches!(load.operands.first(), Some(MachineOperand::PhysReg(reg)) if *reg == move_source),
+        "call-argument spill reload must define the following copy's source"
+    );
+    assert!(
+        same_phys_width(move_source, argument_register),
+        "call-argument spill reload and ABI destination must have matching widths"
+    );
+
+    if reload.len() == 1 {
+        assert!(
+            matches!(
+                load.operands.as_slice(),
+                [
+                    MachineOperand::PhysReg(_),
+                    MachineOperand::PhysReg(base),
+                    MachineOperand::Imm(_),
+                ] if *base == PhysReg::FP
+            ),
+            "direct call-argument spill reload must be frame-pointer relative"
+        );
+    } else {
+        assert!(
+            matches!(
+                reload[0].operands.as_slice(),
+                [
+                    MachineOperand::PhysReg(dst),
+                    MachineOperand::PhysReg(base),
+                    MachineOperand::Imm(_),
+                ] if *dst == PhysReg::Gp(8) && *base == PhysReg::FP
+            ) && matches!(reload[0].opcode, ArmOpcode::AddImm | ArmOpcode::SubImm),
+            "wide call-argument spill reload must materialize its address through x8"
+        );
+        assert!(
+            matches!(
+                load.operands.as_slice(),
+                [
+                    MachineOperand::PhysReg(_),
+                    MachineOperand::PhysReg(base),
+                    MachineOperand::Imm(0),
+                ] if *base == PhysReg::Gp(8)
+            ),
+            "wide call-argument spill reload must load from the materialized x8 address"
+        );
+    }
+
+    reload[load_index].operands[0] = MachineOperand::PhysReg(argument_register);
+    reload
+}
+
+fn same_phys_width(left: PhysReg, right: PhysReg) -> bool {
+    matches!(
+        (left, right),
+        (PhysReg::Gp(_), PhysReg::Gp(_))
+            | (PhysReg::Gp32(_), PhysReg::Gp32(_))
+            | (PhysReg::Fp(_), PhysReg::Fp(_))
+            | (PhysReg::Fp32(_), PhysReg::Fp32(_))
+    )
+}
+
+fn rewrite_call_arg_copy_operations(mut pending: Vec<PendingCallArgCopy>) -> Vec<MachineInst> {
     let mut rewritten = Vec::with_capacity(pending.len() + 1);
 
     while !pending.is_empty() {
         let safe_idx = (0..pending.len()).find(|&i| {
-            let (_, dst, _) = pending[i];
-            let dst_alias = phys_reg_alias(dst).expect("call-arg copy dst should alias");
-            !pending
-                .iter()
-                .enumerate()
-                .any(|(j, &(_, _, src))| j != i && phys_reg_alias(src) == Some(dst_alias))
+            let dst_alias = phys_reg_alias(pending[i].dst).expect("call-arg copy dst should alias");
+            !pending.iter().enumerate().any(|(j, copy)| {
+                j != i && copy.source_reg().and_then(phys_reg_alias) == Some(dst_alias)
+            })
         });
 
         if let Some(idx) = safe_idx {
-            let (opcode, dst, src) = pending.remove(idx);
-            rewritten.push(MachineInst {
-                opcode,
-                operands: vec![MachineOperand::PhysReg(dst), MachineOperand::PhysReg(src)],
-                def: None,
-            });
+            pending.remove(idx).emit(&mut rewritten);
             continue;
         }
 
-        let (_, _, src) = pending[0];
+        let cycle_index = pending
+            .iter()
+            .position(|copy| copy.source_reg().is_some())
+            .expect("parallel-copy cycle must contain a register source");
+        let src = pending[cycle_index]
+            .source_reg()
+            .expect("cycle source disappeared");
         let scratch = scratch_phys_for(src);
         rewritten.push(MachineInst {
             opcode: move_opcode_for_phys(src),
@@ -1576,7 +1763,7 @@ fn rewrite_call_arg_copies(pending_moves: Vec<MachineInst>) -> Vec<MachineInst> 
             ],
             def: None,
         });
-        pending[0].2 = scratch;
+        pending[cycle_index].source = CallArgCopySource::Reg(scratch);
     }
 
     rewritten
@@ -1854,6 +2041,338 @@ mod tests {
                 MachineOperand::PhysReg(PhysReg::Gp(0)),
                 MachineOperand::PhysReg(PhysReg::Gp(9)),
             ]
+        );
+    }
+
+    #[test]
+    fn parallelize_call_arg_moves_resolves_cycle_across_spill_reload() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::CallArgCopyStart,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                    MachineOperand::PhysReg(PhysReg::Gp(2)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::LdrImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(9)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(-8),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(1)),
+                    MachineOperand::PhysReg(PhysReg::Gp(9)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(2)),
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern("_callee".into())],
+                def: None,
+            },
+        ]);
+
+        parallelize_call_arg_moves(&mut mf);
+
+        let insts = &mf.blocks[0].insts;
+        assert_eq!(
+            insts.len(),
+            5,
+            "the marker and redundant reload move must disappear"
+        );
+        assert_eq!(insts[0].opcode, ArmOpcode::LdrImm);
+        assert_eq!(
+            insts[0].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(1)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(-8),
+            ],
+            "the spilled argument should load directly into x1"
+        );
+        assert_eq!(
+            insts[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::PhysReg(PhysReg::Gp(2)),
+            ],
+            "the x0/x2 cycle must preserve old x2 before either destination is written"
+        );
+        assert_eq!(
+            insts[2].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(2)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ]
+        );
+        assert_eq!(
+            insts[3].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+            ]
+        );
+        assert_eq!(insts[4].opcode, ArmOpcode::Bl);
+    }
+
+    #[test]
+    fn apply_allocation_preserves_marked_call_copy_group_across_reload() {
+        let mut mf = MachineFunction::new("test".into());
+        let into_x0 = mf.new_vreg(RegClass::Gp64);
+        let into_x1 = mf.new_vreg(RegClass::Gp64);
+        let into_x2 = mf.new_vreg(RegClass::Gp64);
+        let spill_slot = mf.alloc_local(8);
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::CallArgCopyStart,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                    MachineOperand::VReg(into_x0),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(1)),
+                    MachineOperand::VReg(into_x1),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(2)),
+                    MachineOperand::VReg(into_x2),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern("_callee".into())],
+                def: None,
+            },
+        ]);
+        let liveness = compute_liveness(&mf);
+        let allocation = AllocResult {
+            assignments: HashMap::from([(into_x0, PhysReg::Gp(2)), (into_x2, PhysReg::Gp(0))]),
+            spills: HashMap::from([(into_x1, spill_slot)]),
+            callee_saved_used: vec![],
+            split_records: vec![],
+        };
+
+        apply_allocation(&mut mf, &allocation, &liveness);
+
+        assert_eq!(
+            mf.blocks[0]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                ArmOpcode::CallArgCopyStart,
+                ArmOpcode::MovReg,
+                ArmOpcode::LdrImm,
+                ArmOpcode::MovReg,
+                ArmOpcode::MovReg,
+                ArmOpcode::Bl,
+            ],
+            "allocation must retain the group marker around inserted reloads"
+        );
+
+        parallelize_call_arg_moves(&mut mf);
+
+        let insts = &mf.blocks[0].insts;
+        assert_eq!(insts[0].opcode, ArmOpcode::LdrImm);
+        assert_eq!(
+            insts[0].operands.first(),
+            Some(&MachineOperand::PhysReg(PhysReg::Gp(1))),
+            "the allocated spill must load directly into its ABI register"
+        );
+        assert_eq!(
+            insts[2].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(2)),
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+            ],
+            "the old x0 value must reach x2 before x0 is replaced"
+        );
+        assert_eq!(insts.last().map(|inst| inst.opcode), Some(ArmOpcode::Bl));
+    }
+
+    #[test]
+    fn marked_fp_reload_is_scheduled_after_consumers_of_its_destination() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::CallArgCopyStart,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::SubImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(4096),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::LdrFpImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(29)),
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::Imm(0),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(0)),
+                    MachineOperand::PhysReg(PhysReg::Fp(29)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(1)),
+                    MachineOperand::PhysReg(PhysReg::Fp(0)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern("_callee".into())],
+                def: None,
+            },
+        ]);
+
+        parallelize_call_arg_moves(&mut mf);
+
+        let insts = &mf.blocks[0].insts;
+        assert_eq!(insts[0].opcode, ArmOpcode::FmovReg);
+        assert_eq!(
+            insts[0].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(1)),
+                MachineOperand::PhysReg(PhysReg::Fp(0)),
+            ],
+            "old d0 must be copied before the spilled argument overwrites d0"
+        );
+        assert_eq!(insts[1].opcode, ArmOpcode::SubImm);
+        assert_eq!(insts[2].opcode, ArmOpcode::LdrFpImm);
+        assert_eq!(
+            insts[2].operands.first(),
+            Some(&MachineOperand::PhysReg(PhysReg::Fp(0))),
+            "wide-offset reload should target d0 directly"
+        );
+        assert_eq!(insts[3].opcode, ArmOpcode::Bl);
+    }
+
+    #[test]
+    fn split_bridge_stays_above_marked_call_copy_group() {
+        let mut mf = MachineFunction::new("test".into());
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::CallArgCopyStart,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                    MachineOperand::PhysReg(PhysReg::Gp(2)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::LdrImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(9)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(-8),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(1)),
+                    MachineOperand::PhysReg(PhysReg::Gp(9)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(2)),
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::Bl,
+                operands: vec![MachineOperand::Extern("_callee".into())],
+                def: None,
+            },
+        ]);
+        let split = SplitRecord {
+            vreg: VRegId(999),
+            call_position: 0,
+            call_index: 0,
+            pre_phys: PhysReg::Gp(0),
+            post: PostHalf::Spilled,
+            bridge_slot: -16,
+        };
+
+        insert_split_bridges(&mut mf, &[split]);
+
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::StrImm);
+        assert_eq!(
+            mf.blocks[0].insts[1].opcode,
+            ArmOpcode::CallArgCopyStart,
+            "the bridge store must precede the structural copy boundary"
+        );
+
+        parallelize_call_arg_moves(&mut mf);
+
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::StrImm);
+        assert!(
+            mf.blocks[0]
+                .insts
+                .iter()
+                .all(|inst| inst.opcode != ArmOpcode::CallArgCopyStart),
+            "parallel-copy resolution must consume the marker"
         );
     }
 

@@ -1071,6 +1071,9 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ),
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
+        ArmOpcode::CallArgCopyStart => {
+            panic!("unresolved call-argument copy marker reached ARM64 emission")
+        }
         ArmOpcode::Brk => {
             let imm = if let MachineOperand::Imm(v) = &inst.operands[0] {
                 *v
