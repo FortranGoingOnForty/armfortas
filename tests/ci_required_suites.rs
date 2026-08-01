@@ -20,6 +20,11 @@ const REQUIRED_SUITES: &[RequiredSuite] = &[
         name: "complete afs-as suite",
         command: "ci/run_logged.sh /tmp/afs-as-tests.log cargo test -p afs-as --all-targets -- --nocapture",
     },
+    RequiredSuite {
+        job: "test-afs-ld",
+        name: "complete afs-ld suite with serialized skip evidence",
+        command: "ci/run_logged.sh /tmp/afs-ld-tests.log cargo test -p afs-ld --all-targets -- --nocapture --test-threads=1",
+    },
 ];
 
 const AFS_AS_REQUIRED_CONTROLS: &[(&str, &str)] = &[
@@ -50,6 +55,21 @@ const AFS_LD_REQUIRED_INPUTS: &[(&str, &str)] = &[
     ("workspace manifest", "Cargo.toml"),
     ("workspace lockfile", "Cargo.lock"),
     ("workflow definition", ".github/workflows/ci.yml"),
+];
+
+const AFS_LD_REQUIRED_CONTROLS: &[(&str, &str)] = &[
+    (
+        "macOS skip-accounting profile",
+        "- os: macos-14\nskip_profile: macos",
+    ),
+    (
+        "Linux skip-accounting profile",
+        "- os: ubuntu-latest\nskip_profile: linux",
+    ),
+    (
+        "linker prerequisite-skip gate",
+        r#"afs-ld/ci/check_skips.sh /tmp/afs-ld-tests.log "${{ matrix.skip_profile }}""#,
+    ),
 ];
 
 fn workflow_run_commands(workflow: &str) -> Vec<(&str, &str)> {
@@ -98,6 +118,15 @@ fn missing_required_suites(workflow: &str) -> Vec<&'static str> {
 fn missing_afs_as_controls(workflow: &str) -> Vec<&'static str> {
     let job = workflow_job(workflow, "test-afs-as");
     AFS_AS_REQUIRED_CONTROLS
+        .iter()
+        .filter(|(_, required)| !job.contains(required))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+fn missing_afs_ld_controls(workflow: &str) -> Vec<&'static str> {
+    let job = workflow_job(workflow, "test-afs-ld");
+    AFS_LD_REQUIRED_CONTROLS
         .iter()
         .filter(|(_, required)| !job.contains(required))
         .map(|(name, _)| *name)
@@ -193,6 +222,36 @@ fn policy_check_rejects_each_missing_afs_as_control() {
         let rendered = required.replace('\n', "\n    ");
         let incomplete = complete.replacen(&rendered, "", 1);
         assert_eq!(missing_afs_as_controls(&incomplete), vec![*name]);
+    }
+}
+
+#[test]
+fn afs_ld_ci_exposes_and_rejects_false_green_skips() {
+    let missing = missing_afs_ld_controls(WORKFLOW);
+    assert!(
+        missing.is_empty(),
+        "{} does not enforce afs-ld skip accounting: {}",
+        Path::new(".github/workflows/ci.yml").display(),
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn policy_check_rejects_each_missing_afs_ld_control() {
+    let complete = format!(
+        "jobs:\n  test-afs-ld:\n    {}\n",
+        AFS_LD_REQUIRED_CONTROLS
+            .iter()
+            .map(|(_, required)| required.replace('\n', "\n    "))
+            .collect::<Vec<_>>()
+            .join("\n    ")
+    );
+    assert!(missing_afs_ld_controls(&complete).is_empty());
+
+    for (name, required) in AFS_LD_REQUIRED_CONTROLS {
+        let rendered = required.replace('\n', "\n    ");
+        let incomplete = complete.replacen(&rendered, "", 1);
+        assert_eq!(missing_afs_ld_controls(&incomplete), vec![*name]);
     }
 }
 

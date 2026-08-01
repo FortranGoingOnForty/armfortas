@@ -169,7 +169,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest]
+        include:
+          - os: macos-14
+            skip_profile: macos
+          - os: ubuntu-latest
+            skip_profile: linux
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -178,7 +182,8 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build -p armfortas-rt -p afs-as
-      - run: cargo test -p afs-ld --all-targets -- --nocapture
+      - run: ci/run_logged.sh /tmp/afs-ld-tests.log cargo test -p afs-ld --all-targets -- --nocapture --test-threads=1
+      - run: afs-ld/ci/check_skips.sh /tmp/afs-ld-tests.log "${{ matrix.skip_profile }}"
 
   # ---- Sprint x01: non-macOS hosts. Compiler + lib suite run for real;
   # e2e suites skip with machine-readable counts until x06 lands the
