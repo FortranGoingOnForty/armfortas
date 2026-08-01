@@ -24,7 +24,7 @@ use super::helpers::coerce_to_type;
 #[derive(Clone, Copy)]
 enum MaterializedAllocateSource {
     Absent,
-    Descriptor,
+    Descriptor(ValueId),
     Scalar(ValueId),
     Character { ptr: ValueId, len: ValueId },
 }
@@ -163,6 +163,117 @@ fn emit_scalar_fixed_char_source_copy_on_success(
     );
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
+}
+
+fn emit_raw_scalar_char_source_copy_on_success(
+    b: &mut FuncBuilder,
+    stat_addr: ValueId,
+    dest_slot: ValueId,
+    dest_len: ValueId,
+    src_ptr: ValueId,
+    src_len: ValueId,
+) {
+    let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
+    let zero = b.const_i32(0);
+    let ok = b.icmp(CmpOp::Eq, stat, zero);
+    let copy_bb = b.create_block("alloc_raw_char_source_copy");
+    let done_bb = b.create_block("alloc_raw_char_source_copy_done");
+    b.cond_branch(ok, copy_bb, vec![], done_bb, vec![]);
+
+    b.set_block(copy_bb);
+    let dest_base = b.load_typed(dest_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    b.call(
+        FuncRef::External("afs_assign_char_fixed".into()),
+        vec![dest_base, dest_len, src_ptr, src_len],
+        IrType::Void,
+    );
+    b.branch(done_bb, vec![]);
+    b.set_block(done_bb);
+}
+
+fn emit_raw_scalar_value_source_init_on_success(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    stat_addr: ValueId,
+    dest_slot: ValueId,
+    dest_info: &LocalInfo,
+    source_value: ValueId,
+) {
+    let dest_base = b.load_typed(dest_slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    emit_scalar_allocate_source_init_on_success(
+        b,
+        ctx,
+        stat_addr,
+        dest_base,
+        &dest_info.ty,
+        dest_info.derived_type.as_deref(),
+        source_value,
+    );
+}
+
+fn emit_raw_scalar_allocate_initialization(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    stat_addr: ValueId,
+    dest_slot: ValueId,
+    dest_info: &LocalInfo,
+    source: MaterializedAllocateSource,
+) {
+    if let Some(layout) = dest_info
+        .derived_type
+        .as_deref()
+        .and_then(|type_name| ctx.type_layouts.get(type_name))
+    {
+        // Raw scalar allocation is backed by malloc rather than a descriptor
+        // allocator. Initialize ownership-bearing fields before a SOURCE copy
+        // so deep assignment never inspects allocator garbage. With no SOURCE,
+        // this remains the declaration-default initialization path.
+        emit_allocatable_default_init_on_success(
+            b,
+            stat_addr,
+            dest_slot,
+            layout,
+            false,
+            ctx.type_layouts,
+        );
+    }
+
+    match source {
+        MaterializedAllocateSource::Absent => {}
+        MaterializedAllocateSource::Character { ptr, len } => {
+            if let Some(dest_len) = local_char_runtime_len(b, dest_info) {
+                emit_raw_scalar_char_source_copy_on_success(
+                    b, stat_addr, dest_slot, dest_len, ptr, len,
+                );
+            }
+        }
+        MaterializedAllocateSource::Scalar(source_value) => {
+            emit_raw_scalar_value_source_init_on_success(
+                b,
+                ctx,
+                stat_addr,
+                dest_slot,
+                dest_info,
+                source_value,
+            );
+        }
+        MaterializedAllocateSource::Descriptor(desc) => {
+            let source_base = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let source_value = if dest_info.derived_type.is_some() || is_complex_ty(&dest_info.ty) {
+                source_base
+            } else {
+                b.load_typed(source_base, dest_info.ty.clone())
+            };
+            emit_raw_scalar_value_source_init_on_success(
+                b,
+                ctx,
+                stat_addr,
+                dest_slot,
+                dest_info,
+                source_value,
+            );
+        }
+    }
 }
 
 fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str, dest: ValueId) {
@@ -7357,8 +7468,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     if source_is_character && source_rank == 0 {
                         let (ptr, len) = lower_string_expr_ctx(b, ctx, expr);
                         MaterializedAllocateSource::Character { ptr, len }
-                    } else if source_desc.is_some() || source_scalar_desc.is_some() {
-                        MaterializedAllocateSource::Descriptor
+                    } else if let Some(desc) = source_desc.or(source_scalar_desc) {
+                        MaterializedAllocateSource::Descriptor(desc)
                     } else {
                         MaterializedAllocateSource::Scalar(super::expr::lower_expr_ctx_tl(
                             b, ctx, expr,
@@ -7726,7 +7837,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             b, stat_addr, field_ptr, src_ptr, src_len,
                                         ),
                                         MaterializedAllocateSource::Absent
-                                        | MaterializedAllocateSource::Descriptor => {}
+                                        | MaterializedAllocateSource::Descriptor(_) => {}
                                     }
                                 }
                             } else if let MaterializedAllocateSource::Scalar(source_value) =
@@ -7916,18 +8027,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 errmsg_target.as_ref(),
                                 "ALLOCATE failed",
                             );
-                            if let Some(type_name) = &field_info.derived_type {
-                                if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    emit_allocatable_default_init_on_success(
-                                        b,
-                                        stat_addr,
-                                        field_ptr,
-                                        layout,
-                                        false,
-                                        ctx.type_layouts,
-                                    );
-                                }
-                            }
+                            emit_raw_scalar_allocate_initialization(
+                                b,
+                                ctx,
+                                stat_addr,
+                                field_ptr,
+                                &field_info,
+                                materialized_source,
+                            );
                             continue;
                         }
                     }
@@ -8213,7 +8320,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                             b, stat_addr, desc, src_ptr, src_len,
                                         ),
                                         MaterializedAllocateSource::Absent
-                                        | MaterializedAllocateSource::Descriptor => {}
+                                        | MaterializedAllocateSource::Descriptor(_) => {}
                                     }
                                 }
                             } else if let MaterializedAllocateSource::Scalar(source_value) =
@@ -8404,18 +8511,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 );
                                 b.store(ptr, slot);
                             }
-                            if let Some(type_name) = &info.derived_type {
-                                if let Some(layout) = ctx.type_layouts.get(type_name) {
-                                    emit_allocatable_default_init_on_success(
-                                        b,
-                                        stat_addr,
-                                        slot,
-                                        layout,
-                                        false,
-                                        ctx.type_layouts,
-                                    );
-                                }
-                            }
+                            emit_raw_scalar_allocate_initialization(
+                                b,
+                                ctx,
+                                stat_addr,
+                                slot,
+                                &info,
+                                materialized_source,
+                            );
                         }
                     }
                 }
