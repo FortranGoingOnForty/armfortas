@@ -269,6 +269,38 @@ end program comparisons
 }
 
 #[test]
+fn unsupported_arm64_i64_vector_multiply_remains_scalar() {
+    let source = r#"
+subroutine multiply_i64(a, b, c) bind(c, name="multiply_i64")
+  use iso_c_binding, only: c_int64_t
+  implicit none
+  integer(c_int64_t), intent(in) :: a(32), b(32)
+  integer(c_int64_t), intent(out) :: c(32)
+  integer :: i
+  do i = 1, 32
+    c(i) = a(i) * b(i)
+  end do
+end subroutine multiply_i64
+"#;
+
+    let ir = compile_arm64_ir(source, "-O3");
+    assert!(
+        ir.contains("imul") && !ir.contains("vmul"),
+        "2xi64 multiply has no NEON instruction and must remain scalar in IR:\n{ir}"
+    );
+
+    let asm = compile_arm64_asm(source, "-O3");
+    assert!(
+        asm.contains("\n    mul "),
+        "scalar i64 multiply should reach the ARM64 MUL selector:\n{asm}"
+    );
+    assert!(
+        !asm.lines().any(|line| line.trim() == "nop"),
+        "unsupported vector arithmetic must not survive as a NOP:\n{asm}"
+    );
+}
+
+#[test]
 fn large_frame_i128_store_preserves_low_limb() {
     let asm = compile_arm64_asm(
         r#"

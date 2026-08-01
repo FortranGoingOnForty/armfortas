@@ -406,7 +406,23 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
         }
     }
 
+    assert_no_selected_nops(&mf);
     mf
+}
+
+fn assert_no_selected_nops(mf: &MachineFunction) {
+    if let Some((block, inst)) = mf.blocks.iter().find_map(|block| {
+        block
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == ArmOpcode::Nop)
+            .map(|inst| (block, inst))
+    }) {
+        panic!(
+            "ARM64 isel invariant violated: selected NOP in function {} block {}: {:?}",
+            mf.name, block.label, inst
+        );
+    }
 }
 
 fn select_call_inst(
@@ -2022,17 +2038,18 @@ fn select_inst(
         }),
         InstKind::VMul(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
             VShape::V4S => ArmOpcode::MulV4S,
-            // NEON has no integer 2D mul — Stage 4 should not request
-            // it; if it does we fall through to a placeholder.
-            VShape::V2D => ArmOpcode::Nop,
+            // NEON has no integer 2D multiply. The vectorizer keeps
+            // this shape scalar; reaching isel means target legality
+            // was violated and must fail closed instead of defining an
+            // arbitrary value with NOP.
+            VShape::V2D => reject_unsupported_vector_instruction(inst),
             VShape::F4S => ArmOpcode::FmulV4S,
             VShape::F2D => ArmOpcode::FmulV2D,
         }),
         InstKind::VDiv(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
-            // No integer NEON divide — emit a placeholder; the
-            // vectorizer should refuse to pick V128 lanes for VDiv
-            // on integer types. Float forms exist.
-            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            // No integer NEON divide. The vectorizer refuses these
+            // shapes, so a backend arrival is an invariant violation.
+            VShape::V4S | VShape::V2D => reject_unsupported_vector_instruction(inst),
             VShape::F4S => ArmOpcode::FdivV4S,
             VShape::F2D => ArmOpcode::FdivV2D,
         }),
@@ -2054,8 +2071,7 @@ fn select_inst(
         InstKind::VSqrt(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
             VShape::F4S => ArmOpcode::FsqrtV4S,
             VShape::F2D => ArmOpcode::FsqrtV2D,
-            // sqrt is float-only.
-            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            VShape::V4S | VShape::V2D => reject_unsupported_vector_instruction(inst),
         }),
         InstKind::VFma(a, b, c) => {
             // FMLA is dest += a*b. Conventional 3-operand call
@@ -2064,16 +2080,7 @@ fn select_inst(
             // tracks SSA destinations more carefully.
             let shape = match VShape::from_ir(&inst.ty) {
                 Some(s) if s.is_float() => s,
-                _ => {
-                    // unsupported shape — placeholder
-                    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![],
-                        def: Some(dest),
-                    });
-                    return;
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             };
             let opcode = match shape {
                 VShape::F4S => ArmOpcode::FmlaV4S,
@@ -2173,7 +2180,7 @@ fn select_inst(
                 (Some(VShape::F2D), CmpOp::Lt) => (ArmOpcode::FcmgtV2D, true),
                 (Some(VShape::F4S), CmpOp::Le) => (ArmOpcode::FcmgeV4S, true),
                 (Some(VShape::F2D), CmpOp::Le) => (ArmOpcode::FcmgeV2D, true),
-                _ => (ArmOpcode::Nop, false),
+                _ => reject_unsupported_vector_instruction(inst),
             };
             let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
             mf.block_mut(mb).insts.push(MachineInst {
@@ -2197,7 +2204,7 @@ fn select_inst(
                 (Some(VShape::V4S), CmpOp::Eq) => (ArmOpcode::CmeqV4S, false),
                 (Some(VShape::V4S), CmpOp::Lt) => (ArmOpcode::CmgtV4S, true),
                 (Some(VShape::V4S), CmpOp::Le) => (ArmOpcode::CmgeV4S, true),
-                _ => (ArmOpcode::Nop, false),
+                _ => reject_unsupported_vector_instruction(inst),
             };
             let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
             mf.block_mut(mb).insts.push(MachineInst {
@@ -2222,7 +2229,7 @@ fn select_inst(
                 Some(VShape::V2D) => ArmOpcode::DupGen2D,
                 Some(VShape::F4S) => ArmOpcode::DupEl4S,
                 Some(VShape::F2D) => ArmOpcode::DupEl2D,
-                None => ArmOpcode::Nop,
+                None => reject_unsupported_vector_instruction(inst),
             };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
@@ -2328,24 +2335,7 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                IrType::Int(_) => {
-                    let class = type_to_reg_class(&inst.ty);
-                    let dest = ctx.get_vreg(mf, inst.id, class);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                        def: Some(dest),
-                    });
-                }
-                _ => {
-                    let class = type_to_reg_class(&inst.ty);
-                    let dest = ctx.get_vreg(mf, inst.id, class);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                        def: Some(dest),
-                    });
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             }
         }
         InstKind::VExtract(v, lane) => {
@@ -2357,7 +2347,7 @@ fn select_inst(
                 IrType::Int(IntWidth::I64) => ArmOpcode::Umov2D,
                 IrType::Float(FloatWidth::F32) => ArmOpcode::FmovEl4S,
                 IrType::Float(FloatWidth::F64) => ArmOpcode::FmovEl2D,
-                _ => ArmOpcode::Nop,
+                _ => reject_unsupported_vector_instruction(inst),
             };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
@@ -2433,13 +2423,7 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                _ => {
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![],
-                        def: None,
-                    });
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             }
         }
         InstKind::VReduceMin(v) | InstKind::VReduceMax(v) => {
@@ -2502,29 +2486,18 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                _ => {
-                    let class = type_to_reg_class(&inst.ty);
-                    let dest = ctx.get_vreg(mf, inst.id, class);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                        def: Some(dest),
-                    });
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             }
         }
 
-        // Remaining: ExtractField, InsertField, and other vector ops
-        // (VInsert, VICmp, VFCmp, VBitcast) — placeholder. Land
-        // per-op as the vectorizer grows in Stage 4.
-        _ => {
-            let class = type_to_reg_class(&inst.ty);
-            let _dest = ctx.get_vreg(mf, inst.id, class);
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::Nop,
-                operands: vec![],
-                def: None,
-            });
+        InstKind::VBitcast(..) | InstKind::VInsert(..) => {
+            reject_unsupported_vector_instruction(inst)
+        }
+        InstKind::ExtractField(..) | InstKind::InsertField(..) => {
+            panic!(
+                "ARM64 isel: unsupported aggregate instruction {:?}",
+                inst.kind
+            )
         }
     }
 }
@@ -3456,7 +3429,7 @@ fn emit_vbinop(
     let vb = ctx.lookup_vreg(b);
     let opcode = match VShape::from_ir(&inst.ty) {
         Some(s) => pick(s),
-        None => ArmOpcode::Nop,
+        None => reject_unsupported_vector_instruction(inst),
     };
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
@@ -3482,13 +3455,22 @@ fn emit_vunop(
     let va = ctx.lookup_vreg(a);
     let opcode = match VShape::from_ir(&inst.ty) {
         Some(s) => pick(s),
-        None => ArmOpcode::Nop,
+        None => reject_unsupported_vector_instruction(inst),
     };
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(va)],
         def: Some(dest),
     });
+}
+
+#[cold]
+#[track_caller]
+fn reject_unsupported_vector_instruction(inst: &Inst) -> ! {
+    panic!(
+        "ARM64 isel: unsupported vector instruction {:?} for result type {:?}",
+        inst.kind, inst.ty
+    )
 }
 
 /// Emit a float binary op, selecting single or double precision.
@@ -4864,8 +4846,9 @@ mod tests {
     #[test]
     fn vshape_rejects_unsupported_shape() {
         // 3 lanes is not a NEON shape; we already verified that
-        // verify.rs rejects it. VShape::from_ir simply returns None
-        // and the isel arm falls back to Nop.
+        // verify.rs rejects it. VShape::from_ir simply returns None;
+        // instruction selection treats reaching that state as a hard
+        // target-legality violation.
         let ty = IrType::Vector {
             lanes: 3,
             elem: Box::new(IrType::Int(IntWidth::I32)),
@@ -4930,6 +4913,68 @@ mod tests {
             opcodes.contains(&ArmOpcode::StrQ),
             "expected StrQ in MIR, got {:?}",
             opcodes
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ARM64 isel: unsupported vector instruction VMul")]
+    fn isel_rejects_vmul_2xi64_instead_of_defining_nop() {
+        let v_ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Int(IntWidth::I64)),
+        };
+        let mut func = Function::new("vmul_2xi64_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_dst = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty);
+            let product = b.vmul(va, vb);
+            b.vstore(product, p_dst);
+            b.ret_void();
+        }
+
+        let errors = crate::ir::verify::verify_function(&func);
+        assert!(
+            errors.is_empty(),
+            "2xi64 VMul witness must be verifier-valid: {errors:?}"
+        );
+        let _ = select_function(&func, crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    fn isel_keeps_supported_vmul_4xi32() {
+        let v_ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        let mut func = Function::new("vmul_4xi32_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_dst = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty);
+            let product = b.vmul(va, vb);
+            b.vstore(product, p_dst);
+            b.ret_void();
+        }
+
+        let errors = crate::ir::verify::verify_function(&func);
+        assert!(
+            errors.is_empty(),
+            "4xi32 VMul witness must be verifier-valid: {errors:?}"
+        );
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        assert!(
+            mf.blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .any(|inst| inst.opcode == ArmOpcode::MulV4S),
+            "supported 4xi32 VMul must select MulV4S: {mf:?}"
         );
     }
 
