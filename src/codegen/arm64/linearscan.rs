@@ -954,6 +954,16 @@ pub fn apply_allocation(
                     _ => ArmOpcode::StrImm,
                 };
                 emit_spill_access(&mut new_insts, store_op, scratch, offset as i64);
+                if let Some(receipt) = preserved_entry_arg_def {
+                    let store = new_insts
+                        .last_mut()
+                        .expect("entry-argument spill must end in a store");
+                    debug_assert!(is_store_opcode(store.opcode));
+                    // Transient provenance for `parallelize_entry_arg_moves`:
+                    // this store completes the immediately preceding spilled
+                    // receipt and may be retargeted to the original ABI source.
+                    store.def = Some(receipt);
+                }
             }
             instruction_ordinal += 1;
         }
@@ -1284,69 +1294,70 @@ pub fn insert_split_bridges(mf: &mut MachineFunction, splits: &[SplitRecord]) {
 /// preferring caller-saved destinations, the latent hazard
 /// surfaced.
 ///
-/// Find the leading run of phys-to-phys movs in the entry block
-/// (after the frame setup) whose source is an incoming arg
-/// register, and run the same parallel-copy resolver
-/// (`rewrite_call_arg_copies`) used for pre-call argument setup.
+/// Find the leading run of phys-to-phys receipt moves in the entry block after
+/// frame setup. Allocator-tagged receipt spills are folded into direct stores
+/// from their original ABI sources; the remaining register receipts then form
+/// one parallel-copy graph even when a spill appeared between two cycle legs.
 pub fn parallelize_entry_arg_moves(mf: &mut MachineFunction) {
     if mf.blocks.is_empty() {
         return;
     }
     let original = std::mem::take(&mut mf.blocks[0].insts);
     let mut rebuilt: Vec<MachineInst> = Vec::with_capacity(original.len());
-    let mut iter = original.into_iter().peekable();
+    let mut cursor = 0;
 
     // Pass through the prologue (StpPre/AddImm/SubImm).
-    while let Some(inst) = iter.peek() {
+    while let Some(inst) = original.get(cursor) {
         if matches!(
             inst.opcode,
             ArmOpcode::StpPre | ArmOpcode::AddImm | ArmOpcode::SubImm
         ) {
-            rebuilt.push(iter.next().unwrap());
+            rebuilt.push(inst.clone());
+            cursor += 1;
         } else {
             break;
         }
     }
 
-    // Process arg-receipt parallel groups. Tolerate intervening
-    // store instructions (which read but don't write registers in
-    // the parallel-copy graph) so a result-address spill or
-    // partial-receipt store doesn't fragment the receipts. Stop
-    // once any instruction overwrites an incoming arg register —
-    // beyond that point those values are no longer the original
-    // arg values and parallel-copy resolution would be unsound.
+    // Process receipt groups. Tagged spill stores are emitted before buffered
+    // register writes after their data operand is retargeted to the original
+    // ABI register. Other pass-through instructions remain ordering barriers:
+    // they may consume a value produced by an earlier receipt even though they
+    // do not overwrite any still-unread incoming argument register.
     let mut pending: Vec<MachineInst> = Vec::new();
-    loop {
-        match iter.peek() {
-            None => break,
-            Some(inst) if is_arg_receipt_copy(inst, &mf.entry_arg_receipts) => {
-                pending.push(iter.next().unwrap());
+    while let Some(inst) = original.get(cursor) {
+        if is_arg_receipt_copy(inst, &mf.entry_arg_receipts) {
+            if let Some((consumed, spill)) = rewrite_spilled_entry_arg_receipt(&original[cursor..])
+            {
+                rebuilt.extend(spill);
+                cursor += consumed;
+            } else {
+                pending.push(inst.clone());
+                cursor += 1;
             }
-            Some(inst) if is_transparent_to_arg_receipts(inst) => {
-                if !pending.is_empty() {
-                    rebuilt.extend(rewrite_call_arg_copies(std::mem::take(&mut pending)));
-                }
-                rebuilt.push(iter.next().unwrap());
-            }
-            Some(_) => break,
+            continue;
         }
+        if can_scan_past_entry_receipt(inst) {
+            if !pending.is_empty() {
+                rebuilt.extend(rewrite_call_arg_copies(std::mem::take(&mut pending)));
+            }
+            rebuilt.push(inst.clone());
+            cursor += 1;
+            continue;
+        }
+        break;
     }
     if !pending.is_empty() {
         rebuilt.extend(rewrite_call_arg_copies(pending));
     }
-    rebuilt.extend(iter);
+    rebuilt.extend(original.into_iter().skip(cursor));
     mf.blocks[0].insts = rebuilt;
 }
 
-/// An instruction is *transparent* to the arg-receipt parallel
-/// copy if executing it cannot change the value held in any
-/// incoming arg register (x0..x7 / d0..d7). Stores qualify (they
-/// only read), as does any compute whose destination lies outside
-/// the arg-reg range. Anything that writes into x0..x7 forms a
-/// barrier — the receipts that come after it are reading
-/// post-clobber values, so reordering across the barrier is
-/// unsound.
-fn is_transparent_to_arg_receipts(inst: &MachineInst) -> bool {
+/// Return whether receipt discovery may continue after emitting this
+/// instruction in place. This is not permission to reorder across it: stores
+/// and non-argument-register computations can depend on preceding receipts.
+fn can_scan_past_entry_receipt(inst: &MachineInst) -> bool {
     if is_store_opcode(inst.opcode) {
         return true;
     }
@@ -1357,6 +1368,106 @@ fn is_transparent_to_arg_receipts(inst: &MachineInst) -> bool {
         Some(MachineOperand::PhysReg(dst)) => !is_call_arg_reg(*dst),
         _ => true,
     }
+}
+
+/// Fold one allocator-produced `move-to-temp; [address]; store-temp` entry
+/// receipt into a direct store from the original ABI register. The terminal
+/// store carries the receipt vreg in `def`, set transiently by
+/// `apply_allocation`, so an unrelated body store cannot be mistaken for spill
+/// machinery.
+fn rewrite_spilled_entry_arg_receipt(
+    receipt_and_following: &[MachineInst],
+) -> Option<(usize, Vec<MachineInst>)> {
+    let receipt = receipt_and_following.first()?;
+    let receipt_def = receipt.def?;
+    let (temp, source) = match receipt.operands.as_slice() {
+        [MachineOperand::PhysReg(temp), MachineOperand::PhysReg(source)] => (*temp, *source),
+        _ => return None,
+    };
+
+    let store_index = if receipt_and_following
+        .get(1)
+        .is_some_and(|candidate| candidate.def == Some(receipt_def))
+    {
+        1
+    } else if receipt_and_following
+        .get(2)
+        .is_some_and(|candidate| candidate.def == Some(receipt_def))
+    {
+        2
+    } else {
+        return None;
+    };
+    let expected_store = match source {
+        PhysReg::Gp(_) | PhysReg::Gp32(_) => ArmOpcode::StrImm,
+        PhysReg::Fp(_) | PhysReg::Fp32(_) => ArmOpcode::StrFpImm,
+        _ => panic!("entry-argument receipt spill has a non-register source"),
+    };
+    assert_eq!(
+        receipt.opcode,
+        move_opcode_for_phys(source),
+        "entry-argument receipt move must match its ABI register bank"
+    );
+    assert!(
+        same_phys_width(temp, source),
+        "entry-argument receipt spill temp must match its ABI source width"
+    );
+
+    let store = &receipt_and_following[store_index];
+    assert_eq!(
+        store.opcode, expected_store,
+        "entry-argument receipt spill store must match its ABI source bank"
+    );
+    assert!(
+        matches!(store.operands.first(), Some(MachineOperand::PhysReg(data)) if *data == temp),
+        "entry-argument receipt spill must store the preceding move's temp"
+    );
+    if store_index == 1 {
+        assert!(
+            matches!(
+                store.operands.as_slice(),
+                [
+                    MachineOperand::PhysReg(_),
+                    MachineOperand::PhysReg(base),
+                    MachineOperand::Imm(_),
+                ] if *base == PhysReg::FP
+            ),
+            "direct entry-argument receipt spill must be frame-pointer relative"
+        );
+    } else {
+        let address = &receipt_and_following[1];
+        assert!(
+            matches!(address.opcode, ArmOpcode::AddImm | ArmOpcode::SubImm)
+                && matches!(
+                    address.operands.as_slice(),
+                    [
+                        MachineOperand::PhysReg(dst),
+                        MachineOperand::PhysReg(base),
+                        MachineOperand::Imm(_),
+                    ] if *dst == PhysReg::Gp(8) && *base == PhysReg::FP
+                ),
+            "wide entry-argument receipt spill must materialize its address through x8"
+        );
+        assert!(
+            matches!(
+                store.operands.as_slice(),
+                [
+                    MachineOperand::PhysReg(_),
+                    MachineOperand::PhysReg(base),
+                    MachineOperand::Imm(0),
+                ] if *base == PhysReg::Gp(8)
+            ),
+            "wide entry-argument receipt spill must store through the materialized x8 address"
+        );
+    }
+
+    let mut spill = receipt_and_following[1..=store_index].to_vec();
+    let terminal = spill
+        .last_mut()
+        .expect("entry-argument spill sequence must contain its store");
+    terminal.operands[0] = MachineOperand::PhysReg(source);
+    terminal.def = None;
+    Some((store_index + 1, spill))
 }
 
 fn is_store_opcode(op: ArmOpcode) -> bool {
@@ -2590,6 +2701,223 @@ mod tests {
                 ][..],
             ],
             "entry-receipt defs must survive allocation so swaps are cycle-broken"
+        );
+    }
+
+    #[test]
+    fn entry_receipt_spill_does_not_fragment_register_swap() {
+        let mut mf = MachineFunction::new("test".into());
+        let into_x4 = mf.new_vreg(RegClass::Gp64);
+        let spilled = mf.new_vreg(RegClass::Gp64);
+        let into_x3 = mf.new_vreg(RegClass::Gp64);
+        let spill_slot = mf.alloc_local(8);
+        mf.entry_arg_receipts.extend([into_x4, spilled, into_x3]);
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::StpPre,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::AddImm,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(into_x4),
+                    MachineOperand::PhysReg(PhysReg::Gp(3)),
+                ],
+                def: Some(into_x4),
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(spilled),
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                ],
+                def: Some(spilled),
+            },
+            MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::VReg(into_x3),
+                    MachineOperand::PhysReg(PhysReg::Gp(4)),
+                ],
+                def: Some(into_x3),
+            },
+        ]);
+        let liveness = compute_liveness(&mf);
+        let allocation = AllocResult {
+            assignments: HashMap::from([(into_x4, PhysReg::Gp(4)), (into_x3, PhysReg::Gp(3))]),
+            spills: HashMap::from([(spilled, spill_slot)]),
+            callee_saved_used: vec![],
+            split_records: vec![],
+        };
+
+        apply_allocation(&mut mf, &allocation, &liveness);
+
+        let store_index = mf.blocks[0]
+            .insts
+            .iter()
+            .position(|inst| inst.opcode == ArmOpcode::StrImm)
+            .expect("allocator must materialize the spilled receipt");
+        assert_eq!(
+            mf.blocks[0].insts[store_index - 1].def,
+            Some(spilled),
+            "the witness requires a receipt spill between the two swap legs"
+        );
+        assert_eq!(
+            mf.blocks[0].insts[store_index].def,
+            Some(spilled),
+            "allocation must tag the spill store with its receipt provenance"
+        );
+        assert_eq!(mf.blocks[0].insts[store_index + 1].def, Some(into_x3));
+
+        parallelize_entry_arg_moves(&mut mf);
+
+        let body = &mf.blocks[0].insts[2..];
+        assert_eq!(body.len(), 4);
+        assert_eq!(body[0].opcode, ArmOpcode::StrImm);
+        assert_eq!(
+            body[0].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(0)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(spill_slot as i64),
+            ],
+            "the spilled parameter must be captured directly from its incoming register"
+        );
+        assert_eq!(body[0].def, None, "spill provenance is post-pass metadata");
+        assert_eq!(
+            body[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+            ]
+        );
+        assert_eq!(
+            body[2].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(3)),
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+            ]
+        );
+        assert_eq!(
+            body[3].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Gp(4)),
+                MachineOperand::PhysReg(PhysReg::Gp(9)),
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_fp_entry_receipt_spill_preserves_surrounding_swap() {
+        let mut mf = MachineFunction::new("test".into());
+        let into_d1 = VRegId(400);
+        let spilled = VRegId(401);
+        let into_d0 = VRegId(402);
+        mf.entry_arg_receipts.extend([into_d1, spilled, into_d0]);
+        mf.blocks[0].insts.extend([
+            MachineInst {
+                opcode: ArmOpcode::StpPre,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::AddImm,
+                operands: vec![],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(1)),
+                    MachineOperand::PhysReg(PhysReg::Fp(0)),
+                ],
+                def: Some(into_d1),
+            },
+            MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(29)),
+                    MachineOperand::PhysReg(PhysReg::Fp(2)),
+                ],
+                def: Some(spilled),
+            },
+            MachineInst {
+                opcode: ArmOpcode::SubImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(4096),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::StrFpImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(29)),
+                    MachineOperand::PhysReg(PhysReg::Gp(8)),
+                    MachineOperand::Imm(0),
+                ],
+                def: Some(spilled),
+            },
+            MachineInst {
+                opcode: ArmOpcode::FmovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Fp(0)),
+                    MachineOperand::PhysReg(PhysReg::Fp(1)),
+                ],
+                def: Some(into_d0),
+            },
+        ]);
+
+        parallelize_entry_arg_moves(&mut mf);
+
+        let body = &mf.blocks[0].insts[2..];
+        assert_eq!(
+            body.iter().map(|inst| inst.opcode).collect::<Vec<_>>(),
+            vec![
+                ArmOpcode::SubImm,
+                ArmOpcode::StrFpImm,
+                ArmOpcode::FmovReg,
+                ArmOpcode::FmovReg,
+                ArmOpcode::FmovReg,
+            ]
+        );
+        assert_eq!(
+            body[1].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(2)),
+                MachineOperand::PhysReg(PhysReg::Gp(8)),
+                MachineOperand::Imm(0),
+            ],
+            "wide spill must capture the original d2 value directly"
+        );
+        assert_eq!(body[1].def, None);
+        assert_eq!(
+            body[2].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(29)),
+                MachineOperand::PhysReg(PhysReg::Fp(0)),
+            ]
+        );
+        assert_eq!(
+            body[3].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(0)),
+                MachineOperand::PhysReg(PhysReg::Fp(1)),
+            ]
+        );
+        assert_eq!(
+            body[4].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(1)),
+                MachineOperand::PhysReg(PhysReg::Fp(29)),
+            ]
         );
     }
 
