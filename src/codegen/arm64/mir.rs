@@ -289,6 +289,23 @@ pub enum ArmOpcode {
     Brk, // BRK #imm16  (debug trap)
 }
 
+impl ArmOpcode {
+    /// Return whether operand zero is both an input and the instruction's
+    /// destination. Register allocation must preserve its incoming value when
+    /// the associated virtual-register definition is spilled.
+    pub(crate) fn reads_def_operand(self) -> bool {
+        matches!(
+            self,
+            ArmOpcode::FmlaV4S
+                | ArmOpcode::FmlaV2D
+                | ArmOpcode::BslV16B
+                | ArmOpcode::Ins4S
+                | ArmOpcode::Ins2D
+                | ArmOpcode::Movk
+        )
+    }
+}
+
 /// ARM64 condition codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArmCond {

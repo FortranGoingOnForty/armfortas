@@ -859,20 +859,23 @@ pub fn apply_allocation(
                 }
             }
 
+            let mut destructive_def_scratch = None;
             for (op_idx, scratch, load_op, offset) in &loads {
-                if *op_idx == 0
-                    && inst
-                        .def
-                        .as_ref()
-                        .map(|d| {
-                            matches!(
-                                logical_assignment(*d, cur_pos),
-                                Some(LogicalAssignment::Slot(_))
-                            )
-                        })
-                        .unwrap_or(false)
-                {
+                let is_spilled_def_operand = *op_idx == 0
+                    && matches!(
+                        (inst.operands.first(), inst.def),
+                        (Some(MachineOperand::VReg(operand)), Some(def))
+                            if *operand == def
+                                && matches!(
+                                    logical_assignment(def, cur_pos),
+                                    Some(LogicalAssignment::Slot(_))
+                                )
+                    );
+                if is_spilled_def_operand && !inst.opcode.reads_def_operand() {
                     continue;
+                }
+                if is_spilled_def_operand {
+                    destructive_def_scratch = Some(*scratch);
                 }
                 emit_spill_access(&mut new_insts, *load_op, *scratch, *offset as i64);
                 rewritten.operands[*op_idx] = MachineOperand::PhysReg(*scratch);
@@ -895,7 +898,7 @@ pub fn apply_allocation(
                 if let Some(LogicalAssignment::Slot(offset)) = logical_assignment(*def_vid, cur_pos)
                 {
                     let class = vreg_classes.get(def_vid).copied().unwrap_or(RegClass::Gp64);
-                    let temp_reg = match class {
+                    let temp_reg = destructive_def_scratch.unwrap_or_else(|| match class {
                         RegClass::Fp32 => {
                             let r = fp_temps
                                 .get(def_temp_idx)
@@ -924,7 +927,7 @@ pub fn apply_allocation(
                                 .unwrap_or(GP_SPILL_SCRATCH[0]);
                             PhysReg::Gp(r)
                         }
-                    };
+                    });
                     let scratch = temp_reg;
                     // Replace def operand with scratch.
                     if let Some(MachineOperand::VReg(vid)) = rewritten.operands.first() {
@@ -2702,6 +2705,75 @@ mod tests {
             ],
             "entry-receipt defs must survive allocation so swaps are cycle-broken"
         );
+    }
+
+    #[test]
+    fn apply_allocation_reloads_spilled_bsl_mask() {
+        let mut mf = MachineFunction::new("test".into());
+        let mask = mf.new_vreg(RegClass::V128);
+        let if_true = mf.new_vreg(RegClass::V128);
+        let if_false = mf.new_vreg(RegClass::V128);
+        let mask_slot = mf.alloc_local(16);
+        let true_slot = mf.alloc_local(16);
+        let false_slot = mf.alloc_local(16);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::BslV16B,
+            operands: vec![
+                MachineOperand::VReg(mask),
+                MachineOperand::VReg(if_true),
+                MachineOperand::VReg(if_false),
+            ],
+            def: Some(mask),
+        });
+        let liveness = compute_liveness(&mf);
+        let allocation = AllocResult {
+            assignments: HashMap::new(),
+            spills: HashMap::from([
+                (mask, mask_slot),
+                (if_true, true_slot),
+                (if_false, false_slot),
+            ]),
+            callee_saved_used: vec![],
+            split_records: vec![],
+        };
+
+        apply_allocation(&mut mf, &allocation, &liveness);
+
+        let bsl_index = mf.blocks[0]
+            .insts
+            .iter()
+            .position(|inst| inst.opcode == ArmOpcode::BslV16B)
+            .expect("BSL must survive allocation");
+        let reloads = &mf.blocks[0].insts[..bsl_index];
+        assert_eq!(
+            reloads
+                .iter()
+                .filter(|inst| inst.opcode == ArmOpcode::LdrQ)
+                .count(),
+            3,
+            "BSL must reload its mask as well as both selected values"
+        );
+        assert_eq!(
+            mf.blocks[0].insts[bsl_index].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(29)),
+                MachineOperand::PhysReg(PhysReg::Fp(30)),
+                MachineOperand::PhysReg(PhysReg::Fp(31)),
+            ],
+            "the destructive destination must reuse its mask reload"
+        );
+        let selected_store = &mf.blocks[0].insts[bsl_index + 1];
+        assert_eq!(selected_store.opcode, ArmOpcode::StrQ);
+        assert_eq!(
+            selected_store.operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(29)),
+                MachineOperand::PhysReg(PhysReg::FP),
+                MachineOperand::Imm(mask_slot as i64),
+            ],
+            "the selected value must be stored back through the mask spill slot"
+        );
+        assert!(selected_store.def.is_none());
     }
 
     #[test]
