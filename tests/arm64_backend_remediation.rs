@@ -84,6 +84,44 @@ end function
 }
 
 #[test]
+fn floating_point_contraction_does_not_cross_calls() {
+    let source = r#"
+real(8) function multiply_call_add(a,b,c) result(r) bind(c, name="multiply_call_add")
+  use iso_c_binding
+  interface
+    subroutine observe_fp_state() bind(c, name="observe_fp_state")
+    end subroutine observe_fp_state
+  end interface
+  real(c_double), value :: a,b,c
+  real(c_double) :: product
+  product = a*b
+  call observe_fp_state()
+  r = product+c
+end function
+"#;
+
+    let asm = compile_arm64_asm(source, "-Ofast");
+    let multiply = asm
+        .find("\n    fmul ")
+        .unwrap_or_else(|| panic!("Ofast must retain the pre-call multiply:\n{asm}"));
+    let call = asm
+        .find("\n    bl _observe_fp_state")
+        .unwrap_or_else(|| panic!("missing floating-point observer call:\n{asm}"));
+    let add = asm
+        .find("\n    fadd ")
+        .unwrap_or_else(|| panic!("Ofast must retain the post-call add:\n{asm}"));
+
+    assert!(
+        multiply < call && call < add,
+        "the call must remain between the separately rounded operations:\n{asm}"
+    );
+    assert!(
+        !asm.contains("\n    fmadd "),
+        "Ofast must not contract multiply-add across a call:\n{asm}"
+    );
+}
+
+#[test]
 fn vector_contraction_is_ofast_only_on_arm64() {
     let source = include_str!("../test_programs/do_loop_vectorize_fma.f90");
     let o3_asm = compile_arm64_asm(source, "-O3");

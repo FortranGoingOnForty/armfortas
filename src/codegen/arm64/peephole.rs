@@ -42,6 +42,8 @@
 //!
 //! * The MUL/FMUL result is used exactly once (the subsequent ADD/SUB).
 //! * Both instructions are in the same machine block.
+//! * FP fusion does not cross a direct or indirect call, because a call may
+//!   observe or change the floating-point environment.
 //!
 //! After fusion the multiply is removed and the add/sub is replaced
 //! with the three-source instruction.
@@ -92,31 +94,16 @@ fn fma_fusion(mf: &mut MachineFunction) {
 }
 
 fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<VRegId, usize>) {
-    let block = &mf.blocks[mb_idx];
-
-    // Map: vreg defined by a fmul instruction → (block-instruction-index, precision)
-    #[derive(Clone, Copy)]
+    // Map: vreg defined by an eligible preceding fmul instruction →
+    // (block-instruction-index, precision). Calls clear the map because
+    // contracting across one would move the multiply past an operation that
+    // may observe or change floating-point status and rounding state.
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Prec {
         S,
         D,
     }
     let mut fmul_defs: HashMap<VRegId, (usize, Prec)> = HashMap::new();
-
-    for (i, inst) in block.insts.iter().enumerate() {
-        match inst.opcode {
-            ArmOpcode::FmulS => {
-                if let Some(d) = inst.def {
-                    fmul_defs.insert(d, (i, Prec::S));
-                }
-            }
-            ArmOpcode::FmulD => {
-                if let Some(d) = inst.def {
-                    fmul_defs.insert(d, (i, Prec::D));
-                }
-            }
-            _ => {}
-        }
-    }
 
     // Collect fusions to apply (instruction index → replacement info).
     // Each entry: (fadd/fsub_idx, fmul_idx, new_opcode, new_operands)
@@ -133,11 +120,31 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
 
     let block = &mf.blocks[mb_idx];
     for (i, inst) in block.insts.iter().enumerate() {
-        let (is_add, is_sub, prec_s) = match inst.opcode {
-            ArmOpcode::FaddS => (true, false, true),
-            ArmOpcode::FaddD => (true, false, false),
-            ArmOpcode::FsubS => (false, true, true),
-            ArmOpcode::FsubD => (false, true, false),
+        match inst.opcode {
+            ArmOpcode::FmulS => {
+                if let Some(dest) = inst.def {
+                    fmul_defs.insert(dest, (i, Prec::S));
+                }
+                continue;
+            }
+            ArmOpcode::FmulD => {
+                if let Some(dest) = inst.def {
+                    fmul_defs.insert(dest, (i, Prec::D));
+                }
+                continue;
+            }
+            ArmOpcode::Bl | ArmOpcode::Blr => {
+                fmul_defs.clear();
+                continue;
+            }
+            _ => {}
+        }
+
+        let (is_add, is_sub, precision) = match inst.opcode {
+            ArmOpcode::FaddS => (true, false, Prec::S),
+            ArmOpcode::FaddD => (true, false, Prec::D),
+            ArmOpcode::FsubS => (false, true, Prec::S),
+            ArmOpcode::FsubD => (false, true, Prec::D),
             _ => continue,
         };
         if inst.operands.len() < 3 {
@@ -155,21 +162,21 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
         };
 
         // Check if src0 is a single-use fmul result.
-        let try_fuse_src0 = fmul_defs
-            .get(&src0)
-            .filter(|_| use_count.get(&src0).copied().unwrap_or(0) == 1);
+        let try_fuse_src0 = fmul_defs.get(&src0).copied().filter(|(_, mul_precision)| {
+            *mul_precision == precision && use_count.get(&src0).copied().unwrap_or(0) == 1
+        });
         // Check if src1 is a single-use fmul result.
         let try_fuse_src1 = if is_add {
-            fmul_defs
-                .get(&src1)
-                .filter(|_| use_count.get(&src1).copied().unwrap_or(0) == 1)
+            fmul_defs.get(&src1).copied().filter(|(_, mul_precision)| {
+                *mul_precision == precision && use_count.get(&src1).copied().unwrap_or(0) == 1
+            })
         } else {
             None // fsub(c, fmul(a,b)): src0=c, src1=fmul → handled separately
         };
 
         if is_add {
             // fadd(fmul(a,b), c) → FMADD(a, b, c)
-            if let Some(&(mul_idx, _)) = try_fuse_src0 {
+            if let Some((mul_idx, _)) = try_fuse_src0 {
                 let mul_inst = &block.insts[mul_idx];
                 let n = match &mul_inst.operands[1] {
                     MachineOperand::VReg(v) => *v,
@@ -179,7 +186,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
                     MachineOperand::VReg(v) => *v,
                     _ => continue,
                 };
-                let opcode = if prec_s {
+                let opcode = if precision == Prec::S {
                     ArmOpcode::FmaddS
                 } else {
                     ArmOpcode::FmaddD
@@ -192,7 +199,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
                     m,
                     a: src1,
                 });
-            } else if let Some(&(mul_idx, _)) = try_fuse_src1 {
+            } else if let Some((mul_idx, _)) = try_fuse_src1 {
                 // fadd(c, fmul(a,b)) → FMADD(a, b, c)  [commuted]
                 let mul_inst = &block.insts[mul_idx];
                 let n = match &mul_inst.operands[1] {
@@ -203,7 +210,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
                     MachineOperand::VReg(v) => *v,
                     _ => continue,
                 };
-                let opcode = if prec_s {
+                let opcode = if precision == Prec::S {
                     ArmOpcode::FmaddS
                 } else {
                     ArmOpcode::FmaddD
@@ -219,7 +226,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
             }
         } else if is_sub {
             // fsub(fmul(a,b), c) → FNMSUB(a, b, c)  [result = a*b - c]
-            if let Some(&(mul_idx, _)) = try_fuse_src0 {
+            if let Some((mul_idx, _)) = try_fuse_src0 {
                 let mul_inst = &block.insts[mul_idx];
                 let n = match &mul_inst.operands[1] {
                     MachineOperand::VReg(v) => *v,
@@ -229,7 +236,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
                     MachineOperand::VReg(v) => *v,
                     _ => continue,
                 };
-                let opcode = if prec_s {
+                let opcode = if precision == Prec::S {
                     ArmOpcode::FnmsubS
                 } else {
                     ArmOpcode::FnmsubD
@@ -249,10 +256,10 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
                 // consumes only src0. Planning both fusions for one FSub
                 // would remove both multiplies even though the surviving
                 // fused instruction still needs one of them as input.
-                let try_fuse_sub1 = fmul_defs
-                    .get(&src1)
-                    .filter(|_| use_count.get(&src1).copied().unwrap_or(0) == 1);
-                if let Some(&(mul_idx, _)) = try_fuse_sub1 {
+                let try_fuse_sub1 = fmul_defs.get(&src1).copied().filter(|(_, mul_precision)| {
+                    *mul_precision == precision && use_count.get(&src1).copied().unwrap_or(0) == 1
+                });
+                if let Some((mul_idx, _)) = try_fuse_sub1 {
                     let mul_inst = &block.insts[mul_idx];
                     let n = match &mul_inst.operands[1] {
                         MachineOperand::VReg(v) => *v,
@@ -262,7 +269,7 @@ fn fma_fuse_block(mf: &mut MachineFunction, mb_idx: usize, use_count: &HashMap<V
                         MachineOperand::VReg(v) => *v,
                         _ => continue,
                     };
-                    let opcode = if prec_s {
+                    let opcode = if precision == Prec::S {
                         ArmOpcode::FmsubS
                     } else {
                         ArmOpcode::FmsubD
@@ -1103,6 +1110,114 @@ mod tests {
         assert_eq!(block.insts[0].operands[1], vreg(1));
         assert_eq!(block.insts[0].operands[2], vreg(2));
         assert_eq!(block.insts[0].operands[3], vreg(3));
+    }
+
+    #[test]
+    fn fma_fusion_does_not_move_multiply_across_direct_call() {
+        let fmul = MachineInst {
+            opcode: ArmOpcode::FmulD,
+            operands: vec![vreg(0), vreg(1), vreg(2)],
+            def: Some(vid(0)),
+        };
+        let call = MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::GlobalLabel("observe_fp_state".into())],
+            def: None,
+        };
+        let fadd = MachineInst {
+            opcode: ArmOpcode::FaddD,
+            operands: vec![vreg(4), vreg(0), vreg(3)],
+            def: Some(vid(4)),
+        };
+        let mut mf = mf_with_insts(vec![fmul, call, fadd]);
+
+        fma_fusion(&mut mf);
+
+        let opcodes: Vec<_> = mf.blocks[0].insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            [ArmOpcode::FmulD, ArmOpcode::Bl, ArmOpcode::FaddD],
+            "a call may observe or change FP state, so fusion must not move the multiply across it"
+        );
+    }
+
+    #[test]
+    fn fma_fusion_does_not_move_multiply_across_indirect_call() {
+        let fmul = MachineInst {
+            opcode: ArmOpcode::FmulD,
+            operands: vec![vreg(0), vreg(1), vreg(2)],
+            def: Some(vid(0)),
+        };
+        let call = MachineInst {
+            opcode: ArmOpcode::Blr,
+            operands: vec![vreg(9)],
+            def: None,
+        };
+        let fsub = MachineInst {
+            opcode: ArmOpcode::FsubD,
+            operands: vec![vreg(4), vreg(3), vreg(0)],
+            def: Some(vid(4)),
+        };
+        let mut mf = mf_with_insts(vec![fmul, call, fsub]);
+
+        fma_fusion(&mut mf);
+
+        let opcodes: Vec<_> = mf.blocks[0].insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            [ArmOpcode::FmulD, ArmOpcode::Blr, ArmOpcode::FsubD],
+            "indirect calls are floating-point motion barriers too"
+        );
+    }
+
+    #[test]
+    fn fma_fusion_restarts_after_call_barrier() {
+        let call = MachineInst {
+            opcode: ArmOpcode::Bl,
+            operands: vec![MachineOperand::GlobalLabel("change_fp_state".into())],
+            def: None,
+        };
+        let fmul = MachineInst {
+            opcode: ArmOpcode::FmulD,
+            operands: vec![vreg(0), vreg(1), vreg(2)],
+            def: Some(vid(0)),
+        };
+        let fadd = MachineInst {
+            opcode: ArmOpcode::FaddD,
+            operands: vec![vreg(4), vreg(0), vreg(3)],
+            def: Some(vid(4)),
+        };
+        let mut mf = mf_with_insts(vec![call, fmul, fadd]);
+
+        fma_fusion(&mut mf);
+
+        let opcodes: Vec<_> = mf.blocks[0].insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            [ArmOpcode::Bl, ArmOpcode::FmaddD],
+            "a preceding call must not disable a fresh post-call contraction"
+        );
+    }
+
+    #[test]
+    fn fma_fusion_requires_matching_precision() {
+        let fmul = MachineInst {
+            opcode: ArmOpcode::FmulS,
+            operands: vec![vreg(0), vreg(1), vreg(2)],
+            def: Some(vid(0)),
+        };
+        let fadd = MachineInst {
+            opcode: ArmOpcode::FaddD,
+            operands: vec![vreg(4), vreg(0), vreg(3)],
+            def: Some(vid(4)),
+        };
+        let mut mf = mf_with_insts(vec![fmul, fadd]);
+
+        fma_fusion(&mut mf);
+
+        assert_eq!(mf.blocks[0].insts.len(), 2);
+        assert_eq!(mf.blocks[0].insts[0].opcode, ArmOpcode::FmulS);
+        assert_eq!(mf.blocks[0].insts[1].opcode, ArmOpcode::FaddD);
     }
 
     /// fadd(v3, fmul(v1, v2)) → fmadd(v1, v2, v3)  [commuted]
