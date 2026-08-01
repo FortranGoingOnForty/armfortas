@@ -103,7 +103,7 @@ mod unix {
             "{script} did not report the erased compilation evidence:\n{stderr}"
         );
         assert!(
-            stderr.contains("expected 1486 checked assemblies, got 0"),
+            stderr.contains("expected 1488 checked assemblies, got 0"),
             "{script} did not enforce the exact checked-assembly count:\n{stderr}"
         );
     }

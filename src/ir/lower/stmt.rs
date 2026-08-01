@@ -276,6 +276,55 @@ fn emit_raw_scalar_allocate_initialization(
     }
 }
 
+fn emit_scalar_pointer_deallocation(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    slot: ValueId,
+    layout: Option<&crate::sema::type_layout::TypeLayout>,
+    stat_addr: ValueId,
+    runtime_stat_arg: ValueId,
+) {
+    if let Some(layout) = layout {
+        let needs_lifecycle = derived_layout_needs_finalization(layout, ctx.type_layouts)
+            || derived_layout_needs_component_deallocation(layout, ctx.type_layouts);
+        if needs_lifecycle {
+            // The runtime validates and frees the pointer target, but it cannot
+            // invoke source-level FINAL procedures or walk typed components.
+            // Guard the generated lifecycle work with the same association
+            // state that the runtime checks so a failing DEALLOCATE never
+            // dereferences an unassociated pointer.
+            let target = b.load_typed(slot, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+            let target_raw = b.ptr_to_int(target);
+            let zero = b.const_i64(0);
+            let associated = b.icmp(CmpOp::Ne, target_raw, zero);
+            let cleanup_bb = b.create_block("pointer_dealloc_cleanup");
+            let done_bb = b.create_block("pointer_dealloc_cleanup_done");
+            b.cond_branch(associated, cleanup_bb, vec![], done_bb, vec![]);
+
+            b.set_block(cleanup_bb);
+            finalize_derived_storage(
+                b,
+                ctx.st,
+                ctx.internal_funcs,
+                Some(ctx.contained_host_refs),
+                &ctx.locals,
+                ctx.type_layouts,
+                layout,
+                target,
+            );
+            deallocate_derived_storage_components(b, target, layout, ctx.type_layouts, stat_addr);
+            b.branch(done_bb, vec![]);
+            b.set_block(done_bb);
+        }
+    }
+
+    b.call(
+        FuncRef::External("afs_deallocate_pointer".into()),
+        vec![slot, runtime_stat_arg],
+        IrType::Void,
+    );
+}
+
 fn finalize_assignment_lhs(b: &mut FuncBuilder, ctx: &LowerCtx, type_name: &str, dest: ValueId) {
     if let Some(layout) = ctx.type_layouts.get(type_name) {
         finalize_derived_storage(
@@ -8667,10 +8716,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             continue;
                         }
                         if field.pointer {
-                            b.call(
-                                FuncRef::External("afs_deallocate_pointer".into()),
-                                vec![field_ptr, runtime_stat_arg],
-                                IrType::Void,
+                            let pointer_layout =
+                                field_derived_type_name(&field).and_then(|type_name| {
+                                    ctx.type_layouts.get_related(field_owner, &type_name)
+                                });
+                            emit_scalar_pointer_deallocation(
+                                b,
+                                ctx,
+                                field_ptr,
+                                pointer_layout,
+                                stat_addr,
+                                runtime_stat_arg,
                             );
                             emit_runtime_errmsg_on_failure(
                                 b,
@@ -8752,10 +8808,17 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 info.addr
                             };
-                            b.call(
-                                FuncRef::External("afs_deallocate_pointer".into()),
-                                vec![slot, runtime_stat_arg],
-                                IrType::Void,
+                            let pointer_layout = info
+                                .derived_type
+                                .as_deref()
+                                .and_then(|type_name| ctx.type_layouts.get(type_name));
+                            emit_scalar_pointer_deallocation(
+                                b,
+                                ctx,
+                                slot,
+                                pointer_layout,
+                                stat_addr,
+                                runtime_stat_arg,
                             );
                             emit_runtime_errmsg_on_failure(
                                 b,
