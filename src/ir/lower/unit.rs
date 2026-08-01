@@ -231,10 +231,9 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&decl_spec_import_names),
+                    &decl_spec_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 super::alloc::alloc_decls(
                     &mut b,
@@ -252,15 +251,15 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&required_import_names),
+                    &required_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(
                     globals,
                     &combined_uses,
                     decls,
+                    &required_import_names,
                     ctx.st,
                     ctx.proc_scope_id,
                 );
@@ -788,10 +787,9 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&decl_spec_import_names),
+                    &decl_spec_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 super::alloc::alloc_decls(
                     &mut b,
@@ -809,15 +807,15 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&required_import_names),
+                    &required_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(
                     globals,
                     &combined_uses,
                     decls,
+                    &required_import_names,
                     ctx.st,
                     ctx.proc_scope_id,
                 );
@@ -1644,10 +1642,9 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&decl_spec_import_names),
+                    &decl_spec_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                     if let Some(info) = ctx.locals.get(&result_name).cloned() {
@@ -1723,15 +1720,15 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&required_import_names),
+                    &required_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(
                     globals,
                     &combined_uses,
                     decls,
+                    &required_import_names,
                     ctx.st,
                     ctx.proc_scope_id,
                 );

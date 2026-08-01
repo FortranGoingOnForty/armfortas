@@ -92,123 +92,6 @@ pub fn lower_file(
         }
     }
 
-    // Pass 1.1: propagate transitively-visible globals through USE chains.
-    // When module A USEs module B and re-exports B's symbols (PUBLIC), make
-    // them accessible as (A, var) in the globals map so a `program p; use A`
-    // compiled against A's .amod alone can resolve them. Pollution-free
-    // version: only propagate if the importing module actually re-exports
-    // the symbol — otherwise `use stdlib_ascii, only : digits` in a
-    // PRIVATE-default test module would shadow stdlib_ascii's own
-    // `(stdlib_ascii, digits)` global with a duplicate (A, digits) and
-    // trip "ambiguous USE import" warnings during host-scope install.
-    for unit in units {
-        if let ProgramUnit::Module { name, uses, .. } = &unit.node {
-            let mod_key = name.to_lowercase();
-            let Some(mod_scope_id) = st.find_module_scope(&mod_key) else {
-                continue;
-            };
-            let default_public = !matches!(
-                st.default_access(mod_scope_id),
-                crate::sema::symtab::Access::Private
-            );
-            let access_for = |local_name: &str| -> bool {
-                // F2018 §11.2.2: USE-imported names inherit the importing
-                // module's default access unless explicitly listed in
-                // `public ::` / `private ::`. A symbol absent from the
-                // importing scope's symbol table is governed by the
-                // module-level default.
-                match st.scope(mod_scope_id).symbols.get(local_name) {
-                    Some(sym) => !matches!(sym.attrs.access, crate::sema::symtab::Access::Private),
-                    None => default_public,
-                }
-            };
-            let mut to_add: Vec<((String, String), ModuleGlobalInfo)> = Vec::new();
-            for use_decl in uses {
-                let Decl::UseStmt {
-                    module: src_module,
-                    only,
-                    renames,
-                    ..
-                } = &use_decl.node
-                else {
-                    continue;
-                };
-                let src_mod_key = src_module.to_lowercase();
-                if src_mod_key == mod_key {
-                    continue;
-                }
-                if let Some(only_list) = only {
-                    use crate::ast::decl::OnlyItem;
-                    for item in only_list {
-                        let (local_lc, var_lc) = match item {
-                            OnlyItem::Name(n) | OnlyItem::Generic(n) => {
-                                let lc = n.to_lowercase();
-                                (lc.clone(), lc)
-                            }
-                            OnlyItem::Rename(rn) => {
-                                (rn.local.to_lowercase(), rn.remote.to_lowercase())
-                            }
-                        };
-                        if !access_for(&local_lc) {
-                            continue;
-                        }
-                        let src_key = (src_mod_key.clone(), var_lc);
-                        let new_key = (mod_key.clone(), local_lc);
-                        if let Some(info) = globals.get(&src_key) {
-                            if !globals.contains_key(&new_key) {
-                                to_add.push((new_key, info.clone()));
-                            }
-                        }
-                    }
-                } else {
-                    // USE without ONLY: import everything currently visible
-                    // through the source module — including names the source
-                    // module re-exports via its own USE associations (Pass
-                    // 1.1 already populated those entries when iterating the
-                    // source module earlier in unit order).
-                    let rename_targets: std::collections::HashSet<String> =
-                        renames.iter().map(|r| r.remote.to_lowercase()).collect();
-                    let candidates: Vec<(String, ModuleGlobalInfo)> = globals
-                        .iter()
-                        .filter_map(|((mk, var), info)| {
-                            if *mk == src_mod_key && !rename_targets.contains(var) {
-                                Some((var.clone(), info.clone()))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for (var, info) in candidates {
-                        if !access_for(&var) {
-                            continue;
-                        }
-                        let new_key = (mod_key.clone(), var);
-                        if !globals.contains_key(&new_key) {
-                            to_add.push((new_key, info));
-                        }
-                    }
-                    for rn in renames {
-                        let local_lc = rn.local.to_lowercase();
-                        let var_lc = rn.remote.to_lowercase();
-                        if !access_for(&local_lc) {
-                            continue;
-                        }
-                        let src_key = (src_mod_key.clone(), var_lc);
-                        let new_key = (mod_key.clone(), local_lc);
-                        if let Some(info) = globals.get(&src_key) {
-                            if !globals.contains_key(&new_key) {
-                                to_add.push((new_key, info.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-            for (key, info) in to_add {
-                globals.insert(key, info);
-            }
-        }
-    }
-
     // Pass 1.5: walk every program unit (and its `contains` chain)
     // and collect the names of functions whose result variable is
     // declared `allocatable`. Audit6 BLOCKING-1: these need a hidden
@@ -8270,15 +8153,15 @@ pub(super) fn check_filtered_in_acvalue(v: &crate::ast::expr::AcValue, filtered:
     }
 }
 
-/// Walk the function's USE statements and collect every name
-/// from a USE-only-imported module that the only-list filtered
-/// out. Audit MAJOR-1: those names must NOT silently fall
-/// through to const_int 0; the lowerer treats them as undefined
-/// at the reference site.
+/// Check the names actually referenced by the function and collect those
+/// excluded by a USE ONLY list. Audit MAJOR-1: those names must NOT silently
+/// fall through to const_int 0; the lowerer treats them as undefined at the
+/// reference site.
 pub(super) fn compute_filtered_names(
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
     local_decls: &[crate::ast::decl::SpannedDecl],
+    required_names: &HashSet<String>,
     st: &SymbolTable,
     proc_scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> HashSet<String> {
@@ -8319,83 +8202,46 @@ pub(super) fn compute_filtered_names(
     for decl in uses {
         let Decl::UseStmt {
             module,
-            only,
-            renames,
-            ..
-        } = &decl.node
-        else {
-            continue;
-        };
-        let mod_key = module.to_lowercase();
-        if let Some(only_list) = only {
-            for item in only_list {
-                match item {
-                    OnlyItem::Name(n) => {
-                        visible_local_names.insert(n.to_lowercase());
-                    }
-                    OnlyItem::Generic(n) => {
-                        visible_local_names.insert(n.to_lowercase());
-                    }
-                    OnlyItem::Rename(rn) => {
-                        visible_local_names.insert(rn.local.to_lowercase());
-                    }
-                }
-            }
-        } else {
-            for ((mk, var), info) in globals.iter() {
-                if *mk == mod_key && !info.private {
-                    visible_local_names.insert(var.clone());
-                }
-            }
-            for rn in renames {
-                visible_local_names.insert(rn.local.to_lowercase());
-            }
-        }
-    }
-
-    for decl in uses {
-        let Decl::UseStmt {
-            module,
+            nature,
             only: Some(only_list),
             ..
         } = &decl.node
         else {
             continue;
         };
-        let mod_key = module.to_lowercase();
-        // The set of names this module exports (limited to what
-        // collect_module_globals registered — module functions and
-        // derived types are tracked elsewhere and remain visible).
-        // Private vars are stored in `globals` for submodule access
-        // but never visible to USE; skip them so a name shadow on the
-        // local side doesn't trip the filter.
-        let mut exports: HashSet<String> = HashSet::new();
-        for ((mk, var), info) in globals.iter() {
-            if *mk == mod_key && !info.private {
-                exports.insert(var.clone());
-            }
-        }
-        // The set of (lowercase) names the only-list explicitly
-        // imports. A rename's `remote` is what's pulled from the
-        // module; a Name is itself.
-        let mut imported: HashSet<String> = HashSet::new();
+        let Some(module_scope_id) = resolved_use_module_scope(st, module, *nature) else {
+            continue;
+        };
+        let mut imported_local_names: HashSet<String> = HashSet::new();
         for item in only_list {
             match item {
-                OnlyItem::Name(n) => {
-                    imported.insert(n.to_lowercase());
-                }
-                OnlyItem::Generic(n) => {
-                    imported.insert(n.to_lowercase());
+                OnlyItem::Name(n) | OnlyItem::Generic(n) => {
+                    imported_local_names.insert(n.to_lowercase());
                 }
                 OnlyItem::Rename(rn) => {
-                    imported.insert(rn.remote.to_lowercase());
+                    imported_local_names.insert(rn.local.to_lowercase());
                 }
             }
         }
-        // Anything in exports but not imported is now filtered.
-        for e in &exports {
-            if !imported.contains(e) && !visible_local_names.contains(e) {
-                filtered.insert(e.clone());
+
+        for name in required_names {
+            if visible_local_names.contains(name)
+                || imported_local_names.contains(name)
+                || proc_scope_id.is_some_and(|scope_id| st.lookup_in(scope_id, name).is_some())
+            {
+                continue;
+            }
+            if !st.scope_exports_name(module_scope_id, name) {
+                continue;
+            }
+            let Some(symbol) = st.lookup_in(module_scope_id, name) else {
+                continue;
+            };
+            let Some(source_module) = module_scope_name_for_symbol(st, symbol.scope) else {
+                continue;
+            };
+            if globals.contains_key(&(source_module, symbol.name.to_lowercase())) {
+                filtered.insert(name.clone());
             }
         }
     }
@@ -8592,57 +8438,171 @@ fn module_scope_name_for_symbol(
     }
 }
 
-fn resolve_exported_global_key(
+fn defining_global_key(
     st: &SymbolTable,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
-    mod_key: &str,
-    local_key: &str,
+    symbol: &crate::sema::symtab::Symbol,
 ) -> Option<(String, String)> {
-    let direct_key = (mod_key.to_string(), local_key.to_string());
-    if globals.contains_key(&direct_key) {
-        return Some(direct_key);
-    }
-
-    let mod_scope_id = st.find_module_scope(mod_key)?;
-    if !st.scope_exports_name(mod_scope_id, local_key) {
+    // Intrinsic and non-intrinsic modules may legally share a source name.
+    // The globals registry contains object-backed user/.amod entities, while
+    // intrinsic-module named constants live only in the symbol table. Do not
+    // let an intrinsic symbol bind to a same-named user module's global.
+    if st.scope(symbol.scope).intrinsic_module {
         return None;
     }
-    let sym = st.lookup_in(mod_scope_id, local_key)?;
-    let source_mod = module_scope_name_for_symbol(st, sym.scope)?;
-    let source_key = (source_mod, sym.name.to_lowercase());
-    globals.contains_key(&source_key).then_some(source_key)
+    let source_module = module_scope_name_for_symbol(st, symbol.scope)?;
+    let key = (source_module, symbol.name.to_lowercase());
+    globals.contains_key(&key).then_some(key)
 }
 
-fn resolve_visible_global_key(
+fn use_decl_bindings_for_name(
     st: &SymbolTable,
-    globals: &HashMap<(String, String), ModuleGlobalInfo>,
-    scope_id: crate::sema::symtab::ScopeId,
+    uses: &[crate::ast::decl::SpannedDecl],
+    key: &str,
+) -> Vec<(crate::sema::symtab::ScopeId, String)> {
+    use crate::ast::decl::OnlyItem;
+
+    let mut bindings = Vec::new();
+    for use_decl in uses {
+        let Decl::UseStmt {
+            module,
+            nature,
+            renames,
+            only,
+        } = &use_decl.node
+        else {
+            continue;
+        };
+        let Some(source_scope) = resolved_use_module_scope(st, module, *nature) else {
+            continue;
+        };
+        let mut original_names = Vec::new();
+        if let Some(only_items) = only {
+            for item in only_items {
+                match item {
+                    OnlyItem::Name(name) | OnlyItem::Generic(name)
+                        if name.eq_ignore_ascii_case(key) =>
+                    {
+                        original_names.push(name.to_ascii_lowercase());
+                    }
+                    OnlyItem::Rename(rename) if rename.local.eq_ignore_ascii_case(key) => {
+                        original_names.push(rename.remote.to_ascii_lowercase());
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            let mut locally_renamed = false;
+            let mut remote_renamed = false;
+            for rename in renames {
+                if rename.local.eq_ignore_ascii_case(key) {
+                    original_names.push(rename.remote.to_ascii_lowercase());
+                    locally_renamed = true;
+                }
+                if rename.remote.eq_ignore_ascii_case(key) {
+                    remote_renamed = true;
+                }
+            }
+            if !locally_renamed && !remote_renamed {
+                original_names.push(key.to_string());
+            }
+        }
+        bindings.extend(
+            original_names
+                .into_iter()
+                .map(|original_name| (source_scope, original_name)),
+        );
+    }
+    bindings
+}
+
+fn resolve_symbol_from_use_decls<'a>(
+    st: &'a SymbolTable,
+    uses: &[crate::ast::decl::SpannedDecl],
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    use_decl_bindings_for_name(st, uses, key)
+        .into_iter()
+        .find_map(|(source_scope, original_name)| {
+            if st.scope_exports_name(source_scope, &original_name) {
+                st.lookup_in(source_scope, &original_name)
+            } else {
+                None
+            }
+        })
+}
+
+fn named_module_or_submodule_scope(
+    st: &SymbolTable,
+    name: &str,
+) -> Option<crate::sema::symtab::ScopeId> {
+    st.find_module_scope(name).or_else(|| {
+        st.all_scopes().iter().find_map(|scope| match &scope.kind {
+            crate::sema::symtab::ScopeKind::Submodule(scope_name)
+                if scope_name.eq_ignore_ascii_case(name) =>
+            {
+                Some(scope.id)
+            }
+            _ => None,
+        })
+    })
+}
+
+fn resolve_required_global_symbol<'a>(
+    st: &'a SymbolTable,
+    uses: &[crate::ast::decl::SpannedDecl],
     local_key: &str,
-) -> Option<(String, String)> {
-    let sym = st.lookup_in(scope_id, local_key)?;
-    let source_mod = module_scope_name_for_symbol(st, sym.scope)?;
-    let source_key = (source_mod, sym.name.to_lowercase());
-    globals.contains_key(&source_key).then_some(source_key)
+    host_module: Option<&str>,
+    extra_host: Option<&str>,
+    respect_host_association_policy: bool,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    if !respect_host_association_policy {
+        return resolve_symbol_from_use_decls(st, uses, local_key);
+    }
+
+    if let Some(scope_id) = current_proc_scope() {
+        if let Some(symbol) = st.lookup_in(scope_id, local_key) {
+            return Some(symbol);
+        }
+        if st.host_association_is_restricted(scope_id) {
+            return None;
+        }
+    }
+
+    if let Some(symbol) = resolve_symbol_from_use_decls(st, uses, local_key) {
+        return Some(symbol);
+    }
+    for host in [extra_host, host_module].into_iter().flatten() {
+        let Some(scope_id) = named_module_or_submodule_scope(st, host) else {
+            continue;
+        };
+        if let Some(symbol) = st.lookup_in(scope_id, local_key) {
+            return Some(symbol);
+        }
+    }
+    None
 }
 
-fn global_keys_resolve_to_same_symbol(
+fn install_resolved_global_import(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    local_key: String,
+    symbol: &crate::sema::symtab::Symbol,
     st: &SymbolTable,
-    left: &(String, String),
-    right: &(String, String),
-) -> bool {
-    let Some(left_scope) = st.find_module_scope(&left.0) else {
-        return false;
+) {
+    if locals.contains_key(&local_key) {
+        return;
+    }
+    let Some(global_key) = defining_global_key(st, globals, symbol) else {
+        install_parameter_inline_const(b, locals, local_key, symbol);
+        return;
     };
-    let Some(right_scope) = st.find_module_scope(&right.0) else {
-        return false;
-    };
-    let Some(left_symbol) = st.lookup_in(left_scope, &left.1) else {
-        return false;
-    };
-    let Some(right_symbol) = st.lookup_in(right_scope, &right.1) else {
-        return false;
-    };
-    std::ptr::eq(left_symbol, right_symbol)
+    let info = &globals[&global_key];
+    if install_global_inline_const(b, locals, local_key.clone(), info) {
+        return;
+    }
+    install_one_global(b, locals, local_key, info, symbol.attrs.array_spec.len());
 }
 
 /// Install module globals imported by this function's USE
@@ -8650,10 +8610,8 @@ fn global_keys_resolve_to_same_symbol(
 ///   * USE ONLY filtering — only names in the only-list are installed
 ///   * Renames — both forms, `use m, only: y => x` and
 ///     `use m, x => y` (non-only rename)
-///   * Cross-module collision detection — if two modules bring in
-///     the same local key through their use list, the emitted IR
-///     would resolve ambiguously; validation diagnoses referenced
-///     collisions before this recovery path runs.
+///   * Ambiguity safety — validation rejects referenced collisions before
+///     this resolution path runs.
 ///
 /// Audit C2/C3/C4: previously this function installed every
 /// global regardless of any USE statement, ignored ONLY filtering,
@@ -8664,10 +8622,9 @@ pub(super) fn install_globals_as_locals(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
-    required_names: Option<&HashSet<String>>,
+    required_names: &HashSet<String>,
     host_module: Option<&str>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
     let extra = current_smp_extra_host();
     install_globals_as_locals_in(
@@ -8679,7 +8636,6 @@ pub(super) fn install_globals_as_locals(
         host_module,
         extra.as_deref(),
         st,
-        ambiguous_use_warnings,
         true,
     );
 }
@@ -8691,18 +8647,16 @@ pub(super) fn install_block_globals_as_locals(
     uses: &[crate::ast::decl::SpannedDecl],
     required_names: &HashSet<String>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
     install_globals_as_locals_in(
         b,
         locals,
         globals,
         uses,
-        Some(required_names),
+        required_names,
         None,
         None,
         st,
-        ambiguous_use_warnings,
         false,
     );
 }
@@ -8713,369 +8667,29 @@ pub(super) fn install_globals_as_locals_in(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
-    required_names: Option<&HashSet<String>>,
+    required_names: &HashSet<String>,
     host_module: Option<&str>,
     extra_host: Option<&str>,
     st: &SymbolTable,
-    _ambiguous_use_warnings: &AmbiguousUseWarnings,
     respect_host_association_policy: bool,
 ) {
-    use crate::ast::decl::OnlyItem;
-    use crate::sema::symtab::ScopeId;
-
-    struct PendingGlobalImport {
-        local_key: String,
-        module_key: String,
-        symbol_key: String,
-        source_scope: Option<ScopeId>,
-    }
-
-    // Sorted per-use iteration so the emitted global_addr
-    // instructions land in deterministic order. Audit B-3 holds
-    // across this path too.
-    //
-    // The two-pass pattern:
-    //   1. Enumerate each local key with its module key, original symbol key,
-    //      and exact source scope when USE resolution supplied one.
-    //   2. Sort by local-scope key.
-    //   3. Install in order, checking for collision before inserting.
-    let mut pending: Vec<PendingGlobalImport> = Vec::new();
-
-    if let Some(module_name) = host_module {
-        let mod_key = module_name.to_lowercase();
-        // Build the host-scope chain. For a submodule helper, host_module
-        // is the submodule's own name, but the helper still has F2018
-        // §11.2.3 host-association access to the parent module's globals.
-        // Walk the submodule's `is_submodule_access` USE entry to find
-        // the parent module so its globals get imported here too.
-        let mut host_chain: Vec<String> = vec![mod_key.clone()];
-        // SMP body extra: link name uses the parent module's prefix, but
-        // the body still needs to see its containing submodule's locals.
-        // Caller passes the submodule name as `extra_host` so we can pull
-        // those globals in alongside the parent's.
-        if let Some(extra) = extra_host {
-            let extra_lc = extra.to_lowercase();
-            if !host_chain.contains(&extra_lc) {
-                host_chain.push(extra_lc);
-            }
-        }
-        if st.find_module_scope(&mod_key).is_none() {
-            for scope in st.all_scopes() {
-                if let crate::sema::symtab::ScopeKind::Submodule(n) = &scope.kind {
-                    if n.eq_ignore_ascii_case(&mod_key) {
-                        for assoc in &scope.use_associations {
-                            if !assoc.is_submodule_access {
-                                continue;
-                            }
-                            let src_scope = st.scope(assoc.source_scope);
-                            if let crate::sema::symtab::ScopeKind::Module(parent_name) =
-                                &src_scope.kind
-                            {
-                                let parent_lc = parent_name.to_lowercase();
-                                if !host_chain.contains(&parent_lc) {
-                                    host_chain.push(parent_lc);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        for host_lc in &host_chain {
-            for (mk, var) in globals.keys() {
-                if *mk == *host_lc && !pending.iter().any(|binding| binding.local_key == *var) {
-                    pending.push(PendingGlobalImport {
-                        local_key: var.clone(),
-                        module_key: host_lc.clone(),
-                        symbol_key: var.clone(),
-                        source_scope: None,
-                    });
-                }
-            }
-            // F2018 §11.2.3: a submodule sees every entity its host module
-            // sees, including names brought into the host via USE. Walk
-            // each host scope's UseAssociations and install the source
-            // globals under the local-name the host knows them by.
-            // Without this, a submodule reference to e.g. `one_sp` (from
-            // `use stdlib_constants` in the parent) misses `locals`
-            // entirely, falls into `find_symbol_any_scope` + the
-            // `const_i32(0)` fallback in `Expr::Name`, and breaks generic
-            // dispatch with the wrong IR type.
-            if let Some(host_scope_id) = st.find_module_scope(host_lc) {
-                for assoc in &st.scope(host_scope_id).use_associations {
-                    if assoc.is_submodule_access {
-                        continue;
-                    }
-                    let src_scope = st.scope(assoc.source_scope);
-                    let src_mod_key = match &src_scope.kind {
-                        crate::sema::symtab::ScopeKind::Module(n)
-                        | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
-                        _ => continue,
-                    };
-                    if src_mod_key == *host_lc {
-                        continue;
-                    }
-                    let var_lc = assoc.original_name.to_lowercase();
-                    let local_lc = assoc.local_name.to_lowercase();
-                    if globals.contains_key(&(src_mod_key.clone(), var_lc.clone()))
-                        && !pending.iter().any(|binding| binding.local_key == local_lc)
-                    {
-                        pending.push(PendingGlobalImport {
-                            local_key: local_lc,
-                            module_key: src_mod_key,
-                            symbol_key: var_lc,
-                            source_scope: Some(assoc.source_scope),
-                        });
-                    }
-                }
-                if let Some(required) = required_names {
-                    for local_lc in required {
-                        if pending.iter().any(|binding| binding.local_key == *local_lc) {
-                            continue;
-                        }
-                        if let Some(resolved_key) =
-                            resolve_visible_global_key(st, globals, host_scope_id, local_lc)
-                        {
-                            pending.push(PendingGlobalImport {
-                                local_key: local_lc.clone(),
-                                module_key: resolved_key.0,
-                                symbol_key: resolved_key.1,
-                                source_scope: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for decl in uses {
-        let Decl::UseStmt {
-            module,
-            nature,
-            renames,
-            only,
-        } = &decl.node
-        else {
+    let mut ordered_required: Vec<&String> = required_names.iter().collect();
+    ordered_required.sort_unstable();
+    for local_key in ordered_required {
+        if locals.contains_key(local_key) {
             continue;
-        };
-        let mod_key = module.to_lowercase();
-        let source_scope = resolved_use_module_scope(st, module, *nature);
-        let source_is_intrinsic =
-            source_scope.is_some_and(|scope_id| st.scope(scope_id).intrinsic_module);
-        if let Some(only_list) = only {
-            for item in only_list {
-                match item {
-                    OnlyItem::Name(n) => {
-                        let n_lc = n.to_lowercase();
-                        pending.push(PendingGlobalImport {
-                            local_key: n_lc.clone(),
-                            module_key: mod_key.clone(),
-                            symbol_key: n_lc,
-                            source_scope,
-                        });
-                    }
-                    OnlyItem::Generic(n) => {
-                        let n_lc = n.to_lowercase();
-                        pending.push(PendingGlobalImport {
-                            local_key: n_lc.clone(),
-                            module_key: mod_key.clone(),
-                            symbol_key: n_lc,
-                            source_scope,
-                        });
-                    }
-                    OnlyItem::Rename(rn) => {
-                        pending.push(PendingGlobalImport {
-                            local_key: rn.local.to_lowercase(),
-                            module_key: mod_key.clone(),
-                            symbol_key: rn.remote.to_lowercase(),
-                            source_scope,
-                        });
-                    }
-                }
-            }
-        } else {
-            // No ONLY list: import every name from the module,
-            // minus any rename targets (which are substituted).
-            let rename_targets: std::collections::HashSet<String> =
-                renames.iter().map(|r| r.remote.to_lowercase()).collect();
-            for (mk, var) in globals.keys() {
-                if *mk != mod_key || source_is_intrinsic {
-                    continue;
-                }
-                if rename_targets.contains(var) {
-                    continue;
-                }
-                // Skip PRIVATE symbols — only PUBLIC symbols are accessible
-                // via USE without ONLY.
-                if let Some(mod_scope_id) = source_scope {
-                    if let Some(sym) = st.scope(mod_scope_id).symbols.get(var) {
-                        if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
-                            continue;
-                        }
-                    }
-                }
-                pending.push(PendingGlobalImport {
-                    local_key: var.clone(),
-                    module_key: mod_key.clone(),
-                    symbol_key: var.clone(),
-                    source_scope,
-                });
-            }
-            if let Some(mod_scope_id) = source_scope {
-                for (_, var) in globals.keys() {
-                    if rename_targets.contains(var) {
-                        continue;
-                    }
-                    if pending.iter().any(|binding| binding.local_key == *var) {
-                        continue;
-                    }
-                    if !st.scope_exports_name(mod_scope_id, var) {
-                        continue;
-                    }
-                    if let Some(resolved_key) =
-                        resolve_exported_global_key(st, globals, &mod_key, var)
-                    {
-                        pending.push(PendingGlobalImport {
-                            local_key: var.clone(),
-                            module_key: resolved_key.0,
-                            symbol_key: resolved_key.1,
-                            source_scope,
-                        });
-                    }
-                }
-            }
-            // Also scan the SymbolTable module scope for symbols not
-            // in the globals map (e.g., PARAMETERs, which are inlined
-            // and don't generate globals).
-            if let Some(mod_scope_id) = source_scope {
-                for (sym_key, sym) in &st.scope(mod_scope_id).symbols {
-                    if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
-                        continue;
-                    }
-                    if rename_targets.contains(sym_key) {
-                        continue;
-                    }
-                    let pair = (mod_key.clone(), sym_key.clone());
-                    if !globals.contains_key(&pair)
-                        && !pending.iter().any(|binding| binding.local_key == *sym_key)
-                    {
-                        pending.push(PendingGlobalImport {
-                            local_key: sym_key.clone(),
-                            module_key: pair.0,
-                            symbol_key: pair.1,
-                            source_scope: Some(mod_scope_id),
-                        });
-                    }
-                }
-            }
-            for rn in renames {
-                pending.push(PendingGlobalImport {
-                    local_key: rn.local.to_lowercase(),
-                    module_key: mod_key.clone(),
-                    symbol_key: rn.remote.to_lowercase(),
-                    source_scope,
-                });
-            }
         }
-    }
-
-    pending.sort_by(|a, b| a.local_key.cmp(&b.local_key));
-
-    let mut installed_from: HashMap<String, (String, String)> = HashMap::new();
-    for binding in pending {
-        let PendingGlobalImport {
+        let Some(symbol) = resolve_required_global_symbol(
+            st,
+            uses,
             local_key,
-            module_key: mod_key,
-            symbol_key: var_key,
-            source_scope,
-        } = binding;
-        if let Some(required) = required_names {
-            if !required.contains(&local_key) {
-                continue;
-            }
-        }
-        if respect_host_association_policy {
-            if let Some(scope_id) = current_proc_scope() {
-                if st.host_association_is_restricted(scope_id)
-                    && st.lookup_in(scope_id, &local_key).is_none()
-                {
-                    continue;
-                }
-            }
-        }
-        let visible_intrinsic_parameter = match source_scope {
-            Some(scope_id) => st
-                .lookup_in(scope_id, &var_key)
-                .filter(|symbol| st.scope(symbol.scope).intrinsic_module),
-            None => current_proc_scope()
-                .and_then(|scope_id| st.lookup_in(scope_id, &local_key))
-                .filter(|symbol| st.scope(symbol.scope).intrinsic_module),
-        };
-        if visible_intrinsic_parameter.is_some_and(|symbol| {
-            install_parameter_inline_const(b, locals, local_key.clone(), symbol)
-        }) {
+            host_module,
+            extra_host,
+            respect_host_association_policy,
+        ) else {
             continue;
-        }
-        let resolved_global_key = resolve_exported_global_key(st, globals, &mod_key, &var_key)
-            .unwrap_or_else(|| (mod_key.clone(), var_key.clone()));
-        let source_is_intrinsic =
-            source_scope.is_some_and(|scope_id| st.scope(scope_id).intrinsic_module);
-        let global_info = if source_is_intrinsic {
-            None
-        } else {
-            globals.get(&resolved_global_key)
         };
-        if let Some(info) = global_info {
-            // Collision check: two modules exporting the same local key.
-            let resolved_mod = resolved_global_key.0.clone();
-            if let Some(previous_key) = installed_from.get(&local_key) {
-                if previous_key == &resolved_global_key
-                    || global_keys_resolve_to_same_symbol(st, previous_key, &resolved_global_key)
-                {
-                    continue;
-                }
-                if previous_key.0 != resolved_mod {
-                    // Referenced ambiguities are rejected during validation.
-                    // Collisions that remain here are unreferenced or hidden
-                    // by a more local association, so lowering keeps its
-                    // deterministic first entry without a user diagnostic.
-                    continue;
-                }
-            }
-            installed_from.insert(local_key.clone(), resolved_global_key.clone());
-            if !install_global_inline_const(b, locals, local_key.clone(), info) {
-                // Recover the declared rank from the module symbol — a
-                // deferred-shape allocatable/pointer array has no bounds in
-                // `info.dims`, so the installed LocalInfo would otherwise be
-                // rank 0 (mis-read as a scalar by generic dispatch).
-                let rank = source_scope
-                    .or_else(|| st.find_module_scope(&resolved_global_key.0))
-                    .and_then(|sid| st.lookup_in(sid, &resolved_global_key.1))
-                    .map(|sym| sym.attrs.array_spec.len())
-                    .unwrap_or(0);
-                install_one_global(b, locals, local_key, info, rank);
-            }
-        } else {
-            // Not an IR global — check if it's an intrinsic module parameter constant
-            // (iso_c_binding, iso_fortran_env). These are registered in the symbol
-            // table but never emitted as IR globals; install them as inline_const locals.
-            if let Some(mod_scope_id) = source_scope.or_else(|| st.find_module_scope(&mod_key)) {
-                if let Some(sym) = st
-                    .scope(mod_scope_id)
-                    .symbols
-                    .get(&var_key)
-                    .or_else(|| st.lookup_in(mod_scope_id, &var_key))
-                {
-                    if install_parameter_inline_const(b, locals, local_key.clone(), sym) {
-                        installed_from.insert(local_key, resolved_global_key);
-                    }
-                }
-            }
-            // If still not found (e.g., USE references a name that doesn't exist),
-            // skip silently — sema should have diagnosed it.
-        }
+        install_resolved_global_import(b, locals, globals, local_key.clone(), symbol, st);
     }
 }
 
@@ -13468,58 +13082,8 @@ fn active_block_use_bindings(
     st: &SymbolTable,
     key: &str,
 ) -> Vec<(crate::sema::symtab::ScopeId, String)> {
-    use crate::ast::decl::{Decl, OnlyItem};
-
     for uses in active_block_uses().iter().rev() {
-        let mut bindings = Vec::new();
-        for use_decl in uses {
-            let Decl::UseStmt {
-                module,
-                nature,
-                renames,
-                only,
-            } = &use_decl.node
-            else {
-                continue;
-            };
-            let Some(source_scope) = resolved_use_module_scope(st, module, *nature) else {
-                continue;
-            };
-            let mut original_names = Vec::new();
-            if let Some(only_items) = only {
-                for item in only_items {
-                    match item {
-                        OnlyItem::Name(name) | OnlyItem::Generic(name)
-                            if name.eq_ignore_ascii_case(key) =>
-                        {
-                            original_names.push(name.to_ascii_lowercase());
-                        }
-                        OnlyItem::Rename(rename) if rename.local.eq_ignore_ascii_case(key) => {
-                            original_names.push(rename.remote.to_ascii_lowercase());
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                let mut locally_renamed = false;
-                let mut remote_renamed = false;
-                for rename in renames {
-                    if rename.local.eq_ignore_ascii_case(key) {
-                        original_names.push(rename.remote.to_ascii_lowercase());
-                        locally_renamed = true;
-                    }
-                    if rename.remote.eq_ignore_ascii_case(key) {
-                        remote_renamed = true;
-                    }
-                }
-                if !locally_renamed && !remote_renamed {
-                    original_names.push(key.to_string());
-                }
-            }
-            for original_name in original_names {
-                bindings.push((source_scope, original_name));
-            }
-        }
+        let bindings = use_decl_bindings_for_name(st, uses, key);
         if !bindings.is_empty() {
             return bindings;
         }
@@ -64309,7 +63873,9 @@ mod tests {
     use crate::parser::Parser;
     use crate::sema::resolve;
 
-    fn lower_source(src: &str) -> Module {
+    fn lower_source_with_globals(
+        src: &str,
+    ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
@@ -64327,7 +63893,10 @@ mod tests {
             HashMap::new(),
             crate::target::TargetLayout::LP64,
         )
-        .0
+    }
+
+    fn lower_source(src: &str) -> Module {
+        lower_source_with_globals(src).0
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {
@@ -64344,6 +63913,44 @@ mod tests {
         );
         let ir_text = printer::print_module(&module);
         (module, ir_text)
+    }
+
+    #[test]
+    fn transitive_use_chain_keeps_only_defining_global_entries() {
+        const DEPTH: usize = 24;
+        let mut source = String::new();
+        for index in 0..DEPTH {
+            source.push_str(&format!("module chain_{index}\n"));
+            if index > 0 {
+                source.push_str(&format!("  use chain_{}\n", index - 1));
+            }
+            source.push_str(&format!(
+                "  implicit none\n  integer, save :: value_{index} = {index}\ncontains\n  subroutine read_{index}(out)\n    integer, intent(out) :: out\n    out = value_0 + value_{index}\n  end subroutine read_{index}\nend module chain_{index}\n"
+            ));
+        }
+        source.push_str(&format!(
+            "program use_chain\n  use chain_{}, only: read_{}\n  implicit none\n  integer :: out\n  call read_{}(out)\n  if (out /= {}) error stop 1\nend program use_chain\n",
+            DEPTH - 1,
+            DEPTH - 1,
+            DEPTH - 1,
+            DEPTH - 1,
+        ));
+
+        let (module, globals) = lower_source_with_globals(&source);
+        let errors = verify::verify_module(&module);
+        assert!(errors.is_empty(), "IR verification failed: {errors:?}");
+        assert_eq!(
+            globals.len(),
+            DEPTH,
+            "transitive USE associations must resolve to defining globals without materializing one alias per downstream module"
+        );
+        let ir = printer::print_module(&module);
+        assert!(ir.contains("global_addr @afs_mod_chain_0_value_0"));
+        assert!(ir.contains(&format!(
+            "global_addr @afs_mod_chain_{}_value_{}",
+            DEPTH - 1,
+            DEPTH - 1
+        )));
     }
 
     #[test]

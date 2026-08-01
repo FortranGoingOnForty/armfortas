@@ -8982,7 +8982,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     uses,
                     &required_import_names,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
             }
             let block_key_set: HashSet<&str> = block_keys.iter().map(String::as_str).collect();
