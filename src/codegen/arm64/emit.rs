@@ -19,6 +19,9 @@ pub fn emit_function(mf: &MachineFunction) -> String {
     writeln!(out, "_{}:", mf.name).unwrap();
 
     for block in &mf.blocks {
+        if let Some(label) = mf.long_branch_label(block.id) {
+            writeln!(out, "{}:", label).unwrap();
+        }
         // Don't re-emit entry label (it's the function label).
         if block.id != MBlockId(0) {
             writeln!(out, "{}:", block.label).unwrap();
@@ -978,6 +981,18 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 _ => "b ???".into(),
             }
         }
+        ArmOpcode::BLong => match inst.operands.as_slice() {
+            [MachineOperand::BlockRef(id)] => {
+                let label = mf
+                    .long_branch_label(*id)
+                    .expect("long branch target must have a relocation anchor");
+                format!(
+                    "adrp x16, {0}@PAGE\n    add x16, x16, {0}@PAGEOFF\n    br x16",
+                    label
+                )
+            }
+            operands => panic!("malformed ARM64 long-branch operands: {operands:?}"),
+        },
         ArmOpcode::BCond => {
             let cond = if let MachineOperand::Cond(c) = &inst.operands[0] {
                 cond_str(*c)

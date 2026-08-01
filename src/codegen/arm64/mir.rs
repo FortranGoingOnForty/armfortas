@@ -254,7 +254,11 @@ pub enum ArmOpcode {
     AdrpGotLdr,
 
     // ---- Branch ----
-    B,     // B label
+    B, // B label
+    /// Late branch-relaxation pseudo for a local target outside branch26
+    /// range. Emits `adrp x16, label@PAGE; add x16, x16,
+    /// label@PAGEOFF; br x16`. IP0/x16 is excluded from allocation.
+    BLong,
     BCond, // B.cond label
     // Compare-and-branch (single-instruction zero check). Operands:
     //   [VReg|PhysReg of register to test, BlockRef target]
@@ -519,6 +523,11 @@ pub struct MachineFunction {
     /// Tail-call recognition uses this metadata instead of guessing from load
     /// opcodes, which are also used for ordinary post-call computation.
     pub callee_save_slots: Vec<(PhysReg, i32)>,
+    /// Non-temporary local symbols emitted at targets of long-branch veneers.
+    /// Apple assemblers fold `L...` temporary labels into a nearby symbol plus
+    /// a limited relocation addend, which is insufficient at branch26-scale
+    /// distances. These anchors remain local but are retained in the object.
+    pub long_branch_labels: std::collections::BTreeMap<MBlockId, String>,
     next_vreg: u32,
     next_block: u32,
 }
@@ -535,6 +544,7 @@ impl MachineFunction {
             internal_only: false,
             entry_arg_receipts: Vec::new(),
             callee_save_slots: Vec::new(),
+            long_branch_labels: std::collections::BTreeMap::new(),
             next_vreg: 0,
             next_block: 1,
         }
@@ -573,6 +583,24 @@ impl MachineFunction {
         let id = self.next_block;
         self.next_block += 1;
         id
+    }
+
+    /// Ensure `target` has a stable local relocation anchor for a late
+    /// long-branch veneer. The lowercase prefix deliberately avoids Apple's
+    /// temporary `L...` symbol convention while remaining non-global.
+    pub fn ensure_long_branch_label(&mut self, target: MBlockId) {
+        if self.long_branch_labels.contains_key(&target) {
+            return;
+        }
+        self.block(target);
+        self.long_branch_labels.insert(
+            target,
+            format!("larmfortas_{}_long_{}", self.name, target.0),
+        );
+    }
+
+    pub fn long_branch_label(&self, target: MBlockId) -> Option<&str> {
+        self.long_branch_labels.get(&target).map(String::as_str)
     }
 
     /// Get a block by ID.

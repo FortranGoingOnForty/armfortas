@@ -174,7 +174,7 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
         // Scan ALL instructions in the block for branch targets (not just the last).
         for inst in &block.insts {
             match inst.opcode {
-                ArmOpcode::B => {
+                ArmOpcode::B | ArmOpcode::BLong => {
                     if let Some(MachineOperand::BlockRef(target)) = inst.operands.first() {
                         if let Some(&succ_idx) = block_indices.get(target) {
                             if !succs.contains(&succ_idx) {

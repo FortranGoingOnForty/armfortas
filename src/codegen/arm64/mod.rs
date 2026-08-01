@@ -63,10 +63,10 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
                 tailcall::tail_call_opt(mf);
             }
         }
-        // Branch relaxation: any B.cond whose target lies outside the
-        // ±1MB conditional-branch window is expanded to a
-        // `B.{!cond} skip; B far_target; skip:` trampoline so the
-        // assembler doesn't choke on the encoding.
+        // Branch relaxation: widen out-of-range B.cond/CBZ/TBZ-family
+        // branches through an inverted short branch, and replace an
+        // out-of-range local B with a position-independent x16 veneer.
+        // Iterate to a fixed point because either rewrite changes layout.
         relax_branches::relax_branches(mf);
     }
 

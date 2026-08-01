@@ -1376,6 +1376,7 @@ fn is_branch_or_call_opcode(op: ArmOpcode) -> bool {
     matches!(
         op,
         ArmOpcode::B
+            | ArmOpcode::BLong
             | ArmOpcode::BCond
             | ArmOpcode::Bl
             | ArmOpcode::Blr
