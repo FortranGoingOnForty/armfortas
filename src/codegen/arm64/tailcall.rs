@@ -95,8 +95,9 @@ pub fn tail_call_opt(mf: &mut MachineFunction) {
         // local / derived-type struct).  After the epilogue tears down our
         // frame, the callee's prologue reuses that memory; any pointer into it
         // becomes dangling.  Taint analysis: track GP registers set from
-        // `sub xN, x29, #M` (alloca) and propagated through MovReg / AddReg /
-        // AddImm / Mul.  If any x0–x7 is tainted, the tail call is unsafe.
+        // frame-relative address materialization and propagated through
+        // MovReg / AddReg / AddImm / Mul / CselReg.  If any x0–x7 is tainted,
+        // the tail call is unsafe.
         if has_frame_derived_arg(&block.insts[..bl_candidate]) {
             continue;
         }
@@ -171,7 +172,7 @@ fn is_callee_save_restore(inst: &MachineInst, slots: &[(PhysReg, i32)]) -> bool 
 /// pointer at the point of the Bl.
 ///
 /// "Frame-derived" means the register was set — directly or transitively — from
-/// a `sub xN, x29, #M` (alloca materialization).
+/// an `add`/`sub` relative to x29 (local-address materialization).
 ///
 /// The analysis is a forward taint propagation over both registers AND
 /// FP-relative stack slots, so it correctly handles the spill/reload pattern:
@@ -262,6 +263,17 @@ fn has_frame_derived_arg(insts: &[MachineInst]) -> bool {
             }
             // mul xN, xM, xP  (index computation in GEP; conservative)
             ArmOpcode::Mul
+                if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
+                    || op_gp(inst, 2).is_some_and(|n| tainted_regs.contains(&n)) =>
+            {
+                if let Some(n) = op_gp(inst, 0) {
+                    tainted_regs.insert(n);
+                }
+            }
+            // csel xN, xM, xP, cond — either selectable value can reach the
+            // destination at runtime, so taint from either source is enough
+            // to make the result frame-derived.
+            ArmOpcode::CselReg
                 if op_gp(inst, 1).is_some_and(|n| tainted_regs.contains(&n))
                     || op_gp(inst, 2).is_some_and(|n| tainted_regs.contains(&n)) =>
             {
@@ -366,6 +378,7 @@ fn written_gp_reg(inst: &MachineInst) -> Option<u8> {
         | ArmOpcode::SubImm
         | ArmOpcode::Mul
         | ArmOpcode::MovReg
+        | ArmOpcode::CselReg
         | ArmOpcode::LdrImm => op_gp(inst, 0),
         _ => None,
     }
@@ -778,6 +791,101 @@ mod tests {
         assert!(
             mf.blocks[1].insts.iter().any(|i| i.opcode == ArmOpcode::Ret),
             "tail-call optimization must preserve the return when a frame reload feeds x1 indirectly"
+        );
+    }
+
+    #[test]
+    fn no_tco_when_csel_can_select_frame_derived_pointer_into_argument() {
+        for (true_value, false_value) in [(10, 11), (11, 10)] {
+            let mut mf = build_mf(vec![vec![
+                MachineInst {
+                    opcode: ArmOpcode::SubImm,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(10)),
+                        MachineOperand::PhysReg(PhysReg::FP),
+                        MachineOperand::Imm(32),
+                    ],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::CselReg,
+                    operands: vec![
+                        MachineOperand::PhysReg(PhysReg::Gp(0)),
+                        MachineOperand::PhysReg(PhysReg::Gp(true_value)),
+                        MachineOperand::PhysReg(PhysReg::Gp(false_value)),
+                        MachineOperand::Cond(ArmCond::Ne),
+                    ],
+                    def: None,
+                },
+                bl("_callee"),
+                ldp_post(),
+                ret(),
+            ]]);
+
+            tail_call_opt(&mut mf);
+
+            assert!(
+                mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::Bl),
+                "tail-call optimization must not tear down a frame when CSEL can choose x{true_value} or x{false_value} into x0"
+            );
+            assert!(
+                mf.blocks[0]
+                    .insts
+                    .iter()
+                    .any(|i| i.opcode == ArmOpcode::Ret),
+                "the normal return must remain when CSEL can choose x{true_value} or x{false_value} into x0"
+            );
+        }
+    }
+
+    #[test]
+    fn csel_overwrite_invalidates_exact_frame_address_metadata() {
+        let mut mf = build_mf(vec![vec![
+            MachineInst {
+                opcode: ArmOpcode::SubImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(10)),
+                    MachineOperand::PhysReg(PhysReg::FP),
+                    MachineOperand::Imm(32),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::CselReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(10)),
+                    MachineOperand::PhysReg(PhysReg::Gp(11)),
+                    MachineOperand::PhysReg(PhysReg::Gp(12)),
+                    MachineOperand::Cond(ArmCond::Ne),
+                ],
+                def: None,
+            },
+            MachineInst {
+                opcode: ArmOpcode::LdrImm,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                    MachineOperand::PhysReg(PhysReg::Gp(10)),
+                    MachineOperand::Imm(0),
+                ],
+                def: None,
+            },
+            bl("_callee"),
+            ldp_post(),
+            ret(),
+        ]]);
+
+        tail_call_opt(&mut mf);
+
+        assert!(
+            mf.blocks[0].insts.iter().any(|i| i.opcode == ArmOpcode::B),
+            "a CSEL overwrite must discard stale exact-frame-address metadata"
+        );
+        assert!(
+            !mf.blocks[0]
+                .insts
+                .iter()
+                .any(|i| i.opcode == ArmOpcode::Ret),
+            "clean selected bases must not spuriously block a safe tail call"
         );
     }
 }

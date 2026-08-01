@@ -210,6 +210,49 @@ end subroutine
 }
 
 #[test]
+fn selected_local_character_address_blocks_tail_call_frame_teardown() {
+    // The BIND(C) assumed-size dummy receives a raw data pointer in x0, so the
+    // selected local address itself is what makes tail-call conversion unsafe.
+    let source = r#"
+subroutine wrap(flag)
+  use iso_c_binding, only: c_char
+  implicit none
+  logical, intent(in) :: flag
+  character(kind=c_char, len=4) :: local
+  interface
+    subroutine sink(text) bind(C, name="sink")
+      import c_char
+      character(kind=c_char), intent(in) :: text(*)
+    end subroutine
+  end interface
+  local = 'locl'
+  call sink(merge(local, 'glob', flag))
+end subroutine
+"#;
+    let asm = compile_arm64_asm(source, "-O1");
+    let repeated = compile_arm64_asm(source, "-O1");
+
+    assert_eq!(
+        asm, repeated,
+        "selected-pointer lowering must be deterministic"
+    );
+
+    assert!(
+        asm.lines()
+            .any(|line| line.trim_start().starts_with("csel x")),
+        "character MERGE must exercise the selected-pointer path:\n{asm}"
+    );
+    assert!(
+        asm.contains("bl _sink"),
+        "a selected local address must retain a normal call:\n{asm}"
+    );
+    assert!(
+        !asm.contains("\n    b _sink"),
+        "tail branching would invalidate the selected local address:\n{asm}"
+    );
+}
+
+#[test]
 fn incoming_i128_pair_is_captured_before_overlapping_scalar_moves() {
     let asm = compile_arm64_asm(
         r#"
