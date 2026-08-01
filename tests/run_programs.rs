@@ -5764,6 +5764,31 @@ fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
 }
 
 #[test]
+fn ar56_stop_termination_does_not_finalize_live_entities() {
+    if skip_native_e2e("ar56_stop_termination_does_not_finalize_live_entities", 4) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+
+    for filename in [
+        "ar56_stop_none_no_finalization.f90",
+        "ar56_stop_int_no_finalization.f90",
+        "ar56_error_stop_none_no_finalization.f90",
+        "ar56_error_stop_int_no_finalization.f90",
+    ] {
+        let source = test_dir.join(filename);
+        assert!(source.exists(), "{filename} missing");
+        match run_test(&compiler, &source, "-O0") {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "{filename} must terminate without finalizing live entities at every optimization, got {other:?}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn phase_triangulation_allows_function_call_pipeline_surfaces() {
     if skip_native_e2e(
         "phase_triangulation_allows_function_call_pipeline_surfaces",

@@ -7277,27 +7277,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 StopCode::None
             };
             let quiet = lower_stop_quiet_value(b, ctx, quiet.as_ref());
-            if !matches!(stop_code, StopCode::Msg(..)) {
-                let skip = if matches!(
-                    ctx.hidden_result_abi,
-                    HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
-                ) {
-                    Some(ValueId(0))
-                } else {
-                    None
-                };
-                insert_implicit_dealloc(
-                    b,
-                    &ctx.locals,
-                    &ctx.locals,
-                    ctx.type_layouts,
-                    ctx.st,
-                    ctx.internal_funcs,
-                    Some(ctx.contained_host_refs),
-                    skip,
-                    true,
-                );
-            }
+            // STOP initiates image termination; it is not a normal exit from
+            // the current procedure or any active construct. In particular,
+            // entities that still exist here must not be finalized. The
+            // terminating runtime entry owns I/O shutdown and process exit.
             match (stop_code, quiet) {
                 (StopCode::Msg(ptr, len), Some(quiet)) => {
                     b.call(
@@ -7349,14 +7332,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // and "Allocation of adjoint_array buffer failed". Dispatch
             // to the message or integer entry depending on stop-code type.
             //
-            // Lower the stop-code expression BEFORE the implicit dealloc:
-            // for an allocatable character stop-code (e.g. stdlib's
-            // `error stop err_msg` where err_msg is character(:),
-            // allocatable), the dealloc nullifies the descriptor's data
-            // pointer, so loading after dealloc gives a null ptr and
-            // afs_error_stop_msg falls back to the bare "ERROR STOP"
-            // branch. Capturing first preserves the pointer for the
-            // call (the buffer remains mapped through process exit).
+            // Evaluate the stop-code before transferring control to the
+            // terminating runtime. Character operands may refer to local
+            // allocatable storage, which remains live through this call.
             enum StopCode {
                 Msg(ValueId, ValueId),
                 Int(ValueId),
@@ -7391,36 +7369,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             };
             let quiet = lower_stop_quiet_value(b, ctx, quiet.as_ref());
 
-            // Skip implicit dealloc for character-stop-code error stops.
-            // The user-provided message often references a local
-            // allocatable string whose buffer would be freed by the
-            // dealloc, leaving afs_error_stop_msg reading freed memory
-            // (or, if the load order let it run before dealloc, a now-
-            // null data pointer). Process exit cleans up the heap
-            // anyway. For integer / no-code stops the dealloc still
-            // runs to satisfy any non-error cleanup expectations.
-            if !matches!(stop_code, StopCode::Msg(..)) {
-                let skip = if matches!(
-                    ctx.hidden_result_abi,
-                    HiddenResultAbi::ArrayDescriptor | HiddenResultAbi::DerivedAggregate
-                ) {
-                    Some(ValueId(0))
-                } else {
-                    None
-                };
-                insert_implicit_dealloc(
-                    b,
-                    &ctx.locals,
-                    &ctx.locals,
-                    ctx.type_layouts,
-                    ctx.st,
-                    ctx.internal_funcs,
-                    Some(ctx.contained_host_refs),
-                    skip,
-                    true,
-                );
-            }
-
+            // ERROR STOP has the same no-finalization rule as STOP. Do not
+            // turn image termination into procedure or construct cleanup;
+            // the runtime entry flushes I/O and terminates the process.
             match (stop_code, quiet) {
                 (StopCode::Msg(ptr, len), Some(quiet)) => {
                     b.call(
