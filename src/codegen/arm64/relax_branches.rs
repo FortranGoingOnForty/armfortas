@@ -23,8 +23,9 @@
 //! Inserting an extra block + branch shifts subsequent block offsets,
 //! which can push other previously-in-range branches out of range,
 //! so we iterate the pass until no further insertions are needed
-//! (capped at four iterations — non-convergence triggers a panic that
-//! survives release builds and produces a clear ICE for diagnostics).
+//! (bounded by the number of relaxable conditional branches;
+//! non-convergence triggers a panic that survives release builds and
+//! produces a clear ICE for diagnostics).
 //!
 //! ARM64 unconditional `B` and `BL` carry a 26-bit immediate (±128MB
 //! range), so the trampoline's unconditional `B` itself never needs
@@ -49,24 +50,31 @@ const COND_BRANCH_LIMIT: i64 = (1 << 20) - 64;
 /// tighter than the cond-branch / cbz limit. Same safety margin.
 const TBZ_BRANCH_LIMIT: i64 = (1 << 15) - 64;
 
-/// Iteration cap. In practice 1–2 passes suffice; if convergence
-/// genuinely doesn't happen, something pathological is going on and
-/// we want a loud failure rather than a silent infinite loop.
-const MAX_ITERATIONS: u32 = 4;
-
 /// Run branch relaxation on a machine function. Idempotent: when no
 /// `B.cond` overflows, the function is returned unchanged.
 pub fn relax_branches(mf: &mut MachineFunction) {
-    for _ in 0..MAX_ITERATIONS {
+    // Every changing pass expands at least one previously unexpanded
+    // conditional branch, and expansion replaces its far target with an
+    // adjacent skip block. Therefore at most the original number of
+    // relaxable conditionals can produce changing passes. The inclusive
+    // bound leaves one final pass to observe the fixed point.
+    let max_changing_passes = mf
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter(|inst| relaxable_cond_branch(inst).is_some())
+        .count();
+    for _ in 0..=max_changing_passes {
         if !relax_once(mf) {
             return;
         }
     }
-    // Convergence failure — extremely unlikely. Better to ICE here
-    // than emit an assembly file the assembler will reject.
+    // Exceeding the structural bound means the pass reintroduced a far
+    // conditional branch or repeatedly expanded the same one. Better to
+    // ICE here than emit an assembly file the assembler will reject.
     panic!(
-        "branch relaxation did not converge for function {} after {} iterations",
-        mf.name, MAX_ITERATIONS
+        "branch relaxation did not converge for function {} after exceeding its {}-branch structural bound",
+        mf.name, max_changing_passes
     );
 }
 
@@ -606,5 +614,139 @@ mod tests {
         // Bit operand survives the rewrite.
         assert!(matches!(entry.insts[0].operands[1], MachineOperand::Imm(7)));
         assert_eq!(entry.insts[1].opcode, ArmOpcode::B);
+    }
+
+    #[test]
+    fn four_stage_overflow_cascade_reaches_a_fixed_point() {
+        let mut mf = MachineFunction::new("four_stage_cascade".into());
+        let branch4 = mf.blocks[0].id;
+        let branch3 = mf.new_block("branch3");
+        let branch2 = mf.new_block("branch2");
+        let branch1 = mf.new_block("branch1");
+        let padding = mf.new_block("padding");
+        let target4 = mf.new_block("target4");
+        let target3 = mf.new_block("target3");
+        let target2 = mf.new_block("target2");
+        let target1 = mf.new_block("target1");
+
+        let branch_to = |target| MachineInst {
+            opcode: ArmOpcode::BCond,
+            operands: vec![
+                MachineOperand::Cond(ArmCond::Ne),
+                MachineOperand::BlockRef(target),
+            ],
+            def: None,
+        };
+        for (source, target) in [
+            (branch4, target4),
+            (branch3, target3),
+            (branch2, target2),
+            (branch1, target1),
+        ] {
+            mf.block_mut(source).insts.push(branch_to(target));
+        }
+
+        // Before relaxation the four branch deltas are, in layout order,
+        // LIMIT-8, LIMIT-4, LIMIT, and LIMIT+4. Expanding the last branch
+        // adds four bytes between every earlier branch and its target, so
+        // exactly one additional branch overflows on each following pass.
+        let pad_inst_count = ((COND_BRANCH_LIMIT - 24) / 4) as usize;
+        mf.block_mut(padding).insts = (0..pad_inst_count)
+            .map(|_| MachineInst {
+                opcode: ArmOpcode::Nop,
+                operands: vec![],
+                def: None,
+            })
+            .collect();
+        for target in [target4, target3, target2] {
+            mf.block_mut(target).insts = vec![
+                MachineInst {
+                    opcode: ArmOpcode::Nop,
+                    operands: vec![],
+                    def: None,
+                },
+                MachineInst {
+                    opcode: ArmOpcode::Nop,
+                    operands: vec![],
+                    def: None,
+                },
+            ];
+        }
+
+        let offsets = compute_block_offsets(&mf);
+        let initial_deltas: Vec<_> = [
+            (branch4, target4),
+            (branch3, target3),
+            (branch2, target2),
+            (branch1, target1),
+        ]
+        .into_iter()
+        .map(|(source, target)| offsets[&target] - offsets[&source])
+        .collect();
+        assert_eq!(
+            initial_deltas,
+            [
+                COND_BRANCH_LIMIT - 8,
+                COND_BRANCH_LIMIT - 4,
+                COND_BRANCH_LIMIT,
+                COND_BRANCH_LIMIT + 4,
+            ],
+            "fixture must start with exactly one overflowing branch"
+        );
+
+        let mut pass_probe = mf.clone();
+        for pass in 1..=4 {
+            let blocks_before = pass_probe.blocks.len();
+            assert!(relax_once(&mut pass_probe), "pass {pass} must change");
+            assert_eq!(
+                pass_probe.blocks.len(),
+                blocks_before + 1,
+                "pass {pass} must expose exactly one new overflow"
+            );
+        }
+        assert!(
+            !relax_once(&mut pass_probe),
+            "the fifth pass must be the no-change convergence check"
+        );
+
+        let blocks_before = mf.blocks.len();
+        relax_branches(&mut mf);
+
+        assert_eq!(mf.blocks.len(), blocks_before + 4);
+        assert_eq!(
+            mf.blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.opcode == ArmOpcode::B)
+                .count(),
+            4,
+            "each cascading conditional branch should have one far trampoline"
+        );
+        assert!(
+            !relax_once(&mut mf),
+            "the four-stage cascade should already be at a fixed point"
+        );
+
+        let probed_asm = crate::codegen::arm64::emit::emit_function(&pass_probe);
+        let relaxed_asm = crate::codegen::arm64::emit::emit_function(&mf);
+        assert_eq!(
+            relaxed_asm, probed_asm,
+            "the public fixed-point driver must produce the same layout as explicit passes"
+        );
+
+        let source = format!(".section __TEXT,__text,regular,pure_instructions\n{relaxed_asm}");
+        let encode = || {
+            let object = afs_as::assemble::assemble_source(&source)
+                .expect("afs-as must encode every branch in the relaxed cascade");
+            let mut bytes = Vec::new();
+            afs_as::macho::write_macho(&object, &mut bytes)
+                .expect("afs-as must serialize the relaxed cascade as Mach-O");
+            bytes
+        };
+        assert_eq!(
+            encode(),
+            encode(),
+            "identical relaxed assembly must produce deterministic Mach-O bytes"
+        );
     }
 }
