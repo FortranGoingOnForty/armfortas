@@ -19722,7 +19722,7 @@ pub(super) fn resolve_subroutine_call_name(
 }
 
 pub(super) fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -> String {
-    format!("afs_modproc_{}_{}", module_name.to_lowercase(), proc_name)
+    crate::sema::symtab::module_procedure_link_name(module_name, proc_name)
 }
 
 pub(super) fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
@@ -19795,13 +19795,13 @@ pub(super) fn find_procedure_scope_id(
     st: &SymbolTable,
     name: &str,
 ) -> Option<crate::sema::symtab::ScopeId> {
-    st.all_scopes()
+    st.procedure_scopes_named(name)
         .iter()
-        .enumerate()
         .rev()
-        .find_map(|(idx, scope)| {
-            (scope_matches_procedure_name(scope, name) && scope_has_linkable_parent(st, idx))
-                .then_some(idx)
+        .copied()
+        .find(|scope_id| {
+            scope_matches_procedure_name(st.scope(*scope_id), name)
+                && scope_has_linkable_parent(st, *scope_id)
         })
 }
 
@@ -19835,12 +19835,11 @@ pub(super) fn find_procedure_scope_id_for_caller(
         // parent is `cur_id`. Multiple hosts may share names but
         // siblings under one host don't, so a parent==cur filter is
         // unambiguous.
-        let sibling = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
-            (scope.parent == Some(cur_id)
-                && scope_matches_procedure_name(scope, name)
-                && scope_has_linkable_parent(st, idx))
-            .then_some(idx)
-        });
+        let sibling = st
+            .child_procedure_scopes_named(cur_id, name)
+            .iter()
+            .copied()
+            .find(|scope_id| scope_has_linkable_parent(st, *scope_id));
         if sibling.is_some() {
             return sibling;
         }
@@ -19868,12 +19867,11 @@ pub(super) fn find_procedure_scope_id_for_caller_strict(
         if scope_matches_procedure_name(cur_scope, name) && scope_has_linkable_parent(st, cur_id) {
             return Some(cur_id);
         }
-        let sibling = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
-            (scope.parent == Some(cur_id)
-                && scope_matches_procedure_name(scope, name)
-                && scope_has_linkable_parent(st, idx))
-            .then_some(idx)
-        });
+        let sibling = st
+            .child_procedure_scopes_named(cur_id, name)
+            .iter()
+            .copied()
+            .find(|scope_id| scope_has_linkable_parent(st, *scope_id));
         if sibling.is_some() {
             return sibling;
         }
@@ -24907,7 +24905,13 @@ pub(super) fn callee_scope_id_for_lookup(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<crate::sema::symtab::ScopeId> {
-    use crate::sema::symtab::{ScopeKind, SymbolKind};
+    if let Some(scope_id) = st
+        .procedure_scopes_for_link_name(callee_name)
+        .last()
+        .copied()
+    {
+        return Some(scope_id);
+    }
 
     // When a bare procedure name matches several definitions (e.g. fpm has
     // ten `next` subroutines across modules), the plain name scan below
@@ -24916,76 +24920,27 @@ pub(super) fn callee_scope_id_for_lookup(
     // the caller's own module (a module-contained sibling), which is what
     // host/use association would resolve. Falls back to the name scan when
     // there is no caller context or no same-module match.
-    let caller_module = current_proc_scope().and_then(|sid| {
+    let caller_module_scope = current_proc_scope().and_then(|sid| {
         let mut cur = Some(sid);
         while let Some(id) = cur {
             let sc = st.scope(id);
-            if let Some(m) = scope_module_name(sc) {
-                return Some(m.to_lowercase());
+            if scope_module_name(sc).is_some() {
+                return Some(id);
             }
             cur = sc.parent;
         }
         None
     });
 
-    let mut name_match = None;
-    let mut caller_module_match = None;
-    for (scope_id, scope) in st.all_scopes().iter().enumerate().rev() {
-        let proc_name = match &scope.kind {
-            ScopeKind::Function(name) | ScopeKind::Subroutine(name) | ScopeKind::Program(name) => {
-                name
-            }
-            _ => continue,
-        };
-        if proc_name.eq_ignore_ascii_case(callee_name) {
-            if name_match.is_none() {
-                name_match = Some(scope_id);
-            }
-            if caller_module_match.is_none() {
-                if let (Some(caller_mod), Some(parent_id)) = (caller_module.as_ref(), scope.parent)
-                {
-                    if scope_module_name(st.scope(parent_id))
-                        .is_some_and(|m| m.eq_ignore_ascii_case(caller_mod))
-                    {
-                        caller_module_match = Some(scope_id);
-                    }
-                }
-            }
-        }
-        if matches!(scope.kind, ScopeKind::Program(_))
-            && format!("__prog_{}", proc_name.to_lowercase()).eq_ignore_ascii_case(callee_name)
-        {
-            return Some(scope_id);
-        }
-        if matches!(scope.kind, ScopeKind::Program(_)) {
-            continue;
-        }
-        let Some(parent_id) = scope.parent else {
-            continue;
-        };
-        let parent_scope = st.scope(parent_id);
-        if let Some(module_name) = scope_module_name(parent_scope) {
-            if module_procedure_symbol_name(module_name, proc_name)
-                .eq_ignore_ascii_case(callee_name)
-            {
-                return Some(scope_id);
-            }
-        }
-        let Some(sym) = parent_scope.symbols.get(&proc_name.to_lowercase()) else {
-            continue;
-        };
-        if matches!(
-            sym.kind,
-            SymbolKind::Function
-                | SymbolKind::Subroutine
-                | SymbolKind::ExternalProc
-                | SymbolKind::IntrinsicProc
-                | SymbolKind::ProcedurePointer
-        ) && symbol_link_name(st, sym).eq_ignore_ascii_case(callee_name)
-        {
-            return Some(scope_id);
-        }
-    }
+    let named_scopes = st.procedure_scopes_named(callee_name);
+    let name_match = named_scopes.last().copied();
+    let caller_module_match = caller_module_scope.and_then(|module_scope| {
+        named_scopes
+            .iter()
+            .rev()
+            .copied()
+            .find(|scope_id| st.scope(*scope_id).parent == Some(module_scope))
+    });
     caller_module_match.or(name_match)
 }
 
@@ -63951,6 +63906,76 @@ mod tests {
             DEPTH - 1,
             DEPTH - 1
         )));
+    }
+
+    #[test]
+    fn contained_procedure_lookup_avoids_full_scope_table_accesses() {
+        const PAIRS: usize = 64;
+        let mut source = String::from("module scope_scale\n  implicit none\ncontains\n");
+        for index in 0..PAIRS {
+            source.push_str(&format!(
+                "  subroutine caller_{index}(value)\n    integer, intent(out) :: value\n    call callee_{index}(value)\n  end subroutine caller_{index}\n  subroutine callee_{index}(value)\n    integer, intent(out) :: value\n    value = {index}\n  end subroutine callee_{index}\n"
+            ));
+        }
+        source.push_str("end module scope_scale\n");
+
+        let tokens = Lexer::tokenize(&source, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        let st = resolve::resolve_file(&units, &[], crate::target::TargetLayout::LP64)
+            .unwrap()
+            .st;
+        let module_scope = st.find_module_scope("scope_scale").unwrap();
+        let mut callers = HashMap::new();
+        let mut callees = HashMap::new();
+        for scope in st.all_scopes() {
+            if scope.parent != Some(module_scope) {
+                continue;
+            }
+            match &scope.kind {
+                crate::sema::symtab::ScopeKind::Subroutine(name) if name.starts_with("caller_") => {
+                    callers.insert(name.clone(), scope.id);
+                }
+                crate::sema::symtab::ScopeKind::Subroutine(name) if name.starts_with("callee_") => {
+                    callees.insert(name.clone(), scope.id);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(callers.len(), PAIRS);
+        assert_eq!(callees.len(), PAIRS);
+
+        st.reset_all_scopes_accesses();
+        for index in 0..PAIRS {
+            let caller_name = format!("caller_{index}");
+            let callee_name = format!("callee_{index}");
+            let caller_scope = callers[&caller_name];
+            let callee_scope = callees[&callee_name];
+            let _guard = ProcScopeGuard::enter(Some(caller_scope));
+            assert_eq!(
+                find_procedure_scope_id_for_caller_strict(&st, &callee_name, Some(caller_scope)),
+                Some(callee_scope)
+            );
+            assert_eq!(
+                callee_scope_id_for_lookup(
+                    &st,
+                    &module_procedure_symbol_name("scope_scale", &callee_name)
+                ),
+                Some(callee_scope)
+            );
+            assert_eq!(
+                callee_scope_id_for_lookup(
+                    &st,
+                    &module_procedure_symbol_name("SCOPE_SCALE", &callee_name).to_ascii_uppercase()
+                ),
+                Some(callee_scope)
+            );
+        }
+        assert_eq!(
+            st.all_scopes_accesses(),
+            0,
+            "contained-procedure and ABI lookup must use scope indexes instead of repeatedly scanning the full table"
+        );
     }
 
     #[test]

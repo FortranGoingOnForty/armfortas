@@ -8,7 +8,9 @@ use crate::ast::decl::ArraySpec;
 use crate::ast::expr::SpannedExpr;
 use crate::lexer::Span;
 use std::borrow::Cow;
-use std::cell::RefCell;
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 /// Sprint 07: borrow when the input is already canonical lowercase,
@@ -45,6 +47,112 @@ enum UseEntityIdentity {
 
 type PersistentLookupCache = HashMap<ScopeId, HashMap<String, Option<CachedSymbolRef>>>;
 type UseAmbiguityCache = HashMap<(ScopeId, String, LookupMode, bool), Option<UseAmbiguity>>;
+
+#[derive(Debug, Default)]
+struct ScopeIndex {
+    procedure_scopes_by_name: HashMap<String, Vec<ScopeId>>,
+    procedure_children_by_name: HashMap<ScopeId, HashMap<String, Vec<ScopeId>>>,
+    procedure_scopes_by_link_name: HashMap<String, Vec<ScopeId>>,
+}
+
+impl ScopeIndex {
+    fn build(scopes: &[Scope]) -> Self {
+        let mut index = Self::default();
+        for scope in scopes {
+            let (procedure_name, is_program) = match &scope.kind {
+                ScopeKind::Function(name) | ScopeKind::Subroutine(name) => (name.as_str(), false),
+                ScopeKind::Program(name) => (name.as_str(), true),
+                _ => continue,
+            };
+            let name_key = procedure_name.to_ascii_lowercase();
+            index
+                .procedure_scopes_by_name
+                .entry(name_key.clone())
+                .or_default()
+                .push(scope.id);
+
+            if is_program {
+                index
+                    .procedure_scopes_by_link_name
+                    .entry(format!("__prog_{name_key}"))
+                    .or_default()
+                    .push(scope.id);
+                continue;
+            }
+
+            let Some(parent_id) = scope.parent else {
+                continue;
+            };
+            index
+                .procedure_children_by_name
+                .entry(parent_id)
+                .or_default()
+                .entry(name_key.clone())
+                .or_default()
+                .push(scope.id);
+
+            let parent = &scopes[parent_id];
+            let parent_symbol = parent.symbols.get(&name_key);
+            let module_owner = match &parent.kind {
+                ScopeKind::Module(module_name) => Some(module_name.as_str()),
+                ScopeKind::Submodule(submodule_name) => {
+                    let is_separate = parent_symbol.is_some_and(|symbol| {
+                        symbol.attrs.is_separate_module_procedure
+                            || symbol.attrs.is_separate_module_interface
+                    });
+                    if is_separate {
+                        parent
+                            .submodule_ancestor
+                            .as_deref()
+                            .or(Some(submodule_name.as_str()))
+                    } else {
+                        Some(submodule_name.as_str())
+                    }
+                }
+                _ => None,
+            };
+            if let Some(module_owner) = module_owner {
+                index
+                    .procedure_scopes_by_link_name
+                    .entry(
+                        module_procedure_link_name(module_owner, procedure_name)
+                            .to_ascii_lowercase(),
+                    )
+                    .or_default()
+                    .push(scope.id);
+            }
+            if let Some(binding_label) = parent_symbol
+                .filter(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::Function
+                            | SymbolKind::Subroutine
+                            | SymbolKind::ExternalProc
+                            | SymbolKind::IntrinsicProc
+                            | SymbolKind::ProcedurePointer
+                    )
+                })
+                .and_then(|symbol| symbol.attrs.binding_label.as_deref())
+                .filter(|label| !label.is_empty())
+            {
+                index
+                    .procedure_scopes_by_link_name
+                    .entry(binding_label.to_ascii_lowercase())
+                    .or_default()
+                    .push(scope.id);
+            }
+        }
+        index
+    }
+}
+
+pub(crate) fn module_procedure_link_name(module_name: &str, procedure_name: &str) -> String {
+    format!(
+        "afs_modproc_{}_{}",
+        module_name.to_ascii_lowercase(),
+        procedure_name
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UseAmbiguity {
@@ -123,6 +231,9 @@ pub struct SymbolTable {
     use_ambiguity_cache: RefCell<UseAmbiguityCache>,
     named_interface_presence_cache: RefCell<HashMap<String, bool>>,
     statement_block_scopes: HashMap<(u32, u32, u32, u32, u32), ScopeId>,
+    scope_index: OnceCell<ScopeIndex>,
+    #[cfg(test)]
+    all_scopes_accesses: Cell<usize>,
     /// (scope_id, lowercase fname) → statement function definition.
     /// Populated by sema's `detect_statement_functions` pass during
     /// `resolve_unit` for Subroutine/Function/Program arms.
@@ -158,6 +269,9 @@ impl SymbolTable {
             use_ambiguity_cache: RefCell::new(HashMap::new()),
             named_interface_presence_cache: RefCell::new(HashMap::new()),
             statement_block_scopes: HashMap::new(),
+            scope_index: OnceCell::new(),
+            #[cfg(test)]
+            all_scopes_accesses: Cell::new(0),
             statement_functions: HashMap::new(),
         }
     }
@@ -199,6 +313,11 @@ impl SymbolTable {
         self.export_lookup_cache.borrow_mut().clear();
         self.use_ambiguity_cache.borrow_mut().clear();
         self.named_interface_presence_cache.borrow_mut().clear();
+    }
+
+    fn scope_index(&self) -> &ScopeIndex {
+        self.scope_index
+            .get_or_init(|| ScopeIndex::build(&self.scopes))
     }
 
     fn cached_lookup<'a>(
@@ -304,6 +423,7 @@ impl SymbolTable {
     /// Create a new child scope of the current scope.
     pub fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
         self.clear_lookup_caches();
+        self.scope_index.take();
         let id = self.scopes.len();
         let parent_implicit = self.scopes[self.current].implicit_rules.clone();
         let result_name = match &kind {
@@ -369,6 +489,7 @@ impl SymbolTable {
     /// Get a mutable scope by ID.
     pub fn scope_mut(&mut self, id: ScopeId) -> &mut Scope {
         self.clear_lookup_caches();
+        self.scope_index.take();
         &mut self.scopes[id]
     }
 
@@ -382,6 +503,7 @@ impl SymbolTable {
     }
 
     pub(crate) fn set_submodule_ancestor(&mut self, scope_id: ScopeId, ancestor: &str) {
+        self.scope_index.take();
         self.scopes[scope_id].submodule_ancestor = Some(ancestor.to_ascii_lowercase());
     }
 
@@ -620,6 +742,7 @@ impl SymbolTable {
     /// Define a symbol in the current scope.
     pub fn define(&mut self, symbol: Symbol) -> Result<(), SemaError> {
         self.clear_lookup_caches();
+        self.scope_index.take();
         let key = symbol.name.to_lowercase();
         if self.conflicts_with_protected_host_entity(self.current, &key) {
             return Err(SemaError {
@@ -946,6 +1069,7 @@ impl SymbolTable {
     /// Define a symbol in a specific scope.
     pub fn define_in(&mut self, scope_id: ScopeId, symbol: Symbol) -> Result<(), SemaError> {
         self.clear_lookup_caches();
+        self.scope_index.take();
         let key = symbol.name.to_lowercase();
         let scope = &mut self.scopes[scope_id];
         if scope.symbols.contains_key(&key) {
@@ -1981,7 +2105,52 @@ impl SymbolTable {
 
     /// Iterate all scopes (for generic interface resolution during lowering).
     pub fn all_scopes(&self) -> &[Scope] {
+        #[cfg(test)]
+        self.all_scopes_accesses
+            .set(self.all_scopes_accesses.get() + 1);
         &self.scopes
+    }
+
+    pub(crate) fn procedure_scopes_named(&self, name: &str) -> &[ScopeId] {
+        let key = ensure_ascii_lowercase(name);
+        self.scope_index()
+            .procedure_scopes_by_name
+            .get(key.as_ref())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn child_procedure_scopes_named(
+        &self,
+        parent_scope: ScopeId,
+        name: &str,
+    ) -> &[ScopeId] {
+        let key = ensure_ascii_lowercase(name);
+        self.scope_index()
+            .procedure_children_by_name
+            .get(&parent_scope)
+            .and_then(|children| children.get(key.as_ref()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn procedure_scopes_for_link_name(&self, link_name: &str) -> &[ScopeId] {
+        let key = ensure_ascii_lowercase(link_name);
+        self.scope_index()
+            .procedure_scopes_by_link_name
+            .get(key.as_ref())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_all_scopes_accesses(&self) {
+        self.all_scopes_accesses.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_scopes_accesses(&self) -> usize {
+        self.all_scopes_accesses.get()
     }
 
     /// Check whether implicit none (type) is active in a scope.
@@ -3332,6 +3501,56 @@ mod tests {
         assert_eq!(st.current_scope(), s1);
         st.pop_scope();
         assert_eq!(st.current_scope(), 0);
+    }
+
+    #[test]
+    fn procedure_scope_index_tracks_mutation_and_abi_owners() {
+        let mut st = SymbolTable::new();
+        assert!(st.procedure_scopes_named("later").is_empty());
+
+        let module_scope = st.push_scope(ScopeKind::Module("Mixed_Module".into()));
+        let procedure_scope = st.push_scope(ScopeKind::Subroutine("Do_Work".into()));
+        st.pop_scope();
+
+        assert_eq!(st.procedure_scopes_named("DO_WORK"), &[procedure_scope]);
+        assert_eq!(
+            st.child_procedure_scopes_named(module_scope, "do_work"),
+            &[procedure_scope]
+        );
+        assert_eq!(
+            st.procedure_scopes_for_link_name("AFS_MODPROC_MIXED_MODULE_DO_WORK"),
+            &[procedure_scope]
+        );
+
+        let mut symbol = make_symbol("Do_Work", SymbolKind::Subroutine);
+        symbol.attrs.bind_c = true;
+        symbol.attrs.binding_label = Some("C_Do_Work".into());
+        st.define(symbol).unwrap();
+        assert_eq!(
+            st.procedure_scopes_for_link_name("c_do_work"),
+            &[procedure_scope]
+        );
+
+        st.pop_scope();
+        let submodule_scope = st.push_scope(ScopeKind::Submodule("implementation".into()));
+        let mut separate = make_symbol("step", SymbolKind::Subroutine);
+        separate.attrs.is_separate_module_procedure = true;
+        st.define(separate).unwrap();
+        let separate_scope = st.push_scope(ScopeKind::Subroutine("step".into()));
+        st.pop_scope();
+
+        assert_eq!(
+            st.procedure_scopes_for_link_name("afs_modproc_implementation_step"),
+            &[separate_scope]
+        );
+        st.set_submodule_ancestor(submodule_scope, "ancestor");
+        assert!(st
+            .procedure_scopes_for_link_name("afs_modproc_implementation_step")
+            .is_empty());
+        assert_eq!(
+            st.procedure_scopes_for_link_name("AFS_MODPROC_ANCESTOR_STEP"),
+            &[separate_scope]
+        );
     }
 
     // ---- Default access ----
