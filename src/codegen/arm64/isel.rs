@@ -16,19 +16,33 @@ use std::collections::{HashMap, HashSet};
 pub fn select_module(module: &Module) -> Vec<MachineFunction> {
     // Build function name table for resolving Internal call refs.
     let func_names: Vec<String> = module.functions.iter().map(|f| f.name.clone()).collect();
+    // Imported .amod globals and declared extern procedures are deliberately
+    // absent: this set contains only symbols emitted by the current object.
+    let defined_symbols: HashSet<&str> = module
+        .globals
+        .iter()
+        .map(|global| global.name.as_str())
+        .chain(
+            module
+                .functions
+                .iter()
+                .map(|function| function.name.as_str()),
+        )
+        .collect();
     module
         .functions
         .iter()
-        .map(|f| select_function_with_names(f, &func_names, module.layout))
+        .map(|f| select_function_with_names(f, &func_names, &defined_symbols, module.layout))
         .collect()
 }
 
 fn select_function_with_names(
     func: &Function,
     func_names: &[String],
+    defined_symbols: &HashSet<&str>,
     layout: crate::target::TargetLayout,
 ) -> MachineFunction {
-    let mut mf = select_function(func, layout);
+    let mut mf = select_function_with_symbols(func, defined_symbols, layout);
     // Resolve any Internal call references to actual function names.
     for block in &mut mf.blocks {
         for inst in &mut block.insts {
@@ -55,6 +69,14 @@ use super::abi::{classify_abi_arg, AbiArgLoc, AbiArgState};
 
 /// Select machine instructions for one IR function.
 pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> MachineFunction {
+    select_function_with_symbols(func, &HashSet::new(), layout)
+}
+
+fn select_function_with_symbols(
+    func: &Function,
+    defined_symbols: &HashSet<&str>,
+    layout: crate::target::TargetLayout,
+) -> MachineFunction {
     let mut mf = MachineFunction::new(func.name.clone());
     mf.internal_only = func.internal_only;
     let mut ctx = ISelCtx::new(layout);
@@ -398,7 +420,7 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
         let mb_id = ctx.block_map[&block.id];
 
         for inst in &block.insts {
-            select_inst(&mut mf, &mut ctx, mb_id, inst, func);
+            select_inst(&mut mf, &mut ctx, mb_id, inst, func, defined_symbols);
         }
 
         if let Some(term) = &block.terminator {
@@ -824,6 +846,7 @@ fn select_inst(
     mb: MBlockId,
     inst: &Inst,
     func: &Function,
+    defined_symbols: &HashSet<&str>,
 ) {
     if is_wide_pair_ty_arm(&inst.ty) {
         match &inst.kind {
@@ -1724,13 +1747,16 @@ fn select_inst(
 
         // ---- Memory ----
         InstKind::GlobalAddr(name) => {
-            // Materialize the address of a module-level global into
-            // a Gp64 vreg via ADRP+ADD against `_globalname`. Loads
-            // and stores then operate on this pointer the same way
-            // they operate on an alloca address.
+            // A symbol defined by this IR module can use a direct
+            // PAGE/PAGEOFF address. Undefined data and procedure symbols
+            // must load their resolved address through the Mach-O GOT.
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::AdrpAdd,
+                opcode: if defined_symbols.contains(name.as_str()) {
+                    ArmOpcode::AdrpAdd
+                } else {
+                    ArmOpcode::AdrpGotLdr
+                },
                 operands: vec![
                     MachineOperand::VReg(dest),
                     MachineOperand::GlobalLabel(name.clone()),
@@ -4029,6 +4055,74 @@ mod tests {
             build(&mut b);
         }
         select_function(&func, crate::target::TargetLayout::LP64)
+    }
+
+    fn global_addr_opcode(mf: &MachineFunction, symbol: &str) -> ArmOpcode {
+        mf.blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| {
+                inst.operands
+                    .iter()
+                    .any(|operand| {
+                        matches!(operand, MachineOperand::GlobalLabel(name) if name == symbol)
+                    })
+                    .then_some(inst.opcode)
+            })
+            .unwrap_or_else(|| panic!("missing selected address for {symbol}"))
+    }
+
+    #[test]
+    fn module_selection_distinguishes_defined_and_undefined_symbol_addresses() {
+        let layout = crate::target::TargetLayout::LP64;
+        let mut module = Module::new("address_ownership".into(), layout);
+        module.add_global(Global {
+            name: "defined_data".into(),
+            ty: IrType::Int(IntWidth::I64),
+            initializer: Some(GlobalInit::Zero),
+        });
+
+        let mut defined_proc = Function::new("defined_proc".into(), vec![], IrType::Void);
+        FuncBuilder::new(&mut defined_proc, layout).ret_void();
+        module.add_function(defined_proc);
+
+        let mut probe = Function::new("probe".into(), vec![], IrType::Void);
+        {
+            let mut builder = FuncBuilder::new(&mut probe, layout);
+            builder.global_addr("defined_data", IrType::Int(IntWidth::I64));
+            builder.global_addr("undefined_data", IrType::Int(IntWidth::I64));
+            builder.global_addr("defined_proc", IrType::Void);
+            builder.global_addr("undefined_proc", IrType::Void);
+            builder.ret_void();
+        }
+        module.add_function(probe);
+
+        let selected = select_module(&module);
+        let probe = selected
+            .iter()
+            .find(|function| function.name == "probe")
+            .expect("probe function should be selected");
+
+        assert_eq!(
+            global_addr_opcode(probe, "defined_data"),
+            ArmOpcode::AdrpAdd,
+            "module-defined data may use direct PAGE/PAGEOFF addressing"
+        );
+        assert_eq!(
+            global_addr_opcode(probe, "defined_proc"),
+            ArmOpcode::AdrpAdd,
+            "module-defined procedures may use direct PAGE/PAGEOFF addressing"
+        );
+        assert_eq!(
+            global_addr_opcode(probe, "undefined_data"),
+            ArmOpcode::AdrpGotLdr,
+            "undefined data must load its resolved address through the Mach-O GOT"
+        );
+        assert_eq!(
+            global_addr_opcode(probe, "undefined_proc"),
+            ArmOpcode::AdrpGotLdr,
+            "undefined procedures must load their resolved address through the Mach-O GOT"
+        );
     }
 
     #[test]

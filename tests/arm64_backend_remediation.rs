@@ -10,6 +10,17 @@ fn compiler() -> PathBuf {
         .expect("armfortas binary should be built for integration tests")
 }
 
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "armfortas_arm64_remediation_{label}_{}_{}",
+        std::process::id(),
+        id
+    ));
+    fs::create_dir_all(&dir).expect("create ARM64 regression temp directory");
+    dir
+}
+
 fn compile_arm64_output(source: &str, opt: &str, emit: &str, extension: &str) -> String {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let stem = format!("armfortas_arm64_remediation_{}_{}", std::process::id(), id);
@@ -298,6 +309,127 @@ end subroutine multiply_i64
         !asm.lines().any(|line| line.trim() == "nop"),
         "unsupported vector arithmetic must not survive as a NOP:\n{asm}"
     );
+}
+
+#[test]
+fn undefined_procedure_addresses_use_the_macho_got() {
+    let source = r#"
+module arm64_macho_got_addresses_m
+  use iso_c_binding
+  implicit none
+  abstract interface
+    subroutine hook_interface() bind(C)
+    end subroutine hook_interface
+  end interface
+  interface
+    subroutine external_hook() bind(C, name="armfortas_external_hook")
+    end subroutine external_hook
+  end interface
+  procedure(hook_interface), pointer :: local_slot => null()
+  procedure(hook_interface), pointer :: external_slot => null()
+contains
+  subroutine local_hook() bind(C, name="armfortas_local_hook")
+  end subroutine local_hook
+
+  subroutine capture_hook_addresses() bind(C, name="capture_hook_addresses")
+    local_slot => local_hook
+    external_slot => external_hook
+  end subroutine capture_hook_addresses
+end module arm64_macho_got_addresses_m
+"#;
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let asm = compile_arm64_asm(source, opt);
+        assert!(
+            asm.contains("_armfortas_local_hook@PAGE")
+                && asm.contains("_armfortas_local_hook@PAGEOFF"),
+            "{opt} must address the function defined in this module directly:\n{asm}"
+        );
+        assert!(
+            !asm.contains("_armfortas_local_hook@GOTPAGE"),
+            "{opt} must not route a module-defined function through the GOT:\n{asm}"
+        );
+        assert!(
+            asm.contains("_armfortas_external_hook@GOTPAGE")
+                && asm.contains("_armfortas_external_hook@GOTPAGEOFF"),
+            "{opt} must resolve an undefined function address through the Mach-O GOT:\n{asm}"
+        );
+        assert!(
+            !asm.contains("_armfortas_external_hook@PAGE\n"),
+            "{opt} must not emit a direct relocation for an undefined function address:\n{asm}"
+        );
+    }
+
+    let _ = fs::remove_file(std::env::temp_dir().join("arm64_macho_got_addresses_m.amod"));
+}
+
+#[test]
+fn imported_module_data_addresses_use_the_macho_got() {
+    let dir = unique_temp_dir("imported_data_got");
+    let provider_source = dir.join("external_data_provider.f90");
+    let provider_object = dir.join("external_data_provider.o");
+    fs::write(
+        &provider_source,
+        "module external_data_provider\n  use iso_c_binding\n  implicit none\n  integer(c_int) :: shared = 73\nend module external_data_provider\n",
+    )
+    .expect("write external-data provider");
+
+    let provider = Command::new(compiler())
+        .current_dir(&dir)
+        .args(["-ffree-form", "--target", "arm64-macos", "-c", "-J"])
+        .arg(&dir)
+        .arg(&provider_source)
+        .args(["-o"])
+        .arg(&provider_object)
+        .output()
+        .expect("compile external-data provider");
+    assert!(
+        provider.status.success(),
+        "external-data provider failed to compile: {}",
+        String::from_utf8_lossy(&provider.stderr)
+    );
+    assert!(
+        dir.join("external_data_provider.amod").is_file(),
+        "provider compile did not produce its module interface"
+    );
+
+    let consumer_source = dir.join("external_data_consumer.f90");
+    fs::write(
+        &consumer_source,
+        "subroutine read_shared(out) bind(C, name=\"read_shared\")\n  use iso_c_binding\n  use external_data_provider, only: shared\n  implicit none\n  integer(c_int), intent(out) :: out\n  out = shared\nend subroutine read_shared\n",
+    )
+    .expect("write external-data consumer");
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let assembly = dir.join(format!("external_data_consumer_{}.s", &opt[1..]));
+        let consumer = Command::new(compiler())
+            .current_dir(&dir)
+            .args(["-ffree-form", "--target", "arm64-macos", opt, "-S", "-I"])
+            .arg(&dir)
+            .arg(&consumer_source)
+            .args(["-o"])
+            .arg(&assembly)
+            .output()
+            .expect("compile external-data consumer");
+        assert!(
+            consumer.status.success(),
+            "{opt} external-data consumer failed to compile: {}",
+            String::from_utf8_lossy(&consumer.stderr)
+        );
+
+        let asm = fs::read_to_string(&assembly).expect("read external-data consumer assembly");
+        assert!(
+            asm.contains("_afs_mod_external_data_provider_shared@GOTPAGE")
+                && asm.contains("_afs_mod_external_data_provider_shared@GOTPAGEOFF"),
+            "{opt} must resolve imported module data through the Mach-O GOT:\n{asm}"
+        );
+        assert!(
+            !asm.contains("_afs_mod_external_data_provider_shared@PAGE\n"),
+            "{opt} must not emit a direct relocation for imported module data:\n{asm}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -76,7 +76,7 @@ pub fn relax_branches(mf: &mut MachineFunction) {
 fn relax_once(mf: &mut MachineFunction) -> bool {
     // Compute byte offsets for every block label using the actual
     // emit-time instruction count. Several MIR opcodes lower to
-    // multiple ARM64 instructions (AdrpLdr / AdrpAdd, prologue +
+    // multiple ARM64 instructions (AdrpLdr / AdrpAdd / AdrpGotLdr, prologue +
     // stack-probe sequences, large-immediate movz/movk chains, etc.),
     // so a flat 4-bytes-per-MachineInst estimate would systematically
     // under-shoot the real offsets in functions like stdlib_slaruv

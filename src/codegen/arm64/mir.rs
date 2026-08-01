@@ -250,6 +250,9 @@ pub enum ArmOpcode {
     AdrpLdr,   // ADRP + LDR sequence (load value from PC-relative address)
     AdrpAdd,   // ADRP + ADD sequence (compute PC-relative address)
 
+    /// Load an external symbol address from the Mach-O GOT.
+    AdrpGotLdr,
+
     // ---- Branch ----
     B,     // B label
     BCond, // B.cond label
