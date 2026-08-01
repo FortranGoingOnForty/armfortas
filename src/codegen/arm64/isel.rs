@@ -4729,6 +4729,71 @@ mod tests {
     }
 
     #[test]
+    fn logical_array_selection_uses_one_byte_slot_elements_and_gep_stride() {
+        let index = Param {
+            name: "index".into(),
+            ty: IrType::Int(IntWidth::I64),
+            id: ValueId(0),
+            fortran_noalias: false,
+        };
+        let index_id = index.id;
+        let mut func = Function::new(
+            "logical_array_stride".into(),
+            vec![index],
+            IrType::Ptr(Box::new(IrType::Bool)),
+        );
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let array = b.alloca(IrType::Array(Box::new(IrType::Bool), 3));
+            let element = b.gep(array, vec![index_id], IrType::Bool);
+            b.ret(Some(element));
+        }
+
+        let errors = crate::ir::verify::verify_function(&func);
+        assert!(
+            errors.is_empty(),
+            "logical-array selection witness must be verifier-valid: {errors:?}"
+        );
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        assert_eq!(
+            mf.frame
+                .locals
+                .iter()
+                .map(|slot| slot.size)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "[Bool x 3] must reserve one three-byte slot in the selected frame"
+        );
+
+        let mul = mf
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|inst| inst.opcode == ArmOpcode::Mul)
+            .unwrap_or_else(|| panic!("Bool GEP must scale its index: {mf:?}"));
+        let stride = match mul.operands.get(2) {
+            Some(MachineOperand::VReg(stride)) => *stride,
+            other => panic!("Bool GEP multiplier must be a vreg, got {other:?}: {mf:?}"),
+        };
+        let stride_def = mf
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|inst| inst.def == Some(stride))
+            .unwrap_or_else(|| panic!("Bool GEP stride has no definition: {mf:?}"));
+        assert_eq!(stride_def.opcode, ArmOpcode::Movz);
+        assert_eq!(
+            stride_def.operands,
+            vec![
+                MachineOperand::VReg(stride),
+                MachineOperand::Imm(1),
+                MachineOperand::Shift(0),
+            ],
+            "Bool GEP must scale by the same one-byte width reserved in the frame"
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "named struct storage must be rejected by IR verification")]
     fn named_struct_alloca_size_has_no_placeholder() {
         alloca_size(&IrType::Struct(0), crate::target::TargetLayout::LP64);
