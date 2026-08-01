@@ -21,9 +21,10 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 11;
+const AMOD_VERSION: u32 = 12;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
+const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -1339,7 +1340,12 @@ fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLa
             }
         }
         for fp in &layout.final_procs {
-            writeln!(out, "  @final {} rank={}", fp.name, fp.rank).unwrap();
+            writeln!(
+                out,
+                "  @final {} rank={} elemental={}",
+                fp.name, fp.rank, fp.elemental
+            )
+            .unwrap();
         }
         if let Some(owner_module) = &layout.owner_module {
             writeln!(out, "  @owner {}", owner_module).unwrap();
@@ -2026,24 +2032,26 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     for amod_type in &mut types {
         let layout = &mut amod_type.layout;
         for final_proc in &mut layout.final_procs {
-            if final_proc.rank != usize::MAX {
-                continue;
-            }
             let source_name = final_proc
                 .name
                 .strip_prefix(&final_proc_prefix)
                 .unwrap_or(&final_proc.name);
-            let Some(proc) = procedures
+            let procedure = procedures
                 .iter()
-                .find(|proc| proc.name.eq_ignore_ascii_case(source_name))
-            else {
-                return Err(format!(
-                    "{}: cannot infer rank for legacy @final {}",
-                    path.display(),
-                    final_proc.name
-                ));
-            };
-            final_proc.rank = proc.args.first().map_or(0, |arg| arg.rank as usize);
+                .find(|proc| proc.name.eq_ignore_ascii_case(source_name));
+            if final_proc.rank == usize::MAX {
+                let Some(procedure) = procedure else {
+                    return Err(format!(
+                        "{}: cannot infer rank for legacy @final {}",
+                        path.display(),
+                        final_proc.name
+                    ));
+                };
+                final_proc.rank = procedure.args.first().map_or(0, |arg| arg.rank as usize);
+            }
+            if version < AMOD_FINAL_ELEMENTAL_VERSION {
+                final_proc.elemental = procedure.is_some_and(|procedure| procedure.elemental);
+            }
         }
     }
 
@@ -2710,13 +2718,42 @@ fn parse_type(
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
             let mut parts = rest.split_whitespace();
             let name = parts.next().unwrap_or_default().to_string();
-            let rank = match parts.find_map(|part| part.strip_prefix("rank=")) {
+            let attributes: Vec<_> = parts.collect();
+            let rank = match attributes
+                .iter()
+                .find_map(|part| part.strip_prefix("rank="))
+            {
                 Some(rank) => rank
                     .parse()
                     .unwrap_or_else(|_| panic!("malformed @final rank '{}'", rank)),
                 None => usize::MAX,
             };
-            final_procs.push(crate::sema::type_layout::FinalProc { name, rank });
+            let elemental = match attributes
+                .iter()
+                .find_map(|part| part.strip_prefix("elemental="))
+            {
+                Some("true") => true,
+                Some("false") => false,
+                Some(value) => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (invalid @final elemental value '{}'); rebuild the provider module",
+                        path.display(),
+                        value
+                    ));
+                }
+                None if version < AMOD_FINAL_ELEMENTAL_VERSION => false,
+                None => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @final elemental metadata); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+            };
+            final_procs.push(crate::sema::type_layout::FinalProc {
+                name,
+                rank,
+                elemental,
+            });
         } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
             owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
@@ -3292,13 +3329,14 @@ mod tests {
             vec![crate::sema::type_layout::FinalProc {
                 name: "afs_modproc_physics_finish_particles".into(),
                 rank: 1,
+                elemental: false,
             }]
         );
     }
 
     #[test]
     fn current_type_records_require_and_preserve_accessibility() {
-        let amod_text = r#"#!amod 11
+        let amod_text = r#"#!amod 12
 # module: type_access
 
 @type exposed_t, public
@@ -3323,7 +3361,7 @@ mod tests {
         assert_eq!(iface.types[1].layout.name, "hidden_t");
         assert_eq!(iface.types[1].access, Access::Private);
 
-        let missing_access = r#"#!amod 11
+        let missing_access = r#"#!amod 12
 # module: missing_type_access
 
 @type hidden_t
@@ -3366,7 +3404,7 @@ mod tests {
             ),
         ] {
             let malformed = format!(
-                "#!amod 11\n# module: type_access\n\n@type item_t, public\n  @layout size=4 align=4\n  {record}\n@end type\n"
+                "#!amod 12\n# module: type_access\n\n@type item_t, public\n  @layout size=4 align=4\n  {record}\n@end type\n"
             );
             let error = parse_amod(&malformed, Path::new("bad_field_access.amod"))
                 .expect_err("malformed current @field access was accepted");
@@ -3481,20 +3519,64 @@ mod tests {
     }
 
     #[test]
-    fn legacy_final_proc_rank_is_inferred_from_procedure() {
+    fn legacy_final_proc_characteristics_are_inferred_from_procedure() {
         let amod_text = r#"#!amod 2
 # module: m
 
-@subroutine finish
-  @arg values : type(item), rank=1
+@subroutine finish_array
+  @arg values : type(array_item), rank=1
 @end subroutine
 
-@type item
-  @final afs_modproc_m_finish
+@subroutine finish_elemental, elemental
+  @arg value : type(scalar_item)
+@end subroutine
+
+@type array_item
+  @final afs_modproc_m_finish_array
+@end type
+
+@type scalar_item
+  @final afs_modproc_m_finish_elemental
 @end type
 "#;
         let iface = parse_amod(amod_text, Path::new("legacy.amod")).unwrap();
         assert_eq!(iface.types[0].layout.final_procs[0].rank, 1);
+        assert!(!iface.types[0].layout.final_procs[0].elemental);
+        assert_eq!(iface.types[1].layout.final_procs[0].rank, 0);
+        assert!(iface.types[1].layout.final_procs[0].elemental);
+    }
+
+    #[test]
+    fn current_final_proc_elemental_metadata_is_required_and_preserved() {
+        let amod_text = r#"#!amod 12
+# module: m
+
+@type scalar_t, public
+  @final afs_modproc_m_finish_scalar rank=0 elemental=false
+@end type
+
+@type elemental_t, public
+  @final afs_modproc_m_finish_elemental rank=0 elemental=true
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("current.amod")).unwrap();
+        assert!(!iface.types[0].layout.final_procs[0].elemental);
+        assert!(iface.types[1].layout.final_procs[0].elemental);
+
+        let missing = r#"#!amod 12
+# module: m
+
+@type item_t, public
+  @final afs_modproc_m_finish rank=0
+@end type
+"#;
+        let err = parse_amod(missing, Path::new("missing.amod"))
+            .expect_err("current @final records must carry elemental metadata");
+        assert!(
+            err.contains("missing @final elemental metadata")
+                && err.contains("rebuild the provider module"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3669,7 +3751,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 11
+            r#"#!amod 12
 # module: cache_test
 # source: cache_test.f90
 
@@ -3701,7 +3783,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 11
+            r#"#!amod 12
 # module: cached_parent
 # source: cached_parent.f90
 
@@ -3714,7 +3796,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 11
+            r#"#!amod 12
 # module: supplied_parent
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
@@ -3746,7 +3828,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 11
+            r#"#!amod 12
 # module: child
 # ancestor-module: root
 # parent-submodule: middle
@@ -3845,7 +3927,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 11)")
+            err.contains("incompatible .amod version 6 (compiler requires 12)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

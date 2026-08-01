@@ -2738,6 +2738,7 @@ fn register_local_type_layouts(
             );
             for (final_proc, source_name) in layout.final_procs.iter_mut().zip(final_procs) {
                 final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
+                final_proc.elemental = final_procedure_is_elemental(st, scope_id, source_name);
             }
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
@@ -2776,6 +2777,13 @@ fn final_procedure_rank(st: &SymbolTable, owner_scope: ScopeId, name: &str) -> O
     let symbol = scope.symbols.get(&first_arg.to_lowercase())?;
     let specs = &symbol.attrs.array_spec;
     Some(if specs.is_empty() { 0 } else { specs.len() })
+}
+
+fn final_procedure_is_elemental(st: &SymbolTable, owner_scope: ScopeId, name: &str) -> bool {
+    st.scope(owner_scope)
+        .symbols
+        .get(&name.to_ascii_lowercase())
+        .is_some_and(|symbol| symbol.attrs.elemental)
 }
 
 /// Resolve procedure-pointer default-init targets stored as bare

@@ -3779,7 +3779,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 11\n", "#!amod 10\n", 1);
+        .replacen("#!amod 12\n", "#!amod 11\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3806,7 +3806,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 10 (compiler requires 11)")
+        stderr.contains("incompatible .amod version 11 (compiler requires 12)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -24331,8 +24331,8 @@ fn imported_type_finalizer_round_trips_through_amod_and_runs() {
     let amod = dir.join("m.amod");
     let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
     assert!(
-        amod_text.contains("@final afs_modproc_m_destroy_box"),
-        "module finalizer should round-trip with ABI-qualified name: {}",
+        amod_text.contains("@final afs_modproc_m_destroy_box rank=0 elemental=false"),
+        "module finalizer should round-trip with ABI-qualified characteristics: {}",
         amod_text
     );
 
@@ -37514,7 +37514,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 11\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 12\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

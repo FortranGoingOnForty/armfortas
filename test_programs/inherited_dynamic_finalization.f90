@@ -3,7 +3,7 @@
 ! CHECK: component=21 1 1
 ! CHECK: array=723
 ! CHECK: scalar-parent=5
-! CHECK: scalar-parent-array=712
+! CHECK: scalar-parent-array=7
 ! CHECK: nonintegral-parent=30710 24
 ! CHECK: component-order=1234
 ! CHECK: fixed-array-components=2 7
@@ -270,7 +270,7 @@ program inherited_dynamic_finalization
   scalar_parent_events = 0
   call finalize_scalar_parent_array()
   print '(a,i0)', 'scalar-parent-array=', scalar_parent_events
-  if (scalar_parent_events /= 712) error stop 8
+  if (scalar_parent_events /= 7) error stop 8
 
   call finalize_nonintegral_parent_array()
   print '(a,i0,1x,i0)', 'nonintegral-parent=', &

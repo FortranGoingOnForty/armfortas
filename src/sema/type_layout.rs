@@ -92,6 +92,8 @@ pub struct BoundProc {
 pub struct FinalProc {
     pub name: String,
     pub rank: usize,
+    /// Whether a rank-zero procedure may be applied element-wise to arrays.
+    pub elemental: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1764,7 +1766,11 @@ pub(crate) fn compute_layout_with_attrs_in_scope(
             } else {
                 name.clone()
             };
-            FinalProc { name, rank: 0 }
+            FinalProc {
+                name,
+                rank: 0,
+                elemental: false,
+            }
         })
         .collect();
 

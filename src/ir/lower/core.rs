@@ -28323,8 +28323,28 @@ fn finalize_derived_array_storage_dynamic_with<F>(
         return;
     };
 
-    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
     let base_addr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    if !final_proc.elemental {
+        // Allocatable scalars and arrays share the descriptor ABI. A scalar
+        // FINAL is valid for the rank-zero case, but it is an array fallback
+        // only when the procedure itself is ELEMENTAL.
+        let rank_offset = b.const_i64(16);
+        let rank_ptr = b.gep(desc, vec![rank_offset], IrType::Int(IntWidth::I8));
+        let actual_rank = b.load_typed(rank_ptr, IrType::Int(IntWidth::I32));
+        let zero_rank = b.const_i32(0);
+        let is_scalar = b.icmp(CmpOp::Eq, actual_rank, zero_rank);
+        let call_bb = b.create_block("derived_scalar_final_call");
+        let done_bb = b.create_block("derived_scalar_final_done");
+        b.cond_branch(is_scalar, call_bb, vec![], done_bb, vec![]);
+
+        b.set_block(call_bb);
+        emit_final(b, &final_proc.name, base_addr);
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+        return;
+    }
+
+    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
     let zero = b.const_i64(0);
     let bb_check = b.create_block("derived_array_final_check");
     let idx = b.add_block_param(bb_check, IrType::Int(IntWidth::I64));
@@ -61816,6 +61836,7 @@ pub(super) fn type_layout_vtable_symbol(
     for final_proc in &layout.final_procs {
         final_proc.name.to_lowercase().hash(&mut hasher);
         final_proc.rank.hash(&mut hasher);
+        final_proc.elemental.hash(&mut hasher);
     }
     Some(format!(
         "afs_vtable_v2_local_{:016x}_{}",

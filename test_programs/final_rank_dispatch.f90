@@ -5,6 +5,7 @@
 ! CHECK: rank1=2
 ! CHECK: elements=12
 ! CHECK: strided=3 9
+! CHECK: non_elemental=1
 
 !--- file: final_rank_dispatch_mod.f90
 module final_rank_dispatch_mod
@@ -15,6 +16,7 @@ module final_rank_dispatch_mod
   integer :: rank_one_elements = 0
   integer :: strided_calls = 0
   integer :: strided_sum = 0
+  integer :: non_elemental_calls = 0
 
   type :: counted
     integer :: value = 0
@@ -27,6 +29,11 @@ module final_rank_dispatch_mod
   contains
     final :: finish_strided_scalar
   end type scalar_counted
+
+  type :: non_elemental_counted
+  contains
+    final :: finish_non_elemental_scalar
+  end type non_elemental_counted
 
 contains
 
@@ -59,7 +66,7 @@ contains
     value%value = 7
   end subroutine finalize_scalar
 
-  subroutine finish_strided_scalar(value)
+  impure elemental subroutine finish_strided_scalar(value)
     type(scalar_counted), intent(inout) :: value
     strided_calls = strided_calls + 1
     strided_sum = strided_sum + value%value
@@ -68,6 +75,19 @@ contains
   subroutine clear_strided(values)
     type(scalar_counted), intent(out) :: values(:)
   end subroutine clear_strided
+
+  subroutine finish_non_elemental_scalar(value)
+    type(non_elemental_counted), intent(inout) :: value
+    non_elemental_calls = non_elemental_calls + 1
+  end subroutine finish_non_elemental_scalar
+
+  subroutine finalize_non_elemental_array()
+    type(non_elemental_counted) :: values(3)
+  end subroutine finalize_non_elemental_array
+
+  subroutine finalize_non_elemental_scalar()
+    type(non_elemental_counted) :: value
+  end subroutine finalize_non_elemental_scalar
 
 end module final_rank_dispatch_mod
 
@@ -83,14 +103,18 @@ program final_rank_dispatch
   call finalize_fixed_array()
   call finalize_allocatable_array()
   call clear_strided(strided(1:5:2))
+  call finalize_non_elemental_array()
+  call finalize_non_elemental_scalar()
 
   print '(a,i0)', 'scalar=', scalar_calls
   print '(a,i0)', 'rank1=', rank_one_calls
   print '(a,i0)', 'elements=', rank_one_elements
   print '(a,i0,1x,i0)', 'strided=', strided_calls, strided_sum
+  print '(a,i0)', 'non_elemental=', non_elemental_calls
 
   if (scalar_calls /= 1) error stop 1
   if (rank_one_calls /= 2) error stop 2
   if (rank_one_elements /= 12) error stop 3
   if (strided_calls /= 3 .or. strided_sum /= 9) error stop 4
+  if (non_elemental_calls /= 1) error stop 5
 end program final_rank_dispatch
