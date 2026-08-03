@@ -39,6 +39,12 @@ pub extern "C" fn afs_program_finalize() {
 /// Fortran STOP statement.
 #[no_mangle]
 pub extern "C" fn afs_stop() {
+    afs_stop_quiet(0);
+}
+
+/// Fortran STOP statement with the F2018 QUIET= value already evaluated.
+#[no_mangle]
+pub extern "C" fn afs_stop_quiet(_quiet: i32) {
     afs_program_finalize();
     process::exit(0);
 }
@@ -46,6 +52,12 @@ pub extern "C" fn afs_stop() {
 /// Fortran `STOP <int>` statement.
 #[no_mangle]
 pub extern "C" fn afs_stop_int(code: i64) {
+    afs_stop_int_quiet(code, 0);
+}
+
+/// Fortran `STOP <int>, QUIET=...`.
+#[no_mangle]
+pub extern "C" fn afs_stop_int_quiet(code: i64, _quiet: i32) {
     afs_program_finalize();
     let exit_code = if (0..=255).contains(&code) {
         code as i32
@@ -58,12 +70,20 @@ pub extern "C" fn afs_stop_int(code: i64) {
 /// Fortran `STOP "message"` (character stop-code).
 #[no_mangle]
 pub extern "C" fn afs_stop_msg(ptr: *const u8, len: i64) {
-    if !ptr.is_null() && len > 0 {
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let msg = String::from_utf8_lossy(bytes);
-        eprintln!("STOP {}", msg);
-    } else {
-        eprintln!("STOP");
+    afs_stop_msg_quiet(ptr, len, 0);
+}
+
+/// Fortran `STOP "message", QUIET=...`.
+#[no_mangle]
+pub extern "C" fn afs_stop_msg_quiet(ptr: *const u8, len: i64, quiet: i32) {
+    if quiet == 0 {
+        if !ptr.is_null() && len > 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            let msg = String::from_utf8_lossy(bytes);
+            eprintln!("STOP {}", msg);
+        } else {
+            eprintln!("STOP");
+        }
     }
     afs_program_finalize();
     process::exit(0);
@@ -72,7 +92,15 @@ pub extern "C" fn afs_stop_msg(ptr: *const u8, len: i64) {
 /// Fortran ERROR STOP statement.
 #[no_mangle]
 pub extern "C" fn afs_error_stop() {
-    eprintln!("ERROR STOP");
+    afs_error_stop_quiet(0);
+}
+
+/// Fortran ERROR STOP statement with the F2018 QUIET= value already evaluated.
+#[no_mangle]
+pub extern "C" fn afs_error_stop_quiet(quiet: i32) {
+    if quiet == 0 {
+        eprintln!("ERROR STOP");
+    }
     afs_program_finalize();
     process::exit(1);
 }
@@ -85,12 +113,20 @@ pub extern "C" fn afs_error_stop() {
 /// callers.
 #[no_mangle]
 pub extern "C" fn afs_error_stop_msg(ptr: *const u8, len: i64) {
-    if !ptr.is_null() && len > 0 {
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let msg = String::from_utf8_lossy(bytes);
-        eprintln!("ERROR STOP {}", msg);
-    } else {
-        eprintln!("ERROR STOP");
+    afs_error_stop_msg_quiet(ptr, len, 0);
+}
+
+/// Fortran `ERROR STOP "message", QUIET=...`.
+#[no_mangle]
+pub extern "C" fn afs_error_stop_msg_quiet(ptr: *const u8, len: i64, quiet: i32) {
+    if quiet == 0 {
+        if !ptr.is_null() && len > 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            let msg = String::from_utf8_lossy(bytes);
+            eprintln!("ERROR STOP {}", msg);
+        } else {
+            eprintln!("ERROR STOP");
+        }
     }
     afs_program_finalize();
     process::exit(1);
@@ -102,7 +138,15 @@ pub extern "C" fn afs_error_stop_msg(ptr: *const u8, len: i64) {
 /// be an abnormal termination.
 #[no_mangle]
 pub extern "C" fn afs_error_stop_int(code: i64) {
-    eprintln!("ERROR STOP {}", code);
+    afs_error_stop_int_quiet(code, 0);
+}
+
+/// Fortran `ERROR STOP <int>, QUIET=...`.
+#[no_mangle]
+pub extern "C" fn afs_error_stop_int_quiet(code: i64, quiet: i32) {
+    if quiet == 0 {
+        eprintln!("ERROR STOP {}", code);
+    }
     afs_program_finalize();
     let exit_code = if code > 0 && code <= 255 {
         code as i32

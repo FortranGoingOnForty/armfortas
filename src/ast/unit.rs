@@ -4,6 +4,7 @@
 //! subroutines, functions, block data, and interface blocks.
 
 use super::decl::{SpannedDecl, TypeSpec};
+use super::expr::SpannedExpr;
 use super::stmt::SpannedStmt;
 use super::Spanned;
 
@@ -107,7 +108,9 @@ pub enum DummyArg {
 /// BIND(C) specification.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindInfo {
-    pub name: Option<String>, // BIND(C, NAME="cname") — None if just BIND(C)
+    /// `NAME=` is a scalar default-character constant expression, not a
+    /// string token. Semantic resolution evaluates it in the procedure scope.
+    pub name: Option<SpannedExpr>,
 }
 
 /// Body of an interface block — either a subprogram interface or a module procedure name.

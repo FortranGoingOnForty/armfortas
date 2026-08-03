@@ -1,8 +1,29 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::PathBuf;
 
 use armfortas::driver::OptLevel;
 use armfortas::testing::{capture_from_path, CaptureRequest, CapturedStage, Stage};
+
+struct TempSource(PathBuf);
+
+impl TempSource {
+    fn new(stem: &str, source: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("afs_{stem}_{}.f90", std::process::id()));
+        fs::write(&path, source).expect("temporary Fortran source should be writable");
+        Self(path)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for TempSource {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 fn fixture(name: &str) -> PathBuf {
     let path = PathBuf::from("test_programs").join(name);
@@ -17,6 +38,21 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
         Some(CapturedStage::Run(_)) => panic!("expected text stage for {}", stage.as_str()),
         None => panic!("missing requested stage {}", stage.as_str()),
     }
+}
+
+fn capture_run_stdout(request: CaptureRequest) -> String {
+    let result = capture_from_path(&request).expect("capture should succeed");
+    let run = result
+        .get(Stage::Run)
+        .and_then(CapturedStage::as_run)
+        .expect("missing run stage");
+    assert_eq!(
+        run.exit_code, 0,
+        "program should exit successfully: {run:#?}"
+    );
+    run.stdout_text()
+        .expect("run stdout should be valid UTF-8")
+        .to_owned()
 }
 
 fn function_section<'a>(ir: &'a str, name: &str) -> &'a str {
@@ -94,4 +130,57 @@ fn o1_eliminates_unused_pure_recursive_call_from_program_entry() {
         "O1 optimized caller should delete the dead PURE call:\n{}",
         opt_main
     );
+}
+
+#[test]
+fn unused_impure_call_keeps_its_effect_across_all_opt_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        armfortas::testing::report_harness_skip(
+            "pure_dead_call_elim",
+            "unused_impure_call_keeps_its_effect_across_all_opt_levels",
+            1,
+            &reason,
+        );
+        return;
+    }
+
+    let source = TempSource::new(
+        "impure_dead_call",
+        "program impure_dead_call\n\
+           implicit none\n\
+           integer :: sink\n\
+           sink = noisy()\n\
+           sink = 0\n\
+           print *, 'done'\n\
+         contains\n\
+           integer function noisy()\n\
+             print *, 'effect'\n\
+             noisy = 7\n\
+           end function noisy\n\
+         end program impure_dead_call\n",
+    );
+    for opt_level in [
+        OptLevel::O0,
+        OptLevel::O1,
+        OptLevel::O2,
+        OptLevel::O3,
+        OptLevel::Os,
+        OptLevel::Ofast,
+    ] {
+        let stdout = capture_run_stdout(CaptureRequest {
+            input: source.path(),
+            requested: BTreeSet::from([Stage::Run]),
+            opt_level,
+        });
+        let lines = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            ["effect", "done"],
+            "discarding the result must not discard the call at {opt_level:?}:\n{stdout}"
+        );
+    }
 }

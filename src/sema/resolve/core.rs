@@ -9,7 +9,7 @@ use crate::ast::stmt::{SpannedStmt, Stmt};
 use crate::ast::unit::*;
 use crate::sema::symtab::*;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::statement_functions::detect_statement_functions;
 use super::type_resolution::{derived_char_init_len, entity_char_len_to_info, type_spec_to_info};
@@ -34,6 +34,21 @@ pub(super) fn merge_specific_names(into: &mut Vec<String>, additional: &[String]
     }
 }
 
+fn directly_use_associated_generic_interfaces<'a>(
+    st: &'a SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+) -> Vec<&'a Symbol> {
+    let direct_uses: Vec<_> = st
+        .scope(scope_id)
+        .use_associations
+        .iter()
+        .filter(|association| !association.is_submodule_access)
+        .cloned()
+        .collect();
+    st.named_interface_symbols_from_use_associations(&direct_uses, generic_name)
+}
+
 fn merged_visible_generic_specifics(
     st: &SymbolTable,
     scope_id: ScopeId,
@@ -41,15 +56,351 @@ fn merged_visible_generic_specifics(
     local_specifics: &[String],
 ) -> Vec<String> {
     let mut merged = Vec::new();
-    if let Some(existing) = st.lookup_in(scope_id, generic_name) {
-        if existing.kind == SymbolKind::NamedInterface
-            || (existing.kind == SymbolKind::DerivedType && !existing.arg_names.is_empty())
-        {
+    if let Some(existing) = st.named_interface_facet_symbol_in_scope(scope_id, generic_name) {
+        if existing.scope == scope_id {
             merge_specific_names(&mut merged, &existing.arg_names);
         }
     }
+    for interface in directly_use_associated_generic_interfaces(st, scope_id, generic_name) {
+        merge_specific_names(&mut merged, &interface.arg_names);
+    }
     merge_specific_names(&mut merged, local_specifics);
     merged
+}
+
+fn interface_specific_names(bodies: &[InterfaceBody]) -> Vec<String> {
+    let mut names = Vec::new();
+    for body in bodies {
+        match body {
+            InterfaceBody::Subprogram(sub) => match &sub.node {
+                ProgramUnit::Function { name, .. } | ProgramUnit::Subroutine { name, .. } => {
+                    names.push(name.to_lowercase());
+                }
+                _ => {}
+            },
+            InterfaceBody::ModuleProcedure(procedures) => {
+                names.extend(procedures.iter().map(|name| name.to_lowercase()));
+            }
+        }
+    }
+    names
+}
+
+fn procedure_owner_scope(st: &SymbolTable, from_scope: ScopeId, name: &str) -> ScopeId {
+    st.lookup_in(from_scope, name)
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Function
+                    | SymbolKind::Subroutine
+                    | SymbolKind::ExternalProc
+                    | SymbolKind::IntrinsicProc
+                    | SymbolKind::ProcedurePointer
+            )
+        })
+        .map(|symbol| symbol.scope)
+        .unwrap_or(from_scope)
+}
+
+fn duplicate_generic_specific_error(
+    generic_name: &str,
+    specific: &str,
+    span: crate::lexer::Span,
+) -> SemaError {
+    SemaError {
+        span,
+        msg: format!(
+            "specific procedure '{specific}' is already present in generic interface \
+             '{generic_name}'"
+        ),
+    }
+}
+
+fn validate_explicit_generic_specifics(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+    local_specifics: &[String],
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    let mut declared_here = HashSet::new();
+    let mut visible_specifics = HashSet::new();
+    let interfaces = directly_use_associated_generic_interfaces(st, scope_id, generic_name);
+    let mut seen_interfaces = HashSet::new();
+    for interface in interfaces {
+        let interface_key = (interface.scope, interface.name.to_ascii_lowercase());
+        if interface.scope == scope_id || !seen_interfaces.insert(interface_key) {
+            continue;
+        }
+        visible_specifics.extend(interface.arg_names.iter().map(|specific| {
+            (
+                specific.to_ascii_lowercase(),
+                procedure_owner_scope(st, interface.scope, specific),
+            )
+        }));
+    }
+
+    for specific in local_specifics {
+        let key = specific.to_ascii_lowercase();
+        if !declared_here.insert(key.clone()) {
+            return Err(duplicate_generic_specific_error(
+                generic_name,
+                specific,
+                span,
+            ));
+        }
+
+        // A specific may have the same local name as a different procedure
+        // owned by another module. Compare owner scope as well as spelling so
+        // legal generic merges retain that distinction.
+        let local_owner = procedure_owner_scope(st, scope_id, specific);
+        if visible_specifics.contains(&(key, local_owner)) {
+            return Err(duplicate_generic_specific_error(
+                generic_name,
+                specific,
+                span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProcedureNature {
+    Function,
+    Subroutine,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GenericProcedureNatures {
+    saw_function: bool,
+    saw_subroutine: bool,
+}
+
+impl GenericProcedureNatures {
+    fn add(&mut self, nature: ProcedureNature) {
+        match nature {
+            ProcedureNature::Function => self.saw_function = true,
+            ProcedureNature::Subroutine => self.saw_subroutine = true,
+        }
+    }
+
+    fn is_mixed(self) -> bool {
+        self.saw_function && self.saw_subroutine
+    }
+}
+
+fn procedure_nature(symbol: &Symbol) -> Option<ProcedureNature> {
+    match symbol.kind {
+        SymbolKind::Function => Some(ProcedureNature::Function),
+        SymbolKind::Subroutine => Some(ProcedureNature::Subroutine),
+        SymbolKind::ExternalProc if symbol.type_info.is_some() => Some(ProcedureNature::Function),
+        _ => None,
+    }
+}
+
+fn generic_procedure_natures_from_interfaces<'a>(
+    st: &SymbolTable,
+    interfaces: impl IntoIterator<Item = &'a Symbol>,
+) -> GenericProcedureNatures {
+    let mut natures = GenericProcedureNatures::default();
+    let mut seen_specifics = HashSet::new();
+    for interface in interfaces {
+        for specific in &interface.arg_names {
+            let Some(symbol) = st.lookup_in(interface.scope, specific) else {
+                continue;
+            };
+            let Some(nature) = procedure_nature(symbol) else {
+                continue;
+            };
+            if seen_specifics.insert((symbol.scope, symbol.name.to_ascii_lowercase(), nature)) {
+                natures.add(nature);
+            }
+        }
+    }
+    natures
+}
+
+fn visible_generic_procedure_natures(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+) -> GenericProcedureNatures {
+    let scope = st.scope(scope_id);
+    let mut interfaces = st.named_interface_symbols_in(scope_id, generic_name);
+    interfaces.extend(
+        st.named_interface_symbols_from_use_associations(&scope.use_associations, generic_name),
+    );
+    generic_procedure_natures_from_interfaces(st, interfaces)
+}
+
+fn use_associated_generic_procedure_natures(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    generic_name: &str,
+) -> GenericProcedureNatures {
+    let interfaces = directly_use_associated_generic_interfaces(st, scope_id, generic_name);
+    generic_procedure_natures_from_interfaces(st, interfaces)
+}
+
+fn mixed_generic_procedure_natures_error(
+    generic_name: &str,
+    span: crate::lexer::Span,
+) -> SemaError {
+    SemaError {
+        span,
+        msg: format!(
+            "generic interface '{}' may not mix function and subroutine specific procedures",
+            generic_name.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn declared_procedure_nature(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    unit: &ProgramUnit,
+) -> Option<(String, ProcedureNature)> {
+    match unit {
+        ProgramUnit::Function { name, .. } => {
+            Some((name.to_ascii_lowercase(), ProcedureNature::Function))
+        }
+        ProgramUnit::Subroutine {
+            name, args, prefix, ..
+        } => {
+            let inherited_nature = (args.is_empty()
+                && prefix.iter().any(|item| matches!(item, Prefix::Module))
+                && matches!(st.scope(scope_id).kind, ScopeKind::Submodule(_)))
+            .then(|| st.lookup_in(scope_id, name))
+            .flatten()
+            .and_then(procedure_nature);
+            Some((
+                name.to_ascii_lowercase(),
+                inherited_nature.unwrap_or(ProcedureNature::Subroutine),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn declared_procedure_natures(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    units: &[SpannedUnit],
+) -> HashMap<String, ProcedureNature> {
+    let mut natures = HashMap::new();
+    for unit in units {
+        if let Some((name, nature)) = declared_procedure_nature(st, scope_id, &unit.node) {
+            natures.entry(name).or_insert(nature);
+        }
+        let ProgramUnit::InterfaceBlock { bodies, .. } = &unit.node else {
+            continue;
+        };
+        for body in bodies {
+            let InterfaceBody::Subprogram(subprogram) = body else {
+                continue;
+            };
+            if let Some((name, nature)) = declared_procedure_nature(st, scope_id, &subprogram.node)
+            {
+                natures.entry(name).or_insert(nature);
+            }
+        }
+    }
+    natures
+}
+
+fn validate_local_generic_declarations(
+    st: &SymbolTable,
+    units: &[SpannedUnit],
+    containing_span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    let scope_id = st.current_scope();
+    let local_procedure_natures = declared_procedure_natures(st, scope_id, units);
+    let mut generic_natures = HashMap::new();
+    let mut visible_generic_names = BTreeSet::new();
+    for symbol in st.scope(scope_id).symbols.values() {
+        if symbol.kind == SymbolKind::NamedInterface {
+            visible_generic_names.insert(symbol.name.to_ascii_lowercase());
+        }
+    }
+    for association in &st.scope(scope_id).use_associations {
+        if !association.local_name.is_empty() {
+            visible_generic_names.insert(association.local_name.to_ascii_lowercase());
+        }
+    }
+    for generic_name in visible_generic_names {
+        let natures = visible_generic_procedure_natures(st, scope_id, &generic_name);
+        if natures.is_mixed() {
+            return Err(mixed_generic_procedure_natures_error(
+                &generic_name,
+                containing_span,
+            ));
+        }
+        generic_natures.insert(generic_name, natures);
+    }
+
+    let mut declared = HashSet::new();
+    for unit in units {
+        let ProgramUnit::InterfaceBlock {
+            name: Some(generic_name),
+            bodies,
+            ..
+        } = &unit.node
+        else {
+            continue;
+        };
+        if generic_name.is_empty() {
+            continue;
+        }
+        let specifics = interface_specific_names(bodies);
+        validate_explicit_generic_specifics(st, scope_id, generic_name, &specifics, unit.span)?;
+        let generic_key = generic_name.to_ascii_lowercase();
+        let natures = generic_natures
+            .entry(generic_key.clone())
+            .or_insert_with(|| {
+                use_associated_generic_procedure_natures(st, scope_id, &generic_key)
+            });
+        for body in bodies {
+            match body {
+                InterfaceBody::Subprogram(subprogram) => {
+                    if let Some((_, nature)) =
+                        declared_procedure_nature(st, scope_id, &subprogram.node)
+                    {
+                        natures.add(nature);
+                    }
+                }
+                InterfaceBody::ModuleProcedure(procedures) => {
+                    for procedure in procedures {
+                        let key = procedure.to_ascii_lowercase();
+                        let nature = local_procedure_natures
+                            .get(&key)
+                            .copied()
+                            .or_else(|| st.lookup_in(scope_id, &key).and_then(procedure_nature));
+                        if let Some(nature) = nature {
+                            natures.add(nature);
+                        }
+                    }
+                }
+            }
+            if natures.is_mixed() {
+                return Err(mixed_generic_procedure_natures_error(
+                    generic_name,
+                    unit.span,
+                ));
+            }
+        }
+        for specific in specifics {
+            let specific_key = specific.to_ascii_lowercase();
+            if !declared.insert((generic_key.clone(), specific_key)) {
+                return Err(duplicate_generic_specific_error(
+                    generic_name,
+                    &specific,
+                    unit.span,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Walk a list of program units and build the symbol table.
@@ -99,6 +450,14 @@ pub fn resolve_file(
     for unit in units {
         resolve_unit(&mut st, unit, module_search_paths, &mut layouts)?;
     }
+    // Some procedure(interface) entities are resolved before a later
+    // interface block publishes its callable symbol. Revisit every completed
+    // scope once, after the whole file has been registered, so purity and
+    // result characteristics come from lexical interface lookup rather than
+    // whichever same-named symbol happened to be created first.
+    for scope_id in 0..st.scopes.len() {
+        backfill_procedure_interfaces(&mut st, scope_id);
+    }
     let external_modules = LOADED_EXTERNAL_MODULES.with(|cell| {
         let v = cell.borrow();
         v.iter().cloned().collect::<Vec<_>>()
@@ -114,33 +473,46 @@ pub fn resolve_file(
     })
 }
 
-pub(super) fn backfill_procedure_pointer_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
-    let updates: Vec<(String, Option<TypeInfo>, Vec<String>)> = st
+pub(super) fn backfill_procedure_interfaces(st: &mut SymbolTable, scope_id: ScopeId) {
+    struct InterfaceUpdate {
+        key: String,
+        type_info: Option<TypeInfo>,
+        arg_names: Vec<String>,
+        pure: bool,
+        elemental: bool,
+        result_rank: u8,
+        result_array_spec: Vec<decl::ArraySpec>,
+    }
+
+    let updates: Vec<InterfaceUpdate> = st
         .scope(scope_id)
         .symbols
         .iter()
         .filter_map(|(key, sym)| {
-            if sym.kind != SymbolKind::ProcedurePointer {
-                return None;
-            }
-            let TypeInfo::Derived(iface_name) = sym.type_info.as_ref()? else {
-                return None;
-            };
-            let iface_sym = st.find_symbol_any_scope(&iface_name.to_lowercase())?;
-            Some((
-                key.clone(),
-                iface_sym.type_info.clone(),
-                iface_sym.arg_names.clone(),
-            ))
+            let iface_name = sym.attrs.procedure_iface.as_deref()?;
+            let iface_sym = st.lookup_in(scope_id, iface_name)?;
+            Some(InterfaceUpdate {
+                key: key.clone(),
+                type_info: iface_sym.type_info.clone(),
+                arg_names: iface_sym.arg_names.clone(),
+                pure: iface_sym.attrs.pure,
+                elemental: iface_sym.attrs.elemental,
+                result_rank: iface_sym.attrs.result_rank,
+                result_array_spec: iface_sym.attrs.array_spec.clone(),
+            })
         })
         .collect();
 
-    for (key, type_info, arg_names) in updates {
-        if let Some(sym) = st.scope_mut(scope_id).symbols.get_mut(&key) {
-            if let Some(type_info) = type_info {
+    for update in updates {
+        if let Some(sym) = st.scope_mut(scope_id).symbols.get_mut(&update.key) {
+            if let Some(type_info) = update.type_info {
                 sym.type_info = Some(type_info);
             }
-            sym.arg_names = arg_names;
+            sym.arg_names = update.arg_names;
+            sym.attrs.pure = update.pure;
+            sym.attrs.elemental = update.elemental;
+            sym.attrs.result_rank = update.result_rank;
+            sym.attrs.array_spec = update.result_array_spec;
         }
     }
 }
@@ -177,30 +549,100 @@ fn backfill_function_result_type(
     }
 }
 
-fn normalized_bind_name(
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ProcedureBinding {
+    bind_c: bool,
+    label: Option<String>,
+}
+
+fn resolved_procedure_binding(
     bind: Option<&crate::ast::unit::BindInfo>,
     default_name: &str,
-) -> Option<String> {
-    bind.map(|info| {
-        info.name
-            .as_deref()
-            .unwrap_or(default_name)
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string()
+    st: &SymbolTable,
+    scope_id: ScopeId,
+) -> Result<ProcedureBinding, SemaError> {
+    let Some(bind) = bind else {
+        return Ok(ProcedureBinding::default());
+    };
+    let Some(expr) = &bind.name else {
+        return Ok(ProcedureBinding {
+            bind_c: true,
+            label: Some(default_name.to_string()),
+        });
+    };
+    if !matches!(
+        crate::sema::types::expr_type(expr, st),
+        crate::sema::types::FortranType::Character { kind: 1, .. }
+    ) {
+        return Err(SemaError {
+            span: expr.span,
+            msg: "BIND(C) NAME= must be a scalar default-character constant expression".into(),
+        });
+    }
+    let value = eval_const_char_expr_in_scope(expr, st, scope_id).ok_or_else(|| SemaError {
+        span: expr.span,
+        msg: "BIND(C) NAME= must be a scalar default-character constant expression".into(),
+    })?;
+    if value.is_empty() {
+        return Ok(ProcedureBinding {
+            bind_c: true,
+            label: None,
+        });
+    }
+    let mut chars = value.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        return Err(SemaError {
+            span: expr.span,
+            msg: "BIND(C) NAME= must evaluate to a valid C identifier or an empty string".into(),
+        });
+    }
+    Ok(ProcedureBinding {
+        bind_c: true,
+        label: Some(value),
     })
 }
 
-type InterfaceOuterRef = (
-    String,
-    SymbolKind,
-    Option<TypeInfo>,
-    Vec<String>,
-    Option<String>,
-    bool, // pure
-    bool, // elemental
-    SymbolAttrs,
-);
+fn unresolved_procedure_binding(
+    bind: Option<&crate::ast::unit::BindInfo>,
+    default_name: &str,
+) -> ProcedureBinding {
+    ProcedureBinding {
+        bind_c: bind.is_some(),
+        label: bind.map(|_| default_name.to_string()),
+    }
+}
+
+struct InterfaceOuterRef {
+    name: String,
+    kind: SymbolKind,
+    type_info: Option<TypeInfo>,
+    arg_names: Vec<String>,
+    bind_c: bool,
+    binding_label: Option<String>,
+    pure: bool,
+    elemental: bool,
+    abstract_interface: bool,
+    result_attrs: SymbolAttrs,
+    defined_at: crate::lexer::Span,
+}
+
+fn can_merge_interface_body_with_dummy(symbol: &Symbol) -> bool {
+    // Header dummies begin as variables. Declarations that establish
+    // incompatible data-object or procedure attributes make the placeholder
+    // ineligible to become the explicitly declared procedure.
+    symbol.kind == SymbolKind::Variable
+        && symbol.attrs.array_spec.is_empty()
+        && !symbol.attrs.allocatable
+        && !symbol.attrs.intrinsic
+        && !symbol.attrs.save
+        && !symbol.attrs.target
+        && !symbol.attrs.value
+        && !(symbol.attrs.external && symbol.type_info.is_some())
+}
 
 fn reject_imports_in_disallowed_scope(
     imports: &[ImportStmt],
@@ -383,8 +825,8 @@ pub(super) fn resolve_unit(
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
-            process_contains(st, contains, module_search_paths, layouts)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::Module {
@@ -403,8 +845,8 @@ pub(super) fn resolve_unit(
                 process_uses(st, uses, module_search_paths, layouts)?;
                 process_implicit(st, implicit)?;
                 process_decls(st, decls)?;
-                process_contains(st, contains, module_search_paths, layouts)?;
-                backfill_procedure_pointer_interfaces(st, mod_id);
+                process_contains(st, contains, module_search_paths, layouts, unit.span)?;
+                backfill_procedure_interfaces(st, mod_id);
 
                 st.enter_scope(saved);
             }
@@ -413,7 +855,7 @@ pub(super) fn resolve_unit(
             name,
             args,
             prefix,
-            bind: _,
+            bind,
             uses,
             imports,
             implicit,
@@ -481,11 +923,21 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            let binding = if is_separate_body && bind.is_none() {
+                ProcedureBinding {
+                    bind_c: st.scope(scope_id).bind_c,
+                    label: st.scope(scope_id).binding_label.clone(),
+                }
+            } else {
+                resolved_procedure_binding(bind.as_ref(), name, st, scope_id)?
+            };
+            st.scope_mut(scope_id).bind_c = binding.bind_c;
+            st.scope_mut(scope_id).binding_label = binding.label;
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
-            process_contains(st, contains, module_search_paths, layouts)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::Function {
@@ -493,7 +945,7 @@ pub(super) fn resolve_unit(
             args,
             result,
             return_type,
-            bind: _,
+            bind,
             prefix,
             uses,
             imports,
@@ -542,6 +994,7 @@ pub(super) fn resolve_unit(
             }
             // Define result variable.
             let result_name = result.as_deref().unwrap_or(name.as_str());
+            st.scope_mut(scope_id).result_name = Some(result_name.to_string());
             st.define(Symbol {
                 name: result_name.into(),
                 kind: SymbolKind::Variable,
@@ -556,6 +1009,9 @@ pub(super) fn resolve_unit(
             process_uses(st, uses, module_search_paths, layouts)?;
             process_implicit(st, implicit)?;
             process_decls(st, decls)?;
+            let binding = resolved_procedure_binding(bind.as_ref(), name, st, scope_id)?;
+            st.scope_mut(scope_id).bind_c = binding.bind_c;
+            st.scope_mut(scope_id).binding_label = binding.label;
             backfill_function_result_type(
                 st,
                 host_scope,
@@ -566,8 +1022,8 @@ pub(super) fn resolve_unit(
             process_namelists(st, body)?;
             detect_statement_functions(st, scope_id, body);
             preload_stmt_uses(st, body, module_search_paths, layouts);
-            process_contains(st, contains, module_search_paths, layouts)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::BlockData { name, uses, decls } => {
@@ -575,6 +1031,7 @@ pub(super) fn resolve_unit(
             st.push_scope(ScopeKind::Program(scope_name));
             process_uses(st, uses, module_search_paths, layouts)?;
             process_decls(st, decls)?;
+            validate_local_generic_declarations(st, &[], unit.span)?;
             st.pop_scope();
         }
         ProgramUnit::Submodule {
@@ -664,15 +1121,26 @@ pub(super) fn resolve_unit(
                 });
             }
             process_decls(st, decls)?;
-            process_contains(st, contains, module_search_paths, layouts)?;
-            backfill_procedure_pointer_interfaces(st, scope_id);
+            process_contains(st, contains, module_search_paths, layouts, unit.span)?;
+            backfill_procedure_interfaces(st, scope_id);
             st.pop_scope();
         }
         ProgramUnit::InterfaceBlock {
             name,
-            is_abstract: _,
+            is_abstract,
             bodies,
         } => {
+            let specific_names = interface_specific_names(bodies);
+            if let Some(generic_name) = name.as_deref().filter(|name| !name.is_empty()) {
+                validate_explicit_generic_specifics(
+                    st,
+                    st.current_scope(),
+                    generic_name,
+                    &specific_names,
+                    unit.span,
+                )?;
+            }
+
             // Collect each subprogram's name and return type BEFORE
             // pushing the Interface scope — the subprogram body gets
             // its own scope via resolve_unit, and we need to surface
@@ -740,16 +1208,20 @@ pub(super) fn resolve_unit(
                             result_attrs_for_iface.is_separate_module_interface = prefix
                                 .iter()
                                 .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
-                            outer_refs.push((
-                                fn_name.clone(),
-                                SymbolKind::Function,
-                                ti,
+                            let binding = unresolved_procedure_binding(bind.as_ref(), fn_name);
+                            outer_refs.push(InterfaceOuterRef {
+                                name: fn_name.clone(),
+                                kind: SymbolKind::Function,
+                                type_info: ti,
                                 arg_names,
-                                normalized_bind_name(bind.as_ref(), fn_name),
+                                bind_c: binding.bind_c,
+                                binding_label: binding.label,
                                 pure,
                                 elemental,
-                                result_attrs_for_iface,
-                            ));
+                                abstract_interface: *is_abstract,
+                                result_attrs: result_attrs_for_iface,
+                                defined_at: sub.span,
+                            });
                         }
                         ProgramUnit::Subroutine {
                             name: fn_name,
@@ -778,44 +1250,53 @@ pub(super) fn resolve_unit(
                             let is_separate_module_interface = prefix
                                 .iter()
                                 .any(|item| matches!(item, crate::ast::unit::Prefix::Module));
-                            outer_refs.push((
-                                fn_name.clone(),
-                                SymbolKind::Subroutine,
-                                None,
+                            let binding = unresolved_procedure_binding(bind.as_ref(), fn_name);
+                            outer_refs.push(InterfaceOuterRef {
+                                name: fn_name.clone(),
+                                kind: SymbolKind::Subroutine,
+                                type_info: None,
                                 arg_names,
-                                normalized_bind_name(bind.as_ref(), fn_name),
+                                bind_c: binding.bind_c,
+                                binding_label: binding.label,
                                 pure,
                                 elemental,
-                                SymbolAttrs {
+                                abstract_interface: *is_abstract,
+                                result_attrs: SymbolAttrs {
                                     is_separate_module_interface,
                                     ..Default::default()
                                 },
-                            ));
+                                defined_at: sub.span,
+                            });
                         }
                         _ => {}
                     }
                 }
             }
 
-            st.push_scope(ScopeKind::Interface);
-            let mut specific_names = Vec::new();
+            let interface_scope = st.push_scope(ScopeKind::Interface);
             for body in bodies {
                 match body {
                     InterfaceBody::Subprogram(sub) => {
-                        match &sub.node {
-                            ProgramUnit::Function { name: fn_name, .. }
-                            | ProgramUnit::Subroutine { name: fn_name, .. } => {
-                                specific_names.push(fn_name.to_lowercase());
-                            }
-                            _ => {}
-                        }
                         resolve_unit(st, sub, module_search_paths, layouts)?;
-                    }
-                    InterfaceBody::ModuleProcedure(names) => {
-                        for n in names {
-                            specific_names.push(n.to_lowercase());
+                        if let Some(proc_scope) = find_unit_scope(st, interface_scope, &sub.node) {
+                            let bind_c = st.scope(proc_scope).bind_c;
+                            let binding_label = st.scope(proc_scope).binding_label.clone();
+                            let (name, kind) = match &sub.node {
+                                ProgramUnit::Function { name, .. } => (name, SymbolKind::Function),
+                                ProgramUnit::Subroutine { name, .. } => {
+                                    (name, SymbolKind::Subroutine)
+                                }
+                                _ => continue,
+                            };
+                            if let Some(outer_ref) = outer_refs.iter_mut().find(|outer_ref| {
+                                outer_ref.name.eq_ignore_ascii_case(name) && outer_ref.kind == kind
+                            }) {
+                                outer_ref.bind_c = bind_c;
+                                outer_ref.binding_label = binding_label;
+                            }
                         }
                     }
+                    InterfaceBody::ModuleProcedure(_) => {}
                 }
             }
             st.pop_scope();
@@ -823,19 +1304,31 @@ pub(super) fn resolve_unit(
             // Surface each declared procedure to the enclosing scope
             // so callers under IMPLICIT NONE can resolve the name,
             // and so BIND(C) external prototypes are callable.
-            for (fn_name, kind, ti, arg_names, binding_label, pure, elemental, result_attrs) in
-                outer_refs
-            {
-                let span = unit.span;
+            for outer_ref in outer_refs {
+                let InterfaceOuterRef {
+                    name: fn_name,
+                    kind,
+                    type_info: ti,
+                    arg_names,
+                    bind_c,
+                    binding_label,
+                    pure,
+                    elemental,
+                    abstract_interface,
+                    result_attrs,
+                    defined_at,
+                } = outer_ref;
                 let symbol = Symbol {
                     name: fn_name.clone(),
                     kind: kind.clone(),
                     type_info: ti.clone(),
                     attrs: SymbolAttrs {
                         external: true,
+                        bind_c,
                         binding_label: binding_label.clone(),
                         pure,
                         elemental,
+                        abstract_interface,
                         allocatable: result_attrs.allocatable,
                         pointer: result_attrs.pointer,
                         result_rank: result_attrs.result_rank,
@@ -843,7 +1336,7 @@ pub(super) fn resolve_unit(
                         is_separate_module_interface: result_attrs.is_separate_module_interface,
                         ..Default::default()
                     },
-                    defined_at: span,
+                    defined_at,
                     scope: st.current_scope(),
                     arg_names: arg_names.clone(),
                     const_value: None,
@@ -857,16 +1350,19 @@ pub(super) fn resolve_unit(
                     }
                     let scope_id = st.current_scope();
                     let is_dummy_arg = st.scope(scope_id).arg_order.iter().any(|arg| arg == &key);
+                    let mut merged_dummy = false;
                     if is_dummy_arg {
                         if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
-                            if existing.kind == SymbolKind::Variable {
+                            if can_merge_interface_body_with_dummy(existing) {
                                 let mut attrs = existing.attrs.clone();
+                                let dummy_is_pointer = attrs.pointer;
                                 attrs.external = true;
+                                attrs.bind_c = bind_c;
                                 attrs.binding_label = binding_label;
                                 attrs.pure = pure;
                                 attrs.elemental = elemental;
                                 attrs.allocatable = result_attrs.allocatable;
-                                attrs.pointer = result_attrs.pointer;
+                                attrs.pointer = dummy_is_pointer || result_attrs.pointer;
                                 attrs.result_rank = result_attrs.result_rank;
                                 attrs.array_spec = result_attrs.array_spec;
                                 attrs.is_separate_module_interface =
@@ -875,8 +1371,12 @@ pub(super) fn resolve_unit(
                                 existing.type_info = ti;
                                 existing.attrs = attrs;
                                 existing.arg_names = arg_names;
+                                merged_dummy = true;
                             }
                         }
+                    }
+                    if !merged_dummy {
+                        return Err(err);
                     }
                 }
             }
@@ -1122,6 +1622,21 @@ fn inject_separate_module_procedure_args(
     let Some(iface_scope) = iface_scope else {
         return;
     };
+    let inherited_binding = if st.scope(iface_scope).bind_c {
+        ProcedureBinding {
+            bind_c: true,
+            label: st.scope(iface_scope).binding_label.clone(),
+        }
+    } else {
+        st.scope(parent_module_scope)
+            .symbols
+            .get(&proc_lc)
+            .map(|symbol| ProcedureBinding {
+                bind_c: symbol.attrs.bind_c,
+                label: symbol.attrs.binding_label.clone(),
+            })
+            .unwrap_or_default()
+    };
 
     // Snapshot arg_order and dummy-arg symbols from the interface
     // scope before mutating the body scope.
@@ -1139,32 +1654,16 @@ fn inject_separate_module_procedure_args(
         })
         .collect();
 
-    // Sprint35-SMP Phase 2: also clone the result variable (function
-    // case) so the body's `res = ...` references resolve to a
-    // properly-typed Variable rather than implicit-typing as a scalar.
-    // The result variable is the non-arg Variable in the iface scope:
-    //   - For interface bodies parsed from source: sema's Function arm
-    //     defined a Symbol with the user's `result(NAME)` clause.
-    //   - For .amod-loaded modules: load_external_module synthesized
-    //     a `__amod_result_NAME` Variable that we strip the prefix off.
-    let result_sym: Option<Symbol> = {
-        let arg_set: std::collections::HashSet<String> = st
-            .scope(iface_scope)
-            .arg_order
-            .iter()
-            .map(|n| n.to_lowercase())
-            .collect();
-        st.scope(iface_scope)
-            .symbols
-            .iter()
-            .find(|(key, sym)| {
-                !arg_set.contains(*key)
-                    && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-            })
-            .map(|(_, sym)| sym.clone())
-    };
+    // Also clone the function result into the separate body. The interface
+    // scope records its exact RESULT identity; unrelated locals and named
+    // constants must never participate in this selection.
+    let result_name = st.scope(iface_scope).result_name.clone();
+    let result_sym = st.scope(iface_scope).procedure_result_symbol().cloned();
 
     st.scope_mut(body_scope).arg_order = arg_order;
+    st.scope_mut(body_scope).bind_c = inherited_binding.bind_c;
+    st.scope_mut(body_scope).binding_label = inherited_binding.label;
+    st.scope_mut(body_scope).result_name = result_name.clone();
     for mut sym in arg_symbols {
         sym.scope = body_scope;
         sym.defined_at = span;
@@ -1173,13 +1672,8 @@ fn inject_separate_module_procedure_args(
     if let Some(mut sym) = result_sym {
         sym.scope = body_scope;
         sym.defined_at = span;
-        // For .amod-loaded result vars the name carries the
-        // `__amod_result_` prefix to avoid shadowing user locals in
-        // the parent module's procedure scope. Strip it for the body
-        // scope so user code referencing the result by its declared
-        // name resolves correctly.
-        if let Some(stripped) = sym.name.strip_prefix("__amod_result_") {
-            sym.name = stripped.to_string();
+        if let Some(result_name) = result_name {
+            sym.name = result_name;
         }
         let _ = st.define(sym);
     }
@@ -1747,7 +2241,7 @@ fn eval_const_char_expr_in_scope(
         Expr::StringLiteral { value, .. } => Some(value.source_view().into_owned()),
         Expr::Name { name } => {
             let sym = st.lookup_in(scope_id, &name.to_lowercase())?;
-            if sym.attrs.parameter {
+            if sym.attrs.parameter && sym.attrs.array_spec.is_empty() {
                 sym.const_char_value.clone()
             } else {
                 None
@@ -1788,6 +2282,52 @@ fn eval_const_char_expr_in_scope(
         }
         _ => None,
     }
+}
+
+fn eval_ieee_selected_real_kind_args(
+    args: &[crate::ast::expr::Argument],
+    mut eval: impl FnMut(&crate::ast::expr::SpannedExpr) -> Option<i64>,
+) -> Option<i64> {
+    let mut values = [None, None, None];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            match keyword.to_ascii_lowercase().as_str() {
+                "p" => 0,
+                "r" => 1,
+                "radix" => 2,
+                _ => return None,
+            }
+        } else {
+            if saw_keyword || positional >= values.len() {
+                return None;
+            }
+            let index = positional;
+            positional += 1;
+            index
+        };
+        if values[index].is_some() {
+            return None;
+        }
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        values[index] = Some(eval(expr)?);
+    }
+
+    if values.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(i64::from(
+        crate::sema::types::ieee_selected_real_kind_value(
+            i128::from(values[0].unwrap_or(0)),
+            i128::from(values[1].unwrap_or(0)),
+            values[2].map(i128::from),
+        ),
+    ))
 }
 
 fn eval_const_int_expr_with_params(
@@ -1837,6 +2377,9 @@ fn eval_const_int_expr_with_params(
                 }
             });
             match name.to_lowercase().as_str() {
+                "ieee_selected_real_kind" => eval_ieee_selected_real_kind_args(args, |expr| {
+                    eval_const_int_expr_with_params(expr, const_params, const_char_params)
+                }),
                 "selected_int_kind" => {
                     let r = first_arg_val?;
                     Some(if r <= 2 {
@@ -2195,6 +2738,7 @@ fn register_local_type_layouts(
             );
             for (final_proc, source_name) in layout.final_procs.iter_mut().zip(final_procs) {
                 final_proc.rank = final_procedure_rank(st, scope_id, source_name).unwrap_or(0);
+                final_proc.elemental = final_procedure_is_elemental(st, scope_id, source_name);
             }
             // Don't overwrite a layout that has bound_procs or final_procs with one that doesn't.
             // This handles the case where a subroutine redefines a type without CONTAINS.
@@ -2233,6 +2777,13 @@ fn final_procedure_rank(st: &SymbolTable, owner_scope: ScopeId, name: &str) -> O
     let symbol = scope.symbols.get(&first_arg.to_lowercase())?;
     let specs = &symbol.attrs.array_spec;
     Some(if specs.is_empty() { 0 } else { specs.len() })
+}
+
+fn final_procedure_is_elemental(st: &SymbolTable, owner_scope: ScopeId, name: &str) -> bool {
+    st.scope(owner_scope)
+        .symbols
+        .get(&name.to_ascii_lowercase())
+        .is_some_and(|symbol| symbol.attrs.elemental)
 }
 
 /// Resolve procedure-pointer default-init targets stored as bare
@@ -2312,7 +2863,9 @@ fn resolve_proc_pointer_link_symbol(st: &SymbolTable, from_scope: ScopeId, targe
         break;
     }
 
-    target.to_string()
+    crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(&key)
+        .unwrap_or(target)
+        .to_string()
 }
 
 fn mangle_link_symbol_for(
@@ -2321,6 +2874,11 @@ fn mangle_link_symbol_for(
     name_in_scope: &str,
 ) -> String {
     use crate::sema::symtab::{ScopeKind, SymbolKind};
+    if sym.kind == SymbolKind::IntrinsicProc || sym.attrs.intrinsic {
+        return crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(name_in_scope)
+            .unwrap_or(name_in_scope)
+            .to_string();
+    }
     match sym.kind {
         SymbolKind::Function | SymbolKind::Subroutine => match &scope.kind {
             ScopeKind::Module(module_name) | ScopeKind::Submodule(module_name) => format!(
@@ -2362,24 +2920,204 @@ fn process_implicit(st: &mut SymbolTable, implicit_stmts: &[SpannedDecl]) -> Res
     Ok(())
 }
 
+fn implicit_type_to_type_info(implicit_type: ImplicitType) -> TypeInfo {
+    match implicit_type {
+        ImplicitType::Integer => TypeInfo::Integer { kind: None },
+        ImplicitType::Real => TypeInfo::Real { kind: None },
+        ImplicitType::DoublePrecision => TypeInfo::DoublePrecision,
+        ImplicitType::Complex => TypeInfo::Complex { kind: None },
+        ImplicitType::Logical => TypeInfo::Logical { kind: None },
+        ImplicitType::Character => TypeInfo::Character {
+            len: Some(1),
+            kind: None,
+        },
+    }
+}
+
+fn is_unresolved_declaration_placeholder(
+    st: &SymbolTable,
+    name: &str,
+    declared_kind: &SymbolKind,
+) -> bool {
+    if !matches!(
+        declared_kind,
+        SymbolKind::Variable | SymbolKind::ProcedurePointer
+    ) {
+        return false;
+    }
+    is_procedure_entity_placeholder(st, name)
+        && st
+            .scope(st.current_scope())
+            .symbols
+            .get(&name.to_ascii_lowercase())
+            .is_some_and(|symbol| symbol.type_info.is_none())
+}
+
+fn is_procedure_entity_placeholder(st: &SymbolTable, name: &str) -> bool {
+    let key = name.to_ascii_lowercase();
+    let scope = st.scope(st.current_scope());
+    let has_placeholder_identity = scope
+        .arg_order
+        .iter()
+        .any(|argument| argument.eq_ignore_ascii_case(&key))
+        || scope
+            .result_name
+            .as_deref()
+            .is_some_and(|result| result.eq_ignore_ascii_case(&key));
+    has_placeholder_identity
+        && scope
+            .symbols
+            .get(&key)
+            .is_some_and(|symbol| symbol.kind == SymbolKind::Variable)
+}
+
+fn repeated_symbol_access_error(name: &str, span: crate::lexer::Span) -> SemaError {
+    SemaError {
+        span,
+        msg: format!(
+            "accessibility of '{}' is specified more than once in this scope",
+            name.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn repeated_default_access_error(span: crate::lexer::Span) -> SemaError {
+    SemaError {
+        span,
+        msg: "default accessibility is specified more than once in this scope".into(),
+    }
+}
+
+fn entity_declaration_access(attrs: &[Attribute]) -> (Option<Access>, bool) {
+    let mut access = None;
+    for attr in attrs {
+        let next = match attr {
+            Attribute::Public => Access::Public,
+            Attribute::Private => Access::Private,
+            _ => continue,
+        };
+        if access.replace(next).is_some() {
+            return (access, true);
+        }
+    }
+    (access, false)
+}
+
+fn derived_type_declaration_access(attrs: &[decl::TypeAttr]) -> (Option<Access>, bool) {
+    let mut access = None;
+    for attr in attrs {
+        let next = match attr {
+            decl::TypeAttr::Public => Access::Public,
+            decl::TypeAttr::Private => Access::Private,
+            _ => continue,
+        };
+        if access.replace(next).is_some() {
+            return (access, true);
+        }
+    }
+    (access, false)
+}
+
+fn record_explicit_symbol_access(
+    seen: &mut HashSet<String>,
+    name: &str,
+    span: crate::lexer::Span,
+) -> Result<(), SemaError> {
+    let key = name.to_ascii_lowercase();
+    if !seen.insert(key) {
+        return Err(repeated_symbol_access_error(name, span));
+    }
+    Ok(())
+}
+
+fn validate_accessibility_specifications(decls: &[SpannedDecl]) -> Result<(), SemaError> {
+    let mut default_access_seen = false;
+    let mut explicitly_accessible_names = HashSet::new();
+
+    for declaration in decls {
+        match &declaration.node {
+            Decl::AccessDefault { .. } => {
+                if default_access_seen {
+                    return Err(repeated_default_access_error(declaration.span));
+                }
+                default_access_seen = true;
+            }
+            Decl::AccessList { names, .. } => {
+                for name in names {
+                    record_explicit_symbol_access(
+                        &mut explicitly_accessible_names,
+                        name,
+                        declaration.span,
+                    )?;
+                }
+            }
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } => {
+                let (access, repeated) = entity_declaration_access(attrs);
+                let Some(first_entity) = entities.first() else {
+                    continue;
+                };
+                if repeated {
+                    return Err(repeated_symbol_access_error(
+                        &first_entity.name,
+                        declaration.span,
+                    ));
+                }
+                if access.is_some() {
+                    for entity in entities {
+                        record_explicit_symbol_access(
+                            &mut explicitly_accessible_names,
+                            &entity.name,
+                            declaration.span,
+                        )?;
+                    }
+                }
+            }
+            Decl::DerivedTypeDef { name, attrs, .. } => {
+                let (access, repeated) = derived_type_declaration_access(attrs);
+                if repeated {
+                    return Err(repeated_symbol_access_error(name, declaration.span));
+                }
+                if access.is_some() {
+                    record_explicit_symbol_access(
+                        &mut explicitly_accessible_names,
+                        name,
+                        declaration.span,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), SemaError> {
+    validate_accessibility_specifications(decls)?;
+
     // Collect AccessList entries — they must be applied AFTER all TypeDecls
     // because the list may reference symbols declared later in the module.
-    let mut pending_access: Vec<(Access, Vec<String>)> = Vec::new();
+    let mut pending_access: Vec<(Access, Vec<String>, crate::lexer::Span)> = Vec::new();
     for decl in decls {
         match &decl.node {
-            Decl::AccessDefault { access } => match access {
-                Attribute::Private => st.set_default_access(Access::Private),
-                Attribute::Public => st.set_default_access(Access::Public),
-                _ => {}
-            },
+            Decl::AccessDefault { access } => {
+                let access = match access {
+                    Attribute::Private => Access::Private,
+                    Attribute::Public => Access::Public,
+                    _ => continue,
+                };
+                if !st.set_default_access(access) {
+                    return Err(repeated_default_access_error(decl.span));
+                }
+            }
             Decl::AccessList { access, names } => {
                 let acc = match access {
                     Attribute::Private => Access::Private,
                     Attribute::Public => Access::Public,
                     _ => continue,
                 };
-                pending_access.push((acc, names.clone()));
+                pending_access.push((acc, names.clone(), decl.span));
             }
             Decl::TypeDecl {
                 type_spec,
@@ -2414,14 +3152,16 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         if sym_attrs.pointer {
                             kind = SymbolKind::ProcedurePointer;
                         }
-                        if let Some(iface_sym) =
-                            st.find_symbol_any_scope(&iface_name.to_lowercase())
-                        {
+                        if let Some(iface_sym) = st.lookup(iface_name) {
                             type_info = iface_sym
                                 .type_info
                                 .clone()
                                 .unwrap_or_else(|| type_info.clone());
                             arg_names = iface_sym.arg_names.clone();
+                            sym_attrs.pure = iface_sym.attrs.pure;
+                            sym_attrs.elemental = iface_sym.attrs.elemental;
+                            sym_attrs.result_rank = iface_sym.attrs.result_rank;
+                            sym_attrs.array_spec = iface_sym.attrs.array_spec.clone();
                         }
                     }
                 }
@@ -2441,7 +3181,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     {
                         if let Some(init) = entity.init.as_ref() {
                             let derived_len =
-                                derived_char_init_len(&init.node, st).map(|n| n as i64);
+                                derived_char_init_len(&init.node, st, st.current_scope())
+                                    .map(|n| n as i64);
                             if let Some(n) = derived_len {
                                 if let TypeInfo::Character { len, .. } = &mut entity_type_info {
                                     *len = Some(n);
@@ -2460,8 +3201,12 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         .or_else(|| attr_dimension.cloned())
                         .unwrap_or_default();
                     entity_attrs.array_spec = entity_array_spec;
-                    if st.scope(st.current_scope()).symbols.contains_key(&key) {
-                        // Symbol already exists (e.g., dummy argument) — update type info.
+                    if is_unresolved_declaration_placeholder(st, &key, &kind) {
+                        // Dummy arguments and untyped function results are
+                        // registered before their declaration part. Complete
+                        // each placeholder exactly once; every other local
+                        // symbol must pass through `define` so collisions are
+                        // diagnosed instead of mutating the earlier entity.
                         let sym = st
                             .scope_mut(st.current_scope())
                             .symbols
@@ -2501,6 +3246,204 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                             arg_names: arg_names.clone(),
                             const_value,
                             const_char_value,
+                        })?;
+                    }
+                }
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::Volatile,
+                entities,
+            } => {
+                for entity in entities {
+                    let key = entity.to_ascii_lowercase();
+                    let implicit_type = st.implicit_type(entity).map(implicit_type_to_type_info);
+                    let current_scope = st.current_scope();
+                    if let Some(symbol) = st.scope_mut(current_scope).symbols.get_mut(&key) {
+                        if symbol.kind != SymbolKind::Variable {
+                            return Err(SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "'{}' in a VOLATILE statement is not a variable",
+                                    entity
+                                ),
+                            });
+                        }
+                        if symbol.type_info.is_none() {
+                            symbol.type_info = Some(implicit_type.ok_or_else(|| SemaError {
+                                span: decl.span,
+                                msg: format!("VOLATILE entity '{}' has no implicit type", entity),
+                            })?);
+                        }
+                        symbol.attrs.volatile = true;
+                    } else if let Some(symbol) = st.lookup(entity) {
+                        if symbol.kind != SymbolKind::Variable {
+                            return Err(SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "'{}' in a VOLATILE statement is not a variable",
+                                    entity
+                                ),
+                            });
+                        }
+                        // A USE- or host-associated object can acquire
+                        // VOLATILE in this scope. The standalone AST node is
+                        // the scope-local overlay; do not invent shadow
+                        // storage or mutate the defining scope's symbol.
+                    } else {
+                        let type_info = implicit_type.ok_or_else(|| SemaError {
+                            span: decl.span,
+                            msg: format!("VOLATILE entity '{}' has no implicit type", entity),
+                        })?;
+                        st.define(Symbol {
+                            name: entity.clone(),
+                            kind: SymbolKind::Variable,
+                            type_info: Some(type_info),
+                            attrs: SymbolAttrs {
+                                access: st.default_access(current_scope),
+                                volatile: true,
+                                ..Default::default()
+                            },
+                            defined_at: decl.span,
+                            scope: current_scope,
+                            arg_names: vec![],
+                            const_value: None,
+                            const_char_value: None,
+                        })?;
+                    }
+                }
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::External,
+                entities,
+            } => {
+                let current_scope = st.current_scope();
+                for entity in entities {
+                    let key = entity.to_ascii_lowercase();
+                    let is_dummy = st
+                        .scope(current_scope)
+                        .arg_order
+                        .iter()
+                        .any(|argument| argument.eq_ignore_ascii_case(&key));
+                    if is_dummy {
+                        let symbol = st
+                            .scope_mut(current_scope)
+                            .symbols
+                            .get_mut(&key)
+                            .expect("procedure dummy placeholder must exist");
+                        symbol.attrs.external = true;
+                        continue;
+                    }
+                    st.define(Symbol {
+                        name: entity.clone(),
+                        kind: SymbolKind::ExternalProc,
+                        type_info: None,
+                        attrs: SymbolAttrs {
+                            access: st.default_access(current_scope),
+                            external: true,
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: current_scope,
+                        arg_names: vec![],
+                        const_value: None,
+                        const_char_value: None,
+                    })?;
+                }
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::Intrinsic,
+                entities,
+            } => {
+                let current_scope = st.current_scope();
+                for entity in entities {
+                    let already_intrinsic = st.lookup(entity).is_some_and(|symbol| {
+                        symbol.kind == SymbolKind::IntrinsicProc || symbol.attrs.intrinsic
+                    });
+                    if already_intrinsic {
+                        continue;
+                    }
+                    st.define(Symbol {
+                        name: entity.clone(),
+                        kind: SymbolKind::IntrinsicProc,
+                        type_info: None,
+                        attrs: SymbolAttrs {
+                            access: st.default_access(current_scope),
+                            intrinsic: true,
+                            ..Default::default()
+                        },
+                        defined_at: decl.span,
+                        scope: current_scope,
+                        arg_names: vec![],
+                        const_value: None,
+                        const_char_value: None,
+                    })?;
+                }
+            }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    let key = entity.name.to_ascii_lowercase();
+                    let is_placeholder = is_procedure_entity_placeholder(st, &key);
+                    if is_placeholder {
+                        let existing_type = st
+                            .scope(st.current_scope())
+                            .symbols
+                            .get(&key)
+                            .and_then(|symbol| symbol.type_info.clone());
+                        let type_info = match existing_type {
+                            Some(type_info) => type_info,
+                            None => st
+                                .implicit_type(&entity.name)
+                                .map(implicit_type_to_type_info)
+                                .ok_or_else(|| SemaError {
+                                    span: decl.span,
+                                    msg: format!(
+                                        "array '{}' in DIMENSION statement has no implicit type",
+                                        entity.name
+                                    ),
+                                })?,
+                        };
+                        let current_scope = st.current_scope();
+                        let symbol = st
+                            .scope_mut(current_scope)
+                            .symbols
+                            .get_mut(&key)
+                            .expect("declaration placeholder should remain in its scope");
+                        if !symbol.attrs.array_spec.is_empty() {
+                            return Err(SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "duplicate DIMENSION attribute specified for '{}'",
+                                    entity.name
+                                ),
+                            });
+                        }
+                        symbol.type_info = Some(type_info);
+                        symbol.attrs.array_spec = entity.array_spec.clone();
+                    } else {
+                        let type_info = st
+                            .implicit_type(&entity.name)
+                            .map(implicit_type_to_type_info)
+                            .ok_or_else(|| SemaError {
+                                span: decl.span,
+                                msg: format!(
+                                    "array '{}' in DIMENSION statement has no implicit type",
+                                    entity.name
+                                ),
+                            })?;
+                        st.define(Symbol {
+                            name: entity.name.clone(),
+                            kind: SymbolKind::Variable,
+                            type_info: Some(type_info),
+                            attrs: SymbolAttrs {
+                                access: st.default_access(st.current_scope()),
+                                array_spec: entity.array_spec.clone(),
+                                ..Default::default()
+                            },
+                            defined_at: decl.span,
+                            scope: st.current_scope(),
+                            arg_names: vec![],
+                            const_value: None,
+                            const_char_value: None,
                         })?;
                     }
                 }
@@ -2621,9 +3564,11 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
         }
     }
     // Apply deferred access-list overrides after all symbols are declared.
-    for (access, names) in &pending_access {
+    for (access, names, span) in &pending_access {
         for name in names {
-            st.set_symbol_access(name, *access);
+            if !st.set_symbol_access(name, *access) {
+                return Err(repeated_symbol_access_error(name, *span));
+            }
         }
     }
     Ok(())
@@ -2663,7 +3608,10 @@ fn process_contains(
     contains: &[SpannedUnit],
     module_search_paths: &[std::path::PathBuf],
     layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
+    containing_span: crate::lexer::Span,
 ) -> Result<(), SemaError> {
+    validate_local_generic_declarations(st, contains, containing_span)?;
+
     for unit in contains {
         // Register the subprogram name in the current scope before descending.
         let host_is_submodule =
@@ -2687,10 +3635,12 @@ fn process_contains(
                     && prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
+                let binding = unresolved_procedure_binding(bind.as_ref(), name);
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
-                    binding_label: normalized_bind_name(bind.as_ref(), name),
+                    bind_c: binding.bind_c,
+                    binding_label: binding.label,
                     is_separate_module_procedure: is_smp,
                     ..Default::default()
                 };
@@ -2704,9 +3654,7 @@ fn process_contains(
                         }
                     })
                     .collect();
-                let key = name.to_ascii_lowercase();
-                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
-                let define_result = st.define(Symbol {
+                st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Subroutine,
                     type_info: None,
@@ -2716,12 +3664,7 @@ fn process_contains(
                     arg_names,
                     const_value: None,
                     const_char_value: None,
-                });
-                if let Err(err) = define_result {
-                    if !had_local_symbol {
-                        return Err(err);
-                    }
-                }
+                })?;
             }
             ProgramUnit::Function {
                 name,
@@ -2767,19 +3710,19 @@ fn process_contains(
                     && prefix
                         .iter()
                         .any(|p| matches!(p, crate::ast::unit::Prefix::Module));
+                let binding = unresolved_procedure_binding(bind.as_ref(), name);
                 let fn_attrs = SymbolAttrs {
                     allocatable: result_attrs.allocatable,
                     pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
-                    binding_label: normalized_bind_name(bind.as_ref(), name),
+                    bind_c: binding.bind_c,
+                    binding_label: binding.label,
                     result_rank: result_attrs.result_rank,
                     is_separate_module_procedure: fn_is_smp,
                     ..Default::default()
                 };
-                let key = name.to_ascii_lowercase();
-                let had_local_symbol = st.scope(st.current_scope()).symbols.contains_key(&key);
-                let define_result = st.define(Symbol {
+                st.define(Symbol {
                     name: name.clone(),
                     kind: SymbolKind::Function,
                     type_info: ret_type_info,
@@ -2789,16 +3732,28 @@ fn process_contains(
                     arg_names: vec![],
                     const_value: None,
                     const_char_value: None,
-                });
-                if let Err(err) = define_result {
-                    if !had_local_symbol {
-                        return Err(err);
-                    }
-                }
+                })?;
             }
             _ => {}
         }
+        let host_scope = st.current_scope();
         resolve_unit(st, unit, module_search_paths, layouts)?;
+        if let Some(proc_scope) = find_unit_scope(st, host_scope, &unit.node) {
+            let bind_c = st.scope(proc_scope).bind_c;
+            let binding_label = st.scope(proc_scope).binding_label.clone();
+            let name = match &unit.node {
+                ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } => name,
+                _ => continue,
+            };
+            if let Some(symbol) = st
+                .scope_mut(host_scope)
+                .symbols
+                .get_mut(&name.to_ascii_lowercase())
+            {
+                symbol.attrs.bind_c = bind_c;
+                symbol.attrs.binding_label = binding_label;
+            }
+        }
     }
     Ok(())
 }
@@ -2868,6 +3823,9 @@ pub(super) fn eval_const_int_expr_in_scope(
                     }
                 });
                 match key.as_str() {
+                    "ieee_selected_real_kind" => eval_ieee_selected_real_kind_args(args, |expr| {
+                        eval_const_int_expr_in_scope(expr, st, scope_id)
+                    }),
                     "selected_int_kind" => {
                         let r = first_arg_val?;
                         Some(if r <= 2 {
@@ -3031,11 +3989,15 @@ fn attrs_to_symbol_attrs(attrs: &[Attribute], default_access: Access) -> SymbolA
         match attr {
             Attribute::Allocatable => sa.allocatable = true,
             Attribute::Pointer => sa.pointer = true,
+            Attribute::Asynchronous => sa.asynchronous = true,
+            Attribute::Contiguous => sa.contiguous = true,
+            Attribute::Volatile => sa.volatile = true,
             Attribute::Target => sa.target = true,
             Attribute::Optional => sa.optional = true,
             Attribute::Save => sa.save = true,
             Attribute::Parameter => sa.parameter = true,
             Attribute::Value => sa.value = true,
+            Attribute::Procedure => {}
             Attribute::External => sa.external = true,
             Attribute::NoPass => {}
             Attribute::Intrinsic => sa.intrinsic = true,
@@ -3064,30 +4026,46 @@ fn function_result_attrs(
         .unwrap_or(function_name)
         .to_ascii_lowercase();
     for decl in decls {
-        let crate::ast::decl::Decl::TypeDecl {
-            attrs, entities, ..
-        } = &decl.node
-        else {
-            continue;
-        };
-        let matching_entity = entities
-            .iter()
-            .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
-        if let Some(entity) = matching_entity {
-            let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
-            // Capture result rank: prefer the entity-local array_spec
-            // (e.g. `real :: w(:)`), falling back to a `dimension(...)`
-            // attribute on the type-decl statement.
-            let rank_from_entity = entity.array_spec.as_ref().map(|specs| specs.len());
-            let rank_from_attrs = attrs.iter().find_map(|a| match a {
-                crate::ast::decl::Attribute::Dimension(specs) => Some(specs.len()),
-                _ => None,
-            });
-            sym_attrs.result_rank = rank_from_entity
-                .or(rank_from_attrs)
-                .unwrap_or(0)
-                .min(u8::MAX as usize) as u8;
-            return sym_attrs;
+        match &decl.node {
+            crate::ast::decl::Decl::TypeDecl {
+                attrs, entities, ..
+            } => {
+                let matching_entity = entities
+                    .iter()
+                    .find(|entity| entity.name.eq_ignore_ascii_case(&result_key));
+                if let Some(entity) = matching_entity {
+                    let mut sym_attrs = attrs_to_symbol_attrs(attrs, Access::Default);
+                    // Preserve the full result shape: prefer the entity-local
+                    // array spec (e.g. `real :: w(:)`), falling back to a
+                    // `dimension(...)` attribute on the type declaration.
+                    let array_spec = entity.array_spec.clone().or_else(|| {
+                        attrs.iter().find_map(|a| match a {
+                            crate::ast::decl::Attribute::Dimension(specs) => Some(specs.clone()),
+                            _ => None,
+                        })
+                    });
+                    sym_attrs.result_rank = array_spec
+                        .as_ref()
+                        .map(|specs| specs.len())
+                        .unwrap_or(0)
+                        .min(u8::MAX as usize) as u8;
+                    sym_attrs.array_spec = array_spec.unwrap_or_default();
+                    return sym_attrs;
+                }
+            }
+            crate::ast::decl::Decl::DimensionStmt { entities } => {
+                if let Some(entity) = entities
+                    .iter()
+                    .find(|entity| entity.name.eq_ignore_ascii_case(&result_key))
+                {
+                    return SymbolAttrs {
+                        result_rank: entity.array_spec.len().min(u8::MAX as usize) as u8,
+                        array_spec: entity.array_spec.clone(),
+                        ..SymbolAttrs::default()
+                    };
+                }
+            }
+            _ => {}
         }
     }
     SymbolAttrs::default()
@@ -3120,7 +4098,7 @@ mod tests {
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
         match resolve_file(&units, &[], crate::target::TargetLayout::LP64) {
-            Ok(_) => panic!("expected semantic resolution to fail"),
+            Ok(_) => panic!("expected semantic resolution to fail for source:\n{src}"),
             Err(err) => err,
         }
     }
@@ -3145,6 +4123,35 @@ mod tests {
     }
 
     #[test]
+    fn function_scope_retains_explicit_result_identity() {
+        let st = resolve_source(
+            "\
+module result_parent
+  implicit none
+  interface
+    module function answer() result(actual_result)
+      integer, parameter :: decoy = 101
+      integer :: actual_result
+    end function answer
+  end interface
+end module result_parent
+",
+        );
+        let function_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "answer"))
+            .unwrap();
+        assert_eq!(function_scope.result_name.as_deref(), Some("actual_result"));
+        let result = function_scope
+            .procedure_result_symbol()
+            .expect("explicit function result symbol was not retained");
+        assert_eq!(result.name, "actual_result");
+        assert!(!result.attrs.parameter);
+        assert!(function_scope.symbols.contains_key("decoy"));
+    }
+
+    #[test]
     fn implicit_none_enforced() {
         let st = resolve_source("program test\n  implicit none\n  integer :: x\nend program\n");
         let prog_scope = st
@@ -3153,6 +4160,152 @@ mod tests {
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.implicit_rules.none_type);
+    }
+
+    #[test]
+    fn standalone_dimension_defines_an_implicitly_typed_array() {
+        let st = resolve_source(
+            "program test\n\
+               dimension :: x(-1:1, 4)\n\
+             end program test\n",
+        );
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap();
+        let symbol = program_scope
+            .symbols
+            .get("x")
+            .expect("DIMENSION entity should be declared");
+        assert_eq!(symbol.type_info, Some(TypeInfo::Real { kind: None }));
+        assert_eq!(symbol.attrs.array_spec.len(), 2);
+    }
+
+    #[test]
+    fn standalone_dimension_obeys_implicit_none() {
+        let error = resolve_error(
+            "program test\n\
+               implicit none\n\
+               dimension :: x(3)\n\
+             end program test\n",
+        );
+        assert!(
+            error.msg.contains("has no implicit type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn standalone_volatile_declares_an_implicitly_typed_entity() {
+        let st = resolve_source(
+            "program test\n\
+               implicit integer (w-w)\n\
+               volatile :: watched\n\
+             end program test\n",
+        );
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(scope.kind, ScopeKind::Program(_)))
+            .unwrap();
+        let symbol = program_scope
+            .symbols
+            .get("watched")
+            .expect("VOLATILE entity should be declared");
+        assert_eq!(symbol.type_info, Some(TypeInfo::Integer { kind: None }));
+        assert!(symbol.attrs.volatile);
+    }
+
+    #[test]
+    fn standalone_volatile_obeys_implicit_none() {
+        let error = resolve_error(
+            "program test\n\
+               implicit none\n\
+               volatile :: watched\n\
+             end program test\n",
+        );
+        assert!(
+            error.msg.contains("has no implicit type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn standalone_dimension_can_shape_a_prefixed_function_result() {
+        let st = resolve_source(
+            "module result_shapes\n\
+               implicit none\n\
+             contains\n\
+               real function values()\n\
+                 implicit none\n\
+                 dimension :: values(3)\n\
+               end function values\n\
+             end module result_shapes\n",
+        );
+        let function_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "values"))
+            .unwrap();
+        let result = function_scope
+            .procedure_result_symbol()
+            .expect("function result symbol");
+        assert_eq!(result.type_info, Some(TypeInfo::Real { kind: None }));
+        assert_eq!(result.attrs.array_spec.len(), 1);
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    &scope.kind,
+                    ScopeKind::Module(name) if name == "result_shapes"
+                )
+            })
+            .expect("module scope");
+        let function = module_scope
+            .symbols
+            .get("values")
+            .expect("contained function symbol");
+        assert_eq!(function.attrs.result_rank, 1);
+    }
+
+    #[test]
+    fn procedure_pointer_inherits_array_result_shape_from_interface() {
+        let st = resolve_source(
+            "program array_factory_user\n\
+               implicit none\n\
+               abstract interface\n\
+                 function array_factory(n) result(values)\n\
+                   integer, intent(in) :: n\n\
+                   integer, dimension(n) :: values\n\
+                 end function array_factory\n\
+               end interface\n\
+               procedure(array_factory), pointer :: make_values\n\
+             end program array_factory_user\n",
+        );
+        let program_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    &scope.kind,
+                    ScopeKind::Program(name) if name == "array_factory_user"
+                )
+            })
+            .expect("program scope");
+        let procedure_pointer = program_scope
+            .symbols
+            .get("make_values")
+            .expect("procedure pointer symbol");
+
+        assert_eq!(procedure_pointer.kind, SymbolKind::ProcedurePointer);
+        assert_eq!(
+            procedure_pointer.attrs.procedure_iface.as_deref(),
+            Some("array_factory")
+        );
+        assert_eq!(procedure_pointer.attrs.result_rank, 1);
+        assert_eq!(procedure_pointer.attrs.array_spec.len(), 1);
     }
 
     #[test]
@@ -3353,6 +4506,182 @@ end program
     }
 
     #[test]
+    fn ordinary_type_declarations_reject_existing_local_symbols() {
+        let cases = [
+            (
+                "duplicate in one declaration",
+                "\
+program duplicate_in_one_declaration
+  implicit none
+  integer :: value, VALUE
+end program duplicate_in_one_declaration
+",
+                "VALUE",
+            ),
+            (
+                "duplicate local declarations",
+                "\
+program duplicate_local_declarations
+  implicit none
+  integer :: value
+  real :: VALUE
+end program duplicate_local_declarations
+",
+                "VALUE",
+            ),
+            (
+                "redeclared dummy argument",
+                "\
+subroutine redeclared_dummy(value)
+  implicit none
+  integer, intent(in) :: value
+  real, intent(in) :: VALUE
+end subroutine redeclared_dummy
+",
+                "VALUE",
+            ),
+            (
+                "retyped explicit function result",
+                "\
+integer function retyped_result()
+  implicit none
+  real :: RETYPED_RESULT
+  retyped_result = 1.0
+end function retyped_result
+",
+                "RETYPED_RESULT",
+            ),
+            (
+                "dummy argument replaced by parameter",
+                "\
+subroutine parameter_dummy(value)
+  implicit none
+  integer, parameter :: VALUE = 1
+end subroutine parameter_dummy
+",
+                "VALUE",
+            ),
+            (
+                "function result replaced by parameter",
+                "\
+function parameter_result() result(value)
+  implicit none
+  integer, parameter :: VALUE = 1
+end function parameter_result
+",
+                "VALUE",
+            ),
+            (
+                "parameter replaced by variable",
+                "\
+module replaced_parameter_m
+  implicit none
+  integer, parameter :: value = 1
+  real :: VALUE
+end module replaced_parameter_m
+",
+                "VALUE",
+            ),
+            (
+                "derived type name replaced by variable",
+                "\
+module replaced_type_name_m
+  implicit none
+  type :: payload
+    integer :: value
+  end type payload
+  integer :: PAYLOAD
+end module replaced_type_name_m
+",
+                "PAYLOAD",
+            ),
+        ];
+
+        for (label, source, repeated_name) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg,
+                format!("symbol '{repeated_name}' already defined in this scope"),
+                "unexpected declaration-collision diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_type_declarations_complete_dummy_and_result_placeholders_once() {
+        let st = resolve_source(
+            "\
+module declaration_placeholders_m
+  implicit none
+  abstract interface
+    integer function callback_interface()
+    end function callback_interface
+  end interface
+contains
+  subroutine accept_value(value)
+    integer, intent(in), optional :: value
+  end subroutine accept_value
+
+  subroutine accept_callback(callback)
+    procedure(callback_interface), pointer, intent(in) :: callback
+  end subroutine accept_callback
+
+  function make_value() result(value)
+    integer :: value
+    value = 7
+  end function make_value
+
+  function make_callback() result(callback)
+    procedure(callback_interface), pointer :: callback
+  end function make_callback
+end module declaration_placeholders_m
+",
+        );
+
+        let dummy_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "accept_value"),
+            )
+            .unwrap();
+        let dummy = dummy_scope.symbols.get("value").unwrap();
+        assert_eq!(dummy.kind, SymbolKind::Variable);
+        assert_eq!(dummy.type_info, Some(TypeInfo::Integer { kind: None }));
+        assert_eq!(dummy.attrs.intent, Some(Intent::In));
+        assert!(dummy.attrs.optional);
+
+        let procedure_dummy_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "accept_callback")
+            })
+            .unwrap();
+        let procedure_dummy = procedure_dummy_scope.symbols.get("callback").unwrap();
+        assert_eq!(procedure_dummy.kind, SymbolKind::ProcedurePointer);
+
+        let function_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "make_value"))
+            .unwrap();
+        let result = function_scope.procedure_result_symbol().unwrap();
+        assert_eq!(result.kind, SymbolKind::Variable);
+        assert_eq!(result.type_info, Some(TypeInfo::Integer { kind: None }));
+
+        let procedure_result_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Function(name) if name == "make_callback"),
+            )
+            .unwrap();
+        let procedure_result = procedure_result_scope.procedure_result_symbol().unwrap();
+        assert_eq!(procedure_result.kind, SymbolKind::ProcedurePointer);
+    }
+
+    #[test]
     fn contains_creates_child_scope() {
         let st = resolve_source(
             "\
@@ -3381,6 +4710,1317 @@ end program
             .find(|s| matches!(s.kind, ScopeKind::Program(_)))
             .unwrap();
         assert!(prog_scope.symbols.contains_key("inner"));
+    }
+
+    #[test]
+    fn contains_rejects_conflicting_local_identifiers() {
+        for source in [
+            "\
+program collision
+  implicit none
+  integer :: child
+contains
+  subroutine child()
+  end subroutine child
+end program collision
+",
+            "\
+program collision
+  implicit none
+  integer, parameter :: child = 1
+contains
+  integer function child()
+    child = 2
+  end function child
+end program collision
+",
+            "\
+subroutine outer(child)
+  implicit none
+  integer, intent(in) :: child
+contains
+  subroutine child()
+  end subroutine child
+end subroutine outer
+",
+            "\
+program collision
+  implicit none
+  type :: child
+  end type child
+contains
+  integer function child()
+    child = 1
+  end function child
+end program collision
+",
+            "\
+program collision
+  implicit none
+contains
+  subroutine child()
+  end subroutine child
+  subroutine child()
+  end subroutine child
+end program collision
+",
+        ] {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg, "symbol 'child' already defined in this scope",
+                "unexpected collision diagnostic for source:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_allows_a_generic_name_to_name_its_own_specific() {
+        let st = resolve_source(
+            "\
+module same_name_host
+  implicit none
+  interface child
+    module procedure child
+    module procedure child_real
+  end interface child
+contains
+  integer function child(value)
+    integer, intent(in) :: value
+    child = value + 1
+  end function child
+  integer function child_real(value)
+    real, intent(in) :: value
+    child_real = int(value) + 2
+  end function child_real
+end module same_name_host
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "same_name_host"),
+            )
+            .unwrap();
+        let procedure = module_scope.symbols.get("child").unwrap();
+        assert_eq!(procedure.kind, SymbolKind::Function);
+        let generic = st
+            .named_interface_facet_symbol_in_scope(module_scope.id, "child")
+            .unwrap();
+        assert_eq!(generic.arg_names, ["child", "child_real"]);
+        assert!(st.scopes.iter().any(|scope| {
+            scope.parent == Some(module_scope.id)
+                && matches!(&scope.kind, ScopeKind::Function(name) if name == "child")
+        }));
+    }
+
+    #[test]
+    fn named_generic_rejects_repeated_specific_declarations() {
+        let cases = [
+            (
+                "same statement",
+                "\
+module duplicate_same_statement_m
+  implicit none
+  interface generic_value
+    module procedure integer_value, INTEGER_VALUE
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_same_statement_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "separate statements",
+                "\
+module duplicate_across_statements_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+    procedure :: INTEGER_VALUE
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_across_statements_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "reopened interface",
+                "\
+module duplicate_reopened_interface_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+  end interface generic_value
+  interface generic_value
+    module procedure INTEGER_VALUE
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_reopened_interface_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "imported specific",
+                "\
+module duplicate_import_base_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module duplicate_import_base_m
+
+module duplicate_import_extension_m
+  use duplicate_import_base_m, only: generic_value, integer_value
+  implicit none
+  interface generic_value
+    module procedure INTEGER_VALUE
+  end interface generic_value
+end module duplicate_import_extension_m
+",
+                "generic_value",
+                "integer_value",
+            ),
+            (
+                "defined operator",
+                "\
+module duplicate_operator_specific_m
+  implicit none
+  interface operator(+)
+    module procedure add_integer, ADD_INTEGER
+  end interface operator(+)
+contains
+  integer function add_integer(left, right)
+    integer, intent(in) :: left, right
+    add_integer = left + right
+  end function add_integer
+end module duplicate_operator_specific_m
+",
+                "operator(+)",
+                "add_integer",
+            ),
+        ];
+
+        for (label, source, generic_name, specific_name) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg,
+                format!(
+                    "specific procedure '{specific_name}' is already present in generic interface \
+                     '{generic_name}'"
+                ),
+                "unexpected duplicate-specific diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_generic_rejects_mixed_function_and_subroutine_specifics() {
+        let cases = [
+            (
+                "module procedures",
+                "\
+module mixed_module_procedures_m
+  implicit none
+  interface dispatch
+    module procedure compute_value, update_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_module_procedures_m
+",
+            ),
+            (
+                "bare procedure statements",
+                "\
+module mixed_procedure_statements_m
+  implicit none
+  interface dispatch
+    procedure :: compute_value
+    procedure :: update_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_procedure_statements_m
+",
+            ),
+            (
+                "explicit interface bodies",
+                "\
+module mixed_explicit_bodies_m
+  implicit none
+  interface dispatch
+    integer function compute_value(value)
+      integer, intent(in) :: value
+    end function compute_value
+    subroutine update_value(value)
+      integer, intent(inout) :: value
+    end subroutine update_value
+  end interface dispatch
+end module mixed_explicit_bodies_m
+",
+            ),
+            (
+                "reopened interface",
+                "\
+module mixed_reopened_interface_m
+  implicit none
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+  interface DISPATCH
+    module procedure update_value
+  end interface DISPATCH
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_reopened_interface_m
+",
+            ),
+            (
+                "use-associated extension",
+                "\
+module function_generic_provider_m
+  implicit none
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+end module function_generic_provider_m
+
+module mixed_generic_extension_m
+  use function_generic_provider_m, only: dispatch
+  implicit none
+  interface dispatch
+    module procedure update_value
+  end interface dispatch
+contains
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module mixed_generic_extension_m
+",
+            ),
+            (
+                "merged use-associated generics",
+                "\
+module function_generic_m
+  implicit none
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+end module function_generic_m
+
+module subroutine_generic_m
+  implicit none
+  interface dispatch
+    module procedure update_value
+  end interface dispatch
+contains
+  subroutine update_value(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine update_value
+end module subroutine_generic_m
+
+program mixed_use_association
+  use function_generic_m
+  use subroutine_generic_m
+  implicit none
+end program mixed_use_association
+",
+            ),
+        ];
+
+        for (label, source) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg,
+                "generic interface 'dispatch' may not mix function and subroutine specific procedures",
+                "unexpected mixed-procedure diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_generic_allows_distinct_extensions_and_duplicate_use_paths() {
+        let st = resolve_source(
+            "\
+module generic_base_m
+  implicit none
+  interface generic_value
+    module procedure integer_value
+  end interface generic_value
+contains
+  integer function integer_value(value)
+    integer, intent(in) :: value
+    integer_value = value
+  end function integer_value
+end module generic_base_m
+
+module generic_left_m
+  use generic_base_m, only: generic_value
+end module generic_left_m
+
+module generic_right_m
+  use generic_base_m, only: generic_value
+end module generic_right_m
+
+module generic_extension_m
+  use generic_left_m, only: generic_value
+  use generic_right_m, only: generic_value
+  implicit none
+  interface generic_value
+    module procedure real_value
+  end interface generic_value
+  interface generic_value
+    procedure :: logical_value
+  end interface generic_value
+contains
+  integer function real_value(value)
+    real, intent(in) :: value
+    real_value = int(value)
+  end function real_value
+  integer function logical_value(value)
+    logical, intent(in) :: value
+    logical_value = merge(1, 0, value)
+  end function logical_value
+end module generic_extension_m
+",
+        );
+        let extension_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "generic_extension_m"),
+            )
+            .unwrap();
+        let generic = st
+            .named_interface_symbol_in_scope(extension_scope.id, "generic_value")
+            .unwrap();
+        assert_eq!(
+            generic.arg_names,
+            ["integer_value", "real_value", "logical_value"]
+        );
+    }
+
+    #[test]
+    fn named_generic_allows_same_specific_spelling_from_a_different_owner() {
+        resolve_source(
+            "\
+module same_name_owner_base_m
+  implicit none
+  private
+  public :: select_value
+  interface select_value
+    module procedure pick
+  end interface select_value
+contains
+  integer function pick(value)
+    integer, intent(in) :: value
+    pick = value
+  end function pick
+end module same_name_owner_base_m
+
+module same_name_owner_extension_m
+  use same_name_owner_base_m, only: select_value
+  implicit none
+  interface select_value
+    module procedure pick
+  end interface select_value
+contains
+  integer function pick(value)
+    real, intent(in) :: value
+    pick = int(value)
+  end function pick
+end module same_name_owner_extension_m
+",
+        );
+    }
+
+    #[test]
+    fn named_generic_ignores_unlisted_local_shadow_of_inherited_specific() {
+        resolve_source(
+            "\
+module shadow_base_m
+  implicit none
+  private
+  public :: dispatch
+  interface dispatch
+    module procedure pick
+  end interface dispatch
+contains
+  integer function pick(value)
+    integer, intent(in) :: value
+    pick = value
+  end function pick
+end module shadow_base_m
+
+module shadow_extension_m
+  use shadow_base_m, only: dispatch
+  implicit none
+  interface dispatch
+    module procedure pick_real
+  end interface dispatch
+contains
+  subroutine pick(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine pick
+  integer function pick_real(value)
+    real, intent(in) :: value
+    pick_real = int(value)
+  end function pick_real
+end module shadow_extension_m
+",
+        );
+    }
+
+    #[test]
+    fn local_generic_shadows_instead_of_extending_host_generic() {
+        let st = resolve_source(
+            "\
+module host_generic_m
+  implicit none
+  interface dispatch
+    module procedure host_value
+  end interface dispatch
+contains
+  integer function host_value(value)
+    integer, intent(in) :: value
+    host_value = value
+  end function host_value
+
+  subroutine nested_scope()
+    interface dispatch
+      procedure :: host_value
+    end interface dispatch
+  contains
+    subroutine host_value(value)
+      integer, intent(inout) :: value
+      value = value + 1
+    end subroutine host_value
+  end subroutine nested_scope
+end module host_generic_m
+",
+        );
+        let nested_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "nested_scope"),
+            )
+            .unwrap();
+        let generic = st
+            .named_interface_symbol_in_scope(nested_scope.id, "dispatch")
+            .unwrap();
+        assert_eq!(generic.arg_names, ["host_value"]);
+    }
+
+    #[test]
+    fn repeated_accessibility_specifications_are_rejected() {
+        let cases = [
+            (
+                "same access in separate statements",
+                "\
+module repeated_same_access_m
+  implicit none
+  integer :: value
+  public :: value
+  public :: VALUE
+end module repeated_same_access_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "conflicting access in separate statements",
+                "\
+module repeated_conflicting_access_m
+  implicit none
+  integer :: value
+  public :: value
+  private :: value
+end module repeated_conflicting_access_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "duplicate name in one statement",
+                "\
+module repeated_in_one_access_list_m
+  implicit none
+  integer :: value
+  public :: value, VALUE
+end module repeated_in_one_access_list_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "declaration attribute before access statement",
+                "\
+module attribute_then_access_list_m
+  implicit none
+  integer, public :: value
+  private :: value
+end module attribute_then_access_list_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "access statement before declaration attribute",
+                "\
+module access_list_then_attribute_m
+  implicit none
+  public :: value
+  integer, private :: value
+end module access_list_then_attribute_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "duplicate declaration attributes",
+                "\
+module repeated_access_attribute_m
+  implicit none
+  integer, public, PUBLIC :: value
+end module repeated_access_attribute_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "conflicting declaration attributes",
+                "\
+module conflicting_access_attributes_m
+  implicit none
+  integer, public, private :: value
+end module conflicting_access_attributes_m
+",
+                "accessibility of 'value' is specified more than once in this scope",
+            ),
+            (
+                "duplicate derived type attributes",
+                "\
+module repeated_type_access_attribute_m
+  implicit none
+  type, public, PUBLIC :: item
+    integer :: value
+  end type item
+end module repeated_type_access_attribute_m
+",
+                "accessibility of 'item' is specified more than once in this scope",
+            ),
+            (
+                "derived type attribute and access statement",
+                "\
+module repeated_type_access_m
+  implicit none
+  type, public :: item
+    integer :: value
+  end type item
+  public :: item
+end module repeated_type_access_m
+",
+                "accessibility of 'item' is specified more than once in this scope",
+            ),
+            (
+                "same default access",
+                "\
+module repeated_default_access_m
+  implicit none
+  private
+  private
+end module repeated_default_access_m
+",
+                "default accessibility is specified more than once in this scope",
+            ),
+            (
+                "conflicting default access",
+                "\
+module conflicting_default_access_m
+  implicit none
+  private
+  public
+end module conflicting_default_access_m
+",
+                "default accessibility is specified more than once in this scope",
+            ),
+            (
+                "generic access before generic declaration",
+                "\
+module repeated_generic_access_m
+  implicit none
+  public :: dispatch
+  private :: DISPATCH
+  interface dispatch
+    module procedure compute_value
+  end interface dispatch
+contains
+  integer function compute_value(value)
+    integer, intent(in) :: value
+    compute_value = value
+  end function compute_value
+end module repeated_generic_access_m
+",
+                "accessibility of 'dispatch' is specified more than once in this scope",
+            ),
+        ];
+
+        for (label, source, expected) in cases {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg, expected,
+                "unexpected repeated-access diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_access_and_one_named_override_are_not_repetitions() {
+        resolve_source(
+            "\
+module legal_access_override_m
+  implicit none
+  private
+  public :: visible
+  integer :: hidden
+  integer :: visible
+end module legal_access_override_m
+",
+        );
+    }
+
+    #[test]
+    fn large_accessibility_ledger_accepts_unique_names_and_finds_a_late_repeat() {
+        let names = (0..4096)
+            .map(|index| format!("value_{index:04}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let valid = format!(
+            "\
+module large_unique_access_m
+  implicit none
+  integer, public :: {names}
+end module large_unique_access_m
+"
+        );
+        resolve_source(&valid);
+
+        let invalid = format!(
+            "\
+module large_repeated_access_m
+  implicit none
+  integer, public :: {names}
+  private :: VALUE_0000
+end module large_repeated_access_m
+"
+        );
+        let err = resolve_error(&invalid);
+        assert_eq!(
+            err.msg,
+            "accessibility of 'value_0000' is specified more than once in this scope"
+        );
+    }
+
+    #[test]
+    fn interface_body_registration_rejects_conflicting_local_identifiers() {
+        for source in [
+            "\
+module collision
+  implicit none
+  integer :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+  integer :: COLLIDE
+end module collision
+",
+            "\
+module collision
+  implicit none
+  integer, parameter :: collide = 1
+  interface
+    integer function collide()
+    end function collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  type :: collide
+    integer :: value
+  end type collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  interface
+    integer function collide()
+    end function collide
+  end interface
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end module collision
+",
+            "\
+module collision
+  implicit none
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+contains
+  subroutine collide()
+  end subroutine collide
+end module collision
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, intent(in) :: collide(:)
+  interface
+    subroutine collide(value)
+      integer, intent(in) :: value
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, value :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, allocatable :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, target :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, save :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, intrinsic :: collide
+  interface
+    subroutine collide()
+    end subroutine collide
+  end interface
+end subroutine outer
+",
+            "\
+subroutine outer(collide)
+  implicit none
+  integer, external :: collide
+  interface
+    integer function collide()
+    end function collide
+  end interface
+end subroutine outer
+",
+        ] {
+            let err = resolve_error(source);
+            assert_eq!(
+                err.msg, "symbol 'collide' already defined in this scope",
+                "unexpected interface collision diagnostic for source:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_body_registration_merges_a_procedure_dummy() {
+        let st = resolve_source(
+            "\
+subroutine invoke(callback)
+  implicit none
+  external :: callback
+  interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+end subroutine invoke
+",
+        );
+        let invoke = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "invoke"))
+            .expect("missing invoke scope");
+        let callback = invoke
+            .symbols
+            .get("callback")
+            .expect("procedure dummy interface was not published");
+        assert_eq!(callback.kind, SymbolKind::Subroutine);
+        assert!(callback.attrs.external);
+        assert_eq!(callback.arg_names, ["value"]);
+    }
+
+    #[test]
+    fn interface_body_registration_preserves_compatible_dummy_attributes() {
+        let st = resolve_source(
+            "\
+subroutine invoke(callback)
+  implicit none
+  integer, pointer, optional :: callback
+  interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+end subroutine invoke
+",
+        );
+        let invoke = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "invoke"))
+            .expect("missing invoke scope");
+        let callback = invoke
+            .symbols
+            .get("callback")
+            .expect("procedure dummy interface was not published");
+        assert_eq!(callback.kind, SymbolKind::Subroutine);
+        assert!(callback.attrs.external);
+        assert!(callback.attrs.pointer);
+        assert!(callback.attrs.optional);
+        assert_eq!(callback.arg_names, ["value"]);
+    }
+
+    #[test]
+    fn standalone_external_and_intrinsic_statements_define_procedure_symbols() {
+        let st = resolve_source(
+            "\
+program declarations
+  external :: external_work
+  intrinsic :: sin
+end program declarations
+",
+        );
+        let program = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Program(name) if name == "declarations"))
+            .expect("missing program scope");
+
+        let external = program
+            .symbols
+            .get("external_work")
+            .expect("standalone EXTERNAL symbol");
+        assert_eq!(external.kind, SymbolKind::ExternalProc);
+        assert!(external.attrs.external);
+
+        let intrinsic = program
+            .symbols
+            .get("sin")
+            .expect("standalone INTRINSIC symbol");
+        assert_eq!(intrinsic.kind, SymbolKind::IntrinsicProc);
+        assert!(intrinsic.attrs.intrinsic);
+    }
+
+    #[test]
+    fn standalone_intrinsic_accepts_an_identical_use_associated_intrinsic() {
+        let st = resolve_source(
+            "\
+module intrinsic_provider
+  intrinsic :: sin
+end module intrinsic_provider
+
+program consumer
+  use intrinsic_provider
+  intrinsic :: sin
+end program consumer
+",
+        );
+        let consumer = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Program(name) if name == "consumer"))
+            .expect("missing consumer scope");
+        assert!(
+            !consumer.symbols.contains_key("sin"),
+            "an identical USE-associated intrinsic must not be shadowed locally"
+        );
+    }
+
+    #[test]
+    fn procedure_entities_inherit_purity_from_their_explicit_interface() {
+        let st = resolve_source(
+            "\
+module callbacks
+  abstract interface
+    pure integer function pure_callback(value)
+      integer, intent(in) :: value
+    end function pure_callback
+  end interface
+contains
+  subroutine invoke(callback)
+    procedure(pure_callback) :: callback
+  end subroutine invoke
+end module callbacks
+",
+        );
+        let invoke = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "invoke"))
+            .expect("missing invoke scope");
+        let callback = invoke
+            .symbols
+            .get("callback")
+            .expect("missing procedure dummy");
+        assert!(callback.attrs.external);
+        assert_eq!(
+            callback.attrs.procedure_iface.as_deref(),
+            Some("pure_callback")
+        );
+        assert!(
+            callback.attrs.pure,
+            "procedure dummy did not inherit PURE from its explicit interface"
+        );
+    }
+
+    #[test]
+    fn bind_c_name_resolves_named_character_constant() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: exported_name = 'armfortas_named_binding'
+contains
+  subroutine set_answer(value) bind(c, name=exported_name)
+    integer, intent(out) :: value
+    value = 42
+  end subroutine
+end module
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert_eq!(
+            module_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_named_binding")
+        );
+        assert!(module_scope.symbols["set_answer"].attrs.bind_c);
+    }
+
+    #[test]
+    fn bind_c_name_resolves_concatenated_character_constants() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: prefix = 'armfortas_'
+  character(len=*), parameter :: suffix = 'concat_binding'
+contains
+  subroutine set_answer(value) bind(c, name=prefix // suffix)
+    integer, intent(out) :: value
+  end subroutine
+end module
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert_eq!(
+            module_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_concat_binding")
+        );
+    }
+
+    #[test]
+    fn bind_c_name_resolves_local_character_constant() {
+        let st = resolve_source(
+            "\
+subroutine set_answer(value) bind(c, name=exported_name)
+  character(len=*), parameter :: exported_name = 'armfortas_local_binding'
+  integer, intent(out) :: value
+end subroutine
+",
+        );
+        let proc_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "set_answer"),
+            )
+            .unwrap();
+        assert_eq!(
+            proc_scope.binding_label.as_deref(),
+            Some("armfortas_local_binding")
+        );
+        assert!(proc_scope.bind_c);
+    }
+
+    #[test]
+    fn bind_c_name_resolves_imported_interface_constant() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: exported_name = 'armfortas_iface_binding'
+  interface
+    subroutine set_answer(value) bind(c, name=exported_name)
+      import :: exported_name
+      integer, intent(out) :: value
+    end subroutine
+  end interface
+end module
+",
+        );
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert_eq!(
+            module_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_iface_binding")
+        );
+    }
+
+    #[test]
+    fn separate_module_body_inherits_resolved_bind_c_name() {
+        let st = resolve_source(
+            "\
+module bindings
+  implicit none
+  character(len=*), parameter :: exported_name = 'armfortas_smp_binding'
+  interface
+    module subroutine set_answer(value) bind(c, name=exported_name)
+      import :: exported_name
+      integer, intent(out) :: value
+    end subroutine
+  end interface
+end module
+submodule(bindings) implementation
+contains
+  module procedure set_answer
+    value = 42
+  end procedure set_answer
+end submodule
+",
+        );
+        let submodule_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(&scope.kind, ScopeKind::Submodule(name) if name == "implementation")
+            })
+            .unwrap();
+        let body_scope = st
+            .scopes
+            .iter()
+            .find(|scope| {
+                scope.parent == Some(submodule_scope.id)
+                    && matches!(
+                        &scope.kind,
+                        ScopeKind::Subroutine(name) if name == "set_answer"
+                    )
+            })
+            .unwrap();
+        assert_eq!(
+            body_scope.binding_label.as_deref(),
+            Some("armfortas_smp_binding")
+        );
+        assert!(body_scope.bind_c);
+        assert_eq!(
+            submodule_scope.symbols["set_answer"]
+                .attrs
+                .binding_label
+                .as_deref(),
+            Some("armfortas_smp_binding")
+        );
+        assert!(submodule_scope.symbols["set_answer"].attrs.bind_c);
+    }
+
+    #[test]
+    fn bind_c_name_rejects_nonconstant_character_entity() {
+        let err = resolve_error(
+            "\
+module bindings
+  implicit none
+  character(len=32) :: exported_name = 'armfortas_named_binding'
+contains
+  subroutine set_answer(value) bind(c, name=exported_name)
+    integer, intent(out) :: value
+  end subroutine
+end module
+",
+        );
+        assert!(
+            err.msg
+                .contains("BIND(C) NAME= must be a scalar default-character constant expression"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_c_name_rejects_noncharacter_and_unknown_expressions() {
+        for source in [
+            "subroutine bad() bind(c, name=42)\nend subroutine\n",
+            "subroutine bad() bind(c, name=missing_name)\nend subroutine\n",
+            "subroutine bad() bind(c, name=wide_name)\n  character(kind=4, len=*), parameter :: wide_name = 'wide'\nend subroutine\n",
+            "subroutine bad() bind(c, name=names)\n  character(len=3), parameter :: names(2) = 'foo'\nend subroutine\n",
+        ] {
+            let err = resolve_error(source);
+            assert!(
+                err.msg.contains(
+                    "BIND(C) NAME= must be a scalar default-character constant expression"
+                ),
+                "unexpected error for {source:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_c_name_rejects_invalid_c_identifier() {
+        let err = resolve_error("subroutine bad() bind(c, name='not-a-c-name')\nend subroutine\n");
+        assert!(
+            err.msg
+                .contains("must evaluate to a valid C identifier or an empty string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_bind_c_name_has_no_binding_label() {
+        let st = resolve_source(
+            "\
+module bindings
+contains
+  subroutine native_name() bind(c, name='')
+  end subroutine
+end module
+",
+        );
+        let proc_scope = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "native_name"),
+            )
+            .unwrap();
+        assert!(proc_scope.bind_c);
+        assert_eq!(proc_scope.binding_label, None);
+        let module_scope = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "bindings"))
+            .unwrap();
+        assert!(module_scope.symbols["native_name"].attrs.bind_c);
+        assert_eq!(
+            module_scope.symbols["native_name"].attrs.binding_label,
+            None
+        );
     }
 
     #[test]
@@ -3422,6 +6062,109 @@ end program
                 len: Some(16),
                 kind: None
             }
+        ));
+    }
+
+    #[test]
+    fn character_parameter_length_inference_is_lexically_scoped() {
+        for source in [
+            "\
+module unrelated
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module unrelated
+
+module victim
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: direct = seed
+  character(*), parameter :: parenthesized = (seed)
+  character(*), parameter :: concatenated = seed // seed
+  character(*), parameter :: repeated = repeat(seed, 2)
+end module victim
+",
+            "\
+module victim
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: direct = seed
+  character(*), parameter :: parenthesized = (seed)
+  character(*), parameter :: concatenated = seed // seed
+  character(*), parameter :: repeated = repeat(seed, 2)
+end module victim
+
+module unrelated
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module unrelated
+",
+        ] {
+            let st = resolve_source(source);
+            let victim = st
+                .scopes
+                .iter()
+                .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "victim"))
+                .expect("missing victim module scope");
+
+            for (name, expected_len) in [
+                ("direct", 1),
+                ("parenthesized", 1),
+                ("concatenated", 2),
+                ("repeated", 2),
+            ] {
+                assert!(
+                    matches!(
+                        victim.symbols[name].type_info,
+                        Some(TypeInfo::Character {
+                            len: Some(actual),
+                            ..
+                        }) if actual == expected_len
+                    ),
+                    "{name} inferred the wrong length in source:\n{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn character_parameter_length_inference_honors_use_and_host_association() {
+        let st = resolve_source(
+            "\
+module provider
+  implicit none
+  character(3), parameter :: imported = 'abc'
+end module provider
+
+module consumer
+  use provider, only: imported
+  implicit none
+  character(*), parameter :: use_copy = imported
+contains
+  subroutine nested
+    character(*), parameter :: host_copy = use_copy
+  end subroutine nested
+end module consumer
+",
+        );
+
+        let consumer = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Module(name) if name == "consumer"))
+            .expect("missing consumer module scope");
+        assert!(matches!(
+            consumer.symbols["use_copy"].type_info,
+            Some(TypeInfo::Character { len: Some(3), .. })
+        ));
+
+        let nested = st
+            .scopes
+            .iter()
+            .find(|scope| matches!(&scope.kind, ScopeKind::Subroutine(name) if name == "nested"))
+            .expect("missing nested subroutine scope");
+        assert!(matches!(
+            nested.symbols["host_copy"].type_info,
+            Some(TypeInfo::Character { len: Some(3), .. })
         ));
     }
 }

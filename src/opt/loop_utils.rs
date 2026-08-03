@@ -8,6 +8,27 @@ use crate::ir::inst::*;
 use crate::ir::walk::NaturalLoop;
 use std::collections::{HashMap, HashSet};
 
+/// True when a natural loop contains a source-language VOLATILE memory
+/// access. Transformations that reorder, merge, split, or vectorize
+/// iterations must reject such loops unless they explicitly preserve the
+/// volatile access count and order.
+pub(crate) fn loop_contains_volatile_memory(func: &Function, lp: &NaturalLoop) -> bool {
+    blocks_contain_volatile_memory(func, &lp.body)
+}
+
+/// Variant for loop-tree clients whose loop representation owns only a body
+/// block set rather than a complete `NaturalLoop`.
+pub(crate) fn blocks_contain_volatile_memory(func: &Function, blocks: &HashSet<BlockId>) -> bool {
+    blocks.iter().any(|block_id| {
+        func.block(*block_id).insts.iter().any(|inst| {
+            matches!(
+                inst.kind,
+                InstKind::VolatileLoad(..) | InstKind::VolatileStore(..)
+            )
+        })
+    })
+}
+
 /// Find the unique preheader for a natural loop, if one exists.
 ///
 /// Returns `Some(preheader_id)` only when:
@@ -233,6 +254,8 @@ pub fn remap_inst_kind(kind: &InstKind, map: &HashMap<ValueId, ValueId>) -> Inst
         InstKind::Alloca(t) => InstKind::Alloca(t.clone()),
         InstKind::Load(a) => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),
+        InstKind::VolatileLoad(a) => InstKind::VolatileLoad(r(a)),
+        InstKind::VolatileStore(v, p) => InstKind::VolatileStore(r(v), r(p)),
         InstKind::GetElementPtr(base, idxs) => {
             InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect())
         }

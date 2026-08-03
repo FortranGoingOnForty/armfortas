@@ -83,17 +83,16 @@ pub extern "C" fn afs_cpu_time(time: *mut f64) {
     }
 }
 
-/// DATE_AND_TIME: returns date, time, timezone, and 8-element values array.
-#[no_mangle]
-pub extern "C" fn afs_date_and_time(
+/// Capture DATE_AND_TIME once, write any present character results, and
+/// return the eight integer values from the same snapshot.
+fn date_and_time_snapshot(
     date_buf: *mut u8,
     date_len: i64,
     time_buf: *mut u8,
     time_len: i64,
     zone_buf: *mut u8,
     zone_len: i64,
-    values: *mut i32,
-) {
+) -> [i32; 8] {
     use std::time::SystemTime;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -133,65 +132,137 @@ pub extern "C" fn afs_date_and_time(
     let second = tm.tm_sec;
     let tz_offset_min = tm.tm_gmtoff / 60;
 
-    // DATE: YYYYMMDD
-    if !date_buf.is_null() && date_len >= 8 {
-        let s = format!("{:04}{:02}{:02}", year, month, day);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(date_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), date_buf, n);
-        }
-        if n < date_len as usize {
-            unsafe {
-                std::ptr::write_bytes(date_buf.add(n), b' ', date_len as usize - n);
-            }
-        }
+    // Character assignment truncates or blank-pads to the actual length.
+    let date = format!("{:04}{:02}{:02}", year, month, day);
+    write_character_result(date_buf, date_len, date.as_bytes());
+
+    let time = format!("{:02}{:02}{:02}.{:03}", hour, minute, second, millis);
+    write_character_result(time_buf, time_len, time.as_bytes());
+
+    let zone_sign = if tz_offset_min >= 0 { '+' } else { '-' };
+    let zone_minutes = tz_offset_min.unsigned_abs();
+    let zone = format!(
+        "{}{:02}{:02}",
+        zone_sign,
+        zone_minutes / 60,
+        zone_minutes % 60
+    );
+    write_character_result(zone_buf, zone_len, zone.as_bytes());
+
+    [
+        year,
+        month,
+        day,
+        tz_offset_min as i32,
+        hour,
+        minute,
+        second,
+        millis,
+    ]
+}
+
+unsafe fn write_date_and_time_integer(addr: *mut u8, elem_size: i64, value: i32) {
+    match elem_size {
+        1 => ptr::write_unaligned(addr as *mut i8, value as i8),
+        2 => ptr::write_unaligned(addr as *mut i16, value as i16),
+        4 => ptr::write_unaligned(addr as *mut i32, value),
+        8 => ptr::write_unaligned(addr as *mut i64, value as i64),
+        16 => ptr::write_unaligned(addr as *mut i128, value as i128),
+        _ => unreachable!("DATE_AND_TIME integer kind was validated before storage"),
+    }
+}
+
+fn write_date_and_time_values_descriptor(
+    values: *mut ArrayDescriptor,
+    snapshot: &[i32; 8],
+) -> Result<(), &'static str> {
+    if values.is_null() {
+        return Ok(());
     }
 
-    // TIME: hhmmss.sss
-    if !time_buf.is_null() && time_len >= 10 {
-        let s = format!("{:02}{:02}{:02}.{:03}", hour, minute, second, millis);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(time_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), time_buf, n);
-        }
-        if n < time_len as usize {
-            unsafe {
-                std::ptr::write_bytes(time_buf.add(n), b' ', time_len as usize - n);
-            }
-        }
+    let descriptor = unsafe { &*values };
+    if descriptor.rank != 1 {
+        return Err("VALUES must be a rank-one array");
+    }
+    if !matches!(descriptor.elem_size, 1 | 2 | 4 | 8 | 16) {
+        return Err("VALUES has an unsupported integer kind");
+    }
+    if descriptor.base_addr.is_null() {
+        return Err("VALUES has no storage");
     }
 
-    // ZONE: +hhmm or -hhmm
-    if !zone_buf.is_null() && zone_len >= 5 {
-        let sign = if tz_offset_min >= 0 { '+' } else { '-' };
-        let abs_min = tz_offset_min.unsigned_abs();
-        let s = format!("{}{:02}{:02}", sign, abs_min / 60, abs_min % 60);
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(zone_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), zone_buf, n);
-        }
-        if n < zone_len as usize {
-            unsafe {
-                std::ptr::write_bytes(zone_buf.add(n), b' ', zone_len as usize - n);
-            }
-        }
+    let dim = descriptor.dims[0];
+    let extent = if dim.upper_bound < dim.lower_bound {
+        0
+    } else {
+        dim.upper_bound
+            .checked_sub(dim.lower_bound)
+            .and_then(|span| span.checked_add(1))
+            .ok_or("VALUES extent overflows the descriptor ABI")?
+    };
+    if extent < snapshot.len() as i64 {
+        return Err("VALUES must contain at least eight elements");
+    }
+    if dim.stride == 0 {
+        return Err("VALUES has a zero element stride");
     }
 
-    // VALUES(8): year, month, day, tz_minutes, hour, minute, second, milliseconds
+    let byte_stride = dim
+        .stride
+        .checked_mul(descriptor.elem_size)
+        .and_then(|stride| isize::try_from(stride).ok())
+        .ok_or("VALUES stride overflows the address space")?;
+    for (index, value) in snapshot.iter().copied().enumerate() {
+        let byte_offset = byte_stride
+            .checked_mul(index as isize)
+            .ok_or("VALUES offset overflows the address space")?;
+        let destination = unsafe { descriptor.base_addr.offset(byte_offset) };
+        unsafe {
+            write_date_and_time_integer(destination, descriptor.elem_size, value);
+        }
+    }
+    Ok(())
+}
+
+/// DATE_AND_TIME compatibility entry point for objects whose VALUES actual is
+/// a contiguous default-INTEGER array. New code uses the descriptor ABI below.
+#[no_mangle]
+pub extern "C" fn afs_date_and_time(
+    date_buf: *mut u8,
+    date_len: i64,
+    time_buf: *mut u8,
+    time_len: i64,
+    zone_buf: *mut u8,
+    zone_len: i64,
+    values: *mut i32,
+) {
+    let snapshot =
+        date_and_time_snapshot(date_buf, date_len, time_buf, time_len, zone_buf, zone_len);
     if !values.is_null() {
         unsafe {
-            *values.add(0) = year;
-            *values.add(1) = month;
-            *values.add(2) = day;
-            *values.add(3) = tz_offset_min as i32;
-            *values.add(4) = hour;
-            *values.add(5) = minute;
-            *values.add(6) = second;
-            *values.add(7) = millis;
+            std::ptr::copy_nonoverlapping(snapshot.as_ptr(), values, snapshot.len());
         }
+    }
+}
+
+/// DATE_AND_TIME with descriptor-aware VALUES storage. Element kind and
+/// positive or negative section strides are honored without temporary
+/// contiguous writes or raw-address copyback.
+#[no_mangle]
+pub extern "C" fn afs_date_and_time_desc(
+    date_buf: *mut u8,
+    date_len: i64,
+    time_buf: *mut u8,
+    time_len: i64,
+    zone_buf: *mut u8,
+    zone_len: i64,
+    values: *mut ArrayDescriptor,
+) {
+    let snapshot =
+        date_and_time_snapshot(date_buf, date_len, time_buf, time_len, zone_buf, zone_len);
+    if let Err(message) = write_date_and_time_values_descriptor(values, &snapshot) {
+        eprintln!("Fortran runtime error: DATE_AND_TIME {message}");
+        std::process::exit(1);
     }
 }
 
@@ -330,23 +401,29 @@ fn environment_value(name: &[u8]) -> Option<Vec<u8>> {
     std::env::var_os(String::from_utf8_lossy(name).as_ref()).map(os_string_into_bytes)
 }
 
-/// GET_ENVIRONMENT_VARIABLE: retrieve an environment variable by name.
-#[no_mangle]
-pub extern "C" fn afs_get_environment_variable(
+fn environment_variable_name(name: &[u8], trim_name: bool) -> &[u8] {
+    if !trim_name {
+        return name;
+    }
+    let end = name
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(0, |index| index + 1);
+    &name[..end]
+}
+
+fn get_environment_variable(
     name: *const u8,
     name_len: i64,
     value: *mut u8,
     value_len: i64,
     length: *mut i32,
     status: *mut i32,
+    trim_name: bool,
 ) {
     let var_name = if !name.is_null() && name_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
-        let end = slice
-            .iter()
-            .rposition(|byte| *byte != b' ')
-            .map_or(0, |index| index + 1);
-        &slice[..end]
+        environment_variable_name(slice, trim_name)
     } else {
         store_optional_i32(length, 0);
         write_character_result(value, value_len, &[]);
@@ -368,11 +445,57 @@ pub extern "C" fn afs_get_environment_variable(
     }
 }
 
+/// Compatibility entry point for compiler output predating TRIM_NAME support.
+#[no_mangle]
+pub extern "C" fn afs_get_environment_variable(
+    name: *const u8,
+    name_len: i64,
+    value: *mut u8,
+    value_len: i64,
+    length: *mut i32,
+    status: *mut i32,
+) {
+    get_environment_variable(name, name_len, value, value_len, length, status, true);
+}
+
+/// GET_ENVIRONMENT_VARIABLE with the Fortran 2018 TRIM_NAME argument.
+#[no_mangle]
+pub extern "C" fn afs_get_environment_variable_trim(
+    name: *const u8,
+    name_len: i64,
+    value: *mut u8,
+    value_len: i64,
+    length: *mut i32,
+    status: *mut i32,
+    trim_name: i32,
+) {
+    get_environment_variable(
+        name,
+        name_len,
+        value,
+        value_len,
+        length,
+        status,
+        trim_name != 0,
+    );
+}
+
 /// EXECUTE_COMMAND_LINE: run a shell command.
 const ASYNC_COMMAND_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const ASYNC_COMMAND_RECEIVE_BATCH: usize = 64;
+// Launch the Unix command processor independently of the caller's PATH.
+#[cfg(unix)]
+const COMMAND_PROCESSOR: &str = "/bin/sh";
+#[cfg(not(unix))]
+const COMMAND_PROCESSOR: &str = "sh";
 
 type AsyncCommandSender = std::sync::mpsc::Sender<std::process::Child>;
+
+fn command_process(command: &str) -> std::process::Command {
+    let mut process = std::process::Command::new(COMMAND_PROCESSOR);
+    process.arg("-c").arg(command);
+    process
+}
 
 fn async_command_sender() -> Option<&'static AsyncCommandSender> {
     static SENDER: std::sync::OnceLock<AsyncCommandSender> = std::sync::OnceLock::new();
@@ -439,10 +562,7 @@ fn reap_async_commands(receiver: std::sync::mpsc::Receiver<std::process::Child>)
 fn spawn_async_command(command: &str) -> std::io::Result<u32> {
     let sender = async_command_sender()
         .ok_or_else(|| std::io::Error::other("could not start asynchronous command reaper"))?;
-    let child = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .spawn()?;
+    let child = command_process(command).spawn()?;
     let pid = child.id();
 
     if let Err(error) = sender.send(child) {
@@ -458,6 +578,79 @@ fn spawn_async_command(command: &str) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+fn store_execute_command_failure(
+    cmdstat: *mut i32,
+    cmdmsg: *mut u8,
+    cmdmsg_len: i64,
+    status: i32,
+    message: &str,
+) {
+    store_optional_i32(cmdstat, status);
+    write_character_result(cmdmsg, cmdmsg_len, message.as_bytes());
+}
+
+fn execute_command_line(
+    command: *const u8,
+    cmd_len: i64,
+    wait: i32,
+    exitstat: *mut i32,
+    cmdstat: *mut i32,
+    cmdmsg: *mut u8,
+    cmdmsg_len: i64,
+) {
+    let cmd = if !command.is_null() && cmd_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(command, cmd_len as usize) };
+        String::from_utf8_lossy(slice).trim().to_string()
+    } else {
+        store_execute_command_failure(
+            cmdstat,
+            cmdmsg,
+            cmdmsg_len,
+            1,
+            "command argument is absent or has zero length",
+        );
+        return;
+    };
+
+    if wait != 0 {
+        match command_process(&cmd).status() {
+            Ok(status) => {
+                if !exitstat.is_null() {
+                    unsafe {
+                        *exitstat = status.code().unwrap_or(-1);
+                    }
+                }
+                store_optional_i32(cmdstat, 0);
+            }
+            Err(error) => {
+                store_execute_command_failure(
+                    cmdstat,
+                    cmdmsg,
+                    cmdmsg_len,
+                    -1,
+                    &format!("could not execute command: {error}"),
+                );
+            }
+        }
+    } else {
+        match spawn_async_command(&cmd) {
+            Ok(_) => {
+                store_optional_i32(cmdstat, 0);
+            }
+            Err(error) => {
+                store_execute_command_failure(
+                    cmdstat,
+                    cmdmsg,
+                    cmdmsg_len,
+                    -1,
+                    &format!("could not start asynchronous command: {error}"),
+                );
+            }
+        }
+    }
+}
+
+/// Compatibility entry point for compiler output predating CMDMSG support.
 #[no_mangle]
 pub extern "C" fn afs_execute_command_line(
     command: *const u8,
@@ -466,63 +659,34 @@ pub extern "C" fn afs_execute_command_line(
     exitstat: *mut i32,
     cmdstat: *mut i32,
 ) {
-    let cmd = if !command.is_null() && cmd_len > 0 {
-        let slice = unsafe { std::slice::from_raw_parts(command, cmd_len as usize) };
-        String::from_utf8_lossy(slice).trim().to_string()
-    } else {
-        if !cmdstat.is_null() {
-            unsafe {
-                *cmdstat = 1;
-            }
-        }
-        return;
-    };
+    execute_command_line(
+        command,
+        cmd_len,
+        wait,
+        exitstat,
+        cmdstat,
+        std::ptr::null_mut(),
+        0,
+    );
+}
 
-    use std::process::Command;
-    if wait != 0 {
-        match Command::new("sh").arg("-c").arg(&cmd).status() {
-            Ok(status) => {
-                if !exitstat.is_null() {
-                    unsafe {
-                        *exitstat = status.code().unwrap_or(-1);
-                    }
-                }
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = 0;
-                    }
-                }
-            }
-            Err(_) => {
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = -1;
-                    }
-                }
-            }
-        }
-    } else {
-        match spawn_async_command(&cmd) {
-            Ok(_) => {
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = 0;
-                    }
-                }
-            }
-            Err(_) => {
-                if !cmdstat.is_null() {
-                    unsafe {
-                        *cmdstat = -1;
-                    }
-                }
-            }
-        }
-    }
+#[no_mangle]
+pub extern "C" fn afs_execute_command_line_cmdmsg(
+    command: *const u8,
+    cmd_len: i64,
+    wait: i32,
+    exitstat: *mut i32,
+    cmdstat: *mut i32,
+    cmdmsg: *mut u8,
+    cmdmsg_len: i64,
+) {
+    execute_command_line(
+        command, cmd_len, wait, exitstat, cmdstat, cmdmsg, cmdmsg_len,
+    );
 }
 
 // Shared RNG state for RANDOM_NUMBER / RANDOM_SEED.
-use crate::descriptor::ArrayDescriptor;
+use crate::descriptor::{ArrayDescriptor, MAX_RANK};
 use std::cell::Cell;
 use std::ptr;
 thread_local! {
@@ -531,6 +695,7 @@ thread_local! {
 }
 
 const RANDOM_SEED_VECTOR_SIZE: i64 = 1;
+const RANDOM_INIT_REPEATABLE_SEED: u64 = 0x243f_6a88_85a3_08d3;
 
 fn default_random_seed() -> u64 {
     let now = std::time::SystemTime::now()
@@ -584,6 +749,14 @@ fn next_random_u64() -> u64 {
     })
 }
 
+fn random_unit_f32(bits: u64) -> f32 {
+    ((bits >> 40) as f32) / (1u32 << 24) as f32
+}
+
+fn random_unit_f64(bits: u64) -> f64 {
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
 unsafe fn read_seed_element(addr: *const u8, elem_size: i64) -> u64 {
     match elem_size {
         1 => ptr::read_unaligned(addr as *const i8) as i64 as u64,
@@ -626,7 +799,7 @@ pub extern "C" fn afs_random_number_f32(harvest: *mut f32) {
     }
     let x = next_random_u64();
     unsafe {
-        *harvest = ((x >> 40) as f32) / (1u32 << 24) as f32;
+        *harvest = random_unit_f32(x);
     }
 }
 
@@ -638,40 +811,161 @@ pub extern "C" fn afs_random_number_f64(harvest: *mut f64) {
     }
     let x = next_random_u64();
     unsafe {
-        *harvest = (x >> 11) as f64 / (1u64 << 53) as f64;
+        *harvest = random_unit_f64(x);
     }
 }
 
-/// RANDOM_NUMBER on an N-element f32 array: every element gets an
-/// independent draw in [0, 1).  The scalar entry only fills one slot,
-/// so the IR dispatches to this when HARVEST is an array — without it,
-/// LAPACK / QR / EIG run on uninitialized stack data and segfault
-/// nondeterministically.
+/// Compatibility entry for older objects whose f32 HARVEST is contiguous.
+/// New compiler output uses the descriptor entry below.
 #[no_mangle]
 pub extern "C" fn afs_random_number_array_f32(harvest: *mut f32, n: i64) {
     if harvest.is_null() || n <= 0 {
         return;
     }
     for i in 0..n {
-        let x = next_random_u64();
-        let v = ((x >> 40) as f32) / (1u32 << 24) as f32;
+        let value = random_unit_f32(next_random_u64());
         unsafe {
-            *harvest.offset(i as isize) = v;
+            *harvest.offset(i as isize) = value;
         }
     }
 }
 
+/// Compatibility entry for older objects whose f64 HARVEST is contiguous.
+/// New compiler output uses the descriptor entry below.
 #[no_mangle]
 pub extern "C" fn afs_random_number_array_f64(harvest: *mut f64, n: i64) {
     if harvest.is_null() || n <= 0 {
         return;
     }
     for i in 0..n {
-        let x = next_random_u64();
-        let v = (x >> 11) as f64 / (1u64 << 53) as f64;
+        let value = random_unit_f64(next_random_u64());
         unsafe {
-            *harvest.offset(i as isize) = v;
+            *harvest.offset(i as isize) = value;
         }
+    }
+}
+
+fn fill_random_number_descriptor(harvest: *mut ArrayDescriptor) -> Result<(), &'static str> {
+    if harvest.is_null() {
+        return Err("HARVEST descriptor is null");
+    }
+
+    let descriptor = unsafe { &*harvest };
+    let rank = usize::try_from(descriptor.rank)
+        .ok()
+        .filter(|rank| (1..=MAX_RANK).contains(rank))
+        .ok_or("HARVEST descriptor rank is invalid")?;
+    if !matches!(descriptor.elem_size, 4 | 8) {
+        return Err("HARVEST has an unsupported REAL kind");
+    }
+
+    let mut extents = [0_i64; MAX_RANK];
+    let mut total = 1_usize;
+    let mut min_element_offset = 0_i128;
+    let mut max_element_offset = 0_i128;
+    for (index, dim) in descriptor.dims.iter().copied().take(rank).enumerate() {
+        let extent = if dim.upper_bound < dim.lower_bound {
+            0
+        } else {
+            dim.upper_bound
+                .checked_sub(dim.lower_bound)
+                .and_then(|span| span.checked_add(1))
+                .ok_or("HARVEST extent overflows the descriptor ABI")?
+        };
+        extents[index] = extent;
+        total = total
+            .checked_mul(
+                usize::try_from(extent).map_err(|_| "HARVEST extent exceeds the address space")?,
+            )
+            .ok_or("HARVEST element count exceeds the address space")?;
+        if extent > 1 && dim.stride == 0 {
+            return Err("HARVEST has a zero element stride");
+        }
+
+        let last_offset = i128::from(extent.saturating_sub(1))
+            .checked_mul(i128::from(dim.stride))
+            .ok_or("HARVEST stride span overflows the descriptor ABI")?;
+        if last_offset < 0 {
+            min_element_offset = min_element_offset
+                .checked_add(last_offset)
+                .ok_or("HARVEST offset overflows the descriptor ABI")?;
+        } else {
+            max_element_offset = max_element_offset
+                .checked_add(last_offset)
+                .ok_or("HARVEST offset overflows the descriptor ABI")?;
+        }
+    }
+
+    if total == 0 {
+        return Ok(());
+    }
+    if descriptor.base_addr.is_null() {
+        return Err("HARVEST has no storage");
+    }
+
+    for boundary in [min_element_offset, max_element_offset] {
+        let byte_offset = boundary
+            .checked_mul(i128::from(descriptor.elem_size))
+            .ok_or("HARVEST byte offset overflows the descriptor ABI")?;
+        isize::try_from(byte_offset)
+            .map_err(|_| "HARVEST byte offset exceeds the address space")?;
+    }
+
+    let mut byte_strides = [0_isize; MAX_RANK];
+    let mut byte_rewinds = [0_isize; MAX_RANK];
+    for dimension in 0..rank {
+        if extents[dimension] <= 1 {
+            continue;
+        }
+        let byte_stride = i128::from(descriptor.dims[dimension].stride)
+            .checked_mul(i128::from(descriptor.elem_size))
+            .ok_or("HARVEST byte stride overflows the descriptor ABI")?;
+        byte_strides[dimension] = isize::try_from(byte_stride)
+            .map_err(|_| "HARVEST byte stride exceeds the address space")?;
+        let byte_rewind = byte_stride
+            .checked_mul(i128::from(extents[dimension] - 1))
+            .ok_or("HARVEST byte rewind overflows the descriptor ABI")?;
+        byte_rewinds[dimension] = isize::try_from(byte_rewind)
+            .map_err(|_| "HARVEST byte rewind exceeds the address space")?;
+    }
+
+    let mut indices = [0_i64; MAX_RANK];
+    let mut byte_offset = 0_isize;
+    for linear in 0..total {
+        let destination = descriptor.base_addr.wrapping_offset(byte_offset);
+        let bits = next_random_u64();
+        unsafe {
+            match descriptor.elem_size {
+                4 => ptr::write_unaligned(destination as *mut f32, random_unit_f32(bits)),
+                8 => ptr::write_unaligned(destination as *mut f64, random_unit_f64(bits)),
+                _ => unreachable!("RANDOM_NUMBER element size was validated before storage"),
+            }
+        }
+
+        if linear + 1 == total {
+            break;
+        }
+        for dimension in 0..rank {
+            indices[dimension] += 1;
+            if indices[dimension] < extents[dimension] {
+                byte_offset += byte_strides[dimension];
+                break;
+            }
+            indices[dimension] = 0;
+            byte_offset -= byte_rewinds[dimension];
+        }
+    }
+    Ok(())
+}
+
+/// RANDOM_NUMBER on an array descriptor. New compiler output uses this entry
+/// so noncontiguous and reverse sections retain every dimension's memory
+/// stride. The raw pointer-and-count entries remain for older objects.
+#[no_mangle]
+pub extern "C" fn afs_random_number_array_desc(harvest: *mut ArrayDescriptor) {
+    if let Err(message) = fill_random_number_descriptor(harvest) {
+        eprintln!("Fortran runtime error: RANDOM_NUMBER {message}");
+        std::process::exit(1);
     }
 }
 
@@ -684,6 +978,22 @@ pub extern "C" fn afs_random_seed(seed_val: i64) {
 #[no_mangle]
 pub extern "C" fn afs_random_seed_init() {
     set_random_seed(default_random_seed());
+}
+
+/// RANDOM_INIT: reset RANDOM_NUMBER's generator.
+///
+/// ARMFORTAS currently executes a single Fortran image, so
+/// IMAGE_DISTINCT cannot distinguish any peer image. REPEATABLE uses a
+/// fixed processor seed; the nonrepeatable path retains RANDOM_SEED's
+/// process-dependent initialization.
+#[no_mangle]
+pub extern "C" fn afs_random_init(repeatable: i32, _image_distinct: i32) {
+    let seed = if repeatable != 0 {
+        RANDOM_INIT_REPEATABLE_SEED
+    } else {
+        default_random_seed()
+    };
+    set_random_seed(seed);
 }
 
 #[no_mangle]
@@ -871,6 +1181,100 @@ mod tests {
         assert_eq!(process_clock_seconds(PROCESS_CLOCKS_PER_SECOND), 1.0);
     }
 
+    #[test]
+    fn date_and_time_character_results_truncate_without_overwriting_guards() {
+        const GUARD: u8 = 0xa5;
+
+        let mut date = [GUARD; 9];
+        let mut time = [GUARD; 11];
+        let mut zone = [GUARD; 6];
+        let snapshot = date_and_time_snapshot(
+            unsafe { date.as_mut_ptr().add(1) },
+            7,
+            unsafe { time.as_mut_ptr().add(1) },
+            9,
+            unsafe { zone.as_mut_ptr().add(1) },
+            4,
+        );
+
+        let expected_date = format!("{:04}{:02}{:02}", snapshot[0], snapshot[1], snapshot[2]);
+        let expected_time = format!(
+            "{:02}{:02}{:02}.{:03}",
+            snapshot[4], snapshot[5], snapshot[6], snapshot[7]
+        );
+        let zone_minutes = snapshot[3].unsigned_abs();
+        let expected_zone = format!(
+            "{}{:02}{:02}",
+            if snapshot[3] >= 0 { '+' } else { '-' },
+            zone_minutes / 60,
+            zone_minutes % 60
+        );
+
+        assert_eq!(&date[1..8], &expected_date.as_bytes()[..7]);
+        assert_eq!(&time[1..10], &expected_time.as_bytes()[..9]);
+        assert_eq!(&zone[1..5], &expected_zone.as_bytes()[..4]);
+        assert_eq!((date[0], date[8]), (GUARD, GUARD));
+        assert_eq!((time[0], time[10]), (GUARD, GUARD));
+        assert_eq!((zone[0], zone[5]), (GUARD, GUARD));
+
+        let mut zero_length = [GUARD; 3];
+        date_and_time_snapshot(
+            unsafe { zero_length.as_mut_ptr().add(1) },
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+        );
+        assert_eq!(zero_length, [GUARD; 3]);
+    }
+
+    #[test]
+    fn date_and_time_values_honor_integer_kind_and_negative_stride() {
+        let snapshot = [2026, 7, 30, -240, 12, 34, 56, 789];
+        let sentinel = i64::MIN;
+        let mut storage = [sentinel; 17];
+        let mut descriptor = ArrayDescriptor::zeroed();
+        descriptor.base_addr = unsafe { storage.as_mut_ptr().add(15) }.cast();
+        descriptor.elem_size = std::mem::size_of::<i64>() as i64;
+        descriptor.rank = 1;
+        descriptor.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 8,
+            stride: -2,
+        };
+
+        write_date_and_time_values_descriptor(&mut descriptor, &snapshot).unwrap();
+
+        for (index, expected) in snapshot.iter().copied().enumerate() {
+            assert_eq!(storage[15 - index * 2], expected as i64);
+        }
+        for index in (0..storage.len()).filter(|index| index % 2 == 0) {
+            assert_eq!(storage[index], sentinel);
+        }
+    }
+
+    #[test]
+    fn date_and_time_values_reject_short_descriptors_without_writing() {
+        let snapshot = [2026, 7, 30, -240, 12, 34, 56, 789];
+        let mut storage = [i32::MIN; 7];
+        let mut descriptor = ArrayDescriptor::zeroed();
+        descriptor.base_addr = storage.as_mut_ptr().cast();
+        descriptor.elem_size = std::mem::size_of::<i32>() as i64;
+        descriptor.rank = 1;
+        descriptor.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 7,
+            stride: 1,
+        };
+
+        assert_eq!(
+            write_date_and_time_values_descriptor(&mut descriptor, &snapshot),
+            Err("VALUES must contain at least eight elements")
+        );
+        assert_eq!(storage, [i32::MIN; 7]);
+    }
+
     #[cfg(target_os = "freebsd")]
     #[test]
     fn cpu_time_matches_freebsd_clock_scale() {
@@ -903,6 +1307,87 @@ mod tests {
     fn command_argument_count_nonneg() {
         let c = afs_command_argument_count();
         assert!(c >= 0);
+    }
+
+    #[test]
+    fn execute_command_line_cmdmsg_reports_padded_and_truncated_failures() {
+        let invalid_command = [0u8];
+        let mut cmdstat = 0;
+        let mut full_message = [b'?'; 96];
+        afs_execute_command_line_cmdmsg(
+            std::ptr::null(),
+            0,
+            1,
+            std::ptr::null_mut(),
+            &mut cmdstat,
+            full_message.as_mut_ptr(),
+            full_message.len() as i64,
+        );
+        assert_ne!(cmdstat, 0);
+        assert_ne!(full_message[0], b'?');
+        assert_eq!(full_message[full_message.len() - 1], b' ');
+
+        let mut short_message = [b'?'; 8];
+        afs_execute_command_line_cmdmsg(
+            invalid_command.as_ptr(),
+            invalid_command.len() as i64,
+            0,
+            std::ptr::null_mut(),
+            &mut cmdstat,
+            short_message.as_mut_ptr(),
+            short_message.len() as i64,
+        );
+        assert_ne!(cmdstat, 0);
+        assert!(!short_message.contains(&b'?'));
+    }
+
+    #[test]
+    fn execute_command_line_cmdmsg_is_unchanged_after_successful_start() {
+        let command = b"exit 0";
+        let mut exitstat = i32::MIN;
+        let mut cmdstat = i32::MIN;
+        let mut message = *b"unchanged";
+        afs_execute_command_line_cmdmsg(
+            command.as_ptr(),
+            command.len() as i64,
+            1,
+            &mut exitstat,
+            &mut cmdstat,
+            message.as_mut_ptr(),
+            message.len() as i64,
+        );
+        assert_eq!(exitstat, 0);
+        assert_eq!(cmdstat, 0);
+        assert_eq!(&message, b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_processor_does_not_depend_on_path() {
+        const MISSING_PATH: &str = "/armfortas-command-path-does-not-exist";
+
+        let sync_status = command_process("exit 0")
+            .env("PATH", MISSING_PATH)
+            .status()
+            .expect("synchronous command processor should start outside PATH");
+        assert!(sync_status.success());
+
+        let mut child = command_process("exit 0")
+            .env("PATH", MISSING_PATH)
+            .spawn()
+            .expect("asynchronous command processor should start outside PATH");
+        let async_status = child
+            .wait()
+            .expect("asynchronous command processor should be waitable");
+        assert!(async_status.success());
+    }
+
+    #[test]
+    fn environment_variable_name_honors_trim_name() {
+        assert_eq!(environment_variable_name(b"PATH   ", true), b"PATH");
+        assert_eq!(environment_variable_name(b"PATH   ", false), b"PATH   ");
+        assert_eq!(environment_variable_name(b"   ", true), b"");
+        assert_eq!(environment_variable_name(b"   ", false), b"   ");
     }
 
     #[test]
@@ -997,6 +1482,103 @@ mod tests {
     }
 
     #[test]
+    fn random_number_descriptor_walks_signed_multidimensional_strides() {
+        let mut forward = [-1.0_f32; 16];
+        let mut forward_desc = ArrayDescriptor::zeroed();
+        forward_desc.base_addr = forward.as_mut_ptr() as *mut u8;
+        forward_desc.elem_size = std::mem::size_of::<f32>() as i64;
+        forward_desc.rank = 2;
+        forward_desc.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 3,
+            stride: 2,
+        };
+        forward_desc.dims[1] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 8,
+        };
+
+        set_random_seed(11);
+        fill_random_number_descriptor(&mut forward_desc)
+            .expect("valid positive-stride descriptor should be filled");
+        for (index, value) in forward.iter().copied().enumerate() {
+            if [0, 2, 4, 8, 10, 12].contains(&index) {
+                assert!((0.0..1.0).contains(&value), "forward[{index}]={value}");
+            } else {
+                assert_eq!(value, -1.0, "forward guard {index} was overwritten");
+            }
+        }
+
+        let mut reverse = [-1.0_f64; 18];
+        let mut reverse_desc = ArrayDescriptor::zeroed();
+        reverse_desc.base_addr = unsafe { reverse.as_mut_ptr().add(14) as *mut u8 };
+        reverse_desc.elem_size = std::mem::size_of::<f64>() as i64;
+        reverse_desc.rank = 2;
+        reverse_desc.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: -2,
+        };
+        reverse_desc.dims[1] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: -5,
+        };
+
+        set_random_seed(17);
+        fill_random_number_descriptor(&mut reverse_desc)
+            .expect("valid negative-stride descriptor should be filled");
+        for (index, value) in reverse.iter().copied().enumerate() {
+            if [7, 9, 12, 14].contains(&index) {
+                assert!((0.0..1.0).contains(&value), "reverse[{index}]={value}");
+            } else {
+                assert_eq!(value, -1.0, "reverse guard {index} was overwritten");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_random_number_descriptor_consumes_no_random_values() {
+        let mut empty = ArrayDescriptor::zeroed();
+        empty.elem_size = std::mem::size_of::<f64>() as i64;
+        empty.rank = 1;
+        empty.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+
+        set_random_seed(23);
+        fill_random_number_descriptor(&mut empty)
+            .expect("zero-extent HARVEST should be a successful no-op");
+        let after_empty = next_random_u64();
+        set_random_seed(23);
+        let without_empty = next_random_u64();
+        assert_eq!(after_empty, without_empty);
+    }
+
+    #[test]
+    fn random_number_descriptor_rejects_repeated_storage() {
+        let mut values = [-1.0_f64; 2];
+        let mut descriptor = ArrayDescriptor::zeroed();
+        descriptor.base_addr = values.as_mut_ptr() as *mut u8;
+        descriptor.elem_size = std::mem::size_of::<f64>() as i64;
+        descriptor.rank = 1;
+        descriptor.dims[0] = crate::descriptor::DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 2,
+            stride: 0,
+        };
+
+        assert_eq!(
+            fill_random_number_descriptor(&mut descriptor),
+            Err("HARVEST has a zero element stride")
+        );
+        assert_eq!(values, [-1.0, -1.0]);
+    }
+
+    #[test]
     fn random_seed_keeps_explicit_sequences_reproducible() {
         let mut first = 0.0f64;
         let mut second = 0.0f64;
@@ -1005,6 +1587,29 @@ mod tests {
         afs_random_seed(42);
         afs_random_number_f64(&mut second);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn random_init_repeatable_restarts_the_same_sequence() {
+        let mut first = [0.0f64; 3];
+        let mut advanced = [0.0f64; 3];
+        let mut repeated = [0.0f64; 3];
+
+        afs_random_init(1, 0);
+        for value in &mut first {
+            afs_random_number_f64(value);
+        }
+        for value in &mut advanced {
+            afs_random_number_f64(value);
+        }
+
+        afs_random_init(1, 1);
+        for value in &mut repeated {
+            afs_random_number_f64(value);
+        }
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, advanced);
     }
 }
 

@@ -18,7 +18,10 @@ use crate::ir::inst::{InstKind, Module, RuntimeFunc};
 use crate::ir::{lower, printer as ir_printer, verify};
 use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
 use crate::parser::Parser;
-use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
+use crate::runtime::artifact::{
+    find_source_workspace_from, fresh_runtime_lib, materialize_bundled_runtime,
+    runtime_lib_candidate, RuntimeArchive, RuntimeProfile,
+};
 use crate::sema::{resolve, validate};
 
 static NEXT_ATOMIC_WRITE_ID: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +31,58 @@ struct RemoveFileOnDrop(PathBuf);
 impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Transaction guard for an object or executable written directly by a
+/// subprocess. Preparing removes any old destination; only a verified,
+/// non-empty regular file survives the guard.
+struct PendingExternalOutput {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PendingExternalOutput {
+    fn prepare(path: &Path, tool: &str) -> Result<Self, String> {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot remove stale {tool} output '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            committed: false,
+        })
+    }
+
+    fn verify(mut self, tool: &str) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            format!(
+                "{tool} reported success but did not produce output '{}': {error}",
+                self.path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() == 0 {
+            return Err(format!(
+                "{tool} reported success but did not produce a non-empty regular output '{}'",
+                self.path.display()
+            ));
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingExternalOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -46,7 +101,7 @@ impl OptLevel {
     pub fn parse_flag(flag: &str) -> Option<Self> {
         match flag.to_ascii_lowercase().as_str() {
             "o0" => Some(Self::O0),
-            "o1" => Some(Self::O1),
+            "o" | "o1" => Some(Self::O1),
             "o2" => Some(Self::O2),
             "o3" => Some(Self::O3),
             "os" => Some(Self::Os),
@@ -143,6 +198,169 @@ enum CliInputKind {
     UnsupportedSource,
 }
 
+/// One user-supplied operand in the original linker stream.
+///
+/// Source paths are replaced with their compiled object paths just before
+/// linking, prebuilt artifacts pass through, and libraries retain their exact
+/// position between those inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOperand {
+    Input(PathBuf),
+    Library(String),
+}
+
+/// User-supplied target text for a make dependency rule.
+///
+/// GNU-compatible `-MT` accepts make syntax verbatim, while `-MQ` quotes
+/// make-special characters so the argument names a literal target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepTarget {
+    Verbatim(String),
+    Quoted(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    Preprocess,
+    Tokens,
+    Ast,
+    Ir,
+    Assembly,
+    Object,
+}
+
+impl TerminalMode {
+    /// Return the first terminal phase reached by `compile_with_bundled_runtime`.
+    ///
+    /// Keeping this order aligned with that pipeline makes multi-input jobs
+    /// obey the same mode precedence as single-input jobs even if callers
+    /// construct `Options` directly with more than one mode bit set.
+    fn from_options(opts: &Options) -> Option<Self> {
+        if opts.preprocess_only {
+            Some(Self::Preprocess)
+        } else if opts.emit_tokens {
+            Some(Self::Tokens)
+        } else if opts.emit_ast {
+            Some(Self::Ast)
+        } else if opts.emit_ir {
+            Some(Self::Ir)
+        } else if opts.emit_asm {
+            Some(Self::Assembly)
+        } else if opts.emit_obj {
+            Some(Self::Object)
+        } else {
+            None
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Preprocess => "-E",
+            Self::Tokens => "--emit-tokens",
+            Self::Ast => "--emit-ast",
+            Self::Ir => "--emit-ir",
+            Self::Assembly => "-S",
+            Self::Object => "-c",
+        }
+    }
+
+    fn requires_dependency_order(self) -> bool {
+        matches!(self, Self::Ir | Self::Assembly | Self::Object)
+    }
+
+    fn configure_child(self, opts: &mut Options) {
+        opts.preprocess_only = false;
+        opts.emit_tokens = false;
+        opts.emit_ast = false;
+        opts.emit_ir = false;
+        opts.emit_asm = false;
+        opts.emit_obj = false;
+        match self {
+            Self::Preprocess => opts.preprocess_only = true,
+            Self::Tokens => opts.emit_tokens = true,
+            Self::Ast => opts.emit_ast = true,
+            Self::Ir => opts.emit_ir = true,
+            Self::Assembly => opts.emit_asm = true,
+            Self::Object => opts.emit_obj = true,
+        }
+    }
+
+    fn output_for_input(self, input: &Path) -> Option<PathBuf> {
+        if self == Self::Preprocess {
+            return None;
+        }
+        if self == Self::Object {
+            return Some(input.with_extension("o"));
+        }
+        let stem = input
+            .file_stem()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or("a");
+        let extension = match self {
+            Self::Tokens => "tokens",
+            Self::Ast => "ast",
+            Self::Ir => "ir",
+            Self::Assembly => "s",
+            Self::Preprocess | Self::Object => unreachable!(),
+        };
+        Some(PathBuf::from(format!("{stem}.{extension}")))
+    }
+}
+
+fn terminal_output_collision_key(output: &Path, cwd: &Path) -> PathBuf {
+    let absolute = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        cwd.join(output)
+    };
+    let normalized = normalize_path_lexically(&absolute);
+
+    // Resolve an existing destination first so an input file symlink cannot
+    // hide an output/input alias. Otherwise resolve the existing parent so
+    // equivalent directory-symlink spellings still collide when the output
+    // does not exist yet.
+    if let Ok(existing) = fs::canonicalize(&normalized) {
+        return existing;
+    }
+    match (normalized.parent(), normalized.file_name()) {
+        (Some(parent), Some(file_name)) => fs::canonicalize(parent)
+            .map(|parent| parent.join(file_name))
+            .unwrap_or(normalized),
+        _ => normalized,
+    }
+}
+
+fn validate_unique_terminal_outputs(
+    inputs: &[PathBuf],
+    outputs: &[Option<PathBuf>],
+) -> Result<(), String> {
+    debug_assert_eq!(inputs.len(), outputs.len());
+    if outputs.iter().all(Option::is_none) {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let mut claimed = std::collections::HashMap::<PathBuf, usize>::with_capacity(outputs.len());
+    for (index, output) in outputs.iter().enumerate() {
+        let Some(output) = output else {
+            continue;
+        };
+        let key = terminal_output_collision_key(output, &cwd);
+        if let Some(first_index) = claimed.insert(key, index) {
+            return Err(format!(
+                "multiple input files '{}' and '{}' map to the same output '{}'; \
+                 compile them separately or use distinct source basenames",
+                inputs[first_index].display(),
+                inputs[index].display(),
+                output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Compilation options.
 #[derive(Clone)]
 pub struct Options {
@@ -164,7 +382,7 @@ pub struct Options {
     /// Emit a make-style dependency file (`-MD`/`-MMD`, optionally `-MF`).
     pub emit_depfile: bool,
     pub depfile: Option<PathBuf>,
-    pub dep_targets: Vec<String>,
+    pub dep_targets: Vec<DepTarget>,
     pub depfile_phony: bool,
 
     // ---- Language ----
@@ -198,18 +416,18 @@ pub struct Options {
     pub warn_pedantic: bool,
     pub warn_deprecated: bool,
     pub warn_as_error: bool,
+    pub suppress_warnings: bool, // -w
     pub werror_implicit_interface_compat: bool,
     pub disabled_warnings: Vec<String>,
     pub cli_warnings: Vec<String>,
 
     // ---- Debug / introspection ----
-    pub debug_info: bool,                      // -g (accepted; DWARF deferred)
-    pub verbose: bool,                         // -v
-    pub time_report: bool,                     // --time-report
-    pub diagnostics_format: DiagnosticsFormat, // --diagnostics-format=
-    pub check_bounds: bool,                    // -fcheck=bounds
-    pub check_all: bool,                       // -fcheck=all
-    pub backtrace_requested: bool,             // -fbacktrace (accepted; runtime wiring TODO)
+    pub debug_info: bool,          // -g (accepted; DWARF deferred)
+    pub verbose: bool,             // -v
+    pub time_report: bool,         // --time-report
+    pub check_bounds: bool,        // -fcheck=bounds
+    pub check_all: bool,           // -fcheck=all
+    pub backtrace_requested: bool, // -fbacktrace (accepted; runtime wiring TODO)
 
     // ---- Search paths / linking ----
     /// Directories to search for `.amod` module files (`-I <dir>`).
@@ -218,8 +436,8 @@ pub struct Options {
     pub module_output_dir: Option<PathBuf>,
     /// `-L <dir>` library search paths passed to `ld`.
     pub library_search_paths: Vec<PathBuf>,
-    /// `-l<name>` libraries passed to `ld`.
-    pub link_libs: Vec<String>,
+    /// Positional inputs and `-l<name>` libraries in command-line order.
+    pub link_operands: Vec<LinkOperand>,
     /// `-shared` / `-static`.
     pub shared: bool,
     pub static_link: bool,
@@ -241,12 +459,6 @@ pub struct Options {
     pub no_pie: bool,
     /// ISA capability level (x10): baseline only today.
     pub target_cpu: TargetCpu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticsFormat {
-    Text,
-    Json,
 }
 
 impl Default for Options {
@@ -288,20 +500,20 @@ impl Default for Options {
             warn_pedantic: false,
             warn_deprecated: false,
             warn_as_error: false,
+            suppress_warnings: false,
             werror_implicit_interface_compat: false,
             disabled_warnings: Vec::new(),
             cli_warnings: Vec::new(),
             debug_info: false,
             verbose: false,
             time_report: false,
-            diagnostics_format: DiagnosticsFormat::Text,
             check_bounds: false,
             check_all: false,
             backtrace_requested: false,
             module_search_paths: Vec::new(),
             module_output_dir: None,
             library_search_paths: Vec::new(),
-            link_libs: Vec::new(),
+            link_operands: Vec::new(),
             shared: false,
             static_link: false,
             extra_link_args: Vec::new(),
@@ -348,6 +560,14 @@ impl Options {
         } else {
             PathBuf::from(stem)
         }
+    }
+
+    pub(crate) fn warnings_enabled(&self) -> bool {
+        !self.suppress_warnings
+    }
+
+    pub(crate) fn warnings_are_errors(&self) -> bool {
+        self.warnings_enabled() && self.warn_as_error
     }
 }
 
@@ -435,7 +655,6 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-no-pie" => opts.no_pie = true,
 
             // ---- Optimization ----
-            "-O" => opts.opt_level = OptLevel::O0,
             arg if arg.starts_with("-O") => {
                 opts.opt_level = OptLevel::parse_flag(&arg[1..])
                     .ok_or_else(|| format!("unknown optimization level: {}", arg))?;
@@ -501,12 +720,13 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
 
             "-l" => {
                 i += 1;
-                opts.link_libs
-                    .push(args.get(i).ok_or("-l requires a library name")?.clone());
+                opts.link_operands.push(LinkOperand::Library(
+                    args.get(i).ok_or("-l requires a library name")?.clone(),
+                ));
             }
-            arg if arg.starts_with("-l") => opts
-                .link_libs
-                .push(short_option_value(arg, "-l", "a library name")?.to_string()),
+            arg if arg.starts_with("-l") => opts.link_operands.push(LinkOperand::Library(
+                short_option_value(arg, "-l", "a library name")?.to_string(),
+            )),
 
             "-rpath" | "--rpath" => {
                 i += 1;
@@ -625,23 +845,23 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-fbacktrace" => opts.backtrace_requested = true,
 
             // ---- Warnings (accepted; gating is gradual sprint work) ----
-            "-Wall" => opts.warn_all = true,
-            "-Wextra" => opts.warn_extra = true,
-            "-Wpedantic" | "-pedantic" => opts.warn_pedantic = true,
-            "-Wdeprecated" => opts.warn_deprecated = true,
-            "-Werror" => opts.warn_as_error = true,
+            "-Wall" => set_warning_option(&mut opts, "all", true),
+            "-Wextra" => set_warning_option(&mut opts, "extra", true),
+            "-Wpedantic" | "-pedantic" => set_warning_option(&mut opts, "pedantic", true),
+            "-Wdeprecated" => set_warning_option(&mut opts, "deprecated", true),
+            "-Werror" => set_warning_option(&mut opts, "error", true),
             "-Werror=implicit-interface" => opts.werror_implicit_interface_compat = true,
             arg if arg.starts_with("-Werror=") => {
-                opts.warn_as_error = true;
+                set_warning_option(&mut opts, "error", true);
                 unknown_warning_flags.push(arg.to_string());
             }
             arg if arg.starts_with("-Wno-") => {
-                opts.disabled_warnings.push(arg[5..].to_string());
+                set_warning_option(&mut opts, &arg[5..], false);
             }
             arg if arg.starts_with("-W") => {
                 unknown_warning_flags.push(arg.to_string());
             }
-            "-w" => {}
+            "-w" => opts.suppress_warnings = true,
 
             // ---- Make-style dependency-file compatibility ----
             "-MD" | "-MMD" => opts.emit_depfile = true,
@@ -662,21 +882,27 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
                 let flag = arg.clone();
                 i += 1;
                 opts.emit_depfile = true;
-                opts.dep_targets.push(
-                    args.get(i)
-                        .ok_or_else(|| format!("{} requires a target", flag))?
-                        .clone(),
-                );
+                let target = args
+                    .get(i)
+                    .ok_or_else(|| format!("{} requires a target", flag))?
+                    .clone();
+                opts.dep_targets.push(if flag == "-MQ" {
+                    DepTarget::Quoted(target)
+                } else {
+                    DepTarget::Verbatim(target)
+                });
             }
             arg if arg.starts_with("-MT") => {
                 opts.emit_depfile = true;
-                opts.dep_targets
-                    .push(short_option_value(arg, "-MT", "a target")?.to_string());
+                opts.dep_targets.push(DepTarget::Verbatim(
+                    short_option_value(arg, "-MT", "a target")?.to_string(),
+                ));
             }
             arg if arg.starts_with("-MQ") => {
                 opts.emit_depfile = true;
-                opts.dep_targets
-                    .push(short_option_value(arg, "-MQ", "a target")?.to_string());
+                opts.dep_targets.push(DepTarget::Quoted(
+                    short_option_value(arg, "-MQ", "a target")?.to_string(),
+                ));
             }
 
             // ---- Debug / introspection ----
@@ -686,15 +912,19 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "--time-report" => opts.time_report = true,
             arg if arg.starts_with("--diagnostics-format=") => {
                 let val = &arg["--diagnostics-format=".len()..];
-                opts.diagnostics_format = match val {
-                    "text" => DiagnosticsFormat::Text,
-                    "json" => DiagnosticsFormat::Json,
-                    other => return Err(format!("unknown --diagnostics-format value: {}", other)),
-                };
+                if val != "text" {
+                    return Err(format!(
+                        "unsupported --diagnostics-format value '{val}'; supported value: text"
+                    ));
+                }
             }
 
             // ---- Positional input file ----
-            arg if !arg.starts_with('-') => inputs.push(PathBuf::from(arg)),
+            arg if !arg.starts_with('-') => {
+                let input = PathBuf::from(arg);
+                opts.link_operands.push(LinkOperand::Input(input.clone()));
+                inputs.push(input);
+            }
 
             other => return Err(format!("unknown option: {}", other)),
         }
@@ -710,10 +940,6 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
     }
 
     collect_cli_warnings(&mut opts, &unknown_warning_flags);
-
-    if matches!(opts.diagnostics_format, DiagnosticsFormat::Json) {
-        return Err("JSON diagnostics are not yet implemented".into());
-    }
 
     if inputs.is_empty() {
         return Err("no input file".into());
@@ -917,7 +1143,35 @@ fn parse_free_line_length(value: &str) -> Result<usize, String> {
     Ok(limit)
 }
 
+fn set_warning_option(opts: &mut Options, name: &str, enabled: bool) {
+    if enabled {
+        opts.disabled_warnings.retain(|disabled| disabled != name);
+    } else if !opts
+        .disabled_warnings
+        .iter()
+        .any(|disabled| disabled == name)
+    {
+        opts.disabled_warnings.push(name.to_string());
+    }
+
+    let destination = match name {
+        "all" => Some(&mut opts.warn_all),
+        "extra" => Some(&mut opts.warn_extra),
+        "pedantic" => Some(&mut opts.warn_pedantic),
+        "deprecated" => Some(&mut opts.warn_deprecated),
+        "error" => Some(&mut opts.warn_as_error),
+        _ => None,
+    };
+    if let Some(destination) = destination {
+        *destination = enabled;
+    }
+}
+
 fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
+    if !opts.warnings_enabled() {
+        return;
+    }
+
     if opts.cpp_compat {
         opts.cli_warnings.push(
             "-cpp is accepted for compatibility; preprocessing already runs for Fortran inputs"
@@ -927,7 +1181,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
 
     if opts.check_all {
         opts.cli_warnings.push(
-            "-fcheck=all is accepted, but only array bounds checks are implemented today".into(),
+            "-fcheck=all is accepted, but only array bounds and derived-array assignment conformance checks are implemented today".into(),
         );
     }
 
@@ -1008,7 +1262,7 @@ fn collect_cli_warnings(opts: &mut Options, unknown_warning_flags: &[String]) {
     }
 }
 
-fn strip_bounds_check_calls(module: &mut Module) {
+fn strip_disabled_runtime_check_calls(module: &mut Module, check_bounds: bool, check_all: bool) {
     for func in &mut module.functions {
         let mut changed = false;
         for block in &mut func.blocks {
@@ -1016,7 +1270,13 @@ fn strip_bounds_check_calls(module: &mut Module) {
             block.insts.retain(|inst| {
                 !matches!(
                     inst.kind,
-                    InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _)
+                    InstKind::RuntimeCall(RuntimeFunc::CheckBounds, _) if !check_bounds
+                ) && !matches!(
+                    inst.kind,
+                    InstKind::RuntimeCall(
+                        RuntimeFunc::CheckArrayAssignmentConformance,
+                        _
+                    ) if !check_all
                 )
             });
             changed |= block.insts.len() != before;
@@ -1067,6 +1327,7 @@ LANGUAGE:
   -fmax-errors=<n>            GNU-compatible diagnostic limit spelling
 
 OPTIMIZATION:
+  -O                          Optimize at level 1 (equivalent to -O1)
   -O0, -O1, -O2, -O3          Optimization level (default -O0)
   -Os                         Optimize for size
   -Ofast                      Aggressive optimization; permits floating-point
@@ -1078,6 +1339,7 @@ WARNINGS:
   -Wpedantic                  Pedantic standard conformance warnings
   -Wdeprecated                Deprecated feature warnings
   -Werror                     Treat warnings as errors
+  -w                          Suppress all warnings
   -Werror=implicit-interface  Accept GNU-style implicit-interface diagnostic flag
   -Wno-<name>                 Disable specific warning
 
@@ -1093,8 +1355,7 @@ DEBUGGING:
   -fcheck=array-temps         Accept GNU-style array-temp diagnostic flag
   -fcheck=all                 Enable all runtime checks
   -fcoarray=single            Accept GNU-style single-image coarray mode flag
-  --diagnostics-format=text|json
-                              Diagnostic output format
+  --diagnostics-format=text   Diagnostic output format (text only)
 
 DIRECTORIES:
   -I <dir>                    Module/include search path
@@ -1103,8 +1364,10 @@ DIRECTORIES:
   -l <lib>                    Link library
 
 LINKING:
-  -shared                     Produce shared library
-  -static                     Static linking
+  -shared                     Produce shared library (Mach-O targets only);
+                              ELF targets reject this mode
+  -static                     Prefer static archives with the system Mach-O
+                              linker; fully static ELF linking is not implemented
   -rpath <path>               Runtime library path
 
 INFORMATION:
@@ -1236,6 +1499,42 @@ fn all_input_paths(opts: &Options) -> Vec<PathBuf> {
     inputs
 }
 
+fn resolve_link_operands(inputs: &[PathBuf], opts: &Options) -> Result<Vec<LinkOperand>, String> {
+    // Programmatic callers historically supplied only `input` /
+    // `extra_inputs`. Preserve that API by treating an empty stream as all
+    // positional inputs and no libraries.
+    if opts.link_operands.is_empty() {
+        return Ok(inputs.iter().cloned().map(LinkOperand::Input).collect());
+    }
+
+    let input_slots = opts
+        .link_operands
+        .iter()
+        .filter(|operand| matches!(operand, LinkOperand::Input(_)))
+        .count();
+    if input_slots != inputs.len() {
+        return Err(format!(
+            "internal error: linker operand stream has {} input slots for {} resolved inputs",
+            input_slots,
+            inputs.len()
+        ));
+    }
+
+    let mut resolved_inputs = inputs.iter();
+    opts.link_operands
+        .iter()
+        .map(|operand| match operand {
+            LinkOperand::Input(_) => Ok(LinkOperand::Input(
+                resolved_inputs
+                    .next()
+                    .expect("validated linker input slot count")
+                    .clone(),
+            )),
+            LinkOperand::Library(name) => Ok(LinkOperand::Library(name.clone())),
+        })
+        .collect()
+}
+
 fn classify_cli_input(path: &Path) -> CliInputKind {
     let ext = path
         .extension()
@@ -1294,6 +1593,13 @@ fn validate_link_only_inputs(opts: &Options) -> Result<(), String> {
 /// Execute a fully parsed CLI job, dispatching between source
 /// compilation and pure link steps based on the positional inputs.
 pub fn execute(opts: &Options) -> Result<(), String> {
+    execute_with_bundled_runtime(opts, None)
+}
+
+pub(crate) fn execute_with_bundled_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     let inputs = all_input_paths(opts);
     if let Some(input) = inputs
         .iter()
@@ -1311,9 +1617,12 @@ pub fn execute(opts: &Options) -> Result<(), String> {
     match (has_source, has_link_artifact) {
         (true, false) => {
             if opts.extra_inputs.is_empty() {
-                compile(opts)
+                if TerminalMode::from_options(opts).is_none() {
+                    reject_unsupported_elf_link_mode(opts, &opts.output_path())?;
+                }
+                compile_with_bundled_runtime(opts, bundled_runtime)
             } else {
-                compile_multi(opts)
+                compile_multi_with_bundled_runtime(opts, bundled_runtime)
             }
         }
         (false, true) => {
@@ -1322,13 +1631,14 @@ pub fn execute(opts: &Options) -> Result<(), String> {
                 .output
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("a.out"));
-            link_inputs(&inputs, &output, opts)
+            reject_unsupported_elf_link_mode(opts, &output)?;
+            link_inputs(&inputs, &output, opts, bundled_runtime)
         }
         // Mixed `foo.f90 bar.o libbaz.a -o prog`: gfortran/flang accept it:
         // compile the sources, then link the resulting objects together with
         // the prebuilt artifacts (in command order). compile_multi handles the
         // partition.
-        (true, true) => compile_multi(opts),
+        (true, true) => compile_multi_with_bundled_runtime(opts, bundled_runtime),
         (false, false) => unreachable!("parse_cli guarantees at least one input"),
     }
 }
@@ -1394,6 +1704,16 @@ fn write_stdout_bytes(bytes: &[u8]) -> Result<(), String> {
     let mut stdout = stdout.lock();
     std::io::Write::write_all(&mut stdout, bytes)
         .map_err(|e| format!("cannot write standard output: {}", e))
+}
+
+fn forward_successful_subprocess_stderr(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    std::io::Write::write_all(&mut stderr, bytes)
+        .map_err(|e| format!("cannot forward subprocess diagnostics to standard error: {e}"))
 }
 
 fn normalize_path_lexically(path: &Path) -> PathBuf {
@@ -1513,6 +1833,106 @@ fn module_source_provenance(input: &Path) -> String {
 }
 
 pub fn compile(opts: &Options) -> Result<(), String> {
+    compile_with_bundled_runtime(opts, None)
+}
+
+fn compile_with_bundled_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
+    compile_with_bundled_runtime_inner(opts, bundled_runtime, None)
+}
+
+fn compile_with_bundled_runtime_and_dependencies(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut dependencies = Vec::new();
+    compile_with_bundled_runtime_inner(opts, bundled_runtime, Some(&mut dependencies))?;
+    Ok(dependencies)
+}
+
+fn discard_failed_output(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let preprocesses_to_stdout = opts.preprocess_only
+        && opts
+            .output
+            .as_ref()
+            .is_none_or(|path| path.as_os_str() == "-");
+    if preprocesses_to_stdout {
+        return Ok(());
+    }
+
+    // Diagnostic cleanup must never turn an output/input alias into source
+    // deletion.
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let output_key = terminal_output_collision_key(output, &cwd);
+    if all_input_paths(opts)
+        .iter()
+        .chain(included_files)
+        .any(|input| terminal_output_collision_key(input, &cwd) == output_key)
+    {
+        return Ok(());
+    }
+
+    match fs::remove_file(output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove stale failed output '{}': {error}",
+            output.display()
+        )),
+    }
+}
+
+fn raw_source_failure(opts: &Options, included_files: &[PathBuf]) -> String {
+    let failure = format!("aborting due to errors in {}", opts.input.display());
+    match discard_failed_output(opts, &opts.output_path(), included_files) {
+        Ok(()) => failure,
+        Err(cleanup_error) => format!("{failure}; additionally {cleanup_error}"),
+    }
+}
+
+fn unsupported_elf_link_mode(opts: &Options) -> Option<&'static str> {
+    if opts.target.object_format() != crate::target::ObjectFormat::Elf {
+        return None;
+    }
+    if opts.static_link {
+        return Some(
+            "-static is not supported for ELF targets because static CRT/runtime discovery is not implemented",
+        );
+    }
+    if opts.shared {
+        return Some(
+            "-shared is not supported for ELF targets; shared-library linking is currently available only for Mach-O targets",
+        );
+    }
+    None
+}
+
+fn reject_unsupported_elf_link_mode(opts: &Options, output: &Path) -> Result<(), String> {
+    let Some(failure) = unsupported_elf_link_mode(opts) else {
+        return Ok(());
+    };
+    match discard_failed_output(opts, output, &[]) {
+        Ok(()) => Err(failure.to_string()),
+        Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
+    }
+}
+
+fn compile_with_bundled_runtime_inner(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+    dependency_output: Option<&mut Vec<PathBuf>>,
+) -> Result<(), String> {
+    if TerminalMode::from_options(opts).is_none() {
+        validate_dependency_file_destination(opts, &opts.output_path(), &[])?;
+    }
+
     let mut phases = PhaseTimer::new(opts.time_report);
     if opts.verbose {
         eprintln!("{}", version_string());
@@ -1565,15 +1985,23 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // source, before either continuation joiner runs. Explicit-std
     // runs only — the default std is permissive (gfortran's -std=gnu
     // model); a default build's stderr stays pristine.
-    if let (true, Some(std)) = (opts.std_explicit, opts.std) {
-        for w in conformance::check_source_limits(
+    let mut conformance_warnings_are_errors = false;
+    if let (true, true, Some(std)) = (opts.warnings_enabled(), opts.std_explicit, opts.std) {
+        let warnings = conformance::check_source_limits(
             &source,
             std,
             source_form,
             opts.free_line_length_none_compat,
             opts.free_line_length_limit,
-        ) {
-            diag::render(&file_str, &source, w.span, diag::Level::Warning, &w.msg, 1);
+        );
+        conformance_warnings_are_errors = opts.warnings_are_errors() && !warnings.is_empty();
+        let level = if conformance_warnings_are_errors {
+            diag::Level::Error
+        } else {
+            diag::Level::Warning
+        };
+        for warning in warnings {
+            diag::render(&file_str, &source, warning.span, level, &warning.msg, 1);
         }
     }
     // Unconditional cap (all --std levels): keeps every recursive
@@ -1601,11 +2029,75 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     let phase = phases.start("preprocess");
     let pp_config = preproc_config_for_input(opts, &opts.input, source_form);
-    let pp_result =
-        crate::preprocess::preprocess_bytes(&raw, &pp_config).map_err(|e| format!("{}", e))?;
+    let pp_result = match crate::preprocess::preprocess_bytes(&raw, &pp_config) {
+        Ok(result) => result,
+        Err(error) if conformance_warnings_are_errors => {
+            return Err(format!(
+                "aborting due to errors in {}; additionally preprocessing failed: {error}",
+                opts.input.display()
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     phase.end(&mut phases);
+    if opts.warnings_enabled() && opts.std_explicit {
+        let promoted = opts.warnings_are_errors();
+        let level = if promoted {
+            diag::Level::Error
+        } else {
+            diag::Level::Warning
+        };
+        let mut saw_warning = false;
+        for warning in pp_result.resolved_conformance_warnings() {
+            saw_warning = true;
+            diag::render_mapped(
+                warning.span.filename,
+                warning.span.source,
+                warning.span.display_span,
+                warning.span.source_span,
+                level,
+                warning.message,
+                1,
+            );
+        }
+        conformance_warnings_are_errors |= promoted && saw_warning;
+    }
+    if let Some(dependencies) = dependency_output {
+        dependencies.clone_from(&pp_result.included_files);
+    }
     let included_files = &pp_result.included_files;
+    if conformance_warnings_are_errors {
+        let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
+        let failure = raw_source_failure(opts, included_files);
+        return match depfile_cleanup {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
+        };
+    }
     let preprocessed = pp_result.text.as_str();
+    if let Some((span, chars)) = conformance::find_over_cap_statement(preprocessed, source_form) {
+        render_preprocessed_diagnostic(
+            &pp_result,
+            span,
+            diag::Level::Error,
+            &format!(
+                "statement expands to {} characters after preprocessing, over the \
+                 {}-character compiler limit (the F2023 standard caps statements at \
+                 1,000,000 characters)",
+                chars,
+                conformance::STMT_HARD_CAP
+            ),
+        );
+        let depfile_cleanup = prepare_dependency_file(opts, &opts.output_path(), included_files);
+        let failure = raw_source_failure(opts, included_files);
+        return match depfile_cleanup {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(format!("{failure}; additionally {cleanup_error}")),
+        };
+    }
+    if TerminalMode::from_options(opts).is_none() {
+        prepare_dependency_file(opts, &opts.output_path(), included_files)?;
+    }
 
     if opts.preprocess_only {
         let preprocessed_bytes = pp_result.bytes();
@@ -1645,10 +2137,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 &format!("lexer error: {}", e.msg),
             );
             phases.report();
-            return Err(format!(
-                "aborting due to errors in {}",
-                opts.input.display()
-            ));
+            return Err(raw_source_failure(opts, included_files));
         }
     };
     phase.end(&mut phases);
@@ -1667,7 +2156,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
 
     // 4. Parse.
     let phase = phases.start("parse");
-    let mut parser = Parser::new_source_view(&tokens);
+    let mut parser = Parser::new_source_view_for_form(&tokens, source_form);
     let mut units = match parser.parse_file() {
         Ok(units) => units,
         Err(e) => {
@@ -1679,10 +2168,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 &format!("parse error: {}", e.msg),
             );
             phases.report();
-            return Err(format!(
-                "aborting due to errors in {}",
-                opts.input.display()
-            ));
+            return Err(raw_source_failure(opts, included_files));
         }
     };
     phase.end(&mut phases);
@@ -1709,10 +2195,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 phase.end(&mut phases);
                 render_preprocessed_diagnostic(&pp_result, e.span, diag::Level::Error, &e.msg);
                 phases.report();
-                return Err(format!(
-                    "aborting due to errors in {}",
-                    opts.input.display()
-                ));
+                return Err(raw_source_failure(opts, included_files));
             }
         };
     let mut st = resolve_result.st;
@@ -1732,12 +2215,15 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         &st,
         opts.std,
         &type_layouts,
-        opts.warn_pedantic,
-        opts.warn_deprecated,
+        opts.warnings_enabled() && opts.warn_pedantic,
+        opts.warnings_enabled() && opts.warn_deprecated,
     );
     phase.end(&mut phases);
     let mut had_error = false;
     for d in &diags {
+        if d.kind == validate::DiagKind::Warning && !opts.warnings_enabled() {
+            continue;
+        }
         let level = match d.kind {
             validate::DiagKind::Error => diag::Level::Error,
             validate::DiagKind::Warning => diag::Level::Warning,
@@ -1745,16 +2231,13 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         render_preprocessed_diagnostic(&pp_result, d.span, level, &d.msg);
         match d.kind {
             validate::DiagKind::Error => had_error = true,
-            validate::DiagKind::Warning if opts.warn_as_error => had_error = true,
+            validate::DiagKind::Warning if opts.warnings_are_errors() => had_error = true,
             _ => {}
         }
     }
     if had_error {
         phases.report();
-        return Err(format!(
-            "aborting due to errors in {}",
-            opts.input.display()
-        ));
+        return Err(raw_source_failure(opts, included_files));
     }
     if opts.verbose {
         eprintln!(" sema: {} diagnostics", diags.len());
@@ -1792,9 +2275,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         external_char_len_star,
         target_layout,
     );
-    if !opts.check_bounds {
-        strip_bounds_check_calls(&mut ir_module);
-    }
+    strip_disabled_runtime_check_calls(&mut ir_module, opts.check_bounds, opts.check_all);
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {
         if std::env::var_os("AFS_DUMP_BAD_IR").is_some() {
@@ -1868,10 +2349,19 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let phase = phases.start("codegen");
     let asm_text = crate::codegen::emit_module(&ir_module, opts)?;
     phase.end(&mut phases);
+    let module_artifacts = ModuleArtifactContext {
+        units: &units,
+        symbol_table: &st,
+        source_provenance: &source_provenance,
+        module_globals: &module_globals,
+        type_layouts: &type_layouts,
+        ir_module: &ir_module,
+    };
     if opts.emit_asm {
         let out = opts.output_path();
         fs::write(&out, &asm_text)
             .map_err(|e| format!("cannot write '{}': {}", out.display(), e))?;
+        write_module_artifacts(opts, &module_artifacts)?;
         write_dependency_file(opts, &out, included_files)?;
         if opts.verbose {
             eprintln!(" wrote: {}", out.display());
@@ -1928,119 +2418,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     let _obj_cleanup = (!opts.emit_obj).then(|| RemoveFileOnDrop(obj_path.clone()));
     fs::write(&asm_path, &asm_text).map_err(|e| format!("cannot write temp assembly: {}", e))?;
 
-    // x05: ELF targets assemble with the system assembler when the
-    let local_descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(&units);
-    let local_char_len_star_params =
-        crate::ir::lower::collect_char_len_star_params_for_units(&units);
-
-    let module_artifact_dir: std::path::PathBuf =
-        opts.module_output_dir.clone().unwrap_or_else(|| {
-            if opts.emit_obj {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            } else {
-                opts.output_path()
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .to_path_buf()
-            }
-        });
-
-    // Emit module interface files for each MODULE in the compilation unit.
-    // -J <dir> overrides where they go. For compile-only (-c) builds
-    // without -J, keep the traditional compiler behavior of writing
-    // module files into the current working directory even if the
-    // object output path points into a source subdirectory. For full
-    // link/shared outputs, keep following the primary output path.
-    for unit in &units {
-        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
-            let mod_key = name.to_lowercase();
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                let amod_text = crate::sema::amod::write_amod(
-                    name,
-                    &source_provenance,
-                    &raw,
-                    &st,
-                    mod_scope_id,
-                    &module_globals,
-                    &type_layouts,
-                    &ir_module,
-                    &local_descriptor_params,
-                    &local_char_len_star_params,
-                );
-                let amod_path = module_artifact_dir.join(format!("{}.amod", mod_key));
-                write_module_file_atomic(&amod_path, &amod_text)?;
-                // `.amod` remains the ARMFORTAS module ABI file. A
-                // byte-identical `.mod` alias keeps conventional Fortran
-                // build systems such as CMake able to track module
-                // dependencies for unknown compilers.
-                let mod_path = module_artifact_dir.join(format!("{}.mod", mod_key));
-                write_module_file_atomic(&mod_path, &amod_text)?;
-                if opts.verbose {
-                    eprintln!(" amod: {}", amod_path.display());
-                }
-            }
-        }
-    }
-    for unit in &units {
-        if let crate::ast::unit::ProgramUnit::Submodule {
-            parent,
-            ancestor,
-            name,
-            ..
-        } = &unit.node
-        {
-            let parent_key = parent.to_lowercase();
-            let name_key = name.to_lowercase();
-            let parent_spec = if let Some(ancestor) = ancestor {
-                format!("{}:{}", parent_key, ancestor.to_lowercase())
-            } else {
-                parent_key.clone()
-            };
-            let artifact_stem = format!("{}@{}", parent_key, name_key);
-            let interface_name = format!("{}.amod", artifact_stem);
-            let submodule_scope_id =
-                st.find_submodule_scope(&parent_key, &name_key)
-                    .ok_or_else(|| {
-                        format!(
-                            "cannot emit interface for unresolved submodule '{}:{}'",
-                            parent_key, name_key
-                        )
-                    })?;
-            let interface_text = crate::sema::amod::write_amod(
-                name,
-                &source_provenance,
-                &raw,
-                &st,
-                submodule_scope_id,
-                &module_globals,
-                &type_layouts,
-                &ir_module,
-                &local_descriptor_params,
-                &local_char_len_star_params,
-            );
-            let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
-            let interface_path = module_artifact_dir.join(&interface_name);
-            write_module_file_atomic(&interface_path, &interface_text)?;
-            if opts.verbose {
-                eprintln!(" amod: {}", interface_path.display());
-            }
-            let smod_text = format!(
-                "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
-                crate::sema::amod::SMOD_VERSION,
-                env!("CARGO_PKG_VERSION"),
-                source_provenance,
-                parent_spec,
-                name_key,
-                interface_name,
-                interface_fingerprint
-            );
-            let smod_path = module_artifact_dir.join(format!("{}.smod", artifact_stem));
-            write_module_file_atomic(&smod_path, &smod_text)?;
-            if opts.verbose {
-                eprintln!(" smod: {}", smod_path.display());
-            }
-        }
-    }
+    write_module_artifacts(opts, &module_artifacts)?;
 
     // ELF assembly routing (x14): the in-process afs-as x86 pipeline
     // is the default. AFS_AS_PATH substitutes a subprocess assembler
@@ -2086,6 +2464,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                 phase.end(&mut phases);
             }
             Some(assembler) => {
+                let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
                 let as_result = Command::new(assembler)
                     .args(["--64", "-o"])
                     .arg(&obj_path)
@@ -2099,6 +2478,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
                         String::from_utf8_lossy(&as_result.stderr)
                     ));
                 }
+                forward_successful_subprocess_stderr(&as_result.stderr)?;
+                pending_output.verify("assembler")?;
             }
         }
         if opts.emit_obj {
@@ -2110,12 +2491,23 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         }
         let binary_path = opts.output_path();
         let phase = phases.start("link");
-        let result = link_inputs(std::slice::from_ref(&obj_path), &binary_path, opts);
+        let result = link_inputs(
+            std::slice::from_ref(&obj_path),
+            &binary_path,
+            opts,
+            bundled_runtime,
+        );
         phase.end(&mut phases);
         result?;
         if opts.verbose {
             eprintln!(" linked: {}", binary_path.display());
         }
+        write_link_dependency_file(
+            opts,
+            &binary_path,
+            std::slice::from_ref(&opts.input),
+            included_files,
+        )?;
         phases.report();
         return Ok(());
     }
@@ -2129,6 +2521,7 @@ pub fn compile(opts: &Options) -> Result<(), String> {
         afs_as::assemble::assemble_file(&asm_path, &obj_path).map_err(|e| format!("afs-as: {}", e))
     } else {
         let assembler = assembler.unwrap_or_else(|| "as".into());
+        let pending_output = PendingExternalOutput::prepare(&obj_path, "assembler")?;
         let result = Command::new(assembler)
             .arg(&asm_path)
             .arg("-o")
@@ -2136,7 +2529,8 @@ pub fn compile(opts: &Options) -> Result<(), String> {
             .output()
             .map_err(|e| format!("cannot run assembler: {}", e))?;
         if result.status.success() {
-            Ok(())
+            forward_successful_subprocess_stderr(&result.stderr)?;
+            pending_output.verify("assembler")
         } else {
             Err(format!(
                 "assembler failed:\n{}",
@@ -2159,17 +2553,166 @@ pub fn compile(opts: &Options) -> Result<(), String> {
     // 11. Link.
     let binary_path = opts.output_path();
     let phase = phases.start("link");
-    link(&obj_path, &binary_path, opts)?;
+    link(&obj_path, &binary_path, opts, bundled_runtime)?;
     phase.end(&mut phases);
     if opts.verbose {
         eprintln!(" linked: {}", binary_path.display());
     }
+    write_link_dependency_file(
+        opts,
+        &binary_path,
+        std::slice::from_ref(&opts.input),
+        included_files,
+    )?;
 
     phases.report();
     Ok(())
 }
 
+struct ModuleArtifactContext<'a> {
+    units: &'a [crate::ast::unit::SpannedUnit],
+    symbol_table: &'a crate::sema::symtab::SymbolTable,
+    source_provenance: &'a str,
+    module_globals:
+        &'a std::collections::HashMap<(String, String), crate::ir::lower::ModuleGlobalInfo>,
+    type_layouts: &'a crate::sema::type_layout::TypeLayoutRegistry,
+    ir_module: &'a Module,
+}
+
+fn write_module_artifacts(
+    opts: &Options,
+    context: &ModuleArtifactContext<'_>,
+) -> Result<(), String> {
+    let has_module_artifacts = context.units.iter().any(|unit| {
+        matches!(
+            unit.node,
+            crate::ast::unit::ProgramUnit::Module { .. }
+                | crate::ast::unit::ProgramUnit::Submodule { .. }
+        )
+    });
+    if !has_module_artifacts {
+        return Ok(());
+    }
+
+    let descriptor_params = crate::ir::lower::collect_descriptor_params_for_units(context.units);
+    let char_len_star_params =
+        crate::ir::lower::collect_char_len_star_params_for_units(context.units);
+    let output_dir = opts.module_output_dir.clone().unwrap_or_else(|| {
+        if opts.emit_obj {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            opts.output_path()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        }
+    });
+
+    // -J <dir> overrides where interfaces go. For compile-only (-c)
+    // builds without -J, keep the traditional behavior of writing them
+    // into the current working directory even if the object output path
+    // points into a source subdirectory. Link and assembly-only outputs
+    // follow the primary output path.
+    for unit in context.units {
+        if let crate::ast::unit::ProgramUnit::Module { name, .. } = &unit.node {
+            let mod_key = name.to_lowercase();
+            if let Some(mod_scope_id) = context.symbol_table.find_module_scope(&mod_key) {
+                let amod_text = crate::sema::amod::write_amod(
+                    name,
+                    context.source_provenance,
+                    context.symbol_table,
+                    mod_scope_id,
+                    context.module_globals,
+                    context.type_layouts,
+                    context.ir_module,
+                    &descriptor_params,
+                    &char_len_star_params,
+                );
+                let amod_path = output_dir.join(format!("{}.amod", mod_key));
+                write_module_file_atomic(&amod_path, &amod_text)?;
+                // `.amod` remains the ARMFORTAS module ABI file. A
+                // byte-identical `.mod` alias keeps conventional Fortran
+                // build systems such as CMake able to track module
+                // dependencies for unknown compilers.
+                let mod_path = output_dir.join(format!("{}.mod", mod_key));
+                write_module_file_atomic(&mod_path, &amod_text)?;
+                if opts.verbose {
+                    eprintln!(" amod: {}", amod_path.display());
+                }
+            }
+        }
+    }
+    for unit in context.units {
+        if let crate::ast::unit::ProgramUnit::Submodule {
+            parent,
+            ancestor,
+            name,
+            ..
+        } = &unit.node
+        {
+            let parent_key = parent.to_lowercase();
+            let name_key = name.to_lowercase();
+            let parent_spec = if let Some(ancestor) = ancestor {
+                format!("{}:{}", parent_key, ancestor.to_lowercase())
+            } else {
+                parent_key.clone()
+            };
+            let artifact_stem = format!("{}@{}", parent_key, name_key);
+            let interface_name = format!("{}.amod", artifact_stem);
+            let submodule_scope_id = context
+                .symbol_table
+                .find_submodule_scope(&parent_key, &name_key)
+                .ok_or_else(|| {
+                    format!(
+                        "cannot emit interface for unresolved submodule '{}:{}'",
+                        parent_key, name_key
+                    )
+                })?;
+            let interface_text = crate::sema::amod::write_amod(
+                name,
+                context.source_provenance,
+                context.symbol_table,
+                submodule_scope_id,
+                context.module_globals,
+                context.type_layouts,
+                context.ir_module,
+                &descriptor_params,
+                &char_len_star_params,
+            );
+            let interface_fingerprint = crate::sema::amod::artifact_fingerprint(&interface_text);
+            let interface_path = output_dir.join(&interface_name);
+            write_module_file_atomic(&interface_path, &interface_text)?;
+            if opts.verbose {
+                eprintln!(" amod: {}", interface_path.display());
+            }
+            let smod_text = format!(
+                "#!smod {}\n# compiler: armfortas {}\n# source: {}\n@parent {}\n@submodule {}\n@interface {} fnv1a:{}\n",
+                crate::sema::amod::SMOD_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                context.source_provenance,
+                parent_spec,
+                name_key,
+                interface_name,
+                interface_fingerprint
+            );
+            let smod_path = output_dir.join(format!("{}.smod", artifact_stem));
+            write_module_file_atomic(&smod_path, &smod_text)?;
+            if opts.verbose {
+                eprintln!(" smod: {}", smod_path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    // Build systems use a module artifact's timestamp as the dependency
+    // invalidation signal. Preserve its identity when the interface bytes did
+    // not change, while retaining atomic replacement for changed interfaces.
+    if fs::read(path).is_ok_and(|published| published == contents.as_bytes()) {
+        return Ok(());
+    }
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -2191,20 +2734,89 @@ fn write_module_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn dependency_file_path(opts: &Options, output: &Path) -> Option<PathBuf> {
+    if !opts.emit_depfile && opts.depfile.is_none() {
+        return None;
+    }
+    Some(opts.depfile.clone().unwrap_or_else(|| {
+        let mut path = output.to_path_buf();
+        path.set_extension("d");
+        path
+    }))
+}
+
+fn validate_dependency_file_destination(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let Some(depfile) = dependency_file_path(opts, output) else {
+        return Ok(());
+    };
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot determine current directory: {error}"))?;
+    let depfile_key = terminal_output_collision_key(&depfile, &cwd);
+    if depfile_key == terminal_output_collision_key(output, &cwd) {
+        return Err(format!(
+            "dependency file '{}' conflicts with output '{}'",
+            depfile.display(),
+            output.display()
+        ));
+    }
+    for input in all_input_paths(opts).iter().chain(included_files) {
+        if depfile_key == terminal_output_collision_key(input, &cwd) {
+            return Err(format!(
+                "dependency file '{}' conflicts with compiler input '{}'",
+                depfile.display(),
+                input.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_dependency_file(
+    opts: &Options,
+    output: &Path,
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let Some(depfile) = dependency_file_path(opts, output) else {
+        return Ok(());
+    };
+    validate_dependency_file_destination(opts, output, included_files)?;
+    match fs::remove_file(&depfile) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove stale dependency file '{}': {error}",
+            depfile.display()
+        )),
+    }
+}
+
 fn write_dependency_file(
     opts: &Options,
     output: &Path,
     included_files: &[PathBuf],
 ) -> Result<(), String> {
-    if !opts.emit_depfile && opts.depfile.is_none() {
-        return Ok(());
-    }
+    write_dependency_file_for_sources(
+        opts,
+        output,
+        std::slice::from_ref(&opts.input),
+        included_files,
+    )
+}
 
-    let depfile = opts.depfile.clone().unwrap_or_else(|| {
-        let mut path = output.to_path_buf();
-        path.set_extension("d");
-        path
-    });
+fn write_dependency_file_for_sources(
+    opts: &Options,
+    output: &Path,
+    source_inputs: &[PathBuf],
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    let Some(depfile) = dependency_file_path(opts, output) else {
+        return Ok(());
+    };
+    validate_dependency_file_destination(opts, output, included_files)?;
     if let Some(parent) = depfile.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -2217,20 +2829,27 @@ fn write_dependency_file(
         }
     }
 
-    let targets: Vec<String> = if opts.dep_targets.is_empty() {
-        vec![output.to_string_lossy().into_owned()]
-    } else {
-        opts.dep_targets.clone()
-    };
     let mut body = String::new();
-    for (idx, target) in targets.iter().enumerate() {
-        if idx > 0 {
-            body.push(' ');
+    if opts.dep_targets.is_empty() {
+        body.push_str(&escape_make_dep_token(&output.to_string_lossy()));
+    } else {
+        for (idx, target) in opts.dep_targets.iter().enumerate() {
+            if idx > 0 {
+                body.push(' ');
+            }
+            match target {
+                DepTarget::Verbatim(target) => body.push_str(target),
+                DepTarget::Quoted(target) => body.push_str(&escape_make_dep_token(target)),
+            }
         }
-        body.push_str(&escape_make_dep_token(target));
     }
     body.push_str(": ");
-    body.push_str(&escape_make_dep_token(&opts.input.to_string_lossy()));
+    for (index, input) in source_inputs.iter().enumerate() {
+        if index > 0 {
+            body.push(' ');
+        }
+        body.push_str(&escape_make_dep_token(&input.to_string_lossy()));
+    }
     for include in included_files {
         body.push(' ');
         body.push_str(&escape_make_dep_token(&include.to_string_lossy()));
@@ -2244,18 +2863,65 @@ fn write_dependency_file(
         }
     }
 
-    fs::write(&depfile, body)
-        .map_err(|e| format!("cannot write depfile '{}': {}", depfile.display(), e))
+    write_dependency_file_atomic(&depfile, &body)
+}
+
+fn write_dependency_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dependencies");
+    let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), id));
+    let _cleanup = RemoveFileOnDrop(temporary.clone());
+
+    fs::write(&temporary, contents).map_err(|error| {
+        format!(
+            "cannot write temporary dependency file '{}': {error}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "cannot replace dependency file '{}' atomically: {error}",
+            path.display()
+        )
+    })
+}
+
+fn write_link_dependency_file(
+    opts: &Options,
+    output: &Path,
+    source_inputs: &[PathBuf],
+    included_files: &[PathBuf],
+) -> Result<(), String> {
+    if let Err(error) =
+        write_dependency_file_for_sources(opts, output, source_inputs, included_files)
+    {
+        return match fs::remove_file(output) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error)
+            }
+            Err(cleanup_error) => Err(format!(
+                "{error}; additionally cannot remove failed link output '{}': {cleanup_error}",
+                output.display()
+            )),
+        };
+    }
+    Ok(())
 }
 
 fn escape_make_dep_token(token: &str) -> String {
     let mut out = String::with_capacity(token.len());
     for ch in token.chars() {
         match ch {
-            ' ' | '#' | '\\' => {
+            ' ' | '\t' | '#' | '\\' => {
                 out.push('\\');
                 out.push(ch);
             }
+            '$' => out.push_str("$$"),
             _ => out.push(ch),
         }
     }
@@ -2265,8 +2931,13 @@ fn escape_make_dep_token(token: &str) -> String {
 /// Link an object file with the runtime library to produce a binary.
 /// `opts` contributes the user-supplied `-L`, `-l`, `-rpath`,
 /// `-shared`, and `-static` flags that need to make it through to the linker.
-fn link(obj: &Path, output: &Path, opts: &Options) -> Result<(), String> {
-    link_inputs(&[obj.to_path_buf()], output, opts)
+fn link(
+    obj: &Path,
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
+    link_inputs(&[obj.to_path_buf()], output, opts, bundled_runtime)
 }
 
 /// Link prebuilt objects and archives with the runtime to produce a
@@ -2281,6 +2952,15 @@ pub(crate) fn link_inputs_elf(
     output: &Path,
     opts: &Options,
 ) -> Result<(), String> {
+    link_inputs_elf_with_bundled_runtime(inputs, output, opts, None)
+}
+
+fn link_inputs_elf_with_bundled_runtime(
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     let host = crate::target::TargetSpec::host();
     if host.arch != opts.target.arch
         || host.object_format() != crate::target::ObjectFormat::Elf
@@ -2291,15 +2971,7 @@ pub(crate) fn link_inputs_elf(
             opts.target, host
         ));
     }
-    if opts.static_link {
-        return Err("-static on ELF targets lands in sprint x11 (musl static story)".to_string());
-    }
-    if opts.shared {
-        return Err(
-            "-shared on ELF targets is a follow-up after x06 (executables only this sprint)"
-                .to_string(),
-        );
-    }
+    reject_unsupported_elf_link_mode(opts, output)?;
 
     let linker_override = afs_ld_override();
     // afs-ld's ELF backend currently emits ET_EXEC, not PIE. Route its
@@ -2313,7 +2985,7 @@ pub(crate) fn link_inputs_elf(
         override_dirs.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
     let crt = elf_crt::find_crt(&opts.target, &override_dirs, pie)?;
-    let rt_path = find_runtime_lib()?;
+    let runtime = find_runtime_lib(bundled_runtime)?;
     // LIBRARY_PATH: the cc-compatible -L env knob. On NixOS libgcc_s
     // lives in a third store path (gcc's -libgcc output) that no crt
     // root covers.
@@ -2321,15 +2993,15 @@ pub(crate) fn link_inputs_elf(
     if let Some(dirs) = env_override("LIBRARY_PATH") {
         lib_paths.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
+    let operands = resolve_link_operands(inputs, opts)?;
     let args = elf_crt::elf_link_args(
         &opts.target,
         &crt,
-        inputs,
-        Path::new(&rt_path),
+        &operands,
+        runtime.path(),
         output,
         pie,
         &lib_paths,
-        &opts.link_libs,
     )?;
 
     // x16: honor the AFS_LD routing on ELF targets too — previously
@@ -2339,6 +3011,7 @@ pub(crate) fn link_inputs_elf(
     if opts.verbose {
         print_verbose_command_line(&linker, &args);
     }
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let result = Command::new(&linker)
         .args(&args)
         .output()
@@ -2349,30 +3022,45 @@ pub(crate) fn link_inputs_elf(
             String::from_utf8_lossy(&result.stderr)
         ));
     }
-    Ok(())
+    forward_successful_subprocess_stderr(&result.stderr)?;
+    pending_output.verify("linker")
 }
 
-fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
+fn link_inputs(
+    inputs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     if opts.target.object_format() == crate::target::ObjectFormat::Elf {
-        return link_inputs_elf(inputs, output, opts);
+        return link_inputs_elf_with_bundled_runtime(inputs, output, opts, bundled_runtime);
     }
     if let Some(linker) = afs_ld_override() {
-        return link_inputs_with_afs_ld(&linker, inputs, output, opts);
+        return link_inputs_with_afs_ld(&linker, inputs, output, opts, bundled_runtime);
     }
 
-    let rt_path = find_runtime_lib()?;
+    let runtime = find_runtime_lib(bundled_runtime)?;
     let sdk = Command::new("xcrun")
         .args(["--show-sdk-path"])
         .output()
         .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    if sdk.status.success() {
+        forward_successful_subprocess_stderr(&sdk.stderr)?;
+    }
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
     let mut args: Vec<String> = vec!["-o".into(), output.to_string_lossy().into_owned()];
-    for input in inputs {
-        args.push(input.to_string_lossy().into_owned());
+    for dir in &opts.library_search_paths {
+        args.push(format!("-L{}", dir.display()));
+    }
+    for operand in resolve_link_operands(inputs, opts)? {
+        match operand {
+            LinkOperand::Input(path) => args.push(path.to_string_lossy().into_owned()),
+            LinkOperand::Library(name) => args.push(format!("-l{name}")),
+        }
     }
     args.extend([
-        rt_path,
+        runtime.path().to_string_lossy().into_owned(),
         "-lSystem".into(),
         "-syslibroot".into(),
         sysroot,
@@ -2384,12 +3072,13 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
         // Apple ld trim unused runtime surfaces from final executables.
         args.push("-dead_strip".into());
     }
-    push_link_flags(&mut args, opts);
+    push_macho_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line("ld", &args);
     }
 
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
     let ld_result = Command::new("ld")
         .args(&args)
         .output()
@@ -2400,7 +3089,8 @@ fn link_inputs(inputs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), 
         return Err(format!("linker failed:\n{}", stderr));
     }
 
-    Ok(())
+    forward_successful_subprocess_stderr(&ld_result.stderr)?;
+    pending_output.verify("linker")
 }
 
 fn link_inputs_with_afs_ld(
@@ -2408,12 +3098,13 @@ fn link_inputs_with_afs_ld(
     inputs: &[PathBuf],
     output: &Path,
     opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
 ) -> Result<(), String> {
     if opts.static_link {
         return Err("AFS_LD override does not yet support static-link mode".into());
     }
 
-    let rt_path = find_runtime_lib()?;
+    let runtime = find_runtime_lib(bundled_runtime)?;
     let libsystem_tbd = find_libsystem_tbd()?;
     let mut args: Vec<String> = vec!["-arch".into(), "arm64".into()];
     if opts.shared {
@@ -2422,43 +3113,47 @@ fn link_inputs_with_afs_ld(
         args.extend(["-e".into(), "_main".into()]);
     }
     args.extend(["-o".into(), output.to_string_lossy().into_owned()]);
-    for input in inputs {
-        args.push(input.to_string_lossy().into_owned());
+    for dir in &opts.library_search_paths {
+        args.push("-L".into());
+        args.push(dir.to_string_lossy().into_owned());
     }
-    args.push(rt_path);
+    for operand in resolve_link_operands(inputs, opts)? {
+        match operand {
+            LinkOperand::Input(path) => args.push(path.to_string_lossy().into_owned()),
+            LinkOperand::Library(name) => {
+                args.push("-l".into());
+                args.push(name);
+            }
+        }
+    }
+    args.push(runtime.path().to_string_lossy().into_owned());
     args.push(libsystem_tbd);
-    push_afs_ld_link_flags(&mut args, opts);
+    push_afs_ld_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
         print_verbose_command_line(linker, &args);
     }
 
-    let output = Command::new(linker)
+    let pending_output = PendingExternalOutput::prepare(output, "linker")?;
+    let link_result = Command::new(linker)
         .args(&args)
         .output()
         .map_err(|e| format!("cannot run linker: {}", e))?;
 
-    if output.status.success() {
-        Ok(())
+    if link_result.status.success() {
+        forward_successful_subprocess_stderr(&link_result.stderr)?;
+        pending_output.verify("linker")
     } else {
         Err(format!(
             "linker failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&link_result.stderr)
         ))
     }
 }
 
-/// Append the user-supplied linker flags from `opts` to `args`.
-/// `-L<dir>` and `-l<name>` map directly; `-rpath` is passed as a
-/// pair; `-shared` switches output type; `-static` discourages
-/// dynamic linking on supported platforms.
-fn push_link_flags(args: &mut Vec<String>, opts: &Options) {
-    for dir in &opts.library_search_paths {
-        args.push(format!("-L{}", dir.display()));
-    }
-    for lib in &opts.link_libs {
-        args.push(format!("-l{}", lib));
-    }
+/// Append Mach-O flags that do not participate in the ordered user operand
+/// stream. Search paths and inputs/libraries are emitted before this point.
+fn push_macho_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
     for path in &opts.rpath {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
@@ -2483,15 +3178,7 @@ fn print_verbose_command_line(program: &str, args: &[String]) {
     }
 }
 
-fn push_afs_ld_link_flags(args: &mut Vec<String>, opts: &Options) {
-    for dir in &opts.library_search_paths {
-        args.push("-L".into());
-        args.push(dir.to_string_lossy().into_owned());
-    }
-    for lib in &opts.link_libs {
-        args.push("-l".into());
-        args.push(lib.clone());
-    }
+fn push_afs_ld_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
     for path in &opts.rpath {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
@@ -2551,23 +3238,53 @@ fn env_override(name: &str) -> Option<String> {
 }
 
 /// Link multiple object files with the runtime to produce a binary.
-fn link_multi(objs: &[PathBuf], output: &Path, opts: &Options) -> Result<(), String> {
-    link_inputs(objs, output, opts)
+fn link_multi(
+    objs: &[PathBuf],
+    output: &Path,
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
+    link_inputs(objs, output, opts, bundled_runtime)
 }
 
-/// Compile multiple Fortran source files with automatic dependency
-/// resolution, producing a single linked binary.
+/// Compile multiple Fortran source files while preserving the requested
+/// terminal phase.
 ///
-/// 1. Scan all files for MODULE/USE dependencies.
-/// 2. Topological sort (error on cycles).
-/// 3. Compile each in order to a temp .o + .amod.
-/// 4. Link all .o files into the output binary.
+/// Preprocessing and syntax dumps run in command order because they stop
+/// before module resolution. Later phases scan and topologically order module
+/// dependencies. Linking jobs compile temporary objects and link them; other
+/// terminal modes publish one natural output per source (or ordered stdout for
+/// `-E`) and never enter the linker.
 pub fn compile_multi(opts: &Options) -> Result<(), String> {
+    compile_multi_with_bundled_runtime(opts, None)
+}
+
+fn compile_multi_with_bundled_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<(), String> {
     let mut all_inputs = vec![opts.input.clone()];
     all_inputs.extend(opts.extra_inputs.iter().cloned());
 
-    if opts.emit_obj && opts.output.is_some() {
-        return Err("-o cannot be used with -c and multiple input files".into());
+    let terminal_mode = TerminalMode::from_options(opts);
+    if let (Some(mode), Some(_)) = (terminal_mode, opts.output.as_ref()) {
+        return Err(format!(
+            "-o cannot be used with {} and multiple input files",
+            mode.flag()
+        ));
+    }
+    let link_output = terminal_mode.is_none().then(|| {
+        opts.output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("a.out"))
+    });
+    let collect_link_dependencies = link_output
+        .as_deref()
+        .and_then(|output| dependency_file_path(opts, output))
+        .is_some();
+    if let Some(output) = link_output.as_deref() {
+        reject_unsupported_elf_link_mode(opts, output)?;
+        validate_dependency_file_destination(opts, output, &[])?;
     }
 
     // Partition into Fortran sources (to compile) and prebuilt link
@@ -2579,27 +3296,54 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         .filter(|p| classify_cli_input(p) == CliInputKind::FortranSource)
         .cloned()
         .collect();
-    let artifact_inputs: Vec<PathBuf> = all_inputs
-        .iter()
-        .filter(|p| classify_cli_input(p) == CliInputKind::LinkArtifact)
-        .cloned()
-        .collect();
+    let terminal_outputs = terminal_mode.map(|mode| {
+        source_inputs
+            .iter()
+            .map(|input| mode.output_for_input(input))
+            .collect::<Vec<_>>()
+    });
+    if let Some(outputs) = terminal_outputs.as_deref() {
+        validate_unique_terminal_outputs(&source_inputs, outputs)?;
+    }
 
-    // Scan dependencies (sources only).
-    let file_deps: Vec<dep_scan::FileDeps> = source_inputs
-        .iter()
-        .map(|p| {
-            let source_form = source_form_for_input(opts, p);
-            let pp_config = preproc_config_for_input(opts, p, source_form);
-            dep_scan::scan_file(p, &pp_config)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // A terminal multi-input job owns one default output per source. Remove
+    // those destinations before scanning or compiling so a failed input can
+    // never leave an older artifact looking like the result of this command.
+    if let Some(outputs) = terminal_outputs.as_deref() {
+        for output in outputs.iter().flatten() {
+            match fs::remove_file(output) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot remove stale output '{}': {}",
+                        output.display(),
+                        error
+                    ));
+                }
+            }
+        }
+    }
 
-    // Topological sort.
-    let order = dep_scan::resolve_compilation_order(&file_deps)?;
+    // Syntax-only terminal phases must not acquire semantic dependency
+    // requirements merely because more than one input was supplied. Later
+    // phases still need module producers before their consumers.
+    let order: Vec<usize> = if terminal_mode.is_some_and(|mode| !mode.requires_dependency_order()) {
+        (0..source_inputs.len()).collect()
+    } else {
+        let file_deps: Vec<dep_scan::FileDeps> = source_inputs
+            .iter()
+            .map(|path| {
+                let source_form = source_form_for_input(opts, path);
+                let pp_config = preproc_config_for_input(opts, path, source_form);
+                dep_scan::scan_file(path, &pp_config)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        dep_scan::resolve_compilation_order(&file_deps)?
+    };
 
     // Compile each file in order.
-    let tmp_dir = if opts.emit_obj {
+    let tmp_dir = if terminal_mode.is_some() {
         None
     } else {
         let dir = std::env::temp_dir().join(format!("afs_multi_{}", std::process::id()));
@@ -2607,29 +3351,33 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
         Some(dir)
     };
 
-    let mut object_files: Vec<PathBuf> = Vec::new();
-    let mut src_to_obj: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Compilation may run in dependency order, but linker operands must remain
+    // in command-line order. Keep each generated object in the slot belonging
+    // to its source rather than appending in compilation order.
+    let mut source_objects: Vec<Option<PathBuf>> = vec![None; source_inputs.len()];
+    let mut source_includes =
+        collect_link_dependencies.then(|| vec![Vec::new(); source_inputs.len()]);
     for &idx in &order {
-        let src = &file_deps[idx].path;
-        let obj_path = if opts.emit_obj {
-            src.with_extension("o")
-        } else {
-            let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
-            tmp_dir.join(format!("source_{}.o", idx))
+        let src = &source_inputs[idx];
+        let child_output = match terminal_outputs.as_ref() {
+            Some(outputs) => outputs[idx].clone(),
+            None => {
+                let tmp_dir = tmp_dir.as_ref().expect("temp dir for multi-file link");
+                Some(tmp_dir.join(format!("source_{}.o", idx)))
+            }
         };
 
-        // Preserve every compilation-affecting option. Only orchestration
-        // fields and mutually exclusive output modes differ for a child job.
+        // Preserve every compilation-affecting option. Only orchestration and
+        // output ownership differ for a child job.
         let mut sub_opts = opts.clone();
         sub_opts.input = src.clone();
         sub_opts.extra_inputs.clear();
-        sub_opts.output = Some(obj_path.clone());
-        sub_opts.emit_asm = false;
-        sub_opts.emit_obj = true;
-        sub_opts.emit_ir = false;
-        sub_opts.emit_ast = false;
-        sub_opts.emit_tokens = false;
-        sub_opts.preprocess_only = false;
+        sub_opts.output = child_output.clone();
+        if let Some(mode) = terminal_mode {
+            mode.configure_child(&mut sub_opts);
+        } else {
+            TerminalMode::Object.configure_child(&mut sub_opts);
+        }
         sub_opts.module_search_paths = {
             let mut paths = opts.module_search_paths.clone();
             if let Some(tmp_dir) = tmp_dir.as_ref() {
@@ -2637,56 +3385,73 @@ pub fn compile_multi(opts: &Options) -> Result<(), String> {
             }
             paths
         };
-        compile(&sub_opts)?;
-        if !opts.emit_obj {
-            object_files.push(obj_path.clone());
-            src_to_obj.push((src.clone(), obj_path));
+        if let Some(source_includes) = source_includes.as_mut() {
+            // The outer link job owns one durable dependency file. Child
+            // objects are temporary implementation details and must not
+            // publish rules targeting their temporary paths.
+            sub_opts.emit_depfile = false;
+            sub_opts.depfile = None;
+            sub_opts.dep_targets.clear();
+            sub_opts.depfile_phony = false;
+            source_includes[idx] =
+                compile_with_bundled_runtime_and_dependencies(&sub_opts, bundled_runtime)?;
+        } else {
+            compile_with_bundled_runtime(&sub_opts, bundled_runtime)?;
+        }
+        if terminal_mode.is_none() {
+            let obj_path = child_output.expect("object path for multi-file link");
+            source_objects[idx] = Some(obj_path);
         }
     }
 
-    if opts.emit_obj {
+    if terminal_mode.is_some() {
         return Ok(());
     }
 
     // Assemble the link list in original command order: each source becomes
     // its compiled object; prebuilt artifacts pass straight through. This
     // preserves the ordering callers rely on (objects before archives).
-    let link_list: Vec<PathBuf> = if artifact_inputs.is_empty() {
-        object_files
-    } else {
-        all_inputs
-            .iter()
-            .map(|input| {
-                if classify_cli_input(input) == CliInputKind::LinkArtifact {
-                    input.clone()
-                } else {
-                    src_to_obj
-                        .iter()
-                        .find(|(src, _)| src == input)
-                        .map(|(_, obj)| obj.clone())
-                        .unwrap_or_else(|| input.clone())
-                }
-            })
-            .collect()
-    };
+    let mut next_source = 0;
+    let link_list: Vec<PathBuf> = all_inputs
+        .iter()
+        .map(|input| {
+            if classify_cli_input(input) == CliInputKind::LinkArtifact {
+                input.clone()
+            } else {
+                let object = source_objects[next_source]
+                    .take()
+                    .expect("every source must produce one link object");
+                next_source += 1;
+                object
+            }
+        })
+        .collect();
+
+    let mut seen_includes = std::collections::HashSet::new();
+    let included_files: Vec<PathBuf> = source_includes
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|path| seen_includes.insert(path.clone()))
+        .collect();
 
     // Link all object files.
-    let output = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("a.out"));
-    link_multi(&link_list, &output, opts)?;
+    let output = link_output.expect("link output for multi-file link");
+    prepare_dependency_file(opts, &output, &included_files)?;
+    link_multi(&link_list, &output, opts, bundled_runtime)?;
 
     // Cleanup.
     if let Some(tmp_dir) = tmp_dir {
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
+    write_link_dependency_file(opts, &output, &source_inputs, &included_files)?;
+
     Ok(())
 }
 
 /// Find libarmfortas_rt.a in common locations.
-fn find_runtime_lib() -> Result<String, String> {
+fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArchive, String> {
     // 1. $AFS_RUNTIME_PATH — the explicit override.  Accepts either
     //    a directory containing libarmfortas_rt.a or the archive
     //    path directly.
@@ -2695,27 +3460,28 @@ fn find_runtime_lib() -> Result<String, String> {
         if p.is_dir() {
             let candidate = p.join("libarmfortas_rt.a");
             if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
+                return Ok(RuntimeArchive::external(candidate));
             }
         } else if p.exists() {
-            return Ok(env_path);
+            return Ok(RuntimeArchive::external(p));
         }
     }
 
-    // 2. Cargo workspace — when running out of the build tree.
-    if let Some(workspace_root) = find_workspace_root() {
-        let profile = RuntimeProfile::current();
-        if let Some(candidate) = fresh_runtime_lib(&workspace_root, profile) {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
-        maybe_refresh_runtime_lib(&workspace_root, profile)?;
-        let candidate = runtime_lib_candidate(&workspace_root, profile);
-        if candidate.exists() {
-            return Ok(candidate.to_string_lossy().into_owned());
+    // 2. A source workspace that owns the compiler executable. Development
+    //    binaries under target/{debug,release} retain automatic runtime
+    //    freshness without trusting the caller's current directory.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(workspace_root) = exe
+            .parent()
+            .and_then(|dir| find_source_workspace_from(&[dir.to_path_buf()]))
+        {
+            if let Some(runtime) = runtime_from_workspace(&workspace_root)? {
+                return Ok(runtime);
+            }
         }
     }
 
-    // 3. Sibling of the compiler binary:
+    // 3. Runtime installed with the compiler binary:
     //      <bindir>/libarmfortas_rt.a
     //      <bindir>/../lib/libarmfortas_rt.a      (classic FHS)
     //      <bindir>/../lib/armfortas/libarmfortas_rt.a
@@ -2728,25 +3494,47 @@ fn find_runtime_lib() -> Result<String, String> {
         ];
         for candidate in &candidates {
             if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into_owned());
+                return Ok(RuntimeArchive::external(candidate.clone()));
             }
         }
     }
 
-    // 4. Standard install locations.
+    // 4. Runtime carried by the compiler binary. Cargo installs executable
+    //    targets but has no data-file installation hook, so installed
+    //    armfortas/afs binaries materialize their target-matched archive into
+    //    a private temporary directory for the duration of the linker call.
+    //    Compiler-owned runtimes must win over anything inferred from the
+    //    caller's current directory.
+    if let Some(bytes) = bundled_runtime {
+        return materialize_bundled_runtime(bytes);
+    }
+
+    // 5. Verified current source workspace — only for programmatic
+    //    development callers that do not carry a runtime. Installed binaries
+    //    return from the compiler-owned sources above and never reach this
+    //    caller-controlled fallback.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(workspace_root) = find_source_workspace_from(&[cwd]) {
+            if let Some(runtime) = runtime_from_workspace(&workspace_root)? {
+                return Ok(runtime);
+            }
+        }
+    }
+
+    // 6. Standard install locations.
     for fixed in &[
         "/usr/local/lib/libarmfortas_rt.a",
         "/usr/local/lib/armfortas/libarmfortas_rt.a",
         "/opt/homebrew/lib/libarmfortas_rt.a",
     ] {
         if Path::new(fixed).exists() {
-            return Ok((*fixed).to_string());
+            return Ok(RuntimeArchive::external(PathBuf::from(fixed)));
         }
     }
 
     Err("cannot find libarmfortas_rt.a. Searched: \
-         $AFS_RUNTIME_PATH, cargo workspace, next to the compiler \
-         binary, and /usr/local/lib. Build with \
+         $AFS_RUNTIME_PATH, next to the compiler binary, the compiler's \
+         bundled runtime, a verified armfortas workspace, and /usr/local/lib. Build with \
          'cargo build -p armfortas-rt' or set AFS_RUNTIME_PATH."
         .into())
 }
@@ -2773,6 +3561,7 @@ fn find_libsystem_tbd() -> Result<String, String> {
             String::from_utf8_lossy(&sdk.stderr)
         ));
     }
+    forward_successful_subprocess_stderr(&sdk.stderr)?;
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
     let tbd = PathBuf::from(&sysroot).join("usr/lib/libSystem.tbd");
     if tbd.exists() {
@@ -2799,6 +3588,7 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
         .output()
         .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
     if output.status.success() {
+        forward_successful_subprocess_stderr(&output.stderr)?;
         Ok(())
     } else {
         Err(format!(
@@ -2808,32 +3598,65 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
     }
 }
 
-fn find_workspace_root() -> Option<PathBuf> {
-    let mut bases = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        bases.push(cwd);
+fn runtime_from_workspace(workspace_root: &Path) -> Result<Option<RuntimeArchive>, String> {
+    let profile = RuntimeProfile::current();
+    if let Some(candidate) = fresh_runtime_lib(workspace_root, profile) {
+        return Ok(Some(RuntimeArchive::external(candidate)));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            bases.push(dir.to_path_buf());
-        }
-    }
-
-    for base in bases {
-        for ancestor in base.ancestors() {
-            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists()
-            {
-                return Some(ancestor.to_path_buf());
-            }
-        }
-    }
-    None
+    maybe_refresh_runtime_lib(workspace_root, profile)?;
+    let candidate = runtime_lib_candidate(workspace_root, profile);
+    Ok(candidate
+        .exists()
+        .then(|| RuntimeArchive::external(candidate)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn pending_external_output_rejects_and_cleans_uncommitted_artifacts() {
+        let id = NEXT_ATOMIC_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+        let output = std::env::temp_dir().join(format!(
+            "armfortas_pending_external_output_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::write(&output, b"stale").expect("cannot seed stale output");
+
+        let pending =
+            PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        assert!(!output.exists(), "prepare retained a stale output");
+
+        fs::write(&output, b"").expect("cannot write empty output");
+        let error = pending
+            .verify("test tool")
+            .expect_err("empty output must not commit");
+        assert!(
+            error.contains("non-empty regular output"),
+            "unexpected empty-output diagnostic: {error}"
+        );
+        assert!(!output.exists(), "verify retained an empty output");
+
+        let pending =
+            PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        fs::write(&output, b"partial").expect("cannot write partial output");
+        drop(pending);
+        assert!(!output.exists(), "drop retained a partial output");
+
+        let pending =
+            PendingExternalOutput::prepare(&output, "test tool").expect("cannot prepare output");
+        fs::write(&output, b"complete").expect("cannot write complete output");
+        pending
+            .verify("test tool")
+            .expect("non-empty regular output must commit");
+        assert_eq!(
+            fs::read(&output).expect("cannot read committed output"),
+            b"complete"
+        );
+        let _ = fs::remove_file(output);
+    }
 
     #[test]
     fn normalizes_module_source_provenance() {
@@ -2895,10 +3718,33 @@ mod tests {
 
     #[test]
     fn parses_os_optimization_flag() {
+        assert_eq!(OptLevel::parse_flag("O"), Some(OptLevel::O1));
         assert_eq!(OptLevel::parse_flag("Os"), Some(OptLevel::Os));
         assert_eq!(OptLevel::parse_flag("os"), Some(OptLevel::Os));
         assert_eq!(OptLevel::Os.as_flag(), "-Os");
         assert_eq!(OptLevel::Os.as_str(), "Os");
+    }
+
+    #[test]
+    fn bare_o_selects_o1_and_optimization_flags_obey_last_option_wins() {
+        let parse_level = |flags: &[&str]| {
+            let mut args = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            args.push("hello.f90".to_string());
+            let ParsedCli::Compile(opts) = parse_cli(&args).expect("optimization flags must parse")
+            else {
+                panic!("optimization flags unexpectedly produced an information action");
+            };
+            opts.opt_level
+        };
+
+        assert_eq!(parse_level(&["-O"]), OptLevel::O1);
+        assert_eq!(parse_level(&["-O0", "-O"]), OptLevel::O1);
+        assert_eq!(parse_level(&["-O3", "-O"]), OptLevel::O1);
+        assert_eq!(parse_level(&["-O", "-O0"]), OptLevel::O0);
+        assert_eq!(parse_level(&["-O", "-O2"]), OptLevel::O2);
     }
 
     #[test]
@@ -2921,6 +3767,29 @@ mod tests {
         let opts = Options::from_args(&args).expect("driver should accept -Os");
         assert_eq!(opts.opt_level, OptLevel::Os);
         assert_eq!(opts.input, PathBuf::from("hello.f90"));
+    }
+
+    #[test]
+    fn options_from_args_preserves_mt_and_mq_target_kinds_and_order() {
+        let args = vec![
+            "-MT".to_string(),
+            "raw separated".to_string(),
+            "-MQ".to_string(),
+            "quoted separated".to_string(),
+            "-MTraw-attached".to_string(),
+            "-MQquoted-attached".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let opts = Options::from_args(&args).expect("driver should accept -MT and -MQ targets");
+        assert_eq!(
+            opts.dep_targets,
+            vec![
+                DepTarget::Verbatim("raw separated".to_string()),
+                DepTarget::Quoted("quoted separated".to_string()),
+                DepTarget::Verbatim("raw-attached".to_string()),
+                DepTarget::Quoted("quoted-attached".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -3074,6 +3943,62 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_warning_controls_honor_last_option_and_global_suppression() {
+        let disabled_last = vec![
+            "-Wall".to_string(),
+            "-Werror".to_string(),
+            "-Wno-all".to_string(),
+            "-Wno-error".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&disabled_last).expect("driver should parse warning suppressions")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(!opts.warn_all);
+        assert!(!opts.warn_as_error);
+        assert!(opts.cli_warnings.is_empty());
+
+        let enabled_last = vec![
+            "-Wno-all".to_string(),
+            "-Wno-error".to_string(),
+            "-Wall".to_string(),
+            "-Werror".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&enabled_last).expect("driver should re-enable warning controls")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(opts.warn_all);
+        assert!(opts.warn_as_error);
+        assert_eq!(opts.cli_warnings.len(), 1);
+
+        for args in [
+            vec![
+                "-w".to_string(),
+                "-Wall".to_string(),
+                "hello.f90".to_string(),
+            ],
+            vec![
+                "-Wall".to_string(),
+                "-w".to_string(),
+                "hello.f90".to_string(),
+            ],
+        ] {
+            let ParsedCli::Compile(opts) =
+                parse_cli(&args).expect("driver should parse global warning suppression")
+            else {
+                panic!("expected compile options");
+            };
+            assert!(opts.suppress_warnings);
+            assert!(opts.cli_warnings.is_empty());
+        }
+    }
+
+    #[test]
     fn parse_cli_warns_for_ffree_line_length_none_flag() {
         let args = vec![
             "-ffree-line-length-none".to_string(),
@@ -3124,6 +4049,68 @@ mod tests {
         };
         assert_eq!(opts.module_output_dir, Some(PathBuf::from("mods")));
         assert_eq!(opts.module_search_paths, vec![PathBuf::from("mods")]);
+    }
+
+    #[test]
+    fn parse_cli_preserves_input_and_library_operand_order() {
+        let args = vec![
+            "main.o".to_string(),
+            "-lprovider".to_string(),
+            "consumer.o".to_string(),
+            "-l".to_string(),
+            "tail".to_string(),
+        ];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should parse link operands")
+        else {
+            panic!("expected compile options");
+        };
+        assert_eq!(opts.input, PathBuf::from("main.o"));
+        assert_eq!(opts.extra_inputs, vec![PathBuf::from("consumer.o")]);
+        assert_eq!(
+            opts.link_operands,
+            vec![
+                LinkOperand::Input(PathBuf::from("main.o")),
+                LinkOperand::Library("provider".to_string()),
+                LinkOperand::Input(PathBuf::from("consumer.o")),
+                LinkOperand::Library("tail".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_link_operands_substitutes_compiled_sources_without_reordering_libraries() {
+        let args = vec![
+            "consumer.f90".to_string(),
+            "-lprovider".to_string(),
+            "main.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) = parse_cli(&args).expect("driver should parse link operands")
+        else {
+            panic!("expected compile options");
+        };
+
+        assert_eq!(
+            resolve_link_operands(
+                &[
+                    PathBuf::from("/tmp/consumer.o"),
+                    PathBuf::from("/tmp/main.o"),
+                ],
+                &opts,
+            )
+            .expect("compiled sources should fill their original linker slots"),
+            vec![
+                LinkOperand::Input(PathBuf::from("/tmp/consumer.o")),
+                LinkOperand::Library("provider".to_string()),
+                LinkOperand::Input(PathBuf::from("/tmp/main.o")),
+            ]
+        );
+
+        let mismatch =
+            resolve_link_operands(&[PathBuf::from("/tmp/consumer.o")], &opts).unwrap_err();
+        assert!(
+            mismatch.contains("2 input slots for 1 resolved inputs"),
+            "malformed programmatic options must fail loudly: {mismatch}"
+        );
     }
 
     fn i128_fixture() -> PathBuf {

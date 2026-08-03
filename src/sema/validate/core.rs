@@ -15,8 +15,12 @@ use super::allocatable::{
     validate_allocatable_item,
 };
 use super::pointer::validate_pointer_assignment;
+use super::procedure::{
+    validate_procedure_dummy_actual, validate_procedure_pointer_initializer,
+    validate_procedure_pointer_interface,
+};
 use super::pure_elemental::{
-    check_pure_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
+    check_pure_stmt_expr_calls, reject_pure_nonlocal_definition, validate_elemental_args,
     validate_pure_call,
 };
 use crate::ast::decl::{Attribute, Decl, OnlyItem, SpannedDecl, TypeAttr, TypeSpec, UseNature};
@@ -114,6 +118,10 @@ pub(super) struct Ctx<'a> {
     /// selector, so parameter/intent attributes of a USE-imported symbol
     /// with the same name don't apply inside the body).
     pub(super) associate_frames: Vec<HashSet<String>>,
+    /// Derived types inherited by ASSOCIATE names from their selectors.
+    /// ASSOCIATE is not a symbol-table scope, but component validation must
+    /// still know the alias's type after lexical shadowing takes effect.
+    associate_type_frames: Vec<HashMap<String, TypeInfo>>,
     /// Stack of BLOCK-local declarations. BLOCK constructs are
     /// scoping units, but the resolver does not currently materialize
     /// statement-level block scopes in the symbol table. Validation
@@ -150,6 +158,10 @@ pub(super) struct Ctx<'a> {
     /// One ambiguity in a host scope can be referenced by several contained
     /// procedures. Report it once at the first source reference.
     reported_use_ambiguities: HashSet<(ScopeId, String)>,
+    /// A malformed merged generic can remain visible through host association
+    /// in several nested scopes. Key the exact cross-owner pair so the
+    /// declaration error is emitted once instead of once per reference.
+    reported_indistinguishable_generics: HashSet<(String, ScopeId, String, ScopeId, String)>,
     /// A restricted IMPORT policy can make the same host entity appear in
     /// several declaration expressions. Diagnose the first reference only.
     reported_inaccessible_host_entities: HashSet<(ScopeId, String)>,
@@ -166,6 +178,7 @@ pub(super) struct Ctx<'a> {
 struct BlockBindingAttrs {
     intent_in: bool,
     parameter: bool,
+    allocatable: bool,
     pointer: bool,
     type_info: Option<TypeInfo>,
     rank: Option<usize>,
@@ -190,7 +203,8 @@ enum AmbiguityLexicalFrame {
         scope_id: Option<ScopeId>,
         uses: Vec<SpannedDecl>,
         bindings: HashSet<String>,
-        import_control: BlockImportControl,
+        named_types: HashSet<String>,
+        import_control: Box<BlockImportControl>,
     },
     Associate {
         bindings: HashSet<String>,
@@ -217,6 +231,7 @@ impl<'a> Ctx<'a> {
             allocatable_array_targets: HashSet::new(),
             lookup_cache: RefCell::new(std::collections::HashMap::new()),
             associate_frames: Vec::new(),
+            associate_type_frames: Vec::new(),
             block_decl_frames: Vec::new(),
             warn_pedantic,
             warn_deprecated,
@@ -227,6 +242,7 @@ impl<'a> Ctx<'a> {
             finalizer_capture_host_scopes: HashSet::new(),
             reported_finalizer_captures: HashSet::new(),
             reported_use_ambiguities: HashSet::new(),
+            reported_indistinguishable_generics: HashSet::new(),
             reported_inaccessible_host_entities: HashSet::new(),
             reported_block_use_ambiguities: HashSet::new(),
             ambiguity_lexical_frames: Vec::new(),
@@ -280,6 +296,20 @@ impl<'a> Ctx<'a> {
             .find_map(|frame| frame.get(&key))
     }
 
+    fn associate_binding_type_info(&self, name: &str) -> Option<&TypeInfo> {
+        let key = name.to_lowercase();
+        self.associate_type_frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(&key))
+    }
+
+    fn block_array_element_type_info(&self, name: &str) -> Option<&TypeInfo> {
+        let binding = self.block_binding_attrs(name)?;
+        binding.rank.filter(|rank| *rank > 0)?;
+        binding.type_info.as_ref()
+    }
+
     /// Look up a symbol in the current validation scope.
     pub(super) fn lookup(&self, name: &str) -> Option<&'a Symbol> {
         let key = (self.scope_id, name.to_lowercase());
@@ -291,7 +321,7 @@ impl<'a> Ctx<'a> {
         resolved
     }
 
-    fn lookup_lexical(&self, name: &str) -> Option<&'a Symbol> {
+    pub(super) fn lookup_lexical(&self, name: &str) -> Option<&'a Symbol> {
         let key = name.to_lowercase();
         for frame in self.ambiguity_lexical_frames.iter().rev() {
             match frame {
@@ -383,6 +413,32 @@ impl<'a> Ctx<'a> {
                 AmbiguityLexicalFrame::Associate { .. } => None,
             })
             .unwrap_or(self.scope_id)
+    }
+
+    fn lexical_local_named_type(&self, name: &str) -> Option<bool> {
+        let key = name.to_lowercase();
+        for frame in self.ambiguity_lexical_frames.iter().rev() {
+            match frame {
+                AmbiguityLexicalFrame::Associate { bindings } => {
+                    if bindings.contains(&key) {
+                        return Some(false);
+                    }
+                }
+                AmbiguityLexicalFrame::Block {
+                    bindings,
+                    named_types,
+                    ..
+                } => {
+                    if named_types.contains(&key) {
+                        return Some(true);
+                    }
+                    if bindings.contains(&key) {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn error(&mut self, span: Span, msg: impl Into<String>) {
@@ -575,6 +631,80 @@ fn validate_supported_character_type_spec(ctx: &mut Ctx<'_>, span: Span, type_sp
     }
 }
 
+fn symbol_is_named_type(symbol: &Symbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::DerivedType | SymbolKind::EnumerationType
+    )
+}
+
+/// Validate a source-level reference to a named derived/enumeration type.
+///
+/// Type layouts have a wider lifetime than source visibility: private
+/// layouts must remain available after `.amod` reconstruction so descendant
+/// submodules and public layouts with private component types can be lowered.
+/// Therefore a registry hit is never proof that a source name is accessible.
+/// All source spellings must resolve through the symbol table, whose ordinary
+/// USE lookup filters non-exported symbols while submodule host association
+/// deliberately retains them.
+fn validate_visible_named_type(ctx: &mut Ctx<'_>, span: Span, name: &str) {
+    match ctx.lexical_local_named_type(name) {
+        Some(true) => return,
+        Some(false) => {
+            ctx.error(
+                span,
+                format!("'{}' does not name a derived type in this scope", name),
+            );
+            return;
+        }
+        None => {}
+    }
+
+    match ctx.lookup_lexical(name) {
+        Some(symbol) if symbol_is_named_type(symbol) => {}
+        Some(_) => ctx.error(
+            span,
+            format!("'{}' does not name a derived type in this scope", name),
+        ),
+        None => ctx.error(
+            span,
+            format!("derived type '{}' is not accessible in this scope", name),
+        ),
+    }
+}
+
+fn validate_visible_type_spec(ctx: &mut Ctx<'_>, span: Span, type_spec: &TypeSpec) {
+    if let TypeSpec::Type(name) | TypeSpec::Class(name) = type_spec {
+        validate_visible_named_type(ctx, span, name);
+    }
+}
+
+fn type_decl_encodes_procedure_interface(attrs: &[Attribute], type_spec: &TypeSpec) -> bool {
+    matches!(type_spec, TypeSpec::Type(_))
+        && attrs
+            .iter()
+            .any(|attr| matches!(attr, Attribute::Procedure))
+}
+
+/// Array-constructor and SELECT TYPE guards retain their type-spec as source
+/// text. Intrinsic specs parse directly; a bare identifier is a derived or
+/// enumeration type name and must pass the same visibility check as TYPE(t).
+fn validate_visible_raw_type_spec(ctx: &mut Ctx<'_>, span: Span, raw: &str) {
+    if let Ok(tokens) =
+        crate::lexer::tokenize(raw, span.file_id, crate::lexer::SourceForm::FreeForm)
+    {
+        let mut parser = crate::parser::Parser::new(&tokens);
+        if let Some(Ok(type_spec)) = parser.try_parse_type_spec() {
+            if parser.peek() == &crate::lexer::TokenKind::Eof {
+                validate_visible_type_spec(ctx, span, &type_spec);
+                return;
+            }
+        }
+    }
+
+    validate_visible_named_type(ctx, span, raw.trim());
+}
+
 fn validate_supported_character_type_info(ctx: &mut Ctx<'_>, span: Span, info: Option<TypeInfo>) {
     let Some(TypeInfo::Character {
         kind: Some(kind), ..
@@ -598,15 +728,6 @@ fn character_literal_kind(ctx: &Ctx<'_>, kind: &str) -> Option<i128> {
             .and_then(|symbol| symbol.const_value)
             .map(i128::from)
     })
-}
-
-fn selected_character_kind(name: &str) -> i128 {
-    let name = name.trim_end_matches(' ');
-    if name.eq_ignore_ascii_case("default") || name.eq_ignore_ascii_case("ascii") {
-        1
-    } else {
-        -1
-    }
 }
 
 fn checked_int_value(value: i128, kind: u8, span: Span) -> Result<ConstIntValue, ConstIntError> {
@@ -731,29 +852,9 @@ fn eval_const_int_expr_checked(
             checked_int_value(value, kind, expr.span).map(Some)
         }
         Expr::ParenExpr { inner } => eval_const_int_expr_checked(ctx, inner),
-        Expr::FunctionCall { callee, args } => {
-            let Expr::Name { name } = &callee.node else {
+        Expr::FunctionCall { .. } => {
+            let Some(value) = crate::sema::types::resolve_intrinsic_kind_value(expr, ctx.st) else {
                 return Ok(None);
-            };
-            let Some(first) = call_rank_argument_expr(args, 0, &["name", "x"]) else {
-                return Ok(None);
-            };
-            let value = match name.to_ascii_lowercase().as_str() {
-                "selected_char_kind" => match &first.node {
-                    Expr::StringLiteral { value, .. } => {
-                        selected_character_kind(value.to_string_lossy().as_ref())
-                    }
-                    _ => return Ok(None),
-                },
-                "kind" => match validation_expr_type_info(ctx, first) {
-                    Some(TypeInfo::Integer { kind })
-                    | Some(TypeInfo::Real { kind })
-                    | Some(TypeInfo::Complex { kind })
-                    | Some(TypeInfo::Logical { kind })
-                    | Some(TypeInfo::Character { kind, .. }) => i128::from(kind.unwrap_or(1)),
-                    _ => return Ok(None),
-                },
-                _ => return Ok(None),
             };
             checked_int_value(
                 value,
@@ -1624,6 +1725,15 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
         Expr::FunctionCall { callee, args } => {
             validate_const_int_expr_tree(ctx, callee);
             if let Expr::Name { name } = &callee.node {
+                let derived_constructor = ctx
+                    .lookup_lexical(name)
+                    .filter(|symbol| matches!(symbol.kind, SymbolKind::DerivedType))
+                    .map(|symbol| symbol.name.clone());
+                if let Some(type_name) = derived_constructor {
+                    validate_structure_constructor_component_access(
+                        ctx, expr.span, &type_name, args,
+                    );
+                }
                 let enum_ctor = ctx.lookup(name).and_then(|sym| {
                     matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
                         .then(|| (sym.name.clone(), sym.arg_names.len()))
@@ -1664,7 +1774,9 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
             ctx.in_call_arg = saved;
         }
         Expr::ArrayConstructor { type_spec, values } => {
-            if type_spec.is_none() {
+            if let Some(type_spec) = type_spec {
+                validate_visible_raw_type_spec(ctx, expr.span, type_spec);
+            } else {
                 validate_untyped_array_constructor_elements(ctx, values);
             }
             for value in values {
@@ -1818,6 +1930,13 @@ fn validate_decl_const_int_exprs(ctx: &mut Ctx<'_>, decl: &crate::ast::decl::Spa
                 }
                 if let Some(init) = &entity.ptr_init {
                     validate_const_int_expr_tree(ctx, init);
+                }
+            }
+        }
+        Decl::DimensionStmt { entities } => {
+            for entity in entities {
+                for spec in &entity.array_spec {
+                    validate_const_int_array_spec(ctx, spec);
                 }
             }
         }
@@ -2024,6 +2143,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             controls,
             mask,
             locality,
+            body,
             ..
         } => {
             for control in controls {
@@ -2067,6 +2187,12 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                     }
                 }
             }
+            if locality
+                .iter()
+                .any(|spec| matches!(spec, LocalitySpec::DefaultNone))
+            {
+                validate_do_concurrent_default_none(ctx, controls, locality, body);
+            }
         }
         Stmt::WhereConstruct {
             mask, elsewhere, ..
@@ -2095,9 +2221,17 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 validate_const_int_expr_tree(ctx, expr);
             }
         }
-        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
             if let Some(code) = code {
                 validate_const_int_expr_tree(ctx, code);
+            }
+            if let Some(quiet) = quiet {
+                validate_const_int_expr_tree(ctx, quiet);
+            }
+        }
+        Stmt::Return { value } => {
+            if let Some(value) = value {
+                validate_const_int_expr_tree(ctx, value);
             }
         }
         Stmt::Write { controls, items }
@@ -2189,7 +2323,52 @@ fn validate_unsupported_component_forms(
     ctx: &mut Ctx<'_>,
     components: &[crate::ast::decl::SpannedDecl],
 ) {
-    let _ = (ctx, components);
+    let in_module_specification_part =
+        matches!(ctx.st.scope(ctx.scope_id).kind, ScopeKind::Module(_));
+    for component in components {
+        let attrs = match &component.node {
+            Decl::AccessDefault {
+                access: Attribute::Private,
+            } => {
+                if !in_module_specification_part {
+                    ctx.error(
+                        component.span,
+                        "component PRIVATE statement is permitted only for a type defined in a module specification part",
+                    );
+                }
+                continue;
+            }
+            Decl::TypeDecl { attrs, .. } => attrs,
+            _ => continue,
+        };
+        let public_count = attrs
+            .iter()
+            .filter(|attr| matches!(attr, Attribute::Public))
+            .count();
+        let private_count = attrs
+            .iter()
+            .filter(|attr| matches!(attr, Attribute::Private))
+            .count();
+        let public = public_count != 0;
+        let private = private_count != 0;
+        if public && private {
+            ctx.error(
+                component.span,
+                "derived-type component cannot be both PUBLIC and PRIVATE",
+            );
+        } else if public_count + private_count > 1 {
+            ctx.error(
+                component.span,
+                "derived-type component accessibility is specified more than once",
+            );
+        }
+        if (public || private) && !in_module_specification_part {
+            ctx.error(
+                component.span,
+                "component PUBLIC/PRIVATE attribute is permitted only for a type defined in a module specification part",
+            );
+        }
+    }
 }
 
 /// Find the scope ID for a program unit, preferring children of `parent_scope`.
@@ -2576,6 +2755,13 @@ fn collect_reference_decl(
                 collect_reference_array_spec(spec, shadowed, facts);
             }
         }
+        Decl::DimensionStmt { entities } => {
+            for entity in entities {
+                for spec in &entity.array_spec {
+                    collect_reference_array_spec(spec, shadowed, facts);
+                }
+            }
+        }
         Decl::ImplicitStmt { specs } => {
             for spec in specs {
                 collect_reference_type_spec(&spec.type_spec, decl.span, shadowed, facts);
@@ -2611,8 +2797,28 @@ fn collect_block_binding_names(decls: &[SpannedDecl], out: &mut HashSet<String>)
             Decl::AttributeStmt { entities, .. } => {
                 out.extend(entities.iter().map(|name| name.to_lowercase()));
             }
+            Decl::DimensionStmt { entities } => {
+                out.extend(entities.iter().map(|entity| entity.name.to_lowercase()));
+            }
             Decl::CommonBlock { vars, .. } => {
                 out.extend(vars.iter().map(|name| name.to_lowercase()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_block_named_type_names(decls: &[SpannedDecl], out: &mut HashSet<String>) {
+    for decl in decls {
+        match &decl.node {
+            Decl::DerivedTypeDef { name, .. } | Decl::EnumerationTypeDef { name, .. } => {
+                out.insert(name.to_lowercase());
+            }
+            Decl::EnumDef {
+                type_name: Some(name),
+                ..
+            } => {
+                out.insert(name.to_lowercase());
             }
             _ => {}
         }
@@ -2660,6 +2866,11 @@ fn block_local_bindings(
             Decl::AttributeStmt { entities, .. } => {
                 for name in entities {
                     push(name);
+                }
+            }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    push(&entity.name);
                 }
             }
             Decl::CommonBlock { vars, .. } => {
@@ -2966,9 +3177,17 @@ fn collect_reference_stmt(
             nested_shadowed.extend(assocs.iter().map(|(name, _)| name.to_lowercase()));
             collect_reference_stmts(body, &nested_shadowed, facts);
         }
-        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } | Stmt::Return { value: code } => {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
             if let Some(code) = code {
                 collect_reference_expr(code, shadowed, facts);
+            }
+            if let Some(quiet) = quiet {
+                collect_reference_expr(quiet, shadowed, facts);
+            }
+        }
+        Stmt::Return { value } => {
+            if let Some(value) = value {
+                collect_reference_expr(value, shadowed, facts);
             }
         }
         Stmt::ComputedGoto { selector, .. } | Stmt::ArithmeticIf { expr: selector, .. } => {
@@ -3077,6 +3296,206 @@ fn collect_reference_stmts(
     }
 }
 
+/// `collect_reference_stmt` deliberately leaves BLOCK bodies to the lexical
+/// validation pass. DEFAULT(NONE), however, governs the complete
+/// do-concurrent-block, including a BLOCK nested under another executable
+/// construct. Walk just those skipped lexical islands here while carrying
+/// every intervening construct entity that can shadow an outer variable.
+fn collect_default_none_nested_block_references(
+    st: &SymbolTable,
+    stmts: &[SpannedStmt],
+    shadowed: &HashSet<String>,
+    facts: &mut ProcedureReferenceFacts,
+) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Block {
+                uses,
+                ifaces,
+                decls,
+                body,
+                ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                collect_block_use_binding_names(st, uses, &mut nested_shadowed);
+                collect_block_binding_names(decls, &mut nested_shadowed);
+                extend_declared_names_from_ifaces(&mut nested_shadowed, ifaces);
+                for decl in decls {
+                    collect_reference_decl(decl, &nested_shadowed, facts);
+                }
+                collect_reference_stmts(body, &nested_shadowed, facts);
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_default_none_nested_block_references(st, then_body, shadowed, facts);
+                for (_, body) in else_ifs {
+                    collect_default_none_nested_block_references(st, body, shadowed, facts);
+                }
+                if let Some(body) = else_body {
+                    collect_default_none_nested_block_references(st, body, shadowed, facts);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::Labeled { stmt: action, .. } => {
+                collect_default_none_nested_block_references(
+                    st,
+                    std::slice::from_ref(action.as_ref()),
+                    shadowed,
+                    facts,
+                );
+            }
+            Stmt::DoLoop { body, .. } | Stmt::DoWhile { body, .. } => {
+                collect_default_none_nested_block_references(st, body, shadowed, facts);
+            }
+            Stmt::DoConcurrent {
+                controls,
+                locality,
+                body,
+                ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(controls.iter().map(|control| control.var.to_lowercase()));
+                for spec in locality {
+                    match spec {
+                        LocalitySpec::Local(names)
+                        | LocalitySpec::LocalInit(names)
+                        | LocalitySpec::Reduce { vars: names, .. } => {
+                            nested_shadowed.extend(names.iter().map(|name| name.to_lowercase()));
+                        }
+                        LocalitySpec::Shared(_) | LocalitySpec::DefaultNone => {}
+                    }
+                }
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_default_none_nested_block_references(st, &case.body, shadowed, facts);
+                }
+            }
+            Stmt::SelectType {
+                assoc_name, guards, ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                if let Some(name) = assoc_name {
+                    nested_shadowed.insert(name.to_lowercase());
+                }
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+                }
+            }
+            Stmt::SelectRank {
+                assoc_name, guards, ..
+            } => {
+                let mut nested_shadowed = shadowed.clone();
+                if let Some(name) = assoc_name {
+                    nested_shadowed.insert(name.to_lowercase());
+                }
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_default_none_nested_block_references(st, body, shadowed, facts);
+                for (_, body) in elsewhere {
+                    collect_default_none_nested_block_references(st, body, shadowed, facts);
+                }
+            }
+            Stmt::ForallConstruct { specs, body, .. } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            Stmt::ForallStmt { specs, stmt, .. } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(specs.iter().map(|spec| spec.var.to_lowercase()));
+                collect_default_none_nested_block_references(
+                    st,
+                    std::slice::from_ref(stmt.as_ref()),
+                    &nested_shadowed,
+                    facts,
+                );
+            }
+            Stmt::Associate { assocs, body, .. } => {
+                let mut nested_shadowed = shadowed.clone();
+                nested_shadowed.extend(assocs.iter().map(|(name, _)| name.to_lowercase()));
+                collect_default_none_nested_block_references(st, body, &nested_shadowed, facts);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_do_concurrent_default_none(
+    ctx: &mut Ctx<'_>,
+    controls: &[ConcurrentControl],
+    locality: &[LocalitySpec],
+    body: &[SpannedStmt],
+) {
+    let mut explicitly_localized: HashSet<String> = controls
+        .iter()
+        .map(|control| control.var.to_lowercase())
+        .collect();
+    for spec in locality {
+        match spec {
+            LocalitySpec::Local(names)
+            | LocalitySpec::LocalInit(names)
+            | LocalitySpec::Shared(names)
+            | LocalitySpec::Reduce { vars: names, .. } => {
+                explicitly_localized.extend(names.iter().map(|name| name.to_lowercase()));
+            }
+            LocalitySpec::DefaultNone => {}
+        }
+    }
+
+    let mut facts = ProcedureReferenceFacts::default();
+    collect_reference_stmts(body, &explicitly_localized, &mut facts);
+    collect_default_none_nested_block_references(ctx.st, body, &explicitly_localized, &mut facts);
+
+    let mut missing = HashMap::<String, Span>::new();
+    for reference in facts.references {
+        let Some(symbol) = ctx.lookup_lexical(&reference.name) else {
+            continue;
+        };
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Variable | SymbolKind::ProcedurePointer
+        ) {
+            continue;
+        }
+        missing.entry(reference.name).or_insert(reference.span);
+    }
+
+    let mut missing: Vec<_> = missing.into_iter().collect();
+    missing.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, span) in missing {
+        ctx.error(
+            span,
+            format!(
+                "variable '{name}' referenced in a DO CONCURRENT with DEFAULT(NONE) \
+                 must appear in a locality-spec (F2023 C1134)"
+            ),
+        );
+    }
+}
+
 fn procedure_reference_facts(unit: &ProgramUnit, unit_span: Span) -> ProcedureReferenceFacts {
     let shadowed = HashSet::new();
     let mut facts = ProcedureReferenceFacts::default();
@@ -3136,6 +3555,58 @@ fn procedure_specification_reference_facts(
     facts
 }
 
+fn program_unit_use_decls(unit: &ProgramUnit) -> &[SpannedDecl] {
+    match unit {
+        ProgramUnit::Program { uses, .. }
+        | ProgramUnit::Module { uses, .. }
+        | ProgramUnit::Submodule { uses, .. }
+        | ProgramUnit::Subroutine { uses, .. }
+        | ProgramUnit::Function { uses, .. }
+        | ProgramUnit::BlockData { uses, .. } => uses,
+        ProgramUnit::InterfaceBlock { .. } => &[],
+    }
+}
+
+fn sorted_use_binding_names(st: &SymbolTable, uses: &[SpannedDecl]) -> Vec<String> {
+    let mut names = HashSet::new();
+    collect_block_use_binding_names(st, uses, &mut names);
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort();
+    names
+}
+
+fn report_indistinguishable_merged_generic(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    generic_name: &str,
+    interfaces: Option<&[&Symbol]>,
+) {
+    let pair = interfaces.map_or_else(
+        || indistinguishable_merged_generic_specifics(ctx, generic_name),
+        |interfaces| indistinguishable_generic_specifics_from_interfaces(ctx, interfaces),
+    );
+    let Some(pair) = pair else {
+        return;
+    };
+    let report_key = (
+        generic_name.to_ascii_lowercase(),
+        pair.left_owner_scope,
+        pair.left_name.clone(),
+        pair.right_owner_scope,
+        pair.right_name.clone(),
+    );
+    if ctx.reported_indistinguishable_generics.insert(report_key) {
+        ctx.error(
+            span,
+            format!(
+                "generic interface '{}' has indistinguishable specific procedures \
+                 '{}' and '{}'",
+                generic_name, pair.left_name, pair.right_name
+            ),
+        );
+    }
+}
+
 fn validate_use_ambiguities(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
     for reference in procedure_specification_reference_facts(&unit.node, unit.span).references {
         if reference.role == ReferenceRole::Callable && is_intrinsic_name(&reference.name) {
@@ -3164,23 +3635,43 @@ fn validate_use_ambiguities(ctx: &mut Ctx<'_>, unit: &SpannedUnit) {
         }
     }
 
+    // F2023 15.4.3.4.5 constrains every pair of specifics that is accessible
+    // under one generic identifier; a call is not required to trigger the
+    // constraint. Validate each name introduced by this unit's USE statements
+    // once up front, including names re-exported through a single module.
+    let mut checked_merged_generics = HashSet::new();
+    for name in sorted_use_binding_names(ctx.st, program_unit_use_decls(&unit.node)) {
+        checked_merged_generics.insert(name.clone());
+        report_indistinguishable_merged_generic(ctx, unit.span, &name, None);
+    }
+
     let facts = procedure_reference_facts(&unit.node, unit.span);
     for reference in facts.references {
         let allow_generic_merge = reference.role == ReferenceRole::Callable;
-        let Some(ambiguity) =
+        if let Some(ambiguity) =
             ctx.st
                 .use_ambiguity_in(ctx.scope_id, &reference.name, allow_generic_merge)
-        else {
-            continue;
-        };
-        let report_key = (ambiguity.origin_scope, reference.name.clone());
-        if !ctx.reported_use_ambiguities.insert(report_key) {
+        {
+            let report_key = (ambiguity.origin_scope, reference.name.clone());
+            if !ctx.reported_use_ambiguities.insert(report_key) {
+                continue;
+            }
+            ctx.error(
+                reference.span,
+                use_ambiguity_message(&reference.name, &ambiguity.providers),
+            );
             continue;
         }
-        ctx.error(
-            reference.span,
-            use_ambiguity_message(&reference.name, &ambiguity.providers),
-        );
+        if !allow_generic_merge {
+            continue;
+        }
+        // Local generic declarations can extend a host-associated generic
+        // without introducing another USE name in this unit. Retain the
+        // reference-time fallback for that case, but never rebuild imported
+        // characteristics for every call.
+        if checked_merged_generics.insert(reference.name.clone()) {
+            report_indistinguishable_merged_generic(ctx, reference.span, &reference.name, None);
+        }
     }
 }
 
@@ -3501,6 +3992,19 @@ fn validate_block_use_ambiguities(
     collect_block_binding_names(decls, &mut shadowed);
     extend_declared_names_from_ifaces(&mut shadowed, ifaces);
 
+    // BLOCK constructs are absent from the ordinary scope graph. Check their
+    // explicit USE set here, before reference collection, so an unused merged
+    // generic is held to the same constraint as a program-unit generic.
+    let mut checked_merged_generics = HashSet::new();
+    for name in sorted_use_binding_names(ctx.st, uses) {
+        checked_merged_generics.insert(name.clone());
+        let associations = block_use_associations_for_name(ctx.st, uses, &name);
+        let interfaces = ctx
+            .st
+            .named_interface_symbols_from_use_associations(&associations, &name);
+        report_indistinguishable_merged_generic(ctx, block_span, &name, Some(&interfaces));
+    }
+
     let mut facts = ProcedureReferenceFacts::default();
     for decl in implicit.iter().chain(decls) {
         collect_reference_decl(decl, &shadowed, &mut facts);
@@ -3513,6 +4017,17 @@ fn validate_block_use_ambiguities(
         let mut block_binding_found = false;
 
         let associations = block_use_associations_for_name(ctx.st, uses, &reference.name);
+        if allow_generic_merge && checked_merged_generics.insert(reference.name.clone()) {
+            let interfaces = ctx
+                .st
+                .named_interface_symbols_from_use_associations(&associations, &reference.name);
+            report_indistinguishable_merged_generic(
+                ctx,
+                reference.span,
+                &reference.name,
+                Some(&interfaces),
+            );
+        }
         if let Some(ambiguity) = ctx.st.use_ambiguity_from_associations(
             ctx.scope_id,
             &reference.name,
@@ -3835,6 +4350,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
+            validate_control_transfer_regions(ctx, body);
             validate_label_consistency(ctx, unit.span);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
         }
@@ -3920,6 +4436,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
+            validate_control_transfer_regions(ctx, body);
             validate_label_consistency(ctx, unit.span);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
             ctx.current_args = saved_args;
@@ -4013,6 +4530,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             }
             if let Some(return_type) = return_type {
                 validate_supported_character_type_spec(ctx, unit.span, return_type);
+                validate_visible_type_spec(ctx, unit.span, return_type);
             }
             ctx.in_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             ctx.in_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
@@ -4064,6 +4582,7 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             validate_decls(ctx, decls);
             check_implicit_none(ctx, body, decls);
             validate_stmts(ctx, body);
+            validate_control_transfer_regions(ctx, body);
             validate_label_consistency(ctx, unit.span);
             validate_contained_units(ctx, &unit.node, unit.span, contains);
             ctx.current_args = saved_args;
@@ -4240,8 +4759,35 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         {
             let has_alloc = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let has_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            if has_pointer && type_decl_encodes_procedure_interface(attrs, type_spec) {
+                if let TypeSpec::Type(interface_name) = type_spec {
+                    let owner_scope = ctx.scope_id;
+                    for entity in entities {
+                        validate_procedure_pointer_interface(
+                            ctx,
+                            &entity.name,
+                            owner_scope,
+                            interface_name,
+                            decl.span,
+                        );
+                        if let Some(initial_target) = entity.ptr_init.as_ref() {
+                            validate_procedure_pointer_initializer(
+                                ctx,
+                                &entity.name,
+                                owner_scope,
+                                interface_name,
+                                initial_target,
+                                initial_target.span,
+                            );
+                        }
+                    }
+                }
+            }
 
             validate_supported_character_type_spec(ctx, decl.span, type_spec);
+            if !type_decl_encodes_procedure_interface(attrs, type_spec) {
+                validate_visible_type_spec(ctx, decl.span, type_spec);
+            }
 
             // RANK(n) (F2023 8.5.17). The parser already desugared the
             // shape to a deferred-shape Dimension; here the marker
@@ -4546,6 +5092,7 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         // Derived type definition validation.
         if let Decl::DerivedTypeDef {
             name,
+            extends,
             attrs: type_attrs,
             type_bound_procs,
             components,
@@ -4553,6 +5100,9 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
         } = &decl.node
         {
             ctx.require_std(decl.span, FortranStandard::F90, "derived types");
+            if let Some(parent) = extends {
+                validate_visible_named_type(ctx, decl.span, parent);
+            }
             if type_attrs
                 .iter()
                 .any(|attr| matches!(attr, TypeAttr::Abstract))
@@ -4561,8 +5111,43 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             }
             validate_unsupported_component_forms(ctx, components);
             for component in components {
-                if let Decl::TypeDecl { type_spec, .. } = &component.node {
+                if let Decl::TypeDecl {
+                    type_spec,
+                    attrs,
+                    entities,
+                } = &component.node
+                {
                     validate_supported_character_type_spec(ctx, component.span, type_spec);
+                    if !type_decl_encodes_procedure_interface(attrs, type_spec) {
+                        validate_visible_type_spec(ctx, component.span, type_spec);
+                    }
+                    let has_pointer = attrs
+                        .iter()
+                        .any(|attribute| matches!(attribute, Attribute::Pointer));
+                    if has_pointer && type_decl_encodes_procedure_interface(attrs, type_spec) {
+                        if let TypeSpec::Type(interface_name) = type_spec {
+                            let owner_scope = ctx.scope_id;
+                            for entity in entities {
+                                validate_procedure_pointer_interface(
+                                    ctx,
+                                    &entity.name,
+                                    owner_scope,
+                                    interface_name,
+                                    component.span,
+                                );
+                                if let Some(initial_target) = entity.ptr_init.as_ref() {
+                                    validate_procedure_pointer_initializer(
+                                        ctx,
+                                        &entity.name,
+                                        owner_scope,
+                                        interface_name,
+                                        initial_target,
+                                        initial_target.span,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             validate_derived_type(
@@ -4703,9 +5288,275 @@ fn validate_allocation_options(
     presence
 }
 
+fn allocation_names_designate_same_entity(ctx: &Ctx<'_>, left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    match (ctx.lookup_lexical(left), ctx.lookup_lexical(right)) {
+        (Some(left), Some(right)) => {
+            left.scope == right.scope && left.name.eq_ignore_ascii_case(&right.name)
+        }
+        _ => false,
+    }
+}
+
+fn stable_array_reference_callee(ctx: &Ctx<'_>, callee: &SpannedExpr) -> bool {
+    if validation_expr_rank(ctx, callee).is_none_or(|rank| rank == 0) {
+        return false;
+    }
+
+    match &callee.node {
+        Expr::Name { name } => {
+            if ctx
+                .block_binding_attrs(name)
+                .and_then(|binding| binding.rank)
+                .is_some_and(|rank| rank > 0)
+            {
+                return true;
+            }
+            ctx.lookup_lexical(name).is_some_and(|symbol| {
+                matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                    && !symbol.attrs.array_spec.is_empty()
+            })
+        }
+        Expr::ComponentAccess { .. } => {
+            leaf_field_layout(ctx, callee).is_some_and(|leaf| !leaf.field.procedure_pointer)
+        }
+        Expr::ParenExpr { inner } => stable_array_reference_callee(ctx, inner),
+        _ => false,
+    }
+}
+
+fn stable_subscript_exprs_are_equal(
+    ctx: &Ctx<'_>,
+    left: &SpannedExpr,
+    right: &SpannedExpr,
+) -> bool {
+    if let (Ok(Some(left)), Ok(Some(right))) = (
+        eval_const_int_expr_checked(ctx, left),
+        eval_const_int_expr_checked(ctx, right),
+    ) {
+        return left.value == right.value;
+    }
+
+    allocation_designators_are_equal(ctx, left, right)
+}
+
+// This is deliberately proof-oriented rather than ordinary AST equality.
+// Procedure calls can return a different subscript on each evaluation, while
+// resolved aliases and side-effect-free array references can identify the same
+// object even when their source spellings differ.
+fn stable_section_subscripts_are_equal(
+    ctx: &Ctx<'_>,
+    left: &SectionSubscript,
+    right: &SectionSubscript,
+) -> bool {
+    match (left, right) {
+        (SectionSubscript::Element(left), SectionSubscript::Element(right)) => {
+            stable_subscript_exprs_are_equal(ctx, left, right)
+        }
+        _ => false,
+    }
+}
+
+fn allocation_designators_are_equal(
+    ctx: &Ctx<'_>,
+    left: &SpannedExpr,
+    right: &SpannedExpr,
+) -> bool {
+    match (&left.node, &right.node) {
+        (Expr::ParenExpr { inner: left }, _) => allocation_designators_are_equal(ctx, left, right),
+        (_, Expr::ParenExpr { inner: right }) => allocation_designators_are_equal(ctx, left, right),
+        (Expr::Name { name: left }, Expr::Name { name: right }) => {
+            allocation_names_designate_same_entity(ctx, left, right)
+        }
+        (
+            Expr::ComponentAccess {
+                base: left_base,
+                component: left_component,
+            },
+            Expr::ComponentAccess {
+                base: right_base,
+                component: right_component,
+            },
+        ) => {
+            left_component.eq_ignore_ascii_case(right_component)
+                && allocation_designators_are_equal(ctx, left_base, right_base)
+        }
+        (
+            Expr::FunctionCall {
+                callee: left_callee,
+                args: left_args,
+            },
+            Expr::FunctionCall {
+                callee: right_callee,
+                args: right_args,
+            },
+        ) => {
+            stable_array_reference_callee(ctx, left_callee)
+                && stable_array_reference_callee(ctx, right_callee)
+                && allocation_designators_are_equal(ctx, left_callee, right_callee)
+                && left_args.len() == right_args.len()
+                && left_args.iter().zip(right_args).all(|(left, right)| {
+                    left.keyword.is_none()
+                        && right.keyword.is_none()
+                        && stable_section_subscripts_are_equal(ctx, &left.value, &right.value)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn allocation_object_designator(item: &SpannedExpr, has_allocation_shape: bool) -> &SpannedExpr {
+    if has_allocation_shape {
+        if let Expr::FunctionCall { callee, .. } = &item.node {
+            return callee;
+        }
+    }
+    item
+}
+
+fn validate_distinct_allocation_objects(ctx: &mut Ctx<'_>, items: &[SpannedExpr], statement: &str) {
+    let has_allocation_shape = statement == "ALLOCATE";
+    for (index, item) in items.iter().enumerate().skip(1) {
+        let item_designator = allocation_object_designator(item, has_allocation_shape);
+        let earlier = items[..index].iter().find(|earlier| {
+            allocation_designators_are_equal(
+                ctx,
+                allocation_object_designator(earlier, has_allocation_shape),
+                item_designator,
+            )
+        });
+        let Some(earlier) = earlier else {
+            continue;
+        };
+        let earlier = earlier.to_sexpr();
+        ctx.error(
+            item.span,
+            format!(
+                "{statement} object '{}' designates the same entity as an earlier {statement} object '{earlier}'",
+                item.to_sexpr()
+            ),
+        );
+    }
+}
+
+fn validate_stop_quiet(ctx: &mut Ctx<'_>, quiet: Option<&SpannedExpr>) {
+    let Some(quiet) = quiet else {
+        return;
+    };
+    ctx.require_std(quiet.span, FortranStandard::F2018, "QUIET= specifier");
+    let metadata = validation_expr_metadata(ctx, quiet);
+    let wrong_type = metadata
+        .type_info
+        .as_ref()
+        .is_some_and(|ty| !matches!(ty, TypeInfo::Logical { .. }));
+    let wrong_rank = metadata.rank.is_some_and(|rank| rank != 0);
+    if wrong_type || wrong_rank {
+        ctx.error(quiet.span, "QUIET= expression must be a scalar LOGICAL");
+    }
+}
+
+fn validate_arithmetic_if_expr(ctx: &mut Ctx<'_>, expr: &SpannedExpr) {
+    let metadata = validation_expr_metadata(ctx, expr);
+    let wrong_type = metadata.type_info.as_ref().is_some_and(|ty| {
+        !matches!(
+            ty,
+            TypeInfo::Integer { .. } | TypeInfo::Real { .. } | TypeInfo::DoublePrecision
+        )
+    });
+    let wrong_rank = metadata.rank.is_some_and(|rank| rank != 0);
+    if wrong_type || wrong_rank {
+        ctx.error(
+            expr.span,
+            "arithmetic IF expression must be a scalar INTEGER or REAL",
+        );
+    }
+}
+
+fn validate_inquire_stmt(
+    ctx: &mut Ctx<'_>,
+    stmt_span: Span,
+    specs: &[IoControl],
+    items: &[SpannedExpr],
+) {
+    let iolength_specs: Vec<_> = specs
+        .iter()
+        .filter(|spec| {
+            spec.keyword
+                .as_deref()
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case("iolength"))
+        })
+        .collect();
+
+    if iolength_specs.is_empty() {
+        if !items.is_empty() {
+            ctx.error(stmt_span, "INQUIRE output-item-list requires IOLENGTH=");
+        }
+        return;
+    }
+
+    if specs.len() != 1 || iolength_specs.len() != 1 {
+        ctx.error(
+            stmt_span,
+            "INQUIRE(IOLENGTH=) may not be combined with other specifiers",
+        );
+    }
+    if items.is_empty() {
+        ctx.error(stmt_span, "INQUIRE(IOLENGTH=) requires an output-item-list");
+    }
+
+    let result = &iolength_specs[0].value;
+    let metadata = validation_expr_metadata(ctx, result);
+    let scalar_integer = matches!(metadata.type_info, Some(TypeInfo::Integer { .. }))
+        && metadata.rank.is_none_or(|rank| rank == 0);
+    let definable = actual_is_definable(ctx, result, false).is_none_or(|value| value);
+    if !scalar_integer || !definable {
+        ctx.error(
+            result.span,
+            "INQUIRE(IOLENGTH=) result must be a definable scalar INTEGER variable",
+        );
+    }
+}
+
+fn visit_io_branch_labels(stmt: &Stmt, mut visit: impl FnMut(u64)) {
+    let controls = match stmt {
+        Stmt::Write { controls, .. } | Stmt::Read { controls, .. } => controls,
+        Stmt::Open { specs }
+        | Stmt::Close { specs }
+        | Stmt::Inquire { specs, .. }
+        | Stmt::Rewind { specs }
+        | Stmt::Backspace { specs }
+        | Stmt::Endfile { specs }
+        | Stmt::Flush { specs }
+        | Stmt::Wait { specs } => specs,
+        _ => return,
+    };
+    for control in controls {
+        let is_branch = control.keyword.as_deref().is_some_and(|keyword| {
+            matches!(keyword.to_ascii_lowercase().as_str(), "err" | "end" | "eor")
+        });
+        if !is_branch {
+            continue;
+        }
+        if let Expr::IntegerLiteral { text, .. } = &control.value.node {
+            if let Ok(label) = text.parse::<u64>() {
+                visit(label);
+            }
+        }
+    }
+}
+
 fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
     validate_stmt_const_int_exprs(ctx, stmt);
     validate_stmt_enum_usage(ctx, stmt);
+    if ctx.in_pure {
+        check_pure_stmt_expr_calls(ctx, stmt);
+    }
+    visit_io_branch_labels(&stmt.node, |label| {
+        ctx.labels_referenced.push((label, stmt.span));
+    });
 
     match &stmt.node {
         // ---- Assignment ----
@@ -4721,9 +5572,6 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 stmt.span,
                 resolves_defined_assignment,
             );
-            if ctx.in_pure {
-                check_pure_expr_calls(ctx, value);
-            }
             if polymorphic_allocatable_target(ctx, target)
                 && !assignment_uses_defined_assignment(ctx, target, value)
             {
@@ -4748,6 +5596,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         } => {
             if let Some(type_spec) = type_spec {
                 validate_supported_character_type_spec(ctx, stmt.span, type_spec);
+                validate_visible_type_spec(ctx, stmt.span, type_spec);
             }
             let option_presence =
                 validate_allocation_options(ctx, stmt.span, "ALLOCATE", opts, type_spec.is_some());
@@ -4762,6 +5611,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             if has_source && has_mold {
                 ctx.error(stmt.span, "ALLOCATE cannot specify both SOURCE= and MOLD=");
             }
+            validate_distinct_allocation_objects(ctx, items, "ALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
@@ -4781,6 +5631,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         }
         Stmt::Deallocate { items, opts } => {
             validate_allocation_options(ctx, stmt.span, "DEALLOCATE", opts, false);
+            validate_distinct_allocation_objects(ctx, items, "DEALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
             }
@@ -4795,7 +5646,6 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::Print { .. }
         | Stmt::Open { .. }
         | Stmt::Close { .. }
-        | Stmt::Inquire { .. }
         | Stmt::Rewind { .. }
         | Stmt::Backspace { .. }
         | Stmt::Endfile { .. }
@@ -4805,15 +5655,25 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         {
             ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
         }
+        Stmt::Inquire { specs, items } => {
+            if ctx.in_pure {
+                ctx.error(stmt.span, "I/O statement not allowed in pure procedure");
+            }
+            validate_inquire_stmt(ctx, stmt.span, specs, items);
+        }
 
         // ---- STOP / ERROR STOP in pure ----
         // F2018 §11.4 forbids STOP in pure procedures; F2023 §11.4 explicitly
         // permits ERROR STOP in pure procedures, which stdlib relies on.
-        Stmt::Stop { .. } if ctx.in_pure => {
-            ctx.error(stmt.span, "STOP not allowed in pure procedure");
+        Stmt::Stop { quiet, .. } => {
+            if ctx.in_pure {
+                ctx.error(stmt.span, "STOP not allowed in pure procedure");
+            }
+            validate_stop_quiet(ctx, quiet.as_ref());
         }
-        Stmt::ErrorStop { .. } => {
+        Stmt::ErrorStop { quiet, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "ERROR STOP");
+            validate_stop_quiet(ctx, quiet.as_ref());
         }
 
         // ---- GOTO / labels ----
@@ -4826,8 +5686,14 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 ctx.labels_referenced.push((*label, stmt.span));
             }
         }
-        Stmt::ArithmeticIf { neg, zero, pos, .. } => {
+        Stmt::ArithmeticIf {
+            expr,
+            neg,
+            zero,
+            pos,
+        } => {
             warn_legacy_feature(ctx, stmt.span, "arithmetic IF");
+            validate_arithmetic_if_expr(ctx, expr);
             ctx.labels_referenced.push((*neg, stmt.span));
             ctx.labels_referenced.push((*zero, stmt.span));
             ctx.labels_referenced.push((*pos, stmt.span));
@@ -4873,6 +5739,62 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
         Stmt::DoConcurrent { body, .. } => {
             ctx.require_std(stmt.span, FortranStandard::F2008, "DO CONCURRENT");
             validate_stmts(ctx, body);
+        }
+        Stmt::SelectType {
+            selector,
+            assoc_name,
+            guards,
+            ..
+        } => {
+            ctx.require_std(stmt.span, FortranStandard::F2003, "SELECT TYPE");
+            let refined_name = assoc_name.as_deref().or(match &selector.node {
+                Expr::Name { name } => Some(name.as_str()),
+                _ => None,
+            });
+            let selector_type = validation_expr_type_info(ctx, selector);
+            let selector_rank = validation_expr_rank(ctx, selector);
+            for guard in guards {
+                let (body, refined_type) = match guard {
+                    TypeGuard::TypeIs { type_name, body }
+                    | TypeGuard::ClassIs { type_name, body } => {
+                        validate_visible_raw_type_spec(ctx, stmt.span, type_name);
+                        (
+                            body,
+                            validation_array_constructor_type_info(
+                                ctx,
+                                Some(type_name.as_str()),
+                                &[],
+                            ),
+                        )
+                    }
+                    TypeGuard::ClassDefault { body } => (body, selector_type.clone()),
+                };
+                let mut refinement = HashMap::new();
+                if let (Some(name), Some(type_info)) = (refined_name, refined_type) {
+                    refinement.insert(
+                        name.to_lowercase(),
+                        BlockBindingAttrs {
+                            type_info: Some(type_info),
+                            rank: selector_rank,
+                            ..BlockBindingAttrs::default()
+                        },
+                    );
+                }
+                ctx.block_decl_frames.push(refinement);
+                validate_stmts(ctx, body);
+                ctx.block_decl_frames.pop();
+            }
+        }
+        Stmt::SelectRank { guards, .. } => {
+            ctx.require_std(stmt.span, FortranStandard::F2018, "SELECT RANK");
+            for guard in guards {
+                let body = match guard {
+                    RankGuard::Rank { body, .. }
+                    | RankGuard::RankStar { body }
+                    | RankGuard::RankDefault { body } => body,
+                };
+                validate_stmts(ctx, body);
+            }
         }
         Stmt::SelectCase { cases, .. } => {
             validate_select_case_arms(ctx, stmt.span, cases);
@@ -4928,23 +5850,27 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                 body,
             );
             validate_decls(ctx, uses);
-            validate_decls(ctx, implicit);
-            validate_decls(ctx, decls);
             for iface in ifaces {
                 validate_unit(ctx, iface);
             }
-            let frame = block_binding_frame(ctx, stmt.span, decls);
             let mut ambiguity_bindings = HashSet::new();
             collect_block_binding_names(decls, &mut ambiguity_bindings);
             extend_declared_names_from_ifaces(&mut ambiguity_bindings, ifaces);
+            let mut named_types = HashSet::new();
+            collect_block_named_type_names(decls, &mut named_types);
             ctx.ambiguity_lexical_frames
                 .push(AmbiguityLexicalFrame::Block {
                     span: stmt.span,
                     scope_id: ctx.st.statement_block_scope(stmt.span),
                     uses: uses.clone(),
                     bindings: ambiguity_bindings,
-                    import_control,
+                    named_types,
+                    import_control: Box::new(import_control),
                 });
+            validate_decls(ctx, implicit);
+            validate_block_dimension_implicit_types(ctx, stmt.span, implicit, decls);
+            validate_decls(ctx, decls);
+            let frame = block_binding_frame(ctx, stmt.span, implicit, decls);
             ctx.block_decl_frames.push(frame);
             validate_stmts(ctx, body);
             ctx.block_decl_frames.pop();
@@ -4964,10 +5890,21 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
                     });
                 if intrinsic_move_alloc {
                     ctx.require_std(stmt.span, FortranStandard::F2003, "MOVE_ALLOC");
-                    validate_move_alloc_polymorphic_ownership(ctx, args);
+                    validate_move_alloc_arguments(ctx, args);
                 }
                 if name.eq_ignore_ascii_case("system_clock") && ctx.lookup(name).is_none() {
                     validate_system_clock_args(ctx, args, stmt.span);
+                }
+                if name.eq_ignore_ascii_case("random_init")
+                    && !intrinsic_name_is_shadowed(ctx, "random_init")
+                {
+                    ctx.require_std(stmt.span, FortranStandard::F2018, "RANDOM_INIT");
+                    validate_random_init_args(ctx, args, stmt.span);
+                }
+                if name.eq_ignore_ascii_case("execute_command_line")
+                    && !intrinsic_name_is_shadowed(ctx, "execute_command_line")
+                {
+                    validate_execute_command_line_cmdmsg(ctx, args);
                 }
             }
             if let Some(name) = call_target_function_name(ctx, callee) {
@@ -5147,15 +6084,30 @@ fn derived_type_name_for_expr(
 ) -> Option<String> {
     match &expr.node {
         Expr::Name { name } => ctx
-            .lookup(name)
-            .and_then(|sym| sym.type_info.as_ref())
-            .and_then(derived_type_name_from_type_info),
+            .associate_binding_type_info(name)
+            .and_then(derived_type_name_from_type_info)
+            .or_else(|| {
+                ctx.block_binding_attrs(name)
+                    .and_then(|binding| binding.type_info.as_ref())
+                    .and_then(derived_type_name_from_type_info)
+            })
+            .or_else(|| {
+                ctx.lookup_lexical(name)
+                    .and_then(|sym| sym.type_info.as_ref())
+                    .and_then(derived_type_name_from_type_info)
+            }),
         Expr::ParenExpr { inner } => derived_type_name_for_expr(ctx, inner),
         Expr::FunctionCall { callee, .. } => {
             let Expr::Name { name } = &callee.node else {
                 return derived_type_name_for_expr(ctx, callee);
             };
-            let symbol = ctx.lookup(name)?;
+            if let Some(type_name) = ctx
+                .block_array_element_type_info(name)
+                .and_then(derived_type_name_from_type_info)
+            {
+                return Some(type_name);
+            }
+            let symbol = ctx.lookup_lexical(name)?;
             if matches!(symbol.kind, SymbolKind::DerivedType) {
                 Some(symbol.name.clone())
             } else {
@@ -5463,8 +6415,12 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
     }
     let resolved = match &expr.node {
         Expr::Name { name } => ctx
-            .block_binding_attrs(name)
-            .and_then(|binding| binding.type_info.clone())
+            .associate_binding_type_info(name)
+            .cloned()
+            .or_else(|| {
+                ctx.block_binding_attrs(name)
+                    .and_then(|binding| binding.type_info.clone())
+            })
             .or_else(|| {
                 ctx.lookup_lexical(name)
                     .and_then(|symbol| symbol.type_info.clone())
@@ -5499,6 +6455,9 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                 let leaf = leaf_field_layout(ctx, expr)?;
                 return (!leaf.field.procedure_pointer).then(|| leaf.field.type_info.clone());
             };
+            if let Some(type_info) = ctx.block_array_element_type_info(name) {
+                return Some(type_info.clone());
+            }
             if let Some((type_info, _)) = named_generic_call_result_metadata(ctx, name, args) {
                 return Some(type_info);
             }
@@ -5529,12 +6488,15 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     .collect();
                 if let Some(arg_types) = arg_types {
                     let key = name.to_ascii_lowercase();
-                    let kind_position = match key.as_str() {
+                    let kind_position = crate::sema::types::character_integer_result_kind_position(
+                        &key,
+                    )
+                    .or(match key.as_str() {
                         "cmplx" => Some(2),
                         "int" | "nint" | "floor" | "ceiling" | "real" | "logical" | "char"
-                        | "achar" | "ichar" | "iachar" => Some(1),
+                        | "achar" => Some(1),
                         _ => None,
-                    };
+                    });
                     let requested_kind = kind_position
                         .and_then(|position| call_rank_argument_expr(args, position, &["kind"]))
                         .and_then(|kind_expr| {
@@ -5543,7 +6505,8 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                         .and_then(|value| u8::try_from(value.value).ok());
                     if let Some(kind) = requested_kind {
                         let type_info = match key.as_str() {
-                            "int" | "nint" | "floor" | "ceiling" | "ichar" | "iachar" => {
+                            "int" | "nint" | "floor" | "ceiling" | "len" | "len_trim" | "index"
+                            | "scan" | "verify" | "ichar" | "iachar" => {
                                 TypeInfo::Integer { kind: Some(kind) }
                             }
                             "real" => TypeInfo::Real { kind: Some(kind) },
@@ -5746,6 +6709,149 @@ fn intrinsic_assignment_types_compatible(
     }
 }
 
+fn validation_const_int_value(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<i128> {
+    eval_const_int_expr_checked(ctx, expr)
+        .ok()
+        .flatten()
+        .map(|value| value.value)
+}
+
+fn validation_explicit_dim_bounds(
+    ctx: &Ctx<'_>,
+    spec: &crate::ast::decl::ArraySpec,
+) -> Option<(i128, i128)> {
+    let crate::ast::decl::ArraySpec::Explicit { lower, upper } = spec else {
+        return None;
+    };
+    let lower = lower
+        .as_ref()
+        .map(|lower| validation_const_int_value(ctx, lower))
+        .unwrap_or(Some(1))?;
+    Some((lower, validation_const_int_value(ctx, upper)?))
+}
+
+fn validation_extent(lower: i128, upper: i128) -> Option<i128> {
+    if upper < lower {
+        Some(0)
+    } else {
+        upper.checked_sub(lower)?.checked_add(1)
+    }
+}
+
+fn validation_section_extent(start: i128, end: i128, stride: i128) -> Option<i128> {
+    if stride > 0 {
+        if end < start {
+            Some(0)
+        } else {
+            end.checked_sub(start)?.checked_div(stride)?.checked_add(1)
+        }
+    } else if stride < 0 {
+        if end > start {
+            Some(0)
+        } else {
+            start
+                .checked_sub(end)?
+                .checked_div(stride.checked_neg()?)?
+                .checked_add(1)
+        }
+    } else {
+        None
+    }
+}
+
+fn validation_provable_array_shape(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<Vec<i128>> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => validation_provable_array_shape(ctx, inner),
+        Expr::Name { name } => {
+            let symbol = ctx.lookup_lexical(name)?;
+            if symbol.attrs.array_spec.is_empty() {
+                return None;
+            }
+            symbol
+                .attrs
+                .array_spec
+                .iter()
+                .map(|spec| {
+                    let (lower, upper) = validation_explicit_dim_bounds(ctx, spec)?;
+                    validation_extent(lower, upper)
+                })
+                .collect()
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let symbol = ctx.lookup_lexical(name)?;
+            if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter)
+                || symbol.attrs.array_spec.len() != args.len()
+            {
+                return None;
+            }
+
+            let mut shape = Vec::new();
+            for (arg, spec) in args.iter().zip(&symbol.attrs.array_spec) {
+                match &arg.value {
+                    SectionSubscript::Element(index) => {
+                        if validation_expr_rank(ctx, index).is_some_and(|rank| rank > 0) {
+                            return None;
+                        }
+                    }
+                    SectionSubscript::Range { start, end, stride } => {
+                        let stride = stride
+                            .as_ref()
+                            .map(|stride| validation_const_int_value(ctx, stride))
+                            .unwrap_or(Some(1))?;
+                        let declared_bounds = validation_explicit_dim_bounds(ctx, spec);
+                        let start = start
+                            .as_ref()
+                            .map(|start| validation_const_int_value(ctx, start))
+                            .unwrap_or_else(|| {
+                                declared_bounds.map(
+                                    |(lower, upper)| {
+                                        if stride > 0 {
+                                            lower
+                                        } else {
+                                            upper
+                                        }
+                                    },
+                                )
+                            })?;
+                        let end = end
+                            .as_ref()
+                            .map(|end| validation_const_int_value(ctx, end))
+                            .unwrap_or_else(|| {
+                                declared_bounds.map(
+                                    |(lower, upper)| {
+                                        if stride > 0 {
+                                            upper
+                                        } else {
+                                            lower
+                                        }
+                                    },
+                                )
+                            })?;
+                        shape.push(validation_section_extent(start, end, stride)?);
+                    }
+                }
+            }
+            Some(shape)
+        }
+        _ => None,
+    }
+}
+
+fn intrinsic_assignment_target_reallocates(ctx: &Ctx<'_>, target: &SpannedExpr) -> bool {
+    match &target.node {
+        Expr::Name { name } => ctx
+            .lookup_lexical(name)
+            .is_some_and(|symbol| symbol.attrs.allocatable),
+        Expr::ComponentAccess { .. } => {
+            leaf_field_layout(ctx, target).is_some_and(|leaf| leaf.field.allocatable)
+        }
+        _ => false,
+    }
+}
+
 fn validate_intrinsic_assignment(
     ctx: &mut Ctx<'_>,
     target: &SpannedExpr,
@@ -5757,10 +6863,9 @@ fn validate_intrinsic_assignment(
         return;
     }
 
-    if let (Some(target_rank), Some(value_rank)) = (
-        validation_expr_rank(ctx, target),
-        validation_expr_rank(ctx, value),
-    ) {
+    let target_rank = validation_expr_rank(ctx, target);
+    let value_rank = validation_expr_rank(ctx, value);
+    if let (Some(target_rank), Some(value_rank)) = (target_rank, value_rank) {
         if value_rank != 0 && target_rank != value_rank {
             ctx.error(
                 span,
@@ -5777,7 +6882,8 @@ fn validate_intrinsic_assignment(
     let Some(value_type) = validation_expr_type_info(ctx, value) else {
         return;
     };
-    if !intrinsic_assignment_types_compatible(ctx, &target_type, &value_type) {
+    let types_compatible = intrinsic_assignment_types_compatible(ctx, &target_type, &value_type);
+    if !types_compatible {
         ctx.error(
             value.span,
             format!(
@@ -5786,6 +6892,35 @@ fn validate_intrinsic_assignment(
                 intrinsic_assignment_type_name(&target_type)
             ),
         );
+    }
+
+    let target_is_derived = matches!(target_type, TypeInfo::Derived(_) | TypeInfo::Class(_));
+    if types_compatible
+        && target_is_derived
+        && value_rank.is_some_and(|rank| rank > 0)
+        && !intrinsic_assignment_target_reallocates(ctx, target)
+    {
+        if let (Some(target_shape), Some(value_shape)) = (
+            validation_provable_array_shape(ctx, target),
+            validation_provable_array_shape(ctx, value),
+        ) {
+            if let Some((dimension, (target_extent, value_extent))) = target_shape
+                .iter()
+                .zip(&value_shape)
+                .enumerate()
+                .find(|(_, (target_extent, value_extent))| target_extent != value_extent)
+            {
+                ctx.error(
+                    value.span,
+                    format!(
+                        "intrinsic assignment shape mismatch in dimension {}: target extent {}, value extent {}",
+                        dimension + 1,
+                        target_extent,
+                        value_extent
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -5949,25 +7084,7 @@ fn candidate_symbol<'a>(
 }
 
 fn result_symbol_in_procedure_scope(scope: &Scope) -> Option<&Symbol> {
-    let ScopeKind::Function(function_name) = &scope.kind else {
-        return None;
-    };
-    let argument_names: HashSet<_> = scope
-        .arg_order
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
-    scope
-        .symbols
-        .get(&function_name.to_ascii_lowercase())
-        .filter(|symbol| !argument_names.contains(&symbol.name.to_ascii_lowercase()))
-        .or_else(|| {
-            scope.symbols.iter().find_map(|(name, symbol)| {
-                (!argument_names.contains(name)
-                    && matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter))
-                .then_some(symbol)
-            })
-        })
+    scope.procedure_result_symbol()
 }
 
 fn generic_dummy_type_matches(
@@ -6745,16 +7862,135 @@ fn call_argument_expr<'a>(
     Some(expr)
 }
 
-fn validate_move_alloc_polymorphic_ownership(
+struct MoveAllocCharacteristics {
+    type_info: TypeInfo,
+    rank: usize,
+    polymorphic: bool,
+}
+
+fn move_alloc_characteristics(
     ctx: &mut Ctx<'_>,
-    args: &[crate::ast::expr::Argument],
-) {
+    expr: &SpannedExpr,
+    role: &str,
+) -> Option<MoveAllocCharacteristics> {
+    let (allocatable, type_info) = match &expr.node {
+        Expr::Name { name } => {
+            if ctx.is_associate_name(name) {
+                (false, ctx.associate_binding_type_info(name).cloned())
+            } else if let Some(binding) = ctx.block_binding_attrs(name) {
+                (binding.allocatable, binding.type_info.clone())
+            } else {
+                let symbol = ctx.lookup_lexical(name)?;
+                (
+                    symbol.kind == SymbolKind::Variable && symbol.attrs.allocatable,
+                    symbol.type_info.clone(),
+                )
+            }
+        }
+        Expr::ComponentAccess { base, .. } => {
+            let leaf = leaf_field_layout(ctx, expr)?;
+            let scalar_base = validation_expr_rank(ctx, base).is_none_or(|rank| rank == 0);
+            (
+                leaf.field.allocatable && scalar_base,
+                Some(leaf.field.type_info.clone()),
+            )
+        }
+        _ => (false, validation_expr_type_info(ctx, expr)),
+    };
+
+    let definable = actual_is_definable(ctx, expr, true).unwrap_or(true);
+    if !allocatable || !definable {
+        ctx.error(
+            expr.span,
+            format!("MOVE_ALLOC {role} argument must be a definable allocatable variable"),
+        );
+        return None;
+    }
+
+    let type_info = type_info?;
+    let rank = validation_expr_rank(ctx, expr)?;
+    let polymorphic = matches!(type_info, TypeInfo::Class(_) | TypeInfo::ClassStar);
+    Some(MoveAllocCharacteristics {
+        type_info,
+        rank,
+        polymorphic,
+    })
+}
+
+fn move_alloc_nondeferred_type_parameters_match(source: &TypeInfo, target: &TypeInfo) -> bool {
+    match (source, target) {
+        (
+            TypeInfo::Character {
+                len: Some(source), ..
+            },
+            TypeInfo::Character {
+                len: Some(target), ..
+            },
+        ) => source == target,
+        _ => true,
+    }
+}
+
+fn move_alloc_type_name(type_info: &TypeInfo) -> String {
+    match type_info {
+        TypeInfo::Character { len, kind } => format!(
+            "CHARACTER(kind={},len={})",
+            kind.unwrap_or(1),
+            len.map_or_else(|| ":".to_string(), |len| len.to_string())
+        ),
+        _ => intrinsic_assignment_type_name(type_info),
+    }
+}
+
+fn validate_move_alloc_arguments(ctx: &mut Ctx<'_>, args: &[crate::ast::expr::Argument]) {
     let Some(source) = call_argument_expr(args, 0, "from") else {
         return;
     };
     let Some(target) = call_argument_expr(args, 1, "to") else {
         return;
     };
+
+    let source_characteristics = move_alloc_characteristics(ctx, source, "FROM");
+    let target_characteristics = move_alloc_characteristics(ctx, target, "TO");
+
+    if let (Some(source_info), Some(target_info)) =
+        (&source_characteristics, &target_characteristics)
+    {
+        if source_info.rank != target_info.rank {
+            ctx.error(
+                target.span,
+                format!(
+                    "MOVE_ALLOC FROM and TO arguments must have the same rank (got rank-{} and rank-{})",
+                    source_info.rank, target_info.rank
+                ),
+            );
+        }
+        if source_info.polymorphic && !target_info.polymorphic {
+            ctx.error(
+                target.span,
+                "MOVE_ALLOC TO argument must be polymorphic when FROM is polymorphic",
+            );
+        } else if !generic_type_compatible(
+            ctx,
+            ctx.scope_id,
+            &target_info.type_info,
+            ctx.scope_id,
+            &source_info.type_info,
+        ) || !move_alloc_nondeferred_type_parameters_match(
+            &source_info.type_info,
+            &target_info.type_info,
+        ) {
+            ctx.error(
+                target.span,
+                format!(
+                    "MOVE_ALLOC FROM and TO arguments must have compatible declared type and kind with matching nondeferred type parameters (got {} and {})",
+                    move_alloc_type_name(&source_info.type_info),
+                    move_alloc_type_name(&target_info.type_info)
+                ),
+            );
+        }
+    }
+
     if !polymorphic_allocatable_target(ctx, target) {
         return;
     }
@@ -6796,6 +8032,58 @@ fn layout_component_type_info(
     None
 }
 
+fn scope_has_private_component_access(ctx: &Ctx<'_>, owner_module: &str) -> bool {
+    let mut scope_id = Some(ctx.lexical_scope_id());
+    while let Some(current) = scope_id {
+        let scope = ctx.st.scope(current);
+        if matches!(
+            &scope.kind,
+            ScopeKind::Module(name) if name.eq_ignore_ascii_case(owner_module)
+        ) || (matches!(scope.kind, ScopeKind::Submodule(_))
+            && scope
+                .submodule_ancestor
+                .as_deref()
+                .is_some_and(|ancestor| ancestor.eq_ignore_ascii_case(owner_module)))
+        {
+            return true;
+        }
+        scope_id = scope.parent;
+    }
+    false
+}
+
+fn field_is_accessible(ctx: &Ctx<'_>, field: &crate::sema::type_layout::FieldLayout) -> bool {
+    if field.access != Access::Private {
+        return true;
+    }
+    // PRIVATE components outside a module specification part are diagnosed
+    // at their declarations. Avoid cascading an access error when such a
+    // source-only layout has no meaningful module owner.
+    field
+        .owner_module
+        .as_deref()
+        .is_none_or(|owner| scope_has_private_component_access(ctx, owner))
+}
+
+fn report_inaccessible_component(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    component: &str,
+    base_type: &str,
+    owner_module: Option<&str>,
+) {
+    let owner = owner_module
+        .map(|module| format!(" (declared in module '{}')", module))
+        .unwrap_or_default();
+    ctx.error(
+        span,
+        format!(
+            "private component '{}' of derived type '{}' is not accessible in this scope{}",
+            component, base_type, owner
+        ),
+    );
+}
+
 fn resolve_component_access_type(
     ctx: &Ctx<'_>,
     expr: &crate::ast::expr::SpannedExpr,
@@ -6809,7 +8097,10 @@ fn resolve_component_access_type(
     let Some(layouts) = ctx.type_layouts else {
         return Ok(None);
     };
-    let Some(layout) = layouts.get(&base_type) else {
+    let Some(layout) = layouts
+        .get_for_scope(ctx.lexical_scope_id(), &base_type)
+        .or_else(|| layouts.get(&base_type))
+    else {
         return Ok(None);
     };
     let Some(type_info) = layout_component_type_info(layout, component, layouts) else {
@@ -6822,6 +8113,28 @@ fn resolve_component_access_type(
 }
 
 fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    if let Expr::ComponentAccess { base, component } = &expr.node {
+        if let (Some(base_type), Some(layouts)) =
+            (derived_type_name_for_expr(ctx, base), ctx.type_layouts)
+        {
+            if let Some(layout) = layouts
+                .get_for_scope(ctx.lexical_scope_id(), &base_type)
+                .or_else(|| layouts.get(&base_type))
+            {
+                if let Some(field) = layout.field(component) {
+                    if !field_is_accessible(ctx, field) {
+                        report_inaccessible_component(
+                            ctx,
+                            expr.span,
+                            component,
+                            &base_type,
+                            field.owner_module.as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     if let Err((span, component, base_type)) = resolve_component_access_type(ctx, expr) {
         ctx.error(
             span,
@@ -6830,6 +8143,66 @@ fn validate_component_access(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Spanned
                 component, base_type
             ),
         );
+    }
+}
+
+fn validate_structure_constructor_component_access(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    type_name: &str,
+    args: &[Argument],
+) {
+    let Some(layouts) = ctx.type_layouts else {
+        return;
+    };
+    let Some(layout) = layouts
+        .get_for_scope(ctx.lexical_scope_id(), type_name)
+        .or_else(|| layouts.get(type_name))
+    else {
+        return;
+    };
+
+    let first_positional_type = args
+        .first()
+        .filter(|argument| argument.keyword.is_none())
+        .and_then(|argument| match &argument.value {
+            SectionSubscript::Element(value) => validation_expr_type_info(ctx, value),
+            SectionSubscript::Range { .. } => None,
+        });
+    let positional_parent = crate::sema::type_layout::structure_constructor_uses_positional_parent(
+        layout,
+        layouts,
+        first_positional_type.as_ref(),
+    );
+    let mut positional_index = 0usize;
+    for argument in args {
+        let field = crate::sema::type_layout::structure_constructor_field(
+            layout,
+            layouts,
+            argument.keyword.as_deref(),
+            positional_index,
+            positional_parent,
+        );
+        if argument.keyword.is_none() {
+            positional_index += 1;
+        }
+        let Some(field) = field else {
+            continue;
+        };
+        let field = field.as_ref();
+        if !field_is_accessible(ctx, field) {
+            let argument_span = match &argument.value {
+                SectionSubscript::Element(value) => value.span,
+                SectionSubscript::Range { .. } => span,
+            };
+            report_inaccessible_component(
+                ctx,
+                argument_span,
+                &field.name,
+                type_name,
+                field.owner_module.as_deref(),
+            );
+        }
     }
 }
 
@@ -6872,24 +8245,8 @@ fn validate_assignment_target(ctx: &mut Ctx, target: &crate::ast::expr::SpannedE
     }
 }
 
-/// Validate pointer assignment: LHS must be pointer, RHS must be target/pointer.
-/// Validate that an ALLOCATE/DEALLOCATE item is allocatable or pointer.
-///
-/// For a component access like `pools(i)%tokens(n)`, the target is
-/// the `tokens` field — not the `pools` base.  Resolve the leaf
-/// component through the type-layout registry and check its own
-/// attributes.  Bare-name targets still get the symbol attribute
-/// check.  If the chain can't be resolved (registry missing, cross-
-/// TU stale .amod, etc.) we skip rather than produce a misleading
-/// error.
-/// Check if a call in a pure procedure is to a known impure procedure.
-/// Symbol-level pure tracking isn't yet wired into the symbol table,
-/// so this is conservative: we warn if the callee resolves to an
-/// external procedure (whose body we cannot inspect).  I/O, STOP,
-/// and SAVE violations are caught statement-level in validate_stmt.
-/// Walk an expression tree and check any function calls against the
-/// pure-call constraint.  Catches `r = impure_fn()` which is an
-/// expression-level call, not a `Stmt::Call`.
+/// Whether an I/O control list selects a character expression as its internal
+/// file instead of an external unit.
 fn uses_internal_character_file(ctx: &Ctx, controls: &[IoControl]) -> bool {
     let Some(unit) = controls.iter().find(|control| {
         control
@@ -6974,6 +8331,113 @@ fn validate_system_clock_args(ctx: &mut Ctx, args: &[crate::ast::expr::Argument]
     }
 }
 
+/// F2018 RANDOM_INIT has two required scalar LOGICAL INTENT(IN)
+/// arguments. Intrinsics have no user-declared explicit
+/// interface to drive the generic call validator, so validate their
+/// positional and keyword associations here.
+fn validate_random_init_args(ctx: &mut Ctx, args: &[Argument], span: Span) {
+    const FORMALS: [&str; 2] = ["repeatable", "image_distinct"];
+    let mut associated = [false; FORMALS.len()];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let arg_span = argument_span(arg, span);
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            let Some(index) = FORMALS
+                .iter()
+                .position(|formal| formal.eq_ignore_ascii_case(keyword))
+            else {
+                ctx.error(
+                    arg_span,
+                    format!(
+                        "unknown keyword argument '{}' in call to 'random_init'",
+                        keyword
+                    ),
+                );
+                continue;
+            };
+            index
+        } else {
+            if saw_keyword {
+                ctx.error(
+                    arg_span,
+                    "positional argument follows a keyword argument in call to 'random_init'",
+                );
+                continue;
+            }
+            let index = positional;
+            positional += 1;
+            if index >= FORMALS.len() {
+                continue;
+            }
+            index
+        };
+
+        if associated[index] {
+            ctx.error(
+                arg_span,
+                format!(
+                    "argument '{}' is associated more than once in call to 'random_init'",
+                    FORMALS[index]
+                ),
+            );
+            continue;
+        }
+        associated[index] = true;
+
+        let SectionSubscript::Element(actual) = &arg.value else {
+            ctx.error(
+                arg_span,
+                format!(
+                    "RANDOM_INIT argument '{}' must be scalar",
+                    FORMALS[index].to_ascii_uppercase()
+                ),
+            );
+            continue;
+        };
+        if !matches!(
+            validation_expr_type_info(ctx, actual),
+            Some(TypeInfo::Logical { .. })
+        ) {
+            ctx.error(
+                actual.span,
+                format!(
+                    "RANDOM_INIT argument '{}' must be LOGICAL",
+                    FORMALS[index].to_ascii_uppercase()
+                ),
+            );
+        }
+        if validation_expr_rank(ctx, actual).is_some_and(|rank| rank != 0) {
+            ctx.error(
+                actual.span,
+                format!(
+                    "RANDOM_INIT argument '{}' must be scalar",
+                    FORMALS[index].to_ascii_uppercase()
+                ),
+            );
+        }
+    }
+}
+
+fn validate_execute_command_line_cmdmsg(ctx: &mut Ctx<'_>, args: &[Argument]) {
+    let Some(cmdmsg) = call_rank_argument_expr(args, 4, &["cmdmsg"]) else {
+        return;
+    };
+    let is_scalar_character = matches!(
+        validation_expr_type_info(ctx, cmdmsg),
+        Some(TypeInfo::Character { .. })
+    ) && validation_expr_rank(ctx, cmdmsg).is_none_or(|rank| rank == 0);
+    let is_definable = actual_is_definable(ctx, cmdmsg, false).is_none_or(|value| value);
+    if !is_scalar_character || !is_definable {
+        ctx.error(
+            cmdmsg.span,
+            "EXECUTE_COMMAND_LINE CMDMSG must be a scalar CHARACTER variable",
+        );
+    }
+}
+
 fn call_target_function_name(
     ctx: &Ctx<'_>,
     callee: &crate::ast::expr::SpannedExpr,
@@ -6991,6 +8455,635 @@ enum DirectProcedureKind {
     Subroutine,
 }
 
+struct GenericSpecificCharacteristics {
+    name: String,
+    owner_scope: ScopeId,
+    procedure: GenericProcedureCharacteristics,
+}
+
+struct GenericProcedureCharacteristics {
+    kind: DirectProcedureKind,
+    dummies: Vec<GenericDummyCharacteristics>,
+    result: Option<GenericProcedureResult>,
+    complete: bool,
+}
+
+struct GenericDummyCharacteristics {
+    name: String,
+    optional: bool,
+    kind: GenericDummyKind,
+}
+
+enum GenericDummyKind {
+    Data(GenericDataCharacteristics),
+    Procedure(Option<Box<GenericProcedureCharacteristics>>),
+}
+
+struct GenericDataCharacteristics {
+    type_info: Option<TypeInfo>,
+    declared_scope: ScopeId,
+    rank: usize,
+    assumed_rank: bool,
+    assumed_size: bool,
+    allocatable: bool,
+    pointer: bool,
+    intent: Option<Intent>,
+}
+
+enum GenericProcedureResult {
+    Data(GenericDataCharacteristics),
+    Procedure(Option<Box<GenericProcedureCharacteristics>>),
+}
+
+fn generic_symbol_is_procedure_dummy(symbol: &Symbol) -> bool {
+    symbol.attrs.external
+        || symbol.attrs.procedure_iface.is_some()
+        || matches!(
+            symbol.kind,
+            SymbolKind::Function
+                | SymbolKind::Subroutine
+                | SymbolKind::ExternalProc
+                | SymbolKind::IntrinsicProc
+                | SymbolKind::ProcedurePointer
+        )
+}
+
+fn generic_data_characteristics(
+    symbol: &Symbol,
+    declared_scope: ScopeId,
+) -> GenericDataCharacteristics {
+    GenericDataCharacteristics {
+        type_info: symbol.type_info.clone(),
+        declared_scope,
+        rank: symbol.attrs.array_spec.len(),
+        assumed_rank: symbol
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedRank)),
+        assumed_size: symbol
+            .attrs
+            .array_spec
+            .iter()
+            .any(|spec| matches!(spec, crate::ast::decl::ArraySpec::AssumedSize { .. })),
+        allocatable: symbol.attrs.allocatable,
+        pointer: symbol.attrs.pointer,
+        intent: symbol.attrs.intent,
+    }
+}
+
+fn generic_nested_procedure_characteristics(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    visiting: &mut HashSet<ScopeId>,
+) -> Option<Box<GenericProcedureCharacteristics>> {
+    let interface_name = symbol.attrs.procedure_iface.as_deref()?;
+    let interface_symbol = ctx.st.lookup_in(symbol.scope, interface_name)?;
+    let procedure_scope =
+        assignment_candidate_scope(ctx, &interface_symbol.name, interface_symbol.scope)?;
+    build_generic_procedure_characteristics(ctx, interface_symbol, procedure_scope, visiting)
+        .map(Box::new)
+}
+
+fn generic_function_result(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    procedure_scope: &Scope,
+    declared_scope: ScopeId,
+    visiting: &mut HashSet<ScopeId>,
+) -> Option<GenericProcedureResult> {
+    let result_symbol = procedure_scope.procedure_result_symbol();
+    if let Some(result) = result_symbol.filter(|result| {
+        result.attrs.procedure_iface.is_some()
+            || matches!(result.kind, SymbolKind::ProcedurePointer)
+    }) {
+        return Some(GenericProcedureResult::Procedure(
+            generic_nested_procedure_characteristics(ctx, result, visiting),
+        ));
+    }
+
+    let type_info = symbol
+        .type_info
+        .clone()
+        .or_else(|| result_symbol.and_then(|result| result.type_info.clone()))?;
+    let metadata_symbol = result_symbol.unwrap_or(symbol);
+    let mut data = generic_data_characteristics(metadata_symbol, declared_scope);
+    data.type_info = Some(type_info);
+    data.rank = symbol_declared_result_rank(symbol)
+        .unwrap_or(0)
+        .max(data.rank)
+        .max(usize::from(metadata_symbol.attrs.result_rank));
+    Some(GenericProcedureResult::Data(data))
+}
+
+fn build_generic_procedure_characteristics(
+    ctx: &Ctx<'_>,
+    symbol: &Symbol,
+    procedure_scope: &Scope,
+    visiting: &mut HashSet<ScopeId>,
+) -> Option<GenericProcedureCharacteristics> {
+    if !visiting.insert(procedure_scope.id) {
+        return None;
+    }
+    let characteristics = (|| {
+        let kind = match procedure_scope.kind {
+            ScopeKind::Function(_) => DirectProcedureKind::Function,
+            ScopeKind::Subroutine(_) => DirectProcedureKind::Subroutine,
+            _ => return None,
+        };
+        let declared_scope = ctx
+            .type_layouts
+            .filter(|layouts| layouts.scope_path(procedure_scope.id).is_some())
+            .map_or(symbol.scope, |_| procedure_scope.id);
+        let mut complete = true;
+        let mut dummies = Vec::with_capacity(procedure_scope.arg_order.len());
+        for dummy_name in &procedure_scope.arg_order {
+            let dummy = procedure_scope
+                .symbols
+                .get(&dummy_name.to_ascii_lowercase())?;
+            let dummy_kind = if generic_symbol_is_procedure_dummy(dummy) {
+                let nested = generic_nested_procedure_characteristics(ctx, dummy, visiting);
+                complete &= nested
+                    .as_deref()
+                    .is_some_and(|characteristics| characteristics.complete);
+                GenericDummyKind::Procedure(nested)
+            } else {
+                let data = generic_data_characteristics(dummy, declared_scope);
+                complete &= data.type_info.is_some();
+                GenericDummyKind::Data(data)
+            };
+            dummies.push(GenericDummyCharacteristics {
+                name: dummy.name.to_ascii_lowercase(),
+                optional: dummy.attrs.optional,
+                kind: dummy_kind,
+            });
+        }
+        let result = (kind == DirectProcedureKind::Function)
+            .then(|| {
+                generic_function_result(ctx, symbol, procedure_scope, declared_scope, visiting)
+            })
+            .flatten();
+        Some(GenericProcedureCharacteristics {
+            kind,
+            dummies,
+            result,
+            complete,
+        })
+    })();
+    visiting.remove(&procedure_scope.id);
+    characteristics
+}
+
+fn generic_same_derived_type(
+    ctx: &Ctx<'_>,
+    left_scope: ScopeId,
+    left: &str,
+    right_scope: ScopeId,
+    right: &str,
+) -> bool {
+    let Some(layouts) = ctx.type_layouts else {
+        return left.eq_ignore_ascii_case(right);
+    };
+    let left_layout = layouts
+        .get_for_scope(left_scope, left)
+        .or_else(|| layouts.get(left));
+    let right_layout = layouts
+        .get_for_scope(right_scope, right)
+        .or_else(|| layouts.get(right));
+    match (left_layout, right_layout) {
+        (Some(left), Some(right)) => {
+            layouts.canonical_key_for_layout(left) == layouts.canonical_key_for_layout(right)
+        }
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
+fn generic_type_is_same_or_extension(
+    ctx: &Ctx<'_>,
+    actual_scope: ScopeId,
+    actual: &str,
+    declared_scope: ScopeId,
+    declared: &str,
+) -> bool {
+    let Some(layouts) = ctx.type_layouts else {
+        return actual.eq_ignore_ascii_case(declared);
+    };
+    let actual_layout = layouts
+        .get_for_scope(actual_scope, actual)
+        .or_else(|| layouts.get(actual));
+    let declared_layout = layouts
+        .get_for_scope(declared_scope, declared)
+        .or_else(|| layouts.get(declared));
+    match (actual_layout, declared_layout) {
+        (Some(actual), Some(declared)) => layouts.is_same_or_extension_of(actual, declared),
+        _ => actual.eq_ignore_ascii_case(declared),
+    }
+}
+
+fn generic_same_enumeration(
+    ctx: &Ctx<'_>,
+    left_scope: ScopeId,
+    left: &str,
+    right_scope: ScopeId,
+    right: &str,
+) -> bool {
+    if !left.eq_ignore_ascii_case(right) {
+        return false;
+    }
+    match (
+        ctx.st.lookup_in(left_scope, left),
+        ctx.st.lookup_in(right_scope, right),
+    ) {
+        (Some(left), Some(right)) => {
+            left.kind == SymbolKind::EnumerationType
+                && right.kind == SymbolKind::EnumerationType
+                && left.scope == right.scope
+        }
+        _ => true,
+    }
+}
+
+fn generic_type_compatible(
+    ctx: &Ctx<'_>,
+    left_scope: ScopeId,
+    left: &TypeInfo,
+    right_scope: ScopeId,
+    right: &TypeInfo,
+) -> bool {
+    fn kind_eq(left: Option<u8>, right: Option<u8>, default: u8) -> bool {
+        left.unwrap_or(default) == right.unwrap_or(default)
+    }
+
+    match (left, right) {
+        // Type compatibility is directional (F2023 7.3.3). An unlimited
+        // polymorphic declared type accepts every dynamic type, but the
+        // reverse is not true. Assumed type is TK-compatible only with
+        // assumed type; its permissive actual-argument rules are separate.
+        (TypeInfo::ClassStar, _) => true,
+        (_, TypeInfo::ClassStar) => false,
+        (TypeInfo::TypeStar, TypeInfo::TypeStar) => true,
+        (TypeInfo::TypeStar, _) | (_, TypeInfo::TypeStar) => false,
+        (TypeInfo::Derived(left), TypeInfo::Derived(right)) => {
+            generic_same_derived_type(ctx, left_scope, left, right_scope, right)
+        }
+        (TypeInfo::Class(left), TypeInfo::Derived(right) | TypeInfo::Class(right)) => {
+            generic_type_is_same_or_extension(ctx, right_scope, right, left_scope, left)
+        }
+        (TypeInfo::Derived(left), TypeInfo::Class(right)) => {
+            generic_same_derived_type(ctx, left_scope, left, right_scope, right)
+        }
+        (TypeInfo::Integer { kind: left }, TypeInfo::Integer { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_int_kind())
+        }
+        (TypeInfo::Real { kind: left }, TypeInfo::Real { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::DoublePrecision, TypeInfo::DoublePrecision) => true,
+        (TypeInfo::DoublePrecision, TypeInfo::Real { kind })
+        | (TypeInfo::Real { kind }, TypeInfo::DoublePrecision) => {
+            kind_eq(Some(8), *kind, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Complex { kind: left }, TypeInfo::Complex { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_real_kind())
+        }
+        (TypeInfo::Logical { kind: left }, TypeInfo::Logical { kind: right }) => {
+            kind_eq(*left, *right, crate::driver::defaults::default_int_kind())
+        }
+        (
+            TypeInfo::Character {
+                kind: left_kind, ..
+            },
+            TypeInfo::Character {
+                kind: right_kind, ..
+            },
+        ) => kind_eq(*left_kind, *right_kind, 1),
+        (TypeInfo::Enumeration(left), TypeInfo::Enumeration(right)) => {
+            generic_same_enumeration(ctx, left_scope, left, right_scope, right)
+        }
+        _ => false,
+    }
+}
+
+fn generic_data_tkr_compatible(
+    ctx: &Ctx<'_>,
+    left: &GenericDataCharacteristics,
+    right: &GenericDataCharacteristics,
+) -> bool {
+    let types_compatible = match (&left.type_info, &right.type_info) {
+        (Some(left_type), Some(right_type)) => generic_type_compatible(
+            ctx,
+            left.declared_scope,
+            left_type,
+            right.declared_scope,
+            right_type,
+        ),
+        _ => true,
+    };
+    if !types_compatible {
+        return false;
+    }
+    left.assumed_rank || right.assumed_rank || left.rank == right.rank
+}
+
+fn generic_data_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericDataCharacteristics,
+    right: &GenericDataCharacteristics,
+) -> bool {
+    let types_overlap = match (&left.type_info, &right.type_info) {
+        (Some(left_type), Some(right_type)) => {
+            generic_type_compatible(
+                ctx,
+                left.declared_scope,
+                left_type,
+                right.declared_scope,
+                right_type,
+            ) || generic_type_compatible(
+                ctx,
+                right.declared_scope,
+                right_type,
+                left.declared_scope,
+                left_type,
+            )
+        }
+        _ => true,
+    };
+    if !types_overlap {
+        return true;
+    }
+    let assumed_type_scalar_exception = (left.assumed_size
+        && matches!(left.type_info, Some(TypeInfo::TypeStar))
+        && right.rank == 0)
+        || (right.assumed_size
+            && matches!(right.type_info, Some(TypeInfo::TypeStar))
+            && left.rank == 0);
+    if !left.assumed_rank
+        && !right.assumed_rank
+        && !assumed_type_scalar_exception
+        && left.rank != right.rank
+    {
+        return true;
+    }
+    (left.allocatable && right.pointer && right.intent != Some(Intent::In))
+        || (right.allocatable && left.pointer && left.intent != Some(Intent::In))
+}
+
+fn generic_results_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericProcedureResult,
+    right: &GenericProcedureResult,
+) -> bool {
+    match (left, right) {
+        (GenericProcedureResult::Data(left), GenericProcedureResult::Data(right)) => {
+            generic_data_distinguishable(ctx, left, right)
+        }
+        (GenericProcedureResult::Procedure(left), GenericProcedureResult::Procedure(right)) => {
+            match (left.as_deref(), right.as_deref()) {
+                (Some(left), Some(right)) => {
+                    generic_procedures_distinguishable(ctx, left, right).unwrap_or(false)
+                }
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn generic_dummy_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericDummyCharacteristics,
+    right: &GenericDummyCharacteristics,
+) -> bool {
+    match (&left.kind, &right.kind) {
+        (GenericDummyKind::Data(left), GenericDummyKind::Data(right)) => {
+            generic_data_distinguishable(ctx, left, right)
+        }
+        (GenericDummyKind::Procedure(left), GenericDummyKind::Procedure(right)) => {
+            let (Some(left), Some(right)) = (left.as_deref(), right.as_deref()) else {
+                return false;
+            };
+            if generic_procedures_distinguishable(ctx, left, right).unwrap_or(false) {
+                return true;
+            }
+            match (&left.result, &right.result) {
+                (Some(left), Some(right)) => generic_results_distinguishable(ctx, left, right),
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn generic_rule_one_distinguishes(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> bool {
+    left.iter().chain(right).any(|candidate| {
+        let GenericDummyKind::Data(candidate_data) = &candidate.kind else {
+            return false;
+        };
+        let compatible = |arguments: &[GenericDummyCharacteristics]| {
+            arguments
+                .iter()
+                .filter(|argument| !argument.optional)
+                .filter_map(|argument| match &argument.kind {
+                    GenericDummyKind::Data(data) => Some(data),
+                    GenericDummyKind::Procedure(_) => None,
+                })
+                .filter(|data| generic_data_tkr_compatible(ctx, candidate_data, data))
+                .count()
+        };
+        let not_distinguishable = |arguments: &[GenericDummyCharacteristics]| {
+            arguments
+                .iter()
+                .filter(|argument| {
+                    matches!(argument.kind, GenericDummyKind::Data(_))
+                        && !generic_dummy_distinguishable(ctx, candidate, argument)
+                })
+                .count()
+        };
+        compatible(left) > not_distinguishable(right)
+            || compatible(right) > not_distinguishable(left)
+    })
+}
+
+fn generic_first_position_disambiguator(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> Option<usize> {
+    left.iter().enumerate().find_map(|(index, argument)| {
+        if argument.optional {
+            return None;
+        }
+        right
+            .get(index)
+            .is_none_or(|other| generic_dummy_distinguishable(ctx, argument, other))
+            .then_some(index)
+    })
+}
+
+fn generic_last_name_disambiguator(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> Option<usize> {
+    left.iter().enumerate().rev().find_map(|(index, argument)| {
+        if argument.optional {
+            return None;
+        }
+        right
+            .iter()
+            .find(|other| other.name == argument.name)
+            .is_none_or(|other| generic_dummy_distinguishable(ctx, argument, other))
+            .then_some(index)
+    })
+}
+
+fn generic_rule_four_distinguishes(
+    ctx: &Ctx<'_>,
+    left: &[GenericDummyCharacteristics],
+    right: &[GenericDummyCharacteristics],
+) -> bool {
+    let one_way = |first: &[GenericDummyCharacteristics],
+                   second: &[GenericDummyCharacteristics]| {
+        generic_first_position_disambiguator(ctx, first, second)
+            .zip(generic_last_name_disambiguator(ctx, first, second))
+            .is_some_and(|(position, name)| position <= name)
+    };
+    one_way(left, right) || one_way(right, left)
+}
+
+fn generic_procedures_distinguishable(
+    ctx: &Ctx<'_>,
+    left: &GenericProcedureCharacteristics,
+    right: &GenericProcedureCharacteristics,
+) -> Option<bool> {
+    if left.kind != right.kind {
+        return Some(true);
+    }
+
+    let procedure_counts = |arguments: &[GenericDummyCharacteristics]| {
+        arguments.iter().fold((0usize, 0usize), |counts, argument| {
+            if matches!(argument.kind, GenericDummyKind::Procedure(_)) {
+                (counts.0 + 1, counts.1 + usize::from(!argument.optional))
+            } else {
+                counts
+            }
+        })
+    };
+    let (left_procedures, left_required_procedures) = procedure_counts(&left.dummies);
+    let (right_procedures, right_required_procedures) = procedure_counts(&right.dummies);
+    if left_required_procedures > right_procedures
+        || right_required_procedures > left_procedures
+        || generic_rule_one_distinguishes(ctx, &left.dummies, &right.dummies)
+        || generic_rule_four_distinguishes(ctx, &left.dummies, &right.dummies)
+    {
+        return Some(true);
+    }
+
+    if !left.complete || !right.complete {
+        return None;
+    }
+    let has_optional_or_unlimited_data = |procedure: &GenericProcedureCharacteristics| {
+        procedure
+            .dummies
+            .iter()
+            .any(|argument| match &argument.kind {
+                GenericDummyKind::Data(data) => {
+                    argument.optional || matches!(data.type_info, Some(TypeInfo::ClassStar))
+                }
+                GenericDummyKind::Procedure(_) => false,
+            })
+    };
+    if has_optional_or_unlimited_data(left) && has_optional_or_unlimited_data(right) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+struct IndistinguishableGenericPair {
+    left_name: String,
+    left_owner_scope: ScopeId,
+    right_name: String,
+    right_owner_scope: ScopeId,
+}
+
+fn indistinguishable_generic_specifics_from_interfaces(
+    ctx: &Ctx<'_>,
+    interfaces: &[&Symbol],
+) -> Option<IndistinguishableGenericPair> {
+    let mut specifics = Vec::new();
+    let mut seen = HashSet::new();
+    for interface in interfaces {
+        for specific_name in &interface.arg_names {
+            let owner_scope =
+                interface_specific_owner_scope(ctx, interface, specific_name.as_str());
+            let Some(procedure_scope) = assignment_candidate_scope(ctx, specific_name, owner_scope)
+            else {
+                continue;
+            };
+            let key = (owner_scope, specific_name.to_ascii_lowercase());
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(symbol) = candidate_symbol(ctx, specific_name, owner_scope, procedure_scope)
+            else {
+                continue;
+            };
+            let mut visiting = HashSet::new();
+            let Some(procedure) = build_generic_procedure_characteristics(
+                ctx,
+                symbol,
+                procedure_scope,
+                &mut visiting,
+            ) else {
+                continue;
+            };
+            specifics.push(GenericSpecificCharacteristics {
+                name: specific_name.to_ascii_lowercase(),
+                owner_scope,
+                procedure,
+            });
+        }
+    }
+    specifics.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.owner_scope.cmp(&right.owner_scope))
+    });
+
+    for left_index in 0..specifics.len() {
+        for right in &specifics[left_index + 1..] {
+            let left = &specifics[left_index];
+            if left.owner_scope == right.owner_scope {
+                continue;
+            }
+            if generic_procedures_distinguishable(ctx, &left.procedure, &right.procedure)
+                == Some(false)
+            {
+                return Some(IndistinguishableGenericPair {
+                    left_name: left.name.clone(),
+                    left_owner_scope: left.owner_scope,
+                    right_name: right.name.clone(),
+                    right_owner_scope: right.owner_scope,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn indistinguishable_merged_generic_specifics(
+    ctx: &Ctx<'_>,
+    generic_name: &str,
+) -> Option<IndistinguishableGenericPair> {
+    let interfaces = ctx.lookup_lexical_named_interfaces(generic_name);
+    indistinguishable_generic_specifics_from_interfaces(ctx, &interfaces)
+}
+
 enum ExplicitInterfaceResolution {
     None,
     Resolved(ExplicitProcedureInterface),
@@ -7005,6 +9098,8 @@ struct ExplicitDummyArg {
     allocatable: bool,
     pointer: bool,
     procedure: bool,
+    procedure_scope: ScopeId,
+    procedure_has_explicit_interface: bool,
     rank: usize,
     assumed_rank: bool,
     allows_sequence_association: bool,
@@ -7057,6 +9152,8 @@ fn build_explicit_procedure_interface(
             allocatable: dummy.attrs.allocatable,
             pointer: dummy.attrs.pointer,
             procedure: dummy.attrs.external || dummy.attrs.procedure_iface.is_some(),
+            procedure_scope: procedure_scope.id,
+            procedure_has_explicit_interface: dummy.attrs.procedure_iface.is_some(),
             rank: dummy.attrs.array_spec.len(),
             assumed_rank,
             allows_sequence_association,
@@ -7335,7 +9432,19 @@ fn validate_explicit_actual(
             ),
         );
     }
-    if dummy.procedure || matches!(actual.node, Expr::NilArgument) {
+    if matches!(actual.node, Expr::NilArgument) {
+        return;
+    }
+    if dummy.procedure {
+        validate_procedure_dummy_actual(
+            ctx,
+            &dummy.name,
+            dummy.procedure_scope,
+            dummy.procedure_has_explicit_interface,
+            dummy.pointer,
+            dummy.intent,
+            actual,
+        );
         return;
     }
 
@@ -7571,6 +9680,166 @@ fn register_label(ctx: &mut Ctx, label: u64, span: Span) {
     }
 }
 
+#[derive(Default)]
+struct ControlTransferRegionFacts {
+    next_region: u64,
+    definitions: HashMap<u64, Vec<Vec<u64>>>,
+    references: Vec<(u64, Span, Vec<u64>)>,
+}
+
+impl ControlTransferRegionFacts {
+    fn define(&mut self, label: u64, regions: &[u64]) {
+        self.definitions
+            .entry(label)
+            .or_default()
+            .push(regions.to_vec());
+    }
+
+    fn reference(&mut self, label: u64, span: Span, regions: &[u64]) {
+        self.references.push((label, span, regions.to_vec()));
+    }
+}
+
+fn collect_control_transfer_region(
+    body: &[SpannedStmt],
+    regions: &mut Vec<u64>,
+    facts: &mut ControlTransferRegionFacts,
+) {
+    let region = facts.next_region;
+    facts.next_region += 1;
+    regions.push(region);
+    collect_control_transfer_regions(body, regions, facts);
+    regions.pop();
+}
+
+fn collect_control_transfer_regions(
+    stmts: &[SpannedStmt],
+    regions: &mut Vec<u64>,
+    facts: &mut ControlTransferRegionFacts,
+) {
+    for stmt in stmts {
+        visit_io_branch_labels(&stmt.node, |label| {
+            facts.reference(label, stmt.span, regions);
+        });
+        match &stmt.node {
+            Stmt::Goto { label } => facts.reference(*label, stmt.span, regions),
+            Stmt::ComputedGoto { labels, .. } => {
+                for label in labels {
+                    facts.reference(*label, stmt.span, regions);
+                }
+            }
+            Stmt::ArithmeticIf { neg, zero, pos, .. } => {
+                for label in [neg, zero, pos] {
+                    facts.reference(*label, stmt.span, regions);
+                }
+            }
+            Stmt::Continue { label: Some(label) } => facts.define(*label, regions),
+            Stmt::Labeled { label, stmt } => {
+                facts.define(*label, regions);
+                collect_control_transfer_regions(
+                    std::slice::from_ref(stmt.as_ref()),
+                    regions,
+                    facts,
+                );
+            }
+            Stmt::IfConstruct {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_control_transfer_region(then_body, regions, facts);
+                for (_, body) in else_ifs {
+                    collect_control_transfer_region(body, regions, facts);
+                }
+                if let Some(body) = else_body {
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            Stmt::IfStmt { action, .. }
+            | Stmt::WhereStmt { stmt: action, .. }
+            | Stmt::ForallStmt { stmt: action, .. } => {
+                collect_control_transfer_region(
+                    std::slice::from_ref(action.as_ref()),
+                    regions,
+                    facts,
+                );
+            }
+            Stmt::DoLoop { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::DoConcurrent { body, .. }
+            | Stmt::ForallConstruct { body, .. }
+            | Stmt::Block { body, .. }
+            | Stmt::Associate { body, .. } => {
+                collect_control_transfer_region(body, regions, facts);
+            }
+            Stmt::SelectCase { cases, .. } => {
+                for case in cases {
+                    collect_control_transfer_region(&case.body, regions, facts);
+                }
+            }
+            Stmt::SelectType { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        TypeGuard::TypeIs { body, .. }
+                        | TypeGuard::ClassIs { body, .. }
+                        | TypeGuard::ClassDefault { body } => body,
+                    };
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            Stmt::SelectRank { guards, .. } => {
+                for guard in guards {
+                    let body = match guard {
+                        RankGuard::Rank { body, .. }
+                        | RankGuard::RankStar { body }
+                        | RankGuard::RankDefault { body } => body,
+                    };
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            Stmt::WhereConstruct {
+                body, elsewhere, ..
+            } => {
+                collect_control_transfer_region(body, regions, facts);
+                for (_, body) in elsewhere {
+                    collect_control_transfer_region(body, regions, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A branch may remain within its current structured region or leave one or
+/// more enclosing regions. It may not enter a deeper region or a sibling arm.
+fn validate_control_transfer_regions(ctx: &mut Ctx<'_>, body: &[SpannedStmt]) {
+    let mut facts = ControlTransferRegionFacts::default();
+    collect_control_transfer_regions(body, &mut Vec::new(), &mut facts);
+
+    let mut reported = HashSet::new();
+    for (label, span, source_regions) in facts.references {
+        let Some(definitions) = facts.definitions.get(&label) else {
+            continue;
+        };
+        // Duplicate and undefined labels have their own diagnostics. Avoid
+        // deriving a region result from an ambiguous target.
+        let [target_regions] = definitions.as_slice() else {
+            continue;
+        };
+        if source_regions.starts_with(target_regions) {
+            continue;
+        }
+        let key = (label, span.file_id, span.start.line, span.start.col);
+        if reported.insert(key) {
+            ctx.error(
+                span,
+                format!("control transfer to label {label} enters a structured construct"),
+            );
+        }
+    }
+}
+
 /// At the end of a scope, verify all GOTO labels have targets.
 fn validate_label_consistency(ctx: &mut Ctx, _scope_span: Span) {
     // Collect errors first to avoid borrow conflict.
@@ -7745,17 +10014,27 @@ fn validate_associate(
             }
         })
         .collect();
+    let type_frame = assocs
+        .iter()
+        .filter_map(|(name, selector)| {
+            validation_expr_type_info(ctx, selector)
+                .map(|type_info| (name.to_lowercase(), type_info))
+        })
+        .collect();
     ctx.associate_frames.push(frame.clone());
+    ctx.associate_type_frames.push(type_frame);
     ctx.ambiguity_lexical_frames
         .push(AmbiguityLexicalFrame::Associate { bindings: frame });
     validate_stmts(ctx, body);
     ctx.ambiguity_lexical_frames.pop();
+    ctx.associate_type_frames.pop();
     ctx.associate_frames.pop();
 }
 
 fn block_binding_frame(
     ctx: &Ctx<'_>,
     block_span: Span,
+    implicit: &[SpannedDecl],
     decls: &[SpannedDecl],
 ) -> HashMap<String, BlockBindingAttrs> {
     let mut frame = HashMap::new();
@@ -7763,6 +10042,53 @@ fn block_binding_frame(
         .st
         .statement_block_scope(block_span)
         .unwrap_or(ctx.scope_id);
+    let mut implicit_types = HashMap::new();
+    let scope_rules = &ctx.st.scope(scope_id).implicit_rules;
+    if !scope_rules.none_type {
+        for (letter, implicit_type) in &scope_rules.rules {
+            let type_info = match implicit_type {
+                ImplicitType::Integer => TypeInfo::Integer { kind: None },
+                ImplicitType::Real => TypeInfo::Real { kind: None },
+                ImplicitType::DoublePrecision => TypeInfo::DoublePrecision,
+                ImplicitType::Complex => TypeInfo::Complex { kind: None },
+                ImplicitType::Logical => TypeInfo::Logical { kind: None },
+                ImplicitType::Character => TypeInfo::Character {
+                    len: Some(1),
+                    kind: None,
+                },
+            };
+            implicit_types.insert(*letter, type_info);
+        }
+    }
+    for declaration in implicit {
+        match &declaration.node {
+            Decl::ImplicitNone { type_, .. } => {
+                if *type_ {
+                    implicit_types.clear();
+                }
+            }
+            Decl::ImplicitStmt { specs } => {
+                for spec in specs {
+                    let type_info =
+                        crate::sema::resolve::type_resolution::type_spec_to_info_in_scope(
+                            &spec.type_spec,
+                            ctx.st,
+                            scope_id,
+                        );
+                    for &(start, end) in &spec.ranges {
+                        for letter_byte in start as u8..=end as u8 {
+                            implicit_types.insert(
+                                (letter_byte as char).to_ascii_lowercase(),
+                                type_info.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     for decl in decls {
         match &decl.node {
             Decl::TypeDecl {
@@ -7809,16 +10135,90 @@ fn block_binding_frame(
                     );
                 }
             }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    let type_info =
+                        entity.name.chars().next().and_then(|first| {
+                            implicit_types.get(&first.to_ascii_lowercase()).cloned()
+                        });
+                    frame.insert(
+                        entity.name.to_lowercase(),
+                        BlockBindingAttrs {
+                            type_info,
+                            rank: Some(entity.array_spec.len()),
+                            ..BlockBindingAttrs::default()
+                        },
+                    );
+                }
+            }
             _ => {}
         }
     }
     frame
 }
 
+fn validate_block_dimension_implicit_types(
+    ctx: &mut Ctx<'_>,
+    block_span: Span,
+    implicit: &[SpannedDecl],
+    decls: &[SpannedDecl],
+) {
+    let mut typed_letters = ctx
+        .st
+        .statement_block_scope(block_span)
+        .map(|scope_id| &ctx.st.scope(scope_id).implicit_rules)
+        .filter(|rules| !rules.none_type)
+        .map(|rules| rules.rules.keys().copied().collect::<HashSet<_>>())
+        .unwrap_or_default();
+
+    for declaration in implicit {
+        match &declaration.node {
+            Decl::ImplicitNone { type_, .. } => {
+                if *type_ {
+                    typed_letters.clear();
+                }
+            }
+            Decl::ImplicitStmt { specs } => {
+                for spec in specs {
+                    for &(start, end) in &spec.ranges {
+                        for letter_byte in start as u8..=end as u8 {
+                            typed_letters.insert((letter_byte as char).to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for declaration in decls {
+        let Decl::DimensionStmt { entities } = &declaration.node else {
+            continue;
+        };
+        for entity in entities {
+            let has_type = entity
+                .name
+                .chars()
+                .next()
+                .is_some_and(|first| typed_letters.contains(&first.to_ascii_lowercase()));
+            if !has_type {
+                ctx.error(
+                    declaration.span,
+                    format!(
+                        "array '{}' in DIMENSION statement has no implicit type",
+                        entity.name
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn block_attrs_from_decl(attrs: &[Attribute]) -> BlockBindingAttrs {
     let mut out = BlockBindingAttrs::default();
     for attr in attrs {
         match attr {
+            Attribute::Allocatable => out.allocatable = true,
             Attribute::Parameter => out.parameter = true,
             Attribute::Pointer => out.pointer = true,
             Attribute::Intent(crate::ast::decl::Intent::In) => out.intent_in = true,
@@ -7920,6 +10320,17 @@ fn extend_declared_names_from_decls(
                     declared.insert(e.name.to_lowercase());
                 }
             }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    declared.insert(entity.name.to_lowercase());
+                }
+            }
+            Decl::AttributeStmt {
+                attr: Attribute::External | Attribute::Intrinsic,
+                entities,
+            } => {
+                declared.extend(entities.iter().map(|entity| entity.to_lowercase()));
+            }
             // COMMON block variables are also declared.
             Decl::CommonBlock { vars, .. } => {
                 for v in vars {
@@ -7938,9 +10349,12 @@ fn extend_declared_names_from_ifaces(
     use crate::ast::unit::{InterfaceBody, ProgramUnit};
 
     for iface in ifaces {
-        let ProgramUnit::InterfaceBlock { bodies, .. } = &iface.node else {
+        let ProgramUnit::InterfaceBlock { name, bodies, .. } = &iface.node else {
             continue;
         };
+        if let Some(name) = name.as_ref().filter(|name| !name.is_empty()) {
+            declared.insert(name.to_lowercase());
+        }
         for body in bodies {
             match body {
                 InterfaceBody::Subprogram(sub) => match &sub.node {
@@ -8422,20 +10836,27 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "atan2" | "atan2d" | "atan2pi" | "hypot" | "mod" | "modulo" | "sign" | "dim" | "dprod"
         | "lge" | "lgt" | "lle" | "llt" | "bge" | "bgt" | "ble" | "blt" | "ishft" | "shiftl"
         | "shiftr" | "shifta" | "ibset" | "ibclr" | "btest" | "iand" | "ior" | "ieor"
-        | "matmul" | "dot_product" | "scale" | "repeat" | "ieee_copy_sign" | "ieee_unordered" => {
-            (2, Some(2))
-        }
+        | "matmul" | "dot_product" | "scale" | "repeat" | "ieee_copy_sign" | "ieee_unordered"
+        | "ieee_rem" => (2, Some(2)),
         // Exactly three.
-        "ibits" | "merge" | "merge_bits" | "dshiftl" | "dshiftr" | "unpack" | "spread" => {
-            (3, Some(3))
-        }
+        "ibits" | "merge" | "merge_bits" | "dshiftl" | "dshiftr" | "unpack" | "spread"
+        | "ieee_fma" => (3, Some(3)),
         // Optional-argument ranges (F2023 16.9 per-procedure).
         "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real" | "logical"
         | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim" | "floor" | "ceiling"
         | "maskl" | "maskr" | "shape" | "storage_size" | "associated" | "any" | "all" | "norm2"
         | "f_c_string" | "iall" | "iany" | "iparity" | "parity" => (1, Some(2)),
-        "cmplx" | "size" | "lbound" | "ubound" | "sum" | "product" | "maxval" | "minval"
-        | "count" | "selected_real_kind" => (1, Some(3)),
+        "cmplx"
+        | "size"
+        | "lbound"
+        | "ubound"
+        | "sum"
+        | "product"
+        | "maxval"
+        | "minval"
+        | "count"
+        | "selected_real_kind"
+        | "ieee_selected_real_kind" => (1, Some(3)),
         "ishftc" | "pack" | "transfer" | "c_f_strpointer" | "cshift" => (2, Some(3)),
         "index" | "scan" | "verify" | "reshape" | "eoshift" => (2, Some(4)),
         "null" => (0, Some(1)),
@@ -8448,6 +10869,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "system_clock" => (0, Some(3)),
         "date_and_time" => (0, Some(4)),
         "random_seed" => (0, Some(3)),
+        "random_init" => (2, Some(2)),
         "execute_command_line" => (1, Some(5)),
         "get_command_argument" => (1, Some(5)),
         "get_environment_variable" => (1, Some(6)),
@@ -8471,6 +10893,7 @@ fn intrinsic_is_subroutine(name: &str) -> bool {
             | "cpu_time"
             | "random_number"
             | "random_seed"
+            | "random_init"
             | "move_alloc"
             | "mvbits"
             | "execute_command_line"
@@ -8489,14 +10912,18 @@ fn intrinsic_not_implemented(name: &str) -> bool {
 
 #[derive(Clone, Copy)]
 enum IntrinsicArgumentType {
+    Character,
     Integer,
+    Logical,
     Real,
 }
 
 impl IntrinsicArgumentType {
     fn name(self) -> &'static str {
         match self {
+            Self::Character => "CHARACTER",
             Self::Integer => "INTEGER",
+            Self::Logical => "LOGICAL",
             Self::Real => "REAL",
         }
     }
@@ -8504,7 +10931,10 @@ impl IntrinsicArgumentType {
     fn matches(self, info: &TypeInfo) -> bool {
         matches!(
             (self, info),
-            (Self::Integer, TypeInfo::Integer { .. }) | (Self::Real, TypeInfo::Real { .. })
+            (Self::Character, TypeInfo::Character { .. })
+                | (Self::Integer, TypeInfo::Integer { .. })
+                | (Self::Logical, TypeInfo::Logical { .. })
+                | (Self::Real, TypeInfo::Real { .. })
         )
     }
 }
@@ -8535,13 +10965,266 @@ fn require_intrinsic_argument_type(
     }
 }
 
-fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
-    let key = name.to_ascii_lowercase();
-    if !is_intrinsic_name(&key) || intrinsic_name_is_shadowed(ctx, &key) {
+fn require_intrinsic_scalar_argument(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    position: usize,
+    keyword: &str,
+) {
+    let Some(actual) = call_rank_argument_expr(args, position, &[keyword]) else {
+        return;
+    };
+    if validation_expr_rank(ctx, actual).is_some_and(|rank| rank > 0) {
+        ctx.error(
+            span,
+            format!(
+                "intrinsic '{intrinsic}' argument {} must be scalar",
+                keyword.to_ascii_uppercase()
+            ),
+        );
+    }
+}
+
+fn validate_intrinsic_argument_associations(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    formals: &[&str],
+    required: usize,
+) {
+    let mut associated = vec![false; formals.len()];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let arg_span = argument_span(arg, span);
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            let Some(index) = formals
+                .iter()
+                .position(|formal| formal.eq_ignore_ascii_case(keyword))
+            else {
+                ctx.error(
+                    arg_span,
+                    format!("unknown keyword argument '{keyword}' in call to '{intrinsic}'"),
+                );
+                continue;
+            };
+            index
+        } else {
+            if saw_keyword {
+                ctx.error(
+                    arg_span,
+                    format!(
+                        "positional argument follows a keyword argument in call to '{intrinsic}'"
+                    ),
+                );
+                continue;
+            }
+            let index = positional;
+            positional += 1;
+            if index >= formals.len() {
+                continue;
+            }
+            index
+        };
+
+        if associated[index] {
+            ctx.error(
+                arg_span,
+                format!(
+                    "argument '{}' is associated more than once in call to '{intrinsic}'",
+                    formals[index]
+                ),
+            );
+        } else {
+            associated[index] = true;
+        }
+    }
+
+    for (index, formal) in formals.iter().enumerate().take(required) {
+        if !associated[index] {
+            ctx.error(
+                span,
+                format!("required argument '{formal}' is absent in call to '{intrinsic}'"),
+            );
+        }
+    }
+}
+
+fn intrinsic_real_kind(info: &TypeInfo) -> Option<u8> {
+    match info {
+        TypeInfo::Real { kind } => Some(default_real_kind(*kind)),
+        TypeInfo::DoublePrecision => Some(8),
+        _ => None,
+    }
+}
+
+fn validate_character_intrinsic_kind(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+    position: usize,
+    character_result: bool,
+) {
+    let Some(kind_expr) = call_rank_argument_expr(args, position, &["kind"]) else {
+        return;
+    };
+    let integer = validation_expr_type_info(ctx, kind_expr)
+        .is_some_and(|info| matches!(info, TypeInfo::Integer { .. }));
+    let scalar = validation_expr_rank(ctx, kind_expr).is_none_or(|rank| rank == 0);
+    if !integer || !scalar {
         return;
     }
 
+    let kind = match eval_const_int_expr_checked(ctx, kind_expr) {
+        Ok(Some(kind)) => kind.value,
+        Ok(None) => {
+            ctx.error(
+                kind_expr.span,
+                format!(
+                    "intrinsic '{intrinsic}' argument KIND must be a scalar INTEGER constant expression"
+                ),
+            );
+            return;
+        }
+        Err(error) => {
+            ctx.error(error.span, error.msg);
+            return;
+        }
+    };
+
+    if character_result {
+        if kind != 1 {
+            ctx.error(
+                span,
+                format!(
+                    "CHARACTER(kind={kind}) data is not supported: the backend and runtime support only CHARACTER(kind=1)"
+                ),
+            );
+        }
+    } else if !matches!(kind, 1 | 2 | 4 | 8 | 16) {
+        ctx.error(
+            kind_expr.span,
+            format!(
+                "intrinsic '{intrinsic}' requests unsupported INTEGER result kind {kind}; supported kinds are 1, 2, 4, 8, and 16"
+            ),
+        );
+    }
+}
+
+fn validate_character_intrinsic_call(
+    ctx: &mut Ctx<'_>,
+    span: Span,
+    intrinsic: &str,
+    args: &[Argument],
+) {
+    let Some((formals, required)) = crate::sema::types::character_intrinsic_signature(intrinsic)
+    else {
+        return;
+    };
+    validate_intrinsic_argument_associations(ctx, span, intrinsic, args, formals, required);
+
+    let require_type = |ctx: &mut Ctx<'_>, position, formal, expected| {
+        require_intrinsic_argument_type(ctx, span, intrinsic, args, position, formal, expected);
+    };
+    let require_scalar = |ctx: &mut Ctx<'_>, position, formal| {
+        require_intrinsic_scalar_argument(ctx, span, intrinsic, args, position, formal);
+    };
+
+    match intrinsic {
+        "len" | "len_trim" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+        }
+        "ichar" | "iachar" => {
+            require_type(ctx, 0, "c", IntrinsicArgumentType::Character);
+        }
+        "char" | "achar" => {
+            require_type(ctx, 0, "i", IntrinsicArgumentType::Integer);
+        }
+        "index" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "substring", IntrinsicArgumentType::Character);
+            require_type(ctx, 2, "back", IntrinsicArgumentType::Logical);
+            require_scalar(ctx, 2, "back");
+        }
+        "scan" | "verify" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "set", IntrinsicArgumentType::Character);
+            require_type(ctx, 2, "back", IntrinsicArgumentType::Logical);
+            require_scalar(ctx, 2, "back");
+        }
+        "adjustl" | "adjustr" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+        }
+        "trim" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_scalar(ctx, 0, "string");
+        }
+        "repeat" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "ncopies", IntrinsicArgumentType::Integer);
+            require_scalar(ctx, 0, "string");
+            require_scalar(ctx, 1, "ncopies");
+        }
+        "lge" | "lgt" | "lle" | "llt" => {
+            require_type(ctx, 0, "string_a", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "string_b", IntrinsicArgumentType::Character);
+        }
+        "new_line" => {
+            require_type(ctx, 0, "a", IntrinsicArgumentType::Character);
+        }
+        "f_c_string" => {
+            require_type(ctx, 0, "string", IntrinsicArgumentType::Character);
+            require_type(ctx, 1, "asis", IntrinsicArgumentType::Logical);
+            require_scalar(ctx, 0, "string");
+            require_scalar(ctx, 1, "asis");
+        }
+        _ => unreachable!(),
+    }
+
+    if let Some(position) = crate::sema::types::character_integer_result_kind_position(intrinsic) {
+        require_type(ctx, position, "kind", IntrinsicArgumentType::Integer);
+        require_scalar(ctx, position, "kind");
+        validate_character_intrinsic_kind(ctx, span, intrinsic, args, position, false);
+    } else if matches!(intrinsic, "char" | "achar") {
+        require_type(ctx, 1, "kind", IntrinsicArgumentType::Integer);
+        require_scalar(ctx, 1, "kind");
+        validate_character_intrinsic_kind(ctx, span, intrinsic, args, 1, true);
+    }
+}
+
+pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
+    let key = name.to_ascii_lowercase();
+    if let Some(symbol) = ctx.lookup_lexical(&key) {
+        if !symbol.attrs.external
+            && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
+        {
+            let canonical = symbol.name.to_ascii_lowercase();
+            return is_intrinsic_name(&canonical).then_some(canonical);
+        }
+        return None;
+    }
+    if !ctx.lookup_lexical_named_interfaces(&key).is_empty() {
+        return None;
+    }
+    is_intrinsic_name(&key).then_some(key)
+}
+
+fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &[Argument]) {
+    let Some(key) = resolved_intrinsic_name(ctx, name) else {
+        return;
+    };
+
+    if key == "ieee_fma" {
+        ctx.require_std(span, FortranStandard::F2023, "IEEE_FMA");
+    }
     validate_elemental_intrinsic_rank_conformance(ctx, span, &key, args);
+    validate_character_intrinsic_call(ctx, span, &key, args);
 
     match key.as_str() {
         "fraction" | "exponent" => {
@@ -8575,21 +11258,65 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 IntrinsicArgumentType::Integer,
             );
         }
-        "char" | "achar" => {
-            let Some(kind_expr) = call_rank_argument_expr(args, 1, &["kind"]) else {
-                return;
-            };
-            let Ok(Some(kind)) = eval_const_int_expr_checked(ctx, kind_expr) else {
-                return;
-            };
-            if kind.value != 1 {
+        "ieee_fma" => {
+            const FORMALS: [&str; 3] = ["a", "b", "c"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 3);
+            for (position, formal) in FORMALS.iter().enumerate() {
+                require_intrinsic_argument_type(
+                    ctx,
+                    span,
+                    &key,
+                    args,
+                    position,
+                    formal,
+                    IntrinsicArgumentType::Real,
+                );
+            }
+            let kinds: Vec<u8> = FORMALS
+                .iter()
+                .enumerate()
+                .filter_map(|(position, formal)| {
+                    call_rank_argument_expr(args, position, &[*formal])
+                        .and_then(|actual| validation_expr_type_info(ctx, actual))
+                        .and_then(|info| intrinsic_real_kind(&info))
+                })
+                .collect();
+            if kinds.len() == FORMALS.len() && kinds.iter().any(|kind| *kind != kinds[0]) {
                 ctx.error(
                     span,
-                    format!(
-                        "CHARACTER(kind={}) data is not supported: the backend and runtime support only CHARACTER(kind=1)",
-                        kind.value
-                    ),
+                    "IEEE_FMA arguments A, B, and C must have the same type and kind",
                 );
+            }
+        }
+        "ieee_rem" => {
+            const FORMALS: [&str; 2] = ["x", "y"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 2);
+            for (position, formal) in FORMALS.iter().enumerate() {
+                require_intrinsic_argument_type(
+                    ctx,
+                    span,
+                    &key,
+                    args,
+                    position,
+                    formal,
+                    IntrinsicArgumentType::Real,
+                );
+            }
+        }
+        "ieee_selected_real_kind" => {
+            const FORMALS: [&str; 3] = ["p", "r", "radix"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 0);
+            for (position, formal) in FORMALS.iter().enumerate() {
+                require_intrinsic_argument_type(
+                    ctx,
+                    span,
+                    &key,
+                    args,
+                    position,
+                    formal,
+                    IntrinsicArgumentType::Integer,
+                );
+                require_intrinsic_scalar_argument(ctx, span, &key, args, position, formal);
             }
         }
         _ => {}
@@ -8649,10 +11376,9 @@ pub(super) fn check_intrinsic_call_arity(
     nargs: usize,
     is_call: bool,
 ) {
-    let key = name.to_lowercase();
-    if intrinsic_name_is_shadowed(ctx, &key) || !is_intrinsic_name(&key) {
+    let Some(key) = resolved_intrinsic_name(ctx, name) else {
         return;
-    }
+    };
     let is_sub = intrinsic_is_subroutine(&key);
     if !is_call && is_sub {
         ctx.error(
@@ -8704,6 +11430,9 @@ pub(super) fn check_intrinsic_call_arity(
 }
 
 pub fn is_intrinsic_name(name: &str) -> bool {
+    if crate::sema::specific_intrinsic::specific_intrinsic(name).is_some() {
+        return true;
+    }
     matches!(
         name,
         "abs" | "iabs" | "dabs" | "cabs" | "acos" | "asin" | "atan" | "atan2" |
@@ -8730,6 +11459,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "ieee_support_standard" | "ieee_support_underflow_control" |
         "ieee_is_normal" | "ieee_class" | "ieee_unordered" | "ieee_copy_sign" |
         "ieee_logb" | "ieee_rint" | "ieee_scalb" | "ieee_next_after" |
+        "ieee_fma" | "ieee_rem" |
         "ieee_max" | "ieee_min" | "ieee_max_mag" | "ieee_min_mag" |
         "ieee_max_num" | "ieee_min_num" | "ieee_max_num_mag" | "ieee_min_num_mag" |
         "matmul" | "dot_product" | "transpose" |
@@ -8743,7 +11473,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "mvbits" | "transfer" | "bge" | "bgt" | "ble" | "blt" |
         "dshiftl" | "dshiftr" | "maskl" | "maskr" | "merge_bits" |
         "new_line" | "null" | "move_alloc" | "next" | "previous" |
-        "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" |
+        "system_clock" | "date_and_time" | "cpu_time" | "random_number" | "random_seed" | "random_init" |
         // F2023 string-parsing subroutines.
         "split" | "tokenize" |
         "command_argument_count" | "get_command_argument" | "get_environment_variable" |
@@ -8796,6 +11526,330 @@ mod tests {
             .filter(|d| d.kind == DiagKind::Error)
             .map(|d| d.msg.clone())
             .collect()
+    }
+
+    #[test]
+    fn private_named_types_are_not_visible_through_bare_use() {
+        let errors = errors_from(
+            "\
+module private_types
+  implicit none
+  private
+  public :: visible_t
+
+  type :: hidden_t
+    integer :: value
+  end type hidden_t
+
+  type :: visible_t
+    integer :: value
+  end type visible_t
+contains
+  subroutine internal_access_is_valid()
+    type(hidden_t) :: item
+    item%value = 1
+  end subroutine internal_access_is_valid
+end module private_types
+
+program declaration_consumer
+  use private_types
+  implicit none
+  type(hidden_t) :: item
+end program declaration_consumer
+
+program extension_consumer
+  use private_types
+  implicit none
+  type, extends(hidden_t) :: child_t
+  end type child_t
+end program extension_consumer
+
+program allocation_consumer
+  use private_types
+  implicit none
+  class(*), allocatable :: item
+  allocate(hidden_t :: item)
+end program allocation_consumer
+
+program select_type_consumer
+  use private_types
+  implicit none
+  class(*), allocatable :: item
+  select type (item)
+  type is (hidden_t)
+  class default
+  end select
+end program select_type_consumer
+
+program function_result_consumer
+  use private_types
+  implicit none
+contains
+  type(hidden_t) function make_item()
+  end function make_item
+end program function_result_consumer
+
+program external_function_consumer
+  use private_types
+  implicit none
+  type(hidden_t), external :: make_item
+end program external_function_consumer
+
+program array_constructor_consumer
+  use private_types
+  implicit none
+  class(*), allocatable :: items(:)
+  items = [hidden_t ::]
+end program array_constructor_consumer
+
+program public_consumer
+  use private_types
+  implicit none
+  type(visible_t) :: item
+  item%value = 2
+end program public_consumer
+
+program block_consumers
+  implicit none
+  block
+    use private_types, only: visible_t
+    type(visible_t) :: imported_item
+    imported_item%value = 3
+  end block
+  block
+    type :: local_t
+      integer :: value
+    end type local_t
+    type(local_t) :: local_item
+    local_item%value = 4
+  end block
+end program block_consumers
+",
+        );
+
+        let inaccessible = errors
+            .iter()
+            .filter(|error| {
+                error.contains("derived type 'hidden_t' is not accessible in this scope")
+            })
+            .count();
+        assert_eq!(inaccessible, 7, "{errors:?}");
+        assert_eq!(errors.len(), 7, "{errors:?}");
+    }
+
+    #[test]
+    fn select_type_and_rank_validate_every_guard_body() {
+        let errors = errors_from(
+            "\
+module guard_validation
+  implicit none
+
+  type :: base_t
+  end type base_t
+
+  type, extends(base_t) :: child_t
+  end type child_t
+contains
+  pure subroutine check_type(value)
+    class(base_t), intent(in) :: value
+
+    select type (value)
+    type is (child_t)
+      stop
+    class is (base_t)
+      stop
+    class default
+      stop
+    end select
+  end subroutine check_type
+
+  pure subroutine check_rank(values)
+    integer, intent(in) :: values(..)
+
+    select rank (values)
+    rank (0)
+      stop
+    rank (*)
+      stop
+    rank default
+      stop
+    end select
+  end subroutine check_rank
+end module guard_validation
+",
+        );
+
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.as_str() == "STOP not allowed in pure procedure")
+                .count(),
+            6,
+            "every SELECT TYPE and SELECT RANK guard body must be validated: {errors:?}"
+        );
+        assert_eq!(errors.len(), 6, "unexpected diagnostics: {errors:?}");
+    }
+
+    #[test]
+    fn private_components_are_visible_only_to_their_defining_module() {
+        let errors = errors_from(
+            "\
+module private_component_owner
+  implicit none
+
+  abstract interface
+    subroutine callback_iface()
+    end subroutine callback_iface
+  end interface
+
+  type, public :: explicit_box
+    integer, private :: explicit_hidden = 0
+    integer, public :: explicit_shown = 0
+    procedure(callback_iface), pointer, private, nopass :: private_callback
+  end type explicit_box
+
+  type, public :: default_box
+    private
+    integer :: default_hidden = 0
+    integer, public :: default_shown = 0
+  end type default_box
+contains
+  subroutine owner_access_is_valid(left, right)
+    type(explicit_box), intent(out) :: left
+    type(default_box), intent(out) :: right
+    left%explicit_hidden = 1
+    right%default_hidden = 2
+    if (associated(left%private_callback)) stop 1
+    left = explicit_box(explicit_hidden=3, explicit_shown=4)
+    right = default_box(5, 6)
+  end subroutine owner_access_is_valid
+end module private_component_owner
+
+module module_default_owner
+  implicit none
+  private
+  public :: public_box
+  type :: public_box
+    integer :: visible = 0
+  end type public_box
+end module module_default_owner
+
+program component_consumer
+  use private_component_owner, only: renamed_box => explicit_box, default_box
+  use module_default_owner, only: public_box
+  implicit none
+  type(renamed_box) :: left
+  type(default_box) :: right
+  type(public_box) :: unaffected
+  left%explicit_hidden = 7
+  right%default_hidden = 8
+  if (associated(left%private_callback)) stop 2
+  left%explicit_shown = 9
+  right%default_shown = 10
+  unaffected%visible = 11
+  left = renamed_box(explicit_hidden=12)
+  right = default_box(13)
+  left = renamed_box(explicit_shown=14)
+  right = default_box(default_shown=15)
+  associate (alias => left)
+    alias%explicit_hidden = 16
+    associate (nested_alias => alias)
+      nested_alias%explicit_hidden = 17
+    end associate
+  end associate
+end program component_consumer
+
+module foreign_extension
+  use private_component_owner, only: default_box
+  implicit none
+  type, extends(default_box) :: child_box
+    integer :: child_value = 0
+  end type child_box
+contains
+  subroutine foreign_access_is_invalid(value)
+    type(child_box), intent(inout) :: value
+    value%default_hidden = 18
+  end subroutine foreign_access_is_invalid
+end module foreign_extension
+",
+        );
+
+        let inaccessible = errors
+            .iter()
+            .filter(|error| error.contains("private component"))
+            .count();
+        assert_eq!(inaccessible, 8, "{errors:?}");
+        assert_eq!(errors.len(), 8, "{errors:?}");
+    }
+
+    #[test]
+    fn component_access_specs_require_a_module_type_definition() {
+        let errors = errors_from(
+            "\
+program local_types
+  implicit none
+  type :: explicit_private_t
+    integer, private :: hidden
+  end type explicit_private_t
+  type :: explicit_public_t
+    integer, public :: shown
+  end type explicit_public_t
+  type :: default_private_t
+    private
+    integer :: hidden
+  end type default_private_t
+end program local_types
+",
+        );
+
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("module specification part"))
+                .count(),
+            3,
+            "{errors:?}"
+        );
+        assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn generic_tkr_compatibility_preserves_type_direction() {
+        let st = SymbolTable::new();
+        let ctx = Ctx::new(&st, None, false, false);
+        let data = |type_info| GenericDataCharacteristics {
+            type_info: Some(type_info),
+            declared_scope: 0,
+            rank: 0,
+            assumed_rank: false,
+            assumed_size: false,
+            allocatable: false,
+            pointer: false,
+            intent: None,
+        };
+        let unlimited = data(TypeInfo::ClassStar);
+        let integer = data(TypeInfo::Integer { kind: Some(4) });
+        let assumed_type = data(TypeInfo::TypeStar);
+        let assumed_size_type = GenericDataCharacteristics {
+            rank: 1,
+            assumed_size: true,
+            ..data(TypeInfo::TypeStar)
+        };
+
+        assert!(generic_data_tkr_compatible(&ctx, &unlimited, &integer));
+        assert!(!generic_data_tkr_compatible(&ctx, &integer, &unlimited));
+        assert!(!generic_data_distinguishable(&ctx, &unlimited, &integer));
+        assert!(generic_data_distinguishable(&ctx, &assumed_type, &integer));
+        assert!(!generic_data_tkr_compatible(
+            &ctx,
+            &assumed_size_type,
+            &assumed_type
+        ));
+        assert!(!generic_data_distinguishable(
+            &ctx,
+            &assumed_size_type,
+            &assumed_type
+        ));
     }
 
     #[test]
@@ -10373,6 +13427,79 @@ end program
     }
 
     #[test]
+    fn accepts_canonical_character_intrinsic_keyword_association() {
+        let errs = errors_from(
+            "\
+program p
+  use iso_fortran_env, only: int8, int16, int64
+  implicit none
+  integer(int64) :: i
+  character(8) :: text
+  logical(int8) :: back
+  back = .true.
+  i = index(kind=int64, substring='na', string='banana')
+  i = scan(kind=int16, back=back, set='ab', string='cabca')
+  i = verify(kind=int8, set='ab', string='abXba')
+  i = len(kind=int64, string='abcd')
+  i = len_trim(kind=int16, string='ab  ')
+  i = ichar(kind=kind(0_int64), c='A')
+  i = iachar(kind=int8, c='B')
+  i = index(kind=selected_int_kind(18), substring='na', string='banana')
+  i = verify(kind=selected_real_kind(r=300, p=15), set='ab', string='abXba')
+  text = repeat(ncopies=3, string='xy')
+  text = adjustl(string='  xy    ')
+  text = adjustr(string='xy      ')
+  text = trim(string='xy      ')
+  text = char(kind=1, i=65)
+  text = achar(kind=1, i=66)
+  text = new_line(a='x')
+  if (lge(string_b='A', string_a='B')) continue
+end program p
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_character_intrinsic_association_and_types() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: runtime_kind
+  print *, index(string='a', substring='a', reverse=.true.)
+  print *, scan('abc', string='abc', set='a')
+  print *, verify(string='abc', set='a', back=1)
+  print *, len(string='a', kind=runtime_kind)
+  print *, ichar(c='a', kind=3)
+  print *, repeat(string='a', ncopies=.true.)
+  print *, trim(string=1)
+  print *, new_line(a=1)
+  print *, index(string='a', back=.true.)
+  print *, index(string='a', 'a')
+end program p
+",
+        );
+        for expected in [
+            "unknown keyword argument 'reverse' in call to 'index'",
+            "argument 'string' is associated more than once in call to 'scan'",
+            "BACK must be LOGICAL",
+            "KIND must be a scalar INTEGER constant expression",
+            "unsupported INTEGER result kind 3",
+            "NCOPIES must be INTEGER",
+            "STRING must be CHARACTER",
+            "A must be CHARACTER",
+            "required argument 'substring' is absent in call to 'index'",
+            "positional argument follows a keyword argument in call to 'index'",
+        ] {
+            assert!(
+                errs.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} in {errs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_fraction_exponent_and_scale_types() {
         let errs = errors_from(
             "\
@@ -10393,6 +13520,241 @@ end program
                 "missing {intrinsic} diagnostic: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn validates_exported_ieee_function_contracts() {
+        let errs = errors_from(
+            "\
+program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_fma, ieee_rem, ieee_selected_real_kind
+  implicit none
+  integer :: i
+  integer :: values(2)
+  real :: r4
+  real :: vector(2), matrix(2, 2)
+  real(kind=8) :: r8
+  r4 = ieee_fma(r4, r4)
+  r4 = ieee_fma(r4, r8, r4)
+  r4 = ieee_fma(i, r4, r4)
+  r4 = ieee_rem(r4, i)
+  r4 = ieee_rem(x=r4, unknown=r4)
+  matrix = ieee_fma(vector, matrix, matrix)
+  i = ieee_selected_real_kind()
+  i = ieee_selected_real_kind(p=r4)
+  i = ieee_selected_real_kind(r=values)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("intrinsic 'ieee_fma' takes 3 arguments")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("IEEE_FMA") && err.contains("same type and kind")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("ieee_fma") && err.contains("must be REAL")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("ieee_rem") && err.contains("must be REAL")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("unknown keyword argument 'unknown'") && err.contains("ieee_rem")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("elemental intrinsic 'ieee_fma'") && err.contains("nonconforming")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("intrinsic 'ieee_selected_real_kind' takes 1 to 3 arguments")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("ieee_selected_real_kind")
+                    && err.contains("P")
+                    && err.contains("must be INTEGER")
+            }),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|err| {
+                err.contains("ieee_selected_real_kind")
+                    && err.contains("R")
+                    && err.contains("must be scalar")
+            }),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_ieee_fma_shadows_intrinsic_contract() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface
+    integer function ieee_fma(value)
+      integer, intent(in) :: value
+    end function
+  end interface
+  integer :: result
+  result = ieee_fma(1)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn ieee_fma_requires_f2023() {
+        let errs = errors_with_std(
+            "\
+program p
+  use, intrinsic :: ieee_arithmetic, only : ieee_fma
+  implicit none
+  real :: value
+  value = ieee_fma(1.0, 2.0, 3.0)
+end program
+",
+            FortranStandard::F2018,
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("IEEE_FMA requires --std=F2023")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn random_init_requires_f2018() {
+        let errs = errors_with_std(
+            "\
+program p
+  implicit none
+  call random_init(.true., .false.)
+end program
+",
+            FortranStandard::F2008,
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("RANDOM_INIT requires --std=F2018")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn random_init_requires_two_scalar_logical_arguments() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: wrong_type
+  logical :: wrong_rank(2)
+  call random_init(wrong_type, wrong_rank)
+  call random_init(.true.)
+  call random_init(repeatable=.true., unknown=.false.)
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("REPEATABLE") && err.contains("must be LOGICAL")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("IMAGE_DISTINCT") && err.contains("must be scalar")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("intrinsic 'random_init' takes 2 arguments")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("unknown keyword argument 'unknown'")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_random_init_shadows_the_intrinsic_contract() {
+        let errs = errors_with_std(
+            "\
+program p
+  implicit none
+  interface
+    subroutine random_init(value)
+      integer, intent(in) :: value
+    end subroutine
+  end interface
+  call random_init(7)
+end program
+",
+            FortranStandard::F2008,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn execute_command_line_cmdmsg_requires_a_scalar_character_variable() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: status, wrong_type
+  character(len=32) :: messages(2)
+  call execute_command_line('', cmdstat=status, cmdmsg=wrong_type)
+  call execute_command_line('', cmdstat=status, cmdmsg=messages)
+  call execute_command_line('', cmdstat=status, cmdmsg='literal')
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .filter(|err| err.contains("CMDMSG") && err.contains("scalar CHARACTER variable"))
+                .count()
+                >= 3,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn user_execute_command_line_shadows_intrinsic_cmdmsg_validation() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  interface
+    subroutine execute_command_line(value, cmdmsg)
+      integer, intent(in) :: value
+      integer, intent(out) :: cmdmsg
+    end subroutine
+  end interface
+  integer :: output
+  call execute_command_line(7, cmdmsg=output)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
@@ -10793,6 +14155,136 @@ end program
                 .any(|err| err.contains("cannot preserve its local FINAL procedure")),
             "{:?}",
             errs
+        );
+    }
+
+    #[test]
+    fn rejects_move_alloc_type_kind_and_rank_mismatches() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: first_t
+    integer :: value = 0
+  end type
+  type :: second_t
+    integer :: value = 0
+  end type
+  integer, allocatable :: scalar, vector(:)
+  integer(kind=8), allocatable :: wide
+  real, allocatable :: real_value
+  character(len=5), allocatable :: short
+  character(len=9), allocatable :: long
+  type(first_t), allocatable :: first
+  type(second_t), allocatable :: second
+
+  call move_alloc(scalar, real_value)
+  call move_alloc(scalar, wide)
+  call move_alloc(scalar, vector)
+  call move_alloc(short, long)
+  call move_alloc(first, second)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("type and kind"))
+                .count(),
+            4,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("same rank"))
+                .count(),
+            1,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_move_alloc_nonallocatable_designators() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer, allocatable :: value, target
+  integer, pointer :: pointer_value
+  integer :: plain
+
+  call move_alloc(plain, target)
+  call move_alloc(pointer_value, target)
+  call move_alloc((value), target)
+  call move_alloc(value, plain)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("allocatable variable"))
+                .count(),
+            4,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_move_alloc_deferred_length_polymorphic_widening_and_same_variable() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: base_t
+  end type
+  type, extends(base_t) :: child_t
+  end type
+  character(len=5), allocatable :: fixed
+  character(len=:), allocatable :: deferred
+  integer, allocatable :: same
+  type(child_t), allocatable :: concrete_child
+  class(child_t), allocatable :: polymorphic_child
+  class(base_t), allocatable :: polymorphic_base
+  class(*), allocatable :: anything, anything_else
+
+  call move_alloc(fixed, deferred)
+  call move_alloc(same, same)
+  call move_alloc(concrete_child, polymorphic_base)
+  call move_alloc(polymorphic_child, polymorphic_base)
+  call move_alloc(polymorphic_base, anything)
+  call move_alloc(anything, anything_else)
+  block
+    integer, allocatable :: local_from, local_to
+    call move_alloc(local_from, local_to)
+  end block
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("MOVE_ALLOC")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_move_alloc_polymorphic_source_to_nonpolymorphic_destination() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  type :: payload_t
+  end type
+  class(payload_t), allocatable :: source
+  type(payload_t), allocatable :: target
+  call move_alloc(source, target)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("MOVE_ALLOC") && err.contains("polymorphic"))
+                .count(),
+            1,
+            "{errs:?}"
         );
     }
 
@@ -11883,6 +15375,68 @@ end program
     }
 
     #[test]
+    fn rejects_duplicate_allocate_and_deallocate_objects() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  type :: box_t
+    integer, allocatable :: value
+  end type
+  type(box_t) :: boxes(2)
+  integer, allocatable :: values(:)
+  integer :: index
+
+  allocate(values(2), values(3))
+  allocate(boxes(1)%value, boxes(1)%value)
+  deallocate(values, values)
+  deallocate(boxes(index)%value, boxes(index)%value)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| { err.contains("same entity as an earlier ALLOCATE object") })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| { err.contains("same entity as an earlier DEALLOCATE object") })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_distinct_and_side_effect_selected_allocation_objects() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  type :: box_t
+    integer, allocatable :: value
+  end type
+  type(box_t) :: boxes(2)
+
+  allocate(boxes(1)%value, boxes(2)%value)
+  deallocate(boxes(1)%value, boxes(2)%value)
+  allocate(boxes(next_index())%value, boxes(next_index())%value)
+contains
+  integer function next_index()
+    integer, save :: index = 0
+    index = index + 1
+    next_index = index
+  end function
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
     fn allocatable_and_pointer_forbidden() {
         let errs = errors_from(
             "\
@@ -11978,6 +15532,1546 @@ end program
         assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
     }
 
+    #[test]
+    fn procedure_pointer_declaration_rejects_elemental_interface() {
+        let cases = [
+            (
+                "local",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+end program test
+",
+            ),
+            (
+                "component",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  type :: holder
+    procedure(callback), pointer, nopass :: handler
+  end type holder
+end program test
+",
+            ),
+            (
+                "dummy",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+contains
+  subroutine consume(handler)
+    procedure(callback), pointer, intent(in) :: handler
+  end subroutine consume
+end program test
+",
+            ),
+            (
+                "function result",
+                "\
+program test
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+contains
+  function make_handler() result(handler)
+    procedure(callback), pointer :: handler
+    handler => null()
+  end function make_handler
+end program test
+",
+            ),
+            (
+                "use-associated interface",
+                "\
+module callback_api
+  implicit none
+  private
+  public :: callback
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+end module callback_api
+
+program test
+  use callback_api, only: callback
+  implicit none
+  procedure(callback), pointer :: handler
+end program test
+",
+            ),
+        ];
+
+        for (label, source) in cases {
+            let errs = errors_from(source);
+            assert_eq!(
+                errs,
+                ["procedure pointer 'handler' may not have an ELEMENTAL interface"],
+                "unexpected diagnostic for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_to_elemental_intrinsic_remains_nonelemental() {
+        let accepted = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    real function callback(value)
+      real, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: handler
+  real :: result
+  handler => sin
+  result = handler(0.0)
+end program test
+",
+        );
+        assert!(
+            accepted.is_empty(),
+            "scalar call through compatible intrinsic target should be accepted: {accepted:?}"
+        );
+
+        let rejected = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    real function callback(value)
+      real, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: handler
+  real :: result(2)
+  handler => sin
+  result = handler([0.0, 1.0])
+end program test
+",
+        );
+        assert_eq!(
+            rejected,
+            ["argument 'value' rank mismatch: expected rank 0, got rank 1"]
+        );
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_rejects_data_targets() {
+        let cases = [
+            (
+                "scalar data target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  integer, target :: storage
+  handler => storage
+end program test
+",
+                "procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer",
+            ),
+            (
+                "data pointer target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  integer, pointer :: storage
+  handler => storage
+end program test
+",
+                "procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer",
+            ),
+            (
+                "component procedure pointer and data target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  type :: holder_t
+    procedure(callback), pointer, nopass :: handler
+  end type holder_t
+  type(holder_t) :: holder
+  integer, target :: storage
+  holder%handler => storage
+end program test
+",
+                "procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer",
+            ),
+            (
+                "data function result",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback()
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => make_data()
+contains
+  integer function make_data()
+    make_data = 7
+  end function make_data
+end program test
+",
+                "procedure pointer 'handler' target 'make_data()' is not a procedure-pointer function result",
+            ),
+            (
+                "abstract interface",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => callback
+end program test
+",
+                "procedure pointer 'handler' target 'callback' is an abstract interface and cannot be a procedure target",
+            ),
+        ];
+
+        for (label, source, expected) in cases {
+            let errs = errors_from(source);
+            assert_eq!(errs, [expected], "unexpected diagnostic for {label}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_requires_compatible_characteristics() {
+        let cases = [
+            (
+                "procedure nature",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => transform
+contains
+  integer function transform(value)
+    integer, intent(in) :: value
+    transform = value
+  end function transform
+end program test
+",
+                "procedure nature differs",
+            ),
+            (
+                "dummy count",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value, extra)
+    integer, intent(in) :: value
+    integer, intent(in) :: extra
+  end subroutine action
+end program test
+",
+                "dummy argument count differs",
+            ),
+            (
+                "dummy type",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer(8), intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    logical(1), intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different type",
+            ),
+            (
+                "dummy rank",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value(:)
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different rank or shape",
+            ),
+            (
+                "dummy intent",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different INTENT",
+            ),
+            (
+                "dummy value attribute",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, value :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different VALUE attributes",
+            ),
+            (
+                "function result type",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => transform
+contains
+  logical function transform(value)
+    integer, intent(in) :: value
+    transform = value > 0
+  end function transform
+end program test
+",
+                "function result has a different type",
+            ),
+            (
+                "function result rank",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => transform
+contains
+  function transform(value) result(result)
+    integer, intent(in) :: value
+    integer :: result(1)
+    result = value
+  end function transform
+end program test
+",
+                "function result has a different rank or shape",
+            ),
+            (
+                "pure pointer and impure target",
+                "\
+program test
+  implicit none
+  abstract interface
+    pure subroutine callback(value)
+      integer, intent(inout) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine action
+end program test
+",
+                "target is not PURE",
+            ),
+            (
+                "bind mismatch",
+                "\
+program test
+  use iso_c_binding, only: c_int
+  implicit none
+  abstract interface
+    subroutine callback(value) bind(c)
+      import :: c_int
+      integer(c_int), value :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer(c_int), value :: value
+  end subroutine action
+end program test
+",
+                "BIND(C) attributes differ",
+            ),
+        ];
+
+        for (label, source, reason) in cases {
+            let errs = errors_from(source);
+            assert_eq!(
+                errs.len(),
+                1,
+                "unexpected diagnostic count for {label}: {errs:?}"
+            );
+            assert!(
+                errs[0].contains("procedure pointer 'handler'")
+                    && errs[0].contains("incompatible characteristics")
+                    && errs[0].contains(reason),
+                "unexpected diagnostic for {label}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_checks_full_characteristic_set() {
+        let cases = [
+            (
+                "optional",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, optional :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different OPTIONAL attributes",
+            ),
+            (
+                "allocatable",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, allocatable, intent(inout) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(inout) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different ALLOCATABLE attributes",
+            ),
+            (
+                "asynchronous",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, asynchronous :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different ASYNCHRONOUS attributes",
+            ),
+            (
+                "contiguous",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, contiguous :: value(:)
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value(:)
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different CONTIGUOUS attributes",
+            ),
+            (
+                "volatile",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, volatile :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different VOLATILE attributes",
+            ),
+            (
+                "pointer",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, pointer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different POINTER attributes",
+            ),
+            (
+                "target",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, target, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has different TARGET attributes",
+            ),
+            (
+                "character length",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      character(4), intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    character(5), intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different type",
+            ),
+            (
+                "explicit shape",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value(3)
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  subroutine action(value)
+    integer, intent(in) :: value(4)
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different rank or shape",
+            ),
+            (
+                "nested procedure dummy",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine integer_action(value)
+      integer, intent(in) :: value
+    end subroutine integer_action
+  end interface
+  abstract interface
+    subroutine real_action(value)
+      real, intent(in) :: value
+    end subroutine real_action
+  end interface
+  abstract interface
+    subroutine callback(action)
+      import :: integer_action
+      procedure(integer_action) :: action
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => apply
+contains
+  subroutine apply(action)
+    procedure(real_action) :: action
+  end subroutine apply
+end program test
+",
+                "dummy argument 1 has incompatible procedure characteristics",
+            ),
+            (
+                "allocatable result",
+                "\
+program test
+  implicit none
+  abstract interface
+    function callback() result(value)
+      integer, allocatable :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => make_value
+contains
+  integer function make_value()
+    make_value = 1
+  end function make_value
+end program test
+",
+                "function result has different ALLOCATABLE attributes",
+            ),
+            (
+                "pointer result",
+                "\
+program test
+  implicit none
+  abstract interface
+    function callback() result(value)
+      integer, pointer :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => make_value
+contains
+  integer function make_value()
+    make_value = 1
+  end function make_value
+end program test
+",
+                "function result has different POINTER attributes",
+            ),
+            (
+                "specific intrinsic characteristics",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: handler
+  handler => sin
+end program test
+",
+                "dummy argument 1 has a different type",
+            ),
+        ];
+
+        for (label, source, reason) in cases {
+            let errs = errors_from(source);
+            assert_eq!(
+                errs.len(),
+                1,
+                "unexpected diagnostic count for {label}: {errs:?}"
+            );
+            assert!(
+                errs[0].contains("incompatible characteristics") && errs[0].contains(reason),
+                "unexpected diagnostic for {label}: {errs:?}"
+            );
+        }
+
+        let elemental = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+contains
+  elemental subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            elemental,
+            ["procedure pointer 'handler' target 'action' is a nonintrinsic ELEMENTAL procedure"]
+        );
+
+        let restricted_intrinsic = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    character function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: char
+  procedure(callback), pointer :: handler
+  handler => char
+end program test
+",
+        );
+        assert_eq!(
+            restricted_intrinsic,
+            ["procedure pointer 'handler' target 'char' is not an unrestricted specific intrinsic procedure"]
+        );
+    }
+
+    #[test]
+    fn procedure_pointer_assignment_accepts_compatible_targets() {
+        let errs = errors_from(
+            "\
+module procedure_targets_m
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value(:)
+    end function callback
+    subroutine impure_callback(value)
+      integer, intent(inout) :: value
+    end subroutine impure_callback
+    subroutine shape_callback(count, values)
+      integer, intent(in) :: count
+      integer, intent(in) :: values(count)
+    end subroutine shape_callback
+    real function intrinsic_callback(value)
+      real, intent(in) :: value
+    end function intrinsic_callback
+  end interface
+  abstract interface
+    function callback_factory() result(result)
+      import :: callback
+      procedure(callback), pointer :: result
+    end function callback_factory
+  end interface
+  intrinsic :: sin
+  procedure(callback), pointer :: first
+  procedure(callback), pointer :: second
+  procedure(callback_factory), pointer :: factory
+  procedure(impure_callback), pointer :: impure_handler
+  procedure(shape_callback), pointer :: shape_handler
+  procedure(intrinsic_callback), pointer :: intrinsic_handler
+  type :: holder_t
+    procedure(callback), pointer, nopass :: slot
+    procedure(callback_factory), pointer, nopass :: factory_slot
+  end type holder_t
+  type(holder_t) :: holder
+contains
+  subroutine configure()
+    first => transform
+    second => first
+    holder%slot => transform
+    first => holder%slot
+    first => make_handler()
+    factory => make_handler
+    first => factory()
+    holder%factory_slot => make_handler
+    first => holder%factory_slot()
+    first => null()
+    impure_handler => pure_action
+    shape_handler => shaped_action
+    intrinsic_handler => sin
+  end subroutine configure
+
+  integer function transform(value)
+    integer, intent(in) :: value(:)
+    transform = sum(value)
+  end function transform
+
+  function make_handler() result(result)
+    procedure(callback), pointer :: result
+    result => transform
+  end function make_handler
+
+  pure subroutine pure_action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine pure_action
+
+  subroutine shaped_action(size, items)
+    integer, intent(in) :: size
+    integer, intent(in) :: items(size)
+  end subroutine shaped_action
+end module procedure_targets_m
+",
+        );
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn procedure_pointer_initialization_uses_same_characteristic_rules() {
+        let data_target = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  integer, target :: storage
+  procedure(callback), pointer :: handler => storage
+end program test
+",
+        );
+        assert_eq!(
+            data_target,
+            ["procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer"]
+        );
+
+        let incompatible_target = errors_from(
+            "\
+module test_m
+  implicit none
+  abstract interface
+    integer function callback()
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler => action
+contains
+  logical function action()
+    action = .true.
+  end function action
+end module test_m
+",
+        );
+        assert_eq!(
+            incompatible_target,
+            ["procedure pointer 'handler' target 'action' has incompatible characteristics: function result has a different type"]
+        );
+
+        let abstract_target = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler => callback
+end program test
+",
+        );
+        assert_eq!(
+            abstract_target,
+            ["procedure pointer 'handler' target 'callback' is an abstract interface and cannot be a procedure target"]
+        );
+
+        let component_data_target = errors_from(
+            "\
+module test_m
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  integer, target :: storage
+  type :: holder_t
+    procedure(callback), pointer, nopass :: handler => storage
+  end type holder_t
+end module test_m
+",
+        );
+        assert_eq!(
+            component_data_target,
+            ["procedure pointer 'handler' target 'storage' is not a procedure or procedure pointer"]
+        );
+
+        let internal_target = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler => action
+contains
+  subroutine action()
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            internal_target,
+            ["procedure pointer 'handler' initializer 'action' must name an external, module, or unrestricted specific intrinsic procedure"]
+        );
+
+        let compatible_module_target = errors_from(
+            "\
+module test_m
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  procedure(callback), pointer :: handler => action
+  type :: holder_t
+    procedure(callback), pointer, nopass :: slot => action
+  end type holder_t
+contains
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end module test_m
+",
+        );
+        assert!(
+            compatible_module_target.is_empty(),
+            "unexpected errors: {compatible_module_target:?}"
+        );
+    }
+
+    #[test]
+    fn procedure_dummy_actual_requires_a_callable_with_matching_characteristics() {
+        let data_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  integer :: storage
+  call apply(storage)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+        );
+        assert_eq!(
+            data_actual,
+            ["actual argument for procedure dummy 'action' is not a procedure or procedure pointer"]
+        );
+
+        let incompatible_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+
+  subroutine action(value)
+    real, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            incompatible_actual,
+            ["actual procedure 'action' for dummy 'candidate' has incompatible characteristics: dummy argument 1 has a different type"]
+        );
+
+        let function_call_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    integer function callback()
+    end function callback
+  end interface
+  integer :: storage, result
+  result = evaluate(storage)
+contains
+  integer function evaluate(candidate)
+    procedure(callback) :: candidate
+    evaluate = candidate()
+  end function evaluate
+end program test
+",
+        );
+        assert_eq!(
+            function_call_actual,
+            ["actual argument for procedure dummy 'candidate' is not a procedure or procedure pointer"]
+        );
+
+        let compatible_actual = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+
+  pure subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert!(
+            compatible_actual.is_empty(),
+            "unexpected errors: {compatible_actual:?}"
+        );
+    }
+
+    #[test]
+    fn procedure_dummy_actual_rejects_noncallable_forms() {
+        let cases = [
+            (
+                "data expression",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  integer :: storage
+  call apply(storage + 1)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual argument for procedure dummy 'action' is not a procedure or procedure pointer",
+            ),
+            (
+                "data function result",
+                "\
+program test
+  implicit none
+  abstract interface
+    integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  call apply(make_value())
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+
+  integer function make_value()
+    make_value = 1
+  end function make_value
+end program test
+",
+                "actual argument for procedure dummy 'action' is not a procedure or procedure pointer",
+            ),
+            (
+                "abstract interface",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  call apply(callback)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual procedure 'callback' for dummy 'action' is an abstract interface and is not callable",
+            ),
+            (
+                "NULL for nonpointer dummy",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  call apply(null())
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual argument for nonpointer procedure dummy 'action' cannot be NULL()",
+            ),
+            (
+                "restricted intrinsic",
+                "\
+program test
+  implicit none
+  abstract interface
+    character function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  intrinsic :: char
+  call apply(char)
+contains
+  subroutine apply(action)
+    procedure(callback) :: action
+  end subroutine apply
+end program test
+",
+                "actual procedure 'char' for dummy 'action' is not an unrestricted specific intrinsic procedure",
+            ),
+        ];
+
+        for (label, source, expected) in cases {
+            let errors = errors_from(source);
+            assert_eq!(errors, [expected], "{label}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn procedure_dummy_actual_checks_full_characteristic_set() {
+        let cases = [
+            (
+                "nature",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  integer function action(value)
+    integer, intent(in) :: value
+    action = value
+  end function action
+end program test
+",
+                "procedure nature differs",
+            ),
+            (
+                "dummy count",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value, extra)
+    integer, intent(in) :: value, extra
+  end subroutine action
+end program test
+",
+                "dummy argument count differs",
+            ),
+            (
+                "dummy rank",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value(:)
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different rank or shape",
+            ),
+            (
+                "dummy intent",
+                "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer, intent(out) :: value
+    value = 1
+  end subroutine action
+end program test
+",
+                "dummy argument 1 has a different INTENT",
+            ),
+            (
+                "PURE",
+                "\
+program test
+  implicit none
+  abstract interface
+    pure subroutine callback(value)
+      integer, intent(inout) :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine action
+end program test
+",
+                "target is not PURE",
+            ),
+            (
+                "BIND(C)",
+                "\
+program test
+  use iso_c_binding, only: c_int
+  implicit none
+  abstract interface
+    subroutine callback(value) bind(c)
+      import :: c_int
+      integer(c_int), value :: value
+    end subroutine callback
+  end interface
+  call apply(action)
+contains
+  subroutine apply(candidate)
+    procedure(callback) :: candidate
+  end subroutine apply
+  subroutine action(value)
+    integer(c_int), value :: value
+  end subroutine action
+end program test
+",
+                "BIND(C) attributes differ",
+            ),
+        ];
+
+        for (label, source, reason) in cases {
+            let errors = errors_from(source);
+            assert_eq!(
+                errors,
+                [format!(
+                    "actual procedure 'action' for dummy 'candidate' has incompatible characteristics: {reason}"
+                )],
+                "{label}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_dummy_actual_obeys_pointer_association_rules() {
+        let missing_intent = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  call install(action)
+contains
+  subroutine install(candidate)
+    procedure(callback), pointer :: candidate
+  end subroutine install
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert_eq!(
+            missing_intent,
+            ["nonpointer actual procedure 'action' requires procedure pointer dummy 'candidate' to have INTENT(IN)"]
+        );
+
+        let compatible = errors_from(
+            "\
+program test
+  implicit none
+  abstract interface
+    subroutine callback(value)
+      integer, intent(in) :: value
+    end subroutine callback
+  end interface
+  abstract interface
+    function callback_factory() result(result)
+      import :: callback
+      procedure(callback), pointer :: result
+    end function callback_factory
+  end interface
+  procedure(callback), pointer :: handler
+  handler => action
+  call consume(handler)
+  call consume(make_handler())
+  call consume(null())
+  call borrow(action)
+  call forward(action)
+contains
+  subroutine consume(candidate)
+    procedure(callback), pointer :: candidate
+  end subroutine consume
+
+  subroutine borrow(candidate)
+    procedure(callback), pointer, intent(in) :: candidate
+  end subroutine borrow
+
+  subroutine forward(candidate)
+    procedure(callback) :: candidate
+    call borrow(candidate)
+  end subroutine forward
+
+  function make_handler() result(result)
+    procedure(callback), pointer :: result
+    result => action
+  end function make_handler
+
+  subroutine action(value)
+    integer, intent(in) :: value
+  end subroutine action
+end program test
+",
+        );
+        assert!(compatible.is_empty(), "unexpected errors: {compatible:?}");
+    }
+
+    #[test]
+    fn optional_procedure_dummy_validates_only_present_conditional_arms() {
+        let compatible = errors_from(
+            "\
+program test
+  implicit none
+  logical :: enabled
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  enabled = .true.
+  call maybe((enabled ? action : .nil.))
+contains
+  subroutine maybe(candidate)
+    procedure(callback), optional :: candidate
+  end subroutine maybe
+  subroutine action()
+  end subroutine action
+end program test
+",
+        );
+        assert!(compatible.is_empty(), "unexpected errors: {compatible:?}");
+
+        let invalid_present_arm = errors_from(
+            "\
+program test
+  implicit none
+  logical :: enabled
+  integer :: storage
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+  enabled = .true.
+  call maybe((enabled ? storage : .nil.))
+contains
+  subroutine maybe(candidate)
+    procedure(callback), optional :: candidate
+  end subroutine maybe
+end program test
+",
+        );
+        assert_eq!(
+            invalid_present_arm,
+            ["actual argument for procedure dummy 'candidate' is not a procedure or procedure pointer"]
+        );
+    }
+
+    #[test]
+    fn procedure_dummy_actual_accepts_characteristic_exceptions_and_external_unknowns() {
+        let errors = errors_from(
+            "\
+program test
+  abstract interface
+    subroutine impure_callback(value)
+      integer, intent(inout) :: value
+    end subroutine impure_callback
+    real function intrinsic_callback(value)
+      real, intent(in) :: value
+    end function intrinsic_callback
+  end interface
+  intrinsic :: sin
+  external :: separately_compiled
+  call apply_impure(pure_action)
+  call apply_intrinsic(sin)
+  call apply_impure(separately_compiled)
+contains
+  subroutine apply_impure(candidate)
+    procedure(impure_callback) :: candidate
+  end subroutine apply_impure
+
+  subroutine apply_intrinsic(candidate)
+    procedure(intrinsic_callback) :: candidate
+  end subroutine apply_intrinsic
+
+  pure subroutine pure_action(value)
+    integer, intent(inout) :: value
+    value = value + 1
+  end subroutine pure_action
+end program test
+",
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
     // ---- Pure constraints ----
 
     #[test]
@@ -12051,6 +17145,327 @@ end function
 ",
         );
         assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn pure_control_expressions_reject_impure_function_calls() {
+        let errs = errors_from(
+            "\
+module m
+contains
+  logical function impure_predicate()
+    impure_predicate = .true.
+  end function
+
+  integer function impure_bound()
+    impure_bound = 1
+  end function
+
+  pure subroutine exercise()
+    integer :: i
+
+    if (impure_predicate()) continue
+    do while (impure_predicate())
+      exit
+    end do
+    do i = impure_bound(), 1
+    end do
+    select case (impure_bound())
+    case (1)
+    end select
+  end subroutine
+end module
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("callee is not pure"))
+                .count(),
+            4,
+            "every control expression must enforce PURE call constraints: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_statement_expression_fields_are_checked_exhaustively() {
+        fn errors_for_statement(statement: &str) -> Vec<String> {
+            errors_from(&format!(
+                "\
+module m
+  implicit none
+contains
+  logical function impure_predicate()
+    impure_predicate = .true.
+  end function
+
+  integer function impure_bound()
+    impure_bound = 1
+  end function
+
+  function impure_mask() result(mask)
+    logical :: mask(2)
+    mask = .true.
+  end function
+
+  pure subroutine take_scalar(value)
+    integer, intent(in) :: value
+  end subroutine
+
+  pure subroutine take_vector(value)
+    integer, intent(in) :: value(:)
+  end subroutine
+
+  pure subroutine exercise()
+    integer :: i, values(2)
+    integer, allocatable :: allocated_values(:)
+    character(32) :: buffer
+    values = 0
+{statement}
+  end subroutine
+end module
+"
+            ))
+        }
+
+        let cases = [
+            (
+                "IF/ELSE IF conditions",
+                "    if (impure_predicate()) then\n\
+                     continue\n\
+                   else if (impure_predicate()) then\n\
+                     continue\n\
+                   end if",
+                2,
+            ),
+            (
+                "single-line IF condition",
+                "    if (impure_predicate()) continue",
+                1,
+            ),
+            (
+                "DO WHILE condition",
+                "    do while (impure_predicate())\n\
+                     exit\n\
+                   end do",
+                1,
+            ),
+            (
+                "counted DO header",
+                "    do i = impure_bound(), impure_bound(), impure_bound()\n\
+                   end do",
+                3,
+            ),
+            (
+                "DO CONCURRENT header",
+                "    do concurrent (i = impure_bound():impure_bound():impure_bound(), impure_predicate())\n\
+                   end do",
+                4,
+            ),
+            (
+                "SELECT CASE selector",
+                "    select case (impure_bound())\n\
+                   case (1)\n\
+                   end select",
+                1,
+            ),
+            (
+                "WHERE and ELSEWHERE masks",
+                "    where (impure_mask())\n\
+                     values = 1\n\
+                   elsewhere (impure_mask())\n\
+                     values = 2\n\
+                   end where",
+                2,
+            ),
+            (
+                "FORALL header",
+                "    forall (i = impure_bound():impure_bound():impure_bound(), impure_predicate())\n\
+                     values(i) = i\n\
+                   end forall",
+                4,
+            ),
+            (
+                "ASSOCIATE selector",
+                "    associate (value => impure_bound())\n\
+                     if (value < 0) return\n\
+                   end associate",
+                1,
+            ),
+            (
+                "internal I/O item",
+                "    write(buffer, *) impure_bound()",
+                1,
+            ),
+            (
+                "CALL argument",
+                "    call take_scalar(impure_bound())",
+                1,
+            ),
+            (
+                "ALLOCATE bounds and SOURCE",
+                "    allocate(allocated_values(impure_bound()), source=[impure_bound()])",
+                2,
+            ),
+            (
+                "conditional-expression arms",
+                "    i = (impure_predicate() ? impure_bound() : impure_bound())",
+                3,
+            ),
+            (
+                "array-constructor implied-DO bounds",
+                "    values = [(i, i = impure_bound(), impure_bound(), impure_bound())]",
+                3,
+            ),
+            (
+                "array-section triplet in CALL argument",
+                "    call take_vector(values(impure_bound():impure_bound():impure_bound()))",
+                3,
+            ),
+        ];
+
+        for (context, statement, expected) in cases {
+            let errs = errors_for_statement(statement);
+            assert_eq!(
+                errs.iter()
+                    .filter(|err| err.contains("callee is not pure"))
+                    .count(),
+                expected,
+                "{context} must inspect every nested function call: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_control_expressions_accept_pure_and_intrinsic_calls() {
+        let errs = errors_from(
+            "\
+module m
+  implicit none
+contains
+  pure logical function pure_predicate()
+    pure_predicate = .true.
+  end function
+
+  pure integer function pure_bound()
+    pure_bound = 1
+  end function
+
+  pure subroutine take_scalar(value)
+    integer, intent(in) :: value
+  end subroutine
+
+  pure subroutine exercise()
+    integer :: i
+    if (pure_predicate()) then
+      do i = abs(pure_bound()), pure_bound()
+        call take_scalar(max(i, pure_bound()))
+      end do
+    end if
+  end subroutine
+end module
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "PURE and intrinsic callees must remain valid in control expressions: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_calls_require_an_explicit_pure_contract_for_unknown_and_external_procedures() {
+        let errs = errors_from(
+            "\
+pure subroutine exercise()
+  integer :: value
+  real, external :: external_value
+  real, external :: sin
+  external :: external_work
+
+  call unknown_work()
+  call external_work()
+  value = unknown_value()
+  value = int(external_value())
+  value = int(sin(0.0))
+end subroutine exercise
+",
+        );
+        let contract_errors: Vec<_> = errs
+            .iter()
+            .filter(|err| err.contains("requires an explicit PURE or ELEMENTAL interface"))
+            .collect();
+        assert_eq!(
+            contract_errors.len(),
+            5,
+            "every unresolved or EXTERNAL call must require a positive purity contract: {errs:?}"
+        );
+        for name in [
+            "unknown_work",
+            "external_work",
+            "unknown_value",
+            "external_value",
+            "sin",
+        ] {
+            assert!(
+                contract_errors.iter().any(|err| err.contains(name)),
+                "missing PURE contract diagnostic for {name}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_calls_accept_explicit_pure_interfaces_intrinsics_and_array_subscripts() {
+        let errs = errors_from(
+            "\
+module callbacks
+  abstract interface
+    pure integer function pure_callback(value)
+      integer, intent(in) :: value
+    end function pure_callback
+  end interface
+contains
+  pure subroutine exercise(callback, values)
+    procedure(pure_callback) :: callback
+    integer, intent(inout) :: values(2)
+    intrinsic :: abs
+
+    values(1) = callback(values(2))
+    values(2) = abs(values(1))
+  end subroutine exercise
+end module callbacks
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "positive PURE contracts and data subscripts must remain valid: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_calls_reject_procedure_dummies_with_impure_interfaces() {
+        let errs = errors_from(
+            "\
+module callbacks
+  abstract interface
+    integer function impure_callback(value)
+      integer, intent(in) :: value
+    end function impure_callback
+  end interface
+contains
+  pure integer function exercise(callback, value)
+    procedure(impure_callback) :: callback
+    integer, intent(in) :: value
+    exercise = callback(value)
+  end function exercise
+end module callbacks
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("requires an explicit PURE or ELEMENTAL interface"))
+                .count(),
+            1,
+            "an impure procedure interface is not a positive PURE contract: {errs:?}"
+        );
     }
 
     #[test]
@@ -12216,11 +17631,313 @@ end program
     }
 
     // ---- Label validation ----
-    // Note: the parser does not yet assign labels to statements (labels are
-    // separate tokens consumed but not attached). Full GOTO-target validation
-    // requires a parser enhancement to track statement labels. The validation
-    // infrastructure is in place; these tests verify the diagnostic machinery
-    // using the programmatic API directly.
+
+    #[test]
+    fn arithmetic_if_requires_scalar_integer_or_real_expression() {
+        let logical_errors = errors_from(
+            "\
+program test
+  implicit none
+  if (.true.) 10, 20, 30
+10 continue
+20 continue
+30 continue
+end program
+",
+        );
+        assert!(
+            logical_errors
+                .iter()
+                .any(|error| error
+                    .contains("arithmetic IF expression must be a scalar INTEGER or REAL")),
+            "expected logical arithmetic IF rejection, got {logical_errors:?}"
+        );
+
+        let array_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: values(2)
+  values = [1, 2]
+  if (values) 10, 20, 30
+10 continue
+20 continue
+30 continue
+end program
+",
+        );
+        assert!(
+            array_errors
+                .iter()
+                .any(|error| error
+                    .contains("arithmetic IF expression must be a scalar INTEGER or REAL")),
+            "expected array arithmetic IF rejection, got {array_errors:?}"
+        );
+    }
+
+    #[test]
+    fn arithmetic_if_accepts_scalar_integer_and_real_expressions() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i
+  real :: x
+  i = 0
+  x = 0.0
+  if (i) 10, 20, 30
+10 continue
+  if (x) 20, 30, 40
+20 continue
+30 continue
+40 continue
+end program
+",
+        );
+        assert!(
+            errors.is_empty(),
+            "scalar integer and real arithmetic IF should be valid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn inquire_iolength_requires_an_isolated_definable_scalar_integer_result() {
+        for invalid_result in [
+            "character :: result",
+            "integer :: result(2)",
+            "integer, parameter :: result = 1",
+        ] {
+            let errors = errors_from(&format!(
+                "\
+program test
+  implicit none
+  {invalid_result}
+  inquire(iolength=result) 1
+end program
+"
+            ));
+            assert!(
+                errors.iter().any(|error| error.contains(
+                    "INQUIRE(IOLENGTH=) result must be a definable scalar INTEGER variable"
+                )),
+                "expected invalid IOLENGTH result rejection for '{invalid_result}', got {errors:?}"
+            );
+        }
+
+        let mixed_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(iolength=result, unit=6) 1
+end program
+",
+        );
+        assert!(
+            mixed_errors.iter().any(|error| error
+                .contains("INQUIRE(IOLENGTH=) may not be combined with other specifiers")),
+            "expected mixed INQUIRE form rejection, got {mixed_errors:?}"
+        );
+
+        let wrong_form_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(unit=6) result
+end program
+",
+        );
+        assert!(
+            wrong_form_errors
+                .iter()
+                .any(|error| error.contains("INQUIRE output-item-list requires IOLENGTH=")),
+            "expected output-list form rejection, got {wrong_form_errors:?}"
+        );
+
+        let empty_list_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(iolength=result)
+end program
+",
+        );
+        assert!(
+            empty_list_errors
+                .iter()
+                .any(|error| error.contains("INQUIRE(IOLENGTH=) requires an output-item-list")),
+            "expected empty IOLENGTH list rejection, got {empty_list_errors:?}"
+        );
+
+        let valid_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: result
+  inquire(iolength=result) 1
+end program
+",
+        );
+        assert!(
+            valid_errors.is_empty(),
+            "valid IOLENGTH form should remain accepted, got {valid_errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_cannot_enter_block_construct() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  go to 10
+  block
+10  continue
+  end block
+end program
+",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .contains("control transfer to label 10 enters a structured construct")),
+            "branching into a BLOCK must be rejected before lowering: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn computed_goto_and_arithmetic_if_cannot_enter_structured_constructs() {
+        let computed_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: selector
+  selector = 1
+  go to (10), selector
+  if (.true.) then
+10  continue
+  end if
+end program
+",
+        );
+        assert!(
+            computed_errors.iter().any(|error| error
+                .contains("control transfer to label 10 enters a structured construct")),
+            "computed GOTO must not enter an IF arm: {computed_errors:?}"
+        );
+
+        let arithmetic_errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: selector
+  selector = 0
+  if (selector) 20, 20, 20
+  do
+20  exit
+  end do
+end program
+",
+        );
+        assert!(
+            arithmetic_errors.iter().any(|error| error
+                .contains("control transfer to label 20 enters a structured construct")),
+            "arithmetic IF must not enter a DO construct: {arithmetic_errors:?}"
+        );
+    }
+
+    #[test]
+    fn io_branch_specifier_cannot_enter_block_construct() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  integer :: value
+  read (*, *, err=25) value
+  block
+25  continue
+  end block
+end program
+",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .contains("control transfer to label 25 enters a structured construct")),
+            "an I/O branch specifier must not enter a BLOCK: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_cannot_cross_between_sibling_if_arms() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  logical :: choose_first
+  choose_first = .true.
+  if (choose_first) then
+    go to 30
+  else
+30  continue
+  end if
+end program
+",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .contains("control transfer to label 30 enters a structured construct")),
+            "a branch between sibling IF arms must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_may_stay_within_or_leave_structured_construct() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  block
+    go to 40
+40  continue
+    go to 50
+  end block
+50 continue
+end program
+",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("enters a structured construct")),
+            "a branch may remain in or leave its current construct: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn goto_may_target_labeled_construct_boundary() {
+        let errors = errors_from(
+            "\
+program test
+  implicit none
+  go to 60
+60 block
+     integer :: value
+     value = 1
+   end block
+end program
+",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("enters a structured construct")),
+            "the label on a construct statement is outside its body region: {errors:?}"
+        );
+    }
+
+    // Keep direct context-level tests for undefined/duplicate bookkeeping in
+    // addition to the parsed-source region tests above.
 
     #[test]
     fn goto_undefined_label_detected() {
@@ -12544,6 +18261,142 @@ end program
     }
 
     #[test]
+    fn do_concurrent_default_none_requires_locality_for_outer_variables() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, seed, result(2)
+  do concurrent (i = 1:2) default(none)
+    result(i) = seed + i
+  end do
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("'result'") && e.contains("DEFAULT(NONE)")),
+            "missing DEFAULT(NONE) diagnostic for result: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("'seed'") && e.contains("DEFAULT(NONE)")),
+            "missing DEFAULT(NONE) diagnostic for seed: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_accepts_explicit_and_block_local_variables() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, seed, result(2)
+  seed = 10
+  result = 0
+  do concurrent (i = 1:2) shared(seed, result) default(none)
+    block
+      integer :: local_value
+      local_value = seed + i
+      result(i) = local_value
+    end block
+  end do
+end program
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("DEFAULT(NONE)")),
+            "explicit locality and BLOCK-local entities should satisfy DEFAULT(NONE): {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_reaches_outer_references_in_nested_block() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, seed
+  do concurrent (i = 1:2) default(none)
+    if (i > 0) then
+      block
+        integer :: local_value
+        local_value = seed
+      end block
+    end if
+  end do
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("'seed'") && e.contains("DEFAULT(NONE)")),
+            "DEFAULT(NONE) must cover references in nested BLOCKs: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("'local_value'")),
+            "a BLOCK-local entity must not require an outer locality-spec: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_accepts_use_shadowing_in_nested_block() {
+        let errs = errors_from(
+            "\
+module imported_values
+  implicit none
+  integer, parameter :: value = 7
+end module imported_values
+
+program test
+  implicit none
+  integer :: i, value, result
+  value = 100
+  result = 0
+  do concurrent (i = 1:2) shared(result) default(none)
+    block
+      use imported_values, only: value
+      result = result + value
+    end block
+  end do
+end program test
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("DEFAULT(NONE)")),
+            "a BLOCK use-associated entity must shadow an outer local entity: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn do_concurrent_default_none_accepts_interface_shadowing_in_nested_block() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: i, handler, result
+  handler = 100
+  result = 0
+  do concurrent (i = 1:2) shared(result) default(none)
+    block
+      interface handler
+        pure integer function local_handler(value)
+          integer, intent(in) :: value
+        end function local_handler
+      end interface handler
+      result = result + handler(i)
+    end block
+  end do
+end program test
+",
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("DEFAULT(NONE)")),
+            "a BLOCK interface must shadow an outer local entity: {errs:?}"
+        );
+    }
+
+    #[test]
     fn array_conditional_rhs_accepted() {
         // F2023: an array-valued conditional as an assignment RHS lowers
         // via a per-arm branch, so it is accepted.
@@ -12743,6 +18596,61 @@ end program
         assert!(errs
             .iter()
             .any(|e| e.contains("ERROR STOP") && e.contains("F2008")));
+    }
+
+    #[test]
+    fn stop_quiet_requires_f2018() {
+        let errs = errors_with_std(
+            "\
+program test
+  implicit none
+  stop, quiet=.true.
+end program
+",
+            FortranStandard::F2008,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("QUIET=") && e.contains("F2018")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn stop_quiet_requires_a_scalar_logical_expression() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  integer :: wrong_type
+  logical :: wrong_rank(2)
+  stop, quiet=wrong_type
+  error stop, quiet=wrong_rank
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.contains("QUIET=") && e.contains("scalar LOGICAL"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn stop_quiet_accepts_a_scalar_logical_expression() {
+        let errs = errors_from(
+            "\
+program test
+  implicit none
+  logical :: enabled
+  enabled = .true.
+  error stop 'boom', quiet=(enabled .and. .true.)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]

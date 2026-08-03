@@ -75,8 +75,11 @@ fn simplify_function(func: &mut Function) -> bool {
                 continue;
             }
             if let Some(Terminator::Branch(target, args)) = &block.terminator {
-                if args.is_empty() {
+                if args.is_empty() && *target != block.id {
                     // This block is empty and just forwards to target.
+                    // A self-loop has no distinct forwarding destination:
+                    // replacing its terminator would change nontermination
+                    // into `Unreachable`.
                     redirect = Some((block.id, *target));
                     break;
                 }
@@ -276,6 +279,62 @@ mod tests {
             f.blocks.len() <= 2,
             "should merge empty chain, got {} blocks",
             f.blocks.len()
+        );
+    }
+
+    #[test]
+    fn preserves_empty_infinite_self_loop() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut function = Function::new("test".into(), vec![], IrType::Void);
+        let loop_block = function.create_block("forever");
+        function.block_mut(function.entry).terminator =
+            Some(Terminator::Branch(loop_block, vec![]));
+        function.block_mut(loop_block).terminator = Some(Terminator::Branch(loop_block, vec![]));
+        module.add_function(function);
+
+        assert!(
+            !SimplifyCfg.run(&mut module),
+            "an empty self-loop has no forwarding edge to simplify"
+        );
+        assert!(
+            matches!(
+                module.functions[0].block(loop_block).terminator.as_ref(),
+                Some(Terminator::Branch(target, args))
+                    if *target == loop_block && args.is_empty()
+            ),
+            "CFG simplification converted nontermination into termination"
+        );
+    }
+
+    #[test]
+    fn collapses_empty_cycle_without_destroying_nontermination() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut function = Function::new("test".into(), vec![], IrType::Void);
+        let left = function.create_block("left");
+        let right = function.create_block("right");
+        function.block_mut(function.entry).terminator = Some(Terminator::Branch(left, vec![]));
+        function.block_mut(left).terminator = Some(Terminator::Branch(right, vec![]));
+        function.block_mut(right).terminator = Some(Terminator::Branch(left, vec![]));
+        module.add_function(function);
+
+        assert!(
+            SimplifyCfg.run(&mut module),
+            "a two-block empty cycle can be collapsed to one block"
+        );
+        let function = &module.functions[0];
+        let Some(Terminator::Branch(loop_block, args)) =
+            function.block(function.entry).terminator.as_ref()
+        else {
+            panic!("entry must still branch into the infinite cycle");
+        };
+        assert!(args.is_empty());
+        assert!(
+            matches!(
+                function.block(*loop_block).terminator.as_ref(),
+                Some(Terminator::Branch(target, args))
+                    if target == loop_block && args.is_empty()
+            ),
+            "cycle collapse must leave a reachable self-loop"
         );
     }
 

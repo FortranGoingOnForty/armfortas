@@ -4152,6 +4152,571 @@ fn defined_assignment_derived_operator_result_fixture_passes_at_o0() {
 }
 
 #[test]
+fn ar40_private_parent_constructor_fixture_passes_all_opts() {
+    if skip_native_e2e("ar40_private_parent_constructor_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar40_private_parent_constructor.f90");
+    assert!(
+        source.exists(),
+        "ar40_private_parent_constructor.f90 missing"
+    );
+
+    // The fixture's OPT_EQ and reproducibility annotations expand this O0
+    // anchor across every supported optimization and compile surface.
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar40_private_parent_constructor.f90 should pass at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar42_gvn_transitive_global_fixture_passes_all_opts() {
+    if skip_native_e2e("ar42_gvn_transitive_global_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar42_gvn_transitive_global.f90");
+    assert!(source.exists(), "ar42_gvn_transitive_global.f90 missing");
+
+    // OPT_EQ makes this focused O0 anchor compare runtime behavior with every
+    // supported optimization level, including each level that enables GVN.
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar42_gvn_transitive_global.f90 should pass at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar42_real4_powf_fixture_passes_all_opts() {
+    if skip_native_e2e("ar42_real4_powf_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar42_real4_powf.f90");
+    assert!(source.exists(), "ar42_real4_powf.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar42_real4_powf.f90 should match target powf at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar42_licm_zero_trip_pointer_fixture_passes_all_opts() {
+    if skip_native_e2e("ar42_licm_zero_trip_pointer_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar42_licm_zero_trip_pointer.f90");
+    assert!(source.exists(), "ar42_licm_zero_trip_pointer.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar42_licm_zero_trip_pointer.f90 should preserve the zero-trip guard at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_unrelated_use_generic_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_unrelated_use_generic_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_unrelated_use_generic.f90");
+    assert!(source.exists(), "ar43_unrelated_use_generic.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_unrelated_use_generic.f90 should preserve lexical generic visibility at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_block_use_nature_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_block_use_nature_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_block_use_nature.f90");
+    assert!(source.exists(), "ar43_block_use_nature.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_block_use_nature.f90 should preserve BLOCK USE nature at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_arithmetic_if_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_arithmetic_if_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_arithmetic_if.f90");
+    assert!(source.exists(), "ar43_arithmetic_if.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_arithmetic_if.f90 should evaluate once and select the negative, zero, or positive label at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_associate_derived_expr_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_associate_derived_expr_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_associate_derived_expr.f90");
+    assert!(source.exists(), "ar43_associate_derived_expr.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_associate_derived_expr.f90 should preserve derived selector metadata and finalize expression selectors on every exit, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_io_branch_cleanup_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_io_branch_cleanup_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_io_branch_cleanup.f90");
+    assert!(source.exists(), "ar43_io_branch_cleanup.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_io_branch_cleanup.f90 should clean every BLOCK exited by an I/O label branch without cleaning an enclosing destination scope, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_named_if_select_exit_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_named_if_select_exit_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_named_if_select_exit.f90");
+    assert!(source.exists(), "ar43_named_if_select_exit.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_named_if_select_exit.f90 should honor every named IF/SELECT CASE EXIT and clean owning scopes crossed by the transfer, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_block_initialized_decls_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_block_initialized_decls_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_block_initialized_decls.f90");
+    assert!(source.exists(), "ar43_block_initialized_decls.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_block_initialized_decls.f90 should retain independent SAVE storage for initialized entities in distinct BLOCK scopes at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_select_rank_star_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_select_rank_star_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_select_rank_star.f90");
+    assert!(source.exists(), "ar43_select_rank_star.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_select_rank_star.f90 should distinguish assumed-size RANK(*) from numeric-rank and default guards at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_block_return_shadow_cleanup_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar43_block_return_shadow_cleanup_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_block_return_shadow_cleanup.f90");
+    assert!(
+        source.exists(),
+        "ar43_block_return_shadow_cleanup.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_block_return_shadow_cleanup.f90 should finalize BLOCK and shadowed procedure owners on RETURN at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_locality_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_do_concurrent_locality_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_locality.f90");
+    assert!(source.exists(), "ar43_do_concurrent_locality.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_locality.f90 should preserve every locality contract at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_locality_array_pointer_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar43_do_concurrent_locality_array_pointer_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_locality_array_pointer.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_locality_array_pointer.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_locality_array_pointer.f90 should preserve rank and pointer association at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_reduction_identities_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar43_do_concurrent_reduction_identities_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_reduction_identities.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_reduction_identities.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_reduction_identities.f90 should apply every supported reduction identity at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_default_none_missing_fixture_is_rejected() {
+    if skip_native_e2e(
+        "ar43_do_concurrent_default_none_missing_fixture_is_rejected",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_default_none_missing.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_default_none_missing.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_default_none_missing.f90 should fail with the required locality diagnostic, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_do_concurrent_named_cycle_fixture_passes_all_opts() {
+    if skip_native_e2e("ar43_do_concurrent_named_cycle_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_do_concurrent_named_cycle.f90");
+    assert!(
+        source.exists(),
+        "ar43_do_concurrent_named_cycle.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_do_concurrent_named_cycle.f90 should advance named and unnamed CYCLE to identical control tuples at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar43_goto_into_block_fixture_is_rejected_without_ice() {
+    if skip_native_e2e("ar43_goto_into_block_fixture_is_rejected_without_ice", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar43_goto_into_block.f90");
+    assert!(source.exists(), "ar43_goto_into_block.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar43_goto_into_block.f90 should fail with a semantic control-transfer diagnostic rather than an IR verifier error, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_scalar_reduction_strides_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_scalar_reduction_strides_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_scalar_reduction_strides.f90");
+    assert!(source.exists(), "ar44_scalar_reduction_strides.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_scalar_reduction_strides.f90 should preserve every source and mask descriptor stride at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_zero_extent_bounds_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_zero_extent_bounds_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_zero_extent_bounds.f90");
+    assert!(source.exists(), "ar44_zero_extent_bounds.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_zero_extent_bounds.f90 should canonicalize only empty dimensions across static and descriptor queries, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_allocate_source_zero_bytes_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_allocate_source_zero_bytes_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_allocate_source_zero_bytes.f90");
+    assert!(
+        source.exists(),
+        "ar44_allocate_source_zero_bytes.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_allocate_source_zero_bytes.f90 should accept every conforming zero-byte SOURCE= descriptor at every optimization, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_formatted_input_reversion_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_formatted_input_reversion_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_formatted_input_reversion.f90");
+    assert!(
+        source.exists(),
+        "ar44_formatted_input_reversion.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_formatted_input_reversion.f90 should apply finite format reversion without disturbing unlimited repeats or EOF, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_unformatted_record_framing_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_unformatted_record_framing_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_unformatted_record_framing.f90");
+    assert!(
+        source.exists(),
+        "ar44_unformatted_record_framing.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_unformatted_record_framing.f90 should reject incomplete or mismatched sequential-unformatted framing without rejecting an exact record, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_list_directed_character_quotes_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "ar44_list_directed_character_quotes_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_list_directed_character_quotes.f90");
+    assert!(
+        source.exists(),
+        "ar44_list_directed_character_quotes.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_list_directed_character_quotes.f90 should preserve quoted separators, unescape delimiters, and reject quoted numerics, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_namelist_quoted_slash_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_namelist_quoted_slash_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_namelist_quoted_slash.f90");
+    assert!(source.exists(), "ar44_namelist_quoted_slash.f90 missing");
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_namelist_quoted_slash.f90 should reserve group termination for unquoted slashes across external, repeated, and internal reads, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn ar44_namelist_conversion_status_fixture_passes_all_opts() {
+    if skip_native_e2e("ar44_namelist_conversion_status_fixture_passes_all_opts", 1) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("ar44_namelist_conversion_status.f90");
+    assert!(
+        source.exists(),
+        "ar44_namelist_conversion_status.f90 missing"
+    );
+
+    match run_test(&compiler, &source, "-O0") {
+        TestOutcome::Pass => {}
+        other => panic!(
+            "ar44_namelist_conversion_status.f90 should reject invalid scalar and continuation values without poisoning later valid reads, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
 fn opt_eq_annotations_allow_hello_cross_opt_invariant() {
     if skip_native_e2e("opt_eq_annotations_allow_hello_cross_opt_invariant", 1) {
         return;
@@ -5193,6 +5758,31 @@ fn pointer_result_forward_no_stack_copy_fixture_passes_all_opts() {
             other => panic!(
                 "pointer_result_forward_no_stack_copy.f90 should pass at {}, got {:?}",
                 opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
+fn ar56_stop_termination_does_not_finalize_live_entities() {
+    if skip_native_e2e("ar56_stop_termination_does_not_finalize_live_entities", 4) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+
+    for filename in [
+        "ar56_stop_none_no_finalization.f90",
+        "ar56_stop_int_no_finalization.f90",
+        "ar56_error_stop_none_no_finalization.f90",
+        "ar56_error_stop_int_no_finalization.f90",
+    ] {
+        let source = test_dir.join(filename);
+        assert!(source.exists(), "{filename} missing");
+        match run_test(&compiler, &source, "-O0") {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "{filename} must terminate without finalizing live entities at every optimization, got {other:?}"
             ),
         }
     }

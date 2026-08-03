@@ -127,10 +127,11 @@ fn internal_i128_stack_call_runs_at_o0() {
         "expected successful integer(16) stack-call run:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains('1'),
+        stdout.contains('1'),
         "internal integer(16) stack-call program should print score 1:\n{}",
-        run.stdout
+        stdout
     );
 }
 
@@ -172,11 +173,12 @@ fn internal_i128_stack_call_runs_through_optimized_levels() {
             "expected successful integer(16) stack-call run at {:?}:\n{:#?}",
             level, run
         );
+        let stdout = run.stdout_text().expect("run stdout should be UTF-8");
         assert!(
-            run.stdout.contains('1'),
+            stdout.contains('1'),
             "integer(16) stack-call program should print score 1 at {:?}:\n{}",
             level,
-            run.stdout
+            stdout
         );
     }
 }

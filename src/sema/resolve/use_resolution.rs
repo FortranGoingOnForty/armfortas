@@ -11,8 +11,8 @@ use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
 
 use super::core::{
-    backfill_procedure_pointer_interfaces, merge_specific_names, resolve_unit,
-    LOADED_EXTERNAL_MODULES, LOADING_EXTERNAL_SUBMODULES,
+    backfill_procedure_interfaces, merge_specific_names, resolve_unit, LOADED_EXTERNAL_MODULES,
+    LOADING_EXTERNAL_SUBMODULES,
 };
 
 fn add_use_association(
@@ -787,6 +787,7 @@ fn install_external_interface(
             save: var.save,
             pointer: var.pointer,
             target: var.target,
+            volatile: var.volatile,
             parameter: var.is_parameter,
             external: var.proc_pointer,
             array_spec,
@@ -880,8 +881,10 @@ fn install_external_interface(
             pointer: proc.result_pointer,
             pure: proc.pure,
             elemental: proc.elemental,
+            abstract_interface: proc.abstract_interface,
             is_separate_module_interface: proc.is_separate_module_interface,
             is_separate_module_procedure: proc.is_separate_module_procedure,
+            bind_c: proc.bind_c,
             binding_label: proc.binding_label.clone(),
             result_rank: proc.result_rank,
             array_spec: result_array_spec,
@@ -913,6 +916,15 @@ fn install_external_interface(
         };
         let proc_scope = st.push_scope(proc_scope_kind);
         st.scope_mut(proc_scope).arg_order = arg_names.clone();
+        st.scope_mut(proc_scope).bind_c = proc.bind_c;
+        st.scope_mut(proc_scope).binding_label = proc.binding_label.clone();
+        if matches!(proc.kind, crate::sema::symtab::SymbolKind::Function) {
+            st.scope_mut(proc_scope).result_name = Some(
+                proc.result_name
+                    .clone()
+                    .unwrap_or_else(|| proc.name.clone()),
+            );
+        }
         for arg in &proc.args {
             if arg.hidden {
                 continue;
@@ -925,7 +937,13 @@ fn install_external_interface(
             // explicit-shape dummies must stay explicit-shaped, though: using
             // AssumedShape here makes lowering pass a descriptor to callees
             // whose ABI expects a bare element pointer.
-            let array_spec: Vec<ArraySpec> = if arg.assumed_rank {
+            let array_spec: Vec<ArraySpec> = if let Some(specs) = arg
+                .array_spec
+                .as_ref()
+                .filter(|specs| specs.len() == arg.rank as usize)
+            {
+                specs.clone()
+            } else if arg.assumed_rank {
                 vec![ArraySpec::AssumedRank]
             } else if arg.rank == 0 {
                 Vec::new()
@@ -954,6 +972,10 @@ fn install_external_interface(
                 value: arg.value,
                 allocatable: arg.allocatable,
                 pointer: arg.pointer,
+                target: arg.target,
+                asynchronous: arg.asynchronous,
+                contiguous: arg.contiguous,
+                volatile: arg.volatile,
                 external: arg.external,
                 procedure_iface: arg.procedure_iface.clone(),
                 array_spec,
@@ -1027,12 +1049,18 @@ fn install_external_interface(
             let result_attrs = SymbolAttrs {
                 allocatable: proc.result_allocatable,
                 pointer: proc.result_pointer,
+                external: proc.result_procedure_iface.is_some(),
+                procedure_iface: proc.result_procedure_iface.clone(),
                 array_spec: result_array_spec,
                 ..Default::default()
             };
             let _ = st.define(Symbol {
                 name: synth_name,
-                kind: crate::sema::symtab::SymbolKind::Variable,
+                kind: if proc.result_procedure_iface.is_some() {
+                    crate::sema::symtab::SymbolKind::ProcedurePointer
+                } else {
+                    crate::sema::symtab::SymbolKind::Variable
+                },
                 type_info: proc.return_type.clone(),
                 attrs: result_attrs,
                 defined_at: dummy_span,
@@ -1044,11 +1072,11 @@ fn install_external_interface(
         }
         st.pop_scope();
     }
-    backfill_procedure_pointer_interfaces(st, scope_id);
+    backfill_procedure_interfaces(st, scope_id);
 
     // Register type layouts.
-    for layout in &iface.types {
-        let mut layout = layout.clone();
+    for amod_type in &iface.types {
+        let mut layout = amod_type.layout.clone();
         layout
             .owner_module
             .get_or_insert_with(|| module_name.to_string());
@@ -1057,7 +1085,7 @@ fn install_external_interface(
         type_layouts.insert(layout.clone());
         // Also add a DerivedType symbol.
         let attrs = SymbolAttrs {
-            access: Access::Public,
+            access: amod_type.access,
             type_owner_module: layout.owner_module.as_deref().map(str::to_ascii_lowercase),
             ..Default::default()
         };

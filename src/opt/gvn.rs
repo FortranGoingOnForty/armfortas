@@ -12,7 +12,7 @@ use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, dominator_tree_children};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 pub struct Gvn;
 
@@ -22,12 +22,8 @@ impl Pass for Gvn {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let pure_calls: Vec<PureCallPolicy> = module
-            .functions
-            .iter()
-            .map(PureCallPolicy::for_function)
-            .collect();
-        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
+        let pure_calls = derive_pure_call_policies(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
             // Sprint 15 Stage 2: congruence closure via fixpoint.
@@ -43,7 +39,7 @@ impl Pass for Gvn {
                 if gvn_function(
                     func,
                     &pure_calls,
-                    rounding_effects.may_change_rounding[func_idx],
+                    fpenv_effects.may_cross_fpenv_barrier[func_idx],
                 ) {
                     local_changed = true;
                 } else {
@@ -82,7 +78,7 @@ struct PureCallPolicy {
 }
 
 impl PureCallPolicy {
-    fn for_function(func: &Function) -> Self {
+    fn for_function(func: &Function, reads_non_argument_memory: bool) -> Self {
         let arg_policies = func
             .params
             .iter()
@@ -94,7 +90,7 @@ impl PureCallPolicy {
             && arg_policies
                 .iter()
                 .all(|policy| *policy != PureArgPolicy::Unsupported)
-            && !reads_non_argument_memory(func);
+            && !reads_non_argument_memory;
         Self {
             reusable,
             arg_policies,
@@ -113,8 +109,9 @@ impl PureCallPolicy {
 /// variable is fully legal, and GVN must not hash-cons such a call
 /// across an intervening store to that variable.
 ///
-/// We conservatively reject any callee that contains a `GlobalAddr`
-/// or a non-Internal `Call` / `RuntimeCall`.  The existing
+/// We conservatively reject any callee that transitively contains a
+/// `GlobalAddr`, a source-observable VOLATILE access, or a non-Internal
+/// `Call` / `RuntimeCall`. The existing
 /// argument-policy machinery already handles the "reads through
 /// argument pointer" case via `ReadOnlyWrapperPtr`.
 /// External math intrinsics whose `Call` sites are pure functions of
@@ -184,20 +181,73 @@ fn is_pure_external_intrinsic(name: &str) -> bool {
     PURE_EXTERNAL_INTRINSICS.contains(&name)
 }
 
-fn reads_non_argument_memory(func: &Function) -> bool {
-    for block in &func.blocks {
-        for inst in &block.insts {
+fn derive_pure_call_policies(module: &Module) -> Vec<PureCallPolicy> {
+    let reads_non_argument_memory = analyze_transitive_non_argument_memory(module);
+    module
+        .functions
+        .iter()
+        .zip(reads_non_argument_memory)
+        .map(|(function, reads_non_argument_memory)| {
+            PureCallPolicy::for_function(function, reads_non_argument_memory)
+        })
+        .collect()
+}
+
+/// Compute the conservative transitive closure of functions whose result may
+/// depend on state not represented by their arguments.
+///
+/// Starting from direct global/volatile/unknown-call observations, propagate
+/// the dependency backwards through every internal call edge. A worklist over
+/// callers handles arbitrary function order and recursive SCCs without
+/// optimistic cycle breaking: a cycle is reusable only when none of its
+/// members reaches a direct non-argument dependency.
+fn analyze_transitive_non_argument_memory(module: &Module) -> Vec<bool> {
+    let function_count = module.functions.len();
+    let mut callers_by_callee = vec![Vec::new(); function_count];
+    let mut reads_non_argument_memory = vec![false; function_count];
+
+    for (caller_idx, function) in module.functions.iter().enumerate() {
+        for inst in function.blocks.iter().flat_map(|block| block.insts.iter()) {
             match &inst.kind {
-                InstKind::GlobalAddr(_) => return true,
-                InstKind::Call(FuncRef::External(name), _) if !is_pure_external_intrinsic(name) => {
-                    return true;
+                InstKind::GlobalAddr(_)
+                | InstKind::VolatileLoad(..)
+                | InstKind::VolatileStore(..)
+                | InstKind::RuntimeCall(..)
+                | InstKind::Call(FuncRef::Indirect(_), _) => {
+                    reads_non_argument_memory[caller_idx] = true;
                 }
-                InstKind::RuntimeCall(_, _) => return true,
+                InstKind::Call(FuncRef::External(name), _) if !is_pure_external_intrinsic(name) => {
+                    reads_non_argument_memory[caller_idx] = true;
+                }
+                InstKind::Call(FuncRef::Internal(callee_idx), _) => {
+                    if let Some(callers) = callers_by_callee.get_mut(*callee_idx as usize) {
+                        callers.push(caller_idx);
+                    } else {
+                        // A malformed or stale internal reference cannot be
+                        // used as proof that the call result is repeatable.
+                        reads_non_argument_memory[caller_idx] = true;
+                    }
+                }
                 _ => {}
             }
         }
     }
-    false
+
+    let mut worklist = reads_non_argument_memory
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, reads)| reads.then_some(idx))
+        .collect::<VecDeque<_>>();
+    while let Some(callee_idx) = worklist.pop_front() {
+        for &caller_idx in &callers_by_callee[callee_idx] {
+            if !reads_non_argument_memory[caller_idx] {
+                reads_non_argument_memory[caller_idx] = true;
+                worklist.push_back(caller_idx);
+            }
+        }
+    }
+
+    reads_non_argument_memory
 }
 
 fn is_scalar_type(ty: &IrType) -> bool {
@@ -460,11 +510,10 @@ fn key_of(
     defs: &HashMap<ValueId, &Inst>,
     fpenv_barrier: bool,
 ) -> Option<Key> {
-    // In a function that changes the rounding mode, rounding-dependent FP
-    // ops are not value-numbered at all (conservative — the merge across
-    // a mode change is the bug; FP-env code is rare so the lost CSE is
-    // cheap).
-    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(&inst.kind) {
+    // In a function that accesses the floating-point environment, sensitive
+    // FP ops are not value-numbered at all. Besides rounding-dependent values,
+    // repeated executions can re-raise sticky IEEE flags after a reset.
+    if fpenv_barrier && super::fpenv::is_fpenv_sensitive(&inst.kind) {
         return None;
     }
     let mk = |tag: u32, ops: Vec<ValueId>, aux: i128| -> Option<Key> {
@@ -600,6 +649,8 @@ fn key_of(
         // Impure: loads, stores, runtime calls, external calls, alloca — not GVN candidates.
         InstKind::Load(..)
         | InstKind::Store(..)
+        | InstKind::VolatileLoad(..)
+        | InstKind::VolatileStore(..)
         | InstKind::Alloca(..)
         | InstKind::Call(..)
         | InstKind::RuntimeCall(..)
@@ -964,6 +1015,124 @@ mod tests {
     }
 
     #[test]
+    fn gvn_keeps_fcmp_distinct_when_function_accesses_fp_environment() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Bool);
+        let entry = f.entry;
+        let f64_ty = IrType::Float(FloatWidth::F64);
+        let snan = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(f64::from_bits(0x7ff0_0000_0000_0001), FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let zero = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            f64_ty,
+        );
+        let first = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Eq, snan, zero),
+            IrType::Bool,
+        );
+        let invalid = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let clear = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(
+            &mut f,
+            entry,
+            InstKind::Call(
+                FuncRef::External("afs_ieee_set_flag".into()),
+                vec![invalid, clear],
+            ),
+            IrType::Void,
+        );
+        let second = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Eq, snan, zero),
+            IrType::Bool,
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(f);
+
+        assert!(
+            !Gvn.run(&mut m),
+            "the second signaling comparison must execute after IEEE_INVALID is cleared"
+        );
+        let comparisons = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.kind, InstKind::FCmp(..)))
+            .map(|inst| inst.id)
+            .collect::<Vec<_>>();
+        assert_eq!(comparisons, vec![first, second]);
+        assert!(matches!(
+            m.functions[0].blocks[0].terminator,
+            Some(Terminator::Return(Some(value))) if value == second
+        ));
+    }
+
+    #[test]
+    fn gvn_still_dedupes_fcmp_without_fp_environment_access() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("test".into(), vec![], IrType::Bool);
+        let entry = f.entry;
+        let f64_ty = IrType::Float(FloatWidth::F64);
+        let value = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            f64_ty.clone(),
+        );
+        let zero = push_inst(
+            &mut f,
+            entry,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            f64_ty,
+        );
+        let first = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Gt, value, zero),
+            IrType::Bool,
+        );
+        let second = push_inst(
+            &mut f,
+            entry,
+            InstKind::FCmp(CmpOp::Gt, value, zero),
+            IrType::Bool,
+        );
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(f);
+
+        assert!(Gvn.run(&mut m));
+        assert!(matches!(
+            m.functions[0].blocks[0].terminator,
+            Some(Terminator::Return(Some(result))) if result == first
+        ));
+        assert!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .all(|inst| inst.id != second),
+            "ordinary comparison GVN must remain enabled without an FP-environment barrier"
+        );
+    }
+
+    #[test]
     fn gvn_keeps_float_pure_calls_distinct_across_indirect_call() {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
         let f64_ty = IrType::Float(FloatWidth::F64);
@@ -1208,6 +1377,153 @@ mod tests {
     }
 
     #[test]
+    fn gvn_does_not_reuse_calls_that_access_volatile_storage() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+
+        let mut callee =
+            Function::new("volatile_reader".into(), vec![], IrType::Int(IntWidth::I32));
+        callee.is_pure = true;
+        let callee_entry = callee.entry;
+        let slot = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let value = push_inst(
+            &mut callee,
+            callee_entry,
+            InstKind::VolatileLoad(slot),
+            IrType::Int(IntWidth::I32),
+        );
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(value)));
+        m.add_function(callee);
+
+        let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
+        let caller_entry = caller.entry;
+        let call1 = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let call2 = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let sum = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::IAdd(call1, call2),
+            IrType::Int(IntWidth::I32),
+        );
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(sum)));
+        m.add_function(caller);
+
+        let pass = Gvn;
+        assert!(!pass.run(&mut m));
+        assert_eq!(
+            m.functions[1].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Call(..)))
+                .count(),
+            2,
+            "each call must perform its own volatile read"
+        );
+    }
+
+    #[test]
+    fn gvn_does_not_reuse_wrapper_around_global_reader() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+
+        let mut leaf = Function::new("read_global".into(), vec![], IrType::Int(IntWidth::I32));
+        leaf.is_pure = true;
+        let leaf_entry = leaf.entry;
+        let leaf_addr = push_inst(
+            &mut leaf,
+            leaf_entry,
+            InstKind::GlobalAddr("mutable_state".into()),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let leaf_value = push_inst(
+            &mut leaf,
+            leaf_entry,
+            InstKind::Load(leaf_addr),
+            IrType::Int(IntWidth::I32),
+        );
+        leaf.block_mut(leaf_entry).terminator = Some(Terminator::Return(Some(leaf_value)));
+        m.add_function(leaf);
+
+        let mut wrapper = Function::new(
+            "read_through_wrapper".into(),
+            vec![],
+            IrType::Int(IntWidth::I32),
+        );
+        wrapper.is_pure = true;
+        let wrapper_entry = wrapper.entry;
+        let wrapped_value = push_inst(
+            &mut wrapper,
+            wrapper_entry,
+            InstKind::Call(FuncRef::Internal(0), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        wrapper.block_mut(wrapper_entry).terminator = Some(Terminator::Return(Some(wrapped_value)));
+        m.add_function(wrapper);
+
+        let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
+        let caller_entry = caller.entry;
+        let state_addr = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::GlobalAddr("mutable_state".into()),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Call(FuncRef::Internal(1), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        let replacement = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::ConstInt(100, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Store(replacement, state_addr),
+            IrType::Void,
+        );
+        let second = push_inst(
+            &mut caller,
+            caller_entry,
+            InstKind::Call(FuncRef::Internal(1), vec![]),
+            IrType::Int(IntWidth::I32),
+        );
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(caller);
+
+        assert!(
+            !Gvn.run(&mut m),
+            "a wrapper must inherit its internal callee's mutable-global dependency"
+        );
+        assert_eq!(
+            m.functions[2].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Call(FuncRef::Internal(1), _)))
+                .count(),
+            2,
+            "the store between calls can change the transitive global read"
+        );
+    }
+
+    #[test]
     fn gvn_reuses_pure_calls_after_operand_canonicalization() {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
@@ -1326,7 +1642,7 @@ mod tests {
         );
         callee.block_mut(entry).terminator = Some(Terminator::Return(Some(arg_val)));
 
-        let policy = PureCallPolicy::for_function(&callee);
+        let policy = PureCallPolicy::for_function(&callee, false);
         assert!(policy.reusable);
         assert_eq!(policy.arg_policies, vec![PureArgPolicy::ReadOnlyWrapperPtr]);
     }
@@ -1372,7 +1688,7 @@ mod tests {
         callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(arg_val)));
         m.add_function(callee);
 
-        let pure_calls = vec![PureCallPolicy::for_function(&m.functions[0])];
+        let pure_calls = derive_pure_call_policies(&m);
 
         let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
         let entry = caller.entry;
@@ -1544,11 +1860,7 @@ mod tests {
         caller.block_mut(entry).terminator = Some(Terminator::Return(Some(sum)));
         m.add_function(caller);
 
-        let pure_calls: Vec<PureCallPolicy> = m
-            .functions
-            .iter()
-            .map(PureCallPolicy::for_function)
-            .collect();
+        let pure_calls = derive_pure_call_policies(&m);
         assert!(pure_calls[0].reusable);
         assert_eq!(
             pure_calls[0].arg_policies,
@@ -1976,11 +2288,7 @@ mod tests {
         pm.run(&mut module)
             .expect("pre-GVN fixture pipeline should converge");
 
-        let pure_calls: Vec<PureCallPolicy> = module
-            .functions
-            .iter()
-            .map(PureCallPolicy::for_function)
-            .collect();
+        let pure_calls = derive_pure_call_policies(&module);
         assert!(
             pure_calls.iter().any(|policy| policy.reusable),
             "at least one function in the fixture should remain a reusable PURE callee:\n{}",

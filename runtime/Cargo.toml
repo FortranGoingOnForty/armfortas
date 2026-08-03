@@ -3,7 +3,9 @@ name = "armfortas-rt"
 version = "0.1.0"
 edition = "2021"
 description = "ARMFORTAS Fortran runtime library"
+license = "GPL-3.0-only"
+repository = "https://github.com/FortranGoingOnForty/armfortas"
 
 [lib]
 name = "armfortas_rt"
-crate-type = ["staticlib"]
+crate-type = ["rlib", "staticlib"]

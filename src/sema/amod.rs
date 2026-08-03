@@ -7,9 +7,7 @@
 //! enough information for full ABI-correct separate compilation.
 //!
 //! Innovations over gfortran/flang/ifort:
-//!   - Optimization hints (@hint leaf, no_globals, cost)
 //!   - Linker symbol names (@ir) for direct FFI
-//!   - Source checksum for staleness detection
 //!   - Polymorphic type tags (@tag)
 //!   - Human-editable for hand-written FFI descriptions
 
@@ -18,12 +16,15 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::ast::decl::UseNature;
-use crate::ir::inst::{FuncRef, Function, InstKind, Module as IrModule};
+use crate::ir::inst::Module as IrModule;
 use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
-use crate::sema::type_layout::TypeLayoutRegistry;
+use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 8;
+const AMOD_VERSION: u32 = 12;
+const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
+const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
+const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -72,21 +73,7 @@ pub(crate) fn parse_array_bounds(s: &str) -> Option<Vec<crate::ast::decl::ArrayS
         if dim.is_empty() {
             return None;
         }
-        // Find the first `:` at depth 0 (parens/brackets) to split
-        // lower:upper. Don't split on `:` inside function calls.
-        let mut depth: i32 = 0;
-        let mut split_at: Option<usize> = None;
-        for (idx, ch) in dim.char_indices() {
-            match ch {
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth -= 1,
-                ':' if depth == 0 => {
-                    split_at = Some(idx);
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let split_at = top_level_colon(dim);
         let (lower_str, upper_str) = match split_at {
             Some(i) => (Some(&dim[..i]), &dim[i + 1..]),
             None => (None, dim),
@@ -99,6 +86,79 @@ pub(crate) fn parse_array_bounds(s: &str) -> Option<Vec<crate::ast::decl::ArrayS
         specs.push(ArraySpec::Explicit { lower, upper });
     }
     Some(specs)
+}
+
+fn stringify_dummy_array_spec(specs: &[crate::ast::decl::ArraySpec]) -> Option<String> {
+    use crate::ast::decl::ArraySpec;
+    if specs.is_empty() {
+        return None;
+    }
+    let parts = specs
+        .iter()
+        .map(|spec| match spec {
+            ArraySpec::Explicit { lower, upper } => lower.as_ref().map_or_else(
+                || upper.to_sexpr(),
+                |lower| format!("{}:{}", lower.to_sexpr(), upper.to_sexpr()),
+            ),
+            ArraySpec::AssumedShape { lower } => lower
+                .as_ref()
+                .map_or_else(|| ":".to_string(), |lower| format!("{}:", lower.to_sexpr())),
+            ArraySpec::AssumedSize { lower } => lower.as_ref().map_or_else(
+                || "*".to_string(),
+                |lower| format!("{}:*", lower.to_sexpr()),
+            ),
+            ArraySpec::Deferred => "deferred".to_string(),
+            ArraySpec::AssumedRank => "..".to_string(),
+        })
+        .collect::<Vec<_>>();
+    Some(format!("({})", parts.join("; ")))
+}
+
+fn parse_dummy_array_spec(s: &str) -> Option<Vec<crate::ast::decl::ArraySpec>> {
+    use crate::ast::decl::ArraySpec;
+    let inner = s.strip_prefix('(').and_then(|s| s.strip_suffix(')'))?;
+    let mut specs = Vec::new();
+    for dim in inner.split(';') {
+        let dim = dim.trim();
+        let spec = match dim {
+            "" => return None,
+            ":" => ArraySpec::AssumedShape { lower: None },
+            "*" => ArraySpec::AssumedSize { lower: None },
+            "deferred" => ArraySpec::Deferred,
+            ".." => ArraySpec::AssumedRank,
+            _ if dim.ends_with(":*") => ArraySpec::AssumedSize {
+                lower: Some(parse_simple_expr(dim[..dim.len() - 2].trim())?),
+            },
+            _ if dim.ends_with(':') => ArraySpec::AssumedShape {
+                lower: Some(parse_simple_expr(dim[..dim.len() - 1].trim())?),
+            },
+            _ => {
+                let (lower, upper) = match top_level_colon(dim) {
+                    Some(index) => (
+                        Some(parse_simple_expr(dim[..index].trim())?),
+                        parse_simple_expr(dim[index + 1..].trim())?,
+                    ),
+                    None => (None, parse_simple_expr(dim)?),
+                };
+                ArraySpec::Explicit { lower, upper }
+            }
+        };
+        specs.push(spec);
+    }
+    Some(specs)
+}
+
+fn top_level_colon(text: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_simple_expr(src: &str) -> Option<crate::ast::expr::SpannedExpr> {
@@ -245,7 +305,6 @@ fn format_module_reference(module_name: &str, nature: UseNature) -> String {
 pub fn write_amod(
     module_name: &str,
     source_path: &str,
-    source_content: &[u8],
     st: &SymbolTable,
     mod_scope_id: ScopeId,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
@@ -295,7 +354,6 @@ pub fn write_amod(
         }
     }
     writeln!(out, "# source: {}", source_path).unwrap();
-    writeln!(out, "# checksum: fnv1a:{}", fnv1a_hex_bytes(source_content)).unwrap();
     writeln!(out, "# compiled: {}", compile_timestamp()).unwrap();
     writeln!(out, "# compiler: armfortas 0.1.0").unwrap();
     writeln!(out).unwrap();
@@ -622,7 +680,8 @@ pub fn write_amod(
             .or_else(|| type_layouts.get(key))
         {
             let canonical = type_layouts.canonical_key_for_layout(layout);
-            emit_type(&mut out, &canonical, type_layouts);
+            let access = serialized_type_access(scope, layout);
+            emit_type(&mut out, &canonical, access, type_layouts);
         }
     }
 
@@ -657,6 +716,23 @@ fn is_public(sym: &Symbol, scope: &Scope) -> bool {
         Access::Public => true,
         Access::Default => !matches!(scope.default_access, Access::Private),
     }
+}
+
+fn serialized_type_access(scope: &Scope, layout: &TypeLayout) -> Access {
+    scope
+        .symbols
+        .get(&layout.name.to_ascii_lowercase())
+        .filter(|sym| matches!(sym.kind, SymbolKind::DerivedType))
+        .map(|sym| {
+            if is_public(sym, scope) {
+                Access::Public
+            } else {
+                Access::Private
+            }
+        })
+        // A closure-only layout is implementation support for another
+        // exported entity, not an independently exported module name.
+        .unwrap_or(Access::Private)
 }
 
 fn bound_proc_target_export_key(module_key: &str, target_name: &str) -> String {
@@ -711,6 +787,9 @@ fn emit_variable(
     }
     if sym.attrs.target {
         attrs.push("target");
+    }
+    if sym.attrs.volatile {
+        attrs.push("volatile");
     }
     if sym.attrs.access == Access::Private {
         attrs.push("private");
@@ -835,24 +914,38 @@ fn emit_parameter(
     }
 }
 
-/// Two TypeInfo values represent the same Fortran type. For CHARACTER,
-/// match both kind AND len so a `character(:), allocatable` local does
-/// not get promoted as the result of a `character(3)` function.
-fn result_type_matches(ret: &TypeInfo, cand: &TypeInfo) -> bool {
-    use TypeInfo::*;
-    match (ret, cand) {
-        (Integer { kind: a }, Integer { kind: b }) => a == b,
-        (Real { kind: a }, Real { kind: b }) => a == b,
-        (DoublePrecision, DoublePrecision) => true,
-        (Complex { kind: a }, Complex { kind: b }) => a == b,
-        (Logical { kind: a }, Logical { kind: b }) => a == b,
-        (Character { kind: ak, len: al }, Character { kind: bk, len: bl }) => ak == bk && al == bl,
-        (Derived(a), Derived(b)) => a.eq_ignore_ascii_case(b),
-        (Class(a), Class(b)) => a.eq_ignore_ascii_case(b),
-        (ClassStar, ClassStar) => true,
-        (TypeStar, TypeStar) => true,
-        _ => false,
-    }
+fn procedure_scope_for_module<'a>(
+    st: &'a SymbolTable,
+    mod_scope_id: ScopeId,
+    name: &str,
+) -> Option<&'a Scope> {
+    st.scopes
+        .iter()
+        .find(|scope| {
+            scope.parent == Some(mod_scope_id)
+                && matches!(
+                    &scope.kind,
+                    ScopeKind::Function(proc_name) | ScopeKind::Subroutine(proc_name)
+                        if proc_name.eq_ignore_ascii_case(name)
+                )
+        })
+        .or_else(|| {
+            st.scopes.iter().find(|scope| {
+                let matches_name = matches!(
+                    &scope.kind,
+                    ScopeKind::Function(proc_name) | ScopeKind::Subroutine(proc_name)
+                        if proc_name.eq_ignore_ascii_case(name)
+                );
+                if !matches_name {
+                    return false;
+                }
+                let Some(parent_id) = scope.parent else {
+                    return false;
+                };
+                matches!(st.scope(parent_id).kind, ScopeKind::Interface)
+                    && st.scope(parent_id).parent == Some(mod_scope_id)
+            })
+        })
 }
 
 fn emit_procedure(
@@ -867,8 +960,12 @@ fn emit_procedure(
 ) {
     let is_func = matches!(sym.kind, SymbolKind::Function);
     let kind_str = if is_func { "function" } else { "subroutine" };
+    let proc_scope = procedure_scope_for_module(st, mod_scope_id, name);
 
     if is_func {
+        // RESULT identity is semantic state, not something reconstructed from
+        // whichever same-typed local happens to sort first.
+        let result_var = proc_scope.and_then(Scope::procedure_result_symbol);
         let ret_str = type_info_to_string(sym.type_info.as_ref());
         write!(out, "@function {} -> {}", sym.name, ret_str).unwrap();
         if sym.attrs.allocatable {
@@ -877,93 +974,18 @@ fn emit_procedure(
         if sym.attrs.pointer {
             write!(out, ", result_pointer").unwrap();
         }
+        if let Some(interface_name) = result_var
+            .filter(|result| result.kind == SymbolKind::ProcedurePointer)
+            .and_then(|result| result.attrs.procedure_iface.as_deref())
+        {
+            write!(out, ", result_procedure={interface_name}").unwrap();
+        }
         if sym.attrs.result_rank > 0 {
             write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
         }
-        // Sprint35-SMP Phase 2: emit the result variable's user-declared
-        // name when it differs from the function name (i.e. the source
-        // had a `result(X)` clause). Submodule bodies that reference the
-        // result by its declared name need this preserved across the
-        // .amod boundary so sema can register the right symbol.
-        let result_var: Option<&Symbol> = st
-            .scopes
-            .iter()
-            .find(|s| {
-                let matches_name = match &s.kind {
-                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                        n.eq_ignore_ascii_case(name)
-                    }
-                    _ => false,
-                };
-                if !matches_name {
-                    return false;
-                }
-                let Some(parent_id) = s.parent else {
-                    return false;
-                };
-                parent_id == mod_scope_id
-                    || matches!(st.scope(parent_id).kind, ScopeKind::Interface)
-                        && st.scope(parent_id).parent == Some(mod_scope_id)
-            })
-            .and_then(|pscope| {
-                let arg_set: std::collections::HashSet<String> =
-                    pscope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                // The result variable is defined from the function header
-                // before body declarations are processed. Locals can share
-                // the same type (for example allocatable character scratch
-                // strings in fortsh's expand_braces), so type matching alone
-                // is not enough and HashMap iteration order would otherwise
-                // pick a random local as result_name.
-                let ret_ti = sym.type_info.as_ref();
-                let mut typed_candidates: Vec<_> = pscope
-                    .symbols
-                    .iter()
-                    .filter(|(key, candidate)| {
-                        !arg_set.contains(*key)
-                            && matches!(
-                                candidate.kind,
-                                SymbolKind::Variable | SymbolKind::Parameter
-                            )
-                            && match (ret_ti, candidate.type_info.as_ref()) {
-                                (Some(rt), Some(ct)) => result_type_matches(rt, ct),
-                                _ => true,
-                            }
-                    })
-                    .collect();
-                typed_candidates.sort_by(|(ak, a), (bk, b)| {
-                    (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-                        b.defined_at.start.line,
-                        b.defined_at.start.col,
-                        bk.as_str(),
-                    ))
-                });
-                let mut fallback_candidates: Vec<_> = pscope
-                    .symbols
-                    .iter()
-                    .filter(|(key, candidate)| {
-                        !arg_set.contains(*key)
-                            && matches!(
-                                candidate.kind,
-                                SymbolKind::Variable | SymbolKind::Parameter
-                            )
-                    })
-                    .collect();
-                fallback_candidates.sort_by(|(ak, a), (bk, b)| {
-                    (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-                        b.defined_at.start.line,
-                        b.defined_at.start.col,
-                        bk.as_str(),
-                    ))
-                });
-                typed_candidates
-                    .into_iter()
-                    .next()
-                    .or_else(|| fallback_candidates.into_iter().next())
-                    .map(|(_, candidate)| candidate)
-            });
-        if let Some(result_var) = result_var {
-            if !result_var.name.eq_ignore_ascii_case(name) {
-                write!(out, ", result_name={}", result_var.name).unwrap();
+        if let Some(result_name) = proc_scope.and_then(|scope| scope.result_name.as_deref()) {
+            if !result_name.eq_ignore_ascii_case(name) {
+                write!(out, ", result_name={result_name}").unwrap();
             }
         }
         // Sprint35-SMP Phase 3: serialize the result variable's
@@ -989,6 +1011,9 @@ fn emit_procedure(
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
     }
+    if sym.attrs.abstract_interface {
+        write!(out, ", abstract_interface").unwrap();
+    }
     if sym.attrs.is_separate_module_interface {
         write!(out, ", module_interface").unwrap();
     }
@@ -997,6 +1022,9 @@ fn emit_procedure(
     }
     if !is_public(sym, st.scope(mod_scope_id)) {
         write!(out, ", private").unwrap();
+    }
+    if sym.attrs.bind_c && sym.attrs.binding_label.is_none() {
+        write!(out, ", bind_c").unwrap();
     }
     if let Some(binding_label) = &sym.attrs.binding_label {
         write!(out, ", bind={}", binding_label).unwrap();
@@ -1023,41 +1051,7 @@ fn emit_procedure(
         })
         .unwrap_or_default();
 
-    // Walk into the procedure's scope for full arg info. Interface-declared
-    // procedures sit under an intermediate Interface scope rather than
-    // directly under the module, so check both shapes.
-    let proc_scope = st
-        .scopes
-        .iter()
-        .find(|s| {
-            s.parent == Some(mod_scope_id)
-                && match &s.kind {
-                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                        n.eq_ignore_ascii_case(name)
-                    }
-                    _ => false,
-                }
-        })
-        .or_else(|| {
-            st.scopes.iter().find(|s| {
-                let matches_name = match &s.kind {
-                    ScopeKind::Function(n) | ScopeKind::Subroutine(n) => {
-                        n.eq_ignore_ascii_case(name)
-                    }
-                    _ => false,
-                };
-                if !matches_name {
-                    return false;
-                }
-                let Some(parent_id) = s.parent else {
-                    return false;
-                };
-                let parent = st.scope(parent_id);
-                matches!(parent.kind, ScopeKind::Interface) && parent.parent == Some(mod_scope_id)
-            })
-        });
-
-    let is_bind_c = sym.attrs.binding_label.is_some();
+    let is_bind_c = sym.attrs.bind_c;
     let declared_descriptor_params = descriptor_params
         .get(&metadata_name)
         .or_else(|| descriptor_params.get(&name_lc));
@@ -1086,13 +1080,6 @@ fn emit_procedure(
                 .collect()
         })
         .unwrap_or_default();
-    writeln!(
-        out,
-        "  @abi cc=aapcs64 hidden_char_lens={}",
-        hidden_char_len_args.len()
-    )
-    .unwrap();
-
     if let Some(pscope) = proc_scope {
         for (arg_idx, arg_name) in pscope.arg_order.iter().enumerate() {
             if let Some(arg_sym) = pscope.symbols.get(&arg_name.to_lowercase()) {
@@ -1148,6 +1135,18 @@ fn emit_procedure(
                 if arg_sym.attrs.pointer {
                     arg_attrs.push("pointer");
                 }
+                if arg_sym.attrs.target {
+                    arg_attrs.push("target");
+                }
+                if arg_sym.attrs.asynchronous {
+                    arg_attrs.push("asynchronous");
+                }
+                if arg_sym.attrs.contiguous {
+                    arg_attrs.push("contiguous");
+                }
+                if arg_sym.attrs.volatile {
+                    arg_attrs.push("volatile");
+                }
                 if arg_sym
                     .attrs
                     .array_spec
@@ -1181,6 +1180,11 @@ fn emit_procedure(
                 if !arg_sym.attrs.array_spec.is_empty() {
                     arg_attrs.push(rank_attr.as_str());
                 }
+                let array_spec_attr = stringify_dummy_array_spec(&arg_sym.attrs.array_spec)
+                    .map(|spec| format!("array_spec=\"{spec}\""));
+                if let Some(spec) = array_spec_attr.as_deref() {
+                    arg_attrs.push(spec);
+                }
                 if !arg_attrs.is_empty() {
                     write!(out, ", {}", arg_attrs.join(", ")).unwrap();
                 }
@@ -1204,52 +1208,17 @@ fn emit_procedure(
         writeln!(out, "  @arg {}@len : integer(8)", arg_name).unwrap();
     }
 
-    // @hint line.
-    if let Some(func) = ir_func {
-        let mut hints = Vec::new();
-        if is_leaf(func) {
-            hints.push("leaf".to_string());
-        }
-        if !touches_globals(func) {
-            hints.push("no_globals".to_string());
-        }
-        let cost: usize = func.blocks.iter().map(|b| b.insts.len()).sum();
-        hints.push(format!("cost={}", cost));
-        writeln!(out, "  @hint {}", hints.join(" ")).unwrap();
-    }
-
     writeln!(out, "@end {}", kind_str).unwrap();
     writeln!(out).unwrap();
 }
 
-fn is_leaf(func: &Function) -> bool {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::Call(..) | InstKind::RuntimeCall(..) => return false,
-                _ => {}
-            }
-        }
-    }
-    true
-}
-
-fn touches_globals(func: &Function) -> bool {
-    for block in &func.blocks {
-        for inst in &block.insts {
-            match &inst.kind {
-                InstKind::GlobalAddr(_) => return true,
-                InstKind::Call(FuncRef::External(_), _) => return true,
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
-fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
+fn emit_type(out: &mut String, name: &str, access: Access, type_layouts: &TypeLayoutRegistry) {
     if let Some(layout) = type_layouts.get(&name.to_lowercase()) {
-        writeln!(out, "@type {}", layout.name).unwrap();
+        let access = match access {
+            Access::Private => "private",
+            Access::Public | Access::Default => "public",
+        };
+        writeln!(out, "@type {}, {}", layout.name, access).unwrap();
         writeln!(out, "  @layout size={} align={}", layout.size, layout.align).unwrap();
         if let Some(ref parent) = layout.parent {
             writeln!(out, "  @extends {}", parent).unwrap();
@@ -1297,6 +1266,14 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             }
             if let Some(default_init) = &field.default_init {
                 attrs.push_str(&render_field_default_init(default_init));
+            }
+            let access = match field.access {
+                Access::Private => "private",
+                Access::Public | Access::Default => "public",
+            };
+            attrs.push_str(&format!(" @access {access}"));
+            if let Some(owner_module) = field.owner_module.as_deref() {
+                attrs.push_str(&format!(" @owner {owner_module}"));
             }
             writeln!(
                 out,
@@ -1363,7 +1340,12 @@ fn emit_type(out: &mut String, name: &str, type_layouts: &TypeLayoutRegistry) {
             }
         }
         for fp in &layout.final_procs {
-            writeln!(out, "  @final {} rank={}", fp.name, fp.rank).unwrap();
+            writeln!(
+                out,
+                "  @final {} rank={} elemental={}",
+                fp.name, fp.rank, fp.elemental
+            )
+            .unwrap();
         }
         if let Some(owner_module) = &layout.owner_module {
             writeln!(out, "  @owner {}", owner_module).unwrap();
@@ -1482,7 +1464,7 @@ pub(crate) fn artifact_fingerprint(content: &str) -> String {
 }
 
 fn fnv1a_hex_bytes(content: &[u8]) -> String {
-    // FNV-1a 64-bit hash for source and .amod content fingerprinting.
+    // FNV-1a 64-bit hash for .amod content fingerprinting.
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in content {
         hash ^= byte as u64;
@@ -1529,6 +1511,10 @@ pub struct AmodArg {
     pub descriptor: bool,
     pub allocatable: bool,
     pub pointer: bool,
+    pub target: bool,
+    pub asynchronous: bool,
+    pub contiguous: bool,
+    pub volatile: bool,
     pub hidden: bool,
     /// True for `procedure(iface) :: name` dummies. The producer side
     /// stores these as Variable + EXTERNAL; the consumer-side dispatch
@@ -1549,10 +1535,13 @@ pub struct AmodArg {
     /// Sprint35-SMP Phase 1: rank of the dummy (number of array dimensions);
     /// 0 for scalar. When non-zero the loader reconstructs a SymbolAttrs
     /// `array_spec` of this rank, deriving each dim's kind from the
-    /// `descriptor` / `allocatable` / `pointer` flags. Bound expressions
-    /// (Explicit lower:upper) are not preserved across .amod boundaries —
-    /// SMP-body synthesis only needs the shape kind and rank for Phase 2.
+    /// `descriptor` / `allocatable` / `pointer` flags when exact metadata
+    /// from a current `.amod` is unavailable.
     pub rank: u8,
+    /// Exact source dummy shape. Procedure characteristics include shape and
+    /// nonconstant bound dependence, so rank-only reconstruction is not
+    /// semantically sufficient.
+    pub array_spec: Option<Vec<crate::ast::decl::ArraySpec>>,
 }
 
 /// A procedure parsed from an .amod file.
@@ -1563,6 +1552,10 @@ pub struct AmodProc {
     pub return_type: Option<TypeInfo>,
     pub result_allocatable: bool,
     pub result_pointer: bool,
+    /// Declared interface of a procedure-pointer function result. A plain
+    /// `result_pointer` is insufficient because data pointers can also have
+    /// a derived declared type.
+    pub result_procedure_iface: Option<String>,
     pub result_rank: u8,
     /// Sprint35-SMP Phase 2: the result variable's user-declared name
     /// (from `result(X)` clause). None when the result name matches
@@ -1580,9 +1573,13 @@ pub struct AmodProc {
     pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
+    /// The declaration came from an ABSTRACT INTERFACE body and cannot be
+    /// used as a callable designator or procedure-pointer target.
+    pub abstract_interface: bool,
     pub is_separate_module_interface: bool,
     pub is_separate_module_procedure: bool,
     pub access: Access,
+    pub bind_c: bool,
     pub binding_label: Option<String>,
     pub args: Vec<AmodArg>,
 }
@@ -1598,6 +1595,7 @@ pub struct AmodVar {
     pub pointer: bool,
     pub proc_pointer: bool,
     pub target: bool,
+    pub volatile: bool,
     pub ir_symbol: Option<String>,
     pub deferred_char: bool,
     pub rank: usize,
@@ -1621,6 +1619,16 @@ pub struct AmodVar {
 pub struct AmodInterface {
     pub name: String,
     pub specifics: Vec<String>,
+    pub access: Access,
+}
+
+/// A serialized derived-type layout and the accessibility of its module
+/// symbol. Layout presence and USE visibility are deliberately separate:
+/// descendant submodules need private layouts, while ordinary consumers must
+/// not acquire the private type name.
+#[derive(Debug, Clone)]
+pub struct AmodType {
+    pub layout: TypeLayout,
     pub access: Access,
 }
 
@@ -1661,7 +1669,7 @@ pub struct ModuleInterface {
     pub renames: Vec<UseRename>,
     pub variables: Vec<AmodVar>,
     pub procedures: Vec<AmodProc>,
-    pub types: Vec<crate::sema::type_layout::TypeLayout>,
+    pub types: Vec<AmodType>,
     pub interfaces: Vec<AmodInterface>,
     /// F2023 strict enumeration types: (type name, enumerators in
     /// declaration order, access). Ordinals are positional (1-based).
@@ -1990,8 +1998,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
                 }
             }
         } else if trimmed.starts_with("@type ") {
-            let layout = parse_type(trimmed, &mut lines);
-            types.push(layout);
+            types.push(parse_amod_type(trimmed, &mut lines, version, path)?);
         } else if let Some(name) = trimmed.strip_prefix("@interface ") {
             // Generic interface block: header is `@interface <name>[, private]`,
             // body lists `@specific <proc>` until `@end interface`.
@@ -2022,26 +2029,29 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let final_proc_prefix = format!("afs_modproc_{}_", module_name.to_lowercase());
-    for layout in &mut types {
+    for amod_type in &mut types {
+        let layout = &mut amod_type.layout;
         for final_proc in &mut layout.final_procs {
-            if final_proc.rank != usize::MAX {
-                continue;
-            }
             let source_name = final_proc
                 .name
                 .strip_prefix(&final_proc_prefix)
                 .unwrap_or(&final_proc.name);
-            let Some(proc) = procedures
+            let procedure = procedures
                 .iter()
-                .find(|proc| proc.name.eq_ignore_ascii_case(source_name))
-            else {
-                return Err(format!(
-                    "{}: cannot infer rank for legacy @final {}",
-                    path.display(),
-                    final_proc.name
-                ));
-            };
-            final_proc.rank = proc.args.first().map_or(0, |arg| arg.rank as usize);
+                .find(|proc| proc.name.eq_ignore_ascii_case(source_name));
+            if final_proc.rank == usize::MAX {
+                let Some(procedure) = procedure else {
+                    return Err(format!(
+                        "{}: cannot infer rank for legacy @final {}",
+                        path.display(),
+                        final_proc.name
+                    ));
+                };
+                final_proc.rank = procedure.args.first().map_or(0, |arg| arg.rank as usize);
+            }
+            if version < AMOD_FINAL_ELEMENTAL_VERSION {
+                final_proc.elemental = procedure.is_some_and(|procedure| procedure.elemental);
+            }
         }
     }
 
@@ -2107,6 +2117,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
     let pointer = attr_str.contains("pointer");
     let proc_pointer = attr_str.contains("procptr");
     let target = attr_str.contains("target");
+    let volatile = attr_str.contains("volatile");
     let access = if attr_str.contains("private") {
         Access::Private
     } else {
@@ -2179,6 +2190,7 @@ fn parse_var(line: &str, is_param: bool) -> AmodVar {
         pointer,
         proc_pointer,
         target,
+        volatile,
         ir_symbol,
         deferred_char,
         rank: rank.max(dims.len()),
@@ -2279,10 +2291,15 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let attr_chunks = split_attrs_top_level(attrs_str);
     let pure = attr_chunks.iter().any(|a| a == "pure");
     let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let abstract_interface = attr_chunks.iter().any(|a| a == "abstract_interface");
     let is_separate_module_interface = attr_chunks.iter().any(|a| a == "module_interface");
     let is_separate_module_procedure = attr_chunks.iter().any(|a| a == "module_procedure");
     let result_allocatable = attr_chunks.iter().any(|a| a == "result_allocatable");
     let result_pointer = attr_chunks.iter().any(|a| a == "result_pointer");
+    let result_procedure_iface = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("result_procedure="))
+        .map(str::to_string);
     let result_rank = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("result_rank="))
@@ -2303,6 +2320,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let binding_label = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("bind=").map(|label| label.to_string()));
+    let bind_c = binding_label.is_some() || attr_chunks.iter().any(|attr| attr == "bind_c");
 
     let kind = if is_func {
         SymbolKind::Function
@@ -2321,8 +2339,8 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         if trimmed.starts_with("@arg ") {
             args.push(parse_arg(trimmed));
         }
-        // Skip @abi and @hint lines (informational; reader uses
-        // them for optimization but not for correctness).
+        // Skip @abi and legacy @hint lines; explicit @arg records carry the
+        // ABI-relevant metadata used by the reader.
     }
 
     let result_array_bounds = attr_chunks
@@ -2336,14 +2354,17 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         return_type,
         result_allocatable,
         result_pointer,
+        result_procedure_iface,
         result_rank,
         result_name,
         result_array_bounds,
         pure,
         elemental,
+        abstract_interface,
         is_separate_module_interface,
         is_separate_module_procedure,
         access,
+        bind_c,
         binding_label,
         args,
     }
@@ -2379,29 +2400,39 @@ fn parse_arg(line: &str) -> AmodArg {
         None
     };
 
-    let optional = attr_str.contains("optional");
-    let value = attr_str.contains("value");
-    let descriptor = attr_str.contains("descriptor");
-    let allocatable = attr_str.contains("allocatable");
-    let pointer = attr_str.contains("pointer");
-    let external = attr_str
-        .split(", ")
-        .any(|tok| tok.trim().eq_ignore_ascii_case("external"));
-    let assumed_rank = attr_str
-        .split(", ")
-        .any(|tok| tok.trim().eq_ignore_ascii_case("assumed-rank"));
+    let attr_chunks = split_attrs_top_level(attr_str);
+    let has_attr = |expected: &str| {
+        attr_chunks
+            .iter()
+            .any(|attr| attr.eq_ignore_ascii_case(expected))
+    };
+    let optional = has_attr("optional");
+    let value = has_attr("value");
+    let descriptor = has_attr("descriptor");
+    let allocatable = has_attr("allocatable");
+    let pointer = has_attr("pointer");
+    let target = has_attr("target");
+    let asynchronous = has_attr("asynchronous");
+    let contiguous = has_attr("contiguous");
+    let volatile = has_attr("volatile");
+    let external = has_attr("external");
+    let assumed_rank = has_attr("assumed-rank");
     // Sprint35-SMP Phase 1: parse `rank=N` if present. Emitted only when
     // the dummy is array-shaped; absence means rank 0 (scalar).
-    let rank = attr_str
-        .split(", ")
-        .find_map(|tok| tok.strip_prefix("rank="))
+    let rank = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("rank="))
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(0);
-    let procedure_iface = attr_str.split(", ").find_map(|tok| {
-        let t = tok.trim();
-        let inner = t.strip_prefix("procedure(")?;
+    let procedure_iface = attr_chunks.iter().find_map(|attr| {
+        let inner = attr.strip_prefix("procedure(")?;
         inner.strip_suffix(')').map(|s| s.trim().to_string())
     });
+    let array_spec = attr_chunks
+        .iter()
+        .find_map(|attr| attr.strip_prefix("array_spec="))
+        .map(|spec| spec.trim_matches('"'))
+        .and_then(parse_dummy_array_spec);
 
     AmodArg {
         name,
@@ -2412,18 +2443,25 @@ fn parse_arg(line: &str) -> AmodArg {
         descriptor,
         allocatable,
         pointer,
+        target,
+        asynchronous,
+        contiguous,
+        volatile,
         hidden,
         external,
         procedure_iface,
         assumed_rank,
         rank,
+        array_spec,
     }
 }
 
 fn parse_type(
     header: &str,
     lines: &mut std::iter::Peekable<std::str::Lines>,
-) -> crate::sema::type_layout::TypeLayout {
+    version: u32,
+    path: &Path,
+) -> Result<crate::sema::type_layout::TypeLayout, String> {
     use crate::sema::type_layout::*;
 
     fn parse_field_default_init_token(token: &str) -> Option<FieldDefaultInit> {
@@ -2535,8 +2573,12 @@ fn parse_type(
                 let mut procedure_pointer = false;
                 let mut procedure_pointer_nopass = false;
                 let mut default_init = None;
-                for token in flag_tail.split_whitespace() {
-                    match token {
+                let mut access = None;
+                let mut field_owner_module = None;
+                let tokens: Vec<&str> = flag_tail.split_whitespace().collect();
+                let mut token_index = 0;
+                while token_index < tokens.len() {
+                    match tokens[token_index] {
                         "@allocatable" => allocatable = true,
                         "@pointer" => pointer = true,
                         "@deferred_char" => deferred_char = true,
@@ -2544,17 +2586,96 @@ fn parse_type(
                         "@nopass" => procedure_pointer_nopass = true,
                         "@target" => target = true,
                         "@declared_array" => declared_array = true,
+                        "@access" => {
+                            if access.is_some() {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field accessibility for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            let Some(value) = tokens.get(token_index + 1) else {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (missing @field accessibility value for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            };
+                            access = Some(match *value {
+                                "public" => Access::Public,
+                                "private" => Access::Private,
+                                _ => {
+                                    return Err(format!(
+                                        "{}: corrupt .amod file (invalid @field accessibility '{}' for '{}'); rebuild the provider module",
+                                        path.display(),
+                                        value,
+                                        fname.trim()
+                                    ));
+                                }
+                            });
+                            token_index += 2;
+                            continue;
+                        }
+                        "@owner" => {
+                            if field_owner_module.is_some() {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (duplicate @field owner for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            }
+                            let Some(value) = tokens.get(token_index + 1) else {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (missing @field owner for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    fname.trim()
+                                ));
+                            };
+                            if value.starts_with('@') {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (invalid @field owner '{}' for '{}'); rebuild the provider module",
+                                    path.display(),
+                                    value,
+                                    fname.trim()
+                                ));
+                            }
+                            field_owner_module = Some((*value).to_string());
+                            token_index += 2;
+                            continue;
+                        }
                         _ => {
-                            if let Some(init) = parse_field_default_init_token(token) {
+                            if let Some(init) = parse_field_default_init_token(tokens[token_index])
+                            {
                                 default_init = Some(init);
                             }
                         }
                     }
+                    token_index += 1;
+                }
+                let access = match access {
+                    Some(access) => access,
+                    None if version < AMOD_FIELD_ACCESS_VERSION => Access::Public,
+                    None => {
+                        return Err(format!(
+                            "{}: corrupt .amod file (missing @field accessibility for '{}'); rebuild the provider module",
+                            path.display(),
+                            fname.trim()
+                        ));
+                    }
+                };
+                if version >= AMOD_FIELD_ACCESS_VERSION && field_owner_module.is_none() {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @field owner for '{}'); rebuild the provider module",
+                        path.display(),
+                        fname.trim()
+                    ));
                 }
                 declared_array |= !dims.is_empty();
                 let ftype = parse_type_info(ftype_str.trim());
                 fields.push(FieldLayout {
                     name: fname.trim().to_string(),
+                    access,
+                    owner_module: field_owner_module,
                     offset: offset_str.trim().parse().unwrap_or(0),
                     size: size_str.trim().parse().unwrap_or(0),
                     dims,
@@ -2597,13 +2718,42 @@ fn parse_type(
         } else if let Some(rest) = trimmed.strip_prefix("@final ") {
             let mut parts = rest.split_whitespace();
             let name = parts.next().unwrap_or_default().to_string();
-            let rank = match parts.find_map(|part| part.strip_prefix("rank=")) {
+            let attributes: Vec<_> = parts.collect();
+            let rank = match attributes
+                .iter()
+                .find_map(|part| part.strip_prefix("rank="))
+            {
                 Some(rank) => rank
                     .parse()
                     .unwrap_or_else(|_| panic!("malformed @final rank '{}'", rank)),
                 None => usize::MAX,
             };
-            final_procs.push(crate::sema::type_layout::FinalProc { name, rank });
+            let elemental = match attributes
+                .iter()
+                .find_map(|part| part.strip_prefix("elemental="))
+            {
+                Some("true") => true,
+                Some("false") => false,
+                Some(value) => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (invalid @final elemental value '{}'); rebuild the provider module",
+                        path.display(),
+                        value
+                    ));
+                }
+                None if version < AMOD_FINAL_ELEMENTAL_VERSION => false,
+                None => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (missing @final elemental metadata); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+            };
+            final_procs.push(crate::sema::type_layout::FinalProc {
+                name,
+                rank,
+                elemental,
+            });
         } else if let Some(rest) = trimmed.strip_prefix("@owner ") {
             owner_module = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("@tag ") {
@@ -2616,7 +2766,12 @@ fn parse_type(
     let owner_path = owner_module
         .as_ref()
         .map(|owner| owner.to_ascii_lowercase());
-    TypeLayout {
+    for field in &mut fields {
+        if field.owner_module.is_none() {
+            field.owner_module.clone_from(&owner_module);
+        }
+    }
+    Ok(TypeLayout {
         name,
         owner_module,
         owner_scope: None,
@@ -2629,7 +2784,34 @@ fn parse_type(
         type_tag,
         parent,
         is_abstract,
-    }
+    })
+}
+
+fn parse_amod_type(
+    header: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines>,
+    version: u32,
+    path: &Path,
+) -> Result<AmodType, String> {
+    let malformed = || {
+        format!(
+            "{}: corrupt .amod file (malformed @type accessibility); rebuild the provider module",
+            path.display()
+        )
+    };
+    let rest = header.strip_prefix("@type ").ok_or_else(malformed)?.trim();
+    let (name, access) = match rest.rsplit_once(", ") {
+        Some((name, "public")) if !name.trim().is_empty() => (name.trim(), Access::Public),
+        Some((name, "private")) if !name.trim().is_empty() => (name.trim(), Access::Private),
+        Some(_) => return Err(malformed()),
+        None if version < AMOD_TYPE_ACCESS_VERSION && !rest.is_empty() => (rest, Access::Public),
+        None => return Err(malformed()),
+    };
+    let layout_header = format!("@type {name}");
+    Ok(AmodType {
+        layout: parse_type(&layout_header, lines, version, path)?,
+        access,
+    })
 }
 
 fn parse_type_info(s: &str) -> Option<TypeInfo> {
@@ -2766,6 +2948,7 @@ pub fn extract_module_globals(
                 if let Some(layout) = iface
                     .types
                     .iter()
+                    .map(|amod_type| &amod_type.layout)
                     .find(|layout| layout.name.eq_ignore_ascii_case(type_name))
                 {
                     crate::ir::types::IrType::Array(
@@ -2800,6 +2983,7 @@ pub fn extract_module_globals(
                     declared_rank,
                     allocatable: var.allocatable,
                     is_pointer: var.pointer,
+                    volatile: var.volatile,
                     deferred_char: var.deferred_char,
                     derived_type,
                     char_kind: match var.type_info.as_ref() {
@@ -2865,7 +3049,7 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
 pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
     for proc in &iface.procedures {
-        let is_bind_c = proc.binding_label.is_some();
+        let is_bind_c = proc.bind_c;
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let hidden_len_args: HashSet<String> = proc
             .args
@@ -3133,7 +3317,8 @@ mod tests {
         assert_eq!(af.args.len(), 2);
         assert!(af.args[1].optional);
         assert_eq!(iface.types.len(), 1);
-        let pt = &iface.types[0];
+        let pt = &iface.types[0].layout;
+        assert_eq!(iface.types[0].access, Access::Public);
         assert_eq!(pt.name, "particle");
         assert_eq!(pt.size, 12);
         assert_eq!(pt.fields.len(), 3);
@@ -3144,7 +3329,112 @@ mod tests {
             vec![crate::sema::type_layout::FinalProc {
                 name: "afs_modproc_physics_finish_particles".into(),
                 rank: 1,
+                elemental: false,
             }]
+        );
+    }
+
+    #[test]
+    fn current_type_records_require_and_preserve_accessibility() {
+        let amod_text = r#"#!amod 12
+# module: type_access
+
+@type exposed_t, public
+  @layout size=4 align=4
+  @field value : integer @offset 0 @size 4 @access public @owner type_access
+@end type
+
+@type hidden_t, private
+  @layout size=4 align=4
+  @field value : integer @offset 0 @size 4 @access public @owner type_access
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("type_access.amod")).unwrap();
+        assert_eq!(iface.types.len(), 2);
+        assert_eq!(iface.types[0].layout.name, "exposed_t");
+        assert_eq!(iface.types[0].access, Access::Public);
+        assert_eq!(iface.types[0].layout.fields[0].access, Access::Public);
+        assert_eq!(
+            iface.types[0].layout.fields[0].owner_module.as_deref(),
+            Some("type_access")
+        );
+        assert_eq!(iface.types[1].layout.name, "hidden_t");
+        assert_eq!(iface.types[1].access, Access::Private);
+
+        let missing_access = r#"#!amod 12
+# module: missing_type_access
+
+@type hidden_t
+  @layout size=4 align=4
+@end type
+"#;
+        let err = parse_amod(missing_access, Path::new("missing_type_access.amod"))
+            .expect_err("current @type records without accessibility must be rejected");
+        assert!(
+            err.contains("corrupt .amod file")
+                && err.contains("malformed @type accessibility")
+                && err.contains("rebuild the provider module"),
+            "unexpected missing-access diagnostic: {err}"
+        );
+
+        for (record, expected) in [
+            (
+                "@field value : integer @offset 0 @size 4 @owner type_access",
+                "missing @field accessibility",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access protected @owner type_access",
+                "invalid @field accessibility",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access private",
+                "missing @field owner",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access public @access private @owner type_access",
+                "duplicate @field accessibility",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access public @owner type_access @owner type_access",
+                "duplicate @field owner",
+            ),
+            (
+                "@field value : integer @offset 0 @size 4 @access public @owner @pointer",
+                "invalid @field owner",
+            ),
+        ] {
+            let malformed = format!(
+                "#!amod 12\n# module: type_access\n\n@type item_t, public\n  @layout size=4 align=4\n  {record}\n@end type\n"
+            );
+            let error = parse_amod(&malformed, Path::new("bad_field_access.amod"))
+                .expect_err("malformed current @field access was accepted");
+            assert!(
+                error.contains("corrupt .amod file")
+                    && error.contains(expected)
+                    && error.contains("rebuild the provider module"),
+                "unexpected malformed-field diagnostic: {error}"
+            );
+        }
+
+        let legacy = r#"#!amod 9
+# module: legacy_type_access
+
+@type item_t, public
+  @layout size=4 align=4
+  @field value : integer @offset 0 @size 4
+  @owner legacy_type_access
+@end type
+"#;
+        let legacy_iface = parse_amod(legacy, Path::new("legacy_type_access.amod")).unwrap();
+        assert_eq!(
+            legacy_iface.types[0].layout.fields[0].access,
+            Access::Public
+        );
+        assert_eq!(
+            legacy_iface.types[0].layout.fields[0]
+                .owner_module
+                .as_deref(),
+            Some("legacy_type_access")
         );
     }
 
@@ -3229,20 +3519,64 @@ mod tests {
     }
 
     #[test]
-    fn legacy_final_proc_rank_is_inferred_from_procedure() {
+    fn legacy_final_proc_characteristics_are_inferred_from_procedure() {
         let amod_text = r#"#!amod 2
 # module: m
 
-@subroutine finish
-  @arg values : type(item), rank=1
+@subroutine finish_array
+  @arg values : type(array_item), rank=1
 @end subroutine
 
-@type item
-  @final afs_modproc_m_finish
+@subroutine finish_elemental, elemental
+  @arg value : type(scalar_item)
+@end subroutine
+
+@type array_item
+  @final afs_modproc_m_finish_array
+@end type
+
+@type scalar_item
+  @final afs_modproc_m_finish_elemental
 @end type
 "#;
         let iface = parse_amod(amod_text, Path::new("legacy.amod")).unwrap();
-        assert_eq!(iface.types[0].final_procs[0].rank, 1);
+        assert_eq!(iface.types[0].layout.final_procs[0].rank, 1);
+        assert!(!iface.types[0].layout.final_procs[0].elemental);
+        assert_eq!(iface.types[1].layout.final_procs[0].rank, 0);
+        assert!(iface.types[1].layout.final_procs[0].elemental);
+    }
+
+    #[test]
+    fn current_final_proc_elemental_metadata_is_required_and_preserved() {
+        let amod_text = r#"#!amod 12
+# module: m
+
+@type scalar_t, public
+  @final afs_modproc_m_finish_scalar rank=0 elemental=false
+@end type
+
+@type elemental_t, public
+  @final afs_modproc_m_finish_elemental rank=0 elemental=true
+@end type
+"#;
+        let iface = parse_amod(amod_text, Path::new("current.amod")).unwrap();
+        assert!(!iface.types[0].layout.final_procs[0].elemental);
+        assert!(iface.types[1].layout.final_procs[0].elemental);
+
+        let missing = r#"#!amod 12
+# module: m
+
+@type item_t, public
+  @final afs_modproc_m_finish rank=0
+@end type
+"#;
+        let err = parse_amod(missing, Path::new("missing.amod"))
+            .expect_err("current @final records must carry elemental metadata");
+        assert!(
+            err.contains("missing @final elemental metadata")
+                && err.contains("rebuild the provider module"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3251,7 +3585,7 @@ mod tests {
         let mut lines = "  @final afs_modproc_m_finish rank=oops\n@end type\n"
             .lines()
             .peekable();
-        let _ = parse_type("@type item", &mut lines);
+        let _ = parse_type("@type item", &mut lines, 2, Path::new("legacy.amod"));
     }
 
     #[test]
@@ -3358,6 +3692,58 @@ mod tests {
     }
 
     #[test]
+    fn procedure_characteristic_metadata_round_trips() {
+        let arg = parse_arg(
+            "@arg values : integer, intent(inout), optional, value, descriptor, \
+             allocatable, pointer, target, asynchronous, contiguous, volatile, \
+             external, procedure(callback), rank=6, \
+             array_spec=\"(count; 0:max(count, 1); :; 1:*; deferred; ..)\"",
+        );
+        assert_eq!(arg.intent, Some(Intent::InOut));
+        assert!(arg.optional);
+        assert!(arg.value);
+        assert!(arg.descriptor);
+        assert!(arg.allocatable);
+        assert!(arg.pointer);
+        assert!(arg.target);
+        assert!(arg.asynchronous);
+        assert!(arg.contiguous);
+        assert!(arg.volatile);
+        assert!(arg.external);
+        assert_eq!(arg.procedure_iface.as_deref(), Some("callback"));
+        assert_eq!(arg.rank, 6);
+        assert!(matches!(
+            arg.array_spec.as_deref(),
+            Some([
+                crate::ast::decl::ArraySpec::Explicit { lower: None, .. },
+                crate::ast::decl::ArraySpec::Explicit { lower: Some(_), .. },
+                crate::ast::decl::ArraySpec::AssumedShape { lower: None },
+                crate::ast::decl::ArraySpec::AssumedSize { lower: Some(_) },
+                crate::ast::decl::ArraySpec::Deferred,
+                crate::ast::decl::ArraySpec::AssumedRank,
+            ])
+        ));
+
+        let mut lines = "@end function\n".lines().peekable();
+        let procedure = parse_proc(
+            "@function factory -> type(callback), result_pointer, \
+             result_procedure=callback, result_name=result",
+            &mut lines,
+        );
+        assert!(procedure.result_pointer);
+        assert!(!procedure.abstract_interface);
+        assert_eq!(
+            procedure.result_procedure_iface.as_deref(),
+            Some("callback")
+        );
+        assert_eq!(procedure.result_name.as_deref(), Some("result"));
+
+        let mut lines = "@end subroutine\n".lines().peekable();
+        let abstract_procedure = parse_proc("@subroutine callback, abstract_interface", &mut lines);
+        assert!(abstract_procedure.abstract_interface);
+    }
+
+    #[test]
     fn amod_cache_skips_reparse_on_second_read() {
         // Write a small valid .amod, read it twice, and verify the
         // hit counter advanced exactly once.
@@ -3365,7 +3751,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 12
 # module: cache_test
 # source: cache_test.f90
 
@@ -3397,7 +3783,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 12
 # module: cached_parent
 # source: cached_parent.f90
 
@@ -3410,7 +3796,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 12
 # module: supplied_parent
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
@@ -3442,7 +3828,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 8
+            r#"#!amod 12
 # module: child
 # ancestor-module: root
 # parent-submodule: middle
@@ -3541,7 +3927,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 8)")
+            err.contains("incompatible .amod version 6 (compiler requires 12)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

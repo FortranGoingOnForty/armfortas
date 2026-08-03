@@ -80,6 +80,11 @@ pub(super) fn expr_selects_component(expr: &crate::ast::expr::SpannedExpr) -> bo
 /// Resolved metadata for the leaf of a component access.
 pub(super) struct LeafComponent<'a> {
     pub(super) field: &'a crate::sema::type_layout::FieldLayout,
+    /// Layout that directly declares the leaf field. Procedure-pointer
+    /// components encode their interface name in `field.type_info`; resolving
+    /// that name must start from this declaration scope, not from whichever
+    /// caller happens to select the component.
+    pub(super) owner_layout: &'a crate::sema::type_layout::TypeLayout,
     /// Any ancestor on the path (including the base variable or any
     /// intermediate component) has the TARGET attribute.  F2018
     /// §8.5.14: a subobject of a TARGET is itself a valid target.
@@ -136,6 +141,7 @@ pub(super) fn leaf_field_layout<'a>(
         .get_for_scope(ctx.scope_id, &base_type)
         .or_else(|| layouts.get(&base_type))?;
     let mut leaf: Option<&crate::sema::type_layout::FieldLayout> = None;
+    let mut leaf_owner = current_layout;
     for (i, comp) in chain.iter().enumerate() {
         let field = current_layout.field(comp)?;
         let is_terminal = i + 1 == chain.len();
@@ -151,6 +157,7 @@ pub(super) fn leaf_field_layout<'a>(
             }
         }
         leaf = Some(field);
+        leaf_owner = current_layout;
         if !is_terminal {
             let (crate::sema::symtab::TypeInfo::Derived(name)
             | crate::sema::symtab::TypeInfo::Class(name)) = &field.type_info
@@ -162,6 +169,7 @@ pub(super) fn leaf_field_layout<'a>(
     }
     leaf.map(|field| LeafComponent {
         field,
+        owner_layout: leaf_owner,
         ancestor_is_target,
         ancestor_is_allocatable,
         ancestor_is_pointer,

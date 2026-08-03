@@ -86,19 +86,18 @@ fn integer16_print_runs_across_all_opt_levels() {
             "expected successful integer(16) print run at {:?}:\n{:#?}",
             level, run
         );
+        let stdout = run.stdout_text().expect("run stdout should be UTF-8");
         assert!(
-            run.stdout
-                .contains("170141183460469231731687303715884105727"),
+            stdout.contains("170141183460469231731687303715884105727"),
             "wide positive integer(16) print should survive at {:?}:\n{}",
             level,
-            run.stdout
+            stdout
         );
         assert!(
-            run.stdout
-                .contains("-170141183460469231731687303715884105727"),
+            stdout.contains("-170141183460469231731687303715884105727"),
             "wide negative integer(16) print should survive at {:?}:\n{}",
             level,
-            run.stdout
+            stdout
         );
     }
 }
@@ -208,19 +207,18 @@ fn integer16_formatted_write_runs_across_all_opt_levels() {
             "expected successful formatted integer(16) write run at {:?}:\n{:#?}",
             level, run
         );
+        let stdout = run.stdout_text().expect("run stdout should be UTF-8");
         assert!(
-            run.stdout
-                .contains("170141183460469231731687303715884105727"),
+            stdout.contains("170141183460469231731687303715884105727"),
             "wide positive formatted integer(16) output should survive at {:?}:\n{}",
             level,
-            run.stdout
+            stdout
         );
         assert!(
-            run.stdout
-                .contains("-170141183460469231731687303715884105727"),
+            stdout.contains("-170141183460469231731687303715884105727"),
             "wide negative formatted integer(16) output should survive at {:?}:\n{}",
             level,
-            run.stdout
+            stdout
         );
     }
 }

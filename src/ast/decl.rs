@@ -20,8 +20,9 @@ pub enum Decl {
         entities: Vec<EntityDecl>,
     },
 
-    /// Standalone `PRIVATE` or `PUBLIC` statement that sets the module's
-    /// default access for all subsequent declarations.
+    /// Standalone access statement. At module scope this sets the module's
+    /// default accessibility; inside a derived-type component stream a
+    /// `PRIVATE` record is the type's private-components statement.
     AccessDefault { access: Attribute },
 
     /// `PUBLIC :: name1, name2` or `PRIVATE :: assignment(=)` — sets
@@ -85,11 +86,24 @@ pub enum Decl {
         enumerators: Vec<String>,
     },
 
-    /// Standalone attribute statement: `allocatable :: x`, `dimension(10) :: a`
+    /// Standalone attribute statement: `allocatable :: x`, `target :: a`
     AttributeStmt {
         attr: Attribute,
         entities: Vec<String>,
     },
+
+    /// Standalone `DIMENSION [::] array-name(array-spec), ...` statement.
+    ///
+    /// Unlike a `DIMENSION(...)` attribute on a type declaration, every
+    /// entity in this statement carries its own array specification.
+    DimensionStmt { entities: Vec<DimensionEntity> },
+}
+
+/// One entity in a standalone DIMENSION statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimensionEntity {
+    pub name: String,
+    pub array_spec: Vec<ArraySpec>,
 }
 
 // ---- Type specifiers ----
@@ -165,12 +179,80 @@ pub enum Attribute {
     Asynchronous,
     Protected,
     Contiguous,
+    /// Internal marker for a `PROCEDURE(interface)` entity. The parser
+    /// represents procedure entities as `TypeDecl` nodes so existing
+    /// declaration/lowering paths can retain the interface name in
+    /// `TypeSpec::Type`; this marker distinguishes that encoding from a
+    /// genuine `TYPE(name), EXTERNAL` function declaration.
+    Procedure,
     External,
     NoPass,
     Intrinsic,
     Bind(Option<String>), // bind(c, name="cfunc")
     Public,
     Private,
+}
+
+/// Apply `attr` to the type declaration of entity `name`, splitting a
+/// multi-entity declaration so only `name` acquires the attribute.
+///
+/// Returns `false` when no type declaration in `decls` declares `name`.
+/// Parser folding and post-sema declaration normalization share this
+/// transform so their entity-level attribute behavior cannot drift.
+pub(crate) fn fold_attribute_into_type_decl(
+    decls: &mut Vec<SpannedDecl>,
+    name: &str,
+    attr: &Attribute,
+) -> bool {
+    let mut found: Option<(usize, usize, usize)> = None;
+    for (decl_index, decl) in decls.iter().enumerate() {
+        if let Decl::TypeDecl { entities, .. } = &decl.node {
+            if let Some(entity_index) = entities
+                .iter()
+                .position(|entity| entity.name.eq_ignore_ascii_case(name))
+            {
+                found = Some((decl_index, entity_index, entities.len()));
+                break;
+            }
+        }
+    }
+    let Some((decl_index, entity_index, entity_count)) = found else {
+        return false;
+    };
+
+    if entity_count == 1 {
+        if let Decl::TypeDecl { attrs, .. } = &mut decls[decl_index].node {
+            if !attrs.iter().any(|existing| existing == attr) {
+                attrs.push(attr.clone());
+            }
+        }
+    } else {
+        let span = decls[decl_index].span;
+        let (type_spec, mut attrs, entity) = match &mut decls[decl_index].node {
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities,
+            } => (
+                type_spec.clone(),
+                attrs.clone(),
+                entities.remove(entity_index),
+            ),
+            _ => unreachable!(),
+        };
+        if !attrs.iter().any(|existing| existing == attr) {
+            attrs.push(attr.clone());
+        }
+        decls.push(Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs,
+                entities: vec![entity],
+            },
+            span,
+        ));
+    }
+    true
 }
 
 /// Intent specification.

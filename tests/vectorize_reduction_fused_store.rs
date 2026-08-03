@@ -29,7 +29,10 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
 fn capture_run_stdout(request: CaptureRequest) -> String {
     let result = capture_from_path(&request).expect("capture should succeed");
     match result.get(Stage::Run) {
-        Some(CapturedStage::Run(run)) => run.stdout.clone(),
+        Some(CapturedStage::Run(run)) => run
+            .stdout_text()
+            .expect("run stdout should be valid UTF-8")
+            .to_owned(),
         _ => panic!("missing run stage"),
     }
 }

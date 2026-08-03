@@ -53,6 +53,19 @@ pub fn lower_file(
     external_char_len_star: HashMap<String, Vec<bool>>,
     layout: crate::target::TargetLayout,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
+    // Some declaration forms resolve their concrete type only after sema.
+    // Normalize an owned copy at the lowering boundary so every caller of
+    // `lower_file` (not only the CLI driver) gets the same typed AST.
+    let normalized_units = units
+        .iter()
+        .any(unit_needs_resolved_decl_normalization)
+        .then(|| {
+            let mut owned = units.to_vec();
+            normalize_resolved_decls(&mut owned, st);
+            owned
+        });
+    let units = normalized_units.as_deref().unwrap_or(units);
+
     let mut module = Module::new("main".into(), layout);
     // Modules defined in this unit — lets any function CALL a local-module
     // type's out-of-line memory helpers instead of inlining the walk.
@@ -76,123 +89,6 @@ pub fn lower_file(
                 collect_module_globals(&mut module, &mut globals, name, decls, st, type_layouts);
             }
             _ => {}
-        }
-    }
-
-    // Pass 1.1: propagate transitively-visible globals through USE chains.
-    // When module A USEs module B and re-exports B's symbols (PUBLIC), make
-    // them accessible as (A, var) in the globals map so a `program p; use A`
-    // compiled against A's .amod alone can resolve them. Pollution-free
-    // version: only propagate if the importing module actually re-exports
-    // the symbol — otherwise `use stdlib_ascii, only : digits` in a
-    // PRIVATE-default test module would shadow stdlib_ascii's own
-    // `(stdlib_ascii, digits)` global with a duplicate (A, digits) and
-    // trip "ambiguous USE import" warnings during host-scope install.
-    for unit in units {
-        if let ProgramUnit::Module { name, uses, .. } = &unit.node {
-            let mod_key = name.to_lowercase();
-            let Some(mod_scope_id) = st.find_module_scope(&mod_key) else {
-                continue;
-            };
-            let default_public = !matches!(
-                st.default_access(mod_scope_id),
-                crate::sema::symtab::Access::Private
-            );
-            let access_for = |local_name: &str| -> bool {
-                // F2018 §11.2.2: USE-imported names inherit the importing
-                // module's default access unless explicitly listed in
-                // `public ::` / `private ::`. A symbol absent from the
-                // importing scope's symbol table is governed by the
-                // module-level default.
-                match st.scope(mod_scope_id).symbols.get(local_name) {
-                    Some(sym) => !matches!(sym.attrs.access, crate::sema::symtab::Access::Private),
-                    None => default_public,
-                }
-            };
-            let mut to_add: Vec<((String, String), ModuleGlobalInfo)> = Vec::new();
-            for use_decl in uses {
-                let Decl::UseStmt {
-                    module: src_module,
-                    only,
-                    renames,
-                    ..
-                } = &use_decl.node
-                else {
-                    continue;
-                };
-                let src_mod_key = src_module.to_lowercase();
-                if src_mod_key == mod_key {
-                    continue;
-                }
-                if let Some(only_list) = only {
-                    use crate::ast::decl::OnlyItem;
-                    for item in only_list {
-                        let (local_lc, var_lc) = match item {
-                            OnlyItem::Name(n) | OnlyItem::Generic(n) => {
-                                let lc = n.to_lowercase();
-                                (lc.clone(), lc)
-                            }
-                            OnlyItem::Rename(rn) => {
-                                (rn.local.to_lowercase(), rn.remote.to_lowercase())
-                            }
-                        };
-                        if !access_for(&local_lc) {
-                            continue;
-                        }
-                        let src_key = (src_mod_key.clone(), var_lc);
-                        let new_key = (mod_key.clone(), local_lc);
-                        if let Some(info) = globals.get(&src_key) {
-                            if !globals.contains_key(&new_key) {
-                                to_add.push((new_key, info.clone()));
-                            }
-                        }
-                    }
-                } else {
-                    // USE without ONLY: import everything currently visible
-                    // through the source module — including names the source
-                    // module re-exports via its own USE associations (Pass
-                    // 1.1 already populated those entries when iterating the
-                    // source module earlier in unit order).
-                    let rename_targets: std::collections::HashSet<String> =
-                        renames.iter().map(|r| r.remote.to_lowercase()).collect();
-                    let candidates: Vec<(String, ModuleGlobalInfo)> = globals
-                        .iter()
-                        .filter_map(|((mk, var), info)| {
-                            if *mk == src_mod_key && !rename_targets.contains(var) {
-                                Some((var.clone(), info.clone()))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for (var, info) in candidates {
-                        if !access_for(&var) {
-                            continue;
-                        }
-                        let new_key = (mod_key.clone(), var);
-                        if !globals.contains_key(&new_key) {
-                            to_add.push((new_key, info));
-                        }
-                    }
-                    for rn in renames {
-                        let local_lc = rn.local.to_lowercase();
-                        let var_lc = rn.remote.to_lowercase();
-                        if !access_for(&local_lc) {
-                            continue;
-                        }
-                        let src_key = (src_mod_key.clone(), var_lc);
-                        let new_key = (mod_key.clone(), local_lc);
-                        if let Some(info) = globals.get(&src_key) {
-                            if !globals.contains_key(&new_key) {
-                                to_add.push((new_key, info.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-            for (key, info) in to_add {
-                globals.insert(key, info);
-            }
         }
     }
 
@@ -245,7 +141,7 @@ pub fn lower_file(
     let mut internal_funcs: HashMap<String, u32> = HashMap::new();
     let mut next_internal_idx: u32 = 0;
     for unit in units {
-        collect_internal_func_names(&unit.node, &mut internal_funcs, &mut next_internal_idx);
+        collect_internal_func_names(&unit.node, st, &mut internal_funcs, &mut next_internal_idx);
     }
 
     // Host association: for every contained procedure, compute the set
@@ -1297,18 +1193,57 @@ fn collect_called_contained_names_expr(
 
 pub(super) fn collect_internal_func_names(
     unit: &ProgramUnit,
+    st: &SymbolTable,
     out: &mut HashMap<String, u32>,
     next_idx: &mut u32,
 ) {
-    collect_internal_func_names_inner(unit, false, out, next_idx);
+    collect_internal_func_names_inner(unit, st, 0, false, out, next_idx);
 }
 
 pub(super) fn collect_internal_func_names_inner(
     unit: &ProgramUnit,
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
     is_contained: bool,
     out: &mut HashMap<String, u32>,
     next_idx: &mut u32,
 ) {
+    let unit_scope = st
+        .all_scopes()
+        .iter()
+        .find(|scope| {
+            if scope.parent != Some(parent_scope) {
+                return false;
+            }
+            match (&scope.kind, unit) {
+                (
+                    crate::sema::symtab::ScopeKind::Program(scope_name),
+                    ProgramUnit::Program { name, .. },
+                ) => name
+                    .as_deref()
+                    .unwrap_or("main")
+                    .eq_ignore_ascii_case(scope_name),
+                (
+                    crate::sema::symtab::ScopeKind::Module(scope_name),
+                    ProgramUnit::Module { name, .. },
+                )
+                | (
+                    crate::sema::symtab::ScopeKind::Submodule(scope_name),
+                    ProgramUnit::Submodule { name, .. },
+                )
+                | (
+                    crate::sema::symtab::ScopeKind::Subroutine(scope_name),
+                    ProgramUnit::Subroutine { name, .. },
+                )
+                | (
+                    crate::sema::symtab::ScopeKind::Function(scope_name),
+                    ProgramUnit::Function { name, .. },
+                ) => name.eq_ignore_ascii_case(scope_name),
+                _ => false,
+            }
+        })
+        .map(|scope| scope.id)
+        .unwrap_or(parent_scope);
     match unit {
         ProgramUnit::Program { name, contains, .. } => {
             let fname = name.clone().unwrap_or_else(|| "main".into());
@@ -1316,44 +1251,26 @@ pub(super) fn collect_internal_func_names_inner(
             out.insert(body_name, *next_idx);
             *next_idx += 1;
             for sub in contains {
-                collect_internal_func_names_inner(&sub.node, true, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, st, unit_scope, true, out, next_idx);
             }
         }
-        ProgramUnit::Subroutine {
-            name,
-            bind,
-            contains,
-            ..
-        }
-        | ProgramUnit::Function {
-            name,
-            bind,
-            contains,
-            ..
-        } => {
+        ProgramUnit::Subroutine { name, contains, .. }
+        | ProgramUnit::Function { name, contains, .. } => {
             if is_contained {
                 let idx = *next_idx;
                 *next_idx += 1;
                 out.insert(name.to_lowercase(), idx);
-                if let Some(bind) = bind {
-                    if let Some(bind_name) = bind.name.as_deref() {
-                        out.entry(
-                            bind_name
-                                .trim_matches('\'')
-                                .trim_matches('"')
-                                .to_lowercase(),
-                        )
-                        .or_insert(idx);
-                    }
+                if let Some(bind_name) = st.scope(unit_scope).binding_label.as_deref() {
+                    out.entry(bind_name.to_lowercase()).or_insert(idx);
                 }
             }
             for sub in contains {
-                collect_internal_func_names_inner(&sub.node, true, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, st, unit_scope, true, out, next_idx);
             }
         }
         ProgramUnit::Module { contains, .. } | ProgramUnit::Submodule { contains, .. } => {
             for sub in contains {
-                collect_internal_func_names_inner(&sub.node, false, out, next_idx);
+                collect_internal_func_names_inner(&sub.node, st, unit_scope, false, out, next_idx);
             }
         }
         _ => {}
@@ -1365,7 +1282,7 @@ pub(super) fn function_hidden_result_abi(
     result: &Option<String>,
     return_type: Option<&TypeSpec>,
     decls: &[crate::ast::decl::SpannedDecl],
-    bind: Option<&crate::ast::unit::BindInfo>,
+    is_bind_c: bool,
     st: Option<&SymbolTable>,
 ) -> HiddenResultAbi {
     use crate::ast::decl::Attribute;
@@ -1399,7 +1316,7 @@ pub(super) fn function_hidden_result_abi(
                 return HiddenResultAbi::ArrayDescriptor;
             }
             if matches!(type_spec, TypeSpec::Character(_)) && !has_dims {
-                return if bind.is_some() {
+                return if is_bind_c {
                     HiddenResultAbi::None
                 } else {
                     HiddenResultAbi::StringDescriptor
@@ -1408,7 +1325,7 @@ pub(super) fn function_hidden_result_abi(
             if attrs.iter().any(|a| matches!(a, Attribute::Allocatable)) {
                 return HiddenResultAbi::ArrayDescriptor;
             }
-            if bind.is_none()
+            if !is_bind_c
                 && !decl_is_pointer(&result_key, decls)
                 && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st)
                     .is_some()
@@ -1422,21 +1339,21 @@ pub(super) fn function_hidden_result_abi(
             // of the complex literal as an address (SEGV).
             if matches!(type_spec, TypeSpec::Complex(_) | TypeSpec::DoubleComplex)
                 && !decl_is_pointer(&result_key, decls)
-                && bind.is_none()
+                && !is_bind_c
             {
                 return HiddenResultAbi::ComplexBuffer;
             }
             return HiddenResultAbi::None;
         }
     }
-    if bind.is_none()
+    if !is_bind_c
         && !decl_is_pointer(&result_key, decls)
         && derived_type_name_for_result_var(&return_type.cloned(), &result_key, decls, st).is_some()
     {
         return HiddenResultAbi::DerivedAggregate;
     }
     if matches!(return_type, Some(TypeSpec::Character(_))) {
-        return if bind.is_some() {
+        return if is_bind_c {
             HiddenResultAbi::None
         } else {
             HiddenResultAbi::StringDescriptor
@@ -1450,7 +1367,7 @@ pub(super) fn function_hidden_result_abi(
     if matches!(
         return_type,
         Some(TypeSpec::Complex(_)) | Some(TypeSpec::DoubleComplex)
-    ) && bind.is_none()
+    ) && !is_bind_c
     {
         return HiddenResultAbi::ComplexBuffer;
     }
@@ -1534,7 +1451,7 @@ pub(super) fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<S
                 result,
                 return_type.as_ref(),
                 decls,
-                bind.as_ref(),
+                bind.is_some(),
                 None,
             ) == HiddenResultAbi::ArrayDescriptor
             {
@@ -2192,75 +2109,310 @@ pub(super) fn smp_parent_interface_scope(
     })
 }
 
-/// Rewrite `TYPEOF(entity)` / `CLASSOF(entity)` declaration specs to
-/// the concrete specs resolution recorded on the declared symbols,
-/// recursing through CONTAINS. Runs once in the driver before
-/// lowering: every lowering pre-pass (descriptor params, class-dummy
-/// detection, result ABI, derived storage) keys on the syntactic
-/// TypeSpec, so an unresolved TypeOf silently took the unknown-type
-/// fallbacks — a TYPEOF(point) local dropped its component stores and
-/// a CLASSOF dummy missed the caller-side class descriptor.
-pub fn normalize_typeof_specs(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
-    for unit in units {
-        normalize_typeof_specs_in_unit(&mut unit.node, st);
+fn unit_needs_resolved_decl_normalization(unit: &SpannedUnit) -> bool {
+    fn decls_need_normalization(decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+        decls.iter().any(|decl| match &decl.node {
+            Decl::TypeDecl { type_spec, .. } => {
+                matches!(type_spec, TypeSpec::TypeOf(_) | TypeSpec::ClassOf(_))
+            }
+            Decl::DimensionStmt { .. }
+            | Decl::AttributeStmt {
+                attr: crate::ast::decl::Attribute::Volatile,
+                ..
+            } => true,
+            _ => false,
+        })
+    }
+
+    match &unit.node {
+        ProgramUnit::Program {
+            decls, contains, ..
+        }
+        | ProgramUnit::Module {
+            decls, contains, ..
+        }
+        | ProgramUnit::Submodule {
+            decls, contains, ..
+        }
+        | ProgramUnit::Subroutine {
+            decls, contains, ..
+        }
+        | ProgramUnit::Function {
+            decls, contains, ..
+        } => {
+            decls_need_normalization(decls)
+                || contains.iter().any(unit_needs_resolved_decl_normalization)
+        }
+        ProgramUnit::BlockData { decls, .. } => decls_need_normalization(decls),
+        ProgramUnit::InterfaceBlock { bodies, .. } => bodies.iter().any(|body| match body {
+            crate::ast::unit::InterfaceBody::Subprogram(unit) => {
+                unit_needs_resolved_decl_normalization(unit)
+            }
+            crate::ast::unit::InterfaceBody::ModuleProcedure(_) => false,
+        }),
     }
 }
 
-fn normalize_typeof_specs_in_unit(unit: &mut ProgramUnit, st: &SymbolTable) {
+/// Normalize declarations whose concrete type is known only after semantic
+/// resolution, recursing through CONTAINS.
+///
+/// TYPEOF/CLASSOF specs become their resolved concrete type. Remaining
+/// standalone DIMENSION and VOLATILE nodes denote implicitly typed entities
+/// and become ordinary TypeDecl nodes, keeping every lowering pre-pass and
+/// allocation site on the canonical typed-declaration path.
+fn normalize_resolved_decls(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
+    for unit in units {
+        normalize_resolved_decls_in_unit(&mut unit.node, st, 0);
+    }
+}
+
+/// Compatibility entry point used by the driver. It now normalizes all
+/// sema-resolved declaration forms, not only TYPEOF/CLASSOF.
+pub fn normalize_typeof_specs(units: &mut [crate::ast::Spanned<ProgramUnit>], st: &SymbolTable) {
+    normalize_resolved_decls(units, st);
+}
+
+fn resolved_scope_for_unit(
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
+    unit: &ProgramUnit,
+) -> Option<crate::sema::symtab::ScopeId> {
     use crate::sema::symtab::ScopeKind;
-    let (scope_id, decls, contains) = match unit {
+
+    let expected_name = match unit {
+        ProgramUnit::Program { name, .. } => name.as_deref().unwrap_or("main"),
+        ProgramUnit::BlockData { name, .. } => name.as_deref().unwrap_or("<block_data>"),
+        ProgramUnit::Module { name, .. }
+        | ProgramUnit::Submodule { name, .. }
+        | ProgramUnit::Subroutine { name, .. }
+        | ProgramUnit::Function { name, .. } => name,
+        ProgramUnit::InterfaceBlock { .. } => return None,
+    };
+
+    st.all_scopes().iter().find_map(|scope| {
+        if scope.parent != Some(parent_scope) {
+            return None;
+        }
+        let name = match &scope.kind {
+            ScopeKind::Program(name)
+                if matches!(
+                    unit,
+                    ProgramUnit::Program { .. } | ProgramUnit::BlockData { .. }
+                ) =>
+            {
+                name
+            }
+            ScopeKind::Module(name) if matches!(unit, ProgramUnit::Module { .. }) => name,
+            ScopeKind::Submodule(name) if matches!(unit, ProgramUnit::Submodule { .. }) => name,
+            ScopeKind::Subroutine(name) if matches!(unit, ProgramUnit::Subroutine { .. }) => name,
+            ScopeKind::Function(name) if matches!(unit, ProgramUnit::Function { .. }) => name,
+            _ => return None,
+        };
+        name.eq_ignore_ascii_case(expected_name).then_some(scope.id)
+    })
+}
+
+fn normalize_resolved_decls_in_unit(
+    unit: &mut ProgramUnit,
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
+) {
+    if let ProgramUnit::InterfaceBlock { bodies, .. } = unit {
+        for body in bodies {
+            let crate::ast::unit::InterfaceBody::Subprogram(subprogram) = body else {
+                continue;
+            };
+            let interface_scope = st.all_scopes().iter().find_map(|scope| {
+                (scope.parent == Some(parent_scope)
+                    && matches!(scope.kind, crate::sema::symtab::ScopeKind::Interface)
+                    && resolved_scope_for_unit(st, scope.id, &subprogram.node).is_some())
+                .then_some(scope.id)
+            });
+            if let Some(interface_scope) = interface_scope {
+                normalize_resolved_decls_in_unit(&mut subprogram.node, st, interface_scope);
+            }
+        }
+        return;
+    }
+
+    let Some(scope_id) = resolved_scope_for_unit(st, parent_scope, unit) else {
+        return;
+    };
+    let (decls, contains) = match unit {
         ProgramUnit::Program {
-            name,
-            decls,
-            contains,
-            ..
-        } => {
-            let target = name.clone();
-            let sid = st
-                .all_scopes()
-                .iter()
-                .find(|s| match (&s.kind, target.as_deref()) {
-                    (ScopeKind::Program(n), Some(t)) => n.eq_ignore_ascii_case(t),
-                    (ScopeKind::Program(_), None) => true,
-                    _ => false,
-                })
-                .map(|s| s.id);
-            (sid, decls, contains)
+            decls, contains, ..
         }
-        ProgramUnit::Function {
-            name,
-            decls,
-            contains,
-            ..
-        }
-        | ProgramUnit::Subroutine {
-            name,
-            decls,
-            contains,
-            ..
-        } => (
-            procedure_scope_by_name(st, name).map(|s| s.id),
-            decls,
-            contains,
-        ),
-        ProgramUnit::Module {
-            name,
-            decls,
-            contains,
-            ..
+        | ProgramUnit::Module {
+            decls, contains, ..
         }
         | ProgramUnit::Submodule {
-            name,
-            decls,
-            contains,
-            ..
-        } => (st.find_module_scope(name), decls, contains),
-        _ => return,
+            decls, contains, ..
+        }
+        | ProgramUnit::Subroutine {
+            decls, contains, ..
+        }
+        | ProgramUnit::Function {
+            decls, contains, ..
+        } => (decls, Some(contains)),
+        ProgramUnit::BlockData { decls, .. } => (decls, None),
+        ProgramUnit::InterfaceBlock { .. } => unreachable!(),
     };
-    rewrite_typeof_decls(decls, st, scope_id);
-    for contained in contains {
-        normalize_typeof_specs_in_unit(&mut contained.node, st);
+
+    rewrite_typeof_decls(decls, st, Some(scope_id));
+    rewrite_dimension_decls(decls, st, Some(scope_id));
+    rewrite_implicit_volatile_decls(decls, st, Some(scope_id));
+    if let Some(contains) = contains {
+        for contained in contains {
+            normalize_resolved_decls_in_unit(&mut contained.node, st, scope_id);
+        }
     }
+}
+
+fn rewrite_implicit_volatile_decls(
+    decls: &mut Vec<crate::ast::decl::SpannedDecl>,
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+) {
+    use crate::ast::decl::{Attribute, Decl, EntityDecl, LenSpec};
+
+    let Some(scope_id) = scope_id else {
+        return;
+    };
+    let mut volatile_entities = Vec::new();
+    let mut rewritten = Vec::with_capacity(decls.len());
+    for decl in std::mem::take(decls) {
+        let crate::ast::Spanned { node, span } = decl;
+        let Decl::AttributeStmt {
+            attr: Attribute::Volatile,
+            entities,
+        } = node
+        else {
+            rewritten.push(crate::ast::Spanned::new(node, span));
+            continue;
+        };
+
+        for entity in entities {
+            volatile_entities.push((entity, span));
+        }
+    }
+
+    for (entity, span) in volatile_entities {
+        if crate::ast::decl::fold_attribute_into_type_decl(
+            &mut rewritten,
+            &entity,
+            &Attribute::Volatile,
+        ) {
+            continue;
+        }
+
+        let key = entity.to_ascii_lowercase();
+        let Some(symbol) = st.scope(scope_id).symbols.get(&key) else {
+            if st.lookup_in(scope_id, &key).is_some() {
+                rewritten.push(crate::ast::Spanned::new(
+                    Decl::AttributeStmt {
+                        attr: Attribute::Volatile,
+                        entities: vec![entity],
+                    },
+                    span,
+                ));
+                continue;
+            }
+            panic!(
+                "resolved VOLATILE entity '{}' is missing from scope {}",
+                entity, scope_id
+            );
+        };
+        let type_info = symbol.type_info.as_ref().unwrap_or_else(|| {
+            panic!("resolved VOLATILE entity '{}' has no concrete type", entity)
+        });
+        let type_spec = type_info_to_type_spec(Some(type_info));
+        let char_len = match type_info {
+            crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
+                Some(LenSpec::Expr(synth_int_literal_expr(*len)))
+            }
+            crate::sema::symtab::TypeInfo::Character { len: None, .. } => Some(LenSpec::Star),
+            _ => None,
+        };
+        let array_spec = if symbol.attrs.array_spec.is_empty() {
+            None
+        } else {
+            Some(symbol.attrs.array_spec.clone())
+        };
+        rewritten.push(crate::ast::Spanned::new(
+            Decl::TypeDecl {
+                type_spec,
+                attrs: sym_attrs_to_decl_attrs(&symbol.attrs),
+                entities: vec![EntityDecl {
+                    name: entity,
+                    array_spec,
+                    char_len,
+                    init: None,
+                    ptr_init: None,
+                }],
+            },
+            span,
+        ));
+    }
+    *decls = rewritten;
+}
+
+fn rewrite_dimension_decls(
+    decls: &mut Vec<crate::ast::decl::SpannedDecl>,
+    st: &SymbolTable,
+    scope_id: Option<crate::sema::symtab::ScopeId>,
+) {
+    use crate::ast::decl::{Decl, EntityDecl, LenSpec};
+
+    let Some(scope_id) = scope_id else {
+        return;
+    };
+    let mut rewritten = Vec::with_capacity(decls.len());
+    for decl in std::mem::take(decls) {
+        let crate::ast::Spanned { node, span } = decl;
+        let Decl::DimensionStmt { entities } = node else {
+            rewritten.push(crate::ast::Spanned::new(node, span));
+            continue;
+        };
+
+        for entity in entities {
+            let key = entity.name.to_ascii_lowercase();
+            let symbol = st.scope(scope_id).symbols.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "resolved DIMENSION entity '{}' is missing from scope {}",
+                    entity.name, scope_id
+                )
+            });
+            let type_info = symbol.type_info.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "resolved DIMENSION entity '{}' has no concrete type",
+                    entity.name
+                )
+            });
+            let type_spec = type_info_to_type_spec(Some(type_info));
+            let char_len = match type_info {
+                crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
+                    Some(LenSpec::Expr(synth_int_literal_expr(*len)))
+                }
+                crate::sema::symtab::TypeInfo::Character { len: None, .. } => Some(LenSpec::Star),
+                _ => None,
+            };
+            rewritten.push(crate::ast::Spanned::new(
+                Decl::TypeDecl {
+                    type_spec,
+                    attrs: sym_attrs_to_decl_attrs(&symbol.attrs),
+                    entities: vec![EntityDecl {
+                        name: entity.name,
+                        array_spec: Some(entity.array_spec),
+                        char_len,
+                        init: None,
+                        ptr_init: None,
+                    }],
+                },
+                span,
+            ));
+        }
+    }
+    *decls = rewritten;
 }
 
 fn rewrite_typeof_decls(
@@ -2365,7 +2517,7 @@ pub(super) fn synth_int_literal_expr(n: i64) -> crate::ast::expr::SpannedExpr {
 /// Sprint35-SMP Phase 2: convert a sema SymbolAttrs back to an AST
 /// Vec<Attribute> so the synthesizer's TypeDecl looks the same as one
 /// the parser would have emitted. Skips procedure-only flags (pure,
-/// elemental, result_rank, binding_label, procedure_iface) and the
+/// elemental, result_rank, bind_c, binding_label, procedure_iface) and the
 /// access flag (Public/Private rarely matter for dummies and the
 /// existing decl-attr converter sets a default).
 pub(super) fn sym_attrs_to_decl_attrs(
@@ -2394,6 +2546,9 @@ pub(super) fn sym_attrs_to_decl_attrs(
     if attrs.target {
         out.push(Attribute::Target);
     }
+    if attrs.volatile {
+        out.push(Attribute::Volatile);
+    }
     if attrs.value {
         out.push(Attribute::Value);
     }
@@ -2406,53 +2561,33 @@ pub(super) fn sym_attrs_to_decl_attrs(
     out
 }
 
-/// Sprint35-SMP Phase 2: lookup the parent function scope's result
-/// variable name. Per F2008, a `module function NAME(...) result(R)`
-/// interface body declares both R and the function symbol. The body
-/// scope's `arg_order` lists only the dummies, so the result variable
-/// is the one Variable symbol in the scope whose name is NOT in
-/// arg_order. When no `result()` clause was used, the result name is
-/// the same as the function name. Returns `(result_name, type_info)`.
+/// Look up the parent function scope's explicitly recorded result entity.
+/// Returns `(result_name, symbol)` without consulting unrelated locals.
 pub(super) fn smp_function_result_info(
     st: &SymbolTable,
     parent_scope_id: crate::sema::symtab::ScopeId,
     function_name: &str,
 ) -> Option<(String, crate::sema::symtab::Symbol)> {
     let scope = st.scope(parent_scope_id);
-    let arg_set: std::collections::HashSet<String> =
-        scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-    // First look for a Variable symbol whose name isn't in arg_order
-    // (the result variable from sema's Function processing). If absent
-    // (e.g. .amod-loaded interface where only dummies are stored), fall
-    // back to a synthetic Symbol from the function symbol's type_info.
-    //
-    // For .amod-loaded modules, the result variable is recorded under
-    // a synthetic `__amod_result_<name>` key to avoid collision with
-    // user locals when both share the same proc scope. Strip that
-    // prefix so the synthesized Function decl uses the original name
-    // (`res`), matching what the SMP body's source code references.
-    for (key, sym) in &scope.symbols {
-        if arg_set.contains(key) {
-            continue;
-        }
-        if matches!(
-            sym.kind,
-            crate::sema::symtab::SymbolKind::Variable | crate::sema::symtab::SymbolKind::Parameter
-        ) {
-            let name = sym
-                .name
-                .strip_prefix("__amod_result_")
-                .map(str::to_string)
-                .unwrap_or_else(|| sym.name.clone());
-            let mut sym_clone = sym.clone();
-            sym_clone.name = name.clone();
-            return Some((name, sym_clone));
-        }
+    let result_name = scope
+        .result_name
+        .clone()
+        .unwrap_or_else(|| function_name.to_string());
+    if let Some(sym) = scope.procedure_result_symbol() {
+        let mut sym = sym.clone();
+        sym.name = result_name.clone();
+        return Some((result_name, sym));
     }
-    // No result variable in the scope — synthesize one from the
-    // function symbol itself (parent module level has the Function
-    // symbol with its return-type type_info and result_rank).
-    let parent_module_id = st.scope(parent_scope_id).parent?;
+
+    // A malformed or legacy scope may lack the result entity. Preserve the
+    // existing function-symbol fallback without guessing from other locals.
+    let mut parent_module_id = st.scope(parent_scope_id).parent?;
+    if matches!(
+        st.scope(parent_module_id).kind,
+        crate::sema::symtab::ScopeKind::Interface
+    ) {
+        parent_module_id = st.scope(parent_module_id).parent?;
+    }
     let fn_sym = st
         .scope(parent_module_id)
         .symbols
@@ -2460,7 +2595,9 @@ pub(super) fn smp_function_result_info(
     if !matches!(fn_sym.kind, crate::sema::symtab::SymbolKind::Function) {
         return None;
     }
-    Some((function_name.to_string(), fn_sym.clone()))
+    let mut result_sym = fn_sym.clone();
+    result_sym.name = result_name.clone();
+    Some((result_name, result_sym))
 }
 
 /// Sprint35-SMP Phase 2: when the parent module's interface declares
@@ -3308,6 +3445,7 @@ pub struct ModuleGlobalInfo {
     pub declared_rank: usize,
     pub allocatable: bool,
     pub is_pointer: bool,
+    pub volatile: bool,
     pub deferred_char: bool,
     pub derived_type: Option<String>,
     pub(crate) char_kind: CharKind,
@@ -3708,9 +3846,12 @@ pub(super) fn collect_host_refs_stmt(
         Stmt::Return { value: Some(e) } | Stmt::ComputedGoto { selector: e, .. } => {
             collect_host_refs_expr(e, host_names, sub_locals, refs);
         }
-        Stmt::Stop { code: Some(e), .. }
-        | Stmt::ErrorStop { code: Some(e), .. }
-        | Stmt::ArithmeticIf { expr: e, .. } => {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
+            for e in code.iter().chain(quiet.iter()) {
+                collect_host_refs_expr(e, host_names, sub_locals, refs);
+            }
+        }
+        Stmt::ArithmeticIf { expr: e, .. } => {
             collect_host_refs_expr(e, host_names, sub_locals, refs);
         }
         Stmt::PointerAssignment { target, value } => {
@@ -4078,8 +4219,10 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         Stmt::Return { value: Some(e) }
         | Stmt::ComputedGoto { selector: e, .. }
         | Stmt::ArithmeticIf { expr: e, .. } => collect_name_refs_expr(e, out),
-        Stmt::Stop { code: Some(e), .. } | Stmt::ErrorStop { code: Some(e), .. } => {
-            collect_name_refs_expr(e, out);
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
+            for e in code.iter().chain(quiet.iter()) {
+                collect_name_refs_expr(e, out);
+            }
         }
         Stmt::Labeled { stmt, .. } => collect_name_refs_stmt(stmt, out),
         Stmt::SelectCase {
@@ -4219,8 +4362,6 @@ pub(super) fn collect_name_refs_stmt(stmt: &crate::ast::stmt::SpannedStmt, out: 
         }
         Stmt::Declaration(decl) => collect_name_refs_decls(std::slice::from_ref(decl), out),
         Stmt::Return { value: None }
-        | Stmt::Stop { code: None, .. }
-        | Stmt::ErrorStop { code: None, .. }
         | Stmt::Exit { .. }
         | Stmt::Cycle { .. }
         | Stmt::Goto { .. }
@@ -4441,6 +4582,13 @@ pub(super) fn collect_name_refs_decls(
                     }
                 }
             }
+            Decl::DimensionStmt { entities } => {
+                for entity in entities {
+                    for spec in &entity.array_spec {
+                        collect_name_refs_array_spec(spec, out);
+                    }
+                }
+            }
             Decl::DerivedTypeDef { components, .. } => collect_name_refs_decls(components, out),
             Decl::AccessDefault { .. }
             | Decl::AccessList { .. }
@@ -4471,6 +4619,15 @@ pub(super) fn collect_decl_spec_import_names(
 ) -> HashSet<String> {
     let mut refs = Vec::new();
     collect_name_refs_decls(decls, &mut refs);
+    for decl in decls {
+        if let Decl::AttributeStmt {
+            attr: crate::ast::decl::Attribute::Volatile,
+            entities,
+        } = &decl.node
+        {
+            refs.extend(entities.iter().cloned());
+        }
+    }
 
     let mut declared = HashSet::new();
     for decl in decls {
@@ -4594,9 +4751,14 @@ pub(super) fn collect_module_globals(
             });
             let is_allocatable = attrs.iter().any(|a| matches!(a, Attribute::Allocatable));
             let is_pointer = attrs.iter().any(|a| matches!(a, Attribute::Pointer));
+            let is_volatile = attrs.iter().any(|a| matches!(a, Attribute::Volatile));
             let is_parameter_decl = attrs.iter().any(|a| matches!(a, Attribute::Parameter));
             for entity in entities {
                 let key = entity.name.to_lowercase();
+                let entity_is_volatile = is_volatile
+                    || module_scope_id
+                        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                        .is_some_and(|symbol| symbol.attrs.volatile);
                 let symbol = format!("afs_mod_{}_{}", mod_name.to_lowercase(), key);
                 let init_expr = entity
                     .init
@@ -4672,6 +4834,7 @@ pub(super) fn collect_module_globals(
                             declared_rank,
                             allocatable: true,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: array_char_kind,
@@ -4705,6 +4868,7 @@ pub(super) fn collect_module_globals(
                             declared_rank: 0,
                             allocatable: false,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: true,
                             derived_type: None,
                             char_kind: CharKind::Deferred,
@@ -4870,6 +5034,7 @@ pub(super) fn collect_module_globals(
                             dims,
                             allocatable: false,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: false,
                             derived_type: derived_type_name.clone(),
                             char_kind: global_char_kind.clone(),
@@ -4898,6 +5063,7 @@ pub(super) fn collect_module_globals(
                                 declared_rank: 0,
                                 allocatable: false,
                                 is_pointer: true,
+                                volatile: entity_is_volatile,
                                 deferred_char: false,
                                 derived_type: derived_type_name.clone(),
                                 char_kind: global_char_kind.clone(),
@@ -4938,6 +5104,7 @@ pub(super) fn collect_module_globals(
                                     declared_rank: 0,
                                     allocatable: false,
                                     is_pointer: false,
+                                    volatile: entity_is_volatile,
                                     deferred_char: false,
                                     derived_type: None,
                                     char_kind: CharKind::Fixed(len),
@@ -4989,6 +5156,7 @@ pub(super) fn collect_module_globals(
                                     declared_rank: 0,
                                     allocatable: false,
                                     is_pointer,
+                                    volatile: entity_is_volatile,
                                     deferred_char: false,
                                     derived_type: Some(type_name.clone()),
                                     char_kind: CharKind::None,
@@ -5056,6 +5224,7 @@ pub(super) fn collect_module_globals(
                             declared_rank: 0,
                             allocatable: false,
                             is_pointer,
+                            volatile: entity_is_volatile,
                             deferred_char: false,
                             derived_type: None,
                             char_kind: global_char_kind.clone(),
@@ -6142,6 +6311,20 @@ pub(super) fn eval_const_char_bytes(
     eval_const_char_bytes_with_context(e, param_consts, param_chars, None, None, None)
 }
 
+pub(super) fn eval_const_char_bytes_in_ctx(
+    e: &crate::ast::expr::SpannedExpr,
+    ctx: &LowerCtx<'_>,
+) -> Option<Vec<u8>> {
+    eval_const_char_bytes_with_context(
+        e,
+        &HashMap::new(),
+        &HashMap::new(),
+        Some(ctx.st),
+        ctx.proc_scope_id.or_else(current_proc_scope),
+        Some(ctx.type_layouts),
+    )
+}
+
 fn eval_const_char_bytes_with_context(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
@@ -6220,45 +6403,25 @@ fn eval_const_char_bytes_with_context(
             };
             let intrinsic = name.to_lowercase();
             if intrinsic == "new_line" {
-                if args.len() != 1 || args[0].keyword.is_some() {
-                    return None;
-                }
+                character_intrinsic_argument_expr_slots(&intrinsic, args)?;
                 return Some(vec![b'\n']);
             }
             if intrinsic == "repeat" {
-                if args.len() != 2 {
-                    return None;
-                }
-                let mut pattern_arg = None;
-                let mut copies_arg = None;
-                for (i, arg) in args.iter().enumerate() {
-                    let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
-                        return None;
-                    };
-                    match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
-                        Some(keyword) if keyword == "string" && pattern_arg.is_none() => {
-                            pattern_arg = Some(expr);
-                        }
-                        Some(keyword) if keyword == "ncopies" && copies_arg.is_none() => {
-                            copies_arg = Some(expr);
-                        }
-                        None if i == 0 && pattern_arg.is_none() => pattern_arg = Some(expr),
-                        None if i == 1 && copies_arg.is_none() => copies_arg = Some(expr),
-                        _ => return None,
-                    }
-                }
+                let slots = character_intrinsic_argument_expr_slots(&intrinsic, args)?;
+                let pattern_arg = slots.first()?.as_ref().copied()?;
+                let copies_arg = slots.get(1)?.as_ref().copied()?;
                 let pattern = eval_const_char_bytes_with_context(
-                    pattern_arg?,
+                    pattern_arg,
                     param_consts,
                     param_chars,
                     st,
                     scope_id,
                     type_layouts,
                 )?;
-                let copies = eval_const_char_int_expr(copies_arg?, param_consts, param_chars)
+                let copies = eval_const_char_int_expr(copies_arg, param_consts, param_chars)
                     .or_else(|| {
                         st.and_then(|st| {
-                            eval_const_int_in_scope_or_any_scope(copies_arg?, param_consts, st)
+                            eval_const_int_in_scope_or_any_scope(copies_arg, param_consts, st)
                                 .map(i128::from)
                         })
                     })?;
@@ -6276,28 +6439,8 @@ fn eval_const_char_bytes_with_context(
             if intrinsic != "char" && intrinsic != "achar" {
                 return None;
             }
-
-            let mut code_arg = None;
-            for (i, arg) in args.iter().enumerate() {
-                match arg.keyword.as_deref().map(str::to_ascii_lowercase) {
-                    Some(keyword) if keyword == "kind" => continue,
-                    Some(keyword) if keyword == "i" && code_arg.is_none() => {
-                        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
-                            return None;
-                        };
-                        code_arg = Some(expr);
-                    }
-                    None if i == 0 && code_arg.is_none() => {
-                        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
-                            return None;
-                        };
-                        code_arg = Some(expr);
-                    }
-                    None if i == 1 => continue,
-                    _ => return None,
-                }
-            }
-            let arg_expr = code_arg?;
+            let slots = character_intrinsic_argument_expr_slots(&intrinsic, args)?;
+            let arg_expr = slots.first()?.as_ref().copied()?;
             let code = eval_const_char_int_expr(arg_expr, param_consts, param_chars)?;
             if !(0..=255).contains(&code) {
                 return None;
@@ -6396,19 +6539,13 @@ fn eval_const_char_expr_len(
             };
             let intrinsic = name.to_lowercase();
             match intrinsic.as_str() {
-                "char" | "achar" | "new_line" => Some(1),
-                "repeat" if args.len() >= 2 => {
-                    if args[0].keyword.is_some() || args[1].keyword.is_some() {
-                        return None;
-                    }
-                    let crate::ast::expr::SectionSubscript::Element(str_expr) = &args[0].value
-                    else {
-                        return None;
-                    };
-                    let crate::ast::expr::SectionSubscript::Element(copies_expr) = &args[1].value
-                    else {
-                        return None;
-                    };
+                "char" | "achar" | "new_line" => {
+                    character_intrinsic_argument_expr_slots(&intrinsic, args).map(|_| 1)
+                }
+                "repeat" => {
+                    let slots = character_intrinsic_argument_expr_slots(&intrinsic, args)?;
+                    let str_expr = slots.first()?.as_ref().copied()?;
+                    let copies_expr = slots.get(1)?.as_ref().copied()?;
                     let str_len =
                         eval_const_char_expr_len(str_expr, param_consts, param_chars, st)?;
                     let copies = eval_const_char_int_expr(copies_expr, param_consts, param_chars)?;
@@ -6465,12 +6602,11 @@ fn eval_const_char_int_expr(
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
-            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+            if !name.eq_ignore_ascii_case("len") {
                 return None;
             }
-            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
-                return None;
-            };
+            let slots = character_intrinsic_argument_expr_slots(name, args)?;
+            let arg_expr = slots.first()?.as_ref().copied()?;
             eval_const_char_bytes(arg_expr, param_consts, param_chars)
                 .and_then(|bytes| i128::try_from(bytes.len()).ok())
         }
@@ -7313,16 +7449,22 @@ pub(super) fn eval_const_derived_ctor_global_init(
     let layout = registry.get(type_name)?;
     let mut bytes = vec![0u8; layout.size];
     let mut wrote = apply_derived_const_default_bytes(&mut bytes, 0, layout, registry);
+    let positional_parent =
+        structure_constructor_expr_uses_positional_parent(layout, args, None, st, registry);
     let mut positional_idx = 0usize;
 
     for arg in args {
-        let field = if let Some(keyword) = &arg.keyword {
-            layout.field(keyword)?
-        } else {
-            let field = layout.fields.get(positional_idx)?;
+        let field = crate::sema::type_layout::structure_constructor_field(
+            layout,
+            registry,
+            arg.keyword.as_deref(),
+            positional_idx,
+            positional_parent,
+        )?;
+        if arg.keyword.is_none() {
             positional_idx += 1;
-            field
-        };
+        }
+        let field = field.as_ref();
         if !field.dims.is_empty() || field.allocatable || field.pointer {
             return None;
         }
@@ -7346,6 +7488,27 @@ pub(super) fn eval_const_derived_ctor_global_init(
     } else {
         None
     }
+}
+
+fn structure_constructor_expr_uses_positional_parent(
+    layout: &crate::sema::type_layout::TypeLayout,
+    args: &[crate::ast::expr::Argument],
+    locals: Option<&HashMap<String, LocalInfo>>,
+    st: &SymbolTable,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    let Some(first) = args.first().filter(|argument| argument.keyword.is_none()) else {
+        return false;
+    };
+    let crate::ast::expr::SectionSubscript::Element(first_expr) = &first.value else {
+        return false;
+    };
+    let first_type = operator_expr_type_info(first_expr, locals, st, Some(registry));
+    crate::sema::type_layout::structure_constructor_uses_positional_parent(
+        layout,
+        registry,
+        first_type.as_ref(),
+    )
 }
 
 pub(super) fn collect_decl_param_consts_with_host(
@@ -7800,8 +7963,8 @@ pub(super) fn check_filtered_in_stmt(
         }
 
         // ---- Branch / transfer ----
-        Stmt::Stop { code, .. } | Stmt::ErrorStop { code, .. } => {
-            if let Some(e) = code {
+        Stmt::Stop { code, quiet } | Stmt::ErrorStop { code, quiet } => {
+            for e in code.iter().chain(quiet.iter()) {
                 check_filtered_in_expr(e, filtered);
             }
         }
@@ -7990,15 +8153,15 @@ pub(super) fn check_filtered_in_acvalue(v: &crate::ast::expr::AcValue, filtered:
     }
 }
 
-/// Walk the function's USE statements and collect every name
-/// from a USE-only-imported module that the only-list filtered
-/// out. Audit MAJOR-1: those names must NOT silently fall
-/// through to const_int 0; the lowerer treats them as undefined
-/// at the reference site.
+/// Check the names actually referenced by the function and collect those
+/// excluded by a USE ONLY list. Audit MAJOR-1: those names must NOT silently
+/// fall through to const_int 0; the lowerer treats them as undefined at the
+/// reference site.
 pub(super) fn compute_filtered_names(
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
     local_decls: &[crate::ast::decl::SpannedDecl],
+    required_names: &HashSet<String>,
     st: &SymbolTable,
     proc_scope_id: Option<crate::sema::symtab::ScopeId>,
 ) -> HashSet<String> {
@@ -8039,83 +8202,46 @@ pub(super) fn compute_filtered_names(
     for decl in uses {
         let Decl::UseStmt {
             module,
-            only,
-            renames,
-            ..
-        } = &decl.node
-        else {
-            continue;
-        };
-        let mod_key = module.to_lowercase();
-        if let Some(only_list) = only {
-            for item in only_list {
-                match item {
-                    OnlyItem::Name(n) => {
-                        visible_local_names.insert(n.to_lowercase());
-                    }
-                    OnlyItem::Generic(n) => {
-                        visible_local_names.insert(n.to_lowercase());
-                    }
-                    OnlyItem::Rename(rn) => {
-                        visible_local_names.insert(rn.local.to_lowercase());
-                    }
-                }
-            }
-        } else {
-            for ((mk, var), info) in globals.iter() {
-                if *mk == mod_key && !info.private {
-                    visible_local_names.insert(var.clone());
-                }
-            }
-            for rn in renames {
-                visible_local_names.insert(rn.local.to_lowercase());
-            }
-        }
-    }
-
-    for decl in uses {
-        let Decl::UseStmt {
-            module,
+            nature,
             only: Some(only_list),
             ..
         } = &decl.node
         else {
             continue;
         };
-        let mod_key = module.to_lowercase();
-        // The set of names this module exports (limited to what
-        // collect_module_globals registered — module functions and
-        // derived types are tracked elsewhere and remain visible).
-        // Private vars are stored in `globals` for submodule access
-        // but never visible to USE; skip them so a name shadow on the
-        // local side doesn't trip the filter.
-        let mut exports: HashSet<String> = HashSet::new();
-        for ((mk, var), info) in globals.iter() {
-            if *mk == mod_key && !info.private {
-                exports.insert(var.clone());
-            }
-        }
-        // The set of (lowercase) names the only-list explicitly
-        // imports. A rename's `remote` is what's pulled from the
-        // module; a Name is itself.
-        let mut imported: HashSet<String> = HashSet::new();
+        let Some(module_scope_id) = resolved_use_module_scope(st, module, *nature) else {
+            continue;
+        };
+        let mut imported_local_names: HashSet<String> = HashSet::new();
         for item in only_list {
             match item {
-                OnlyItem::Name(n) => {
-                    imported.insert(n.to_lowercase());
-                }
-                OnlyItem::Generic(n) => {
-                    imported.insert(n.to_lowercase());
+                OnlyItem::Name(n) | OnlyItem::Generic(n) => {
+                    imported_local_names.insert(n.to_lowercase());
                 }
                 OnlyItem::Rename(rn) => {
-                    imported.insert(rn.remote.to_lowercase());
+                    imported_local_names.insert(rn.local.to_lowercase());
                 }
             }
         }
-        // Anything in exports but not imported is now filtered.
-        for e in &exports {
-            if !imported.contains(e) && !visible_local_names.contains(e) {
-                filtered.insert(e.clone());
+
+        for name in required_names {
+            if visible_local_names.contains(name)
+                || imported_local_names.contains(name)
+                || proc_scope_id.is_some_and(|scope_id| st.lookup_in(scope_id, name).is_some())
+            {
+                continue;
+            }
+            if !st.scope_exports_name(module_scope_id, name) {
+                continue;
+            }
+            let Some(symbol) = st.lookup_in(module_scope_id, name) else {
+                continue;
+            };
+            let Some(source_module) = module_scope_name_for_symbol(st, symbol.scope) else {
+                continue;
+            };
+            if globals.contains_key(&(source_module, symbol.name.to_lowercase())) {
+                filtered.insert(name.clone());
             }
         }
     }
@@ -8159,6 +8285,9 @@ pub(super) fn install_one_global(
         info.ty.clone()
     };
     let addr = b.global_addr(&info.symbol, addr_ty);
+    if info.volatile {
+        b.mark_volatile_address(addr);
+    }
     locals.insert(
         local_key,
         LocalInfo {
@@ -8309,57 +8438,171 @@ fn module_scope_name_for_symbol(
     }
 }
 
-fn resolve_exported_global_key(
+fn defining_global_key(
     st: &SymbolTable,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
-    mod_key: &str,
-    local_key: &str,
+    symbol: &crate::sema::symtab::Symbol,
 ) -> Option<(String, String)> {
-    let direct_key = (mod_key.to_string(), local_key.to_string());
-    if globals.contains_key(&direct_key) {
-        return Some(direct_key);
-    }
-
-    let mod_scope_id = st.find_module_scope(mod_key)?;
-    if !st.scope_exports_name(mod_scope_id, local_key) {
+    // Intrinsic and non-intrinsic modules may legally share a source name.
+    // The globals registry contains object-backed user/.amod entities, while
+    // intrinsic-module named constants live only in the symbol table. Do not
+    // let an intrinsic symbol bind to a same-named user module's global.
+    if st.scope(symbol.scope).intrinsic_module {
         return None;
     }
-    let sym = st.lookup_in(mod_scope_id, local_key)?;
-    let source_mod = module_scope_name_for_symbol(st, sym.scope)?;
-    let source_key = (source_mod, sym.name.to_lowercase());
-    globals.contains_key(&source_key).then_some(source_key)
+    let source_module = module_scope_name_for_symbol(st, symbol.scope)?;
+    let key = (source_module, symbol.name.to_lowercase());
+    globals.contains_key(&key).then_some(key)
 }
 
-fn resolve_visible_global_key(
+fn use_decl_bindings_for_name(
     st: &SymbolTable,
-    globals: &HashMap<(String, String), ModuleGlobalInfo>,
-    scope_id: crate::sema::symtab::ScopeId,
+    uses: &[crate::ast::decl::SpannedDecl],
+    key: &str,
+) -> Vec<(crate::sema::symtab::ScopeId, String)> {
+    use crate::ast::decl::OnlyItem;
+
+    let mut bindings = Vec::new();
+    for use_decl in uses {
+        let Decl::UseStmt {
+            module,
+            nature,
+            renames,
+            only,
+        } = &use_decl.node
+        else {
+            continue;
+        };
+        let Some(source_scope) = resolved_use_module_scope(st, module, *nature) else {
+            continue;
+        };
+        let mut original_names = Vec::new();
+        if let Some(only_items) = only {
+            for item in only_items {
+                match item {
+                    OnlyItem::Name(name) | OnlyItem::Generic(name)
+                        if name.eq_ignore_ascii_case(key) =>
+                    {
+                        original_names.push(name.to_ascii_lowercase());
+                    }
+                    OnlyItem::Rename(rename) if rename.local.eq_ignore_ascii_case(key) => {
+                        original_names.push(rename.remote.to_ascii_lowercase());
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            let mut locally_renamed = false;
+            let mut remote_renamed = false;
+            for rename in renames {
+                if rename.local.eq_ignore_ascii_case(key) {
+                    original_names.push(rename.remote.to_ascii_lowercase());
+                    locally_renamed = true;
+                }
+                if rename.remote.eq_ignore_ascii_case(key) {
+                    remote_renamed = true;
+                }
+            }
+            if !locally_renamed && !remote_renamed {
+                original_names.push(key.to_string());
+            }
+        }
+        bindings.extend(
+            original_names
+                .into_iter()
+                .map(|original_name| (source_scope, original_name)),
+        );
+    }
+    bindings
+}
+
+fn resolve_symbol_from_use_decls<'a>(
+    st: &'a SymbolTable,
+    uses: &[crate::ast::decl::SpannedDecl],
+    key: &str,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    use_decl_bindings_for_name(st, uses, key)
+        .into_iter()
+        .find_map(|(source_scope, original_name)| {
+            if st.scope_exports_name(source_scope, &original_name) {
+                st.lookup_in(source_scope, &original_name)
+            } else {
+                None
+            }
+        })
+}
+
+fn named_module_or_submodule_scope(
+    st: &SymbolTable,
+    name: &str,
+) -> Option<crate::sema::symtab::ScopeId> {
+    st.find_module_scope(name).or_else(|| {
+        st.all_scopes().iter().find_map(|scope| match &scope.kind {
+            crate::sema::symtab::ScopeKind::Submodule(scope_name)
+                if scope_name.eq_ignore_ascii_case(name) =>
+            {
+                Some(scope.id)
+            }
+            _ => None,
+        })
+    })
+}
+
+fn resolve_required_global_symbol<'a>(
+    st: &'a SymbolTable,
+    uses: &[crate::ast::decl::SpannedDecl],
     local_key: &str,
-) -> Option<(String, String)> {
-    let sym = st.lookup_in(scope_id, local_key)?;
-    let source_mod = module_scope_name_for_symbol(st, sym.scope)?;
-    let source_key = (source_mod, sym.name.to_lowercase());
-    globals.contains_key(&source_key).then_some(source_key)
+    host_module: Option<&str>,
+    extra_host: Option<&str>,
+    respect_host_association_policy: bool,
+) -> Option<&'a crate::sema::symtab::Symbol> {
+    if !respect_host_association_policy {
+        return resolve_symbol_from_use_decls(st, uses, local_key);
+    }
+
+    if let Some(scope_id) = current_proc_scope() {
+        if let Some(symbol) = st.lookup_in(scope_id, local_key) {
+            return Some(symbol);
+        }
+        if st.host_association_is_restricted(scope_id) {
+            return None;
+        }
+    }
+
+    if let Some(symbol) = resolve_symbol_from_use_decls(st, uses, local_key) {
+        return Some(symbol);
+    }
+    for host in [extra_host, host_module].into_iter().flatten() {
+        let Some(scope_id) = named_module_or_submodule_scope(st, host) else {
+            continue;
+        };
+        if let Some(symbol) = st.lookup_in(scope_id, local_key) {
+            return Some(symbol);
+        }
+    }
+    None
 }
 
-fn global_keys_resolve_to_same_symbol(
+fn install_resolved_global_import(
+    b: &mut FuncBuilder,
+    locals: &mut HashMap<String, LocalInfo>,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    local_key: String,
+    symbol: &crate::sema::symtab::Symbol,
     st: &SymbolTable,
-    left: &(String, String),
-    right: &(String, String),
-) -> bool {
-    let Some(left_scope) = st.find_module_scope(&left.0) else {
-        return false;
+) {
+    if locals.contains_key(&local_key) {
+        return;
+    }
+    let Some(global_key) = defining_global_key(st, globals, symbol) else {
+        install_parameter_inline_const(b, locals, local_key, symbol);
+        return;
     };
-    let Some(right_scope) = st.find_module_scope(&right.0) else {
-        return false;
-    };
-    let Some(left_symbol) = st.lookup_in(left_scope, &left.1) else {
-        return false;
-    };
-    let Some(right_symbol) = st.lookup_in(right_scope, &right.1) else {
-        return false;
-    };
-    std::ptr::eq(left_symbol, right_symbol)
+    let info = &globals[&global_key];
+    if install_global_inline_const(b, locals, local_key.clone(), info) {
+        return;
+    }
+    install_one_global(b, locals, local_key, info, symbol.attrs.array_spec.len());
 }
 
 /// Install module globals imported by this function's USE
@@ -8367,10 +8610,8 @@ fn global_keys_resolve_to_same_symbol(
 ///   * USE ONLY filtering — only names in the only-list are installed
 ///   * Renames — both forms, `use m, only: y => x` and
 ///     `use m, x => y` (non-only rename)
-///   * Cross-module collision detection — if two modules bring in
-///     the same local key through their use list, the emitted IR
-///     would resolve ambiguously; validation diagnoses referenced
-///     collisions before this recovery path runs.
+///   * Ambiguity safety — validation rejects referenced collisions before
+///     this resolution path runs.
 ///
 /// Audit C2/C3/C4: previously this function installed every
 /// global regardless of any USE statement, ignored ONLY filtering,
@@ -8381,10 +8622,9 @@ pub(super) fn install_globals_as_locals(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
-    required_names: Option<&HashSet<String>>,
+    required_names: &HashSet<String>,
     host_module: Option<&str>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
     let extra = current_smp_extra_host();
     install_globals_as_locals_in(
@@ -8396,7 +8636,6 @@ pub(super) fn install_globals_as_locals(
         host_module,
         extra.as_deref(),
         st,
-        ambiguous_use_warnings,
         true,
     );
 }
@@ -8408,18 +8647,16 @@ pub(super) fn install_block_globals_as_locals(
     uses: &[crate::ast::decl::SpannedDecl],
     required_names: &HashSet<String>,
     st: &SymbolTable,
-    ambiguous_use_warnings: &AmbiguousUseWarnings,
 ) {
     install_globals_as_locals_in(
         b,
         locals,
         globals,
         uses,
-        Some(required_names),
+        required_names,
         None,
         None,
         st,
-        ambiguous_use_warnings,
         false,
     );
 }
@@ -8430,294 +8667,29 @@ pub(super) fn install_globals_as_locals_in(
     locals: &mut HashMap<String, LocalInfo>,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     uses: &[crate::ast::decl::SpannedDecl],
-    required_names: Option<&HashSet<String>>,
+    required_names: &HashSet<String>,
     host_module: Option<&str>,
     extra_host: Option<&str>,
     st: &SymbolTable,
-    _ambiguous_use_warnings: &AmbiguousUseWarnings,
     respect_host_association_policy: bool,
 ) {
-    use crate::ast::decl::OnlyItem;
-
-    // Sorted per-use iteration so the emitted global_addr
-    // instructions land in deterministic order. Audit B-3 holds
-    // across this path too.
-    //
-    // The two-pass pattern:
-    //   1. Enumerate the (use statement, key-in-local-scope, module_key)
-    //      triples this function imports.
-    //   2. Sort by local-scope key.
-    //   3. Install in order, checking for collision before inserting.
-    let mut pending: Vec<(String, (String, String))> = Vec::new();
-
-    if let Some(module_name) = host_module {
-        let mod_key = module_name.to_lowercase();
-        // Build the host-scope chain. For a submodule helper, host_module
-        // is the submodule's own name, but the helper still has F2018
-        // §11.2.3 host-association access to the parent module's globals.
-        // Walk the submodule's `is_submodule_access` USE entry to find
-        // the parent module so its globals get imported here too.
-        let mut host_chain: Vec<String> = vec![mod_key.clone()];
-        // SMP body extra: link name uses the parent module's prefix, but
-        // the body still needs to see its containing submodule's locals.
-        // Caller passes the submodule name as `extra_host` so we can pull
-        // those globals in alongside the parent's.
-        if let Some(extra) = extra_host {
-            let extra_lc = extra.to_lowercase();
-            if !host_chain.contains(&extra_lc) {
-                host_chain.push(extra_lc);
-            }
+    let mut ordered_required: Vec<&String> = required_names.iter().collect();
+    ordered_required.sort_unstable();
+    for local_key in ordered_required {
+        if locals.contains_key(local_key) {
+            continue;
         }
-        if st.find_module_scope(&mod_key).is_none() {
-            for scope in st.all_scopes() {
-                if let crate::sema::symtab::ScopeKind::Submodule(n) = &scope.kind {
-                    if n.eq_ignore_ascii_case(&mod_key) {
-                        for assoc in &scope.use_associations {
-                            if !assoc.is_submodule_access {
-                                continue;
-                            }
-                            let src_scope = st.scope(assoc.source_scope);
-                            if let crate::sema::symtab::ScopeKind::Module(parent_name) =
-                                &src_scope.kind
-                            {
-                                let parent_lc = parent_name.to_lowercase();
-                                if !host_chain.contains(&parent_lc) {
-                                    host_chain.push(parent_lc);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        for host_lc in &host_chain {
-            for (mk, var) in globals.keys() {
-                if *mk == *host_lc && !pending.iter().any(|(k, _)| k == var) {
-                    pending.push((var.clone(), (host_lc.clone(), var.clone())));
-                }
-            }
-            // F2018 §11.2.3: a submodule sees every entity its host module
-            // sees, including names brought into the host via USE. Walk
-            // each host scope's UseAssociations and install the source
-            // globals under the local-name the host knows them by.
-            // Without this, a submodule reference to e.g. `one_sp` (from
-            // `use stdlib_constants` in the parent) misses `locals`
-            // entirely, falls into `find_symbol_any_scope` + the
-            // `const_i32(0)` fallback in `Expr::Name`, and breaks generic
-            // dispatch with the wrong IR type.
-            if let Some(host_scope_id) = st.find_module_scope(host_lc) {
-                for assoc in &st.scope(host_scope_id).use_associations {
-                    if assoc.is_submodule_access {
-                        continue;
-                    }
-                    let src_scope = st.scope(assoc.source_scope);
-                    let src_mod_key = match &src_scope.kind {
-                        crate::sema::symtab::ScopeKind::Module(n)
-                        | crate::sema::symtab::ScopeKind::Submodule(n) => n.to_lowercase(),
-                        _ => continue,
-                    };
-                    if src_mod_key == *host_lc {
-                        continue;
-                    }
-                    let var_lc = assoc.original_name.to_lowercase();
-                    let local_lc = assoc.local_name.to_lowercase();
-                    if globals.contains_key(&(src_mod_key.clone(), var_lc.clone()))
-                        && !pending.iter().any(|(k, _)| k == &local_lc)
-                    {
-                        pending.push((local_lc, (src_mod_key, var_lc)));
-                    }
-                }
-                if let Some(required) = required_names {
-                    for local_lc in required {
-                        if pending.iter().any(|(k, _)| k == local_lc) {
-                            continue;
-                        }
-                        if let Some(resolved_key) =
-                            resolve_visible_global_key(st, globals, host_scope_id, local_lc)
-                        {
-                            pending.push((local_lc.clone(), resolved_key));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for decl in uses {
-        let Decl::UseStmt {
-            module,
-            nature: _,
-            renames,
-            only,
-        } = &decl.node
-        else {
+        let Some(symbol) = resolve_required_global_symbol(
+            st,
+            uses,
+            local_key,
+            host_module,
+            extra_host,
+            respect_host_association_policy,
+        ) else {
             continue;
         };
-        let mod_key = module.to_lowercase();
-        if let Some(only_list) = only {
-            for item in only_list {
-                match item {
-                    OnlyItem::Name(n) => {
-                        let n_lc = n.to_lowercase();
-                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
-                    }
-                    OnlyItem::Generic(n) => {
-                        let n_lc = n.to_lowercase();
-                        pending.push((n_lc.clone(), (mod_key.clone(), n_lc)));
-                    }
-                    OnlyItem::Rename(rn) => {
-                        pending.push((
-                            rn.local.to_lowercase(),
-                            (mod_key.clone(), rn.remote.to_lowercase()),
-                        ));
-                    }
-                }
-            }
-        } else {
-            // No ONLY list: import every name from the module,
-            // minus any rename targets (which are substituted).
-            let rename_targets: std::collections::HashSet<String> =
-                renames.iter().map(|r| r.remote.to_lowercase()).collect();
-            for (mk, var) in globals.keys() {
-                if *mk != mod_key {
-                    continue;
-                }
-                if rename_targets.contains(var) {
-                    continue;
-                }
-                // Skip PRIVATE symbols — only PUBLIC symbols are accessible
-                // via USE without ONLY.
-                if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                    if let Some(sym) = st.scope(mod_scope_id).symbols.get(var) {
-                        if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
-                            continue;
-                        }
-                    }
-                }
-                pending.push((var.clone(), (mod_key.clone(), var.clone())));
-            }
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                for (_, var) in globals.keys() {
-                    if rename_targets.contains(var) {
-                        continue;
-                    }
-                    if pending.iter().any(|(k, _)| k == var) {
-                        continue;
-                    }
-                    if !st.scope_exports_name(mod_scope_id, var) {
-                        continue;
-                    }
-                    if let Some(resolved_key) =
-                        resolve_exported_global_key(st, globals, &mod_key, var)
-                    {
-                        pending.push((var.clone(), resolved_key));
-                    }
-                }
-            }
-            // Also scan the SymbolTable module scope for symbols not
-            // in the globals map (e.g., PARAMETERs, which are inlined
-            // and don't generate globals).
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                for (sym_key, sym) in &st.scope(mod_scope_id).symbols {
-                    if matches!(sym.attrs.access, crate::sema::symtab::Access::Private) {
-                        continue;
-                    }
-                    if rename_targets.contains(sym_key) {
-                        continue;
-                    }
-                    let pair = (mod_key.clone(), sym_key.clone());
-                    if !globals.contains_key(&pair) && !pending.iter().any(|(k, _)| k == sym_key) {
-                        pending.push((sym_key.clone(), pair));
-                    }
-                }
-            }
-            for rn in renames {
-                pending.push((
-                    rn.local.to_lowercase(),
-                    (mod_key.clone(), rn.remote.to_lowercase()),
-                ));
-            }
-        }
-    }
-
-    pending.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut installed_from: HashMap<String, (String, String)> = HashMap::new();
-    for (local_key, (mod_key, var_key)) in pending {
-        if let Some(required) = required_names {
-            if !required.contains(&local_key) {
-                continue;
-            }
-        }
-        if respect_host_association_policy {
-            if let Some(scope_id) = current_proc_scope() {
-                if st.host_association_is_restricted(scope_id)
-                    && st.lookup_in(scope_id, &local_key).is_none()
-                {
-                    continue;
-                }
-            }
-        }
-        let visible_intrinsic_parameter = current_proc_scope()
-            .and_then(|scope_id| st.lookup_in(scope_id, &local_key))
-            .filter(|symbol| st.scope(symbol.scope).intrinsic_module);
-        if visible_intrinsic_parameter.is_some_and(|symbol| {
-            install_parameter_inline_const(b, locals, local_key.clone(), symbol)
-        }) {
-            continue;
-        }
-        let resolved_global_key = resolve_exported_global_key(st, globals, &mod_key, &var_key)
-            .unwrap_or_else(|| (mod_key.clone(), var_key.clone()));
-        if let Some(info) = globals.get(&resolved_global_key) {
-            // Collision check: two modules exporting the same local key.
-            let resolved_mod = resolved_global_key.0.clone();
-            if let Some(previous_key) = installed_from.get(&local_key) {
-                if previous_key == &resolved_global_key
-                    || global_keys_resolve_to_same_symbol(st, previous_key, &resolved_global_key)
-                {
-                    continue;
-                }
-                if previous_key.0 != resolved_mod {
-                    // Referenced ambiguities are rejected during validation.
-                    // Collisions that remain here are unreferenced or hidden
-                    // by a more local association, so lowering keeps its
-                    // deterministic first entry without a user diagnostic.
-                    continue;
-                }
-            }
-            installed_from.insert(local_key.clone(), resolved_global_key.clone());
-            if !install_global_inline_const(b, locals, local_key.clone(), info) {
-                // Recover the declared rank from the module symbol — a
-                // deferred-shape allocatable/pointer array has no bounds in
-                // `info.dims`, so the installed LocalInfo would otherwise be
-                // rank 0 (mis-read as a scalar by generic dispatch).
-                let rank = st
-                    .find_module_scope(&resolved_global_key.0)
-                    .and_then(|sid| st.lookup_in(sid, &resolved_global_key.1))
-                    .map(|sym| sym.attrs.array_spec.len())
-                    .unwrap_or(0);
-                install_one_global(b, locals, local_key, info, rank);
-            }
-        } else {
-            // Not an IR global — check if it's an intrinsic module parameter constant
-            // (iso_c_binding, iso_fortran_env). These are registered in the symbol
-            // table but never emitted as IR globals; install them as inline_const locals.
-            if let Some(mod_scope_id) = st.find_module_scope(&mod_key) {
-                if let Some(sym) = st
-                    .scope(mod_scope_id)
-                    .symbols
-                    .get(&var_key)
-                    .or_else(|| st.lookup_in(mod_scope_id, &var_key))
-                {
-                    if install_parameter_inline_const(b, locals, local_key.clone(), sym) {
-                        installed_from.insert(local_key, resolved_global_key);
-                    }
-                }
-            }
-            // If still not found (e.g., USE references a name that doesn't exist),
-            // skip silently — sema should have diagnosed it.
-        }
+        install_resolved_global_import(b, locals, globals, local_key.clone(), symbol, st);
     }
 }
 
@@ -8952,7 +8924,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 else {
                     return None;
                 };
-                return selected_kind_const_value(&key, arg).map(ConstScalar::Int);
+                return crate::sema::types::selected_kind_value(&key, arg).map(ConstScalar::Int);
             }
             if key == "int" {
                 let value = const_call_arg_expr(args.first()?)
@@ -9221,45 +9193,6 @@ fn eval_const_transfer_with_any_scope(
         &source_bytes,
         target_bytes,
     )))
-}
-
-fn selected_kind_const_value(name: &str, arg: i128) -> Option<i128> {
-    match name {
-        "selected_int_kind" => Some(if arg <= 2 {
-            1
-        } else if arg <= 4 {
-            2
-        } else if arg <= 9 {
-            4
-        } else if arg <= 18 {
-            8
-        } else if arg <= 38 {
-            16
-        } else {
-            -1
-        }),
-        "selected_real_kind" => Some(if arg <= 6 {
-            4
-        } else if arg <= 15 {
-            8
-        } else {
-            -1
-        }),
-        "selected_logical_kind" => Some(if arg <= 8 {
-            1
-        } else if arg <= 16 {
-            2
-        } else if arg <= 32 {
-            4
-        } else if arg <= 64 {
-            8
-        } else if arg <= 128 {
-            16
-        } else {
-            -1
-        }),
-        _ => None,
-    }
 }
 
 fn eval_const_transfer_with_decl_scope(
@@ -9856,7 +9789,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     else {
                         return None;
                     };
-                    selected_kind_const_value(&key, arg).map(ConstScalar::Int)
+                    crate::sema::types::selected_kind_value(&key, arg).map(ConstScalar::Int)
                 }
                 "selected_char_kind" => {
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
@@ -10991,22 +10924,15 @@ pub(super) fn fixed_char_expr_len(
         }
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
-                if name.eq_ignore_ascii_case("repeat")
-                    && args.len() >= 2
-                    && args[0].keyword.is_none()
-                    && args[1].keyword.is_none()
-                {
-                    if let (
-                        crate::ast::expr::SectionSubscript::Element(source),
-                        crate::ast::expr::SectionSubscript::Element(copies),
-                    ) = (&args[0].value, &args[1].value)
-                    {
-                        let source_len = fixed_char_expr_len(b, source, locals, st, type_layouts)?;
-                        let copies =
-                            fixed_char_int_expr_len_context(b, copies, locals, st, type_layouts)?;
-                        if copies >= 0 {
-                            return source_len.checked_mul(copies);
-                        }
+                if name.eq_ignore_ascii_case("repeat") {
+                    let slots = character_intrinsic_argument_expr_slots(name, args)?;
+                    let source = slots.first()?.as_ref().copied()?;
+                    let copies = slots.get(1)?.as_ref().copied()?;
+                    let source_len = fixed_char_expr_len(b, source, locals, st, type_layouts)?;
+                    let copies =
+                        fixed_char_int_expr_len_context(b, copies, locals, st, type_layouts)?;
+                    if copies >= 0 {
+                        return source_len.checked_mul(copies);
                     }
                 }
                 if let Some(info) = locals.get(&name.to_lowercase()) {
@@ -11076,12 +11002,11 @@ fn fixed_char_int_expr_len_context(
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
-            if !name.eq_ignore_ascii_case("len") || args.len() != 1 || args[0].keyword.is_some() {
+            if !name.eq_ignore_ascii_case("len") {
                 return None;
             }
-            let crate::ast::expr::SectionSubscript::Element(arg_expr) = &args[0].value else {
-                return None;
-            };
+            let slots = character_intrinsic_argument_expr_slots(name, args)?;
+            let arg_expr = slots.first()?.as_ref().copied()?;
             fixed_char_expr_len(b, arg_expr, locals, st, type_layouts)
         }
         _ => None,
@@ -11432,6 +11357,60 @@ fn lower_character_minmax_string_expr(
     Some((best_ptr, best_len))
 }
 
+fn character_intrinsic_argument_expr_slots<'a>(
+    name: &str,
+    args: &'a [crate::ast::expr::Argument],
+) -> Option<Vec<Option<&'a crate::ast::expr::SpannedExpr>>> {
+    let (formals, required) = crate::sema::types::character_intrinsic_signature(name)?;
+    let mut slots = vec![None; formals.len()];
+    let mut positional = 0usize;
+    let mut saw_keyword = false;
+
+    for arg in args {
+        let index = if let Some(keyword) = arg.keyword.as_deref() {
+            saw_keyword = true;
+            formals
+                .iter()
+                .position(|formal| formal.eq_ignore_ascii_case(keyword))?
+        } else {
+            if saw_keyword {
+                return None;
+            }
+            let index = positional;
+            positional += 1;
+            if index >= formals.len() {
+                return None;
+            }
+            index
+        };
+        if slots[index].is_some() {
+            return None;
+        }
+        let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value else {
+            return None;
+        };
+        slots[index] = Some(expr);
+    }
+
+    slots
+        .iter()
+        .take(required)
+        .all(Option::is_some)
+        .then_some(slots)
+}
+
+fn character_intrinsic_integer_result_type(
+    kind_expr: Option<&crate::ast::expr::SpannedExpr>,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> Option<IrType> {
+    let kind = match kind_expr {
+        Some(expr) => intrinsic_kind_arg_width(expr, Some(locals), st)?,
+        None => crate::driver::defaults::default_int_kind(),
+    };
+    int_width_from_kind_value(i64::from(kind)).map(IrType::Int)
+}
+
 pub(super) fn lower_char_intrinsic(
     b: &mut FuncBuilder,
     name: &str,
@@ -11443,17 +11422,12 @@ pub(super) fn lower_char_intrinsic(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
-    use crate::ast::expr::SectionSubscript;
-
-    // Extract the SpannedExpr from argument i.
+    let argument_slots = character_intrinsic_argument_expr_slots(name, args);
     let arg_spanned = |i: usize| -> Option<&crate::ast::expr::SpannedExpr> {
-        args.get(i).and_then(|a| {
-            if let SectionSubscript::Element(e) = &a.value {
-                Some(e)
-            } else {
-                None
-            }
-        })
+        argument_slots
+            .as_ref()?
+            .get(i)
+            .and_then(|slot| slot.as_ref().copied())
     };
     let lower_string_arg =
         |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr| -> (ValueId, ValueId) {
@@ -11472,6 +11446,20 @@ pub(super) fn lower_char_intrinsic(
         |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr, ptr: ValueId| {
             deallocate_owned_string_expr_temp(b, locals, expr, st, type_layouts, ptr);
         };
+    let lower_back_arg = |b: &mut FuncBuilder, expr: &crate::ast::expr::SpannedExpr| -> ValueId {
+        let raw = super::expr::lower_expr_full(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        );
+        let logical = coerce_to_type(b, raw, &IrType::Bool);
+        coerce_to_type(b, logical, &IrType::Int(IntWidth::I32))
+    };
 
     match name {
         "max" | "min" => lower_character_minmax_string_expr(
@@ -11487,10 +11475,8 @@ pub(super) fn lower_char_intrinsic(
         )
         .map(|(ptr, _)| ptr),
         "len" => {
-            // F2018 §16.9.108: LEN returns default integer. Descriptor
-            // length is stored as I64; truncate to I32 so generic
-            // dispatch can match `integer` formals (kind=4).
             let arg = arg_spanned(0)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
             let (ptr_to_release, len) =
                 if actual_expr_rank(arg, locals, st, type_layouts).is_some_and(|rank| rank > 0) {
                     if let Some(len) = actual_char_arg_runtime_len(
@@ -11513,18 +11499,15 @@ pub(super) fn lower_char_intrinsic(
                     let (ptr, len) = lower_string_arg(b, arg);
                     (Some(ptr), len)
                 };
-            let truncated = match b.func().value_type(len) {
-                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(len, IntWidth::I32),
-                _ => len,
-            };
+            let result = coerce_to_type(b, len, &result_type);
             if let Some(ptr) = ptr_to_release {
                 release_string_arg(b, arg, ptr);
             }
-            Some(truncated)
+            Some(result)
         }
         "len_trim" => {
-            // F2018 §16.9.109: LEN_TRIM returns default integer.
             let arg = arg_spanned(0)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
             let (ptr, len_val) = lower_string_arg(b, arg);
             let raw = b.call(
                 FuncRef::External("afs_len_trim".into()),
@@ -11532,31 +11515,32 @@ pub(super) fn lower_char_intrinsic(
                 IrType::Int(IntWidth::I64),
             );
             release_string_arg(b, arg, ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "ichar" | "iachar" => {
             let arg = arg_spanned(0)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
             let (ptr, _) = lower_string_arg(b, arg);
-            let result = b.call(
+            let raw = b.call(
                 FuncRef::External("afs_ichar_ptr".into()),
                 vec![ptr],
                 IrType::Int(IntWidth::I32),
             );
             release_string_arg(b, arg, ptr);
-            Some(result)
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "char" | "achar" => {
-            let int_arg = args.first().and_then(|a| {
-                if let SectionSubscript::Element(e) = &a.value {
-                    Some(super::expr::lower_expr(b, locals, e, st))
-                } else {
-                    None
-                }
-            })?;
-            let i32_arg = match b.func().value_type(int_arg) {
-                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(int_arg, IntWidth::I32),
-                _ => int_arg,
-            };
+            let int_arg = super::expr::lower_expr_full(
+                b,
+                locals,
+                arg_spanned(0)?,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let i32_arg = coerce_to_type(b, int_arg, &IrType::Int(IntWidth::I32));
             let byte_val = b.call(
                 FuncRef::External("afs_char".into()),
                 vec![i32_arg],
@@ -11570,15 +11554,18 @@ pub(super) fn lower_char_intrinsic(
             b.store(byte_val, byte_ptr);
             Some(buf)
         }
-        "new_line" => Some(b.const_string(b"\n")),
+        "new_line" => {
+            let _ = arg_spanned(0)?;
+            Some(b.const_string(b"\n"))
+        }
         "index" => {
-            // F2018 §16.9.93: INDEX returns default integer.
             let hay = arg_spanned(0)?;
             let needle = arg_spanned(1)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
             let (hay_ptr, hay_len_val) = lower_string_arg(b, hay);
             let (needle_ptr, needle_len_val) = lower_string_arg(b, needle);
             let back_val = arg_spanned(2)
-                .map(|e| super::expr::lower_expr(b, locals, e, st))
+                .map(|e| lower_back_arg(b, e))
                 .unwrap_or_else(|| b.const_i32(0));
             let raw = b.call(
                 FuncRef::External("afs_index".into()),
@@ -11587,16 +11574,16 @@ pub(super) fn lower_char_intrinsic(
             );
             release_string_arg(b, hay, hay_ptr);
             release_string_arg(b, needle, needle_ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "scan" => {
-            // F2018 §16.9.169: SCAN returns default integer.
             let src = arg_spanned(0)?;
             let set = arg_spanned(1)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
             let (src_ptr, src_len_val) = lower_string_arg(b, src);
             let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
-                .map(|e| super::expr::lower_expr(b, locals, e, st))
+                .map(|e| lower_back_arg(b, e))
                 .unwrap_or_else(|| b.const_i32(0));
             let raw = b.call(
                 FuncRef::External("afs_scan".into()),
@@ -11605,16 +11592,16 @@ pub(super) fn lower_char_intrinsic(
             );
             release_string_arg(b, src, src_ptr);
             release_string_arg(b, set, set_ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "verify" => {
-            // F2018 §16.9.213: VERIFY returns default integer.
             let src = arg_spanned(0)?;
             let set = arg_spanned(1)?;
+            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
             let (src_ptr, src_len_val) = lower_string_arg(b, src);
             let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
-                .map(|e| super::expr::lower_expr(b, locals, e, st))
+                .map(|e| lower_back_arg(b, e))
                 .unwrap_or_else(|| b.const_i32(0));
             let raw = b.call(
                 FuncRef::External("afs_verify".into()),
@@ -11623,7 +11610,7 @@ pub(super) fn lower_char_intrinsic(
             );
             release_string_arg(b, src, src_ptr);
             release_string_arg(b, set, set_ptr);
-            Some(b.int_trunc(raw, IntWidth::I32))
+            Some(coerce_to_type(b, raw, &result_type))
         }
         "lge" | "lgt" | "lle" | "llt" => {
             let lhs = arg_spanned(0)?;
@@ -11722,7 +11709,16 @@ pub(super) fn lower_char_intrinsic(
         "repeat" => {
             let arg = arg_spanned(0)?;
             let (src_ptr, src_len) = lower_string_arg(b, arg);
-            let raw_copies = super::expr::lower_expr(b, locals, arg_spanned(1)?, st);
+            let raw_copies = super::expr::lower_expr_full(
+                b,
+                locals,
+                arg_spanned(1)?,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
             let copies = widen_to_i64(b, raw_copies);
             let copies = clamp_nonnegative_i64(b, copies);
             let total_len = b.imul(src_len, copies);
@@ -12916,7 +12912,7 @@ pub(super) fn find_named_interface_symbol<'a>(
         }
     }
 
-    if let Some(sym) = use_associated_named_interface_symbols(st, &key)
+    if let Some(sym) = lexically_visible_named_interface_symbols(st, &key)
         .into_iter()
         .next()
     {
@@ -12968,32 +12964,58 @@ fn named_interface_symbol_in_scope_chain<'a>(
     }
 }
 
-fn use_associated_named_interface_symbols<'a>(
+fn lexically_visible_named_interface_symbols<'a>(
     st: &'a SymbolTable,
     key: &str,
 ) -> Vec<&'a crate::sema::symtab::Symbol> {
-    use crate::sema::symtab::ScopeKind;
-
-    let mut symbols = Vec::new();
-    let mut seen = HashSet::new();
+    // Lowering runs after semantic resolution, when SymbolTable::current may
+    // name an unrelated unit. The procedure guard is the authoritative caller
+    // scope. Preserve every owner in a merged generic, but root the traversal
+    // at the first lexical binding instead of scanning sibling program units.
+    let Some(mut scope_id) = current_proc_scope() else {
+        return Vec::new();
+    };
+    let mut symbols = st.named_interface_symbols_in(scope_id, key);
+    if symbols.is_empty() {
+        return symbols;
+    }
+    let mut seen: HashSet<_> = symbols
+        .iter()
+        .map(|symbol| (symbol.scope, symbol.name.to_ascii_lowercase()))
+        .collect();
     let mut visited = HashSet::new();
-    for scope in st.all_scopes() {
-        if matches!(scope.kind, ScopeKind::Submodule(_) | ScopeKind::Block) {
-            continue;
-        }
-        for assoc in &scope.use_associations {
-            if assoc.local_name != key {
+    loop {
+        let scope = st.scope(scope_id);
+        let has_local_interface = st.named_interface_symbol_in_scope(scope_id, key).is_some();
+        let has_local_symbol = scope.symbols.contains_key(key);
+        let mut has_use_binding = false;
+        for association in &scope.use_associations {
+            if association.local_name != key {
                 continue;
             }
+            has_use_binding = true;
             collect_named_interface_symbols_from_scope(
                 st,
-                assoc.source_scope,
-                &assoc.original_name,
+                association.source_scope,
+                &association.original_name,
                 &mut visited,
                 &mut symbols,
                 &mut seen,
             );
         }
+        if has_local_interface || has_local_symbol || has_use_binding {
+            break;
+        }
+        let Some(parent) = scope.parent else {
+            break;
+        };
+        if matches!(
+            st.scope(parent).kind,
+            crate::sema::symtab::ScopeKind::Global
+        ) {
+            break;
+        }
+        scope_id = parent;
     }
     symbols
 }
@@ -13004,7 +13026,7 @@ fn collect_named_interface_symbols_from_scope<'a>(
     key: &str,
     visited: &mut HashSet<(crate::sema::symtab::ScopeId, String)>,
     symbols: &mut Vec<&'a crate::sema::symtab::Symbol>,
-    seen: &mut HashSet<(String, crate::sema::symtab::ScopeId)>,
+    seen: &mut HashSet<(crate::sema::symtab::ScopeId, String)>,
 ) {
     let visit_key = (scope_id, key.to_ascii_lowercase());
     if !visited.insert(visit_key) {
@@ -13012,22 +13034,23 @@ fn collect_named_interface_symbols_from_scope<'a>(
     }
     let scope = st.scope(scope_id);
 
-    if let Some(sym) = st.named_interface_symbol_in_scope(scope_id, key) {
-        if sym.attrs.access != crate::sema::symtab::Access::Private && is_named_interface_like(sym)
+    if let Some(symbol) = st.named_interface_symbol_in_scope(scope_id, key) {
+        if symbol.attrs.access != crate::sema::symtab::Access::Private
+            && is_named_interface_like(symbol)
         {
-            let sym_key = (sym.name.to_ascii_lowercase(), sym.scope);
-            if seen.insert(sym_key) {
-                symbols.push(sym);
+            let identity = (symbol.scope, symbol.name.to_ascii_lowercase());
+            if seen.insert(identity) {
+                symbols.push(symbol);
             }
         }
     }
 
-    for assoc in &scope.use_associations {
-        if assoc.local_name == key {
+    for association in &scope.use_associations {
+        if association.local_name == key {
             collect_named_interface_symbols_from_scope(
                 st,
-                assoc.source_scope,
-                &assoc.original_name,
+                association.source_scope,
+                &association.original_name,
                 visited,
                 symbols,
                 seen,
@@ -13036,20 +13059,17 @@ fn collect_named_interface_symbols_from_scope<'a>(
     }
 
     let mut seen_use_scopes = Vec::new();
-    for assoc in &scope.use_associations {
-        if !assoc.from_bare_use {
+    for association in &scope.use_associations {
+        if !association.from_bare_use
+            || association.local_name != association.original_name
+            || seen_use_scopes.contains(&association.source_scope)
+        {
             continue;
         }
-        if assoc.local_name != assoc.original_name {
-            continue;
-        }
-        if seen_use_scopes.contains(&assoc.source_scope) {
-            continue;
-        }
-        seen_use_scopes.push(assoc.source_scope);
+        seen_use_scopes.push(association.source_scope);
         collect_named_interface_symbols_from_scope(
             st,
-            assoc.source_scope,
+            association.source_scope,
             key,
             visited,
             symbols,
@@ -13062,63 +13082,25 @@ fn active_block_use_bindings(
     st: &SymbolTable,
     key: &str,
 ) -> Vec<(crate::sema::symtab::ScopeId, String)> {
-    use crate::ast::decl::{Decl, OnlyItem};
-
     for uses in active_block_uses().iter().rev() {
-        let mut bindings = Vec::new();
-        for use_decl in uses {
-            let Decl::UseStmt {
-                module,
-                renames,
-                only,
-                ..
-            } = &use_decl.node
-            else {
-                continue;
-            };
-            let Some(source_scope) = st.find_module_scope(module) else {
-                continue;
-            };
-            let mut original_names = Vec::new();
-            if let Some(only_items) = only {
-                for item in only_items {
-                    match item {
-                        OnlyItem::Name(name) | OnlyItem::Generic(name)
-                            if name.eq_ignore_ascii_case(key) =>
-                        {
-                            original_names.push(name.to_ascii_lowercase());
-                        }
-                        OnlyItem::Rename(rename) if rename.local.eq_ignore_ascii_case(key) => {
-                            original_names.push(rename.remote.to_ascii_lowercase());
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                let mut locally_renamed = false;
-                let mut remote_renamed = false;
-                for rename in renames {
-                    if rename.local.eq_ignore_ascii_case(key) {
-                        original_names.push(rename.remote.to_ascii_lowercase());
-                        locally_renamed = true;
-                    }
-                    if rename.remote.eq_ignore_ascii_case(key) {
-                        remote_renamed = true;
-                    }
-                }
-                if !locally_renamed && !remote_renamed {
-                    original_names.push(key.to_string());
-                }
-            }
-            for original_name in original_names {
-                bindings.push((source_scope, original_name));
-            }
-        }
+        let bindings = use_decl_bindings_for_name(st, uses, key);
         if !bindings.is_empty() {
             return bindings;
         }
     }
     Vec::new()
+}
+
+fn resolved_use_module_scope(
+    st: &SymbolTable,
+    module: &str,
+    nature: crate::ast::decl::UseNature,
+) -> Option<crate::sema::symtab::ScopeId> {
+    match nature {
+        crate::ast::decl::UseNature::Normal => st.find_module_scope(module),
+        crate::ast::decl::UseNature::Intrinsic => st.find_intrinsic_module_scope(module),
+        crate::ast::decl::UseNature::NonIntrinsic => st.find_non_intrinsic_module_scope(module),
+    }
 }
 
 fn active_block_use_named_interface_symbols<'a>(
@@ -13204,12 +13186,15 @@ pub(super) fn user_callable_shadows_intrinsic(
     let key = name.to_ascii_lowercase();
     let caller_scope_id =
         caller_scope_id.or_else(|| callee_scope_id_for_lookup(st, caller_link_name));
+    // A BLOCK USE binding is the innermost lexical binding. In particular,
+    // an explicit INTRINSIC import must not fall through to a same-named
+    // user procedure visible in a host or unrelated program unit.
+    if let Some(symbol) = active_block_use_linkable_symbol(st, &key) {
+        return is_user_callable(symbol);
+    }
     if let Some(scope_id) = caller_scope_id {
-        if let Some(sym) = st.lookup_in(scope_id, &key) {
-            if is_user_callable(sym) {
-                return true;
-            }
-        }
+        return st.lookup_in(scope_id, &key).is_some_and(is_user_callable)
+            || find_named_interface_symbol(st, &key).is_some();
     }
     if let Some(sym) = st.lookup(&key) {
         if is_user_callable(sym) {
@@ -13233,6 +13218,41 @@ pub(super) fn user_callable_shadows_intrinsic(
                     .is_some_and(is_user_callable)
             })
     })
+}
+
+/// Resolve the canonical intrinsic name visible at a call site.
+///
+/// Intrinsic-module USE association can rename a procedure
+/// (`fused => ieee_fma`). The local spelling is correct for lookup, but
+/// intrinsic dispatch must use the imported symbol's original name. A
+/// visible user callable still wins and returns `None`.
+pub(super) fn resolved_intrinsic_name_for_call(
+    st: &SymbolTable,
+    caller_scope_id: Option<crate::sema::symtab::ScopeId>,
+    caller_link_name: &str,
+    name: &str,
+) -> Option<String> {
+    use crate::sema::symtab::SymbolKind;
+
+    let intrinsic_name = |symbol: &crate::sema::symtab::Symbol| {
+        (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
+            .then(|| symbol.name.to_ascii_lowercase())
+    };
+
+    let key = name.to_ascii_lowercase();
+    if let Some(symbol) = active_block_use_linkable_symbol(st, &key) {
+        return intrinsic_name(symbol);
+    }
+    let caller_scope_id =
+        caller_scope_id.or_else(|| callee_scope_id_for_lookup(st, caller_link_name));
+    if let Some(scope_id) = caller_scope_id {
+        if let Some(symbol) = st.lookup_in(scope_id, &key) {
+            return intrinsic_name(symbol);
+        }
+    } else if let Some(symbol) = st.lookup(&key) {
+        return intrinsic_name(symbol);
+    }
+    crate::sema::validate::is_intrinsic_name(&key).then_some(key)
 }
 
 #[derive(Clone, Debug)]
@@ -13346,7 +13366,7 @@ pub(super) fn named_interface_specific_candidates(
     }
 
     if !defined_operator {
-        for sym in use_associated_named_interface_symbols(st, &key) {
+        for sym in lexically_visible_named_interface_symbols(st, &key) {
             append_named_interface_specific_candidates(st, sym, &mut specifics, &mut seen);
         }
     }
@@ -13437,7 +13457,7 @@ fn operator_interface_specific_candidates(
             &mut seen_candidates,
         );
     }
-    for sym in use_associated_named_interface_symbols(st, &iface_key) {
+    for sym in lexically_visible_named_interface_symbols(st, &iface_key) {
         append_named_interface_specific_candidates(
             st,
             sym,
@@ -13949,6 +13969,17 @@ pub(super) fn resolve_generic_call_by_semantics(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<SpecificProcCandidate> {
     resolve_generic_call_by_semantics_impl(st, locals, callee, args, type_layouts, false)
+}
+
+pub(super) fn resolved_generic_specific_name_by_semantics(
+    st: &SymbolTable,
+    locals: Option<&HashMap<String, LocalInfo>>,
+    callee: &str,
+    args: &[crate::ast::expr::Argument],
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<String> {
+    resolve_generic_call_by_semantics(st, locals, callee, args, type_layouts)
+        .map(|candidate| candidate.name)
 }
 
 pub(super) fn resolve_generic_call_by_semantics_and_rank(
@@ -14802,23 +14833,16 @@ pub(super) fn function_scope_declared_result_rank(
     st: &SymbolTable,
     scope: &crate::sema::symtab::Scope,
 ) -> Option<usize> {
-    use crate::sema::symtab::{ScopeKind, SymbolKind};
+    use crate::sema::symtab::ScopeKind;
 
     let ScopeKind::Function(function_name) = &scope.kind else {
         return None;
     };
-    let arg_set: HashSet<String> = scope
-        .arg_order
-        .iter()
-        .map(|arg| arg.to_lowercase())
-        .collect();
-    for (key, sym) in &scope.symbols {
-        if arg_set.contains(key) {
-            continue;
-        }
-        if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-            return value_symbol_declared_rank(sym);
-        }
+    if let Some(rank) = scope
+        .procedure_result_symbol()
+        .and_then(value_symbol_declared_rank)
+    {
+        return Some(rank);
     }
 
     let key = function_name.to_ascii_lowercase();
@@ -15054,7 +15078,7 @@ fn function_scope_result_type_info(
     st: &SymbolTable,
     scope: &crate::sema::symtab::Scope,
 ) -> Option<crate::sema::symtab::TypeInfo> {
-    use crate::sema::symtab::{ScopeKind, SymbolKind};
+    use crate::sema::symtab::ScopeKind;
 
     let ScopeKind::Function(function_name) = &scope.kind else {
         return None;
@@ -15081,38 +15105,9 @@ fn function_scope_result_type_info(
         return Some(ti);
     }
 
-    // Fallback: scan the body for the result variable. With a `result(X)`
-    // clause the result variable is named X (not the function name), and a
-    // function can have other locals/parameters too — `scope.symbols` is a
-    // HashMap, so returning the first non-argument variable picked a
-    // nondeterministic one (fpm version_t%s(): result var `string` vs
-    // locals `buffer`, `ii` — generic dispatch on the call then matched
-    // the wrong specific, or none). Pick deterministically by declaration
-    // position, which puts the header-declared result variable first.
-    let arg_set: HashSet<String> = scope
-        .arg_order
-        .iter()
-        .map(|arg| arg.to_lowercase())
-        .collect();
-    let mut candidates: Vec<_> = scope
-        .symbols
-        .iter()
-        .filter(|(k, sym)| {
-            !arg_set.contains(*k)
-                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-                && sym.type_info.is_some()
-        })
-        .collect();
-    candidates.sort_by(|(ak, a), (bk, b)| {
-        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-            b.defined_at.start.line,
-            b.defined_at.start.col,
-            bk.as_str(),
-        ))
-    });
-    candidates
-        .first()
-        .and_then(|(_, sym)| sym.type_info.clone())
+    scope
+        .procedure_result_symbol()
+        .and_then(|symbol| symbol.type_info.clone())
 }
 
 fn bound_proc_result_type_info(
@@ -15638,22 +15633,7 @@ pub(super) fn assignment_expr_type_info(
                     let mut common: Option<crate::sema::symtab::TypeInfo> = None;
                     for specific in &sym.arg_names {
                         let scope = procedure_scope_by_name(st, specific)?;
-                        let arg_set: std::collections::HashSet<String> =
-                            scope.arg_order.iter().map(|n| n.to_lowercase()).collect();
-                        let t = scope.symbols.iter().find_map(|(key, s)| {
-                            if arg_set.contains(key) {
-                                return None;
-                            }
-                            if matches!(
-                                s.kind,
-                                crate::sema::symtab::SymbolKind::Variable
-                                    | crate::sema::symtab::SymbolKind::Parameter
-                            ) {
-                                s.type_info.clone()
-                            } else {
-                                None
-                            }
-                        })?;
+                        let t = function_scope_result_type_info(st, scope)?;
                         match &common {
                             None => common = Some(t),
                             Some(c) => {
@@ -16598,10 +16578,9 @@ pub(super) fn intrinsic_kind_arg_width(
     st: &SymbolTable,
 ) -> Option<u8> {
     match &expr.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
-        Expr::Name { name } => named_kind_value(name, locals, None, Some(st)),
-        Expr::ParenExpr { inner } => intrinsic_kind_arg_width(inner, locals, st),
-        _ => None,
+        Expr::Name { name } => named_kind_value(name, locals, None, Some(st))
+            .or_else(|| crate::sema::types::resolve_intrinsic_kind_arg(expr, st)),
+        _ => crate::sema::types::resolve_intrinsic_kind_arg(expr, st),
     }
 }
 
@@ -16667,20 +16646,9 @@ pub(super) fn specific_candidate_result_type_info(
                     })
                 })
                 .or_else(|| {
-                    let arg_set: HashSet<String> = scope
-                        .arg_order
-                        .iter()
-                        .map(|arg| arg.to_ascii_lowercase())
-                        .collect();
-                    scope.symbols.iter().find_map(|(key, sym)| {
-                        if arg_set.contains(key) {
-                            return None;
-                        }
-                        (key.starts_with("__amod_result_")
-                            || matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter))
-                        .then(|| sym.type_info.clone())
-                        .flatten()
-                    })
+                    scope
+                        .procedure_result_symbol()
+                        .and_then(|symbol| symbol.type_info.clone())
                 })
         })
 }
@@ -17029,13 +16997,15 @@ pub(super) fn local_intrinsic_call_type_info(
     };
     let lower_name = name.to_ascii_lowercase();
     let has_keyword = args.iter().any(|arg| arg.keyword.is_some());
-    let integer_inquiry_kind_pos = match lower_name.as_str() {
-        "size" | "lbound" | "ubound" => Some(2),
-        "shape" | "len" | "len_trim" => Some(1),
-        "count" => Some(2),
-        "index" | "scan" | "verify" => Some(3),
-        _ => None,
-    };
+    let integer_inquiry_kind_pos =
+        crate::sema::types::character_integer_result_kind_position(&lower_name).or({
+            match lower_name.as_str() {
+                "size" | "lbound" | "ubound" => Some(2),
+                "shape" => Some(1),
+                "count" => Some(2),
+                _ => None,
+            }
+        });
     if let Some(positional_index) = integer_inquiry_kind_pos {
         if let Some(kind) =
             intrinsic_kind_call_arg_width(args, positional_index, "kind", locals, st)
@@ -19115,6 +19085,7 @@ pub(super) fn emit_resolved_operator_call(
     append_host_closure_args_raw(
         b,
         locals,
+        st,
         contained_host_refs,
         &specific_key,
         &mut call_args,
@@ -19334,10 +19305,11 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "date_and_time" => Some(&["date", "time", "zone", "values"]),
         "get_command_argument" => Some(&["number", "value", "length", "status"]),
         "get_command" => Some(&["command", "length", "status"]),
-        "get_environment_variable" => Some(&["name", "value", "length", "status"]),
+        "get_environment_variable" => Some(&["name", "value", "length", "status", "trim_name"]),
         "random_number" => Some(&["harvest"]),
         "random_seed" => Some(&["size", "put", "get"]),
-        "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat"]),
+        "random_init" => Some(&["repeatable", "image_distinct"]),
+        "execute_command_line" => Some(&["command", "wait", "exitstat", "cmdstat", "cmdmsg"]),
         "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
         "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
         "cmplx" => Some(&["x", "y", "kind"]),
@@ -19349,6 +19321,9 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "unpack" => Some(&["vector", "mask", "field"]),
         "cshift" => Some(&["array", "shift", "dim"]),
         "eoshift" => Some(&["array", "shift", "boundary", "dim"]),
+        "ieee_fma" => Some(&["a", "b", "c"]),
+        "ieee_rem" => Some(&["x", "y"]),
+        "ieee_selected_real_kind" => Some(&["p", "r", "radix"]),
         _ => None,
     }
 }
@@ -19384,6 +19359,40 @@ pub(super) fn callee_arg_ir_type(
         .map(type_info_to_ir_type)
 }
 
+fn callee_arg_call_ir_type(
+    st: &SymbolTable,
+    callee_name: &str,
+    idx: usize,
+    is_value: bool,
+) -> Option<IrType> {
+    let symbol = callee_arg_symbol(st, callee_name, idx)?;
+    let element_type = if symbol_is_procedure_dummy(symbol) {
+        procedure_code_ptr_ir_type()
+    } else {
+        symbol.type_info.as_ref().map(type_info_to_ir_type)?
+    };
+    if is_value {
+        return Some(element_type);
+    }
+
+    let uses_descriptor = symbol_uses_descriptor_for_lowering(symbol);
+    let uses_string_descriptor = matches!(
+        symbol.type_info,
+        Some(crate::sema::symtab::TypeInfo::Character { len: None, .. })
+    ) && (symbol.attrs.allocatable || symbol.attrs.pointer)
+        && symbol.attrs.array_spec.is_empty();
+    let is_derived = matches!(
+        symbol.type_info,
+        Some(crate::sema::symtab::TypeInfo::Derived(_))
+    );
+    Some(by_ref_storage_ir_type(
+        &element_type,
+        uses_descriptor,
+        uses_string_descriptor,
+        is_derived,
+    ))
+}
+
 pub(super) fn coerce_value_call_arg(
     b: &mut FuncBuilder,
     st: &SymbolTable,
@@ -19402,7 +19411,10 @@ pub(super) fn zero_value_for_ir_type(b: &mut FuncBuilder, ty: &IrType) -> ValueI
         IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
         IrType::Float(FloatWidth::F64) => b.const_f64(0.0),
         IrType::Bool => b.const_bool(false),
-        IrType::Ptr(_) => b.const_i64(0),
+        IrType::Ptr(pointee) => {
+            let zero = b.const_i64(0);
+            b.int_to_ptr(zero, (**pointee).clone())
+        }
         IrType::FuncPtr(_) => b.const_i64(0),
         IrType::Array(elem, 2) if matches!(elem.as_ref(), IrType::Float(_)) => {
             let zero = b.const_i32(0);
@@ -19421,12 +19433,15 @@ pub(super) fn missing_optional_call_arg(
     idx: usize,
     is_value: bool,
 ) -> ValueId {
-    if !is_value {
-        return b.const_i64(0);
-    }
-    callee_arg_ir_type(st, callee_name, idx)
+    callee_arg_call_ir_type(st, callee_name, idx, is_value)
         .map(|ty| zero_value_for_ir_type(b, &ty))
-        .unwrap_or_else(|| b.const_i32(0))
+        .unwrap_or_else(|| {
+            if is_value {
+                b.const_i32(0)
+            } else {
+                b.const_i64(0)
+            }
+        })
 }
 
 pub(super) fn optional_value_presence_local_name(arg_name: &str) -> String {
@@ -19707,7 +19722,7 @@ pub(super) fn resolve_subroutine_call_name(
 }
 
 pub(super) fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -> String {
-    format!("afs_modproc_{}_{}", module_name.to_lowercase(), proc_name)
+    crate::sema::symtab::module_procedure_link_name(module_name, proc_name)
 }
 
 pub(super) fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
@@ -19725,20 +19740,14 @@ pub(super) fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
 
 pub(super) fn lowered_procedure_symbol_name(
     name: &str,
-    bind: Option<&crate::ast::unit::BindInfo>,
+    binding_label: Option<&str>,
     host_link_name: Option<&str>,
     host_module: Option<&str>,
     internal_only: bool,
     internal_funcs: &HashMap<String, u32>,
 ) -> String {
-    if let Some(bind) = bind {
-        return bind
-            .name
-            .as_deref()
-            .unwrap_or(name)
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string();
+    if let Some(binding_label) = binding_label {
+        return binding_label.to_string();
     }
     if internal_only {
         if let Some(idx) = internal_funcs.get(&name.to_lowercase()) {
@@ -19786,13 +19795,13 @@ pub(super) fn find_procedure_scope_id(
     st: &SymbolTable,
     name: &str,
 ) -> Option<crate::sema::symtab::ScopeId> {
-    st.all_scopes()
+    st.procedure_scopes_named(name)
         .iter()
-        .enumerate()
         .rev()
-        .find_map(|(idx, scope)| {
-            (scope_matches_procedure_name(scope, name) && scope_has_linkable_parent(st, idx))
-                .then_some(idx)
+        .copied()
+        .find(|scope_id| {
+            scope_matches_procedure_name(st.scope(*scope_id), name)
+                && scope_has_linkable_parent(st, *scope_id)
         })
 }
 
@@ -19826,12 +19835,11 @@ pub(super) fn find_procedure_scope_id_for_caller(
         // parent is `cur_id`. Multiple hosts may share names but
         // siblings under one host don't, so a parent==cur filter is
         // unambiguous.
-        let sibling = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
-            (scope.parent == Some(cur_id)
-                && scope_matches_procedure_name(scope, name)
-                && scope_has_linkable_parent(st, idx))
-            .then_some(idx)
-        });
+        let sibling = st
+            .child_procedure_scopes_named(cur_id, name)
+            .iter()
+            .copied()
+            .find(|scope_id| scope_has_linkable_parent(st, *scope_id));
         if sibling.is_some() {
             return sibling;
         }
@@ -19859,12 +19867,11 @@ pub(super) fn find_procedure_scope_id_for_caller_strict(
         if scope_matches_procedure_name(cur_scope, name) && scope_has_linkable_parent(st, cur_id) {
             return Some(cur_id);
         }
-        let sibling = st.all_scopes().iter().enumerate().find_map(|(idx, scope)| {
-            (scope.parent == Some(cur_id)
-                && scope_matches_procedure_name(scope, name)
-                && scope_has_linkable_parent(st, idx))
-            .then_some(idx)
-        });
+        let sibling = st
+            .child_procedure_scopes_named(cur_id, name)
+            .iter()
+            .copied()
+            .find(|scope_id| scope_has_linkable_parent(st, *scope_id));
         if sibling.is_some() {
             return sibling;
         }
@@ -20937,7 +20944,14 @@ pub(super) fn emit_named_function_call(
     } else {
         &key
     };
-    append_host_closure_args_raw(b, locals, contained_host_refs, closure_key, &mut call_args);
+    append_host_closure_args_raw(
+        b,
+        locals,
+        st,
+        contained_host_refs,
+        closure_key,
+        &mut call_args,
+    );
 
     // After generic resolution the specific is authoritative: never let the
     // BARE generic name participate in the internal-subprogram rebind.
@@ -22294,6 +22308,22 @@ fn procedure_code_ptr_ir_type() -> IrType {
     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)))
 }
 
+pub(super) fn specific_intrinsic_procedure_target_symbol(
+    st: &SymbolTable,
+    proc_scope_id: Option<crate::sema::symtab::ScopeId>,
+    name: &str,
+) -> Option<&'static str> {
+    let key = name.to_ascii_lowercase();
+    let symbol = st.lookup_local_then_any(proc_scope_id, &key);
+    if symbol.is_none_or(|symbol| {
+        symbol.kind == crate::sema::symtab::SymbolKind::IntrinsicProc || symbol.attrs.intrinsic
+    }) {
+        crate::sema::specific_intrinsic::specific_intrinsic_wrapper_symbol(&key)
+    } else {
+        None
+    }
+}
+
 fn procedure_dummy_symbol_in_scope<'a>(
     st: &'a SymbolTable,
     scope_id: crate::sema::symtab::ScopeId,
@@ -22478,6 +22508,7 @@ fn procedure_actual_closure_args(
     append_host_closure_args_raw(
         b,
         locals,
+        st,
         contained_host_refs,
         closure_key,
         &mut closure_args,
@@ -24061,6 +24092,39 @@ pub(super) fn decl_is_pointer(name: &str, decls: &[crate::ast::decl::SpannedDecl
     false
 }
 
+/// Does the named variable in `decls` carry the VOLATILE attribute?
+/// Covers both declaration attributes and standalone `VOLATILE :: name`
+/// statements.
+pub(super) fn decl_is_volatile(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    use crate::ast::decl::Attribute;
+    let key = name.to_lowercase();
+    for decl in decls {
+        match &decl.node {
+            Decl::TypeDecl {
+                attrs, entities, ..
+            } if entities
+                .iter()
+                .any(|entity| entity.name.to_lowercase() == key) =>
+            {
+                if attrs
+                    .iter()
+                    .any(|attribute| matches!(attribute, Attribute::Volatile))
+                {
+                    return true;
+                }
+            }
+            Decl::AttributeStmt { attr, entities }
+                if matches!(attr, Attribute::Volatile)
+                    && entities.iter().any(|entity| entity.to_lowercase() == key) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Does the named variable in `decls` carry the OPTIONAL attribute?
 pub(super) fn decl_is_optional(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
     use crate::ast::decl::Attribute;
@@ -24446,6 +24510,7 @@ pub(super) struct HostRefParamInfo {
     allocatable: bool,
     is_pointer: bool,
     is_class: bool,
+    volatile: bool,
     /// SSA value id of an extra hidden i64 length parameter when the
     /// host var is a `character(*)` (assumed-length) variable that needs
     /// its runtime length forwarded alongside the pointer.
@@ -24607,6 +24672,7 @@ pub(super) fn build_host_ref_params(
             allocatable: alloc,
             is_pointer: ptr_is_pointer,
             is_class: decl_is_class(hname, host_decls),
+            volatile: decl_is_volatile(hname, host_decls),
             assumed_len_id,
             procedure_dummy_closure_ids,
         });
@@ -24650,6 +24716,7 @@ pub(super) fn append_host_closure_args(
     append_host_closure_args_raw(
         b,
         &ctx.locals,
+        ctx.st,
         Some(ctx.contained_host_refs),
         callee_key,
         arg_vals,
@@ -24659,6 +24726,7 @@ pub(super) fn append_host_closure_args(
 pub(super) fn append_host_closure_args_raw(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     callee_key: &str,
     arg_vals: &mut Vec<ValueId>,
@@ -24668,15 +24736,23 @@ pub(super) fn append_host_closure_args_raw(
         _ => return,
     };
     for hname in refs {
+        let needs_procedure_closure = current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, hname))
+            .is_some_and(symbol_is_procedure_dummy);
         let info = match locals.get(hname) {
             Some(i) => i.clone(),
             None => {
                 // Should never happen: the host-refs analysis only
                 // records names declared in the host, and every host
-                // scope installs those as locals. Push a null to keep
-                // the ABI alignment consistent rather than panic.
-                let zero = b.const_i64(0);
-                arg_vals.push(zero);
+                // scope installs those as locals. Preserve the complete
+                // typed ABI shape so the verifier can still diagnose the
+                // missing producer without shifting every later argument.
+                arg_vals.push(null_procedure_closure_arg(b));
+                if needs_procedure_closure {
+                    for _ in 0..crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
+                        arg_vals.push(null_procedure_closure_arg(b));
+                    }
+                }
                 continue;
             }
         };
@@ -24733,7 +24809,7 @@ pub(super) fn append_host_closure_args_raw(
             arg_vals.push(len);
         }
         let mut proc_closure_args = procedure_dummy_closure_args_from_locals(b, locals, hname);
-        if !proc_closure_args.is_empty() {
+        if needs_procedure_closure || !proc_closure_args.is_empty() {
             proc_closure_args.truncate(crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS);
             while proc_closure_args.len() < crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS {
                 proc_closure_args.push(null_procedure_closure_arg(b));
@@ -24761,6 +24837,9 @@ pub(super) fn install_host_ref_locals(
         );
         let slot = b.alloca(slot_ty);
         b.store(info.id, slot);
+        if info.volatile {
+            b.mark_indirect_volatile_address(slot);
+        }
         // For character(*) host refs, store the forwarded length into a
         // dedicated slot and set CharKind::AssumedLen so substring access
         // can recover the runtime length.
@@ -24826,7 +24905,13 @@ pub(super) fn callee_scope_id_for_lookup(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<crate::sema::symtab::ScopeId> {
-    use crate::sema::symtab::{ScopeKind, SymbolKind};
+    if let Some(scope_id) = st
+        .procedure_scopes_for_link_name(callee_name)
+        .last()
+        .copied()
+    {
+        return Some(scope_id);
+    }
 
     // When a bare procedure name matches several definitions (e.g. fpm has
     // ten `next` subroutines across modules), the plain name scan below
@@ -24835,76 +24920,27 @@ pub(super) fn callee_scope_id_for_lookup(
     // the caller's own module (a module-contained sibling), which is what
     // host/use association would resolve. Falls back to the name scan when
     // there is no caller context or no same-module match.
-    let caller_module = current_proc_scope().and_then(|sid| {
+    let caller_module_scope = current_proc_scope().and_then(|sid| {
         let mut cur = Some(sid);
         while let Some(id) = cur {
             let sc = st.scope(id);
-            if let Some(m) = scope_module_name(sc) {
-                return Some(m.to_lowercase());
+            if scope_module_name(sc).is_some() {
+                return Some(id);
             }
             cur = sc.parent;
         }
         None
     });
 
-    let mut name_match = None;
-    let mut caller_module_match = None;
-    for (scope_id, scope) in st.all_scopes().iter().enumerate().rev() {
-        let proc_name = match &scope.kind {
-            ScopeKind::Function(name) | ScopeKind::Subroutine(name) | ScopeKind::Program(name) => {
-                name
-            }
-            _ => continue,
-        };
-        if proc_name.eq_ignore_ascii_case(callee_name) {
-            if name_match.is_none() {
-                name_match = Some(scope_id);
-            }
-            if caller_module_match.is_none() {
-                if let (Some(caller_mod), Some(parent_id)) = (caller_module.as_ref(), scope.parent)
-                {
-                    if scope_module_name(st.scope(parent_id))
-                        .is_some_and(|m| m.eq_ignore_ascii_case(caller_mod))
-                    {
-                        caller_module_match = Some(scope_id);
-                    }
-                }
-            }
-        }
-        if matches!(scope.kind, ScopeKind::Program(_))
-            && format!("__prog_{}", proc_name.to_lowercase()).eq_ignore_ascii_case(callee_name)
-        {
-            return Some(scope_id);
-        }
-        if matches!(scope.kind, ScopeKind::Program(_)) {
-            continue;
-        }
-        let Some(parent_id) = scope.parent else {
-            continue;
-        };
-        let parent_scope = st.scope(parent_id);
-        if let Some(module_name) = scope_module_name(parent_scope) {
-            if module_procedure_symbol_name(module_name, proc_name)
-                .eq_ignore_ascii_case(callee_name)
-            {
-                return Some(scope_id);
-            }
-        }
-        let Some(sym) = parent_scope.symbols.get(&proc_name.to_lowercase()) else {
-            continue;
-        };
-        if matches!(
-            sym.kind,
-            SymbolKind::Function
-                | SymbolKind::Subroutine
-                | SymbolKind::ExternalProc
-                | SymbolKind::IntrinsicProc
-                | SymbolKind::ProcedurePointer
-        ) && symbol_link_name(st, sym).eq_ignore_ascii_case(callee_name)
-        {
-            return Some(scope_id);
-        }
-    }
+    let named_scopes = st.procedure_scopes_named(callee_name);
+    let name_match = named_scopes.last().copied();
+    let caller_module_match = caller_module_scope.and_then(|module_scope| {
+        named_scopes
+            .iter()
+            .rev()
+            .copied()
+            .find(|scope_id| st.scope(*scope_id).parent == Some(module_scope))
+    });
     caller_module_match.or(name_match)
 }
 
@@ -25146,6 +25182,9 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
         return false;
     };
     let scope = st.scope(scope_id);
+    if scope.bind_c {
+        return true;
+    }
     let Some(proc_name) = (match &scope.kind {
         crate::sema::symtab::ScopeKind::Function(name)
         | crate::sema::symtab::ScopeKind::Subroutine(name) => Some(name.to_lowercase()),
@@ -25157,8 +25196,7 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
     while let Some(scope_id) = owner_scope {
         let scope = st.scope(scope_id);
         if scope.symbols.get(&proc_name).is_some_and(|sym| {
-            matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine)
-                && sym.attrs.binding_label.is_some()
+            matches!(sym.kind, SymbolKind::Function | SymbolKind::Subroutine) && sym.attrs.bind_c
         }) {
             return true;
         }
@@ -25188,7 +25226,12 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
                 .unwrap_or(false)
         })
         .collect();
-    mask.iter().any(|flag| *flag).then_some(mask)
+    // `Some` means that this lookup key resolved to a concrete procedure,
+    // not that the procedure necessarily has an assumed-length character
+    // dummy. Preserve an all-false mask so multi-key ABI lookup stops at the
+    // selected specific instead of falling through to a same-named imported
+    // character procedure and appending one of its hidden length arguments.
+    Some(mask)
 }
 
 /// Check if a callee has deferred-length allocatable/pointer character dummies
@@ -25255,7 +25298,7 @@ pub(super) fn callee_return_derived_info(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<(String, bool)> {
-    use crate::sema::symtab::{SymbolKind, TypeInfo};
+    use crate::sema::symtab::TypeInfo;
     if let Some(sym) = find_linkable_symbol_for_callee(st, callee_name) {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
@@ -25269,24 +25312,7 @@ pub(super) fn callee_return_derived_info(
         _ => return None,
     };
 
-    let arg_set: HashSet<String> = callee_scope.arg_order.iter().cloned().collect();
-    let mut candidates: Vec<_> = callee_scope
-        .symbols
-        .iter()
-        .filter(|(key, sym)| {
-            !arg_set.contains(*key)
-                && matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-                && matches!(sym.type_info, Some(TypeInfo::Derived(_)))
-        })
-        .collect();
-    candidates.sort_by(|(ak, a), (bk, b)| {
-        (a.defined_at.start.line, a.defined_at.start.col, ak.as_str()).cmp(&(
-            b.defined_at.start.line,
-            b.defined_at.start.col,
-            bk.as_str(),
-        ))
-    });
-    if let Some((_, sym)) = candidates.into_iter().next() {
+    if let Some(sym) = callee_scope.procedure_result_symbol() {
         if let Some(TypeInfo::Derived(name)) = sym.type_info.as_ref() {
             return Some((name.clone(), sym.attrs.pointer));
         }
@@ -25444,7 +25470,7 @@ fn character_return_abi_for_symbol(
     let TypeInfo::Character { .. } = sym.type_info.as_ref()? else {
         return None;
     };
-    if sym.attrs.binding_label.is_some() {
+    if sym.attrs.bind_c {
         Some(CharacterReturnAbi::BindCScalarByte)
     } else {
         Some(CharacterReturnAbi::HiddenDescriptor)
@@ -25484,7 +25510,7 @@ pub(super) fn callee_hidden_result_abi(
     }
     match sym.type_info.as_ref()? {
         TypeInfo::Character { .. } => {
-            if sym.attrs.binding_label.is_some() {
+            if sym.attrs.bind_c {
                 None
             } else {
                 Some(HiddenResultAbi::StringDescriptor)
@@ -25500,7 +25526,7 @@ pub(super) fn callee_hidden_result_abi(
         // caller passed a hidden buffer that a clang-built callee never
         // writes — the x08 differential read zeros).
         TypeInfo::Complex { .. } if !sym.attrs.pointer => {
-            if sym.attrs.binding_label.is_some() {
+            if sym.attrs.bind_c {
                 None
             } else {
                 Some(HiddenResultAbi::ComplexBuffer)
@@ -25810,7 +25836,7 @@ fn symbol_returns_owned_character_temp(sym: &crate::sema::symtab::Symbol) -> boo
     ) && sym.attrs.allocatable
         && !sym.attrs.pointer
         && sym.attrs.result_rank == 0
-        && sym.attrs.binding_label.is_none()
+        && !sym.attrs.bind_c
 }
 
 fn callable_symbol_returns_owned_character_temp(
@@ -26254,13 +26280,21 @@ pub(super) fn lower_string_expr_full(
             }
             if let Expr::Name { name } = &callee.node {
                 let key = name.to_lowercase();
-                let first_char_arg = args.first().and_then(|a| {
+                let source_first_arg = args.first().and_then(|a| {
                     if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
                         Some(e)
                     } else {
                         None
                     }
                 });
+                let canonical_character_args = character_intrinsic_argument_expr_slots(&key, args);
+                let canonical_arg = |position: usize| {
+                    canonical_character_args
+                        .as_ref()
+                        .and_then(|slots| slots.get(position))
+                        .and_then(|slot| slot.as_ref().copied())
+                };
+                let first_arg = canonical_arg(0).or(source_first_arg);
                 // F2008 §13.7: a user-defined function or generic
                 // interface with the same name as an intrinsic
                 // procedure shadows the intrinsic. The integer-context
@@ -26291,7 +26325,7 @@ pub(super) fn lower_string_expr_full(
                 // = repeat(char, n) downstream of `use stdlib_strings`).
                 let user_named_interface_shadows_intrinsic = find_named_interface_symbol(st, &key)
                     .is_some()
-                    && !first_char_arg
+                    && !first_arg
                         .map(|arg| expr_is_character_expr(b, locals, arg, st, type_layouts))
                         .unwrap_or(false);
                 let intrinsic_key = if user_named_interface_shadows_intrinsic {
@@ -26316,7 +26350,7 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "trim" => {
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = first_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -26339,33 +26373,8 @@ pub(super) fn lower_string_expr_full(
                         // F2023 18.2.3.4: F_C_STRING(STRING [, ASIS]) returns
                         // TRIM(STRING)//C_NULL_CHAR, or STRING//C_NULL_CHAR when
                         // ASIS is true. The result length includes the NUL.
-                        fn elem(
-                            a: &crate::ast::expr::Argument,
-                        ) -> Option<&crate::ast::expr::SpannedExpr> {
-                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                                Some(e)
-                            } else {
-                                None
-                            }
-                        }
-                        let string_arg = args
-                            .iter()
-                            .find(|a| {
-                                a.keyword
-                                    .as_deref()
-                                    .is_some_and(|k| k.eq_ignore_ascii_case("string"))
-                            })
-                            .or_else(|| args.iter().find(|a| a.keyword.is_none()))
-                            .and_then(elem);
-                        let asis_arg = args
-                            .iter()
-                            .find(|a| {
-                                a.keyword
-                                    .as_deref()
-                                    .is_some_and(|k| k.eq_ignore_ascii_case("asis"))
-                            })
-                            .or_else(|| args.iter().filter(|a| a.keyword.is_none()).nth(1))
-                            .and_then(elem);
+                        let string_arg = canonical_arg(0);
+                        let asis_arg = canonical_arg(1);
                         if let Some(s) = string_arg {
                             let (src_ptr, src_len) = lower_string_expr_full(
                                 b,
@@ -26431,15 +26440,8 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "repeat" => {
-                        let second_int_arg = args.get(1).and_then(|a| {
-                            if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                                Some(e)
-                            } else {
-                                None
-                            }
-                        });
                         if let (Some(src_expr), Some(copies_expr)) =
-                            (first_char_arg, second_int_arg)
+                            (canonical_arg(0), canonical_arg(1))
                         {
                             let (src_ptr, src_len) = lower_string_expr_full(
                                 b,
@@ -26451,7 +26453,16 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
-                            let raw_copies = super::expr::lower_expr(b, locals, copies_expr, st);
+                            let raw_copies = super::expr::lower_expr_full(
+                                b,
+                                locals,
+                                copies_expr,
+                                st,
+                                type_layouts,
+                                internal_funcs,
+                                contained_host_refs,
+                                descriptor_params,
+                            );
                             let copies = widen_to_i64(b, raw_copies);
                             let copies = clamp_nonnegative_i64(b, copies);
                             let total_len = b.imul(src_len, copies);
@@ -26486,7 +26497,7 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "adjustl" => {
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = first_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -26520,7 +26531,7 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "adjustr" => {
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = first_arg {
                             let (src_ptr, len_val) = lower_string_expr_full(
                                 b,
                                 locals,
@@ -26563,7 +26574,7 @@ pub(super) fn lower_string_expr_full(
                         // available — otherwise the substring fast
                         // path is skipped and a const-zero pointer
                         // gets fed into afs_ichar_ptr.
-                        if let Some(arg) = first_char_arg {
+                        if let Some(arg) = canonical_arg(0) {
                             let int_val = super::expr::lower_expr_full(
                                 b,
                                 locals,
@@ -26574,12 +26585,7 @@ pub(super) fn lower_string_expr_full(
                                 contained_host_refs,
                                 descriptor_params,
                             );
-                            let i32_val = match b.func().value_type(int_val) {
-                                Some(IrType::Int(IntWidth::I64)) => {
-                                    b.int_trunc(int_val, IntWidth::I32)
-                                }
-                                _ => int_val,
-                            };
+                            let i32_val = coerce_to_type(b, int_val, &IrType::Int(IntWidth::I32));
                             let byte_val = b.call(
                                 FuncRef::External("afs_char".into()),
                                 vec![i32_val],
@@ -26595,9 +26601,11 @@ pub(super) fn lower_string_expr_full(
                         }
                     }
                     "new_line" => {
-                        let ptr = b.const_string(b"\n");
-                        let len = b.const_i64(1);
-                        return (ptr, len);
+                        if canonical_arg(0).is_some() {
+                            let ptr = b.const_string(b"\n");
+                            let len = b.const_i64(1);
+                            return (ptr, len);
+                        }
                     }
                     "merge" => {
                         let second_char_arg = args.get(1).and_then(|a| {
@@ -26615,7 +26623,7 @@ pub(super) fn lower_string_expr_full(
                             }
                         });
                         if let (Some(tsrc), Some(fsrc), Some(mask_expr)) =
-                            (first_char_arg, second_char_arg, mask_arg)
+                            (first_arg, second_char_arg, mask_arg)
                         {
                             let (t_ptr, t_len) = lower_string_expr_full(
                                 b,
@@ -27647,6 +27655,7 @@ pub(super) fn emit_final_proc_call(
     append_host_closure_args_raw(
         b,
         closure_locals,
+        st,
         contained_host_refs,
         &resolved_key,
         &mut call_args,
@@ -27833,8 +27842,28 @@ fn finalize_derived_array_storage_dynamic_with<F>(
         return;
     };
 
-    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
     let base_addr = b.load_typed(desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+    if !final_proc.elemental {
+        // Allocatable scalars and arrays share the descriptor ABI. A scalar
+        // FINAL is valid for the rank-zero case, but it is an array fallback
+        // only when the procedure itself is ELEMENTAL.
+        let rank_offset = b.const_i64(16);
+        let rank_ptr = b.gep(desc, vec![rank_offset], IrType::Int(IntWidth::I8));
+        let actual_rank = b.load_typed(rank_ptr, IrType::Int(IntWidth::I32));
+        let zero_rank = b.const_i32(0);
+        let is_scalar = b.icmp(CmpOp::Eq, actual_rank, zero_rank);
+        let call_bb = b.create_block("derived_scalar_final_call");
+        let done_bb = b.create_block("derived_scalar_final_done");
+        b.cond_branch(is_scalar, call_bb, vec![], done_bb, vec![]);
+
+        b.set_block(call_bb);
+        emit_final(b, &final_proc.name, base_addr);
+        b.branch(done_bb, vec![]);
+        b.set_block(done_bb);
+        return;
+    }
+
+    let elem_count = array_descriptor_total_elements_dynamic(b, desc);
     let zero = b.const_i64(0);
     let bb_check = b.create_block("derived_array_final_check");
     let idx = b.add_block_param(bb_check, IrType::Int(IntWidth::I64));
@@ -28904,6 +28933,88 @@ pub(super) fn collect_label_blocks(
     });
 }
 
+/// Return the IR edge for a transfer to `label`, inserting cleanup blocks for
+/// every active lexical construct the transfer exits.
+///
+/// Fortran I/O branch specifiers (`ERR=`, `END=`) are control transfers just
+/// like `GOTO`: leaving a BLOCK or an owning ASSOCIATE must finalize and
+/// deallocate that construct's locals before entering the labeled statement.
+/// Centralizing the edge construction keeps explicit and implicit transfers
+/// on the same cleanup path.
+pub(super) fn lexical_cleanup_edge_for_label(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    label: u64,
+    cleanup_name: &str,
+) -> Option<BlockId> {
+    let target = *ctx.label_blocks.get(&label)?;
+    let retained_cleanup_depth = ctx
+        .lexical_cleanups
+        .iter()
+        .rposition(|scope| scope.labels.contains(&label))
+        .map_or(0, |index| index + 1);
+    Some(lexical_cleanup_edge_to_depth(
+        b,
+        ctx,
+        target,
+        retained_cleanup_depth,
+        cleanup_name,
+    ))
+}
+
+/// Return an edge to `target` that cleans every lexical scope entered after
+/// `retained_cleanup_depth`.
+///
+/// Construct destinations capture the active depth when the construct starts.
+/// A transfer to that destination retains enclosing scopes and tears down only
+/// scopes nested inside the construct. Label transfers derive the same depth
+/// from the innermost active scope containing the destination label.
+pub(super) fn lexical_cleanup_edge_to_depth(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    target: BlockId,
+    retained_cleanup_depth: usize,
+    cleanup_name: &str,
+) -> BlockId {
+    debug_assert!(retained_cleanup_depth <= ctx.lexical_cleanups.len());
+    if retained_cleanup_depth >= ctx.lexical_cleanups.len() {
+        return target;
+    }
+
+    let source = b.current_block();
+    let cleanup = b.create_block(cleanup_name);
+    b.set_block(cleanup);
+    emit_lexical_cleanups_to_depth(b, ctx, retained_cleanup_depth);
+    if b.func().block(b.current_block()).terminator.is_none() {
+        b.branch(target, vec![]);
+    }
+    b.set_block(source);
+    cleanup
+}
+
+/// Finalize and deallocate each active lexical scope exited by a control
+/// transfer, from innermost to outermost.
+pub(super) fn emit_lexical_cleanups_to_depth(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx<'_>,
+    retained_cleanup_depth: usize,
+) {
+    debug_assert!(retained_cleanup_depth <= ctx.lexical_cleanups.len());
+    for scope in ctx.lexical_cleanups[retained_cleanup_depth..].iter().rev() {
+        insert_implicit_dealloc(
+            b,
+            &scope.owned_locals,
+            &ctx.locals,
+            ctx.type_layouts,
+            ctx.st,
+            ctx.internal_funcs,
+            Some(ctx.contained_host_refs),
+            None,
+            true,
+        );
+    }
+}
+
 pub(super) fn collect_format_labels(stmts: &[SpannedStmt], out: &mut HashMap<u64, String>) {
     for stmt in stmts {
         match &stmt.node {
@@ -29144,13 +29255,18 @@ pub(super) fn try_lower_select(
 pub(super) fn lower_if(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    name: &Option<String>,
     condition: &crate::ast::expr::SpannedExpr,
     then_body: &[SpannedStmt],
     else_ifs: &[(crate::ast::expr::SpannedExpr, Vec<SpannedStmt>)],
     else_body: &Option<Vec<SpannedStmt>>,
 ) {
-    if else_ifs.is_empty() {
-        if let Some(value) = known_logical_condition(condition, &ctx.locals, ctx.st) {
+    let known_condition = else_ifs
+        .is_empty()
+        .then(|| known_logical_condition(condition, &ctx.locals, ctx.st))
+        .flatten();
+    if name.is_none() {
+        if let Some(value) = known_condition {
             if value {
                 super::stmt::lower_stmts(b, ctx, then_body);
             } else if let Some(eb) = else_body {
@@ -29166,6 +29282,21 @@ pub(super) fn lower_if(
     }
 
     let bb_end = b.create_block("if_end");
+    ctx.push_construct_exit(name.clone(), bb_end);
+
+    if let Some(value) = known_condition {
+        if value {
+            super::stmt::lower_stmts(b, ctx, then_body);
+        } else if let Some(eb) = else_body {
+            super::stmt::lower_stmts(b, ctx, eb);
+        }
+        if b.func().block(b.current_block()).terminator.is_none() {
+            b.branch(bb_end, vec![]);
+        }
+        ctx.pop_construct_exit(name);
+        b.set_block(bb_end);
+        return;
+    }
 
     let bb_then = b.create_block("if_then");
     let bb_next = if !else_ifs.is_empty() || else_body.is_some() {
@@ -29212,6 +29343,7 @@ pub(super) fn lower_if(
         }
     }
 
+    ctx.pop_construct_exit(name);
     b.set_block(bb_end);
 }
 
@@ -29318,15 +29450,712 @@ fn known_logical_condition(
     }
 }
 
+#[derive(Clone)]
+enum DoConcurrentLocalityKind {
+    Local,
+    LocalInit,
+    Reduce(String),
+}
+
+#[derive(Clone, Copy)]
+enum DoConcurrentPrivateCleanup {
+    None,
+    ArrayDescriptor { desc: ValueId, stat: ValueId },
+    Heap { ptr: ValueId },
+}
+
+struct DoConcurrentLocalityBinding {
+    name: String,
+    outside: LocalInfo,
+    private: LocalInfo,
+    kind: DoConcurrentLocalityKind,
+    outside_array_desc: Option<ValueId>,
+    cleanup: DoConcurrentPrivateCleanup,
+}
+
+struct DoConcurrentLocalityState {
+    bindings: Vec<DoConcurrentLocalityBinding>,
+    span: crate::lexer::Span,
+}
+
+fn zero_byte_storage(b: &mut FuncBuilder, bytes: u64) -> ValueId {
+    let addr = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        bytes.max(1),
+    ));
+    let zero = b.const_i32(0);
+    let size = b.const_i64(bytes.max(1) as i64);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![addr, zero, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    addr
+}
+
+fn concurrent_scalar_storage_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    if info.by_ref {
+        b.load(info.addr)
+    } else {
+        info.addr
+    }
+}
+
+fn allocate_do_concurrent_private(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    outside: &LocalInfo,
+    reduction: bool,
+) -> (LocalInfo, Option<ValueId>, DoConcurrentPrivateCleanup) {
+    if local_is_array_like(outside) {
+        let outside_desc = if local_uses_array_descriptor(outside) {
+            array_descriptor_addr(b, outside)
+        } else {
+            materialize_array_descriptor_for_info(b, outside)
+        };
+        let private_desc = zero_byte_storage(b, 392);
+        let mut private = outside.clone();
+        private.addr = private_desc;
+        private.by_ref = false;
+        private.inline_const = None;
+
+        if outside.is_pointer && !reduction {
+            // A pointer construct entity owns only its association, never the
+            // target. LOCAL_INIT copies the descriptor and LOCAL clears it.
+            private.allocatable = true;
+            private.descriptor_arg = false;
+            return (
+                private,
+                Some(outside_desc),
+                DoConcurrentPrivateCleanup::None,
+            );
+        }
+
+        let stat = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, stat);
+        b.call(
+            FuncRef::External("afs_allocate_like".into()),
+            vec![private_desc, outside_desc, stat],
+            IrType::Void,
+        );
+        // The construct entity has fixed bounds for the lifetime of this
+        // invocation. Keep descriptor addressing without exposing allocatable
+        // assignment semantics to its body.
+        private.allocatable = false;
+        private.descriptor_arg = true;
+        private.is_pointer = false;
+        return (
+            private,
+            Some(outside_desc),
+            DoConcurrentPrivateCleanup::ArrayDescriptor {
+                desc: private_desc,
+                stat,
+            },
+        );
+    }
+
+    if matches!(outside.char_kind, CharKind::Deferred) {
+        // Deferred-length scalar locality is only valid for a POINTER (an
+        // allocatable is excluded by the locality constraints). Its 32-byte
+        // descriptor is the association value.
+        let private_addr = zero_byte_storage(b, 32);
+        let mut private = outside.clone();
+        private.addr = private_addr;
+        private.by_ref = false;
+        private.inline_const = None;
+        if reduction {
+            private.is_pointer = false;
+        }
+        return (private, None, DoConcurrentPrivateCleanup::None);
+    }
+
+    if outside.is_class && local_uses_array_descriptor(outside) {
+        // Rank-zero polymorphic POINTERs use the array descriptor record for
+        // their dynamic type and association.
+        let private_addr = zero_byte_storage(b, 392);
+        let mut private = outside.clone();
+        private.addr = private_addr;
+        private.by_ref = false;
+        private.inline_const = None;
+        return (private, None, DoConcurrentPrivateCleanup::None);
+    }
+
+    if let CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } =
+        outside.char_kind
+    {
+        let private_addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+        let mut private = outside.clone();
+        private.addr = private_addr;
+        private.by_ref = false;
+        private.inline_const = None;
+        if outside.is_pointer && !reduction {
+            let zero = b.const_i32(0);
+            let bytes = b.const_i64(8);
+            b.call(
+                FuncRef::External("memset".into()),
+                vec![private_addr, zero, bytes],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            return (private, None, DoConcurrentPrivateCleanup::None);
+        }
+        if reduction {
+            private.is_pointer = false;
+        }
+
+        let len = b.load(len_addr);
+        let one = b.const_i64(1);
+        let bytes = b.iadd(len, one);
+        let ptr = b.runtime_call(
+            RuntimeFunc::Allocate,
+            vec![bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        b.store(ptr, private_addr);
+        let zero = b.const_i32(0);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![ptr, zero, bytes],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return (private, None, DoConcurrentPrivateCleanup::Heap { ptr });
+    }
+
+    let private_addr = if outside.is_pointer && !reduction {
+        if outside.derived_type.is_some() {
+            b.alloca(outside.ty.clone())
+        } else {
+            b.alloca(IrType::Ptr(Box::new(outside.ty.clone())))
+        }
+    } else if let CharKind::Fixed(len) = outside.char_kind {
+        zero_byte_storage(b, (len.max(0) + 1) as u64)
+    } else if let Some(type_name) = outside.derived_type.as_deref() {
+        let bytes = ctx
+            .type_layouts
+            .get(type_name)
+            .map(|layout| layout.size as u64)
+            .unwrap_or_else(|| outside.ty.size_bytes(&ctx.layout).max(1));
+        zero_byte_storage(b, bytes)
+    } else {
+        b.alloca(outside.ty.clone())
+    };
+
+    let mut private = outside.clone();
+    private.addr = private_addr;
+    private.by_ref = false;
+    private.allocatable = false;
+    private.descriptor_arg = false;
+    private.inline_const = None;
+    if reduction {
+        private.is_pointer = false;
+    }
+    (private, None, DoConcurrentPrivateCleanup::None)
+}
+
+fn emit_do_concurrent_local_init(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    binding: &DoConcurrentLocalityBinding,
+) {
+    let outside = &binding.outside;
+    let private = &binding.private;
+
+    if local_is_array_like(outside) {
+        let source_desc = binding
+            .outside_array_desc
+            .expect("array locality binding should retain its source descriptor");
+        if outside.is_pointer {
+            emit_memcpy_bytes(b, private.addr, source_desc, 392);
+        } else {
+            let null_stat = b.const_i64(0);
+            b.call(
+                FuncRef::External("afs_copy_array_data_no_realloc".into()),
+                vec![private.addr, source_desc, null_stat],
+                IrType::Void,
+            );
+        }
+        return;
+    }
+
+    if matches!(outside.char_kind, CharKind::Deferred) {
+        let source = concurrent_scalar_storage_addr(b, outside);
+        emit_memcpy_bytes(b, private.addr, source, 32);
+        return;
+    }
+
+    if outside.is_class && local_uses_array_descriptor(outside) {
+        let source = array_descriptor_addr(b, outside);
+        emit_memcpy_bytes(b, private.addr, source, 392);
+        return;
+    }
+
+    if matches!(
+        outside.char_kind,
+        CharKind::FixedRuntime { .. } | CharKind::AssumedLen { .. }
+    ) {
+        if outside.is_pointer {
+            let source = concurrent_scalar_storage_addr(b, outside);
+            emit_memcpy_bytes(b, private.addr, source, 8);
+        } else {
+            let source = b.load(outside.addr);
+            let dest = b.load(private.addr);
+            let len = match outside.char_kind {
+                CharKind::FixedRuntime { len_addr } | CharKind::AssumedLen { len_addr } => {
+                    b.load(len_addr)
+                }
+                _ => unreachable!(),
+            };
+            b.call(
+                FuncRef::External("memcpy".into()),
+                vec![dest, source, len],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+        }
+        return;
+    }
+
+    let source = concurrent_scalar_storage_addr(b, outside);
+    if outside.is_pointer {
+        emit_memcpy_bytes(b, private.addr, source, 8);
+    } else if let CharKind::Fixed(len) = outside.char_kind {
+        emit_memcpy_bytes(b, private.addr, source, len.max(0));
+    } else if let Some(type_name) = outside.derived_type.as_deref() {
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, private.addr, source);
+    } else {
+        let bytes = local_storage_size_bytes(outside, ctx.type_layouts, ctx.layout);
+        emit_memcpy_bytes(b, private.addr, source, bytes);
+    }
+}
+
+fn emit_do_concurrent_local_reset(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    binding: &DoConcurrentLocalityBinding,
+) {
+    let outside = &binding.outside;
+    let private = &binding.private;
+
+    if outside.is_pointer {
+        let bytes = if local_is_array_like(outside)
+            || (outside.is_class && local_uses_array_descriptor(outside))
+        {
+            392
+        } else if matches!(outside.char_kind, CharKind::Deferred) {
+            32
+        } else {
+            8
+        };
+        let zero = b.const_i32(0);
+        let size = b.const_i64(bytes);
+        b.call(
+            FuncRef::External("memset".into()),
+            vec![private.addr, zero, size],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+        );
+        return;
+    }
+
+    let Some(type_name) = private.derived_type.as_deref() else {
+        return;
+    };
+    let Some(layout) = ctx.type_layouts.get(type_name) else {
+        return;
+    };
+    if local_is_array_like(private) {
+        let base = array_base_addr(b, private);
+        let count = array_total_elems_value(b, private);
+        initialize_derived_array_storage_dynamic(b, base, layout, count, ctx.type_layouts);
+    } else {
+        initialize_derived_storage(b, private.addr, layout, ctx.type_layouts);
+    }
+}
+
+fn synth_call_expr(
+    name: &str,
+    args: Vec<crate::ast::expr::SpannedExpr>,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(synth_name_expr(name, span)),
+            args: args
+                .into_iter()
+                .map(|value| crate::ast::expr::Argument {
+                    keyword: None,
+                    value: crate::ast::expr::SectionSubscript::Element(value),
+                })
+                .collect(),
+        },
+        span,
+    )
+}
+
+fn normalized_reduce_op(op: &str) -> String {
+    op.trim().trim_matches('.').to_ascii_lowercase()
+}
+
+fn synth_typed_integer_expr(
+    value: i128,
+    ty: &IrType,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    let kind = match ty {
+        IrType::Int(width) => Some(width.bytes().to_string()),
+        _ => None,
+    };
+    crate::ast::Spanned::new(
+        Expr::IntegerLiteral {
+            text: value.to_string(),
+            kind,
+        },
+        span,
+    )
+}
+
+fn integer_type_bounds(ty: &IrType) -> Option<(i128, i128)> {
+    let IrType::Int(width) = ty else {
+        return None;
+    };
+    let bits = width.bits();
+    if bits == 128 {
+        Some((i128::MIN, i128::MAX))
+    } else {
+        let magnitude = 1_i128 << (bits - 1);
+        Some((-magnitude, magnitude - 1))
+    }
+}
+
+fn synth_character_reduction_identity(
+    code: i64,
+    name: &str,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    let character = synth_call_expr("char", vec![synth_int_expr(code, span)], span);
+    let len = synth_call_expr("len", vec![synth_name_expr(name, span)], span);
+    synth_call_expr("repeat", vec![character, len], span)
+}
+
+fn synth_do_concurrent_reduction_identity(
+    op: &str,
+    name: &str,
+    info: &LocalInfo,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    match normalized_reduce_op(op).as_str() {
+        "+" | "or" | "neqv" | "ior" | "ieor" => synth_typed_integer_expr(0, &info.ty, span),
+        "*" => synth_typed_integer_expr(1, &info.ty, span),
+        "and" | "eqv" => crate::ast::Spanned::new(
+            Expr::LogicalLiteral {
+                value: true,
+                kind: None,
+            },
+            span,
+        ),
+        "max" => {
+            if info.char_kind != CharKind::None {
+                return synth_character_reduction_identity(0, name, span);
+            }
+            if let Some((least, _)) = integer_type_bounds(&info.ty) {
+                return synth_typed_integer_expr(least, &info.ty, span);
+            }
+            let huge = synth_call_expr("huge", vec![synth_name_expr(name, span)], span);
+            crate::ast::Spanned::new(
+                Expr::UnaryOp {
+                    op: UnaryOp::Minus,
+                    operand: Box::new(huge),
+                },
+                span,
+            )
+        }
+        "min" => {
+            if info.char_kind != CharKind::None {
+                return synth_character_reduction_identity(u8::MAX.into(), name, span);
+            }
+            if let Some((_, greatest)) = integer_type_bounds(&info.ty) {
+                return synth_typed_integer_expr(greatest, &info.ty, span);
+            }
+            synth_call_expr("huge", vec![synth_name_expr(name, span)], span)
+        }
+        "iand" => synth_typed_integer_expr(-1, &info.ty, span),
+        _ => lower_stmt_error(
+            span,
+            &format!("unsupported DO CONCURRENT REDUCE operator '{op}'"),
+        ),
+    }
+}
+
+fn synth_do_concurrent_reduction_merge(
+    op: &str,
+    outside_name: &str,
+    private_name: &str,
+    span: crate::lexer::Span,
+) -> crate::ast::expr::SpannedExpr {
+    let left = synth_name_expr(outside_name, span);
+    let right = synth_name_expr(private_name, span);
+    match normalized_reduce_op(op).as_str() {
+        "+" => crate::ast::Spanned::new(
+            Expr::BinaryOp {
+                op: BinaryOp::Add,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        ),
+        "*" => crate::ast::Spanned::new(
+            Expr::BinaryOp {
+                op: BinaryOp::Mul,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        ),
+        "and" | "or" | "eqv" | "neqv" => {
+            let op = match normalized_reduce_op(op).as_str() {
+                "and" => BinaryOp::And,
+                "or" => BinaryOp::Or,
+                "eqv" => BinaryOp::Eqv,
+                "neqv" => BinaryOp::Neqv,
+                _ => unreachable!(),
+            };
+            crate::ast::Spanned::new(
+                Expr::BinaryOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }
+        "max" | "min" | "iand" | "ior" | "ieor" => {
+            synth_call_expr(&normalized_reduce_op(op), vec![left, right], span)
+        }
+        _ => lower_stmt_error(
+            span,
+            &format!("unsupported DO CONCURRENT REDUCE operator '{op}'"),
+        ),
+    }
+}
+
+fn emit_synthetic_assignment(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    target_name: &str,
+    value: crate::ast::expr::SpannedExpr,
+    span: crate::lexer::Span,
+) {
+    let stmt = crate::ast::Spanned::new(
+        Stmt::Assignment {
+            target: synth_name_expr(target_name, span),
+            value,
+        },
+        span,
+    );
+    super::stmt::lower_stmt(b, ctx, &stmt);
+}
+
+impl DoConcurrentLocalityState {
+    fn prepare(
+        b: &mut FuncBuilder,
+        ctx: &mut LowerCtx,
+        locality: &[LocalitySpec],
+        span: crate::lexer::Span,
+    ) -> Self {
+        let mut bindings = Vec::new();
+        let mut bound_names = HashSet::new();
+
+        for spec in locality {
+            let (kind, names): (Option<DoConcurrentLocalityKind>, &[String]) = match spec {
+                LocalitySpec::Local(names) => (Some(DoConcurrentLocalityKind::Local), names),
+                LocalitySpec::LocalInit(names) => {
+                    (Some(DoConcurrentLocalityKind::LocalInit), names)
+                }
+                LocalitySpec::Reduce { op, vars } => {
+                    (Some(DoConcurrentLocalityKind::Reduce(op.clone())), vars)
+                }
+                LocalitySpec::Shared(_) | LocalitySpec::DefaultNone => (None, &[]),
+            };
+            let Some(kind) = kind else {
+                continue;
+            };
+            for name in names {
+                let key = name.to_lowercase();
+                // Duplicate locality-specs are diagnosed by semantic
+                // validation. Avoid manufacturing two construct entities if
+                // malformed input reaches lowering.
+                if !bound_names.insert(key.clone()) {
+                    continue;
+                }
+                let outside = ctx.locals.get(&key).cloned().unwrap_or_else(|| {
+                    lower_stmt_error(
+                        span,
+                        &format!("DO CONCURRENT locality variable '{name}' has no visible binding"),
+                    )
+                });
+                let reduction = matches!(kind, DoConcurrentLocalityKind::Reduce(_));
+                let (private, outside_array_desc, cleanup) =
+                    allocate_do_concurrent_private(b, ctx, &outside, reduction);
+                bindings.push(DoConcurrentLocalityBinding {
+                    name: key,
+                    outside,
+                    private,
+                    kind: kind.clone(),
+                    outside_array_desc,
+                    cleanup,
+                });
+            }
+        }
+
+        let state = Self { bindings, span };
+        state.initialize_reductions(b, ctx);
+        state
+    }
+
+    fn initialize_reductions(&self, b: &mut FuncBuilder, ctx: &mut LowerCtx) {
+        for binding in &self.bindings {
+            let DoConcurrentLocalityKind::Reduce(op) = &binding.kind else {
+                continue;
+            };
+            let saved = ctx
+                .locals
+                .insert(binding.name.clone(), binding.private.clone());
+            let identity = synth_do_concurrent_reduction_identity(
+                op,
+                &binding.name,
+                &binding.private,
+                self.span,
+            );
+            emit_synthetic_assignment(b, ctx, &binding.name, identity, self.span);
+            match saved {
+                Some(info) => {
+                    ctx.locals.insert(binding.name.clone(), info);
+                }
+                None => {
+                    ctx.locals.remove(&binding.name);
+                }
+            }
+        }
+    }
+
+    fn initialize_iteration(&self, b: &mut FuncBuilder, ctx: &LowerCtx) {
+        for binding in &self.bindings {
+            match binding.kind {
+                DoConcurrentLocalityKind::Local => {
+                    emit_do_concurrent_local_reset(b, ctx, binding);
+                }
+                DoConcurrentLocalityKind::LocalInit => {
+                    emit_do_concurrent_local_init(b, ctx, binding);
+                }
+                DoConcurrentLocalityKind::Reduce(_) => {}
+            }
+        }
+    }
+
+    fn install_private_bindings(&self, ctx: &mut LowerCtx) -> Vec<Option<LocalInfo>> {
+        self.bindings
+            .iter()
+            .map(|binding| {
+                ctx.locals
+                    .insert(binding.name.clone(), binding.private.clone())
+            })
+            .collect()
+    }
+
+    fn restore_outside_bindings(&self, ctx: &mut LowerCtx, saved: Vec<Option<LocalInfo>>) {
+        for (binding, saved) in self.bindings.iter().zip(saved) {
+            match saved {
+                Some(info) => {
+                    ctx.locals.insert(binding.name.clone(), info);
+                }
+                None => {
+                    ctx.locals.remove(&binding.name);
+                }
+            }
+        }
+    }
+
+    fn merge_reductions(&self, b: &mut FuncBuilder, ctx: &mut LowerCtx) {
+        let mut temp_ordinal = 0usize;
+        for binding in &self.bindings {
+            let DoConcurrentLocalityKind::Reduce(op) = &binding.kind else {
+                continue;
+            };
+            let private_name = loop {
+                let candidate = format!("afs_doconc_reduce_private_{temp_ordinal}");
+                temp_ordinal += 1;
+                if !ctx.locals.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            let saved_outside_view =
+                if binding.outside.is_pointer && local_is_array_like(&binding.outside) {
+                    // REDUCE strips POINTER from the construct entity, and the
+                    // final intrinsic assignment defines the associated target;
+                    // it must not invoke allocatable-style descriptor
+                    // replacement on the outside pointer.
+                    let mut target_view = binding.outside.clone();
+                    target_view.allocatable = false;
+                    target_view.descriptor_arg = true;
+                    ctx.locals.insert(binding.name.clone(), target_view)
+                } else {
+                    None
+                };
+            ctx.locals
+                .insert(private_name.clone(), binding.private.clone());
+            let merged =
+                synth_do_concurrent_reduction_merge(op, &binding.name, &private_name, self.span);
+            emit_synthetic_assignment(b, ctx, &binding.name, merged, self.span);
+            ctx.locals.remove(&private_name);
+            if let Some(outside) = saved_outside_view {
+                ctx.locals.insert(binding.name.clone(), outside);
+            }
+        }
+    }
+
+    fn cleanup(&self, b: &mut FuncBuilder) {
+        for binding in &self.bindings {
+            match binding.cleanup {
+                DoConcurrentPrivateCleanup::None => {}
+                DoConcurrentPrivateCleanup::ArrayDescriptor { desc, stat } => {
+                    let zero = b.const_i32(0);
+                    b.store(zero, stat);
+                    b.call(
+                        FuncRef::External("afs_deallocate_array".into()),
+                        vec![desc, stat],
+                        IrType::Void,
+                    );
+                }
+                DoConcurrentPrivateCleanup::Heap { ptr } => {
+                    b.runtime_call(RuntimeFunc::Deallocate, vec![ptr], IrType::Void);
+                }
+            }
+        }
+    }
+}
+
 /// DO loop fields bundled for passing without too many args.
+pub(super) enum DoLoopBody<'a> {
+    Statements(&'a [SpannedStmt]),
+    ConcurrentTail {
+        source_name: &'a Option<String>,
+        controls: &'a [ConcurrentControl],
+        mask: Option<&'a crate::ast::expr::SpannedExpr>,
+        locality: &'a [LocalitySpec],
+        source_body: &'a [SpannedStmt],
+        span: crate::lexer::Span,
+    },
+}
+
 pub(super) struct DoLoopFields<'a> {
-    pub(super) name: &'a Option<String>,
+    pub(super) cycle_name: &'a Option<String>,
+    pub(super) exit_name: &'a Option<String>,
     pub(super) var: &'a Option<String>,
     pub(super) start: &'a Option<crate::ast::expr::SpannedExpr>,
     pub(super) end: &'a Option<crate::ast::expr::SpannedExpr>,
     pub(super) step: &'a Option<crate::ast::expr::SpannedExpr>,
-    pub(super) body: &'a [SpannedStmt],
+    pub(super) body: DoLoopBody<'a>,
     pub(super) concurrent: bool,
+    pub(super) locality: &'a [LocalitySpec],
+    pub(super) span: crate::lexer::Span,
 }
 
 pub(super) fn try_lower_bulk_do_concurrent(
@@ -29363,13 +30192,31 @@ pub(super) fn lower_do_concurrent(
     name: &Option<String>,
     controls: &[ConcurrentControl],
     mask: Option<&crate::ast::expr::SpannedExpr>,
+    locality: &[LocalitySpec],
     body: &[SpannedStmt],
     span: crate::lexer::Span,
 ) {
-    if try_lower_bulk_do_concurrent(b, ctx, controls, mask, body) {
+    // The bulk map recognizes only the assignment expression. It cannot
+    // manufacture the construct entities required by a locality-spec.
+    if locality.is_empty() && try_lower_bulk_do_concurrent(b, ctx, controls, mask, body) {
         return;
     }
 
+    lower_do_concurrent_controls(b, ctx, name, controls, mask, locality, body, span, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_do_concurrent_controls(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    source_name: &Option<String>,
+    controls: &[ConcurrentControl],
+    mask: Option<&crate::ast::expr::SpannedExpr>,
+    locality: &[LocalitySpec],
+    source_body: &[SpannedStmt],
+    span: crate::lexer::Span,
+    outermost: bool,
+) {
     let Some((ctrl, rest)) = controls.split_first() else {
         return;
     };
@@ -29378,7 +30225,6 @@ pub(super) fn lower_do_concurrent(
     let start_opt = Some(ctrl.start.clone());
     let end_opt = Some(ctrl.end.clone());
 
-    let nested_body_storage;
     let masked_body_storage;
     let lowered_body = if rest.is_empty() {
         if let Some(mask_expr) = mask {
@@ -29386,41 +30232,46 @@ pub(super) fn lower_do_concurrent(
                 Stmt::IfConstruct {
                     name: None,
                     condition: mask_expr.clone(),
-                    then_body: body.to_vec(),
+                    then_body: source_body.to_vec(),
                     else_ifs: vec![],
                     else_body: None,
                 },
                 mask_expr.span,
             )];
-            masked_body_storage.as_slice()
+            DoLoopBody::Statements(masked_body_storage.as_slice())
         } else {
-            body
+            DoLoopBody::Statements(source_body)
         }
     } else {
-        nested_body_storage = vec![crate::ast::Spanned::new(
-            Stmt::DoConcurrent {
-                name: None,
-                controls: rest.to_vec(),
-                mask: mask.cloned(),
-                locality: vec![],
-                body: body.to_vec(),
-            },
+        DoLoopBody::ConcurrentTail {
+            source_name,
+            controls: rest,
+            mask,
+            locality,
+            source_body,
             span,
-        )];
-        nested_body_storage.as_slice()
+        }
     };
 
+    let unnamed = None;
     lower_do_loop(
         b,
         ctx,
         DoLoopFields {
-            name,
+            cycle_name: if rest.is_empty() {
+                source_name
+            } else {
+                &unnamed
+            },
+            exit_name: if outermost { source_name } else { &unnamed },
             var: &var_opt,
             start: &start_opt,
             end: &end_opt,
             step: &ctrl.step,
             body: lowered_body,
             concurrent: true,
+            locality: if rest.is_empty() { locality } else { &[] },
+            span,
         },
     );
 }
@@ -29428,15 +30279,18 @@ pub(super) fn lower_do_concurrent(
 /// Lower DO loop (counted loop with variable, start, end, step).
 pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoLoopFields) {
     let DoLoopFields {
-        name,
+        cycle_name,
+        exit_name,
         var,
         start,
         end,
         step,
         body,
         concurrent,
+        locality,
+        span,
     } = fields;
-    let (check_name, body_name, incr_name, exit_name, neg_check_name, pos_check_name) =
+    let (check_name, body_name, incr_name, exit_block_name, neg_check_name, pos_check_name) =
         if concurrent {
             (
                 "doconc_check",
@@ -29510,11 +30364,19 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
             let one = b.const_i32(1);
             coerce_to_type(b, one, &var_ty)
         };
+        // Header expressions are evaluated in the enclosing scope. Only
+        // after they have been captured may locality construct entities be
+        // created and substituted into the loop body.
+        let locality_state = if concurrent && !locality.is_empty() {
+            Some(DoConcurrentLocalityState::prepare(b, ctx, locality, span))
+        } else {
+            None
+        };
 
         let bb_check = b.create_block(check_name);
         let bb_body = b.create_block(body_name);
         let bb_incr = b.create_block(incr_name);
-        let bb_exit = b.create_block(exit_name);
+        let bb_exit = b.create_block(exit_block_name);
         let bb_zero_step = b.create_block("do_zero_step");
 
         b.branch(bb_check, vec![]);
@@ -29561,9 +30423,16 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         b.branch(bb_exit, vec![]);
 
         // Body.
-        ctx.push_loop(name.clone(), bb_incr, bb_exit);
+        ctx.push_loop(cycle_name.clone(), exit_name.clone(), bb_incr, bb_exit);
         b.set_block(bb_body);
-        super::stmt::lower_stmts(b, ctx, body);
+        let saved_locality_bindings = locality_state.as_ref().map(|state| {
+            state.initialize_iteration(b, ctx);
+            state.install_private_bindings(ctx)
+        });
+        lower_do_loop_body(b, ctx, body);
+        if let (Some(state), Some(saved)) = (locality_state.as_ref(), saved_locality_bindings) {
+            state.restore_outside_bindings(ctx, saved);
+        }
         if b.func().block(b.current_block()).terminator.is_none() {
             b.branch(bb_incr, vec![]);
         }
@@ -29577,15 +30446,19 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
         b.branch(bb_check, vec![]);
 
         b.set_block(bb_exit);
+        if let Some(state) = locality_state {
+            state.merge_reductions(b, ctx);
+            state.cleanup(b);
+        }
     } else {
         // Infinite DO (no variable) — `do ... end do` without loop control.
         let bb_body = b.create_block(body_name);
-        let bb_exit = b.create_block(exit_name);
+        let bb_exit = b.create_block(exit_block_name);
         b.branch(bb_body, vec![]);
 
-        ctx.push_loop(name.clone(), bb_body, bb_exit);
+        ctx.push_loop(cycle_name.clone(), exit_name.clone(), bb_body, bb_exit);
         b.set_block(bb_body);
-        super::stmt::lower_stmts(b, ctx, body);
+        lower_do_loop_body(b, ctx, body);
         if b.func().block(b.current_block()).terminator.is_none() {
             b.branch(bb_body, vec![]);
         }
@@ -29595,10 +30468,35 @@ pub(super) fn lower_do_loop(b: &mut FuncBuilder, ctx: &mut LowerCtx, fields: DoL
     }
 }
 
+fn lower_do_loop_body(b: &mut FuncBuilder, ctx: &mut LowerCtx, body: DoLoopBody<'_>) {
+    match body {
+        DoLoopBody::Statements(stmts) => super::stmt::lower_stmts(b, ctx, stmts),
+        DoLoopBody::ConcurrentTail {
+            source_name,
+            controls,
+            mask,
+            locality,
+            source_body,
+            span,
+        } => lower_do_concurrent_controls(
+            b,
+            ctx,
+            source_name,
+            controls,
+            mask,
+            locality,
+            source_body,
+            span,
+            false,
+        ),
+    }
+}
+
 /// Lower SELECT CASE.
 pub(super) fn lower_select_case(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    name: &Option<String>,
     selector: &crate::ast::expr::SpannedExpr,
     cases: &[CaseBlock],
 ) {
@@ -29610,6 +30508,7 @@ pub(super) fn lower_select_case(
         .unwrap_or_default();
     let sel_val = (!selector_is_char).then(|| super::expr::lower_expr_ctx(b, ctx, selector));
     let bb_end = b.create_block("select_end");
+    ctx.push_construct_exit(name.clone(), bb_end);
 
     // For simplicity, lower as a chain of if-else comparisons.
     // (Switch terminator would be ideal for integer constants, but the
@@ -29789,6 +30688,7 @@ pub(super) fn lower_select_case(
         }
     }
 
+    ctx.pop_construct_exit(name);
     b.set_block(bb_end);
 }
 
@@ -32613,6 +33513,423 @@ pub(super) fn lower_array_store(
     b.store(coerced, elem_ptr);
 }
 
+fn iolength_intrinsic_transfer_bytes(type_info: &crate::sema::symtab::TypeInfo) -> Option<i64> {
+    use crate::sema::symtab::TypeInfo;
+
+    match type_info {
+        TypeInfo::Integer { kind } => Some(i64::from(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+        )),
+        TypeInfo::Real { kind } => {
+            let kind = kind.unwrap_or_else(crate::driver::defaults::default_real_kind);
+            matches!(kind, 4 | 8).then_some(i64::from(kind))
+        }
+        TypeInfo::DoublePrecision => Some(8),
+        TypeInfo::Complex { kind } => {
+            let kind = kind.unwrap_or_else(crate::driver::defaults::default_real_kind);
+            matches!(kind, 4 | 8).then_some(i64::from(kind) * 2)
+        }
+        TypeInfo::Logical { kind } => Some(i64::from(
+            kind.unwrap_or_else(crate::driver::defaults::default_int_kind),
+        )),
+        TypeInfo::Enumeration(_) => Some(i64::from(crate::driver::defaults::default_int_kind())),
+        TypeInfo::Character { .. }
+        | TypeInfo::Derived(_)
+        | TypeInfo::Class(_)
+        | TypeInfo::ClassStar
+        | TypeInfo::TypeStar => None,
+    }
+}
+
+fn lower_iolength_add(
+    b: &mut FuncBuilder,
+    total_addr: ValueId,
+    count: ValueId,
+    elem_size: ValueId,
+) {
+    let total = b.load_typed(total_addr, IrType::Int(IntWidth::I64));
+    let next = b.call(
+        FuncRef::External("afs_iolength_add".into()),
+        vec![total, count, elem_size],
+        IrType::Int(IntWidth::I64),
+    );
+    b.store(next, total_addr);
+}
+
+fn lower_iolength_add_const(b: &mut FuncBuilder, total_addr: ValueId, count: i64, elem_size: i64) {
+    let count = b.const_i64(count);
+    let elem_size = b.const_i64(elem_size);
+    lower_iolength_add(b, total_addr, count, elem_size);
+}
+
+fn lower_iolength_add_array(
+    b: &mut FuncBuilder,
+    total_addr: ValueId,
+    desc: ValueId,
+    elem_size: ValueId,
+) {
+    let total = b.load_typed(total_addr, IrType::Int(IntWidth::I64));
+    let next = b.call(
+        FuncRef::External("afs_iolength_add_array".into()),
+        vec![total, desc, elem_size],
+        IrType::Int(IntWidth::I64),
+    );
+    b.store(next, total_addr);
+}
+
+fn derived_layout_iolength_bytes(
+    b: &mut FuncBuilder,
+    ctx: &LowerCtx,
+    layout: &crate::sema::type_layout::TypeLayout,
+    span: crate::lexer::Span,
+) -> i64 {
+    let mut total = 0i64;
+    for field in &layout.fields {
+        if field.procedure_pointer
+            || field.pointer
+            || field.allocatable
+            || field_uses_array_descriptor(field)
+        {
+            lower_stmt_error(
+                span,
+                &format!(
+                    "INQUIRE(IOLENGTH=) derived item has allocatable or pointer component '{}'",
+                    field.name
+                ),
+            );
+        }
+
+        let count = field.dims.iter().try_fold(1i64, |count, (_, extent)| {
+            count.checked_mul((*extent).max(0))
+        });
+        let Some(count) = count else {
+            lower_stmt_error(
+                span,
+                &format!(
+                    "INQUIRE(IOLENGTH=) component '{}' element count overflows INTEGER(8)",
+                    field.name
+                ),
+            );
+        };
+
+        let scalar_bytes = if let Some(nested_type) = field_derived_type_name(field) {
+            let Some(nested_layout) = derived_io_layout_for_type(b, ctx, &nested_type) else {
+                unsupported_derived_io_field(span, field);
+            };
+            derived_layout_iolength_bytes(b, ctx, &nested_layout, span)
+        } else {
+            match field_char_kind(field) {
+                CharKind::Fixed(len) => len,
+                CharKind::Deferred
+                | CharKind::FixedRuntime { .. }
+                | CharKind::AssumedLen { .. } => unsupported_derived_io_field(span, field),
+                CharKind::None => {
+                    if let crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } =
+                        &field.type_info
+                    {
+                        *len
+                    } else {
+                        let Some(bytes) = iolength_intrinsic_transfer_bytes(&field.type_info)
+                        else {
+                            unsupported_derived_io_field(span, field);
+                        };
+                        bytes
+                    }
+                }
+            }
+        };
+        if scalar_bytes < 0 {
+            unsupported_derived_io_field(span, field);
+        }
+
+        total = count
+            .checked_mul(scalar_bytes)
+            .and_then(|bytes| total.checked_add(bytes))
+            .unwrap_or_else(|| {
+                lower_stmt_error(
+                    span,
+                    &format!(
+                        "INQUIRE(IOLENGTH=) component '{}' transfer size overflows INTEGER(8)",
+                        field.name
+                    ),
+                )
+            });
+    }
+    total
+}
+
+fn lower_iolength_array_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    type_info: &crate::sema::symtab::TypeInfo,
+    total_addr: ValueId,
+) {
+    let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        item,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        lower_stmt_error(
+            item.span,
+            "unsupported array expression in INQUIRE(IOLENGTH=)",
+        );
+    };
+
+    match type_info {
+        crate::sema::symtab::TypeInfo::Character { .. } => {
+            let elem_size = descriptor_elem_size(b, desc);
+            lower_iolength_add_array(b, total_addr, desc, elem_size);
+        }
+        crate::sema::symtab::TypeInfo::Derived(type_name) => {
+            if resolve_defined_io_type_specific(ctx, "write(unformatted)", type_info).is_some() {
+                lower_stmt_error(
+                    item.span,
+                    "INQUIRE(IOLENGTH=) item may not require defined I/O",
+                );
+            }
+            let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+                lower_stmt_error(item.span, "unknown derived type in INQUIRE(IOLENGTH=)");
+            };
+            let transfer_bytes = derived_layout_iolength_bytes(b, ctx, &layout, item.span);
+            let elem_size = b.const_i64(transfer_bytes);
+            lower_iolength_add_array(b, total_addr, desc, elem_size);
+        }
+        crate::sema::symtab::TypeInfo::Class(_)
+        | crate::sema::symtab::TypeInfo::ClassStar
+        | crate::sema::symtab::TypeInfo::TypeStar => {
+            lower_stmt_error(
+                item.span,
+                "polymorphic INQUIRE(IOLENGTH=) items are not implemented",
+            );
+        }
+        _ => {
+            let Some(bytes) = iolength_intrinsic_transfer_bytes(type_info) else {
+                lower_stmt_error(item.span, "unsupported type in INQUIRE(IOLENGTH=)");
+            };
+            let elem_size = b.const_i64(bytes);
+            lower_iolength_add_array(b, total_addr, desc, elem_size);
+        }
+    }
+
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, item, ctx.st, desc);
+}
+
+fn lower_iolength_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    total_addr: ValueId,
+) {
+    if let Expr::ArrayConstructor { values, type_spec } = &item.node {
+        if type_spec.is_none()
+            && values
+                .iter()
+                .any(|value| matches!(value, AcValue::ImpliedDo(_)))
+        {
+            lower_iolength_ac_values(b, ctx, values, total_addr);
+            return;
+        }
+    }
+
+    let Some(type_info) =
+        operator_expr_type_info(item, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+    else {
+        lower_stmt_error(item.span, "cannot determine INQUIRE(IOLENGTH=) item type");
+    };
+    let rank = actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts)).unwrap_or(0);
+    if rank > 0 {
+        lower_iolength_array_item(b, ctx, item, &type_info, total_addr);
+        return;
+    }
+
+    match type_info {
+        crate::sema::symtab::TypeInfo::Character { .. } => {
+            let (ptr, len) = lower_string_expr_ctx(b, ctx, item);
+            let one = b.const_i64(1);
+            lower_iolength_add(b, total_addr, one, len);
+            deallocate_owned_string_expr_temp(
+                b,
+                &ctx.locals,
+                item,
+                ctx.st,
+                Some(ctx.type_layouts),
+                ptr,
+            );
+        }
+        crate::sema::symtab::TypeInfo::Derived(ref type_name) => {
+            if resolve_defined_io_type_specific(ctx, "write(unformatted)", &type_info).is_some() {
+                lower_stmt_error(
+                    item.span,
+                    "INQUIRE(IOLENGTH=) item may not require defined I/O",
+                );
+            }
+            let Some(layout) = derived_io_layout_for_type(b, ctx, type_name) else {
+                lower_stmt_error(item.span, "unknown derived type in INQUIRE(IOLENGTH=)");
+            };
+            let _base_addr = lower_arg_by_ref_ctx(b, ctx, item);
+            let transfer_bytes = derived_layout_iolength_bytes(b, ctx, &layout, item.span);
+            lower_iolength_add_const(b, total_addr, 1, transfer_bytes);
+        }
+        crate::sema::symtab::TypeInfo::Class(_)
+        | crate::sema::symtab::TypeInfo::ClassStar
+        | crate::sema::symtab::TypeInfo::TypeStar => {
+            lower_stmt_error(
+                item.span,
+                "polymorphic INQUIRE(IOLENGTH=) items are not implemented",
+            );
+        }
+        _ => {
+            let Some(bytes) = iolength_intrinsic_transfer_bytes(&type_info) else {
+                lower_stmt_error(item.span, "unsupported type in INQUIRE(IOLENGTH=)");
+            };
+            let _value = super::expr::lower_expr_ctx_tl(b, ctx, item);
+            lower_iolength_add_const(b, total_addr, 1, bytes);
+        }
+    }
+}
+
+fn lower_iolength_ac_values(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    values: &[AcValue],
+    total_addr: ValueId,
+) {
+    for value in values {
+        match value {
+            AcValue::Expr(expr) => lower_iolength_item(b, ctx, expr, total_addr),
+            AcValue::ImpliedDo(implied_do) => {
+                lower_iolength_ac_implied_do(b, ctx, implied_do, total_addr)
+            }
+        }
+    }
+}
+
+fn lower_iolength_ac_implied_do(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    implied_do: &crate::ast::expr::ImpliedDoLoop,
+    total_addr: ValueId,
+) {
+    if implied_do.step.as_ref().and_then(eval_const_int) == Some(0) {
+        lower_stmt_error(
+            implied_do.start.span,
+            "INQUIRE(IOLENGTH=) implied-DO step may not be zero",
+        );
+    }
+
+    let var_key = implied_do.var.to_lowercase();
+    let var_ty = ctx
+        .locals
+        .get(&var_key)
+        .map(|local| local.ty.clone())
+        .filter(|ty| matches!(ty, IrType::Int(_)))
+        .unwrap_or(IrType::Int(IntWidth::I32));
+    let var_addr = b.alloca(var_ty.clone());
+    let start_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.start);
+    let start = coerce_to_type(b, start_raw, &var_ty);
+    b.store(start, var_addr);
+    let end_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.end);
+    let end = coerce_to_type(b, end_raw, &var_ty);
+    let step_raw = match &implied_do.step {
+        Some(step) => super::expr::lower_expr_ctx(b, ctx, step),
+        None => b.const_i32(1),
+    };
+    let step = coerce_to_type(b, step_raw, &var_ty);
+
+    let old_local = ctx.locals.insert(
+        var_key.clone(),
+        LocalInfo {
+            addr: var_addr,
+            ty: var_ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let check = b.create_block("iolength_impdo_check");
+    let body = b.create_block("iolength_impdo_body");
+    let exit = b.create_block("iolength_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let current = b.load(var_addr);
+    let const_step = implied_do.step.as_ref().and_then(eval_const_int);
+    if let Some(step_value) = const_step {
+        let op = if step_value < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let keep_going = b.icmp(op, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    } else {
+        let zero_raw = b.const_i32(0);
+        let zero = coerce_to_type(b, zero_raw, &var_ty);
+        let is_zero = b.icmp(CmpOp::Eq, step, zero);
+        let negative = b.icmp(CmpOp::Lt, step, zero);
+        let zero_step = b.create_block("iolength_impdo_zero_step");
+        let sign_check = b.create_block("iolength_impdo_sign_check");
+        let negative_check = b.create_block("iolength_impdo_negative_check");
+        let positive_check = b.create_block("iolength_impdo_positive_check");
+        b.cond_branch(is_zero, zero_step, vec![], sign_check, vec![]);
+
+        b.set_block(sign_check);
+        b.cond_branch(negative, negative_check, vec![], positive_check, vec![]);
+
+        b.set_block(negative_check);
+        let keep_going = b.icmp(CmpOp::Ge, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+
+        b.set_block(positive_check);
+        let keep_going = b.icmp(CmpOp::Le, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+
+        b.set_block(zero_step);
+        b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+        b.branch(exit, vec![]);
+    }
+
+    b.set_block(body);
+    lower_iolength_ac_values(b, ctx, &implied_do.values, total_addr);
+    let current = b.load(var_addr);
+    let next = b.iadd(current, step);
+    b.store(next, var_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
+    if let Some(previous) = old_local {
+        ctx.locals.insert(var_key.clone(), previous);
+    } else {
+        ctx.locals.remove(&var_key);
+    }
+}
+
+pub(super) fn lower_inquire_iolength_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+) -> ValueId {
+    let total_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, total_addr);
+    for item in items {
+        lower_iolength_item(b, ctx, item, total_addr);
+    }
+    b.load_typed(total_addr, IrType::Int(IntWidth::I64))
+}
+
 /// Lower the items of a PRINT/WRITE statement to unit-based I/O calls.
 pub(super) fn lower_write_items(
     b: &mut FuncBuilder,
@@ -33821,8 +35138,6 @@ fn resolve_defined_io_item_specific(
     interface_name: &str,
     item: &crate::ast::expr::SpannedExpr,
 ) -> Option<SpecificProcCandidate> {
-    use crate::sema::symtab::TypeInfo;
-
     if actual_expr_rank(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))
         .is_some_and(|rank| rank != 0)
     {
@@ -33831,6 +35146,16 @@ fn resolve_defined_io_item_specific(
 
     let actual_type =
         generic_actual_expr_type_info(item, &ctx.locals, ctx.st, Some(ctx.type_layouts))?;
+    resolve_defined_io_type_specific(ctx, interface_name, &actual_type)
+}
+
+fn resolve_defined_io_type_specific(
+    ctx: &LowerCtx,
+    interface_name: &str,
+    actual_type: &crate::sema::symtab::TypeInfo,
+) -> Option<SpecificProcCandidate> {
+    use crate::sema::symtab::TypeInfo;
+
     if !matches!(actual_type, TypeInfo::Derived(_) | TypeInfo::Class(_)) {
         return None;
     }
@@ -33851,10 +35176,25 @@ fn resolve_defined_io_item_specific(
             ctx.st,
             ctx.proc_scope_id,
             declared_type,
-            Some(&actual_type),
+            Some(actual_type),
             Some(ctx.type_layouts),
         )
     })
+}
+
+fn resolve_defined_io_item_plan(
+    ctx: &LowerCtx,
+    interface_name: &str,
+    items: &[crate::ast::expr::SpannedExpr],
+) -> Vec<Option<SpecificProcCandidate>> {
+    items
+        .iter()
+        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
+        .collect()
+}
+
+fn is_mixed_defined_io_plan(candidates: &[Option<SpecificProcCandidate>]) -> bool {
+    candidates.iter().any(Option::is_some) && candidates.iter().any(Option::is_none)
 }
 
 pub(super) fn scratch_char_buffer_arg(b: &mut FuncBuilder) -> (ValueId, ValueId, ValueId) {
@@ -33894,7 +35234,13 @@ fn const_char_slot_arg(b: &mut FuncBuilder, value: &str) -> (ValueId, ValueId) {
     )
 }
 
-fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DefinedIoEdit {
+    pub(super) iotype: String,
+    pub(super) v_list: Vec<i32>,
+}
+
+fn materialize_i32_rank1_descriptor(b: &mut FuncBuilder, values: &[i32]) -> ValueId {
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
     let descriptor_bytes = b.const_i64(392);
@@ -33904,27 +35250,40 @@ fn materialize_empty_i32_rank1_descriptor(b: &mut FuncBuilder) -> ValueId {
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
     );
 
-    let null_base = {
+    let base = if values.is_empty() {
         let zero = b.const_i64(0);
         b.int_to_ptr(zero, IrType::Int(IntWidth::I32))
+    } else {
+        let storage = b.alloca(IrType::Array(
+            Box::new(IrType::Int(IntWidth::I32)),
+            values.len() as u64,
+        ));
+        for (index, value) in values.iter().enumerate() {
+            let index = b.const_i64(index as i64);
+            let element = b.gep(storage, vec![index], IrType::Int(IntWidth::I32));
+            let value = b.const_i32(*value);
+            b.store(value, element);
+        }
+        let zero = b.const_i64(0);
+        b.gep(storage, vec![zero], IrType::Int(IntWidth::I32))
     };
     store_byte_aggregate_field(
         b,
         desc,
         0,
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
-        null_base,
+        base,
     );
     let elem_bytes = b.const_i64(4);
     let rank = b.const_i32(1);
     let flags = b.const_i32(2);
     let one = b.const_i64(1);
-    let zero = b.const_i64(0);
+    let upper = b.const_i64(values.len() as i64);
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
     store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
-    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), zero);
+    store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), upper);
     store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
     desc
 }
@@ -33966,7 +35325,7 @@ fn emit_defined_io_call(
     candidate: &SpecificProcCandidate,
     item: &crate::ast::expr::SpannedExpr,
     unit: ValueId,
-    formatted_iotype: Option<&str>,
+    formatted: Option<(&str, &[i32])>,
     iostat: Option<ValueId>,
     iomsg_arg: ValueId,
     iomsg_len: ValueId,
@@ -34039,13 +35398,13 @@ fn emit_defined_io_call(
     b.store(unit_i32, unit_slot);
 
     let iostat_arg = dtio_iostat_arg(b, iostat);
-    let mut call_args = if let Some(iotype) = formatted_iotype {
+    let mut call_args = if let Some((iotype, v_list)) = formatted {
         let (iotype_arg, _iotype_len) = const_char_slot_arg(b, iotype);
         vec![
             item_arg,
             unit_slot,
             iotype_arg,
-            materialize_empty_i32_rank1_descriptor(b),
+            materialize_i32_rank1_descriptor(b, v_list),
             iostat_arg,
             iomsg_arg,
         ]
@@ -34053,7 +35412,7 @@ fn emit_defined_io_call(
         vec![item_arg, unit_slot, iostat_arg, iomsg_arg]
     };
 
-    let default_char_len_mask = if formatted_iotype.is_some() {
+    let default_char_len_mask = if formatted.is_some() {
         vec![false, false, true, false, false, true]
     } else {
         vec![false, false, false, true]
@@ -34063,16 +35422,16 @@ fn emit_defined_io_call(
             .or_else(|| callee_char_len_star_mask(ctx.st, key))
     })
     .unwrap_or(default_char_len_mask);
-    let iotype_len = formatted_iotype.map(|s| s.len() as i64).unwrap_or(0);
+    let iotype_len = formatted
+        .map(|(iotype, _)| iotype.len() as i64)
+        .unwrap_or(0);
     for (idx, flag) in char_len_mask.iter().enumerate() {
         if !*flag {
             continue;
         }
-        let len = if formatted_iotype.is_some() && idx == 2 {
+        let len = if formatted.is_some() && idx == 2 {
             b.const_i64(iotype_len)
-        } else if (formatted_iotype.is_some() && idx == 5)
-            || (formatted_iotype.is_none() && idx == 3)
-        {
+        } else if (formatted.is_some() && idx == 5) || (formatted.is_none() && idx == 3) {
             iomsg_len
         } else {
             b.const_i64(0)
@@ -34083,6 +35442,7 @@ fn emit_defined_io_call(
     append_host_closure_args_raw(
         b,
         &ctx.locals,
+        ctx.st,
         Some(ctx.contained_host_refs),
         &specific_key,
         &mut call_args,
@@ -34103,6 +35463,7 @@ pub(super) fn try_lower_defined_io_write_items(
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
     formatted_iotype: Option<&str>,
+    explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: ValueId,
     iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
@@ -34114,25 +35475,38 @@ pub(super) fn try_lower_defined_io_write_items(
     } else {
         "write(unformatted)"
     };
-    let Some(candidates) = items
-        .iter()
-        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if candidates.iter().any(Option::is_none) {
         return false;
+    }
+    let explicit_edits = if formatted_iotype == Some("DT") {
+        match explicit_edits.filter(|edits| edits.len() == items.len()) {
+            Some(edits) => Some(edits),
+            None => return false,
+        }
+    } else {
+        None
     };
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
     let done = b.create_block("defined_write_done");
     lower_io_status_continue_or_exit(b, iostat, done);
 
-    for (item, candidate) in items.iter().zip(candidates.iter()) {
+    for (index, (item, candidate)) in items.iter().zip(candidates.iter()).enumerate() {
+        let formatted = explicit_edits
+            .map(|edits| {
+                let edit = &edits[index];
+                (edit.iotype.as_str(), edit.v_list.as_slice())
+            })
+            .or_else(|| formatted_iotype.map(|iotype| (iotype, &[] as &[i32])));
         emit_defined_io_call(
             b,
             ctx,
-            candidate,
+            candidate
+                .as_ref()
+                .expect("all-defined I/O plan lost a candidate"),
             item,
             unit,
-            formatted_iotype,
+            formatted,
             Some(iostat),
             iomsg_arg,
             iomsg_len,
@@ -34144,12 +35518,101 @@ pub(super) fn try_lower_defined_io_write_items(
     true
 }
 
+pub(super) fn try_lower_mixed_defined_io_write_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    advance: ValueId,
+    iostat: ValueId,
+    iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
+) -> bool {
+    // Mixed explicit DT editing needs stateful interleaving of intrinsic
+    // format processing and defined-I/O calls. This list-directed dispatcher
+    // has no active-descriptor state, so it must not fabricate DT metadata.
+    if items.is_empty() || formatted_iotype == Some("DT") {
+        return false;
+    }
+    let interface_name = if formatted_iotype.is_some() {
+        "write(formatted)"
+    } else {
+        "write(unformatted)"
+    };
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if !is_mixed_defined_io_plan(&candidates) {
+        return false;
+    }
+
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    b.call(
+        FuncRef::External("afs_list_write_begin".into()),
+        vec![unit, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+
+    let failed = b.create_block("mixed_defined_write_failed");
+    let done = b.create_block("mixed_defined_write_done");
+    lower_io_status_continue_or_exit(b, iostat, failed);
+
+    for (item, candidate) in items.iter().zip(candidates.iter()) {
+        if let Some(candidate) = candidate {
+            let formatted = formatted_iotype.map(|iotype| (iotype, &[] as &[i32]));
+            emit_defined_io_call(
+                b,
+                ctx,
+                candidate,
+                item,
+                unit,
+                formatted,
+                Some(iostat),
+                iomsg_arg,
+                iomsg_len,
+            );
+            lower_io_status_continue_or_exit(b, iostat, failed);
+        } else {
+            lower_write_items_adv(b, ctx, std::slice::from_ref(item), unit, false);
+            b.call(
+                FuncRef::External("afs_list_write_check".into()),
+                vec![unit, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+                IrType::Void,
+            );
+            lower_io_status_continue_or_exit(b, iostat, failed);
+        }
+    }
+
+    b.call(
+        FuncRef::External("afs_write_newline_if".into()),
+        vec![unit, advance],
+        IrType::Void,
+    );
+    b.call(
+        FuncRef::External("afs_list_write_end".into()),
+        vec![unit, advance, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+    b.branch(done, vec![]);
+
+    b.set_block(failed);
+    b.call(
+        FuncRef::External("afs_list_write_end".into()),
+        vec![unit, advance, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+    b.branch(done, vec![]);
+    b.set_block(done);
+    true
+}
+
 pub(super) fn try_lower_defined_io_read_items(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     items: &[crate::ast::expr::SpannedExpr],
     unit: ValueId,
     formatted_iotype: Option<&str>,
+    explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: Option<ValueId>,
     iomsg: Option<(ValueId, ValueId)>,
 ) -> bool {
@@ -34161,12 +35624,17 @@ pub(super) fn try_lower_defined_io_read_items(
     } else {
         "read(unformatted)"
     };
-    let Some(candidates) = items
-        .iter()
-        .map(|item| resolve_defined_io_item_specific(ctx, interface_name, item))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if candidates.iter().any(Option::is_none) {
         return false;
+    }
+    let explicit_edits = if formatted_iotype == Some("DT") {
+        match explicit_edits.filter(|edits| edits.len() == items.len()) {
+            Some(edits) => Some(edits),
+            None => return false,
+        }
+    } else {
+        None
     };
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
 
@@ -34179,14 +35647,22 @@ pub(super) fn try_lower_defined_io_read_items(
     });
     let done = b.create_block("defined_read_done");
     lower_io_status_continue_or_exit(b, statement_iostat, done);
-    for (item, candidate) in items.iter().zip(candidates.iter()) {
+    for (index, (item, candidate)) in items.iter().zip(candidates.iter()).enumerate() {
+        let formatted = explicit_edits
+            .map(|edits| {
+                let edit = &edits[index];
+                (edit.iotype.as_str(), edit.v_list.as_slice())
+            })
+            .or_else(|| formatted_iotype.map(|iotype| (iotype, &[] as &[i32])));
         emit_defined_io_call(
             b,
             ctx,
-            candidate,
+            candidate
+                .as_ref()
+                .expect("all-defined I/O plan lost a candidate"),
             item,
             unit,
-            formatted_iotype,
+            formatted,
             Some(statement_iostat),
             iomsg_arg,
             iomsg_len,
@@ -34199,6 +35675,107 @@ pub(super) fn try_lower_defined_io_read_items(
         lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
     }
     true
+}
+
+pub(super) fn try_lower_mixed_defined_io_read_items(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    items: &[crate::ast::expr::SpannedExpr],
+    unit: ValueId,
+    formatted_iotype: Option<&str>,
+    iostat: Option<ValueId>,
+    iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
+) -> bool {
+    // Mixed explicit DT editing needs stateful interleaving of intrinsic
+    // format processing and defined-I/O calls. This list-directed dispatcher
+    // has no active-descriptor state, so it must not fabricate DT metadata.
+    if items.is_empty() || formatted_iotype == Some("DT") {
+        return false;
+    }
+    let interface_name = if formatted_iotype.is_some() {
+        "read(formatted)"
+    } else {
+        "read(unformatted)"
+    };
+    let candidates = resolve_defined_io_item_plan(ctx, interface_name, items);
+    if !is_mixed_defined_io_plan(&candidates) {
+        return false;
+    }
+
+    let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let owns_iostat = iostat.is_none();
+    let statement_iostat = iostat.unwrap_or_else(|| {
+        let tmp = b.alloca(IrType::Int(IntWidth::I32));
+        let zero = b.const_i32(0);
+        b.store(zero, tmp);
+        tmp
+    });
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    b.call(
+        FuncRef::External("afs_list_read_begin".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+
+    let done = b.create_block("mixed_defined_read_done");
+    let mode = ReadMode::Unit {
+        unit,
+        iostat: statement_iostat,
+        error_exit: done,
+    };
+    lower_read_continue_or_exit(b, mode);
+    for (item, candidate) in items.iter().zip(candidates.iter()) {
+        if let Some(candidate) = candidate {
+            let formatted = formatted_iotype.map(|iotype| (iotype, &[] as &[i32]));
+            emit_defined_io_call(
+                b,
+                ctx,
+                candidate,
+                item,
+                unit,
+                formatted,
+                Some(statement_iostat),
+                iomsg_arg,
+                iomsg_len,
+            );
+            lower_read_continue_or_exit(b, mode);
+        } else {
+            lower_list_read_item(b, ctx, item, mode);
+        }
+    }
+    b.branch(done, vec![]);
+    b.set_block(done);
+    b.call(
+        FuncRef::External("afs_list_read_end".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+    if owns_iostat {
+        lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
+    }
+    true
+}
+
+fn lower_list_read_item(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    item: &crate::ast::expr::SpannedExpr,
+    mode: ReadMode,
+) {
+    if lower_array_read_item(b, ctx, item, mode) {
+        return;
+    }
+    if lower_derived_unit_read_item(b, ctx, item, mode) {
+        return;
+    }
+    if lower_list_char_read_item(b, ctx, item, mode) {
+        return;
+    }
+    let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
+        return;
+    };
+    let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
 }
 
 pub(super) fn lower_list_read_items(
@@ -34231,19 +35808,7 @@ pub(super) fn lower_list_read_items(
     lower_read_continue_or_exit(b, mode);
 
     for item in items {
-        if lower_array_read_item(b, ctx, item, mode) {
-            continue;
-        }
-        if lower_derived_unit_read_item(b, ctx, item, mode) {
-            continue;
-        }
-        if lower_list_char_read_item(b, ctx, item, mode) {
-            continue;
-        }
-        let Some((addr, ty, logical)) = lower_read_target_addr(b, ctx, item) else {
-            continue;
-        };
-        let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
+        lower_list_read_item(b, ctx, item, mode);
     }
     b.branch(done, vec![]);
     b.set_block(done);
@@ -34405,10 +35970,10 @@ pub(super) fn lower_read_err_branch(
     let Some(label) = err_label else {
         return;
     };
-    let Some(&target_bb) = ctx.label_blocks.get(&label) else {
+    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
         return;
     };
-    let Some(IrType::Ptr(_)) = b.func().value_type(iostat_addr) else {
+    let Some(target_bb) = lexical_cleanup_edge_for_label(b, ctx, label, "io_err_cleanup") else {
         return;
     };
 
@@ -34437,9 +36002,10 @@ pub(super) fn lower_read_status_branches(
     let iostat_end = b.const_i32(-1);
     let is_end = b.icmp(CmpOp::Eq, status, iostat_end);
 
-    if let Some((label, target_bb)) =
-        end_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
-    {
+    let end_edge = end_label.and_then(|label| {
+        lexical_cleanup_edge_for_label(b, ctx, label, "read_end_cleanup").map(|edge| (label, edge))
+    });
+    if let Some((label, target_bb)) = end_edge {
         let ok_bb = b.create_block(&format!("read_not_end_{}", label));
         b.cond_branch(is_end, target_bb, vec![], ok_bb, vec![]);
         b.set_block(ok_bb);
@@ -34461,9 +36027,10 @@ pub(super) fn lower_read_status_branches(
     let not_end = b.icmp(CmpOp::Ne, status, iostat_end);
     let is_err = b.and(nonzero, not_end);
 
-    if let Some((label, target_bb)) =
-        err_label.and_then(|label| ctx.label_blocks.get(&label).copied().map(|bb| (label, bb)))
-    {
+    let err_edge = err_label.and_then(|label| {
+        lexical_cleanup_edge_for_label(b, ctx, label, "read_err_cleanup").map(|edge| (label, edge))
+    });
+    if let Some((label, target_bb)) = err_edge {
         let ok_bb = b.create_block(&format!("read_ok_{}", label));
         b.cond_branch(is_err, target_bb, vec![], ok_bb, vec![]);
         b.set_block(ok_bb);
@@ -34964,17 +36531,13 @@ pub(super) fn lower_read_into_addr(
                     iostat,
                     ..
                 } => {
-                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
-                        FuncRef::External("afs_fmt_read_real".into()),
-                        vec![unit, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        FuncRef::External("afs_fmt_read_real32".into()),
+                        vec![unit, fmt_ptr, fmt_len, current_idx, addr, iostat],
                         IrType::Void,
                     );
                     finish_read_item(b, mode);
-                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                    let narrow = b.float_trunc(wide, FloatWidth::F32);
-                    b.store(narrow, addr);
                 }
                 ReadMode::FormattedInternal {
                     buf_ptr,
@@ -34985,17 +36548,21 @@ pub(super) fn lower_read_into_addr(
                     iostat,
                     ..
                 } => {
-                    let tmp = b.alloca(IrType::Float(FloatWidth::F64));
                     let current_idx = b.load_typed(item_idx, IrType::Int(IntWidth::I64));
                     b.call(
-                        FuncRef::External("afs_fmt_read_real_internal".into()),
-                        vec![buf_ptr, buf_len, fmt_ptr, fmt_len, current_idx, tmp, iostat],
+                        FuncRef::External("afs_fmt_read_real32_internal".into()),
+                        vec![
+                            buf_ptr,
+                            buf_len,
+                            fmt_ptr,
+                            fmt_len,
+                            current_idx,
+                            addr,
+                            iostat,
+                        ],
                         IrType::Void,
                     );
                     finish_read_item(b, mode);
-                    let wide = b.load_typed(tmp, IrType::Float(FloatWidth::F64));
-                    let narrow = b.float_trunc(wide, FloatWidth::F32);
-                    b.store(narrow, addr);
                 }
             }
             true
@@ -38820,6 +40387,7 @@ pub(super) fn actual_is_descriptor_backed(
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
+const DESC_ASSUMED_SIZE: i32 = armfortas_rt::descriptor::DESC_ASSUMED_SIZE as i32;
 
 pub(super) fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
     if info.by_ref {
@@ -39230,6 +40798,14 @@ pub(super) fn descriptor_flags(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
     b.load_typed(ptr, IrType::Int(IntWidth::I32))
 }
 
+pub(super) fn descriptor_is_assumed_size(b: &mut FuncBuilder, desc: ValueId) -> ValueId {
+    let flags = descriptor_flags(b, desc);
+    let marker = b.const_i32(DESC_ASSUMED_SIZE);
+    let bits = b.bit_and(flags, marker);
+    let zero = b.const_i32(0);
+    b.icmp(CmpOp::Ne, bits, zero)
+}
+
 pub(super) fn materialize_array_descriptor_for_info(
     b: &mut FuncBuilder,
     info: &LocalInfo,
@@ -39248,14 +40824,38 @@ pub(super) fn materialize_array_descriptor_for_info(
     let fallback_elem_size = ir_scalar_byte_size(&info.ty, b.layout);
     let elem_size = allocated_array_elem_size(b, info, fallback_elem_size, None);
     store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_size);
-    let rank = b.const_i32(info.dims.len() as i32);
+    // F2018 15.5.2.4: when an assumed-size dummy is forwarded to an
+    // assumed-rank dummy, the latter is associated with a rank-one
+    // assumed-size sequence regardless of the former dummy's declared
+    // rank (for example, `a(2, *)`). Preserve that view in the descriptor
+    // instead of exposing the explicit leading dimensions as a concrete
+    // rank.
+    let descriptor_rank = if info.last_dim_assumed_size {
+        1
+    } else {
+        info.dims.len() as i32
+    };
+    let rank = b.const_i32(descriptor_rank);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
     let mut flags = 2;
     if local_uses_char_slot_table(info) {
         flags |= DESC_CHAR_SLOT_TABLE;
     }
+    if info.last_dim_assumed_size {
+        flags |= DESC_ASSUMED_SIZE;
+    }
     let flags = b.const_i32(flags);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
+
+    if info.last_dim_assumed_size {
+        let lower = b.const_i64(1);
+        let upper = b.const_i64(0);
+        let stride = b.const_i64(1);
+        store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), lower);
+        store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), upper);
+        store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), stride);
+        return desc;
+    }
 
     // Per F2018 column-major layout: dim[k].stride is the memory step
     // (in elements) between adjacent logical positions along dim k.
@@ -41148,7 +42748,7 @@ pub(super) fn try_lower_scalarized_subscript_array_assign(
         end: synth_size_expr(dest_name, value.span),
         step: None,
     }];
-    lower_do_concurrent(b, ctx, &None, &controls, None, &body, value.span);
+    lower_do_concurrent(b, ctx, &None, &controls, None, &[], &body, value.span);
     true
 }
 
@@ -41236,7 +42836,7 @@ pub(super) fn try_lower_elemental_array_assign(
         end: synth_int_expr(dest_upper, value.span),
         step: None,
     }];
-    lower_do_concurrent(b, ctx, &None, &controls, None, &body, value.span);
+    lower_do_concurrent(b, ctx, &None, &controls, None, &[], &body, value.span);
     true
 }
 
@@ -41408,7 +43008,7 @@ pub(super) fn try_lower_defined_operator_array_assign(
         end: synth_int_expr(dest_upper, span),
         step: None,
     }];
-    lower_do_concurrent(b, ctx, &None, &controls, None, &body, span);
+    lower_do_concurrent(b, ctx, &None, &controls, None, &[], &body, span);
     true
 }
 
@@ -44757,16 +46357,18 @@ pub(super) fn resolved_named_callee_is_elemental(
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> bool {
     let callee_key = callee_name.to_lowercase();
-    if crate::sema::validate::is_intrinsic_name(&callee_key)
-        && is_array_reducing_intrinsic(&callee_key)
-        && !user_callable_shadows_intrinsic(
-            st,
-            current_proc_scope(),
-            b.func().name.as_str(),
-            &callee_key,
-        )
-    {
-        return false;
+    if let Some(intrinsic_name) = resolved_intrinsic_name_for_call(
+        st,
+        current_proc_scope(),
+        b.func().name.as_str(),
+        &callee_key,
+    ) {
+        if is_array_reducing_intrinsic(&intrinsic_name) {
+            return false;
+        }
+        if is_elemental_math_intrinsic(&intrinsic_name) {
+            return true;
+        }
     }
     let actual_vals: Vec<ValueId> = args
         .iter()
@@ -45568,6 +47170,25 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             ) {
                 return None;
             }
+            // Scalarization synthesizes a second call whose actual arguments
+            // are temporary scalar names. Preserve the intrinsic's canonical
+            // identity across that rewrite: a USE-renamed call such as
+            // `fused => ieee_fma` otherwise reaches type inference and the
+            // scalar intrinsic dispatcher under the local spelling `fused`,
+            // then falls through to a bare `ieee_fma` external.
+            if let Some(intrinsic_name) = resolved_intrinsic_name_for_call(
+                st,
+                current_proc_scope(),
+                b.func().name.as_str(),
+                name,
+            ) {
+                mapped_callee = crate::ast::Spanned::new(
+                    Expr::Name {
+                        name: intrinsic_name,
+                    },
+                    callee.span,
+                );
+            }
         }
         Expr::ComponentAccess { base, component } => {
             let tl = type_layouts?;
@@ -45845,7 +47466,19 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
 
     let control_desc = control_desc.or(fallback_control_desc)?;
     let control_rank = control_rank.or(fallback_control_rank).unwrap_or(1).max(1);
-    let result_type = operator_expr_type_info(expr, Some(locals), st, type_layouts)?;
+    let mapped_call = crate::ast::Spanned::new(
+        Expr::FunctionCall {
+            callee: Box::new(mapped_callee.clone()),
+            args: mapped_args.clone(),
+        },
+        expr.span,
+    );
+    // The element type is the type of the scalarized call, not of the
+    // original array-valued syntax. This distinction is load-bearing for
+    // USE-renamed intrinsics: the canonicalized mapped callee and synthetic
+    // scalar locals carry enough information to select the intrinsic result,
+    // while the original local spelling can look like an untyped external.
+    let result_type = operator_expr_type_info(&mapped_call, Some(&loop_locals), st, type_layouts)?;
     let (result_elem_ty, result_char_len) = match result_type {
         crate::sema::symtab::TypeInfo::Character { len: Some(len), .. } => {
             (IrType::Int(IntWidth::I8), Some(len))
@@ -45964,14 +47597,6 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             b.store(elem, temp_info.addr);
         }
     }
-
-    let mapped_call = crate::ast::Spanned::new(
-        Expr::FunctionCall {
-            callee: Box::new(mapped_callee.clone()),
-            args: mapped_args.clone(),
-        },
-        expr.span,
-    );
 
     if let Some(_char_len) = result_char_len {
         let (src_ptr, src_len) = lower_string_expr_full(
@@ -46409,7 +48034,7 @@ fn function_call_has_vector_subscript(
     })
 }
 
-fn array_expr_descriptor_may_own_temp(
+pub(super) fn array_expr_descriptor_may_own_temp(
     expr: &crate::ast::expr::SpannedExpr,
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
@@ -49474,7 +51099,7 @@ pub(super) fn lower_1d_section_assign(
                 }
                 let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
                 lower_derived_array_copy_from_desc(
-                    b, ctx, type_name, tmp_base, tmp_n, tmp_stride, desc,
+                    b, ctx, type_name, tmp_base, tmp_n, tmp_stride, None, desc,
                 );
                 src_snapshot = Some((tmp_desc, Some(type_name.to_string())));
             } else {
@@ -49521,11 +51146,21 @@ pub(super) fn lower_1d_section_assign(
                 dest_base,
                 dest_n,
                 dest_stride,
+                Some(dest_desc),
                 desc,
             );
             deallocate_section_snapshot_descriptor(b, ctx.type_layouts, src_snapshot);
         } else {
-            lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+            lower_derived_array_copy_loop(
+                b,
+                ctx,
+                type_name,
+                dest_base,
+                dest_n,
+                dest_stride,
+                dest_desc,
+                value,
+            );
         }
         return true;
     }
@@ -51112,6 +52747,7 @@ pub(super) fn lower_array_assign(
                                 dest_base,
                                 dest_n,
                                 dest_stride,
+                                None,
                                 src_desc,
                             );
                             let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -51431,7 +53067,7 @@ pub(super) fn lower_array_assign(
                         }
                         let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
                         lower_derived_array_copy_from_desc(
-                            b, ctx, type_name, tmp_base, tmp_n, tmp_stride, src_desc,
+                            b, ctx, type_name, tmp_base, tmp_n, tmp_stride, None, src_desc,
                         );
                         assign_src_desc = tmp_desc;
                         Some(tmp_desc)
@@ -51479,6 +53115,7 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
+                        None,
                         assign_src_desc,
                     );
                     if let Some(tmp_desc) = tmp_src_desc {
@@ -51568,6 +53205,7 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
+                        None,
                         src_desc,
                     );
                     deallocate_array_expr_descriptor_if_temp(
@@ -51715,6 +53353,11 @@ pub(super) fn lower_array_assign(
         let zero = b.const_i64(0);
         let dest_base = b.gep(dest_base_typed, vec![zero], IrType::Int(IntWidth::I8));
         let dest_n = array_total_elems_value(b, dest_info);
+        let dest_shape_desc = if local_uses_array_descriptor(dest_info) {
+            array_descriptor_addr(b, dest_info)
+        } else {
+            materialize_array_descriptor_for_info(b, dest_info)
+        };
         let dest_stride = if local_uses_array_descriptor(dest_info) {
             let dest_desc = array_descriptor_addr(b, dest_info);
             load_array_desc_i64_field(b, dest_desc, 24 + 16)
@@ -51752,7 +53395,7 @@ pub(super) fn lower_array_assign(
                     }
                     let tmp_stride = load_array_desc_i64_field(b, tmp_desc, 24 + 16);
                     lower_derived_array_copy_from_desc(
-                        b, ctx, type_name, tmp_base, tmp_n, tmp_stride, src_desc,
+                        b, ctx, type_name, tmp_base, tmp_n, tmp_stride, None, src_desc,
                     );
                     lower_derived_array_copy_from_desc(
                         b,
@@ -51761,6 +53404,7 @@ pub(super) fn lower_array_assign(
                         dest_base,
                         dest_n,
                         dest_stride,
+                        Some(dest_shape_desc),
                         tmp_desc,
                     );
                     let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
@@ -51790,7 +53434,16 @@ pub(super) fn lower_array_assign(
                 }
             }
         }
-        lower_derived_array_copy_loop(b, ctx, type_name, dest_base, dest_n, dest_stride, value);
+        lower_derived_array_copy_loop(
+            b,
+            ctx,
+            type_name,
+            dest_base,
+            dest_n,
+            dest_stride,
+            dest_shape_desc,
+            value,
+        );
         return;
     }
 
@@ -54274,6 +55927,22 @@ fn lower_minmaxloc_rank1_scalar(
     Some(b.load(result_addr))
 }
 
+fn static_array_lbound(lower: i64, extent: i64) -> i64 {
+    if extent <= 0 {
+        1
+    } else {
+        lower
+    }
+}
+
+fn static_array_ubound(lower: i64, extent: i64) -> i64 {
+    if extent <= 0 {
+        0
+    } else {
+        lower + extent - 1
+    }
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -54462,8 +56131,8 @@ pub(super) fn lower_array_intrinsic(
                 "lbound" => {
                     if let Some(dim) = dim_arg_const() {
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
-                            let lower = info.dims[dim as usize - 1].0;
-                            let r64 = b.const_i64(lower);
+                            let (lower, extent) = info.dims[dim as usize - 1];
+                            let r64 = b.const_i64(static_array_lbound(lower, extent));
                             return Some(b.int_trunc(r64, IntWidth::I32));
                         }
                     }
@@ -54472,7 +56141,7 @@ pub(super) fn lower_array_intrinsic(
                     if let Some(dim) = dim_arg_const() {
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
                             let (lower, extent) = info.dims[dim as usize - 1];
-                            let r64 = b.const_i64(lower + extent - 1);
+                            let r64 = b.const_i64(static_array_ubound(lower, extent));
                             return Some(b.int_trunc(r64, IntWidth::I32));
                         }
                     }
@@ -54618,10 +56287,10 @@ pub(super) fn lower_array_intrinsic(
                             let default = b.const_i64(1);
                             let idx0 = b.isub(raw_dim, one);
                             let mut result = default;
-                            for (idx, (lower, _extent)) in info.dims.iter().enumerate() {
+                            for (idx, (lower, extent)) in info.dims.iter().enumerate() {
                                 let cond_idx = b.const_i32(idx as i32);
                                 let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                                let lower_val = b.const_i64(*lower);
+                                let lower_val = b.const_i64(static_array_lbound(*lower, *extent));
                                 result = b.select(is_match, lower_val, result);
                             }
                             result
@@ -54666,7 +56335,7 @@ pub(super) fn lower_array_intrinsic(
                             for (idx, (lower, extent)) in info.dims.iter().enumerate() {
                                 let cond_idx = b.const_i32(idx as i32);
                                 let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                                let upper_val = b.const_i64(lower + extent - 1);
+                                let upper_val = b.const_i64(static_array_ubound(*lower, *extent));
                                 result = b.select(is_match, upper_val, result);
                             }
                             result
@@ -55351,21 +57020,9 @@ pub(super) fn layout_component_field_or_parent_view(
         if parent_name.eq_ignore_ascii_case(component)
             || parent_layout.name.eq_ignore_ascii_case(component)
         {
-            return Some(crate::sema::type_layout::FieldLayout {
-                name: parent_layout.name.clone(),
-                offset: 0,
-                size: parent_layout.size,
-                dims: vec![],
-                declared_array: false,
-                type_info: crate::sema::symtab::TypeInfo::Derived(parent_layout.name.clone()),
-                allocatable: false,
-                pointer: false,
-                deferred_char: false,
-                target: false,
-                procedure_pointer: false,
-                procedure_pointer_nopass: false,
-                default_init: None,
-            });
+            return Some(crate::sema::type_layout::whole_parent_component_field(
+                parent_layout,
+            ));
         }
         parent = parent_layout.parent.as_deref();
     }
@@ -58094,6 +59751,7 @@ pub(super) fn store_derived_field_expr(
                         append_host_closure_args_raw(
                             b,
                             locals,
+                            st,
                             contained_host_refs,
                             closure_key,
                             &mut closure_args,
@@ -58279,6 +59937,7 @@ pub(super) fn lower_derived_array_copy_loop(
     dest_base: ValueId,
     dest_n: ValueId,
     dest_stride: ValueId,
+    dest_shape_desc: ValueId,
     value: &crate::ast::expr::SpannedExpr,
 ) {
     let elem_bytes = ctx
@@ -58297,6 +59956,13 @@ pub(super) fn lower_derived_array_copy_loop(
         Some(ctx.contained_host_refs),
         Some(ctx.descriptor_params),
     );
+    if let Some((source_desc, _)) = src_desc.as_ref() {
+        b.runtime_call(
+            RuntimeFunc::CheckArrayAssignmentConformance,
+            vec![dest_shape_desc, *source_desc],
+            IrType::Void,
+        );
+    }
     let src_n = src_desc.as_ref().map(|(desc, _)| {
         b.call(
             FuncRef::External("afs_array_size".into()),
@@ -58363,6 +60029,7 @@ pub(super) fn lower_derived_array_copy_from_desc(
     dest_base: ValueId,
     dest_n: ValueId,
     dest_stride: ValueId,
+    dest_shape_desc: Option<ValueId>,
     src_desc: ValueId,
 ) {
     let elem_bytes = ctx
@@ -58371,6 +60038,13 @@ pub(super) fn lower_derived_array_copy_from_desc(
         .map(|layout| layout.size as i64)
         .unwrap_or(8);
     let elem_bytes_val = b.const_i64(elem_bytes);
+    if let Some(dest_shape_desc) = dest_shape_desc {
+        b.runtime_call(
+            RuntimeFunc::CheckArrayAssignmentConformance,
+            vec![dest_shape_desc, src_desc],
+            IrType::Void,
+        );
+    }
     let src_n = b.call(
         FuncRef::External("afs_array_size".into()),
         vec![src_desc],
@@ -58600,7 +60274,7 @@ pub(super) fn lower_hidden_string_result_copy(b: &mut FuncBuilder, ctx: &LowerCt
         .as_ref()
         .expect("hidden string result must have a result variable name");
     let info = ctx
-        .locals
+        .procedure_locals
         .get(result_name)
         .unwrap_or_else(|| panic!("missing hidden string result local '{}'", result_name));
     if info.is_pointer && matches!(info.char_kind, CharKind::Deferred) {
@@ -58998,18 +60672,6 @@ pub(super) fn emit_runtime_errmsg_on_failure(
     }
     b.branch(done_bb, vec![]);
     b.set_block(done_bb);
-}
-
-pub(super) fn allocate_char_source_value(
-    b: &mut FuncBuilder,
-    ctx: &LowerCtx,
-    opts: &[IoControl],
-) -> Option<(ValueId, ValueId)> {
-    let expr = allocate_keyword_expr(opts, "source")?;
-    if !expr_is_character_expr(b, &ctx.locals, expr, ctx.st, Some(ctx.type_layouts)) {
-        return None;
-    }
-    Some(lower_string_expr_ctx(b, ctx, expr))
 }
 
 pub(super) fn allocate_char_mold_len(
@@ -59693,6 +61355,7 @@ pub(super) fn type_layout_vtable_symbol(
     for final_proc in &layout.final_procs {
         final_proc.name.to_lowercase().hash(&mut hasher);
         final_proc.rank.hash(&mut hasher);
+        final_proc.elemental.hash(&mut hasher);
     }
     Some(format!(
         "afs_vtable_v2_local_{:016x}_{}",
@@ -59915,7 +61578,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
     dest_base: ValueId,
     dest_ty: &IrType,
     derived_type: Option<&str>,
-    source_expr: &SpannedExpr,
+    source_value: ValueId,
 ) {
     let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
     let zero = b.const_i32(0);
@@ -59926,10 +61589,8 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
 
     b.set_block(init_bb);
     if let Some(type_name) = derived_type {
-        let src = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
-        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, src);
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_base, source_value);
     } else {
-        let raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
         // Complex(sp/dp) results returned via the ComplexBuffer ABI
         // come back as a pointer to a fresh 8/16-byte buffer holding
         // the lane pair.  Depending on the call site that pointer is
@@ -59944,7 +61605,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
         // `allocate(mean_, source = mean(x, 1, mask))` where mean
         // returns scalar complex(sp).
         if is_complex_ty(dest_ty) {
-            let raw_ty = b.func().value_type(raw);
+            let raw_ty = b.func().value_type(source_value);
             let raw_is_complex_buffer = matches!(
                 raw_ty,
                 Some(IrType::Ptr(ref inner)) if matches!(
@@ -59959,7 +61620,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
                 let bytes = b.const_i64(complex_byte_size(dest_ty));
                 b.call(
                     FuncRef::External("memcpy".into()),
-                    vec![dest_base, raw, bytes],
+                    vec![dest_base, source_value, bytes],
                     IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                 );
                 b.branch(done_bb, vec![]);
@@ -59967,7 +61628,7 @@ pub(super) fn emit_scalar_allocate_source_init_on_success(
                 return;
             }
         }
-        let coerced = coerce_to_type(b, raw, dest_ty);
+        let coerced = coerce_to_type(b, source_value, dest_ty);
         b.store(coerced, dest_base);
     }
     b.branch(done_bb, vec![]);
@@ -59981,7 +61642,7 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     dest_desc: ValueId,
     dest_ty: &IrType,
     derived_type: Option<&str>,
-    source_expr: &SpannedExpr,
+    source_value: ValueId,
 ) {
     let stat = b.load_typed(stat_addr, IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
@@ -59998,8 +61659,6 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     );
     let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
     let dest_stride = load_array_desc_i64_field(b, dest_desc, 24 + 16);
-    let scalar_raw = super::expr::lower_expr_ctx_tl(b, ctx, source_expr);
-
     let elem_bytes = if let Some(type_name) = derived_type {
         ctx.type_layouts
             .get(type_name)
@@ -60013,9 +61672,9 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     let elem_bytes_val = b.const_i64(elem_bytes);
 
     let complex_scalar_src = if is_complex_ty(dest_ty) {
-        let raw_ty = b.func().value_type(scalar_raw);
+        let raw_ty = b.func().value_type(source_value);
         Some(match raw_ty {
-            Some(IrType::Ptr(ref inner)) if inner.as_ref() == dest_ty => scalar_raw,
+            Some(IrType::Ptr(ref inner)) if inner.as_ref() == dest_ty => source_value,
             Some(IrType::Ptr(ref inner))
                 if matches!(
                     inner.as_ref(),
@@ -60025,15 +61684,15 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
                                 && (*n == 8 || *n == 16))
                 ) || matches!(inner.as_ref(), IrType::Int(IntWidth::I8)) =>
             {
-                scalar_raw
+                source_value
             }
-            _ => materialize_complex_operand(b, scalar_raw, complex_float_width(dest_ty)),
+            _ => materialize_complex_operand(b, source_value, complex_float_width(dest_ty)),
         })
     } else {
         None
     };
     let scalar = if derived_type.is_none() && complex_scalar_src.is_none() {
-        Some(coerce_to_type(b, scalar_raw, dest_ty))
+        Some(coerce_to_type(b, source_value, dest_ty))
     } else {
         None
     };
@@ -60058,7 +61717,7 @@ pub(super) fn emit_array_allocate_scalar_source_init_on_success(
     let dest_off = b.imul(dest_index, elem_bytes_val);
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
     if let Some(type_name) = derived_type {
-        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, scalar_raw);
+        emit_derived_value_copy(b, ctx.type_layouts, type_name, dest_ptr, source_value);
     } else if let Some(src_ptr) = complex_scalar_src {
         b.call(
             FuncRef::External("memcpy".into()),
@@ -60579,7 +62238,7 @@ pub(super) fn lower_sequence_array_actual(
     copy_back: bool,
     temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
-    if contiguous_sequence_section_actual(locals, expr) {
+    if proven_contiguous_sequence_section_actual(locals, expr) {
         let (source_desc, elem_ty) = lower_array_expr_descriptor(
             b,
             locals,
@@ -60673,7 +62332,7 @@ pub(super) fn lower_sequence_char_array_actual(
         return None;
     }
 
-    let desc = if contiguous_sequence_section_actual(locals, expr) {
+    let desc = if proven_contiguous_sequence_section_actual(locals, expr) {
         source_desc
     } else {
         let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
@@ -60698,7 +62357,7 @@ pub(super) fn lower_sequence_char_array_actual(
     Some(base)
 }
 
-fn contiguous_sequence_section_actual(
+fn proven_contiguous_sequence_section_actual(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
 ) -> bool {
@@ -60712,6 +62371,14 @@ fn contiguous_sequence_section_actual(
         return false;
     };
     if info.dims.is_empty() && !local_uses_array_descriptor(info) {
+        return false;
+    }
+    // A unit triplet describes logical positions in the source descriptor;
+    // it does not prove adjacent positions are adjacent in memory. POINTER
+    // and assumed-shape/assumed-rank descriptors may carry arbitrary runtime
+    // strides, so their sections need the conservative copy path. Allocatable
+    // storage and ordinary explicit-shape locals are contiguous by contract.
+    if info.is_pointer || info.descriptor_arg {
         return false;
     }
     if args.len() == 1 {
@@ -61221,16 +62888,54 @@ pub(super) fn lower_pointer_dummy_actual(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
+    use crate::sema::symtab::SymbolKind;
+
     if let Expr::Name { name } = &expr.node {
-        let info = locals.get(&name.to_lowercase())?;
-        if !info.is_pointer {
+        let key = name.to_lowercase();
+        if let Some(info) = locals.get(&key).filter(|info| info.is_pointer) {
+            return Some(if info.by_ref {
+                b.load(info.addr)
+            } else {
+                info.addr
+            });
+        }
+        let is_procedure = st
+            .lookup_local_then_any(current_proc_scope(), &key)
+            .is_some_and(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Subroutine
+                        | SymbolKind::ExternalProc
+                        | SymbolKind::IntrinsicProc
+                        | SymbolKind::ProcedurePointer
+                ) || symbol.attrs.external
+                    || symbol.attrs.procedure_iface.is_some()
+            });
+        if is_procedure {
+            // A direct procedure designator has no pointer slot of its own.
+            // Materialize one for a procedure-pointer dummy: its callee-side
+            // representation dereferences the incoming slot to obtain the
+            // code address.
+            let raw = lower_arg_by_ref_full(
+                b,
+                locals,
+                expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            if b.func().value_type(raw).is_some_and(|ty| ty.is_ptr()) {
+                let slot = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                let pointer =
+                    coerce_to_type(b, raw, &IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                b.store(pointer, slot);
+                return Some(slot);
+            }
             return None;
         }
-        return Some(if info.by_ref {
-            b.load(info.addr)
-        } else {
-            info.addr
-        });
     }
     if let Expr::ComponentAccess { .. } = &expr.node {
         let tl = type_layouts?;
@@ -62044,15 +63749,20 @@ pub(super) fn lower_structure_constructor_expr(
         zero_fill_bytes(b, tmp, layout.size as i64);
     }
 
+    let positional_parent =
+        structure_constructor_expr_uses_positional_parent(layout, args, Some(locals), st, tl);
     let mut positional_idx = 0usize;
     for arg in args {
-        let field = if let Some(keyword) = &arg.keyword {
-            layout.field(keyword)
-        } else {
-            let field = layout.fields.get(positional_idx);
+        let field = crate::sema::type_layout::structure_constructor_field(
+            layout,
+            tl,
+            arg.keyword.as_deref(),
+            positional_idx,
+            positional_parent,
+        );
+        if arg.keyword.is_none() {
             positional_idx += 1;
-            field
-        };
+        }
         let Some(field) = field else {
             eprintln!(
                 "warning: structure constructor for '{}' has invalid field initializer",
@@ -62060,6 +63770,7 @@ pub(super) fn lower_structure_constructor_expr(
             );
             continue;
         };
+        let field = field.as_ref();
         if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(tmp, vec![offset], IrType::Int(IntWidth::I8));
@@ -62125,7 +63836,9 @@ mod tests {
     use crate::parser::Parser;
     use crate::sema::resolve;
 
-    fn lower_source(src: &str) -> Module {
+    fn lower_source_with_globals(
+        src: &str,
+    ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         let units = parser.parse_file().unwrap();
@@ -62143,7 +63856,10 @@ mod tests {
             HashMap::new(),
             crate::target::TargetLayout::LP64,
         )
-        .0
+    }
+
+    fn lower_source(src: &str) -> Module {
+        lower_source_with_globals(src).0
     }
 
     fn lower_and_verify(src: &str) -> (Module, String) {
@@ -62160,6 +63876,114 @@ mod tests {
         );
         let ir_text = printer::print_module(&module);
         (module, ir_text)
+    }
+
+    #[test]
+    fn transitive_use_chain_keeps_only_defining_global_entries() {
+        const DEPTH: usize = 24;
+        let mut source = String::new();
+        for index in 0..DEPTH {
+            source.push_str(&format!("module chain_{index}\n"));
+            if index > 0 {
+                source.push_str(&format!("  use chain_{}\n", index - 1));
+            }
+            source.push_str(&format!(
+                "  implicit none\n  integer, save :: value_{index} = {index}\ncontains\n  subroutine read_{index}(out)\n    integer, intent(out) :: out\n    out = value_0 + value_{index}\n  end subroutine read_{index}\nend module chain_{index}\n"
+            ));
+        }
+        source.push_str(&format!(
+            "program use_chain\n  use chain_{}, only: read_{}\n  implicit none\n  integer :: out\n  call read_{}(out)\n  if (out /= {}) error stop 1\nend program use_chain\n",
+            DEPTH - 1,
+            DEPTH - 1,
+            DEPTH - 1,
+            DEPTH - 1,
+        ));
+
+        let (module, globals) = lower_source_with_globals(&source);
+        let errors = verify::verify_module(&module);
+        assert!(errors.is_empty(), "IR verification failed: {errors:?}");
+        assert_eq!(
+            globals.len(),
+            DEPTH,
+            "transitive USE associations must resolve to defining globals without materializing one alias per downstream module"
+        );
+        let ir = printer::print_module(&module);
+        assert!(ir.contains("global_addr @afs_mod_chain_0_value_0"));
+        assert!(ir.contains(&format!(
+            "global_addr @afs_mod_chain_{}_value_{}",
+            DEPTH - 1,
+            DEPTH - 1
+        )));
+    }
+
+    #[test]
+    fn contained_procedure_lookup_avoids_full_scope_table_accesses() {
+        const PAIRS: usize = 64;
+        let mut source = String::from("module scope_scale\n  implicit none\ncontains\n");
+        for index in 0..PAIRS {
+            source.push_str(&format!(
+                "  subroutine caller_{index}(value)\n    integer, intent(out) :: value\n    call callee_{index}(value)\n  end subroutine caller_{index}\n  subroutine callee_{index}(value)\n    integer, intent(out) :: value\n    value = {index}\n  end subroutine callee_{index}\n"
+            ));
+        }
+        source.push_str("end module scope_scale\n");
+
+        let tokens = Lexer::tokenize(&source, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let units = parser.parse_file().unwrap();
+        let st = resolve::resolve_file(&units, &[], crate::target::TargetLayout::LP64)
+            .unwrap()
+            .st;
+        let module_scope = st.find_module_scope("scope_scale").unwrap();
+        let mut callers = HashMap::new();
+        let mut callees = HashMap::new();
+        for scope in st.all_scopes() {
+            if scope.parent != Some(module_scope) {
+                continue;
+            }
+            match &scope.kind {
+                crate::sema::symtab::ScopeKind::Subroutine(name) if name.starts_with("caller_") => {
+                    callers.insert(name.clone(), scope.id);
+                }
+                crate::sema::symtab::ScopeKind::Subroutine(name) if name.starts_with("callee_") => {
+                    callees.insert(name.clone(), scope.id);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(callers.len(), PAIRS);
+        assert_eq!(callees.len(), PAIRS);
+
+        st.reset_all_scopes_accesses();
+        for index in 0..PAIRS {
+            let caller_name = format!("caller_{index}");
+            let callee_name = format!("callee_{index}");
+            let caller_scope = callers[&caller_name];
+            let callee_scope = callees[&callee_name];
+            let _guard = ProcScopeGuard::enter(Some(caller_scope));
+            assert_eq!(
+                find_procedure_scope_id_for_caller_strict(&st, &callee_name, Some(caller_scope)),
+                Some(callee_scope)
+            );
+            assert_eq!(
+                callee_scope_id_for_lookup(
+                    &st,
+                    &module_procedure_symbol_name("scope_scale", &callee_name)
+                ),
+                Some(callee_scope)
+            );
+            assert_eq!(
+                callee_scope_id_for_lookup(
+                    &st,
+                    &module_procedure_symbol_name("SCOPE_SCALE", &callee_name).to_ascii_uppercase()
+                ),
+                Some(callee_scope)
+            );
+        }
+        assert_eq!(
+            st.all_scopes_accesses(),
+            0,
+            "contained-procedure and ABI lookup must use scope indexes instead of repeatedly scanning the full table"
+        );
     }
 
     #[test]
@@ -62410,6 +64234,31 @@ end program
         assert!(ir.contains("afs_write_internal_int"));
         assert!(ir.contains("afs_lst_ia_int"));
         assert!(ir.contains("afs_deallocate_array"));
+    }
+
+    #[test]
+    fn lower_inquire_iolength_uses_checked_scalar_and_array_accumulators() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  type :: record_t
+    integer(1) :: tag
+    integer(8) :: payload
+    character(3) :: code
+  end type record_t
+  integer :: n
+  integer(2) :: values(2, 3)
+  character(5) :: text
+  type(record_t) :: records(2)
+  inquire(iolength=n) values, text, records
+end program
+",
+        );
+        assert!(ir.matches("afs_iolength_add_array").count() >= 2);
+        assert!(ir.contains("afs_iolength_add"));
+        assert!(!ir.contains("afs_inquire_unit"));
+        assert!(!ir.contains("iolength_derived_array"));
     }
 
     #[test]
@@ -62787,6 +64636,43 @@ end module m
     }
 
     #[test]
+    fn omitted_optional_by_reference_arg_has_the_callee_pointer_type() {
+        let module = lower_source(
+            "\
+program test
+  implicit none
+  call consume(1)
+contains
+  subroutine consume(required, optional_arg)
+    integer, intent(in) :: required
+    integer, intent(in), optional :: optional_arg
+  end subroutine consume
+end program test
+",
+        );
+        let caller = module
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("__prog_"))
+            .expect("missing lowered program");
+        let omitted_arg = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| match &inst.kind {
+                InstKind::Call(_, args) if args.len() == 2 => Some(args[1]),
+                _ => None,
+            })
+            .expect("missing call to contained subroutine");
+
+        assert_eq!(
+            caller.value_type(omitted_arg),
+            Some(IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)))),
+            "an absent by-reference dummy must use the callee's pointer type",
+        );
+    }
+
+    #[test]
     fn nondefault_logical_array_masks_verify() {
         lower_and_verify(
             "\
@@ -63003,6 +64889,89 @@ end program
 ",
         );
         assert!(ir.matches("doconc_check").count() >= 2);
+    }
+
+    #[test]
+    fn lower_named_cycle_in_multi_control_do_concurrent_targets_next_tuple() {
+        let (module, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: i, j, seen(3, 4)
+  seen = 0
+tuples: do concurrent (i = 1:3, j = 1:4)
+    if (j == 2) cycle tuples
+    seen(i, j) = 10 * i + j
+  end do tuples
+end program
+",
+        );
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("__prog_"))
+            .expect("missing lowered program function");
+        let increments: Vec<_> = function
+            .blocks
+            .iter()
+            .filter(|block| block.name.starts_with("doconc_incr"))
+            .map(|block| block.id)
+            .collect();
+        assert_eq!(
+            increments.len(),
+            2,
+            "two controls must produce two sequential loop increments:\n{ir}"
+        );
+        let cycle_target = function
+            .blocks
+            .iter()
+            .find(|block| block.name.starts_with("if_then"))
+            .and_then(|block| match &block.terminator {
+                Some(crate::ir::inst::Terminator::Branch(target, _)) => Some(*target),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing named CYCLE branch:\n{ir}"));
+        assert_eq!(
+            cycle_target, increments[1],
+            "named CYCLE must advance the innermost control and therefore the next tuple:\n{ir}"
+        );
+        assert_ne!(
+            cycle_target, increments[0],
+            "named CYCLE must not skip the remaining inner-control values:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_do_concurrent_locality_uses_private_construct_entities() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: i, j, seed, scratch, total
+  integer :: seen(2, 2)
+  seed = 10
+  scratch = 77
+  total = 5
+  seen = 0
+  do concurrent (i = 1:2, j = 1:2) &
+      local_init(seed) local(scratch) shared(seen) reduce(+:total) default(none)
+    scratch = 100 * i + j
+    seen(i, j) = seed + scratch
+    seed = seed + 1
+    total = total + i + j
+  end do
+end program
+",
+        );
+        assert!(ir.matches("doconc_check").count() >= 2);
+        assert!(
+            ir.matches("alloca i32").count() >= 8,
+            "LOCAL, LOCAL_INIT, and REDUCE need storage distinct from the five source scalars:\n{ir}"
+        );
+        assert!(
+            ir.contains("call @memcpy"),
+            "LOCAL_INIT should copy the enclosing value into its construct entity:\n{ir}"
+        );
     }
 
     #[test]
@@ -63267,6 +65236,34 @@ end program
         assert!(ir.contains("case_0_body"));
         assert!(ir.contains("case_1_body"));
         assert!(ir.contains("select_end"));
+    }
+
+    #[test]
+    fn source_i64_select_case_uses_a_typed_comparison_chain() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer(8) :: selector, result
+  selector = 4294967296_8
+  select case (selector)
+  case (4294967296_8)
+    result = 1_8
+  case default
+    result = 0_8
+  end select
+  if (result /= 1_8) error stop 1
+end program
+",
+        );
+        assert!(
+            ir.contains("icmp eq"),
+            "source SELECT CASE must compare values with typed integer IR:\n{ir}",
+        );
+        assert!(
+            !ir.contains("switch %"),
+            "general source SELECT CASE intentionally uses typed comparison chains:\n{ir}",
+        );
     }
 
     #[test]
@@ -63644,6 +65641,129 @@ end program
             &program_ir[borrowed_start..]
         );
         assert_eq!(program_ir.matches("rt_call @__afs_deallocate").count(), 1);
+    }
+
+    #[test]
+    fn generic_derived_result_does_not_inherit_renamed_character_dummy_abi() {
+        let (module, ir) = lower_and_verify(include_str!(
+            "../../../test_programs/generic_private_rename_derived_result.f90"
+        ));
+        let callee_name = "afs_modproc_generic_private_rename_string_mod_lower_string";
+        let (callee_index, callee) = module
+            .functions
+            .iter()
+            .enumerate()
+            .find(|(_, function)| function.name == callee_name)
+            .expect("missing selected generic specific");
+        assert_eq!(
+            callee.params.len(),
+            2,
+            "derived-result specific must use only sret plus its visible dummy",
+        );
+        let caller = module
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with("__prog_"))
+            .expect("missing program caller");
+        let call_arities: Vec<usize> = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| match &inst.kind {
+                InstKind::Call(FuncRef::External(name), args) if name == callee_name => {
+                    Some(args.len())
+                }
+                InstKind::Call(FuncRef::Internal(index), args)
+                    if *index as usize == callee_index =>
+                {
+                    Some(args.len())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !call_arities.is_empty(),
+            "missing generic call to selected derived-result specific:\n{ir}",
+        );
+        assert!(
+            call_arities
+                .iter()
+                .all(|arity| *arity == callee.params.len()),
+            "renamed character procedure metadata leaked into derived-result calls: \
+             callee has {} parameters, call arities are {call_arities:?}\n{ir}",
+            callee.params.len(),
+        );
+    }
+
+    #[test]
+    fn host_associated_procedure_pointer_call_forwards_full_closure_abi() {
+        let (module, ir) = lower_and_verify(
+            "\
+program p
+  use iso_c_binding, only: c_funptr, c_funloc, c_f_procpointer, c_int
+  implicit none
+  abstract interface
+    subroutine cb_i(out) bind(C)
+      import :: c_int
+      integer(c_int), intent(out) :: out
+    end subroutine
+  end interface
+  procedure(cb_i), pointer :: fp
+  type(c_funptr) :: raw
+  integer(c_int) :: got
+
+  raw = c_funloc(fill_answer)
+  call c_f_procpointer(raw, fp)
+  call wrapper(got)
+contains
+  subroutine wrapper(out)
+    integer(c_int), intent(out) :: out
+    call fp(out)
+  end subroutine wrapper
+
+  subroutine fill_answer(out) bind(C)
+    integer(c_int), intent(out) :: out
+    out = 42_c_int
+  end subroutine fill_answer
+end program p
+",
+        );
+        let (wrapper_index, wrapper) = module
+            .functions
+            .iter()
+            .enumerate()
+            .find(|(_, function)| {
+                function.name.starts_with("afs_internal___prog_p_")
+                    && function.params.len() == 2 + crate::sema::type_layout::PROC_PTR_CLOSURE_SLOTS
+            })
+            .expect("missing contained wrapper with captured procedure pointer");
+        let caller = module
+            .functions
+            .iter()
+            .find(|function| function.name == "__prog_p")
+            .expect("missing lowered program");
+        let call_args = caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| match &inst.kind {
+                InstKind::Call(FuncRef::Internal(index), args)
+                    if *index as usize == wrapper_index =>
+                {
+                    Some(args)
+                }
+                InstKind::Call(FuncRef::External(name), args) if name == &wrapper.name => {
+                    Some(args)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing call to captured procedure-pointer wrapper:\n{ir}"));
+
+        assert_eq!(
+            call_args.len(),
+            wrapper.params.len(),
+            "caller must forward the captured procedure pointer and every reserved closure slot:\n{ir}",
+        );
     }
 
     #[test]
@@ -64335,6 +66455,76 @@ end module
             9,
             "each scalar intrinsic must release its owned character argument:\n{}",
             consume_ir
+        );
+    }
+
+    #[test]
+    fn character_intrinsics_lower_canonical_keyword_slots_and_result_kinds() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_intrinsic_keyword_m
+  implicit none
+contains
+  function make_text() result(value)
+    character(6) :: value
+    value = 'banana'
+  end function
+  subroutine consume()
+    integer(2) :: short
+    integer(8) :: wide
+    integer(16) :: widest
+    character(6) :: text
+    logical(1) :: back
+    back = .true.
+    wide = index(kind=8, substring='na', string=make_text())
+    wide = index(kind=selected_int_kind(18), substring='na', string='banana')
+    short = scan(kind=2, back=back, set='ab', string='cabca')
+    widest = verify(kind=16, set='ab', string='abXba')
+    wide = ichar(kind=kind(0_8), c='A')
+    text = repeat(ncopies=3, string='xy')
+    text = char(kind=1, i=65)
+    back = lge(string_b='A', string_a='B')
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_intrinsic_keyword_m_consume")
+            .expect("missing keyword intrinsic consumer IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir
+                .matches("call @afs_modproc_character_intrinsic_keyword_m_make_text")
+                .count(),
+            1,
+            "keyword actuals must be associated and evaluated exactly once:\n{consume_ir}"
+        );
+        for runtime in [
+            "call @afs_index",
+            "call @afs_scan",
+            "call @afs_verify",
+            "call @afs_ichar_ptr",
+            "call @afs_repeat",
+            "call @afs_char",
+            "call @afs_lge",
+        ] {
+            assert!(
+                consume_ir.contains(runtime),
+                "missing {runtime} in:\n{consume_ir}"
+            );
+        }
+        assert!(
+            consume_ir.contains(": i16 : i16"),
+            "kind=2 result must truncate to i16:\n{consume_ir}"
+        );
+        assert!(
+            consume_ir.contains(": i128 signed : i128"),
+            "kind=16 result must extend to i128:\n{consume_ir}"
         );
     }
 
@@ -65216,6 +67406,76 @@ end module
         assert_eq!(module.globals.len(), 2);
         assert!(module.globals.iter().any(|g| g.name.contains("counter")));
         assert!(module.globals.iter().any(|g| g.name.contains("threshold")));
+    }
+
+    #[test]
+    fn source_global_array_initializers_cover_flattened_ir_storage() {
+        let (module, _) = lower_and_verify(
+            "\
+module initialized_globals
+  implicit none
+  integer :: ints(3) = [1, 2, 3]
+  complex(4), parameter :: values(2) = [(1.0, 2.0), (3.0, 4.0)]
+end module initialized_globals
+",
+        );
+        let ints = module
+            .globals
+            .iter()
+            .find(|global| global.name.ends_with("_ints"))
+            .expect("missing integer array global");
+        let values = module
+            .globals
+            .iter()
+            .find(|global| global.name.ends_with("_values"))
+            .expect("missing complex array global");
+
+        assert!(
+            matches!(&ints.initializer, Some(GlobalInit::IntArray(entries)) if entries.len() == 3),
+            "integer array initializer must cover every declared element: {ints:?}",
+        );
+        assert!(
+            matches!(&values.initializer, Some(GlobalInit::FloatArray(entries)) if entries.len() == 4),
+            "complex array initializer must cover both lanes of every declared element: {values:?}",
+        );
+    }
+
+    #[test]
+    fn source_derived_local_uses_explicit_full_sized_byte_storage() {
+        let (module, ir) = lower_and_verify(
+            "\
+program derived_stack_storage
+  implicit none
+  type :: pair_t
+    integer(8) :: first
+    integer(8) :: second
+  end type pair_t
+  type(pair_t) :: pair
+  pair%first = 11_8
+  pair%second = 22_8
+  if (pair%first + pair%second /= 33_8) error stop 1
+end program derived_stack_storage
+",
+        );
+
+        assert!(
+            module.struct_defs.is_empty(),
+            "source derived types must not enter the reserved named-struct IR surface: {ir}",
+        );
+        assert!(
+            module.functions.iter().any(|func| {
+                func.blocks.iter().any(|block| {
+                    block.insts.iter().any(|inst| {
+                        matches!(
+                            &inst.kind,
+                            InstKind::Alloca(IrType::Array(element, 16))
+                                if matches!(element.as_ref(), IrType::Int(IntWidth::I8))
+                        )
+                    })
+                })
+            }),
+            "a two-i64 derived local must reserve its complete 16-byte layout: {ir}",
+        );
     }
 
     #[test]

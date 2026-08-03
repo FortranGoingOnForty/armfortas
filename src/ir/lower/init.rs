@@ -408,11 +408,32 @@ pub(crate) fn init_decls(
         match &decl.node {
             Decl::TypeDecl { entities, .. } => {
                 for entity in entities {
-                    let Some(init_expr) = &entity.init else {
-                        continue;
-                    };
                     let key = entity.name.to_lowercase();
                     let Some(info) = locals.get(&key) else {
+                        continue;
+                    };
+                    if let Some(Expr::Name { name }) =
+                        entity.ptr_init.as_ref().map(|init| &init.node)
+                    {
+                        let is_procedure_pointer = st
+                            .lookup_local_then_any(proc_scope_id, &key)
+                            .is_some_and(|symbol| {
+                                symbol.kind == crate::sema::symtab::SymbolKind::ProcedurePointer
+                            });
+                        if is_procedure_pointer {
+                            if let Some(wrapper) =
+                                specific_intrinsic_procedure_target_symbol(st, proc_scope_id, name)
+                            {
+                                let addr = b.global_addr(
+                                    wrapper,
+                                    procedure_pointer_symbol_addr_elem_type(info),
+                                );
+                                store_scalar_pointer_slot_value(b, info, addr);
+                                continue;
+                            }
+                        }
+                    }
+                    let Some(init_expr) = &entity.init else {
                         continue;
                     };
                     // Dummy arguments (by_ref locals) cannot have

@@ -21,14 +21,17 @@
 //! | ieee_class                       | implemented     | bit pattern              |
 //! | ieee_value                       | implemented     | bit pattern (call-opaque)|
 //! | ieee_copy_sign/logb/rint/scalb   | implemented     | libm                     |
+//! | ieee_fma/rem                     | implemented     | libm fma/remainder       |
 //! | ieee_next_after                  | implemented     | libm nextafter           |
+//! | ieee_selected_real_kind          | implemented     | compiler IR, kinds 4/8   |
 //! | ieee_max/min(_mag), *_num(_mag)  | implemented     | 60559:2020 (this file)   |
 //! | ieee_get/set_rounding_mode       | implemented     | FPCR (arm) / MXCSR (x86) |
 //! | ieee_get/set_flag, get/set_status| implemented     | FPSR/FPCR or MXCSR       |
 //! | ieee_support_datatype/nan/inf    | true (r4,r8)    | -                        |
 //! | ieee_support_denormal/subnormal  | true            | -                        |
 //! | ieee_support_divide/sqrt/io      | true            | -                        |
-//! | ieee_support_rounding/flag       | true            | -                        |
+//! | ieee_support_rounding            | mode-dependent  | FPCR (arm) / MXCSR (x86) |
+//! | ieee_support_flag                | true            | -                        |
 //! | ieee_support_underflow_control   | false           | FZ flipping out of scope |
 //! | ieee_support_halting             | false           | trap delivery unreliable |
 //! | ieee_support_standard            | false           | implies halting (false)  |
@@ -53,6 +56,18 @@ unsafe extern "C" {
     fn c_scalbn(x: f64, exponent: i32) -> f64;
     #[link_name = "scalbnf"]
     fn c_scalbnf(x: f32, exponent: i32) -> f32;
+    #[link_name = "nextafter"]
+    fn c_nextafter(x: f64, y: f64) -> f64;
+    #[link_name = "nextafterf"]
+    fn c_nextafterf(x: f32, y: f32) -> f32;
+    #[link_name = "fma"]
+    fn c_fma(a: f64, b: f64, c: f64) -> f64;
+    #[link_name = "fmaf"]
+    fn c_fmaf(a: f32, b: f32, c: f32) -> f32;
+    #[link_name = "remainder"]
+    fn c_remainder(x: f64, y: f64) -> f64;
+    #[link_name = "remainderf"]
+    fn c_remainderf(x: f32, y: f32) -> f32;
 }
 
 fn class_f64(bits: u64) -> i32 {
@@ -234,6 +249,30 @@ pub extern "C" fn afs_ieee_copy_sign_r4(x: f32, y: f32) -> f32 {
 }
 
 #[no_mangle]
+pub extern "C" fn afs_ieee_fma_r8(a: f64, b: f64, c: f64) -> f64 {
+    // SAFETY: C99 fma has no pointer or lifetime preconditions.
+    unsafe { c_fma(a, b, c) }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_fma_r4(a: f32, b: f32, c: f32) -> f32 {
+    // SAFETY: C99 fmaf has no pointer or lifetime preconditions.
+    unsafe { c_fmaf(a, b, c) }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_rem_r8(x: f64, y: f64) -> f64 {
+    // SAFETY: C99 remainder has no pointer or lifetime preconditions.
+    unsafe { c_remainder(x, y) }
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_rem_r4(x: f32, y: f32) -> f32 {
+    // SAFETY: C99 remainderf has no pointer or lifetime preconditions.
+    unsafe { c_remainderf(x, y) }
+}
+
+#[no_mangle]
 pub extern "C" fn afs_fraction_r8(x: f64) -> f64 {
     let bits = x.to_bits();
     let exponent = (bits >> 52) & 0x7ff;
@@ -403,8 +442,8 @@ fn round_integral_bits(
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
-    let use_current = !(0..=4).contains(&round);
-    let mode = if use_current {
+    let uses_ambient_mode = !(0..=4).contains(&round);
+    let mode = if uses_ambient_mode {
         fpenv::get_rounding()
     } else {
         round
@@ -417,7 +456,9 @@ pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
         return f64::from_bits(bits | (1u64 << 51));
     }
     let result_bits = round_integral_bits(bits, 11, 52, 1023, mode);
-    if use_current && exponent != 0x7ff && result_bits != bits {
+    // With ROUND, IEEE_RINT is quiet roundToIntegral{rounding}. Without
+    // ROUND, it is roundToIntegralExact and signals when a finite value changes.
+    if uses_ambient_mode && exponent != 0x7ff && result_bits != bits {
         fpenv::set_flag(5, true);
     }
     f64::from_bits(result_bits)
@@ -425,8 +466,8 @@ pub extern "C" fn afs_ieee_rint_r8_round(x: f64, round: i32) -> f64 {
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_rint_r4_round(x: f32, round: i32) -> f32 {
-    let use_current = !(0..=4).contains(&round);
-    let mode = if use_current {
+    let uses_ambient_mode = !(0..=4).contains(&round);
+    let mode = if uses_ambient_mode {
         fpenv::get_rounding()
     } else {
         round
@@ -439,7 +480,7 @@ pub extern "C" fn afs_ieee_rint_r4_round(x: f32, round: i32) -> f32 {
         return f32::from_bits(bits | (1u32 << 22));
     }
     let result_bits = round_integral_bits(bits as u64, 8, 23, 127, mode) as u32;
-    if use_current && exponent != 0xff && result_bits != bits {
+    if uses_ambient_mode && exponent != 0xff && result_bits != bits {
         fpenv::set_flag(5, true);
     }
     f32::from_bits(result_bits)
@@ -470,36 +511,12 @@ pub extern "C" fn afs_ieee_scalb_r4(x: f32, i: i32) -> f32 {
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_next_after_r8(x: f64, y: f64) -> f64 {
-    if x.is_nan() || y.is_nan() {
-        return f64::NAN;
-    }
-    if x == y {
-        return y;
-    }
-    if x == 0.0 {
-        return f64::from_bits(1).copysign(y);
-    }
-    let bits = x.to_bits();
-    let up = (y > x) == (x > 0.0);
-    let next = if up { bits + 1 } else { bits - 1 };
-    f64::from_bits(next)
+    unsafe { c_nextafter(x, y) }
 }
 
 #[no_mangle]
 pub extern "C" fn afs_ieee_next_after_r4(x: f32, y: f32) -> f32 {
-    if x.is_nan() || y.is_nan() {
-        return f32::NAN;
-    }
-    if x == y {
-        return y;
-    }
-    if x == 0.0 {
-        return f32::from_bits(1).copysign(y);
-    }
-    let bits = x.to_bits();
-    let up = (y > x) == (x > 0.0);
-    let next = if up { bits + 1 } else { bits - 1 };
-    f32::from_bits(next)
+    unsafe { c_nextafterf(x, y) }
 }
 
 // ---- F2023 / ISO/IEC 60559:2020 maximum/minimum family ----
@@ -747,7 +764,8 @@ pub extern "C" fn afs_ieee_min_num_mag_r4(x: f32, y: f32) -> f32 {
 // both in MXCSR. Ported from libgfortran/config/fpu-aarch64.h and the
 // MXCSR halves of fpu-387.h.
 //
-// Rounding tags (ieee_round_type): 0=nearest, 1=to_zero, 2=up, 3=down.
+// Rounding tags (ieee_round_type): 0=nearest, 1=to_zero, 2=up, 3=down,
+// 4=away, 5=other. FPCR and MXCSR represent only the first four.
 // Flag tags (ieee_flag_type): 1=invalid, 2=divide_by_zero, 3=overflow,
 // 4=underflow, 5=inexact.
 
@@ -781,12 +799,16 @@ mod fpenv {
             _ => 1,    // to_zero
         }
     }
+    pub fn supports_rounding(tag: i32) -> bool {
+        matches!(tag, 0..=3)
+    }
     pub fn set_rounding(tag: i32) {
         let rmode: u64 = match tag {
+            0 => 0b00,
             2 => 0b01,
             3 => 0b10,
             1 => 0b11,
-            _ => 0b00,
+            _ => return,
         };
         let fpcr = (read_fpcr() & !(0b11 << 22)) | (rmode << 22);
         write_fpcr(fpcr);
@@ -848,12 +870,16 @@ mod fpenv {
             _ => 1,    // to_zero
         }
     }
+    pub fn supports_rounding(tag: i32) -> bool {
+        matches!(tag, 0..=3)
+    }
     pub fn set_rounding(tag: i32) {
         let rc: u32 = match tag {
+            0 => 0b00,
             3 => 0b01,
             2 => 0b10,
             1 => 0b11,
-            _ => 0b00,
+            _ => return,
         };
         let mxcsr = (read_mxcsr() & !(0b11 << 13)) | (rc << 13);
         write_mxcsr(mxcsr);
@@ -899,6 +925,9 @@ mod fpenv {
     pub fn get_rounding() -> i32 {
         0
     }
+    pub fn supports_rounding(tag: i32) -> bool {
+        tag == 0
+    }
     pub fn set_rounding(_tag: i32) {}
     pub fn test_flag(_tag: i32) -> i32 {
         0
@@ -913,6 +942,11 @@ mod fpenv {
 #[no_mangle]
 pub extern "C" fn afs_ieee_get_rounding() -> i32 {
     fpenv::get_rounding()
+}
+
+#[no_mangle]
+pub extern "C" fn afs_ieee_support_rounding(tag: i32) -> i32 {
+    i32::from(fpenv::supports_rounding(tag))
 }
 
 #[no_mangle]
@@ -1043,6 +1077,25 @@ mod tests {
         assert_eq!(afs_ieee_min_num_r4(f32::NAN, 5.0), 5.0);
     }
 
+    #[test]
+    fn fused_multiply_add_and_exact_remainder() {
+        let delta64 = 2.0f64.powi(-27);
+        assert_eq!(
+            afs_ieee_fma_r8(1.0 + delta64, 1.0 - delta64, -1.0),
+            -2.0f64.powi(-54)
+        );
+        let delta32 = 2.0f32.powi(-13);
+        assert_eq!(
+            afs_ieee_fma_r4(1.0 + delta32, 1.0 - delta32, -1.0),
+            -2.0f32.powi(-26)
+        );
+
+        assert_eq!(afs_ieee_rem_r8(7.0, 2.0), -1.0);
+        assert_eq!(afs_ieee_rem_r8(5.0, 2.0), 1.0);
+        assert_eq!(afs_ieee_rem_r8(-4.0, 2.0).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(afs_ieee_rem_r4(7.0, 2.0), -1.0);
+    }
+
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn rounding_and_flags_round_trip() {
@@ -1054,6 +1107,8 @@ mod tests {
         assert_eq!(afs_ieee_get_rounding(), 2);
         afs_ieee_set_rounding(3); // down
         assert_eq!(afs_ieee_get_rounding(), 3);
+        afs_ieee_set_rounding(1); // toward zero
+        assert_eq!(afs_ieee_get_rounding(), 1);
         afs_ieee_set_rounding(0); // nearest
         assert_eq!(afs_ieee_get_rounding(), 0);
         afs_ieee_set_rounding(orig);
@@ -1070,6 +1125,39 @@ mod tests {
     }
 
     #[test]
+    fn rounding_support_matches_the_architecture() {
+        assert_eq!(afs_ieee_support_rounding(0), 1);
+
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        for tag in 1..=3 {
+            assert_eq!(afs_ieee_support_rounding(tag), 1, "rounding tag {tag}");
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        for tag in 1..=3 {
+            assert_eq!(afs_ieee_support_rounding(tag), 0, "rounding tag {tag}");
+        }
+
+        for tag in [4, 5, -1, i32::MAX] {
+            assert_eq!(afs_ieee_support_rounding(tag), 0, "rounding tag {tag}");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn unsupported_rounding_tags_preserve_the_environment() {
+        let saved = fpenv::get_status();
+
+        afs_ieee_set_rounding(2);
+        for tag in [4, 5, -1, i32::MAX] {
+            afs_ieee_set_rounding(tag);
+            assert_eq!(afs_ieee_get_rounding(), 2, "rounding tag {tag}");
+        }
+
+        fpenv::set_status(saved);
+    }
+
+    #[test]
     fn logb_and_next_after() {
         assert_eq!(afs_ieee_logb_r8(8.0), 3.0);
         assert_eq!(afs_ieee_logb_r8(1.0), 0.0);
@@ -1078,6 +1166,54 @@ mod tests {
         assert!(afs_ieee_next_after_r8(1.0, 0.0) < 1.0);
         assert_eq!(afs_ieee_copy_sign_r8(3.0, -1.0), -3.0);
         assert_eq!(afs_ieee_scalb_r8(1.5, 3), 12.0);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn next_after_raises_boundary_flags_only() {
+        let saved = fpenv::get_status();
+        let clear_range_flags = || {
+            afs_ieee_set_flag(3, 0);
+            afs_ieee_set_flag(4, 0);
+            afs_ieee_set_flag(5, 0);
+        };
+
+        clear_range_flags();
+        let overflow64 = afs_ieee_next_after_r8(f64::MAX, f64::INFINITY);
+        assert_eq!(overflow64.to_bits(), f64::INFINITY.to_bits());
+        assert_eq!(afs_ieee_test_flag(3), 1);
+        assert_eq!(afs_ieee_test_flag(4), 0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let underflow64 = afs_ieee_next_after_r8(f64::MIN_POSITIVE, 0.0);
+        assert_eq!(underflow64.to_bits(), 0x000f_ffff_ffff_ffff);
+        assert_eq!(afs_ieee_test_flag(3), 0);
+        assert_eq!(afs_ieee_test_flag(4), 1);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let overflow32 = afs_ieee_next_after_r4(f32::MAX, f32::INFINITY);
+        assert_eq!(overflow32.to_bits(), f32::INFINITY.to_bits());
+        assert_eq!(afs_ieee_test_flag(3), 1);
+        assert_eq!(afs_ieee_test_flag(4), 0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let underflow32 = afs_ieee_next_after_r4(0.0, 1.0);
+        assert_eq!(underflow32.to_bits(), 1);
+        assert_eq!(afs_ieee_test_flag(3), 0);
+        assert_eq!(afs_ieee_test_flag(4), 1);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        clear_range_flags();
+        let ordinary = afs_ieee_next_after_r8(1.0, 2.0);
+        assert_eq!(ordinary.to_bits(), 1.0f64.to_bits() + 1);
+        assert_eq!(afs_ieee_test_flag(3), 0);
+        assert_eq!(afs_ieee_test_flag(4), 0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        fpenv::set_status(saved);
     }
 
     #[test]
@@ -1157,6 +1293,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn rint_round_argument_is_quiet_but_ambient_form_is_exact() {
+        let saved = fpenv::get_status();
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8_round(1.1, 2), 2.0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r4_round(-1.1, 3), -2.0);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8_round(2.0, 0), 2.0);
+        assert_eq!(
+            afs_ieee_rint_r4_round(-0.0, 4).to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        assert_eq!(afs_ieee_rint_r8_round(f64::INFINITY, 3), f64::INFINITY);
+        let quiet_nan = f32::from_bits(0x7fc0_0123);
+        assert_eq!(
+            afs_ieee_rint_r4_round(quiet_nan, 1).to_bits(),
+            quiet_nan.to_bits()
+        );
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(1, 0);
+        let signaling_nan = f64::from_bits(0x7ff0_0000_0000_0123);
+        assert_eq!(
+            afs_ieee_rint_r8_round(signaling_nan, 2).to_bits(),
+            0x7ff8_0000_0000_0123
+        );
+        assert_eq!(afs_ieee_test_flag(1), 1);
+        assert_eq!(afs_ieee_test_flag(5), 0);
+
+        afs_ieee_set_flag(5, 1);
+        assert_eq!(afs_ieee_rint_r4_round(3.0, 0), 3.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        afs_ieee_set_rounding(3);
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r8_round(1.9, -1), 1.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        afs_ieee_set_flag(5, 0);
+        assert_eq!(afs_ieee_rint_r4_round(-1.1, -1), -2.0);
+        assert_eq!(afs_ieee_test_flag(5), 1);
+
+        fpenv::set_status(saved);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

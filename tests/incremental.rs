@@ -9,7 +9,9 @@
 //!   - A consumer recompiled against the same .amod produces the
 //!     same .o (no unnecessary recompilation cascade).
 
+use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,35 +44,40 @@ fn find_compiler() -> PathBuf {
 }
 
 fn compile(compiler: &Path, source: &Path, obj: &Path, search: &Path) {
-    let result = Command::new(compiler)
-        .current_dir(search)
-        .args([
-            source.to_str().unwrap(),
-            "-c",
-            "-O0",
-            "-o",
-            obj.to_str().unwrap(),
-            &format!("-I{}", search.display()),
-        ])
-        .output()
-        .expect("compiler launch failed");
+    compile_with_opt(compiler, source, obj, search, "-O0");
+}
+
+fn compile_with_opt(compiler: &Path, source: &Path, obj: &Path, search: &Path, opt: &str) {
+    compile_with_opt_and_env(compiler, source, obj, search, opt, &[]);
+}
+
+fn compile_with_opt_and_env(
+    compiler: &Path,
+    source: &Path,
+    obj: &Path,
+    search: &Path,
+    opt: &str,
+    environment: &[(&str, &OsStr)],
+) {
+    let mut command = Command::new(compiler);
+    command.current_dir(search).args([
+        source.to_str().unwrap(),
+        "-c",
+        opt,
+        "-o",
+        obj.to_str().unwrap(),
+        &format!("-I{}", search.display()),
+    ]);
+    for &(name, value) in environment {
+        command.env(name, value);
+    }
+    let result = command.output().expect("compiler launch failed");
     assert!(
         result.status.success(),
         "compile {} failed:\n{}",
         source.display(),
         String::from_utf8_lossy(&result.stderr)
     );
-}
-
-/// Extract the interface body from an .amod file (everything after the
-/// first blank line, which separates the header from the interface).
-fn extract_amod_body(amod: &[u8]) -> &[u8] {
-    let text = std::str::from_utf8(amod).unwrap_or("");
-    if let Some(idx) = text.find("\n\n") {
-        &amod[idx + 2..]
-    } else {
-        amod
-    }
 }
 
 fn fnv1a_hex(bytes: &[u8]) -> String {
@@ -84,12 +91,72 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 
 /// Compile a module and return the .amod contents.
 fn compile_module(compiler: &Path, dir: &Path, name: &str, source: &str) -> Vec<u8> {
+    compile_module_with_opt(compiler, dir, name, source, "-O0")
+}
+
+fn compile_module_with_opt(
+    compiler: &Path,
+    dir: &Path,
+    name: &str,
+    source: &str,
+    opt: &str,
+) -> Vec<u8> {
+    compile_module_with_opt_and_env(compiler, dir, name, source, opt, &[])
+}
+
+fn compile_module_with_opt_and_env(
+    compiler: &Path,
+    dir: &Path,
+    name: &str,
+    source: &str,
+    opt: &str,
+    environment: &[(&str, &OsStr)],
+) -> Vec<u8> {
     let f90 = dir.join(format!("{}.f90", name));
     let obj = dir.join(format!("{}.o", name));
     fs::write(&f90, source).unwrap();
-    compile(compiler, &f90, &obj, dir);
+    compile_with_opt_and_env(compiler, &f90, &obj, dir, opt, environment);
     let amod = dir.join(format!("{}.amod", name));
     fs::read(&amod).unwrap_or_else(|e| panic!("{}.amod not found: {}", name, e))
+}
+
+fn open_publication_witness(path: &Path) -> fs::File {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open .amod as a publication identity witness")
+}
+
+fn assert_publication_was_not_replaced(mut witness: fs::File, path: &Path) {
+    const PUBLICATION_PROBE: &[u8] = b"same published file";
+    witness
+        .set_len(0)
+        .expect("truncate publication identity witness");
+    witness
+        .write_all(PUBLICATION_PROBE)
+        .expect("write publication identity witness");
+    drop(witness);
+    assert_eq!(
+        fs::read(path).expect("read republished .amod"),
+        PUBLICATION_PROBE,
+        "byte-identical .amod publication replaced the existing file"
+    );
+}
+
+fn assert_publication_was_replaced(mut witness: fs::File, path: &Path, expected: &[u8]) {
+    const PUBLICATION_PROBE: &[u8] = b"superseded published file";
+    witness
+        .set_len(0)
+        .expect("truncate superseded publication witness");
+    witness
+        .write_all(PUBLICATION_PROBE)
+        .expect("write superseded publication witness");
+    drop(witness);
+    assert_eq!(
+        fs::read(path).expect("read changed .amod"),
+        expected,
+        "changed .amod interface was not atomically republished"
+    );
 }
 
 fn compile_module_tree_with_spelling(
@@ -193,10 +260,13 @@ fn same_source_produces_identical_amod() {
     let src = "module m\n  implicit none\n  integer :: x = 42\nend module\n";
 
     let amod1 = compile_module(&compiler, &dir, "m", src);
+    let amod_path = dir.join("m.amod");
+    let published_file = open_publication_witness(&amod_path);
     // Recompile with identical source.
     let amod2 = compile_module(&compiler, &dir, "m", src);
 
     assert_eq!(amod1, amod2, ".amod changed despite identical source");
+    assert_publication_was_not_replaced(published_file, &amod_path);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -223,16 +293,18 @@ fn module_artifacts_ignore_relative_vs_absolute_source_spelling() {
     assert_module_artifacts_equal(&relative_dir, &absolute_dir);
     let parent = fs::read_to_string(relative_dir.join("repro_parent.amod")).unwrap();
     assert!(parent.contains("# source: parent.f90\n"));
-    assert!(parent.contains(&format!(
-        "# checksum: fnv1a:{}\n",
-        fnv1a_hex(PROVENANCE_PARENT_SOURCE)
-    )));
+    assert!(
+        !parent.lines().any(|line| line.starts_with("# checksum:")),
+        ".amod must not fingerprint complete source bytes"
+    );
     let child_interface = fs::read(relative_dir.join("repro_parent@repro_child.amod")).unwrap();
     let child_interface_text = String::from_utf8(child_interface.clone()).unwrap();
-    assert!(child_interface_text.contains(&format!(
-        "# checksum: fnv1a:{}\n",
-        fnv1a_hex(PROVENANCE_CHILD_SOURCE)
-    )));
+    assert!(
+        !child_interface_text
+            .lines()
+            .any(|line| line.starts_with("# checksum:")),
+        "submodule .amod must not fingerprint complete source bytes"
+    );
     let child = fs::read_to_string(relative_dir.join("repro_parent@repro_child.smod")).unwrap();
     assert!(child.contains("# source: child.f90\n"));
     assert!(child.contains(&format!(
@@ -296,13 +368,131 @@ fn changed_public_interface_changes_amod() {
     let v2 = "module m\n  implicit none\n  integer :: x = 42\n  integer :: y = 99\nend module\n";
 
     let amod1 = compile_module(&compiler, &dir, "m", v1);
+    let amod_path = dir.join("m.amod");
+    let published_file = open_publication_witness(&amod_path);
     let amod2 = compile_module(&compiler, &dir, "m", v2);
 
     assert_ne!(
         amod1, amod2,
         ".amod should differ when public interface changes"
     );
+    assert_publication_was_replaced(published_file, &amod_path, &amod2);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn module_interface_is_stable_across_optimization_levels() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=module_interface_is_stable_across_optimization_levels count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let source = "\
+module m
+  implicit none
+contains
+  integer function compute(value)
+    integer, intent(in) :: value
+    compute = (value + 0) * 1
+  end function
+end module
+";
+
+    let baseline = compile_module_with_opt(&compiler, &dir, "m", source, "-O0");
+    for opt in ["-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let candidate = compile_module_with_opt(&compiler, &dir, "m", source, opt);
+        assert_eq!(
+            candidate, baseline,
+            ".amod interface bytes changed at {opt}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn module_interface_is_stable_across_build_environments() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=incremental test=module_interface_is_stable_across_build_environments count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let root = unique_dir();
+    let baseline_dir = root.join("baseline");
+    let varied_dir = root.join("varied");
+    let baseline_tmp = root.join("tmp-baseline");
+    let varied_tmp = root.join("tmp-varied");
+    let unused_tools = root.join("unused-tools");
+    for directory in [
+        &baseline_dir,
+        &varied_dir,
+        &baseline_tmp,
+        &varied_tmp,
+        &unused_tools,
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut varied_path_entries = vec![unused_tools];
+    varied_path_entries.extend(std::env::split_paths(&inherited_path));
+    let varied_path =
+        std::env::join_paths(varied_path_entries).expect("construct varied PATH value");
+    let baseline_environment = [
+        ("TMPDIR", baseline_tmp.as_os_str()),
+        ("TMP", baseline_tmp.as_os_str()),
+        ("TEMP", baseline_tmp.as_os_str()),
+        ("LC_ALL", OsStr::new("C")),
+        ("PATH", inherited_path.as_os_str()),
+        ("CARGO_BUILD_JOBS", OsStr::new("1")),
+    ];
+    let varied_environment = [
+        ("TMPDIR", varied_tmp.as_os_str()),
+        ("TMP", varied_tmp.as_os_str()),
+        ("TEMP", varied_tmp.as_os_str()),
+        ("LC_ALL", OsStr::new("POSIX")),
+        ("PATH", varied_path.as_os_str()),
+        ("CARGO_BUILD_JOBS", OsStr::new("4")),
+    ];
+    let source = "\
+module m
+  implicit none
+  integer, parameter :: answer = 42
+contains
+  integer function identity(value)
+    integer, intent(in) :: value
+    identity = value
+  end function
+end module
+";
+
+    let baseline = compile_module_with_opt_and_env(
+        &compiler,
+        &baseline_dir,
+        "m",
+        source,
+        "-O2",
+        &baseline_environment,
+    );
+    let varied = compile_module_with_opt_and_env(
+        &compiler,
+        &varied_dir,
+        "m",
+        source,
+        "-O2",
+        &varied_environment,
+    );
+    assert_eq!(
+        varied, baseline,
+        ".amod interface bytes depend on TMPDIR, PATH, locale, or job count"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -339,17 +529,16 @@ end module
 ";
 
     let amod1 = compile_module(&compiler, &dir, "m", v1);
+    let amod_path = dir.join("m.amod");
+    let published_file = open_publication_witness(&amod_path);
     let amod2 = compile_module(&compiler, &dir, "m", v2);
 
-    // The header includes a source checksum which will differ. But the
-    // interface section (everything after the blank line separating the
-    // header from the body) should be identical.
-    let body1 = extract_amod_body(&amod1);
-    let body2 = extract_amod_body(&amod2);
+    assert_ne!(v1, v2, "fixture must change the procedure body");
     assert_eq!(
-        body1, body2,
-        ".amod interface body changed but only private impl differs"
+        amod1, amod2,
+        ".amod changed even though only a procedure body changed"
     );
+    assert_publication_was_not_replaced(published_file, &amod_path);
     let _ = fs::remove_dir_all(&dir);
 }
 

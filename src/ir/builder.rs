@@ -23,6 +23,14 @@ pub struct FuncBuilder<'a> {
     local_modules: std::rc::Rc<std::collections::HashSet<String>>,
     owned_string_descriptors: std::collections::HashSet<ValueId>,
     owned_string_temps: std::collections::HashMap<ValueId, Vec<ValueId>>,
+    /// Address values whose memory accesses are source-language VOLATILE.
+    /// This is lowering metadata only: emitted accesses carry their semantics
+    /// explicitly as `VolatileLoad` / `VolatileStore` in the durable IR.
+    volatile_addresses: std::collections::HashSet<ValueId>,
+    /// Compiler-generated pointer slots for by-reference VOLATILE entities.
+    /// Loading the slot is ordinary, but the pointer obtained from it
+    /// designates volatile storage.
+    indirect_volatile_addresses: std::collections::HashSet<ValueId>,
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -35,6 +43,8 @@ impl<'a> FuncBuilder<'a> {
             local_modules: std::rc::Rc::new(std::collections::HashSet::new()),
             owned_string_descriptors: std::collections::HashSet::new(),
             owned_string_temps: std::collections::HashMap::new(),
+            volatile_addresses: std::collections::HashSet::new(),
+            indirect_volatile_addresses: std::collections::HashSet::new(),
         }
     }
 
@@ -71,6 +81,33 @@ impl<'a> FuncBuilder<'a> {
 
     pub fn take_owned_string_temp_bases(&mut self, value: ValueId) -> Vec<ValueId> {
         self.owned_string_temps.remove(&value).unwrap_or_default()
+    }
+
+    /// Mark a directly-addressed entity as source-language VOLATILE.
+    pub fn mark_volatile_address(&mut self, address: ValueId) {
+        self.volatile_addresses.insert(address);
+    }
+
+    /// Mark a compiler spill slot whose loaded pointer designates a
+    /// source-language VOLATILE entity (the normal by-reference ABI shape).
+    pub fn mark_indirect_volatile_address(&mut self, slot: ValueId) {
+        self.indirect_volatile_addresses.insert(slot);
+    }
+
+    fn propagate_volatile_pointer_result(
+        &mut self,
+        source: ValueId,
+        result: ValueId,
+        result_ty: &IrType,
+    ) {
+        if !result_ty.is_ptr() {
+            return;
+        }
+        if self.indirect_volatile_addresses.contains(&source)
+            || self.volatile_addresses.contains(&source)
+        {
+            self.volatile_addresses.insert(result);
+        }
     }
 
     /// Switch to emitting into a different block.
@@ -305,7 +342,20 @@ impl<'a> FuncBuilder<'a> {
             .func
             .value_type(true_val)
             .unwrap_or(IrType::Int(IntWidth::I32));
-        self.emit(InstKind::Select(cond, true_val, false_val), ty)
+        let result = self.emit(InstKind::Select(cond, true_val, false_val), ty.clone());
+        if ty.is_ptr()
+            && (self.volatile_addresses.contains(&true_val)
+                || self.volatile_addresses.contains(&false_val))
+        {
+            self.volatile_addresses.insert(result);
+        }
+        if ty.is_ptr()
+            && (self.indirect_volatile_addresses.contains(&true_val)
+                || self.indirect_volatile_addresses.contains(&false_val))
+        {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     // ---- Logic ----
@@ -423,12 +473,26 @@ impl<'a> FuncBuilder<'a> {
     }
 
     pub fn ptr_to_int(&mut self, val: ValueId) -> ValueId {
-        self.emit(InstKind::PtrToInt(val), IrType::Int(IntWidth::I64))
+        let result = self.emit(InstKind::PtrToInt(val), IrType::Int(IntWidth::I64));
+        if self.volatile_addresses.contains(&val) {
+            self.volatile_addresses.insert(result);
+        }
+        if self.indirect_volatile_addresses.contains(&val) {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     pub fn int_to_ptr(&mut self, val: ValueId, pointee: IrType) -> ValueId {
         let ptr_ty = IrType::Ptr(Box::new(pointee));
-        self.emit(InstKind::IntToPtr(val, ptr_ty.clone()), ptr_ty)
+        let result = self.emit(InstKind::IntToPtr(val, ptr_ty.clone()), ptr_ty);
+        if self.volatile_addresses.contains(&val) {
+            self.volatile_addresses.insert(result);
+        }
+        if self.indirect_volatile_addresses.contains(&val) {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     // ---- Memory ----
@@ -452,24 +516,50 @@ impl<'a> FuncBuilder<'a> {
             Some(IrType::Ptr(inner)) => *inner,
             _ => IrType::Int(IntWidth::I64), // fallback
         };
-        self.emit(InstKind::Load(addr), ty)
+        let kind = if self.volatile_addresses.contains(&addr) {
+            InstKind::VolatileLoad(addr)
+        } else {
+            InstKind::Load(addr)
+        };
+        let result = self.emit(kind, ty.clone());
+        self.propagate_volatile_pointer_result(addr, result, &ty);
+        result
     }
 
     /// Load with an explicit result type (ignoring the pointer's inner type).
     /// Used for loading fields from aggregate pointers (e.g., first 8 bytes of a descriptor).
     pub fn load_typed(&mut self, addr: ValueId, ty: IrType) -> ValueId {
-        self.emit(InstKind::Load(addr), ty)
+        let kind = if self.volatile_addresses.contains(&addr) {
+            InstKind::VolatileLoad(addr)
+        } else {
+            InstKind::Load(addr)
+        };
+        let result = self.emit(kind, ty.clone());
+        self.propagate_volatile_pointer_result(addr, result, &ty);
+        result
     }
 
     pub fn store(&mut self, value: ValueId, addr: ValueId) -> ValueId {
-        self.emit(InstKind::Store(value, addr), IrType::Void)
+        let kind = if self.volatile_addresses.contains(&addr) {
+            InstKind::VolatileStore(value, addr)
+        } else {
+            InstKind::Store(value, addr)
+        };
+        self.emit(kind, IrType::Void)
     }
 
     pub fn gep(&mut self, base: ValueId, indices: Vec<ValueId>, result_ty: IrType) -> ValueId {
-        self.emit(
+        let result = self.emit(
             InstKind::GetElementPtr(base, indices),
             IrType::Ptr(Box::new(result_ty)),
-        )
+        );
+        if self.volatile_addresses.contains(&base) {
+            self.volatile_addresses.insert(result);
+        }
+        if self.indirect_volatile_addresses.contains(&base) {
+            self.indirect_volatile_addresses.insert(result);
+        }
+        result
     }
 
     // ---- Calls ----
@@ -572,6 +662,20 @@ impl<'a> FuncBuilder<'a> {
     }
 
     pub fn switch(&mut self, selector: ValueId, cases: Vec<(i64, BlockId)>, default: BlockId) {
+        let selector_ty = self
+            .func
+            .value_type(selector)
+            .unwrap_or_else(|| panic!("switch selector %{} has no registered type", selector.0));
+        assert!(
+            selector_ty.switch_int_width().is_some(),
+            "switch selector must be i8, i16, i32, or i64, got {selector_ty}",
+        );
+        for (value, _) in &cases {
+            assert!(
+                selector_ty.switch_case_is_representable(*value),
+                "switch case value {value} is not representable in selector type {selector_ty}",
+            );
+        }
         self.func.block_mut(self.current_block).terminator = Some(Terminator::Switch {
             selector,
             cases,
@@ -665,6 +769,28 @@ mod tests {
         }
         assert_eq!(func.blocks.len(), 3);
         assert_eq!(func.block(BlockId(1)).params.len(), 1); // header has 1 param
+    }
+
+    #[test]
+    #[should_panic(expected = "switch selector must be i8, i16, i32, or i64")]
+    fn switch_builder_rejects_floating_selector() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+        let selector = b.const_f64(1.0);
+        let case = b.create_block("case");
+        let default = b.create_block("default");
+        b.switch(selector, vec![(1, case)], default);
+    }
+
+    #[test]
+    #[should_panic(expected = "case value 128 is not representable in selector type i8")]
+    fn switch_builder_rejects_case_outside_selector_width() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+        let selector = b.const_int(0, IntWidth::I8);
+        let case = b.create_block("case");
+        let default = b.create_block("default");
+        b.switch(selector, vec![(128, case)], default);
     }
 
     #[test]

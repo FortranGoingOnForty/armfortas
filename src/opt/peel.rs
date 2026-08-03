@@ -12,7 +12,10 @@
 //! peeled iteration. Later const-prop folds `iv=init_const` through the
 //! clone, turning `if (i==1)` into `if (true)` and eliminating dead code.
 
-use super::loop_utils::{clone_loop, find_preheader, loop_defined_values, resolve_const_int};
+use super::loop_utils::{
+    clone_loop, find_preheader, loop_contains_volatile_memory, loop_defined_values,
+    resolve_const_int,
+};
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::types::IrType;
@@ -42,6 +45,9 @@ fn peel_in_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
+        if loop_contains_volatile_memory(func, lp) {
+            continue;
+        }
         let Some(ph_id) = find_preheader(func, lp, &preds) else {
             continue;
         };

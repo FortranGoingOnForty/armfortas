@@ -1825,7 +1825,7 @@ fn generic_character_function_dispatches_to_character_specific() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  interface pick\n    integer function pick_i(n)\n      integer, intent(in) :: n\n    end function pick_i\n    integer function pick_c(s)\n      character(len=*), intent(in) :: s\n    end function pick_c\n  end interface\n  if (pick('ab') /= 2) error stop 1\n  print *, pick('ab')\ncontains\n  integer function pick_i(n)\n    integer, intent(in) :: n\n    pick_i = n + 100\n  end function pick_i\n  integer function pick_c(s)\n    character(len=*), intent(in) :: s\n    pick_c = len_trim(s)\n  end function pick_c\nend program\n",
+        "program p\n  implicit none\n  interface pick\n    procedure :: pick_i, pick_c\n  end interface\n  if (pick('ab') /= 2) error stop 1\n  print *, pick('ab')\ncontains\n  integer function pick_i(n)\n    integer, intent(in) :: n\n    pick_i = n + 100\n  end function pick_i\n  integer function pick_c(s)\n    character(len=*), intent(in) :: s\n    pick_c = len_trim(s)\n  end function pick_c\nend program\n",
     );
     let exe = dir.join("generic_character_dispatch.bin");
     compile_fortran_program(&src, &exe);
@@ -1863,7 +1863,7 @@ fn generic_hidden_result_character_dispatches_to_character_specific() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  character(len=8) :: out\n  interface build\n    function build_i(n) result(out)\n      integer, intent(in) :: n\n      character(len=8) :: out\n    end function build_i\n    function build_c(s) result(out)\n      character(len=*), intent(in) :: s\n      character(len=8) :: out\n    end function build_c\n  end interface\n  out = build('ab')\n  if (trim(out) /= 'ab') error stop 1\n  print *, trim(out)\ncontains\n  function build_i(n) result(out)\n    integer, intent(in) :: n\n    character(len=8) :: out\n    write(out, '(I0)') n\n  end function build_i\n  function build_c(s) result(out)\n    character(len=*), intent(in) :: s\n    character(len=8) :: out\n    out = s\n  end function build_c\nend program\n",
+        "program p\n  implicit none\n  character(len=8) :: out\n  interface build\n    procedure :: build_i, build_c\n  end interface\n  out = build('ab')\n  if (trim(out) /= 'ab') error stop 1\n  print *, trim(out)\ncontains\n  function build_i(n) result(out)\n    integer, intent(in) :: n\n    character(len=8) :: out\n    write(out, '(I0)') n\n  end function build_i\n  function build_c(s) result(out)\n    character(len=*), intent(in) :: s\n    character(len=8) :: out\n    out = s\n  end function build_c\nend program\n",
     );
     let exe = dir.join("generic_hidden_result_character_dispatch.bin");
     compile_fortran_program(&src, &exe);
@@ -1884,6 +1884,125 @@ fn generic_hidden_result_character_dispatches_to_character_specific() {
         "unexpected generic hidden-result character dispatch output: {}",
         stdout
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn specific_intrinsic_procedure_targets_keep_fortran_abi_at_every_opt_level() {
+    const OPT_LEVELS: [&str; 6] = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"];
+
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=calling_convention_runtime test=specific_intrinsic_procedure_targets_keep_fortran_abi_at_every_opt_level count={} reason=\"{}\"",
+            OPT_LEVELS.len(),
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("specific_intrinsic_procptr");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"module callback_types
+  implicit none
+  abstract interface
+    real function real_callback(value)
+      real, intent(in) :: value
+    end function real_callback
+    double precision function double_callback(value)
+      double precision, intent(in) :: value
+    end function double_callback
+    integer function integer_callback(value)
+      integer, intent(in) :: value
+    end function integer_callback
+    integer function character_callback(value)
+      character(len=*), intent(in) :: value
+    end function character_callback
+    complex function complex_callback(value)
+      complex, intent(in) :: value
+    end function complex_callback
+  end interface
+  intrinsic :: sin
+  type :: callback_holder
+    procedure(real_callback), pointer, nopass :: initialized => sin
+    procedure(real_callback), pointer, nopass :: rebound => null()
+  end type callback_holder
+end module callback_types
+
+program p
+  use callback_types
+  implicit none
+  intrinsic :: sin, dsin, iabs, len, conjg
+  procedure(real_callback), pointer :: initialized => sin
+  procedure(real_callback), pointer :: assigned
+  procedure(double_callback), pointer :: double_target
+  procedure(integer_callback), pointer :: integer_target
+  procedure(character_callback), pointer :: character_target
+  procedure(complex_callback), pointer :: complex_target
+  type(callback_holder) :: holder
+  complex :: result
+
+  assigned => sin
+  double_target => dsin
+  integer_target => iabs
+  character_target => len
+  complex_target => conjg
+  holder%rebound => sin
+
+  if (abs(initialized(0.5) - sin(0.5)) > 1.0e-6) error stop 1
+  if (abs(assigned(0.25) - sin(0.25)) > 1.0e-6) error stop 2
+  if (abs(holder%initialized(0.75) - sin(0.75)) > 1.0e-6) error stop 3
+  if (abs(holder%rebound(1.0) - sin(1.0)) > 1.0e-6) error stop 4
+  if (abs(double_target(0.5d0) - dsin(0.5d0)) > 1.0d-12) error stop 5
+  if (integer_target(-7) /= 7) error stop 6
+  if (character_target('compiler') /= 8) error stop 7
+  result = complex_target((1.5, -2.0))
+  if (abs(real(result) - 1.5) > 1.0e-6) error stop 8
+  if (abs(aimag(result) - 2.0) > 1.0e-6) error stop 9
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for opt_level in OPT_LEVELS {
+        let tag = opt_level.trim_start_matches('-');
+        let exe = dir.join(format!("specific_intrinsic_procptr_{tag}.bin"));
+        let compile = Command::new(compiler("armfortas"))
+            .arg(opt_level)
+            .arg(&src)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("cannot compile specific-intrinsic probe at {opt_level}: {error}")
+            });
+        assert!(
+            compile.status.success(),
+            "specific-intrinsic procedure-pointer compile failed at {}:\n{}",
+            opt_level,
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&exe).output().unwrap_or_else(|error| {
+            panic!("cannot run specific-intrinsic probe at {opt_level}: {error}")
+        });
+        assert!(
+            run.status.success(),
+            "specific-intrinsic procedure-pointer runtime failed at {}: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            opt_level,
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected specific-intrinsic output at {}: {}",
+            opt_level,
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

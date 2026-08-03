@@ -395,6 +395,8 @@ fn register_ieee_modules(st: &mut SymbolTable) {
                 }
                 insert_proc(st, m, "ieee_get_flag");
                 insert_proc(st, m, "ieee_set_flag");
+                insert_proc(st, m, "ieee_get_status");
+                insert_proc(st, m, "ieee_set_status");
                 insert_proc(st, m, "ieee_get_halting_mode");
                 insert_proc(st, m, "ieee_set_halting_mode");
             }

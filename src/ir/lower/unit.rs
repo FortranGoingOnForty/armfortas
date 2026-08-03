@@ -22,6 +22,80 @@ use super::ctx::{
 };
 use super::helpers::clamp_nonnegative_i64;
 
+fn dummy_has_required_data_storage(name: &str, decls: &[crate::ast::decl::SpannedDecl]) -> bool {
+    let mut declared = false;
+    let mut nullable_or_nondata = false;
+    for decl in decls {
+        match &decl.node {
+            crate::ast::decl::Decl::TypeDecl {
+                attrs, entities, ..
+            } if entities
+                .iter()
+                .any(|entity| entity.name.eq_ignore_ascii_case(name)) =>
+            {
+                declared = true;
+                nullable_or_nondata |= attrs.iter().any(|attr| {
+                    matches!(
+                        attr,
+                        crate::ast::decl::Attribute::Optional
+                            | crate::ast::decl::Attribute::Pointer
+                            | crate::ast::decl::Attribute::Value
+                            | crate::ast::decl::Attribute::Procedure
+                            | crate::ast::decl::Attribute::External
+                            | crate::ast::decl::Attribute::Intrinsic
+                    )
+                });
+            }
+            crate::ast::decl::Decl::AttributeStmt { attr, entities }
+                if entities
+                    .iter()
+                    .any(|entity| entity.eq_ignore_ascii_case(name)) =>
+            {
+                nullable_or_nondata |= matches!(
+                    attr,
+                    crate::ast::decl::Attribute::Optional
+                        | crate::ast::decl::Attribute::Pointer
+                        | crate::ast::decl::Attribute::Value
+                        | crate::ast::decl::Attribute::Procedure
+                        | crate::ast::decl::Attribute::External
+                        | crate::ast::decl::Attribute::Intrinsic
+                );
+            }
+            _ => {}
+        }
+    }
+    declared && !nullable_or_nondata
+}
+
+fn mark_directly_dereferenceable_params(
+    func: &mut Function,
+    args: &[DummyArg],
+    decls: &[crate::ast::decl::SpannedDecl],
+) {
+    let required_data_dummies: HashSet<String> = args
+        .iter()
+        .filter_map(|arg| {
+            let DummyArg::Name(name) = arg else {
+                return None;
+            };
+            dummy_has_required_data_storage(name, decls).then(|| name.to_lowercase())
+        })
+        .collect();
+    // Host-closure parameters remain deliberately unmarked: a capture may
+    // forward an absent OPTIONAL or a disassociated POINTER from its host.
+    let ids: Vec<ValueId> = func
+        .params
+        .iter()
+        .filter(|param| {
+            param.name == "_sret" || required_data_dummies.contains(&param.name.to_lowercase())
+        })
+        .map(|param| param.id)
+        .collect();
+    for id in ids {
+        func.mark_param_directly_dereferenceable(id);
+    }
+}
+
 fn install_procedure_dummy_closure_locals(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
@@ -120,6 +194,7 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                fname.clone(),
                 module.layout,
             );
             ctx.proc_scope_id = {
@@ -134,8 +209,6 @@ pub(crate) fn lower_unit(
                     }
                 })
             };
-            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
-
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
@@ -158,10 +231,9 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&decl_spec_import_names),
+                    &decl_spec_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 super::alloc::alloc_decls(
                     &mut b,
@@ -169,7 +241,7 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     type_layouts,
-                    &mut pending_globals,
+                    &mut ctx.pending_globals,
                     &fname,
                     st,
                 );
@@ -179,15 +251,15 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&required_import_names),
+                    &required_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(
                     globals,
                     &combined_uses,
                     decls,
+                    &required_import_names,
                     ctx.st,
                     ctx.proc_scope_id,
                 );
@@ -201,6 +273,7 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
+                ctx.capture_procedure_locals();
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
@@ -223,7 +296,7 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
-            for pg in pending_globals {
+            for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
 
@@ -330,16 +403,16 @@ pub(crate) fn lower_unit(
                 Some((_, sd)) => sd.as_slice(),
                 None => decls.as_slice(),
             };
+            let proc_scope_id =
+                procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let func_name = lowered_procedure_symbol_name(
                 name,
-                bind.as_ref(),
+                proc_scope_id.and_then(|scope_id| st.scope(scope_id).binding_label.as_deref()),
                 host_link_name,
                 host_module,
                 internal_only,
                 internal_funcs,
             );
-            let proc_scope_id =
-                procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
                 collect_decl_param_consts_with_scope(decls, host_param_consts, st);
             let mut params: Vec<Param> = args
@@ -470,6 +543,7 @@ pub(crate) fn lower_unit(
             );
 
             let mut func = Function::new(func_name.clone(), params, IrType::Void);
+            mark_directly_dereferenceable_params(&mut func, args, decls);
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
             func.is_elemental = prefix.iter().any(|p| matches!(p, Prefix::Elemental));
@@ -486,10 +560,10 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                func_name.clone(),
                 module.layout,
             );
             ctx.proc_scope_id = proc_scope_id;
-            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
@@ -713,10 +787,9 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&decl_spec_import_names),
+                    &decl_spec_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 super::alloc::alloc_decls(
                     &mut b,
@@ -724,7 +797,7 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     type_layouts,
-                    &mut pending_globals,
+                    &mut ctx.pending_globals,
                     &func_name,
                     st,
                 );
@@ -734,15 +807,15 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&required_import_names),
+                    &required_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(
                     globals,
                     &combined_uses,
                     decls,
+                    &required_import_names,
                     ctx.st,
                     ctx.proc_scope_id,
                 );
@@ -756,6 +829,7 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
+                ctx.capture_procedure_locals();
                 // Pre-create blocks for all statement labels so GOTO can branch forward.
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
@@ -779,7 +853,7 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
-            for pg in pending_globals {
+            for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
 
@@ -830,16 +904,27 @@ pub(crate) fn lower_unit(
             prefix,
             ..
         } => {
+            let proc_scope_id =
+                procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
+            let is_bind_c = proc_scope_id
+                .map(|scope_id| st.scope(scope_id).bind_c)
+                .unwrap_or_else(|| bind.is_some());
+            let result_name = result.as_deref().unwrap_or(name.as_str());
+            let is_bind_c_character_result = is_bind_c
+                && matches!(
+                    return_type
+                        .as_ref()
+                        .or_else(|| declared_type_spec_for_name(result_name, decls)),
+                    Some(TypeSpec::Character(_))
+                );
             let func_name = lowered_procedure_symbol_name(
                 name,
-                bind.as_ref(),
+                proc_scope_id.and_then(|scope_id| st.scope(scope_id).binding_label.as_deref()),
                 host_link_name,
                 host_module,
                 internal_only,
                 internal_funcs,
             );
-            let proc_scope_id =
-                procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
             let visible_param_consts =
                 collect_decl_param_consts_with_scope(decls, host_param_consts, st);
 
@@ -852,7 +937,7 @@ pub(crate) fn lower_unit(
                 result,
                 return_type.as_ref(),
                 decls,
-                bind.as_ref(),
+                is_bind_c,
                 Some(st),
             );
             let uses_hidden_result = hidden_result_abi != HiddenResultAbi::None;
@@ -940,11 +1025,8 @@ pub(crate) fn lower_unit(
                 params.extend(real);
                 (params, IrType::Void)
             } else {
-                let result_name = result.as_deref().unwrap_or(name.as_str());
                 let result_is_pointer = decl_is_pointer(result_name, decls);
-                let mut ret_ty = if bind.is_some()
-                    && matches!(return_type.as_ref(), Some(TypeSpec::Character(_)))
-                {
+                let mut ret_ty = if is_bind_c_character_result {
                     IrType::Int(IntWidth::I8)
                 } else {
                     return_type
@@ -1071,6 +1153,7 @@ pub(crate) fn lower_unit(
             );
 
             let mut func = Function::new(func_name.clone(), func_params, ir_ret_ty.clone());
+            mark_directly_dereferenceable_params(&mut func, args, decls);
             // Propagate PURE/ELEMENTAL from AST prefix.
             use crate::ast::unit::Prefix;
             func.is_pure = prefix.iter().any(|p| matches!(p, Prefix::Pure));
@@ -1088,10 +1171,10 @@ pub(crate) fn lower_unit(
                 char_len_star_params,
                 contained_host_refs,
                 ambiguous_use_warnings.clone(),
+                func_name.clone(),
                 module.layout,
             );
             ctx.proc_scope_id = proc_scope_id;
-            let mut pending_globals: Vec<PendingGlobal> = Vec::new();
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
                 host_uses.iter().chain(uses.iter()).cloned().collect();
             let required_import_names = collect_required_import_names(decls, body);
@@ -1413,6 +1496,49 @@ pub(crate) fn lower_unit(
                     // variable. We materialize that local through alloc_decls
                     // / ensure_hidden_string_result_local below and copy it
                     // into the hidden descriptor right before return.
+                } else if is_bind_c_character_result {
+                    // A scalar interoperable CHARACTER result is returned as
+                    // one byte, but its function body still needs normal
+                    // CHARACTER storage so assignment applies Fortran string
+                    // semantics. Keep one payload byte plus a stable trailing
+                    // NUL and load only the payload byte at return.
+                    let buf_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 2);
+                    let result_addr = b.alloca(buf_ty);
+                    let zero = b.const_i32(0);
+                    let two = b.const_i64(2);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![result_addr, zero, two],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    let space = b.const_i32(b' ' as i32);
+                    let one = b.const_i64(1);
+                    b.call(
+                        FuncRef::External("memset".into()),
+                        vec![result_addr, space, one],
+                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    );
+                    ctx.locals.insert(
+                        result_name.clone(),
+                        LocalInfo {
+                            addr: result_addr,
+                            ty: IrType::Int(IntWidth::I8),
+                            dims: vec![],
+                            allocatable: false,
+                            descriptor_arg: false,
+                            by_ref: false,
+                            char_kind: CharKind::Fixed(1),
+                            derived_type: None,
+                            inline_const: None,
+                            is_pointer: false,
+                            runtime_dim_upper: vec![],
+                            is_class: false,
+                            logical_kind: None,
+                            last_dim_assumed_size: false,
+                        },
+                    );
+                    ctx.result_addr = Some(result_addr);
+                    ctx.result_type = Some(IrType::Int(IntWidth::I8));
                 } else if result_is_pointer {
                     let result_addr = b.alloca(ir_ret_ty.clone());
                     let zero_byte = b.const_i32(0);
@@ -1516,10 +1642,9 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&decl_spec_import_names),
+                    &decl_spec_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 if hidden_result_abi == HiddenResultAbi::ArrayDescriptor {
                     if let Some(info) = ctx.locals.get(&result_name).cloned() {
@@ -1572,7 +1697,7 @@ pub(crate) fn lower_unit(
                     decls,
                     &visible_param_consts,
                     type_layouts,
-                    &mut pending_globals,
+                    &mut ctx.pending_globals,
                     &func_name,
                     st,
                 );
@@ -1595,15 +1720,15 @@ pub(crate) fn lower_unit(
                     &mut ctx.locals,
                     globals,
                     &combined_uses,
-                    Some(&required_import_names),
+                    &required_import_names,
                     host_module,
                     ctx.st,
-                    &ctx.ambiguous_use_warnings,
                 );
                 ctx.filtered_names = compute_filtered_names(
                     globals,
                     &combined_uses,
                     decls,
+                    &required_import_names,
                     ctx.st,
                     ctx.proc_scope_id,
                 );
@@ -1617,6 +1742,7 @@ pub(crate) fn lower_unit(
                     ctx.proc_scope_id,
                     Some(type_layouts),
                 );
+                ctx.capture_procedure_locals();
                 collect_label_blocks(&mut b, body, &mut ctx.label_blocks);
                 collect_format_labels(body, &mut ctx.format_labels);
                 let _proc_scope_guard = ProcScopeGuard::enter(ctx.proc_scope_id);
@@ -1661,6 +1787,12 @@ pub(crate) fn lower_unit(
                     );
                     if uses_hidden_result {
                         b.ret(None);
+                    } else if is_bind_c_character_result {
+                        let result_addr = ctx
+                            .result_addr
+                            .expect("BIND(C) character function has no result storage");
+                        let byte = b.load_typed(result_addr, IrType::Int(IntWidth::I8));
+                        b.ret(Some(byte));
                     } else if !result_is_pointer && derived_result_type.is_some() {
                         // Derived-type result: return the buffer
                         // address as a Ptr(i8) (the declared return
@@ -1682,7 +1814,7 @@ pub(crate) fn lower_unit(
             }
 
             module.add_function(func);
-            for pg in pending_globals {
+            for pg in std::mem::take(&mut ctx.pending_globals) {
                 module.add_global(pg.global);
             }
 

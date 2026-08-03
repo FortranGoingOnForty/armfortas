@@ -105,7 +105,11 @@ fn const_value_of(func: &Function, value: ValueId) -> Option<ScalarConst> {
 fn side_effect_free(kind: &InstKind) -> bool {
     !matches!(
         kind,
-        InstKind::Store(..) | InstKind::Call(..) | InstKind::RuntimeCall(..)
+        InstKind::Store(..)
+            | InstKind::VolatileLoad(..)
+            | InstKind::VolatileStore(..)
+            | InstKind::Call(..)
+            | InstKind::RuntimeCall(..)
     )
 }
 

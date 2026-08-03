@@ -10,6 +10,17 @@ fn compiler() -> PathBuf {
         .expect("armfortas binary should be built for integration tests")
 }
 
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "armfortas_arm64_remediation_{label}_{}_{}",
+        std::process::id(),
+        id
+    ));
+    fs::create_dir_all(&dir).expect("create ARM64 regression temp directory");
+    dir
+}
+
 fn compile_arm64_output(source: &str, opt: &str, emit: &str, extension: &str) -> String {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let stem = format!("armfortas_arm64_remediation_{}_{}", std::process::id(), id);
@@ -43,6 +54,14 @@ fn compile_arm64_ir(source: &str, opt: &str) -> String {
     compile_arm64_output(source, opt, "--emit-ir", "ir")
 }
 
+fn setup_defines_fp_arg(setup: &str, register: &str) -> bool {
+    setup.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with(&format!("fmov {register},"))
+            || line.starts_with(&format!("ldr {register},"))
+    })
+}
+
 #[test]
 fn floating_point_contraction_is_ofast_only() {
     let source = r#"
@@ -69,6 +88,44 @@ end function
     assert!(
         fast_asm.contains("\n    fmadd "),
         "Ofast should contract multiply-add on ARM64:\n{fast_asm}"
+    );
+}
+
+#[test]
+fn floating_point_contraction_does_not_cross_calls() {
+    let source = r#"
+real(8) function multiply_call_add(a,b,c) result(r) bind(c, name="multiply_call_add")
+  use iso_c_binding
+  interface
+    subroutine observe_fp_state() bind(c, name="observe_fp_state")
+    end subroutine observe_fp_state
+  end interface
+  real(c_double), value :: a,b,c
+  real(c_double) :: product
+  product = a*b
+  call observe_fp_state()
+  r = product+c
+end function
+"#;
+
+    let asm = compile_arm64_asm(source, "-Ofast");
+    let multiply = asm
+        .find("\n    fmul ")
+        .unwrap_or_else(|| panic!("Ofast must retain the pre-call multiply:\n{asm}"));
+    let call = asm
+        .find("\n    bl _observe_fp_state")
+        .unwrap_or_else(|| panic!("missing floating-point observer call:\n{asm}"));
+    let add = asm
+        .find("\n    fadd ")
+        .unwrap_or_else(|| panic!("Ofast must retain the post-call add:\n{asm}"));
+
+    assert!(
+        multiply < call && call < add,
+        "the call must remain between the separately rounded operations:\n{asm}"
+    );
+    assert!(
+        !asm.contains("\n    fmadd "),
+        "Ofast must not contract multiply-add across a call:\n{asm}"
     );
 }
 
@@ -157,6 +214,49 @@ end subroutine
     assert!(
         !asm.contains("\n    b _sink"),
         "frame teardown invalidates overflow arguments:\n{asm}"
+    );
+}
+
+#[test]
+fn selected_local_character_address_blocks_tail_call_frame_teardown() {
+    // The BIND(C) assumed-size dummy receives a raw data pointer in x0, so the
+    // selected local address itself is what makes tail-call conversion unsafe.
+    let source = r#"
+subroutine wrap(flag)
+  use iso_c_binding, only: c_char
+  implicit none
+  logical, intent(in) :: flag
+  character(kind=c_char, len=4) :: local
+  interface
+    subroutine sink(text) bind(C, name="sink")
+      import c_char
+      character(kind=c_char), intent(in) :: text(*)
+    end subroutine
+  end interface
+  local = 'locl'
+  call sink(merge(local, 'glob', flag))
+end subroutine
+"#;
+    let asm = compile_arm64_asm(source, "-O1");
+    let repeated = compile_arm64_asm(source, "-O1");
+
+    assert_eq!(
+        asm, repeated,
+        "selected-pointer lowering must be deterministic"
+    );
+
+    assert!(
+        asm.lines()
+            .any(|line| line.trim_start().starts_with("csel x")),
+        "character MERGE must exercise the selected-pointer path:\n{asm}"
+    );
+    assert!(
+        asm.contains("bl _sink"),
+        "a selected local address must retain a normal call:\n{asm}"
+    );
+    assert!(
+        !asm.contains("\n    b _sink"),
+        "tail branching would invalidate the selected local address:\n{asm}"
     );
 }
 
@@ -266,6 +366,159 @@ end program comparisons
         !ir.contains("vicmp") && !ir.contains("vfcmp"),
         "unsupported ARM64 comparisons reached vector instruction selection:\n{ir}"
     );
+}
+
+#[test]
+fn unsupported_arm64_i64_vector_multiply_remains_scalar() {
+    let source = r#"
+subroutine multiply_i64(a, b, c) bind(c, name="multiply_i64")
+  use iso_c_binding, only: c_int64_t
+  implicit none
+  integer(c_int64_t), intent(in) :: a(32), b(32)
+  integer(c_int64_t), intent(out) :: c(32)
+  integer :: i
+  do i = 1, 32
+    c(i) = a(i) * b(i)
+  end do
+end subroutine multiply_i64
+"#;
+
+    let ir = compile_arm64_ir(source, "-O3");
+    assert!(
+        ir.contains("imul") && !ir.contains("vmul"),
+        "2xi64 multiply has no NEON instruction and must remain scalar in IR:\n{ir}"
+    );
+
+    let asm = compile_arm64_asm(source, "-O3");
+    assert!(
+        asm.contains("\n    mul "),
+        "scalar i64 multiply should reach the ARM64 MUL selector:\n{asm}"
+    );
+    assert!(
+        !asm.lines().any(|line| line.trim() == "nop"),
+        "unsupported vector arithmetic must not survive as a NOP:\n{asm}"
+    );
+}
+
+#[test]
+fn undefined_procedure_addresses_use_the_macho_got() {
+    let source = r#"
+module arm64_macho_got_addresses_m
+  use iso_c_binding
+  implicit none
+  abstract interface
+    subroutine hook_interface() bind(C)
+    end subroutine hook_interface
+  end interface
+  interface
+    subroutine external_hook() bind(C, name="armfortas_external_hook")
+    end subroutine external_hook
+  end interface
+  procedure(hook_interface), pointer :: local_slot => null()
+  procedure(hook_interface), pointer :: external_slot => null()
+contains
+  subroutine local_hook() bind(C, name="armfortas_local_hook")
+  end subroutine local_hook
+
+  subroutine capture_hook_addresses() bind(C, name="capture_hook_addresses")
+    local_slot => local_hook
+    external_slot => external_hook
+  end subroutine capture_hook_addresses
+end module arm64_macho_got_addresses_m
+"#;
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let asm = compile_arm64_asm(source, opt);
+        assert!(
+            asm.contains("_armfortas_local_hook@PAGE")
+                && asm.contains("_armfortas_local_hook@PAGEOFF"),
+            "{opt} must address the function defined in this module directly:\n{asm}"
+        );
+        assert!(
+            !asm.contains("_armfortas_local_hook@GOTPAGE"),
+            "{opt} must not route a module-defined function through the GOT:\n{asm}"
+        );
+        assert!(
+            asm.contains("_armfortas_external_hook@GOTPAGE")
+                && asm.contains("_armfortas_external_hook@GOTPAGEOFF"),
+            "{opt} must resolve an undefined function address through the Mach-O GOT:\n{asm}"
+        );
+        assert!(
+            !asm.contains("_armfortas_external_hook@PAGE\n"),
+            "{opt} must not emit a direct relocation for an undefined function address:\n{asm}"
+        );
+    }
+
+    let _ = fs::remove_file(std::env::temp_dir().join("arm64_macho_got_addresses_m.amod"));
+}
+
+#[test]
+fn imported_module_data_addresses_use_the_macho_got() {
+    let dir = unique_temp_dir("imported_data_got");
+    let provider_source = dir.join("external_data_provider.f90");
+    let provider_object = dir.join("external_data_provider.o");
+    fs::write(
+        &provider_source,
+        "module external_data_provider\n  use iso_c_binding\n  implicit none\n  integer(c_int) :: shared = 73\nend module external_data_provider\n",
+    )
+    .expect("write external-data provider");
+
+    let provider = Command::new(compiler())
+        .current_dir(&dir)
+        .args(["-ffree-form", "--target", "arm64-macos", "-c", "-J"])
+        .arg(&dir)
+        .arg(&provider_source)
+        .args(["-o"])
+        .arg(&provider_object)
+        .output()
+        .expect("compile external-data provider");
+    assert!(
+        provider.status.success(),
+        "external-data provider failed to compile: {}",
+        String::from_utf8_lossy(&provider.stderr)
+    );
+    assert!(
+        dir.join("external_data_provider.amod").is_file(),
+        "provider compile did not produce its module interface"
+    );
+
+    let consumer_source = dir.join("external_data_consumer.f90");
+    fs::write(
+        &consumer_source,
+        "subroutine read_shared(out) bind(C, name=\"read_shared\")\n  use iso_c_binding\n  use external_data_provider, only: shared\n  implicit none\n  integer(c_int), intent(out) :: out\n  out = shared\nend subroutine read_shared\n",
+    )
+    .expect("write external-data consumer");
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let assembly = dir.join(format!("external_data_consumer_{}.s", &opt[1..]));
+        let consumer = Command::new(compiler())
+            .current_dir(&dir)
+            .args(["-ffree-form", "--target", "arm64-macos", opt, "-S", "-I"])
+            .arg(&dir)
+            .arg(&consumer_source)
+            .args(["-o"])
+            .arg(&assembly)
+            .output()
+            .expect("compile external-data consumer");
+        assert!(
+            consumer.status.success(),
+            "{opt} external-data consumer failed to compile: {}",
+            String::from_utf8_lossy(&consumer.stderr)
+        );
+
+        let asm = fs::read_to_string(&assembly).expect("read external-data consumer assembly");
+        assert!(
+            asm.contains("_afs_mod_external_data_provider_shared@GOTPAGE")
+                && asm.contains("_afs_mod_external_data_provider_shared@GOTPAGEOFF"),
+            "{opt} must resolve imported module data through the Mach-O GOT:\n{asm}"
+        );
+        assert!(
+            !asm.contains("_afs_mod_external_data_provider_shared@PAGE\n"),
+            "{opt} must not emit a direct relocation for imported module data:\n{asm}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -419,8 +672,8 @@ end function call4
         .unwrap_or_else(|| panic!("complex(4) call missing:\n{c4}"));
     let setup4 = &c4[..call4];
     assert!(
-        setup4.contains("fmov s0,") && setup4.contains("fmov s1,"),
-        "complex(4) VALUE argument must use s0:s1:\n{c4}"
+        setup_defines_fp_arg(setup4, "s0") && setup_defines_fp_arg(setup4, "s1"),
+        "complex(4) VALUE argument must initialize s0:s1:\n{c4}"
     );
 
     let c8 = compile_arm64_asm(
@@ -444,13 +697,8 @@ end function call8
         .unwrap_or_else(|| panic!("complex(8) call missing:\n{c8}"));
     let setup8 = &c8[..call8];
     assert!(
-        setup8
-            .lines()
-            .any(|line| line.trim_start().starts_with("fmov d0,"))
-            && setup8
-                .lines()
-                .any(|line| line.trim_start().starts_with("fmov d1,")),
-        "complex(8) VALUE argument must use d0:d1:\n{c8}"
+        setup_defines_fp_arg(setup8, "d0") && setup_defines_fp_arg(setup8, "d1"),
+        "complex(8) VALUE argument must initialize d0:d1:\n{c8}"
     );
 
     let mixed = compile_arm64_asm(
@@ -493,9 +741,7 @@ end function call_mixed8
     let setup = &mixed[..call];
     for reg in ["s0", "s1", "s2", "s3"] {
         assert!(
-            setup
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("fmov {reg},"))),
+            setup_defines_fp_arg(setup, reg),
             "scalar/complex/scalar arguments must occupy s0/s1:s2/s3:\n{mixed}"
         );
     }
@@ -509,9 +755,7 @@ end function call_mixed8
     let setup8 = &mixed[call8_start..call8];
     for reg in ["d0", "d1", "d2", "d3"] {
         assert!(
-            setup8
-                .lines()
-                .any(|line| line.trim_start().starts_with(&format!("fmov {reg},"))),
+            setup_defines_fp_arg(setup8, reg),
             "scalar/complex/scalar arguments must occupy d0/d1:d2/d3:\n{mixed}"
         );
     }

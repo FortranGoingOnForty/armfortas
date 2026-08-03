@@ -15,7 +15,6 @@
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, predecessors, terminator_targets};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -199,6 +198,7 @@ fn memory_effect(
             AliasResult::MayAlias => MemoryEffect::Clobbered,
             AliasResult::NoAlias => MemoryEffect::NoAlias,
         },
+        InstKind::VolatileLoad(..) | InstKind::VolatileStore(..) => MemoryEffect::Clobbered,
         InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
             // A callee may access module/global state without receiving its
             // address as an argument.
@@ -212,14 +212,14 @@ fn memory_effect(
             // Same fix as LocalLsf (commit e4016f6).
             let mut saw_pointer_arg = false;
             for arg in args.iter().copied() {
-                if !alias_oracle.value_is_pointer(arg) {
+                let Some(arg) = alias_oracle.call_arg_pointer(arg) else {
                     continue;
-                }
+                };
                 saw_pointer_arg = true;
-                if call_arg_may_carry_indirect_pointer(alias_oracle, arg) {
+                if arg.may_carry_indirect_pointer {
                     return MemoryEffect::Clobbered;
                 }
-                if alias_oracle.may_reach_through_call_arg(load_ptr, arg) {
+                if alias_oracle.may_reach_through_call_arg(load_ptr, arg.pointer) {
                     return MemoryEffect::Clobbered;
                 }
             }
@@ -231,20 +231,6 @@ fn memory_effect(
         }
         _ => MemoryEffect::Ignore,
     }
-}
-
-fn call_arg_may_carry_indirect_pointer(
-    alias_oracle: &alias::AliasOracle<'_>,
-    value: ValueId,
-) -> bool {
-    matches!(
-        alias_oracle.value_type(value),
-        Some(IrType::Ptr(inner))
-            if matches!(
-                inner.as_ref(),
-                IrType::Array(..) | IrType::Struct(_) | IrType::Ptr(_) | IrType::FuncPtr(_)
-            )
-    )
 }
 
 fn paths_to_load_are_clean(
@@ -888,6 +874,80 @@ mod tests {
         } else {
             panic!("unexpected terminator after GlobalLsf: {:?}", term);
         }
+    }
+
+    #[test]
+    fn does_not_forward_across_ptr_to_int_call_arg() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let span = crate::lexer::Span {
+            file_id: 0,
+            start: crate::lexer::Position { line: 0, col: 0 },
+            end: crate::lexer::Position { line: 0, col: 0 },
+        };
+        let load_block = f.create_block("load");
+
+        let ptr = f.next_value_id();
+        f.register_type(ptr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: ptr,
+            ty: IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            span,
+            kind: InstKind::Alloca(IrType::Int(IntWidth::I32)),
+        });
+        let initial = f.next_value_id();
+        f.register_type(initial, IrType::Int(IntWidth::I32));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: initial,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::ConstInt(42, IntWidth::I32),
+        });
+        let store = f.next_value_id();
+        f.register_type(store, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: store,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Store(initial, ptr),
+        });
+        let c_ptr = f.next_value_id();
+        f.register_type(c_ptr, IrType::Int(IntWidth::I64));
+        f.block_mut(f.entry).insts.push(Inst {
+            id: c_ptr,
+            ty: IrType::Int(IntWidth::I64),
+            span,
+            kind: InstKind::PtrToInt(ptr),
+        });
+        let call = f.next_value_id();
+        f.register_type(call, IrType::Void);
+        f.block_mut(f.entry).insts.push(Inst {
+            id: call,
+            ty: IrType::Void,
+            span,
+            kind: InstKind::Call(FuncRef::External("mutate".into()), vec![c_ptr]),
+        });
+        f.block_mut(f.entry).terminator = Some(Terminator::Branch(load_block, vec![]));
+
+        let load = f.next_value_id();
+        f.register_type(load, IrType::Int(IntWidth::I32));
+        f.block_mut(load_block).insts.push(Inst {
+            id: load,
+            ty: IrType::Int(IntWidth::I32),
+            span,
+            kind: InstKind::Load(ptr),
+        });
+        f.block_mut(load_block).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(
+            !GlobalLsf.run(&mut m),
+            "global LSF must preserve a load across a call receiving PtrToInt(local)"
+        );
+        assert!(matches!(
+            m.functions[0].block(load_block).terminator,
+            Some(Terminator::Return(Some(value))) if value == load
+        ));
     }
 
     #[test]

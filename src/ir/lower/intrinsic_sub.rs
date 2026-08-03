@@ -125,14 +125,15 @@ pub(crate) fn lower_intrinsic_subroutine(
         (z, z)
     }
 
-    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
-    /// through an i64 slot. Non-i64 destinations get a temporary i64
-    /// alloca followed by an explicit writeback after the runtime call.
-    fn nth_arg_i64_out(
+    /// Adapt an intrinsic out-arg to a fixed-width runtime ABI. A destination
+    /// with a different kind gets a temporary of the ABI type followed by an
+    /// explicit writeback after the runtime call.
+    fn nth_arg_typed_out(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
         args: &[Option<crate::ast::expr::Argument>],
         n: usize,
+        runtime_ty: IrType,
     ) -> (ValueId, Option<RuntimeOutWriteback>) {
         if let Some(Some(arg)) = args.get(n) {
             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
@@ -145,10 +146,10 @@ pub(crate) fn lower_intrinsic_subroutine(
                     _ => None,
                 };
                 if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
-                    if dest_ty == IrType::Int(IntWidth::I64) {
+                    if dest_ty == runtime_ty {
                         return (dest_ptr, None);
                     }
-                    let tmp_ptr = b.alloca(IrType::Int(IntWidth::I64));
+                    let tmp_ptr = b.alloca(runtime_ty);
                     return (
                         tmp_ptr,
                         Some(RuntimeOutWriteback {
@@ -164,43 +165,40 @@ pub(crate) fn lower_intrinsic_subroutine(
         (b.const_i64(0), None)
     }
 
-    /// Helper: adapt an intrinsic out-arg to a runtime ABI that writes
-    /// through an f64 slot. Non-f64 destinations get a temporary f64
-    /// alloca followed by an explicit writeback after the runtime call.
+    /// Adapt an intrinsic out-arg to a runtime ABI that writes through i32.
+    fn nth_arg_i32_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        nth_arg_typed_out(b, ctx, args, n, IrType::Int(IntWidth::I32))
+    }
+
+    /// Adapt an intrinsic out-arg to a runtime ABI that writes through i64.
+    fn nth_arg_i64_out(
+        b: &mut FuncBuilder,
+        ctx: &LowerCtx,
+        args: &[Option<crate::ast::expr::Argument>],
+        n: usize,
+    ) -> (ValueId, Option<RuntimeOutWriteback>) {
+        nth_arg_typed_out(b, ctx, args, n, IrType::Int(IntWidth::I64))
+    }
+
+    /// Adapt an intrinsic out-arg to a runtime ABI that writes through f64.
     fn nth_arg_f64_out(
         b: &mut FuncBuilder,
         ctx: &LowerCtx,
         args: &[Option<crate::ast::expr::Argument>],
         n: usize,
     ) -> (ValueId, Option<RuntimeOutWriteback>) {
-        if let Some(Some(arg)) = args.get(n) {
-            if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                let dest_ptr = lower_arg_by_ref_ctx(b, ctx, e);
-                let semantic_dest_ty =
-                    generic_actual_expr_type_info(e, &ctx.locals, ctx.st, Some(ctx.type_layouts))
-                        .map(|ti| type_info_to_ir_type(&ti));
-                let pointer_dest_ty = match b.func().value_type(dest_ptr) {
-                    Some(IrType::Ptr(inner)) => Some((*inner).clone()),
-                    _ => None,
-                };
-                if let Some(dest_ty) = semantic_dest_ty.or(pointer_dest_ty) {
-                    if dest_ty == IrType::Float(FloatWidth::F64) {
-                        return (dest_ptr, None);
-                    }
-                    let tmp_ptr = b.alloca(IrType::Float(FloatWidth::F64));
-                    return (
-                        tmp_ptr,
-                        Some(RuntimeOutWriteback {
-                            dest_ptr,
-                            dest_ty,
-                            tmp_ptr,
-                        }),
-                    );
-                }
-                return (dest_ptr, None);
-            }
-        }
-        (b.const_i64(0), None)
+        nth_arg_typed_out(b, ctx, args, n, IrType::Float(FloatWidth::F64))
+    }
+
+    fn emit_runtime_out_writeback(b: &mut FuncBuilder, writeback: RuntimeOutWriteback) {
+        let raw = b.load(writeback.tmp_ptr);
+        let coerced = coerce_to_type(b, raw, &writeback.dest_ty);
+        b.store(coerced, writeback.dest_ptr);
     }
 
     let arg_slots = reorder_args_by_keyword_slots(args, name, ctx.st);
@@ -549,14 +547,40 @@ pub(crate) fn lower_intrinsic_subroutine(
             true
         }
         "date_and_time" => {
-            // call date_and_time(date, time, zone, values) — all optional strings/array
-            // Runtime: afs_date_and_time(date_buf, date_len, time_buf, time_len, zone_buf, zone_len, values)
+            // DATE_AND_TIME(date, time, zone, values): strings are optional,
+            // while a present VALUES actual is always passed as an array
+            // descriptor so integer kind and section stride remain explicit.
             let (date_ptr, date_len) = nth_arg_str(b, ctx, args, 0);
             let (time_ptr, time_len) = nth_arg_str(b, ctx, args, 1);
             let (zone_ptr, zone_len) = nth_arg_str(b, ctx, args, 2);
-            let values = nth_arg_ref(b, ctx, args, 3);
+            let values = if let Some(expr) = nth_arg_expr(args, 3) {
+                let Some((descriptor, elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) else {
+                    eprintln!(
+                        "armfortas: error: DATE_AND_TIME VALUES must be a rank-one INTEGER array"
+                    );
+                    std::process::exit(1);
+                };
+                if !matches!(elem_ty, IrType::Int(_)) {
+                    eprintln!(
+                        "armfortas: error: DATE_AND_TIME VALUES must be a rank-one INTEGER array"
+                    );
+                    std::process::exit(1);
+                }
+                descriptor
+            } else {
+                b.const_i64(0)
+            };
             b.call(
-                FuncRef::External("afs_date_and_time".into()),
+                FuncRef::External("afs_date_and_time_desc".into()),
                 vec![
                     date_ptr, date_len, time_ptr, time_len, zone_ptr, zone_len, values,
                 ],
@@ -569,13 +593,16 @@ pub(crate) fn lower_intrinsic_subroutine(
             // Runtime: afs_get_command_argument(number, value, value_len, length, status)
             let number = nth_arg_val(b, ctx, args, 0, 0);
             let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
-            let length = nth_arg_ref(b, ctx, args, 2);
-            let status = nth_arg_ref(b, ctx, args, 3);
+            let (length, length_writeback) = nth_arg_i32_out(b, ctx, args, 2);
+            let (status, status_writeback) = nth_arg_i32_out(b, ctx, args, 3);
             b.call(
                 FuncRef::External("afs_get_command_argument".into()),
                 vec![number, val_ptr, val_len, length, status],
                 IrType::Void,
             );
+            for writeback in [length_writeback, status_writeback].into_iter().flatten() {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "command_argument_count" => {
@@ -585,38 +612,45 @@ pub(crate) fn lower_intrinsic_subroutine(
         "get_command" => {
             // call get_command(command, length, status)
             let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
-            let length = nth_arg_ref(b, ctx, args, 1);
-            let status = nth_arg_ref(b, ctx, args, 2);
+            let (length, length_writeback) = nth_arg_i32_out(b, ctx, args, 1);
+            let (status, status_writeback) = nth_arg_i32_out(b, ctx, args, 2);
             b.call(
                 FuncRef::External("afs_get_command".into()),
                 vec![cmd_ptr, cmd_len, length, status],
                 IrType::Void,
             );
+            for writeback in [length_writeback, status_writeback].into_iter().flatten() {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "get_environment_variable" => {
-            // call get_environment_variable(name, value, length, status)
-            // Runtime: afs_get_environment_variable(name, name_len, value, value_len, length, status)
+            // call get_environment_variable(name, value, length, status, trim_name)
+            // Runtime: afs_get_environment_variable_trim(
+            //     name, name_len, value, value_len, length, status, trim_name)
             let (name_ptr, name_len) = nth_arg_str(b, ctx, args, 0);
             let (val_ptr, val_len) = nth_arg_str(b, ctx, args, 1);
-            let length = nth_arg_ref(b, ctx, args, 2);
-            let status = nth_arg_ref(b, ctx, args, 3);
+            let (length, length_writeback) = nth_arg_i32_out(b, ctx, args, 2);
+            let (status, status_writeback) = nth_arg_i32_out(b, ctx, args, 3);
+            let trim_name = nth_arg_val(b, ctx, args, 4, 1);
+            let trim_name = coerce_to_type(b, trim_name, &IrType::Int(IntWidth::I32));
             b.call(
-                FuncRef::External("afs_get_environment_variable".into()),
-                vec![name_ptr, name_len, val_ptr, val_len, length, status],
+                FuncRef::External("afs_get_environment_variable_trim".into()),
+                vec![
+                    name_ptr, name_len, val_ptr, val_len, length, status, trim_name,
+                ],
                 IrType::Void,
             );
+            for writeback in [length_writeback, status_writeback].into_iter().flatten() {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "random_number" => {
-            // F2018 §16.9.171: RANDOM_NUMBER(harvest) accepts both
-            // scalar and array harvest. The scalar runtime fills only
-            // one element; routing array actuals to it left N-1 slots
-            // as stack garbage, which surfaced as denormal/NaN values
-            // throughout stdlib examples (e.g. sparse_spmv: count() on
-            // the resulting matrix returned 1 instead of m*n, malloc
-            // sized COO%index(2,1), and the next assign ran past dim 0).
-            let harvest = nth_arg_ref(b, ctx, args, 0);
+            // F2018 §16.9.171: an array HARVEST is described by its
+            // rank, extents, and signed memory strides. Passing only
+            // its first address plus SIZE makes every section look
+            // contiguous and defines storage outside the actual.
             let harvest_expr = nth_arg_expr(args, 0);
             let kind_is_f32 = harvest_expr
                 .and_then(|expr| {
@@ -633,36 +667,36 @@ pub(crate) fn lower_intrinsic_subroutine(
                 .map(|e| expr_returns_array(e, &ctx.locals, ctx.st))
                 .unwrap_or(false);
             if is_array {
-                if let Some(expr) = harvest_expr {
-                    if let Some((desc, _elem_ty)) = lower_array_expr_descriptor(
-                        b,
-                        &ctx.locals,
-                        expr,
-                        ctx.st,
-                        Some(ctx.type_layouts),
-                        Some(ctx.internal_funcs),
-                        Some(ctx.contained_host_refs),
-                        Some(ctx.descriptor_params),
-                    ) {
-                        let n = b.call(
-                            FuncRef::External("afs_array_size".into()),
-                            vec![desc],
-                            IrType::Int(IntWidth::I64),
-                        );
-                        let runtime = if kind_is_f32 {
-                            "afs_random_number_array_f32"
-                        } else {
-                            "afs_random_number_array_f64"
-                        };
-                        b.call(
-                            FuncRef::External(runtime.into()),
-                            vec![harvest, n],
-                            IrType::Void,
-                        );
-                        return true;
-                    }
+                let Some(expr) = harvest_expr else {
+                    unreachable!("array classification requires a present RANDOM_NUMBER HARVEST");
+                };
+                let Some((descriptor, elem_ty)) = lower_array_expr_descriptor(
+                    b,
+                    &ctx.locals,
+                    expr,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                ) else {
+                    eprintln!(
+                        "armfortas: error: RANDOM_NUMBER HARVEST array requires a descriptor"
+                    );
+                    std::process::exit(1);
+                };
+                if !matches!(elem_ty, IrType::Float(_)) {
+                    eprintln!("armfortas: error: RANDOM_NUMBER HARVEST must be REAL");
+                    std::process::exit(1);
                 }
+                b.call(
+                    FuncRef::External("afs_random_number_array_desc".into()),
+                    vec![descriptor],
+                    IrType::Void,
+                );
+                return true;
             }
+            let harvest = nth_arg_ref(b, ctx, args, 0);
             let runtime = if kind_is_f32 {
                 "afs_random_number_f32"
             } else {
@@ -750,16 +784,46 @@ pub(crate) fn lower_intrinsic_subroutine(
             }
             true
         }
+        "random_init" => {
+            let repeatable = nth_arg_val(b, ctx, args, 0, 0);
+            let image_distinct = nth_arg_val(b, ctx, args, 1, 0);
+            let abi_ty = IrType::Int(IntWidth::I32);
+            let repeatable = coerce_to_type(b, repeatable, &abi_ty);
+            let image_distinct = coerce_to_type(b, image_distinct, &abi_ty);
+            b.call(
+                FuncRef::External("afs_random_init".into()),
+                vec![repeatable, image_distinct],
+                IrType::Void,
+            );
+            true
+        }
         "execute_command_line" => {
             let (cmd_ptr, cmd_len) = nth_arg_str(b, ctx, args, 0);
             let wait = nth_arg_val(b, ctx, args, 1, 1);
-            let exitstat = nth_arg_ref(b, ctx, args, 2);
-            let cmdstat = nth_arg_ref(b, ctx, args, 3);
-            b.call(
-                FuncRef::External("afs_execute_command_line".into()),
-                vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
-                IrType::Void,
-            );
+            let (exitstat, exitstat_writeback) = nth_arg_i32_out(b, ctx, args, 2);
+            let (cmdstat, cmdstat_writeback) = nth_arg_i32_out(b, ctx, args, 3);
+            if nth_arg_expr(args, 4).is_some() {
+                let (cmdmsg, cmdmsg_len) = nth_arg_str(b, ctx, args, 4);
+                b.call(
+                    FuncRef::External("afs_execute_command_line_cmdmsg".into()),
+                    vec![
+                        cmd_ptr, cmd_len, wait, exitstat, cmdstat, cmdmsg, cmdmsg_len,
+                    ],
+                    IrType::Void,
+                );
+            } else {
+                b.call(
+                    FuncRef::External("afs_execute_command_line".into()),
+                    vec![cmd_ptr, cmd_len, wait, exitstat, cmdstat],
+                    IrType::Void,
+                );
+            }
+            for writeback in [exitstat_writeback, cmdstat_writeback]
+                .into_iter()
+                .flatten()
+            {
+                emit_runtime_out_writeback(b, writeback);
+            }
             true
         }
         "flush" => {

@@ -72,8 +72,8 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::PtrToInt(v)
         | InstKind::IntToPtr(v, _) => vec![*v],
 
-        InstKind::Load(a) => vec![*a],
-        InstKind::Store(v, a) => vec![*v, *a],
+        InstKind::Load(a) | InstKind::VolatileLoad(a) => vec![*a],
+        InstKind::Store(v, a) | InstKind::VolatileStore(v, a) => vec![*v, *a],
         InstKind::GetElementPtr(base, idxs) => {
             let mut uses = vec![*base];
             uses.extend(idxs);
@@ -229,8 +229,8 @@ pub fn for_each_operand_mut(kind: &mut InstKind, mut r: impl FnMut(&mut ValueId)
         | InstKind::PtrToInt(v)
         | InstKind::IntToPtr(v, _) => r(v),
 
-        InstKind::Load(a) => r(a),
-        InstKind::Store(v, a) => {
+        InstKind::Load(a) | InstKind::VolatileLoad(a) => r(a),
+        InstKind::Store(v, a) | InstKind::VolatileStore(v, a) => {
             r(v);
             r(a);
         }

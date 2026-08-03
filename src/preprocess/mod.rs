@@ -1,7 +1,8 @@
 //! Fortran-aware C-style preprocessor.
 //!
 //! Text-to-text transformation that runs before lexing. Handles #define,
-//! #ifdef/#ifndef/#if/#elif/#else/#endif, #include, #undef, #error, #warning.
+//! #ifdef/#ifndef/#if/#elif/#else/#endif, #include, Fortran INCLUDE, #undef,
+//! #error, #warning, #line/GNU linemarkers, null directives, and #pragma.
 //! Aware of Fortran string literals and comments — won't expand macros inside them.
 
 use std::collections::HashMap;
@@ -131,6 +132,7 @@ pub struct PreprocOutput {
     pub source_map: Vec<SourceLoc>,
     /// Resolved include files in first-seen order, including nested includes.
     pub included_files: Vec<PathBuf>,
+    conformance_warnings: Vec<PreprocWarning>,
     source_view: bool,
     eof_origin: SourceOrigin,
 }
@@ -160,7 +162,11 @@ struct SourceFile {
 }
 
 impl SourceFile {
-    fn new(filename: Arc<str>, text: String, source_view: bool) -> Self {
+    fn new(filename: Arc<str>, mut text: String, source_view: bool) -> Self {
+        // Normalize the stream marker before physical-line dispatch and source mapping.
+        if text.starts_with('\u{feff}') {
+            text.drain(..'\u{feff}'.len_utf8());
+        }
         let mut line_starts = vec![0];
         line_starts.extend(
             text.bytes()
@@ -245,6 +251,12 @@ impl SourceOrigin {
         origin.source_col = origin.source_col.saturating_add(source_bytes as u32);
         origin
     }
+}
+
+#[derive(Debug, Clone)]
+struct PreprocWarning {
+    origin: SourceOrigin,
+    message: &'static str,
 }
 
 fn source_text_width(text: &str, range: Range<usize>, source_view: bool) -> usize {
@@ -553,6 +565,11 @@ pub(crate) struct ResolvedSpan<'a> {
     pub source_span: Span,
 }
 
+pub(crate) struct ResolvedPreprocWarning<'a> {
+    pub span: ResolvedSpan<'a>,
+    pub message: &'static str,
+}
+
 impl PreprocOutput {
     pub(crate) fn bytes(&self) -> Vec<u8> {
         if self.source_view {
@@ -588,6 +605,29 @@ impl PreprocOutput {
             None
         };
         resolved_span_from_points(span.file_id, start, end)
+    }
+
+    pub(crate) fn resolved_conformance_warnings(
+        &self,
+    ) -> impl Iterator<Item = ResolvedPreprocWarning<'_>> {
+        self.conformance_warnings.iter().map(|warning| {
+            let display_col = warning
+                .origin
+                .source
+                .display_col(warning.origin.source_line, warning.origin.source_col);
+            let start = ResolvedPoint {
+                filename: &warning.origin.filename,
+                source: &warning.origin.source,
+                line: warning.origin.line,
+                col: display_col,
+                source_line: warning.origin.source_line,
+                source_col: warning.origin.source_col,
+            };
+            ResolvedPreprocWarning {
+                span: resolved_span_from_points(0, start, None),
+                message: warning.message,
+            }
+        })
     }
 }
 
@@ -723,7 +763,6 @@ impl ReportedLocation {
 
 struct ProcessEnd {
     next: ReportedLocation,
-    last: Option<ReportedLocation>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -737,18 +776,24 @@ enum MacroContext {
 enum CondState {
     /// Currently in a true branch, emitting output.
     Active,
-    /// In a false branch, skipping output. Saw the directive at this level.
+    /// No arm has matched yet, so the current arm is skipped.
     Skipping,
-    /// Already found a true branch at this level, skip rest (including #else).
+    /// A prior arm matched, so later alternatives are skipped.
     Done,
     /// Parent was skipping, so everything at this level is skipped regardless.
     ParentSkipping,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConditionalFrame {
+    state: CondState,
+    seen_else: bool,
+}
+
 struct Preprocessor {
     defines: HashMap<String, MacroDef>,
     include_paths: Vec<PathBuf>,
-    cond_stack: Vec<CondState>,
+    cond_stack: Vec<ConditionalFrame>,
     /// O(1) counter: number of non-Active levels on the stack.
     /// `is_emitting()` is just `skip_depth == 0`.
     skip_depth: u32,
@@ -765,6 +810,7 @@ struct Preprocessor {
     /// Whether source stripping is currently inside a C-style block comment.
     in_c_block_comment: bool,
     included_files: Vec<PathBuf>,
+    conformance_warnings: Vec<PreprocWarning>,
 }
 
 impl Preprocessor {
@@ -792,6 +838,7 @@ impl Preprocessor {
             skip_depth: 0,
             include_depth: 0,
             included_files: Vec::new(),
+            conformance_warnings: Vec::new(),
         }
     }
 
@@ -830,6 +877,17 @@ impl Preprocessor {
         }
     }
 
+    fn display_directive_name(&self, directive: &str) -> String {
+        const MAX_CHARS: usize = 80;
+
+        let Some((end, _)) = directive.char_indices().nth(MAX_CHARS) else {
+            return self.display_source_text(directive);
+        };
+        let mut displayed = self.display_source_text(&directive[..end]);
+        displayed.push_str("...");
+        displayed
+    }
+
     fn set_location_macros(&mut self, location: &ReportedLocation) {
         self.defines.insert(
             "__LINE__".into(),
@@ -853,19 +911,6 @@ impl Preprocessor {
             self.source_view,
         ));
         let process_end = self.process_into(root_source.clone(), &mut output, &mut source_map)?;
-
-        // Check for unterminated conditionals (only at top level).
-        if self.include_depth == 0 && !self.cond_stack.is_empty() {
-            let location = process_end.last.as_ref().unwrap_or(&process_end.next);
-            return Err(PreprocError {
-                filename: location.filename.to_string(),
-                line: location.line,
-                msg: format!(
-                    "unterminated #if/#ifdef ({} level(s) still open)",
-                    self.cond_stack.len()
-                ),
-            });
-        }
         let final_reported = process_end.next;
 
         let mut eof_origin = None;
@@ -891,6 +936,7 @@ impl Preprocessor {
             text: output,
             source_map,
             included_files: self.included_files.clone(),
+            conformance_warnings: self.conformance_warnings.clone(),
             source_view: self.source_view,
             eof_origin,
         })
@@ -908,6 +954,7 @@ impl Preprocessor {
             line: 1,
         };
         let mut last_reported = None;
+        let conditional_floor = self.cond_stack.len();
 
         let now = current_datetime();
         self.defines.insert(
@@ -956,11 +1003,12 @@ impl Preprocessor {
                 i += 1;
             }
 
-            // Also join Fortran &-continued lines (free-form).
-            // A line ending with & in the code portion (not inside strings or after !)
-            // continues on the next line.
+            // Also join Fortran &-continued lines (free-form). A trailing
+            // & outside a string continues code; a trailing & inside an
+            // unterminated character literal continues that literal.
             // Skip for preprocessor directives (#if, #define, etc.) where ! and &
             // have C semantics, not Fortran semantics.
+            let mut joined_fortran_continuation = false;
             if !self.fixed_form && !logical_line.text.trim_start().starts_with('#') {
                 // Incremental: scan only the newly appended piece per
                 // join, carrying string state — the full-line rescan
@@ -983,10 +1031,22 @@ impl Preprocessor {
                         }
                         logical_line.truncate(amp_pos);
                         let leading = raw_next.len() - next.len();
-                        let content_start = leading + usize::from(next.starts_with('&'));
                         let physical_line = (i + 1) as u32;
                         let piece_reported =
                             reported_start.at_physical_offset(physical_line - orig_line_num);
+                        if scan.amp_in_string && !next.starts_with('&') && self.is_emitting() {
+                            self.conformance_warnings.push(PreprocWarning {
+                                origin: Self::make_source_origin(
+                                    &source,
+                                    physical_line,
+                                    u32::try_from(leading.saturating_add(1)).unwrap_or(u32::MAX),
+                                    &piece_reported,
+                                ),
+                                message:
+                                    "missing '&' at the start of a continued character literal",
+                            });
+                        }
+                        let content_start = leading + usize::from(next.starts_with('&'));
                         let next_line = MappedText::source_line(
                             raw_next,
                             Self::make_source_origin(&source, physical_line, 1, &piece_reported),
@@ -994,6 +1054,7 @@ impl Preprocessor {
                         let next_piece = next_line.slice(content_start..raw_next.len());
                         let base = logical_line.text.len();
                         logical_line.append(&next_piece);
+                        joined_fortran_continuation = true;
                         i += 1;
                         scan = scan_trailing_ampersand(
                             &logical_line.text[base..],
@@ -1046,6 +1107,7 @@ impl Preprocessor {
                     output,
                     source_map,
                     &mut reported,
+                    conditional_floor,
                 )?;
                 output.push('\n');
                 source_map.push(logical_line.into_source_loc());
@@ -1056,9 +1118,40 @@ impl Preprocessor {
             }
 
             let emitted = if self.is_emitting() {
-                let expanded = self.expand_mapped_macros(&logical_line);
-                output.push_str(&expanded.text);
-                expanded
+                let expanded = self.expand_mapped_macros(&logical_line)?;
+                match parse_fortran_include_path(&expanded.text, self.fixed_form) {
+                    Ok(Some(path)) => {
+                        if joined_fortran_continuation {
+                            return Err(PreprocError {
+                                filename: reported_start.filename.to_string(),
+                                line: reported_start.line,
+                                msg: "Fortran INCLUDE line cannot be continued".into(),
+                            });
+                        }
+                        let path = self.display_source_text(&path);
+                        self.include_file(
+                            &path,
+                            filename,
+                            false,
+                            &reported_start.filename,
+                            reported_start.line,
+                            output,
+                            source_map,
+                        )?;
+                        MappedText::empty(expanded.fallback)
+                    }
+                    Ok(None) => {
+                        output.push_str(&expanded.text);
+                        expanded
+                    }
+                    Err(msg) => {
+                        return Err(PreprocError {
+                            filename: reported_start.filename.to_string(),
+                            line: reported_start.line,
+                            msg: self.display_source_text(&msg),
+                        });
+                    }
+                }
             } else {
                 MappedText::empty(logical_line.fallback.clone())
             };
@@ -1067,10 +1160,25 @@ impl Preprocessor {
             reported.advance(physical_lines);
         }
 
-        Ok(ProcessEnd {
-            next: reported,
-            last: last_reported,
-        })
+        if self.cond_stack.len() > conditional_floor {
+            let open_levels = self.cond_stack.len() - conditional_floor;
+            while self.cond_stack.len() > conditional_floor {
+                self.pop_cond();
+            }
+            let location = last_reported.as_ref().unwrap_or(&reported);
+            let scope = if self.include_depth > 0 {
+                " in include file"
+            } else {
+                ""
+            };
+            return Err(PreprocError {
+                filename: location.filename.to_string(),
+                line: location.line,
+                msg: format!("unterminated #if/#ifdef{scope} ({open_levels} level(s) still open)"),
+            });
+        }
+
+        Ok(ProcessEnd { next: reported })
     }
 
     fn process_directive(
@@ -1080,6 +1188,7 @@ impl Preprocessor {
         output: &mut String,
         source_map: &mut Vec<SourceLoc>,
         reported: &mut ReportedLocation,
+        conditional_floor: usize,
     ) -> Result<bool, PreprocError> {
         let diagnostic_filename = reported.filename.clone();
         let diagnostic_line = reported.line;
@@ -1106,9 +1215,14 @@ impl Preprocessor {
             "ifdef" => self.do_ifdef(args_text, false)?,
             "ifndef" => self.do_ifdef(args_text, true)?,
             "if" => self.do_if(&args, &diagnostic_filename, diagnostic_line)?,
-            "elif" => self.do_elif(&args, &diagnostic_filename, diagnostic_line)?,
-            "else" => self.do_else(&diagnostic_filename, diagnostic_line)?,
-            "endif" => self.do_endif(&diagnostic_filename, diagnostic_line)?,
+            "elif" => self.do_elif(
+                &args,
+                &diagnostic_filename,
+                diagnostic_line,
+                conditional_floor,
+            )?,
+            "else" => self.do_else(&diagnostic_filename, diagnostic_line, conditional_floor)?,
+            "endif" => self.do_endif(&diagnostic_filename, diagnostic_line, conditional_floor)?,
             _ => {}
         }
         if matches!(
@@ -1154,8 +1268,26 @@ impl Preprocessor {
             "line" => {
                 return Ok(self.do_line(args_text, reported));
             }
-            "" => {} // bare # is allowed (null directive)
-            _ => {}  // unknown directives are ignored (like #pragma)
+            "pragma" => {} // implementations may ignore unrecognized pragmas
+            "" => {}       // bare # is allowed (null directive)
+            _ if directive.parse::<u32>().is_ok() => {
+                let marker = if args_text.is_empty() {
+                    directive.to_string()
+                } else {
+                    format!("{directive} {args_text}")
+                };
+                return Ok(self.do_line(&marker, reported));
+            }
+            _ => {
+                return Err(PreprocError {
+                    filename: diagnostic_filename.to_string(),
+                    line: diagnostic_line,
+                    msg: format!(
+                        "unknown preprocessing directive #{}",
+                        self.display_directive_name(directive)
+                    ),
+                });
+            }
         }
         Ok(false)
     }
@@ -1166,11 +1298,14 @@ impl Preprocessor {
         if !matches!(state, CondState::Active) {
             self.skip_depth += 1;
         }
-        self.cond_stack.push(state);
+        self.cond_stack.push(ConditionalFrame {
+            state,
+            seen_else: false,
+        });
     }
 
     fn set_top_cond(&mut self, new: CondState) {
-        let old = *self.cond_stack.last().unwrap();
+        let old = self.cond_stack.last().unwrap().state;
         let was_skip = !matches!(old, CondState::Active);
         let now_skip = !matches!(new, CondState::Active);
         match (was_skip, now_skip) {
@@ -1178,15 +1313,34 @@ impl Preprocessor {
             (true, false) => self.skip_depth -= 1,
             _ => {}
         }
-        *self.cond_stack.last_mut().unwrap() = new;
+        self.cond_stack.last_mut().unwrap().state = new;
     }
 
     fn pop_cond(&mut self) -> Option<CondState> {
-        let popped = self.cond_stack.pop()?;
+        let popped = self.cond_stack.pop()?.state;
         if !matches!(popped, CondState::Active) {
             self.skip_depth -= 1;
         }
         Some(popped)
+    }
+
+    fn require_file_local_conditional(
+        &self,
+        directive: &str,
+        filename: &str,
+        line_num: u32,
+        conditional_floor: usize,
+    ) -> Result<(), PreprocError> {
+        if conditional_floor > 0 && self.cond_stack.len() == conditional_floor {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: line_num,
+                msg: format!(
+                    "{directive} cannot match a conditional opened outside this include file"
+                ),
+            });
+        }
+        Ok(())
     }
 
     // ---- Conditional directives ----
@@ -1231,20 +1385,31 @@ impl Preprocessor {
         args: &MappedText,
         filename: &str,
         line_num: u32,
+        conditional_floor: usize,
     ) -> Result<(), PreprocError> {
-        match self.cond_stack.last().copied() {
-            None => Err(PreprocError {
+        self.require_file_local_conditional("#elif", filename, line_num, conditional_floor)?;
+        let Some(frame) = self.cond_stack.last().copied() else {
+            return Err(PreprocError {
                 filename: filename.into(),
                 line: line_num,
                 msg: "#elif without matching #if".into(),
-            }),
-            Some(CondState::ParentSkipping) => Ok(()),
-            Some(CondState::Active) => {
+            });
+        };
+        if frame.seen_else {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: line_num,
+                msg: "#elif after #else".into(),
+            });
+        }
+        match frame.state {
+            CondState::ParentSkipping => Ok(()),
+            CondState::Active => {
                 self.set_top_cond(CondState::Done);
                 Ok(())
             }
-            Some(CondState::Done) => Ok(()),
-            Some(CondState::Skipping) => {
+            CondState::Done => Ok(()),
+            CondState::Skipping => {
                 let val = self.eval_condition(args, filename, line_num)?;
                 self.set_top_cond(if val {
                     CondState::Active
@@ -1256,27 +1421,49 @@ impl Preprocessor {
         }
     }
 
-    fn do_else(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
-        match self.cond_stack.last().copied() {
-            None => Err(PreprocError {
+    fn do_else(
+        &mut self,
+        filename: &str,
+        line_num: u32,
+        conditional_floor: usize,
+    ) -> Result<(), PreprocError> {
+        self.require_file_local_conditional("#else", filename, line_num, conditional_floor)?;
+        let Some(frame) = self.cond_stack.last().copied() else {
+            return Err(PreprocError {
                 filename: filename.into(),
                 line: line_num,
                 msg: "#else without matching #if".into(),
-            }),
-            Some(CondState::ParentSkipping) => Ok(()),
-            Some(CondState::Active) => {
+            });
+        };
+        if frame.seen_else {
+            return Err(PreprocError {
+                filename: filename.into(),
+                line: line_num,
+                msg: "#else after #else".into(),
+            });
+        }
+        self.cond_stack.last_mut().unwrap().seen_else = true;
+        match frame.state {
+            CondState::ParentSkipping => Ok(()),
+            CondState::Active => {
                 self.set_top_cond(CondState::Done);
                 Ok(())
             }
-            Some(CondState::Done) => Ok(()),
-            Some(CondState::Skipping) => {
+            CondState::Done => Ok(()),
+            CondState::Skipping => {
                 self.set_top_cond(CondState::Active);
                 Ok(())
             }
         }
     }
 
-    fn do_endif(&mut self, filename: &str, line_num: u32) -> Result<(), PreprocError> {
+    fn do_endif(
+        &mut self,
+        filename: &str,
+        line_num: u32,
+        conditional_floor: usize,
+    ) -> Result<(), PreprocError> {
+        self.require_file_local_conditional("#endif", filename, line_num, conditional_floor)?;
         if self.pop_cond().is_none() {
             return Err(PreprocError {
                 filename: filename.into(),
@@ -1392,6 +1579,27 @@ impl Preprocessor {
         };
         let path = self.display_source_text(path_str);
 
+        self.include_file(
+            &path,
+            source_filename,
+            search_system,
+            diagnostic_filename,
+            diagnostic_line,
+            output,
+            source_map,
+        )
+    }
+
+    fn include_file(
+        &mut self,
+        path: &str,
+        source_filename: &str,
+        search_system: bool,
+        diagnostic_filename: &str,
+        diagnostic_line: u32,
+        output: &mut String,
+        source_map: &mut Vec<SourceLoc>,
+    ) -> Result<(), PreprocError> {
         if self.include_depth >= 64 {
             return Err(PreprocError {
                 filename: diagnostic_filename.into(),
@@ -1402,7 +1610,7 @@ impl Preprocessor {
 
         // Search for the file.
         let resolved = self
-            .resolve_include(&path, source_filename, search_system)
+            .resolve_include(path, source_filename, search_system)
             .ok_or_else(|| PreprocError {
                 filename: diagnostic_filename.into(),
                 line: diagnostic_line,
@@ -1438,7 +1646,16 @@ impl Preprocessor {
             content,
             self.source_view,
         ));
+        let conditional_depth = self.cond_stack.len();
         let include_result = self.process_into(included_source, output, source_map);
+        while self.cond_stack.len() > conditional_depth {
+            self.pop_cond();
+        }
+        debug_assert_eq!(
+            self.cond_stack.len(),
+            conditional_depth,
+            "included file crossed its conditional-stack floor"
+        );
         self.include_depth -= 1;
 
         restore_macro(&mut self.defines, "__FILE__", saved_file);
@@ -1478,7 +1695,7 @@ impl Preprocessor {
         line_num: u32,
     ) -> Result<bool, PreprocError> {
         // Expand macros in the expression first.
-        let expanded = self.expand_condition_macros(expr);
+        let expanded = self.expand_condition_macros(expr)?;
         // Parse and evaluate the expression.
         eval_expr(&expanded).map_err(|msg| PreprocError {
             filename: filename.into(),
@@ -1493,15 +1710,16 @@ impl Preprocessor {
     /// ordinary source lines, but apply condition-specific semantics:
     /// `defined` is resolved during the walk and any remaining identifiers
     /// are rewritten to `0` at the end.
-    fn expand_condition_macros(&self, expr: &MappedText) -> String {
+    fn expand_condition_macros(&self, expr: &MappedText) -> Result<String, PreprocError> {
         let expanding = std::collections::HashSet::new();
-        let expanded = self.expand_mapped_macros_inner(expr, &expanding, MacroContext::Condition);
-        replace_undefined_idents(&expanded.text)
+        let expanded =
+            self.expand_mapped_macros_inner(expr, &expanding, MacroContext::Condition)?;
+        Ok(replace_undefined_idents(&expanded.text))
     }
 
     // ---- Macro expansion in source lines ----
 
-    fn expand_mapped_macros(&self, line: &MappedText) -> MappedText {
+    fn expand_mapped_macros(&self, line: &MappedText) -> Result<MappedText, PreprocError> {
         let expanding = std::collections::HashSet::new();
         self.expand_mapped_macros_inner(line, &expanding, MacroContext::Source)
     }
@@ -1511,9 +1729,9 @@ impl Preprocessor {
         line: &MappedText,
         expanding: &std::collections::HashSet<String>,
         context: MacroContext,
-    ) -> MappedText {
+    ) -> Result<MappedText, PreprocError> {
         if self.defines.is_empty() && context == MacroContext::Source {
-            return line.clone();
+            return Ok(line.clone());
         }
 
         let mut result = MappedText::empty(line.fallback.clone());
@@ -1585,17 +1803,28 @@ impl Preprocessor {
                 if let Some(def) = self.defines.get(ident) {
                     let invocation = line.origin_at(start);
                     if def.is_function {
-                        if i < bytes.len() && bytes[i] == b'(' {
+                        let mut paren_start = i;
+                        while paren_start < bytes.len() && bytes[paren_start].is_ascii_whitespace()
+                        {
+                            paren_start += 1;
+                        }
+                        if paren_start < bytes.len() && bytes[paren_start] == b'(' {
                             if let Some((expanded, new_i)) = self.expand_mapped_function_macro(
-                                def, line, i, invocation, expanding, context,
-                            ) {
+                                ident,
+                                def,
+                                line,
+                                paren_start,
+                                invocation,
+                                expanding,
+                                context,
+                            )? {
                                 let mut next_expanding = expanding.clone();
                                 next_expanding.insert(ident.to_string());
                                 result.append(&self.expand_mapped_macros_inner(
                                     &expanded,
                                     &next_expanding,
                                     context,
-                                ));
+                                )?);
                                 i = new_i;
                                 continue;
                             }
@@ -1609,7 +1838,7 @@ impl Preprocessor {
                             &body,
                             &next_expanding,
                             context,
-                        ));
+                        )?);
                     }
                 } else {
                     result.append_slice(line, start..i);
@@ -1622,18 +1851,19 @@ impl Preprocessor {
             i = end;
         }
 
-        result
+        Ok(result)
     }
 
     fn expand_mapped_function_macro(
         &self,
+        name: &str,
         def: &MacroDef,
         line: &MappedText,
         paren_start: usize,
         invocation: SourceOrigin,
         expanding: &std::collections::HashSet<String>,
         context: MacroContext,
-    ) -> Option<(MappedText, usize)> {
+    ) -> Result<Option<(MappedText, usize)>, PreprocError> {
         let bytes = line.text.as_bytes();
         let mut i = paren_start + 1;
         let mut arg_start = i;
@@ -1687,17 +1917,49 @@ impl Preprocessor {
         }
 
         if depth != 0 {
-            return None;
+            return Ok(None);
         }
 
-        let args: Vec<MappedText> = arg_ranges
+        let mut args: Vec<MappedText> = arg_ranges
             .into_iter()
             .map(|range| line.slice(range))
             .collect();
+        let provided = if def.params.is_empty() && args.len() == 1 && args[0].text.is_empty() {
+            0
+        } else {
+            args.len()
+        };
+        let required = def.params.len();
+        let too_few = provided < required;
+        let too_many = !def.is_variadic && provided > required;
+        if too_few || too_many {
+            let msg = if too_few {
+                let minimum = if def.is_variadic {
+                    format!("at least {required}")
+                } else {
+                    required.to_string()
+                };
+                format!(
+                    "macro \"{name}\" requires {minimum} argument{}, but only {provided} given",
+                    if required == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("macro \"{name}\" passed {provided} arguments, but takes just {required}")
+            };
+            return Err(PreprocError {
+                filename: invocation.filename.to_string(),
+                line: invocation.line,
+                msg,
+            });
+        }
+        if provided == 0 {
+            args.clear();
+        }
+
         let expanded_args: Vec<MappedText> = args
             .iter()
             .map(|arg| self.expand_mapped_macros_inner(arg, expanding, context))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let mut param_map: HashMap<&str, usize> = HashMap::new();
         for (pi, param) in def.params.iter().enumerate() {
@@ -1728,7 +1990,7 @@ impl Preprocessor {
         while bi < body_bytes.len() {
             if body_bytes[bi] == b'#' && bi + 1 < body_bytes.len() && body_bytes[bi + 1] != b'#' {
                 let mut id_start = bi + 1;
-                while id_start < body_bytes.len() && body_bytes[id_start] == b' ' {
+                while id_start < body_bytes.len() && body_bytes[id_start].is_ascii_whitespace() {
                     id_start += 1;
                 }
                 let mut id_end = id_start;
@@ -1739,13 +2001,16 @@ impl Preprocessor {
                 }
                 if id_end > id_start {
                     let id = std::str::from_utf8(&body_bytes[id_start..id_end]).unwrap_or("");
-                    if let Some(&pi) = param_map.get(id) {
-                        let raw = args.get(pi).map(|arg| arg.text.as_str()).unwrap_or("");
-                        body.push_text(
-                            &format!("\"{}\"", raw),
-                            invocation.clone(),
-                            SourceRunKind::Anchor,
-                        );
+                    let raw = if let Some(&pi) = param_map.get(id) {
+                        args.get(pi)
+                    } else if id == "__VA_ARGS__" && def.is_variadic {
+                        Some(&va_args_raw)
+                    } else {
+                        None
+                    };
+                    if let Some(raw) = raw {
+                        let stringified = stringify_macro_argument(&raw.text);
+                        body.push_text(&stringified, invocation.clone(), SourceRunKind::Anchor);
                         bi = id_end;
                         continue;
                     }
@@ -1807,7 +2072,7 @@ impl Preprocessor {
             bi = end;
         }
 
-        Some((body, i))
+        Ok(Some((body, i)))
     }
 }
 
@@ -1836,6 +2101,66 @@ fn join_mapped_args(args: &[MappedText], fallback: SourceOrigin) -> MappedText {
         joined.append(arg);
     }
     joined
+}
+
+fn stringify_macro_argument(argument: &str) -> String {
+    let mut stringified = String::with_capacity(argument.len() + 2);
+    stringified.push('"');
+
+    let mut chars = argument.chars().peekable();
+    let mut quote = None;
+    let mut pending_space = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                push_escaped_stringification_char(&mut stringified, ch);
+                if let Some(escaped) = chars.next() {
+                    push_escaped_stringification_char(&mut stringified, escaped);
+                }
+                continue;
+            }
+
+            push_escaped_stringification_char(&mut stringified, ch);
+            if ch == delimiter {
+                if chars.peek() == Some(&delimiter) {
+                    let doubled = chars
+                        .next()
+                        .expect("peeked doubled quote must remain available");
+                    push_escaped_stringification_char(&mut stringified, doubled);
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && stringified.len() > 1 {
+            stringified.push(' ');
+        }
+        pending_space = false;
+
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            push_escaped_stringification_char(&mut stringified, ch);
+        } else {
+            stringified.push(ch);
+        }
+    }
+
+    stringified.push('"');
+    stringified
+}
+
+fn push_escaped_stringification_char(stringified: &mut String, ch: char) {
+    if matches!(ch, '"' | '\\') {
+        stringified.push('\\');
+    }
+    stringified.push(ch);
 }
 
 fn macro_param_is_pasted_left(body: &[u8], start: usize) -> bool {
@@ -1909,7 +2234,7 @@ impl<'a> ConditionExprParser<'a> {
     }
 
     fn parse(mut self) -> Result<i64, String> {
-        let value = self.parse_logical_or()?;
+        let value = self.parse_logical_or(true)?;
         self.skip_whitespace();
         if self.pos != self.input.len() {
             return Err(self.unexpected_token());
@@ -1917,121 +2242,210 @@ impl<'a> ConditionExprParser<'a> {
         Ok(value)
     }
 
-    fn parse_logical_or(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_logical_and()?;
+    fn parse_logical_or(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_logical_and(evaluate)?;
         while self.consume("||") {
-            let right = self.parse_logical_and()?;
-            left = i64::from(left != 0 || right != 0);
+            let right = self.parse_logical_and(evaluate && left == 0)?;
+            if evaluate {
+                left = i64::from(left != 0 || right != 0);
+            }
         }
         Ok(left)
     }
 
-    fn parse_logical_and(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_equality()?;
+    fn parse_logical_and(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_bitwise_or(evaluate)?;
         while self.consume("&&") {
-            let right = self.parse_equality()?;
-            left = i64::from(left != 0 && right != 0);
+            let right = self.parse_bitwise_or(evaluate && left != 0)?;
+            if evaluate {
+                left = i64::from(left != 0 && right != 0);
+            }
         }
         Ok(left)
     }
 
-    fn parse_equality(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_relational()?;
+    fn parse_bitwise_or(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_bitwise_xor(evaluate)?;
+        while self.consume_single(b'|') {
+            let right = self.parse_bitwise_xor(evaluate)?;
+            if evaluate {
+                left |= right;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_xor(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_bitwise_and(evaluate)?;
+        while self.consume("^") {
+            let right = self.parse_bitwise_and(evaluate)?;
+            if evaluate {
+                left ^= right;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_and(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_equality(evaluate)?;
+        while self.consume_single(b'&') {
+            let right = self.parse_equality(evaluate)?;
+            if evaluate {
+                left &= right;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_equality(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_relational(evaluate)?;
         loop {
             if self.consume("==") {
-                let right = self.parse_relational()?;
-                left = i64::from(left == right);
+                let right = self.parse_relational(evaluate)?;
+                if evaluate {
+                    left = i64::from(left == right);
+                }
             } else if self.consume("!=") {
-                let right = self.parse_relational()?;
-                left = i64::from(left != right);
+                let right = self.parse_relational(evaluate)?;
+                if evaluate {
+                    left = i64::from(left != right);
+                }
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_relational(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_additive()?;
+    fn parse_relational(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_shift(evaluate)?;
         loop {
             if self.consume("<=") {
-                let right = self.parse_additive()?;
-                left = i64::from(left <= right);
+                let right = self.parse_shift(evaluate)?;
+                if evaluate {
+                    left = i64::from(left <= right);
+                }
             } else if self.consume(">=") {
-                let right = self.parse_additive()?;
-                left = i64::from(left >= right);
+                let right = self.parse_shift(evaluate)?;
+                if evaluate {
+                    left = i64::from(left >= right);
+                }
             } else if self.consume("<") {
-                let right = self.parse_additive()?;
-                left = i64::from(left < right);
+                let right = self.parse_shift(evaluate)?;
+                if evaluate {
+                    left = i64::from(left < right);
+                }
             } else if self.consume(">") {
-                let right = self.parse_additive()?;
-                left = i64::from(left > right);
+                let right = self.parse_shift(evaluate)?;
+                if evaluate {
+                    left = i64::from(left > right);
+                }
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_additive(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_multiplicative()?;
+    fn parse_shift(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_additive(evaluate)?;
+        loop {
+            if self.consume("<<") {
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    let count = shift_count(right)?;
+                    left = left.wrapping_shl(count);
+                }
+            } else if self.consume(">>") {
+                let right = self.parse_additive(evaluate)?;
+                if evaluate {
+                    let count = shift_count(right)?;
+                    left = left.wrapping_shr(count);
+                }
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_additive(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_multiplicative(evaluate)?;
         loop {
             if self.consume("+") {
-                left = left.wrapping_add(self.parse_multiplicative()?);
+                let right = self.parse_multiplicative(evaluate)?;
+                if evaluate {
+                    left = left.wrapping_add(right);
+                }
             } else if self.consume("-") {
-                left = left.wrapping_sub(self.parse_multiplicative()?);
+                let right = self.parse_multiplicative(evaluate)?;
+                if evaluate {
+                    left = left.wrapping_sub(right);
+                }
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_multiplicative(&mut self) -> Result<i64, String> {
-        let mut left = self.parse_unary()?;
+    fn parse_multiplicative(&mut self, evaluate: bool) -> Result<i64, String> {
+        let mut left = self.parse_unary(evaluate)?;
         loop {
             if self.consume("*") {
-                left = left.wrapping_mul(self.parse_unary()?);
+                let right = self.parse_unary(evaluate)?;
+                if evaluate {
+                    left = left.wrapping_mul(right);
+                }
             } else if self.consume("/") {
-                let right = self.parse_unary()?;
-                if right == 0 {
-                    return Err("division by zero in #if expression".into());
+                let right = self.parse_unary(evaluate)?;
+                if evaluate {
+                    if right == 0 {
+                        return Err("division by zero in #if expression".into());
+                    }
+                    left = if left == i64::MIN && right == -1 {
+                        i64::MIN
+                    } else {
+                        left / right
+                    };
                 }
-                left = if left == i64::MIN && right == -1 {
-                    i64::MIN
-                } else {
-                    left / right
-                };
             } else if self.consume("%") {
-                let right = self.parse_unary()?;
-                if right == 0 {
-                    return Err("modulo by zero in #if expression".into());
+                let right = self.parse_unary(evaluate)?;
+                if evaluate {
+                    if right == 0 {
+                        return Err("modulo by zero in #if expression".into());
+                    }
+                    left = if left == i64::MIN && right == -1 {
+                        0
+                    } else {
+                        left % right
+                    };
                 }
-                left = if left == i64::MIN && right == -1 {
-                    0
-                } else {
-                    left % right
-                };
             } else {
                 return Ok(left);
             }
         }
     }
 
-    fn parse_unary(&mut self) -> Result<i64, String> {
+    fn parse_unary(&mut self, evaluate: bool) -> Result<i64, String> {
         if self.consume("!") {
-            return Ok(i64::from(self.parse_unary()? == 0));
+            let value = self.parse_unary(evaluate)?;
+            return Ok(if evaluate { i64::from(value == 0) } else { 0 });
+        }
+        if self.consume("~") {
+            let value = self.parse_unary(evaluate)?;
+            return Ok(if evaluate { !value } else { 0 });
         }
         if self.consume("-") {
-            return Ok(self.parse_unary()?.wrapping_neg());
+            let value = self.parse_unary(evaluate)?;
+            return Ok(if evaluate { value.wrapping_neg() } else { 0 });
         }
         if self.consume("+") {
-            return self.parse_unary();
+            return self.parse_unary(evaluate);
         }
-        self.parse_primary()
+        self.parse_primary(evaluate)
     }
 
-    fn parse_primary(&mut self) -> Result<i64, String> {
+    fn parse_primary(&mut self, evaluate: bool) -> Result<i64, String> {
         self.skip_whitespace();
         if self.consume("(") {
-            let value = self.parse_logical_or()?;
+            let value = self.parse_logical_or(evaluate)?;
             if !self.consume(")") {
                 return Err("unmatched parenthesis in #if expression".into());
             }
@@ -2063,10 +2477,12 @@ impl<'a> ConditionExprParser<'a> {
                 if self.pos == digits {
                     return Err("invalid hex in #if: missing digits".into());
                 }
-                return i64::from_str_radix(&self.input[digits..self.pos], 16)
-                    .map_err(|err| format!("invalid hex in #if: {}", err));
+                let value = i64::from_str_radix(&self.input[digits..self.pos], 16)
+                    .map_err(|err| format!("invalid hex in #if: {}", err))?;
+                return Ok(if evaluate { value } else { 0 });
             }
 
+            let radix = if bytes[self.pos] == b'0' { 8 } else { 10 };
             while self
                 .input
                 .as_bytes()
@@ -2075,9 +2491,18 @@ impl<'a> ConditionExprParser<'a> {
             {
                 self.pos += 1;
             }
-            return self.input[start..self.pos]
-                .parse::<i64>()
-                .map_err(|err| format!("invalid integer in #if: {}", err));
+            let digits = &self.input[start..self.pos];
+            if radix == 8 {
+                if let Some(invalid) = digits.bytes().find(|digit| matches!(digit, b'8' | b'9')) {
+                    return Err(format!(
+                        "invalid digit '{}' in octal integer in #if expression",
+                        invalid as char
+                    ));
+                }
+            }
+            let value = i64::from_str_radix(digits, radix)
+                .map_err(|err| format!("invalid integer in #if: {}", err))?;
+            return Ok(if evaluate { value } else { 0 });
         }
 
         if bytes[self.pos].is_ascii_alphabetic() || bytes[self.pos] == b'_' {
@@ -2106,6 +2531,17 @@ impl<'a> ConditionExprParser<'a> {
         }
     }
 
+    fn consume_single(&mut self, token: u8) -> bool {
+        self.skip_whitespace();
+        let bytes = self.input.as_bytes();
+        if bytes.get(self.pos) == Some(&token) && bytes.get(self.pos + 1) != Some(&token) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn skip_whitespace(&mut self) {
         while self
             .input
@@ -2123,6 +2559,13 @@ impl<'a> ConditionExprParser<'a> {
             self.input[self.pos..].trim()
         )
     }
+}
+
+fn shift_count(value: i64) -> Result<u32, String> {
+    u32::try_from(value)
+        .ok()
+        .filter(|count| *count < i64::BITS)
+        .ok_or_else(|| format!("invalid shift count {value} in #if expression"))
 }
 
 /// Replace remaining identifiers with "0" in a #if expression.
@@ -2179,6 +2622,7 @@ fn find_code_trailing_ampersand(line: &str) -> Option<usize> {
 struct AmpScan {
     amp: Option<usize>,
     in_string: Option<u8>,
+    amp_in_string: bool,
 }
 
 /// Scan `piece` (a suffix of the logical line starting at byte
@@ -2192,6 +2636,7 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
     let bytes = line.as_bytes();
     let mut in_string: Option<u8> = carried;
     let mut last_amp: Option<usize> = None;
+    let mut last_amp_in_string = false;
 
     let mut i = 0;
     while i < bytes.len() {
@@ -2208,19 +2653,25 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
                 }
                 in_string = None;
                 last_amp = None; // any `&` we saw was inside the now-closed string
+                last_amp_in_string = false;
                 i += 1;
                 continue;
             }
             if ch == b'&' {
                 last_amp = Some(i);
+                last_amp_in_string = true;
             } else if !ch.is_ascii_whitespace() {
                 last_amp = None;
+                last_amp_in_string = false;
             }
             i += 1;
             continue;
         }
 
         if ch == b'\'' || ch == b'"' {
+            // A quote is significant code after any earlier ampersand.
+            last_amp = None;
+            last_amp_in_string = false;
             in_string = Some(ch);
             i += 1;
             continue;
@@ -2233,9 +2684,11 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
 
         if ch == b'&' {
             last_amp = Some(i);
+            last_amp_in_string = false;
         } else if !ch.is_ascii_whitespace() {
             // Non-whitespace after the & means it's not trailing.
             last_amp = None;
+            last_amp_in_string = false;
         }
 
         i += 1;
@@ -2244,7 +2697,87 @@ fn scan_trailing_ampersand(piece: &str, base: usize, carried: Option<u8>) -> Amp
     AmpScan {
         amp: last_amp.map(|pos| base + pos),
         in_string,
+        amp_in_string: last_amp.is_some() && last_amp_in_string,
     }
+}
+
+fn parse_fortran_include_path(line: &str, fixed_form: bool) -> Result<Option<String>, String> {
+    let statement = if fixed_form && !line.starts_with('\t') {
+        let end = line
+            .char_indices()
+            .nth(72)
+            .map_or(line.len(), |(offset, _)| offset);
+        &line[..end]
+    } else {
+        line
+    };
+    let bytes = statement.as_bytes();
+    let mut pos = 0;
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+
+    for expected in b"include" {
+        if fixed_form {
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+        }
+        let Some(actual) = bytes.get(pos) else {
+            return Ok(None);
+        };
+        if actual.to_ascii_lowercase() != *expected {
+            return Ok(None);
+        }
+        pos += 1;
+    }
+
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let Some(&quote) = bytes.get(pos) else {
+        return Ok(None);
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        return Ok(None);
+    }
+    pos += 1;
+
+    let mut path = String::new();
+    let mut piece_start = pos;
+    let closed_at = loop {
+        let Some(&byte) = bytes.get(pos) else {
+            return Err("unterminated Fortran INCLUDE string".into());
+        };
+        if byte == quote {
+            path.push_str(&statement[piece_start..pos]);
+            if bytes.get(pos + 1) == Some(&quote) {
+                path.push(quote as char);
+                pos += 2;
+                piece_start = pos;
+                continue;
+            }
+            break pos + 1;
+        }
+        pos += statement[pos..]
+            .chars()
+            .next()
+            .expect("INCLUDE path index must stay on a character boundary")
+            .len_utf8();
+    };
+
+    pos = closed_at;
+    while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    if pos == bytes.len() || bytes[pos] == b'!' {
+        return Ok(Some(path));
+    }
+
+    Err(format!(
+        "unexpected text after Fortran INCLUDE path: {}",
+        statement[pos..].trim()
+    ))
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
@@ -2462,6 +2995,75 @@ mod tests {
     }
 
     #[test]
+    fn utf8_bom_does_not_hide_first_line_directive() {
+        let output = pp_bytes(b"\xef\xbb\xbf#define FOO 42\nx = FOO\n");
+        assert!(!output.starts_with(b"\xef\xbb\xbf"), "got: {output:?}");
+        assert!(
+            !output
+                .windows(b"#define".len())
+                .any(|text| text == b"#define"),
+            "got: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"x = 42".len())
+                .any(|text| text == b"x = 42"),
+            "got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn utf8_bom_is_removed_from_included_source_before_directive_dispatch() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-bom-include-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, "\u{feff}#define INCLUDED_VALUE 73\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let source = format!("#include \"{name}\"\nx = INCLUDED_VALUE\n");
+        let output = preprocess(&source, &config).unwrap().text;
+        assert!(!output.contains('\u{feff}'), "got: {output:?}");
+        assert!(!output.contains("#define"), "got: {output:?}");
+        assert!(output.contains("x = 73"), "got: {output:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn utf8_bom_is_only_removed_at_the_start_of_each_file() {
+        let source = "x = 1\n\u{feff}#define HIDDEN 2\ny = HIDDEN\n";
+        let output = pp(source);
+        assert!(
+            output.contains("\u{feff}#define HIDDEN 2"),
+            "got: {output:?}"
+        );
+        assert!(output.contains("y = HIDDEN"), "got: {output:?}");
+    }
+
+    #[test]
+    fn utf8_bom_is_removed_before_source_map_construction() {
+        let result =
+            preprocess("\u{feff}value = @\nsecond = 1\n", &PreprocConfig::default()).unwrap();
+        assert_eq!(result.text, "value = @\nsecond = 1\n");
+        let column = result.text.lines().next().unwrap().find('@').unwrap() as u32 + 1;
+        let resolved = result.resolve_span(Span {
+            file_id: 0,
+            start: Position {
+                line: 1,
+                col: column,
+            },
+            end: Position {
+                line: 1,
+                col: column + 1,
+            },
+        });
+        assert_eq!(resolved.source_span.start.line, 1);
+        assert_eq!(resolved.source_span.start.col, column);
+        assert!(!resolved.source.starts_with('\u{feff}'));
+    }
+
+    #[test]
     fn function_macro_body_preserves_non_utf8_bytes() {
         let out = pp_bytes(b"#define PAYLOAD() 'A\xffB'\nx = PAYLOAD()\n");
         assert!(out
@@ -2557,16 +3159,106 @@ mod tests {
     }
 
     #[test]
+    fn function_macro_expands_after_preprocessing_whitespace() {
+        let out = pp("#define DOUBLE(x) ((x) * 2)\ny = DOUBLE \t (21)\n");
+        assert!(
+            out.contains("y = ((21) * 2)"),
+            "spaced function-like invocation remained unexpanded: {out:?}"
+        );
+    }
+
+    #[test]
     fn function_macro_no_parens_not_expanded() {
-        let out = pp("#define FOO(x) (x+1)\ny = FOO\n");
-        // No parens after FOO — should not expand.
-        assert!(out.contains("y = FOO"));
+        let out = pp("#define FOO(x) (x+1)\ny = FOO \t + 2\n");
+        // No invocation parens after the preprocessing whitespace: preserve
+        // both the identifier and the intervening bytes.
+        assert!(out.contains("y = FOO \t + 2"), "got: {out:?}");
     }
 
     #[test]
     fn function_macro_nested_parens() {
         let out = pp("#define F(x) (x)\ny = F(a(b, c))\n");
         assert!(out.contains("y = (a(b, c))"));
+    }
+
+    #[test]
+    fn function_macro_rejects_missing_arguments() {
+        let err = pp_err("#define PAIR(a, b) ((a) + (b))\ny = PAIR(1)\n");
+        assert_eq!(err.line, 2);
+        assert!(
+            err.msg.contains("PAIR")
+                && err.msg.contains("requires 2 arguments")
+                && err.msg.contains("only 1 given"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn function_macro_rejects_extra_arguments() {
+        let err = pp_err("#define ID(x) x\ny = ID(1, 2)\n");
+        assert_eq!(err.line, 2);
+        assert!(
+            err.msg.contains("ID")
+                && err.msg.contains("passed 2 arguments")
+                && err.msg.contains("takes just 1"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn function_macro_accepts_zero_and_empty_arguments() {
+        let out = pp(concat!(
+            "#define ZERO() 7\n",
+            "#define EMPTY(x) [x]\n",
+            "a = ZERO()\n",
+            "b = EMPTY()\n",
+        ));
+        assert!(out.contains("a = 7"), "got: {out:?}");
+        assert!(out.contains("b = []"), "got: {out:?}");
+    }
+
+    #[test]
+    fn variadic_macro_allows_extra_arguments_but_requires_fixed_parameters() {
+        let out = pp("#define V(first, ...) first + __VA_ARGS__\ny = V(1, 2, 3)\n");
+        assert!(out.contains("y = 1 + 2, 3"), "got: {out:?}");
+
+        let err = pp_err("#define V(first, second, ...) first + second\ny = V(1)\n");
+        assert!(
+            err.msg.contains("requires at least 2 arguments") && err.msg.contains("only 1 given"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_function_macro_arity_error_uses_invocation_location() {
+        let err = pp_err(concat!(
+            "#define PAIR(a, b) ((a) + (b))\n",
+            "#define WRAP(x) PAIR(x)\n",
+            "#line 40 \"virtual.f90\"\n",
+            "y = WRAP(1)\n",
+        ));
+        assert_eq!(err.filename, "virtual.f90");
+        assert_eq!(err.line, 40);
+        assert!(err.msg.contains("PAIR"), "unexpected diagnostic: {err}");
+    }
+
+    #[test]
+    fn condition_function_macro_arity_error_is_not_discarded() {
+        let err = pp_err("#define PAIR(a, b) ((a) + (b))\n#if PAIR(1)\n#endif\n");
+        assert_eq!(err.line, 2);
+        assert!(err.msg.contains("PAIR"), "unexpected diagnostic: {err}");
+    }
+
+    #[test]
+    fn function_macro_large_extra_argument_list_is_rejected_iteratively() {
+        let arguments = std::iter::repeat_n("1", 20_000)
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = pp_err(&format!("#define ID(x) x\nvalue = ID({arguments})\n"));
+        assert!(
+            err.msg.contains("passed 20000 arguments"),
+            "unexpected diagnostic: {err}"
+        );
     }
 
     #[test]
@@ -2850,6 +3542,85 @@ print *, FIRST("a\",b", 9)
     }
 
     #[test]
+    fn duplicate_else_is_rejected_for_taken_and_untaken_arms() {
+        for condition in ["0", "1"] {
+            let source = format!("#if {condition}\nfirst\n#else\nsecond\n#else\nthird\n#endif\n");
+            let error = pp_err(&source);
+            assert_eq!(error.line, 5);
+            assert_eq!(error.msg, "#else after #else");
+        }
+    }
+
+    #[test]
+    fn elif_after_else_is_rejected_before_evaluating_its_expression() {
+        for condition in ["0", "1"] {
+            let source =
+                format!("#if {condition}\nfirst\n#else\nsecond\n#elif 1 / 0\nthird\n#endif\n");
+            let error = pp_err(&source);
+            assert_eq!(error.line, 5);
+            assert_eq!(error.msg, "#elif after #else");
+        }
+    }
+
+    #[test]
+    fn repeated_alternatives_are_rejected_inside_skipped_parents() {
+        for (directive, expected) in [
+            ("#else", "#else after #else"),
+            ("#elif 1", "#elif after #else"),
+        ] {
+            let source =
+                format!("#if 0\n#if 1\nfirst\n#else\nsecond\n{directive}\nthird\n#endif\n#endif\n");
+            let error = pp_err(&source);
+            assert_eq!(error.line, 6);
+            assert_eq!(error.msg, expected);
+        }
+    }
+
+    #[test]
+    fn single_else_inside_skipped_parent_preserves_following_emission() {
+        let output =
+            pp("#if 0\n#if 1\ndead_first\n#else\ndead_second\n#endif\n#endif\nafter = 1\n");
+        assert!(!output.contains("dead_first"), "got: {output:?}");
+        assert!(!output.contains("dead_second"), "got: {output:?}");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+    }
+
+    #[test]
+    fn large_conditional_chain_accepts_one_final_else() {
+        let mut source = String::with_capacity(20_000 * 8);
+        source.push_str("#if 0\n");
+        for _ in 0..20_000 {
+            source.push_str("#elif 0\n");
+        }
+        source.push_str("#else\nselected = 1\n#endif\nafter = 1\n");
+
+        let output = pp(&source);
+        assert!(output.contains("selected = 1"), "got no selected arm");
+        assert!(output.contains("after = 1"), "lost post-conditional source");
+    }
+
+    #[test]
+    fn repeated_alternative_in_include_reports_included_location() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-repeated-else-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(
+            &path,
+            "#if 1\nselected = 1\n#else\nfirst_else = 1\n#else\nsecond_else = 1\n#endif\n",
+        )
+        .unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let error = preprocess(&format!("#include \"{name}\"\n"), &config).unwrap_err();
+        assert_eq!(error.filename, path.to_string_lossy());
+        assert_eq!(error.line, 5);
+        assert_eq!(error.msg, "#else after #else");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn error_endif_without_if() {
         let err = pp_err("#endif\n");
         assert!(err.msg.contains("without matching"));
@@ -2987,12 +3758,12 @@ end program
             filename: "macro-arg.f90".into(),
             ..PreprocConfig::default()
         };
-        let result = preprocess("#define ID(x) x\nv = ID(   @ )\n", &config).unwrap();
+        let result = preprocess("#define ID(x) x\nv = ID \t (   @ )\n", &config).unwrap();
         let generated_col = result.text.lines().nth(1).unwrap().find('@').unwrap() as u32 + 1;
         let resolved = result.resolve_span(diagnostic_span(2, generated_col));
 
-        assert_eq!(resolved.display_span.start, Position { line: 2, col: 11 });
-        assert_eq!(resolved.source_span.start, Position { line: 2, col: 11 });
+        assert_eq!(resolved.display_span.start, Position { line: 2, col: 14 });
+        assert_eq!(resolved.source_span.start, Position { line: 2, col: 14 });
     }
 
     #[test]
@@ -3075,6 +3846,71 @@ end program
     }
 
     #[test]
+    fn eval_logical_operators_short_circuit_arithmetic_faults() {
+        assert_eq!(ConditionExprParser::new("0 && (1 / 0)").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("1 || (1 % 0)").parse().unwrap(), 1);
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 / 0) || 1")
+                .parse()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || 0 && (1 / 0)")
+                .parse()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || 1 / 0 && 0").parse().unwrap(),
+            1
+        );
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 / 0) || (1 / 0)")
+                .parse()
+                .unwrap_err(),
+            "division by zero in #if expression"
+        );
+    }
+
+    #[test]
+    fn eval_short_circuited_operands_still_require_valid_syntax() {
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 / )").parse().unwrap_err(),
+            "unexpected token in #if expression: ')'"
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || (1 % 0").parse().unwrap_err(),
+            "unmatched parenthesis in #if expression"
+        );
+    }
+
+    #[test]
+    fn eval_large_short_circuit_chain_is_iterative() {
+        let mut expression = String::from("1");
+        for _ in 0..20_000 {
+            expression.push_str(" || (1 / 0)");
+        }
+        assert_eq!(ConditionExprParser::new(&expression).parse().unwrap(), 1);
+    }
+
+    #[test]
+    fn if_logical_operators_short_circuit_dead_arithmetic() {
+        let output = preprocess(
+            "#if 0 && (1 / 0)\ndead_and\n#else\nand_ok\n#endif\n\
+             #if 1 || (1 % 0)\nor_ok\n#else\ndead_or\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap()
+        .text;
+        let output_lines = lines(&output);
+        assert!(output_lines.contains(&"and_ok"), "got: {output:?}");
+        assert!(output_lines.contains(&"or_ok"), "got: {output:?}");
+        assert!(!output.contains("dead_and"), "got: {output:?}");
+        assert!(!output.contains("dead_or"), "got: {output:?}");
+    }
+
+    #[test]
     fn eval_not() {
         assert!(eval_expr("!0").unwrap());
         assert!(!eval_expr("!1").unwrap());
@@ -3135,6 +3971,77 @@ end program
     fn eval_precedence() {
         // 2 + 3 * 4 = 14 (not 20)
         assert!(eval_expr("2 + 3 * 4 == 14").unwrap());
+    }
+
+    #[test]
+    fn eval_cpp_shift_and_bitwise_precedence() {
+        assert_eq!(ConditionExprParser::new("1 << 3 + 1").parse().unwrap(), 16);
+        assert_eq!(ConditionExprParser::new("32 >> 2 + 1").parse().unwrap(), 4);
+        assert_eq!(ConditionExprParser::new("16 >> 1 >> 2").parse().unwrap(), 2);
+        assert_eq!(ConditionExprParser::new("1 << 2 < 5").parse().unwrap(), 1);
+        assert_eq!(ConditionExprParser::new("2 ^ 3 & 1").parse().unwrap(), 3);
+        assert_eq!(
+            ConditionExprParser::new("1 | 2 ^ 3 & 1").parse().unwrap(),
+            3
+        );
+        assert_eq!(ConditionExprParser::new("2 & 3 == 2").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("1 | 0 && 0").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("~0").parse().unwrap(), -1);
+        assert_eq!(ConditionExprParser::new("~~42").parse().unwrap(), 42);
+        assert_eq!(ConditionExprParser::new("~1 + 2").parse().unwrap(), 0);
+    }
+
+    #[test]
+    fn eval_cpp_shifts_reject_invalid_live_counts_but_skip_dead_counts() {
+        assert_eq!(
+            ConditionExprParser::new("1 << -1").parse().unwrap_err(),
+            "invalid shift count -1 in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 >> 64").parse().unwrap_err(),
+            "invalid shift count 64 in #if expression"
+        );
+        assert_eq!(
+            ConditionExprParser::new("0 && (1 << -1)").parse().unwrap(),
+            0
+        );
+        assert_eq!(
+            ConditionExprParser::new("1 || (1 >> 64)").parse().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn eval_cpp_integer_literals_use_their_spelled_radix() {
+        assert_eq!(ConditionExprParser::new("0").parse().unwrap(), 0);
+        assert_eq!(ConditionExprParser::new("010").parse().unwrap(), 8);
+        assert_eq!(ConditionExprParser::new("077").parse().unwrap(), 63);
+        assert_eq!(ConditionExprParser::new("0x10 + 010").parse().unwrap(), 24);
+        assert_eq!(
+            ConditionExprParser::new("08").parse().unwrap_err(),
+            "invalid digit '8' in octal integer in #if expression"
+        );
+
+        let error = pp_err("#if 08\nunexpected\n#endif\n");
+        assert_eq!(error.line, 1);
+        assert!(
+            error
+                .msg
+                .contains("invalid digit '8' in octal integer in #if expression"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn if_cpp_shift_bitwise_and_octal_semantics_select_the_true_branch() {
+        let out = pp(
+            "#if (~0 == -1) && ((1 << 4) == 16) && ((0x0f & 017) == 15)\n\
+             selected\n\
+             #else\n\
+             #error cpp integer semantics broken\n\
+             #endif\n",
+        );
+        assert!(lines(&out).contains(&"selected"));
     }
 
     #[test]
@@ -3280,6 +4187,16 @@ end program
     }
 
     #[test]
+    fn if_function_macro_expands_after_preprocessing_whitespace() {
+        let out = pp("#define INC(x) ((x) + 1)\n#if INC \t (41) > 41\nyes\n#endif\n");
+        assert!(
+            lines(&out).contains(&"yes"),
+            "spaced function macro in #if failed, got: {:?}",
+            lines(&out)
+        );
+    }
+
+    #[test]
     fn if_object_macro_can_expand_into_function_macro() {
         let out = pp(
             "#define INC(x) ((x) + 1)\n#define WRAP(x) INC(x)\n#if WRAP(41) > 41\nyes\n#endif\n",
@@ -3315,14 +4232,67 @@ end program
 
     #[test]
     fn stringification() {
-        let out = pp("#define STR(x) #x\ny = STR(hello)\n");
+        let out = pp("#define STR(x) #x\ny = STR(hello)\nz = STR(   )\n");
         assert!(out.contains("y = \"hello\""));
+        assert!(out.contains("z = \"\""));
     }
 
     #[test]
     fn stringification_with_spaces() {
         let out = pp("#define STR(x) #x\ny = STR(a + b)\n");
         assert!(out.contains("y = \"a + b\""));
+    }
+
+    #[test]
+    fn stringification_normalizes_only_inter_token_whitespace() {
+        let out = pp("#define STR(x) #x\n\
+             y = STR(  alpha\t  +    beta  )\n\
+             z = STR(\"a   b\"    +   gamma)\n");
+        assert!(out.contains("y = \"alpha + beta\""), "got: {out}");
+        assert!(out.contains("z = \"\\\"a   b\\\" + gamma\""), "got: {out}");
+    }
+
+    #[test]
+    fn stringification_escapes_quotes_and_backslashes_in_literals() {
+        let out = pp(r#"#define STR(x) #x
+y = STR("a\b")
+z = STR("a""b")
+w = STR('a\b')
+"#);
+        assert!(out.contains("y = \"\\\"a\\\\b\\\"\""), "got: {out}");
+        assert!(out.contains("z = \"\\\"a\\\"\\\"b\\\"\""), "got: {out}");
+        assert!(out.contains("w = \"'a\\\\b'\""), "got: {out}");
+    }
+
+    #[test]
+    fn variadic_arguments_can_be_stringified() {
+        let out = pp("#define STRV(...) #__VA_ARGS__\n\
+             y = STRV(alpha,    beta +   gamma)\n\
+             z = STRV()\n");
+        assert!(out.contains("y = \"alpha, beta + gamma\""), "got: {out}");
+        assert!(out.contains("z = \"\""), "got: {out}");
+    }
+
+    #[test]
+    fn stringification_operator_accepts_tab_before_parameter() {
+        let out = pp("#define STR(x) #\tx\ny = STR(hello)\n");
+        assert!(out.contains("y = \"hello\""), "got: {out}");
+    }
+
+    #[test]
+    fn large_stringification_is_iterative_and_normalizes_whitespace() {
+        const TOKENS: usize = 20_000;
+        let raw = std::iter::repeat_n("token", TOKENS)
+            .collect::<Vec<_>>()
+            .join(" \t  ");
+        let expected = format!(
+            "\"{}\"",
+            std::iter::repeat_n("token", TOKENS)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        assert_eq!(stringify_macro_argument(&raw), expected);
     }
 
     #[test]
@@ -3432,6 +4402,94 @@ deep
         assert!(lines(&out).contains(&"deep"));
     }
 
+    // ---- Unknown directives ----
+
+    #[test]
+    fn unknown_directive_is_rejected_in_active_source() {
+        for directive in ["incldue", "Include", "not_a_directive"] {
+            let error = pp_err(&format!("before\n#{directive} \"missing.inc\"\nafter\n"));
+            assert_eq!(error.filename, "<input>");
+            assert_eq!(error.line, 2);
+            assert_eq!(
+                error.msg,
+                format!("unknown preprocessing directive #{directive}")
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_directive_is_ignored_in_skipped_conditional_group() {
+        let output = pp("#if 0\n#incldue \"missing.inc\"\n#endif\nafter = 1\n");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+    }
+
+    #[test]
+    fn many_unknown_directives_in_skipped_group_remain_linear_and_inert() {
+        let mut source = String::with_capacity(50_000 * 20);
+        source.push_str("#if 0\n");
+        for _ in 0..50_000 {
+            source.push_str("#incldue \"missing\"\n");
+        }
+        source.push_str("#endif\nafter = 1\n");
+
+        let output = pp(&source);
+        assert!(output.contains("after = 1"), "lost following source");
+    }
+
+    #[test]
+    fn huge_unknown_directive_has_a_bounded_diagnostic() {
+        let directive = "x".repeat(256 * 1024);
+        let error = pp_err(&format!("#{directive}\n"));
+        assert_eq!(
+            error.msg,
+            format!("unknown preprocessing directive #{}...", "x".repeat(80))
+        );
+    }
+
+    #[test]
+    fn pragma_directive_remains_an_explicit_no_op() {
+        let output = pp("#pragma once\nafter = 1\n");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+    }
+
+    #[test]
+    fn gnu_numeric_linemarker_remains_a_recognized_directive() {
+        let result = preprocess(
+            "# 700 \"virtual.f90\" 1\nx = __LINE__\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result.source_map[1].filename, "virtual.f90");
+        assert_eq!(result.source_map[1].line, 700);
+        assert!(result.text.contains("x = 700"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn unknown_directive_uses_reported_location() {
+        let error = pp_err("#line 700 \"virtual.f90\"\n#incldue \"missing.inc\"\n");
+        assert_eq!(error.filename, "virtual.f90");
+        assert_eq!(error.line, 700);
+        assert_eq!(error.msg, "unknown preprocessing directive #incldue");
+    }
+
+    #[test]
+    fn unknown_directive_in_include_reports_included_location() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-unknown-directive-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, "before\n#incldue \"missing.inc\"\nafter\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+
+        let error = preprocess(&format!("#include \"{name}\"\n"), &config).unwrap_err();
+        assert_eq!(error.filename, path.to_string_lossy());
+        assert_eq!(error.line, 2);
+        assert_eq!(error.msg, "unknown preprocessing directive #incldue");
+        let _ = std::fs::remove_file(path);
+    }
+
     // ---- Null directive ----
 
     #[test]
@@ -3465,6 +4523,165 @@ deep
     }
 
     #[test]
+    fn fortran_include_injects_file_content_and_tracks_dependency() {
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-fortran-include-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        std::fs::write(&include_path, "integer, parameter :: answer = 42\n").unwrap();
+
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let source = format!("include '{include_name}' ! ordinary Fortran include\nreal :: x\n");
+        let result = preprocess(&source, &config).unwrap();
+
+        assert!(
+            result.text.contains("integer, parameter :: answer = 42"),
+            "INCLUDE content was not injected: {:?}",
+            result.text
+        );
+        assert!(result.text.contains("real :: x"));
+        assert_eq!(result.included_files, vec![include_path.clone()]);
+        assert_eq!(result.source_map.len(), 3);
+        assert_eq!(
+            result.source_map[0].filename,
+            include_path.to_string_lossy()
+        );
+        assert_eq!(result.source_map[0].line, 1);
+        assert_eq!(result.source_map[2].filename, "<input>");
+        assert_eq!(result.source_map[2].line, 2);
+
+        let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn fortran_include_accepts_reference_free_and_fixed_forms() {
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-fortran-include-forms-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        std::fs::write(
+            &include_path,
+            "      integer, parameter :: included_value = 42\n",
+        )
+        .unwrap();
+
+        let free_config = PreprocConfig {
+            include_paths: vec![dir.clone()],
+            ..PreprocConfig::default()
+        };
+        for source in [
+            format!("INCLUDE \"{include_name}\" ! trailing comment\n"),
+            format!("include'{include_name}'\n"),
+        ] {
+            let result = preprocess(&source, &free_config).unwrap();
+            assert!(
+                result.text.contains("included_value = 42"),
+                "INCLUDE content was not injected for {source:?}: {:?}",
+                result.text
+            );
+            assert_eq!(result.included_files, vec![include_path.clone()]);
+        }
+
+        let fixed_config = PreprocConfig {
+            include_paths: vec![dir],
+            fixed_form: true,
+            ..PreprocConfig::default()
+        };
+        let fixed_source = format!("      I N C L U D E '{include_name}'\n");
+        let result = preprocess(&fixed_source, &fixed_config).unwrap();
+        assert!(
+            result.text.contains("included_value = 42"),
+            "fixed-form INCLUDE content was not injected: {:?}",
+            result.text
+        );
+        assert_eq!(result.included_files, vec![include_path.clone()]);
+
+        let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn fortran_include_path_can_be_produced_by_a_macro() {
+        let dir = std::env::temp_dir();
+        let include_name = format!("afs-fortran-include-macro-{}.inc", std::process::id());
+        let include_path = dir.join(&include_name);
+        std::fs::write(&include_path, "integer, parameter :: macro_value = 7\n").unwrap();
+
+        let mut config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        config.defines.insert(
+            "INCLUDE_FILE".into(),
+            MacroDef::object(&format!("\"{include_name}\"")),
+        );
+        let result = preprocess("include INCLUDE_FILE\n", &config).unwrap();
+
+        assert!(result.text.contains("macro_value = 7"));
+        assert_eq!(result.included_files, vec![include_path.clone()]);
+
+        let _ = std::fs::remove_file(include_path);
+    }
+
+    #[test]
+    fn fortran_include_recognition_preserves_neighboring_source() {
+        assert_eq!(
+            parse_fortran_include_path("include_file = 3", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("10 include 'decl.inc'", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("12345 INCLUDE 'decl.inc'", true).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("     1INCLUDE 'decl.inc'", true).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_fortran_include_path("include 'a''b.inc'", false).unwrap(),
+            Some("a'b.inc".into())
+        );
+
+        let result = preprocess(
+            "#if 0\ninclude 'missing-inactive-file.inc'\n#endif\ninclude_file = 3\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        assert!(result.text.contains("include_file = 3"));
+        assert!(result.included_files.is_empty());
+    }
+
+    #[test]
+    fn malformed_fortran_include_is_diagnosed_at_its_reported_location() {
+        let error = preprocess(
+            "#line 40 \"virtual.f90\"\ninclude 'decl.inc'; print *, 1\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.filename, "virtual.f90");
+        assert_eq!(error.line, 40);
+        assert_eq!(
+            error.msg,
+            "unexpected text after Fortran INCLUDE path: ; print *, 1"
+        );
+
+        let error =
+            preprocess("include 'unterminated.inc\n", &PreprocConfig::default()).unwrap_err();
+        assert_eq!(error.msg, "unterminated Fortran INCLUDE string");
+
+        let error = preprocess(
+            "include &\n  & 'continued.inc'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.msg, "Fortran INCLUDE line cannot be continued");
+    }
+
+    #[test]
     fn include_defines_propagate() {
         use std::io::Write;
         let dir = std::env::temp_dir();
@@ -3478,6 +4695,102 @@ deep
         let src = "#include \"test_pp_define.inc\"\nx = INCLUDED_VAL\n";
         let result = preprocess(src, &config).unwrap();
         assert!(result.text.contains("x = 99"), "got: {:?}", result.text);
+    }
+
+    #[test]
+    fn include_files_cannot_close_or_mutate_parent_conditionals() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let cases = [
+            (
+                "endif",
+                "#endif\n",
+                "#if 1\n#include \"{name}\"\nparent = 1\n",
+                "#endif",
+            ),
+            (
+                "else",
+                "#else\nchild_else = 1\n",
+                "#if 1\n#include \"{name}\"\nparent = 1\n#endif\n",
+                "#else",
+            ),
+            (
+                "elif",
+                "#elif 0\nchild_elif = 1\n",
+                "#if 1\n#include \"{name}\"\nparent = 1\n#endif\n",
+                "#elif",
+            ),
+        ];
+
+        for (case, included, parent_template, directive) in cases {
+            let name = format!("afs-cond-boundary-{case}-{pid}.inc");
+            let path = dir.join(&name);
+            std::fs::write(&path, included).unwrap();
+            let config = PreprocConfig {
+                include_paths: vec![dir.clone()],
+                ..PreprocConfig::default()
+            };
+            let parent = parent_template.replace("{name}", &name);
+            let error = preprocess(&parent, &config).unwrap_err();
+            assert_eq!(error.filename, path.to_string_lossy());
+            assert_eq!(error.line, 1);
+            assert!(
+                error.msg.contains(directive) && error.msg.contains("outside this include file"),
+                "unexpected diagnostic: {error}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn include_files_cannot_leave_conditionals_for_the_parent_to_close() {
+        let dir = std::env::temp_dir();
+        let name = format!("afs-cond-open-{}.inc", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, "#if 1\nincluded = 1\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let parent = format!("#include \"{name}\"\n#endif\nparent = 1\n");
+        let error = preprocess(&parent, &config).unwrap_err();
+        assert_eq!(error.filename, path.to_string_lossy());
+        assert_eq!(error.line, 2);
+        assert!(
+            error.msg.contains("unterminated")
+                && error.msg.contains("include file")
+                && error.msg.contains("1 level"),
+            "unexpected diagnostic: {error}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn balanced_include_conditionals_preserve_the_parent_state() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let name = format!("afs-cond-balanced-{pid}.inc");
+        let nested_name = format!("afs-cond-balanced-nested-{pid}.inc");
+        let path = dir.join(&name);
+        let nested_path = dir.join(&nested_name);
+        std::fs::write(
+            &path,
+            format!("#if 1\nincluded = 1\n#include \"{nested_name}\"\n#endif\n"),
+        )
+        .unwrap();
+        std::fs::write(&nested_path, "#if 1\nnested = 1\n#endif\n").unwrap();
+        let config = PreprocConfig {
+            include_paths: vec![dir],
+            ..PreprocConfig::default()
+        };
+        let parent = format!("#if 1\n#include \"{name}\"\nparent = 1\n#endif\nafter = 1\n");
+        let output = preprocess(&parent, &config).unwrap().text;
+        assert!(output.contains("included = 1"), "got: {output:?}");
+        assert!(output.contains("nested = 1"), "got: {output:?}");
+        assert!(output.contains("parent = 1"), "got: {output:?}");
+        assert!(output.contains("after = 1"), "got: {output:?}");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(nested_path);
     }
 
     #[test]
@@ -3551,6 +4864,135 @@ deep
             "got: {:?}",
             out.lines().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn missing_leading_ampersand_on_character_continuation_is_recorded() {
+        let config = PreprocConfig {
+            filename: "continued-character.f90".into(),
+            ..PreprocConfig::default()
+        };
+        let result = preprocess("print *, 'hello &\n  world'\n", &config).unwrap();
+        assert!(
+            result.text.contains("print *, 'hello world'"),
+            "continuation was not joined permissively: {:?}",
+            result.text
+        );
+
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].span.filename, "continued-character.f90");
+        assert_eq!(
+            warnings[0].span.display_span.start,
+            Position { line: 2, col: 3 }
+        );
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 2, col: 3 }
+        );
+        assert_eq!(
+            warnings[0].message,
+            "missing '&' at the start of a continued character literal"
+        );
+    }
+
+    #[test]
+    fn leading_ampersand_satisfies_character_continuation_syntax() {
+        let result =
+            preprocess("print *, 'hello &\n  &world'\n", &PreprocConfig::default()).unwrap();
+        assert!(
+            result.text.contains("print *, 'hello world'"),
+            "continuation was not joined: {:?}",
+            result.text
+        );
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+    }
+
+    #[test]
+    fn code_continuation_does_not_require_a_leading_ampersand() {
+        let result = preprocess("x = 1 + &\n  2\n", &PreprocConfig::default()).unwrap();
+        assert!(result.text.contains("x = 1 + 2"), "got: {:?}", result.text);
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+    }
+
+    #[test]
+    fn character_continuation_warning_skips_comment_and_blank_lines() {
+        let result = preprocess(
+            "print *, 'hello &\n! intervening comment\n\n    world'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 4, col: 5 }
+        );
+    }
+
+    #[test]
+    fn character_continuation_warning_honors_reported_locations() {
+        let result = preprocess(
+            "#line 700 \"generated.f90\"\nprint *, 'hello &\n  world'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].span.filename, "generated.f90");
+        assert_eq!(
+            warnings[0].span.display_span.start,
+            Position { line: 701, col: 3 }
+        );
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 3, col: 3 }
+        );
+        assert_eq!(warnings[0].span.source.lines().nth(2), Some("  world'"));
+    }
+
+    #[test]
+    fn inactive_character_continuation_does_not_emit_a_warning() {
+        let result = preprocess(
+            "#if 0\nprint *, 'hidden &\n  extension'\n#endif\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+    }
+
+    #[test]
+    fn only_missing_character_continuation_markers_are_recorded() {
+        let result = preprocess(
+            "print *, 'one &\n  two &\n  &three'\n",
+            &PreprocConfig::default(),
+        )
+        .unwrap();
+        let warnings = result.resolved_conformance_warnings().collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].span.source_span.start,
+            Position { line: 2, col: 3 }
+        );
+    }
+
+    #[test]
+    fn ampersand_before_a_later_quote_is_not_a_continuation_marker() {
+        assert_eq!(find_code_trailing_ampersand("x = & 'unterminated"), None);
+    }
+
+    #[test]
+    fn long_conforming_character_continuation_chain_stays_warning_free() {
+        let fragments = 20_000;
+        let mut source = String::from("value = 'x&\n");
+        for _ in 0..fragments {
+            source.push_str("  &x&\n");
+        }
+        source.push_str("  &x'\n");
+
+        let result = preprocess(&source, &PreprocConfig::default()).unwrap();
+        assert_eq!(result.resolved_conformance_warnings().count(), 0);
+        assert_eq!(result.text.matches('x').count(), fragments + 2);
     }
 
     #[test]

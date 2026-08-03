@@ -16,19 +16,33 @@ use std::collections::{HashMap, HashSet};
 pub fn select_module(module: &Module) -> Vec<MachineFunction> {
     // Build function name table for resolving Internal call refs.
     let func_names: Vec<String> = module.functions.iter().map(|f| f.name.clone()).collect();
+    // Imported .amod globals and declared extern procedures are deliberately
+    // absent: this set contains only symbols emitted by the current object.
+    let defined_symbols: HashSet<&str> = module
+        .globals
+        .iter()
+        .map(|global| global.name.as_str())
+        .chain(
+            module
+                .functions
+                .iter()
+                .map(|function| function.name.as_str()),
+        )
+        .collect();
     module
         .functions
         .iter()
-        .map(|f| select_function_with_names(f, &func_names, module.layout))
+        .map(|f| select_function_with_names(f, &func_names, &defined_symbols, module.layout))
         .collect()
 }
 
 fn select_function_with_names(
     func: &Function,
     func_names: &[String],
+    defined_symbols: &HashSet<&str>,
     layout: crate::target::TargetLayout,
 ) -> MachineFunction {
-    let mut mf = select_function(func, layout);
+    let mut mf = select_function_with_symbols(func, defined_symbols, layout);
     // Resolve any Internal call references to actual function names.
     for block in &mut mf.blocks {
         for inst in &mut block.insts {
@@ -55,6 +69,14 @@ use super::abi::{classify_abi_arg, AbiArgLoc, AbiArgState};
 
 /// Select machine instructions for one IR function.
 pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> MachineFunction {
+    select_function_with_symbols(func, &HashSet::new(), layout)
+}
+
+fn select_function_with_symbols(
+    func: &Function,
+    defined_symbols: &HashSet<&str>,
+    layout: crate::target::TargetLayout,
+) -> MachineFunction {
     let mut mf = MachineFunction::new(func.name.clone());
     mf.internal_only = func.internal_only;
     let mut ctx = ISelCtx::new(layout);
@@ -398,7 +420,7 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
         let mb_id = ctx.block_map[&block.id];
 
         for inst in &block.insts {
-            select_inst(&mut mf, &mut ctx, mb_id, inst, func);
+            select_inst(&mut mf, &mut ctx, mb_id, inst, func, defined_symbols);
         }
 
         if let Some(term) = &block.terminator {
@@ -406,7 +428,23 @@ pub fn select_function(func: &Function, layout: crate::target::TargetLayout) -> 
         }
     }
 
+    assert_no_selected_nops(&mf);
     mf
+}
+
+fn assert_no_selected_nops(mf: &MachineFunction) {
+    if let Some((block, inst)) = mf.blocks.iter().find_map(|block| {
+        block
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == ArmOpcode::Nop)
+            .map(|inst| (block, inst))
+    }) {
+        panic!(
+            "ARM64 isel invariant violated: selected NOP in function {} block {}: {:?}",
+            mf.name, block.label, inst
+        );
+    }
 }
 
 fn select_call_inst(
@@ -592,6 +630,13 @@ fn select_call_inst(
         None
     };
 
+    if !pending_reg_arg_moves.is_empty() {
+        mf.block_mut(mb).insts.push(MachineInst {
+            opcode: ArmOpcode::CallArgCopyStart,
+            operands: vec![],
+            def: None,
+        });
+    }
     for (opcode, dst, src) in pending_reg_arg_moves {
         mf.block_mut(mb).insts.push(MachineInst {
             opcode,
@@ -808,6 +853,7 @@ fn select_inst(
     mb: MBlockId,
     inst: &Inst,
     func: &Function,
+    defined_symbols: &HashSet<&str>,
 ) {
     if is_wide_pair_ty_arm(&inst.ty) {
         match &inst.kind {
@@ -943,7 +989,7 @@ fn select_inst(
                 );
                 return;
             }
-            InstKind::Load(addr) => {
+            InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
                 let dest_slot = ctx.lookup_wide_slot(inst.id);
                 if let Some(&offset) = ctx.alloca_offsets.get(addr) {
                     emit_load_phys_i128_pair(
@@ -1708,13 +1754,16 @@ fn select_inst(
 
         // ---- Memory ----
         InstKind::GlobalAddr(name) => {
-            // Materialize the address of a module-level global into
-            // a Gp64 vreg via ADRP+ADD against `_globalname`. Loads
-            // and stores then operate on this pointer the same way
-            // they operate on an alloca address.
+            // A symbol defined by this IR module can use a direct
+            // PAGE/PAGEOFF address. Undefined data and procedure symbols
+            // must load their resolved address through the Mach-O GOT.
             let dest = ctx.get_vreg(mf, inst.id, RegClass::Gp64);
             mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::AdrpAdd,
+                opcode: if defined_symbols.contains(name.as_str()) {
+                    ArmOpcode::AdrpAdd
+                } else {
+                    ArmOpcode::AdrpGotLdr
+                },
                 operands: vec![
                     MachineOperand::VReg(dest),
                     MachineOperand::GlobalLabel(name.clone()),
@@ -1743,7 +1792,7 @@ fn select_inst(
             }
         }
 
-        InstKind::Load(addr) => {
+        InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
             // Audit CRITICAL-2: dispatch on the IR result type so the
             // load opcode width matches the value, not the pointer.
             // Previously every integer load used `ldr w_, [_]` regardless
@@ -1759,7 +1808,7 @@ fn select_inst(
             });
         }
 
-        InstKind::Store(val, addr) => {
+        InstKind::Store(val, addr) | InstKind::VolatileStore(val, addr) => {
             if matches!(func.value_type(*val), Some(ref t) if is_wide_pair_ty_arm(t)) {
                 let src_slot = ctx.lookup_wide_slot(*val);
                 emit_load_phys_i128_pair(
@@ -2022,17 +2071,18 @@ fn select_inst(
         }),
         InstKind::VMul(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
             VShape::V4S => ArmOpcode::MulV4S,
-            // NEON has no integer 2D mul — Stage 4 should not request
-            // it; if it does we fall through to a placeholder.
-            VShape::V2D => ArmOpcode::Nop,
+            // NEON has no integer 2D multiply. The vectorizer keeps
+            // this shape scalar; reaching isel means target legality
+            // was violated and must fail closed instead of defining an
+            // arbitrary value with NOP.
+            VShape::V2D => reject_unsupported_vector_instruction(inst),
             VShape::F4S => ArmOpcode::FmulV4S,
             VShape::F2D => ArmOpcode::FmulV2D,
         }),
         InstKind::VDiv(a, b) => emit_vbinop(mf, ctx, mb, inst, *a, *b, |s| match s {
-            // No integer NEON divide — emit a placeholder; the
-            // vectorizer should refuse to pick V128 lanes for VDiv
-            // on integer types. Float forms exist.
-            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            // No integer NEON divide. The vectorizer refuses these
+            // shapes, so a backend arrival is an invariant violation.
+            VShape::V4S | VShape::V2D => reject_unsupported_vector_instruction(inst),
             VShape::F4S => ArmOpcode::FdivV4S,
             VShape::F2D => ArmOpcode::FdivV2D,
         }),
@@ -2054,8 +2104,7 @@ fn select_inst(
         InstKind::VSqrt(a) => emit_vunop(mf, ctx, mb, inst, *a, |s| match s {
             VShape::F4S => ArmOpcode::FsqrtV4S,
             VShape::F2D => ArmOpcode::FsqrtV2D,
-            // sqrt is float-only.
-            VShape::V4S | VShape::V2D => ArmOpcode::Nop,
+            VShape::V4S | VShape::V2D => reject_unsupported_vector_instruction(inst),
         }),
         InstKind::VFma(a, b, c) => {
             // FMLA is dest += a*b. Conventional 3-operand call
@@ -2064,16 +2113,7 @@ fn select_inst(
             // tracks SSA destinations more carefully.
             let shape = match VShape::from_ir(&inst.ty) {
                 Some(s) if s.is_float() => s,
-                _ => {
-                    // unsupported shape — placeholder
-                    let dest = ctx.get_vreg(mf, inst.id, RegClass::V128);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![],
-                        def: Some(dest),
-                    });
-                    return;
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             };
             let opcode = match shape {
                 VShape::F4S => ArmOpcode::FmlaV4S,
@@ -2173,7 +2213,7 @@ fn select_inst(
                 (Some(VShape::F2D), CmpOp::Lt) => (ArmOpcode::FcmgtV2D, true),
                 (Some(VShape::F4S), CmpOp::Le) => (ArmOpcode::FcmgeV4S, true),
                 (Some(VShape::F2D), CmpOp::Le) => (ArmOpcode::FcmgeV2D, true),
-                _ => (ArmOpcode::Nop, false),
+                _ => reject_unsupported_vector_instruction(inst),
             };
             let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
             mf.block_mut(mb).insts.push(MachineInst {
@@ -2197,7 +2237,7 @@ fn select_inst(
                 (Some(VShape::V4S), CmpOp::Eq) => (ArmOpcode::CmeqV4S, false),
                 (Some(VShape::V4S), CmpOp::Lt) => (ArmOpcode::CmgtV4S, true),
                 (Some(VShape::V4S), CmpOp::Le) => (ArmOpcode::CmgeV4S, true),
-                _ => (ArmOpcode::Nop, false),
+                _ => reject_unsupported_vector_instruction(inst),
             };
             let (lhs, rhs) = if swap { (vb, va) } else { (va, vb) };
             mf.block_mut(mb).insts.push(MachineInst {
@@ -2222,7 +2262,7 @@ fn select_inst(
                 Some(VShape::V2D) => ArmOpcode::DupGen2D,
                 Some(VShape::F4S) => ArmOpcode::DupEl4S,
                 Some(VShape::F2D) => ArmOpcode::DupEl2D,
-                None => ArmOpcode::Nop,
+                None => reject_unsupported_vector_instruction(inst),
             };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
@@ -2328,24 +2368,7 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                IrType::Int(_) => {
-                    let class = type_to_reg_class(&inst.ty);
-                    let dest = ctx.get_vreg(mf, inst.id, class);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                        def: Some(dest),
-                    });
-                }
-                _ => {
-                    let class = type_to_reg_class(&inst.ty);
-                    let dest = ctx.get_vreg(mf, inst.id, class);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                        def: Some(dest),
-                    });
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             }
         }
         InstKind::VExtract(v, lane) => {
@@ -2357,7 +2380,7 @@ fn select_inst(
                 IrType::Int(IntWidth::I64) => ArmOpcode::Umov2D,
                 IrType::Float(FloatWidth::F32) => ArmOpcode::FmovEl4S,
                 IrType::Float(FloatWidth::F64) => ArmOpcode::FmovEl2D,
-                _ => ArmOpcode::Nop,
+                _ => reject_unsupported_vector_instruction(inst),
             };
             mf.block_mut(mb).insts.push(MachineInst {
                 opcode,
@@ -2433,13 +2456,7 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                _ => {
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![],
-                        def: None,
-                    });
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             }
         }
         InstKind::VReduceMin(v) | InstKind::VReduceMax(v) => {
@@ -2502,29 +2519,18 @@ fn select_inst(
                         def: Some(dest),
                     });
                 }
-                _ => {
-                    let class = type_to_reg_class(&inst.ty);
-                    let dest = ctx.get_vreg(mf, inst.id, class);
-                    mf.block_mut(mb).insts.push(MachineInst {
-                        opcode: ArmOpcode::Nop,
-                        operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(src)],
-                        def: Some(dest),
-                    });
-                }
+                _ => reject_unsupported_vector_instruction(inst),
             }
         }
 
-        // Remaining: ExtractField, InsertField, and other vector ops
-        // (VInsert, VICmp, VFCmp, VBitcast) — placeholder. Land
-        // per-op as the vectorizer grows in Stage 4.
-        _ => {
-            let class = type_to_reg_class(&inst.ty);
-            let _dest = ctx.get_vreg(mf, inst.id, class);
-            mf.block_mut(mb).insts.push(MachineInst {
-                opcode: ArmOpcode::Nop,
-                operands: vec![],
-                def: None,
-            });
+        InstKind::VBitcast(..) | InstKind::VInsert(..) => {
+            reject_unsupported_vector_instruction(inst)
+        }
+        InstKind::ExtractField(..) | InstKind::InsertField(..) => {
+            panic!(
+                "ARM64 isel: unsupported aggregate instruction {:?}",
+                inst.kind
+            )
         }
     }
 }
@@ -2730,17 +2736,46 @@ fn select_terminator(
             cases,
             default,
         } => {
+            let selector_ty = func
+                .value_type(*selector)
+                .expect("switch selector must have a verified type");
+            let selector_width = selector_ty.switch_int_width().unwrap_or_else(|| {
+                panic!("switch selector must use a general-purpose register, got {selector_ty}")
+            });
             let sel_vreg = ctx.lookup_vreg(*selector);
+            let selector_class = mf.vreg_class(sel_vreg).unwrap_or_else(|| {
+                panic!("switch selector vreg {sel_vreg:?} has no registered class")
+            });
+            assert!(
+                matches!(selector_class, RegClass::Gp32 | RegClass::Gp64),
+                "switch selector must use a general-purpose register, got {selector_class:?}",
+            );
             let default_mb = ctx.lookup_block(*default);
 
             for (val, dest) in cases {
+                assert!(
+                    selector_ty.switch_case_is_representable(*val),
+                    "switch case value {val} is not representable in selector type {selector_ty}",
+                );
                 let dest_mb = ctx.lookup_block(*dest);
-                // CMP selector, #val; B.EQ case_block
-                mf.block_mut(mb).insts.push(MachineInst {
-                    opcode: ArmOpcode::CmpImm,
-                    operands: vec![MachineOperand::VReg(sel_vreg), MachineOperand::Imm(*val)],
-                    def: None,
-                });
+                if (0..=4095).contains(val) {
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::CmpImm,
+                        operands: vec![MachineOperand::VReg(sel_vreg), MachineOperand::Imm(*val)],
+                        def: None,
+                    });
+                } else {
+                    let case_vreg = mf.new_vreg(selector_class);
+                    emit_const_int(mf, mb, case_vreg, *val as i128, selector_width);
+                    mf.block_mut(mb).insts.push(MachineInst {
+                        opcode: ArmOpcode::CmpReg,
+                        operands: vec![
+                            MachineOperand::VReg(sel_vreg),
+                            MachineOperand::VReg(case_vreg),
+                        ],
+                        def: None,
+                    });
+                }
                 mf.block_mut(mb).insts.push(MachineInst {
                     opcode: ArmOpcode::BCond,
                     operands: vec![
@@ -3427,7 +3462,7 @@ fn emit_vbinop(
     let vb = ctx.lookup_vreg(b);
     let opcode = match VShape::from_ir(&inst.ty) {
         Some(s) => pick(s),
-        None => ArmOpcode::Nop,
+        None => reject_unsupported_vector_instruction(inst),
     };
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
@@ -3453,13 +3488,22 @@ fn emit_vunop(
     let va = ctx.lookup_vreg(a);
     let opcode = match VShape::from_ir(&inst.ty) {
         Some(s) => pick(s),
-        None => ArmOpcode::Nop,
+        None => reject_unsupported_vector_instruction(inst),
     };
     mf.block_mut(mb).insts.push(MachineInst {
         opcode,
         operands: vec![MachineOperand::VReg(dest), MachineOperand::VReg(va)],
         def: Some(dest),
     });
+}
+
+#[cold]
+#[track_caller]
+fn reject_unsupported_vector_instruction(inst: &Inst) -> ! {
+    panic!(
+        "ARM64 isel: unsupported vector instruction {:?} for result type {:?}",
+        inst.kind, inst.ty
+    )
 }
 
 /// Emit a float binary op, selecting single or double precision.
@@ -3949,18 +3993,21 @@ fn alloca_size(ty: &IrType, layout: crate::target::TargetLayout) -> u32 {
         IrType::Float(w) => w.bytes(),
         IrType::Ptr(_) => 8,
         IrType::Array(elem, count) => {
-            // Stack storage uses ABI-sized elements. Fortran LOGICAL arrays are
-            // stored as default-kind 4-byte elements, even though Bool SSA
-            // values themselves remain byte-sized.
+            // Array storage follows the IR element layout so allocation,
+            // descriptor sizes, and GEP strides cannot disagree. Scalar Bool
+            // slots remain four bytes for frame alignment, but Bool array
+            // elements are the one-byte representation used everywhere else.
             let elem_size = match elem.as_ref() {
-                IrType::Bool => 4,
-                IrType::Struct(_) => alloca_size(elem, layout),
+                IrType::Array(_, _) | IrType::Struct(_) => alloca_size(elem, layout),
                 _ => elem.size_bytes(&layout) as u32,
             };
             elem_size * (*count as u32)
         }
         IrType::FuncPtr(_) => 8,
-        IrType::Struct(_) => 8,      // placeholder
+        IrType::Struct(id) => panic!(
+            "named struct storage must be rejected by IR verification before ARM64 selection \
+             (struct.{id})"
+        ),
         IrType::Vector { .. } => 16, // 128-bit NEON
     }
 }
@@ -3997,6 +4044,9 @@ fn runtime_func_symbol(rf: &RuntimeFunc, args: &[(ValueId, AbiArgLoc, IrType)]) 
         RuntimeFunc::Stop => "afs_stop".into(),
         RuntimeFunc::ErrorStop => "afs_error_stop".into(),
         RuntimeFunc::CheckBounds => "afs_check_bounds".into(),
+        RuntimeFunc::CheckArrayAssignmentConformance => {
+            "afs_check_array_assignment_conformance".into()
+        }
     }
 }
 
@@ -4012,6 +4062,74 @@ mod tests {
             build(&mut b);
         }
         select_function(&func, crate::target::TargetLayout::LP64)
+    }
+
+    fn global_addr_opcode(mf: &MachineFunction, symbol: &str) -> ArmOpcode {
+        mf.blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find_map(|inst| {
+                inst.operands
+                    .iter()
+                    .any(|operand| {
+                        matches!(operand, MachineOperand::GlobalLabel(name) if name == symbol)
+                    })
+                    .then_some(inst.opcode)
+            })
+            .unwrap_or_else(|| panic!("missing selected address for {symbol}"))
+    }
+
+    #[test]
+    fn module_selection_distinguishes_defined_and_undefined_symbol_addresses() {
+        let layout = crate::target::TargetLayout::LP64;
+        let mut module = Module::new("address_ownership".into(), layout);
+        module.add_global(Global {
+            name: "defined_data".into(),
+            ty: IrType::Int(IntWidth::I64),
+            initializer: Some(GlobalInit::Zero),
+        });
+
+        let mut defined_proc = Function::new("defined_proc".into(), vec![], IrType::Void);
+        FuncBuilder::new(&mut defined_proc, layout).ret_void();
+        module.add_function(defined_proc);
+
+        let mut probe = Function::new("probe".into(), vec![], IrType::Void);
+        {
+            let mut builder = FuncBuilder::new(&mut probe, layout);
+            builder.global_addr("defined_data", IrType::Int(IntWidth::I64));
+            builder.global_addr("undefined_data", IrType::Int(IntWidth::I64));
+            builder.global_addr("defined_proc", IrType::Void);
+            builder.global_addr("undefined_proc", IrType::Void);
+            builder.ret_void();
+        }
+        module.add_function(probe);
+
+        let selected = select_module(&module);
+        let probe = selected
+            .iter()
+            .find(|function| function.name == "probe")
+            .expect("probe function should be selected");
+
+        assert_eq!(
+            global_addr_opcode(probe, "defined_data"),
+            ArmOpcode::AdrpAdd,
+            "module-defined data may use direct PAGE/PAGEOFF addressing"
+        );
+        assert_eq!(
+            global_addr_opcode(probe, "defined_proc"),
+            ArmOpcode::AdrpAdd,
+            "module-defined procedures may use direct PAGE/PAGEOFF addressing"
+        );
+        assert_eq!(
+            global_addr_opcode(probe, "undefined_data"),
+            ArmOpcode::AdrpGotLdr,
+            "undefined data must load its resolved address through the Mach-O GOT"
+        );
+        assert_eq!(
+            global_addr_opcode(probe, "undefined_proc"),
+            ArmOpcode::AdrpGotLdr,
+            "undefined procedures must load their resolved address through the Mach-O GOT"
+        );
     }
 
     #[test]
@@ -4694,20 +4812,178 @@ mod tests {
     }
 
     #[test]
-    fn logical_arrays_use_default_kind_storage_for_stack_slots() {
+    fn logical_array_alloca_size_matches_bool_gep_stride() {
+        let layout = crate::target::TargetLayout::LP64;
+        let bool_stride = IrType::Bool.size_bytes(&layout) as u32;
         assert_eq!(
-            alloca_size(
-                &IrType::Array(Box::new(IrType::Bool), 3),
-                crate::target::TargetLayout::LP64
-            ),
-            12
+            alloca_size(&IrType::Array(Box::new(IrType::Bool), 3), layout),
+            bool_stride * 3,
+            "array allocation and Bool GEP lowering must use the same element width",
         );
         assert_eq!(
             alloca_size(
                 &IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
-                crate::target::TargetLayout::LP64
+                layout
             ),
-            12
+            12,
+        );
+    }
+
+    #[test]
+    fn logical_array_selection_uses_one_byte_slot_elements_and_gep_stride() {
+        let index = Param {
+            name: "index".into(),
+            ty: IrType::Int(IntWidth::I64),
+            id: ValueId(0),
+            fortran_noalias: false,
+        };
+        let index_id = index.id;
+        let mut func = Function::new(
+            "logical_array_stride".into(),
+            vec![index],
+            IrType::Ptr(Box::new(IrType::Bool)),
+        );
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let array = b.alloca(IrType::Array(Box::new(IrType::Bool), 3));
+            let element = b.gep(array, vec![index_id], IrType::Bool);
+            b.ret(Some(element));
+        }
+
+        let errors = crate::ir::verify::verify_function(&func);
+        assert!(
+            errors.is_empty(),
+            "logical-array selection witness must be verifier-valid: {errors:?}"
+        );
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        assert_eq!(
+            mf.frame
+                .locals
+                .iter()
+                .map(|slot| slot.size)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "[Bool x 3] must reserve one three-byte slot in the selected frame"
+        );
+
+        let mul = mf
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|inst| inst.opcode == ArmOpcode::Mul)
+            .unwrap_or_else(|| panic!("Bool GEP must scale its index: {mf:?}"));
+        let stride = match mul.operands.get(2) {
+            Some(MachineOperand::VReg(stride)) => *stride,
+            other => panic!("Bool GEP multiplier must be a vreg, got {other:?}: {mf:?}"),
+        };
+        let stride_def = mf
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|inst| inst.def == Some(stride))
+            .unwrap_or_else(|| panic!("Bool GEP stride has no definition: {mf:?}"));
+        assert_eq!(stride_def.opcode, ArmOpcode::Movz);
+        assert_eq!(
+            stride_def.operands,
+            vec![
+                MachineOperand::VReg(stride),
+                MachineOperand::Imm(1),
+                MachineOperand::Shift(0),
+            ],
+            "Bool GEP must scale by the same one-byte width reserved in the frame"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "named struct storage must be rejected by IR verification")]
+    fn named_struct_alloca_size_has_no_placeholder() {
+        alloca_size(&IrType::Struct(0), crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    #[should_panic(expected = "switch selector must use a general-purpose register")]
+    fn switch_selection_rejects_floating_selector() {
+        let mut func = Function::new("bad_switch".into(), vec![], IrType::Void);
+        let selector;
+        let case;
+        let default;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            selector = b.const_f64(1.0);
+            case = b.create_block("case");
+            default = b.create_block("default");
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+        func.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: vec![(1, case)],
+            default,
+        });
+
+        select_function(&func, crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    fn switch_i64_case_materializes_a_gp_register_compare() {
+        let mut func = Function::new("wide_switch".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let selector = b.const_i64(0);
+            let case = b.create_block("case");
+            let default = b.create_block("default");
+            b.switch(selector, vec![(i64::MAX, case)], default);
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        let compare = mf.blocks[0]
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == ArmOpcode::CmpReg)
+            .expect("switch register compare");
+        let [MachineOperand::VReg(selector), MachineOperand::VReg(case_value)] =
+            compare.operands.as_slice()
+        else {
+            panic!("switch must compare two GP registers: {compare:?}");
+        };
+        assert_eq!(mf.vreg_class(*selector), Some(RegClass::Gp64));
+        assert_eq!(mf.vreg_class(*case_value), Some(RegClass::Gp64));
+    }
+
+    #[test]
+    fn switch_case_in_cmp_immediate_range_keeps_the_fast_path() {
+        let mut func = Function::new("small_switch".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let selector = b.const_i64(0);
+            let case = b.create_block("case");
+            let default = b.create_block("default");
+            b.switch(selector, vec![(4095, case)], default);
+            b.set_block(case);
+            b.ret_void();
+            b.set_block(default);
+            b.ret_void();
+        }
+
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        let compare = mf.blocks[0]
+            .insts
+            .iter()
+            .find(|inst| matches!(inst.opcode, ArmOpcode::CmpImm | ArmOpcode::CmpReg))
+            .expect("switch compare");
+        assert_eq!(compare.opcode, ArmOpcode::CmpImm);
+        assert!(
+            matches!(
+                compare.operands.as_slice(),
+                [MachineOperand::VReg(_), MachineOperand::Imm(4095)]
+            ),
+            "encodable switch case must remain an immediate compare: {compare:?}",
         );
     }
 
@@ -4736,8 +5012,9 @@ mod tests {
     #[test]
     fn vshape_rejects_unsupported_shape() {
         // 3 lanes is not a NEON shape; we already verified that
-        // verify.rs rejects it. VShape::from_ir simply returns None
-        // and the isel arm falls back to Nop.
+        // verify.rs rejects it. VShape::from_ir simply returns None;
+        // instruction selection treats reaching that state as a hard
+        // target-legality violation.
         let ty = IrType::Vector {
             lanes: 3,
             elem: Box::new(IrType::Int(IntWidth::I32)),
@@ -4802,6 +5079,68 @@ mod tests {
             opcodes.contains(&ArmOpcode::StrQ),
             "expected StrQ in MIR, got {:?}",
             opcodes
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ARM64 isel: unsupported vector instruction VMul")]
+    fn isel_rejects_vmul_2xi64_instead_of_defining_nop() {
+        let v_ty = IrType::Vector {
+            lanes: 2,
+            elem: Box::new(IrType::Int(IntWidth::I64)),
+        };
+        let mut func = Function::new("vmul_2xi64_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_dst = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty);
+            let product = b.vmul(va, vb);
+            b.vstore(product, p_dst);
+            b.ret_void();
+        }
+
+        let errors = crate::ir::verify::verify_function(&func);
+        assert!(
+            errors.is_empty(),
+            "2xi64 VMul witness must be verifier-valid: {errors:?}"
+        );
+        let _ = select_function(&func, crate::target::TargetLayout::LP64);
+    }
+
+    #[test]
+    fn isel_keeps_supported_vmul_4xi32() {
+        let v_ty = IrType::Vector {
+            lanes: 4,
+            elem: Box::new(IrType::Int(IntWidth::I32)),
+        };
+        let mut func = Function::new("vmul_4xi32_test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let p_a = b.alloca(v_ty.clone());
+            let p_b = b.alloca(v_ty.clone());
+            let p_dst = b.alloca(v_ty.clone());
+            let va = b.vload(p_a, v_ty.clone());
+            let vb = b.vload(p_b, v_ty);
+            let product = b.vmul(va, vb);
+            b.vstore(product, p_dst);
+            b.ret_void();
+        }
+
+        let errors = crate::ir::verify::verify_function(&func);
+        assert!(
+            errors.is_empty(),
+            "4xi32 VMul witness must be verifier-valid: {errors:?}"
+        );
+        let mf = select_function(&func, crate::target::TargetLayout::LP64);
+        assert!(
+            mf.blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .any(|inst| inst.opcode == ArmOpcode::MulV4S),
+            "supported 4xi32 VMul must select MulV4S: {mf:?}"
         );
     }
 

@@ -17,8 +17,9 @@
 //!    behavior on divide-by-zero is implementation-defined, and the
 //!    runtime / hardware should observe it the same way it would
 //!    without optimization.
-//!  * Float operations follow IEEE 754 semantics; division by zero
-//!    yields well-defined ±inf or NaN and is folded.
+//!  * Float operations follow IEEE 754 semantics; folds are disabled when
+//!    the surrounding call graph can observe their rounding or sticky-status
+//!    effects.
 //!
 //! Constant *propagation* (replacing uses of a value that happens to
 //! be a constant) is a separate pass; this one only rewrites the
@@ -121,9 +122,9 @@ fn try_fold(
     kind: &InstKind,
     ty: &IrType,
     consts: &HashMap<ValueId, Const>,
-    fpenv_barrier: bool,
+    preserve_fpenv_effects: bool,
 ) -> Option<InstKind> {
-    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(kind) {
+    if preserve_fpenv_effects && super::fpenv::is_fpenv_sensitive(kind) {
         return None;
     }
 
@@ -200,7 +201,17 @@ fn try_fold(
         InstKind::FNeg(a) => fold_float_un(get(a), ty, |x| -x),
         InstKind::FAbs(a) => fold_float_un(get(a), ty, |x| x.abs()),
         InstKind::FSqrt(a) => fold_float_un(get(a), ty, |x| x.sqrt()),
-        InstKind::FPow(a, b) => fold_float_bin(get(a), get(b), ty, |x, y| x.powf(y)),
+        InstKind::FPow(a, b) => {
+            // REAL(4) power lowers to the selected target's `powf`.
+            // Evaluating binary64 power and narrowing is not equivalent,
+            // while host `f32::powf` still cannot define a cross-target
+            // libm result. Retain the runtime call unless this is F64.
+            if matches!(ty, IrType::Float(FloatWidth::F32)) {
+                None
+            } else {
+                fold_float_bin(get(a), get(b), ty, |x, y| x.powf(y))
+            }
+        }
 
         // Comparisons -----------------------------------------------------
         InstKind::ICmp(op, a, b) => {
@@ -571,10 +582,10 @@ impl Pass for ConstFold {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
-            let fpenv_barrier = rounding_effects.may_run_after_change[func_idx];
+            let preserve_fpenv_effects = fpenv_effects.may_run_in_dynamic_fpenv[func_idx];
 
             // Audit N-8: we walk `func.blocks` in vec order, which
             // is NOT guaranteed to be reverse-postorder. If a fold
@@ -612,7 +623,7 @@ impl Pass for ConstFold {
                             continue;
                         }
                         if let Some(new_kind) =
-                            try_fold(&inst.kind, &inst.ty, &consts, fpenv_barrier)
+                            try_fold(&inst.kind, &inst.ty, &consts, preserve_fpenv_effects)
                         {
                             if let Some(c) = Const::from_inst(&new_kind) {
                                 consts.insert(inst.id, c);
@@ -646,6 +657,7 @@ mod tests {
     fn make_module_with(insts: Vec<(InstKind, IrType)>) -> (Module, Vec<ValueId>) {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
+        f.internal_only = true;
         let entry = f.entry;
         let mut ids = Vec::new();
         for (kind, ty) in insts {
@@ -766,6 +778,108 @@ mod tests {
     }
 
     #[test]
+    fn leaves_f32_pow_for_target_powf() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(f32::from_bits(0x3edd_1cea) as f64, FloatWidth::F32),
+                IrType::Float(FloatWidth::F32),
+            ),
+            (
+                InstKind::ConstFloat(f32::from_bits(0xbf4b_5bd3) as f64, FloatWidth::F32),
+                IrType::Float(FloatWidth::F32),
+            ),
+            (
+                InstKind::FPow(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F32),
+            ),
+        ]);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "REAL(4) power must retain the target runtime's powf semantics"
+        );
+        assert!(
+            matches!(first_block_kinds(&m)[2], InstKind::FPow(..)),
+            "REAL(4) power must not be evaluated through binary64 and narrowed"
+        );
+    }
+
+    #[test]
+    fn folds_f64_pow_when_environment_is_closed() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(4.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(0.5, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FPow(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+
+        assert!(ConstFold.run(&mut m));
+        assert!(matches!(
+            first_block_kinds(&m)[2],
+            InstKind::ConstFloat(2.0, FloatWidth::F64)
+        ));
+    }
+
+    #[test]
+    fn folds_float_to_int_when_environment_is_closed() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.5, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FloatToInt(ValueId(0), IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+        ]);
+
+        assert!(ConstFold.run(&mut m));
+        assert!(matches!(
+            first_block_kinds(&m)[1],
+            InstKind::ConstInt(1, IntWidth::I32)
+        ));
+    }
+
+    #[test]
+    fn leaves_flag_raising_float_to_int_when_environment_is_observed() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.5, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FloatToInt(ValueId(0), IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::ConstInt(5, IntWidth::I32),
+                IrType::Int(IntWidth::I32),
+            ),
+            (
+                InstKind::Call(
+                    FuncRef::External("afs_ieee_test_flag".into()),
+                    vec![ValueId(2)],
+                ),
+                IrType::Int(IntWidth::I32),
+            ),
+        ]);
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "folding a live inexact conversion suppresses its IEEE_INEXACT effect"
+        );
+        assert!(matches!(first_block_kinds(&m)[1], InstKind::FloatToInt(..)));
+    }
+
+    #[test]
     fn leaves_rounding_dependent_fold_after_fpenv_change() {
         let (mut m, _) = make_module_with(vec![
             (
@@ -798,6 +912,31 @@ mod tests {
             "constant FP arithmetic must remain dynamic when the function changes rounding mode"
         );
         assert!(matches!(first_block_kinds(&m)[4], InstKind::FAdd(..)));
+    }
+
+    #[test]
+    fn leaves_rounding_dependent_fold_in_external_entry() {
+        let (mut m, _) = make_module_with(vec![
+            (
+                InstKind::ConstFloat(1.0, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::ConstFloat(5.551_115_123_125_783e-17, FloatWidth::F64),
+                IrType::Float(FloatWidth::F64),
+            ),
+            (
+                InstKind::FAdd(ValueId(0), ValueId(1)),
+                IrType::Float(FloatWidth::F64),
+            ),
+        ]);
+        m.functions[0].internal_only = false;
+
+        assert!(
+            !ConstFold.run(&mut m),
+            "constant FP arithmetic must remain dynamic at an external entry"
+        );
+        assert!(matches!(first_block_kinds(&m)[2], InstKind::FAdd(..)));
     }
 
     #[test]

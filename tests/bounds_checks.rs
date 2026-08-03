@@ -81,9 +81,10 @@ fn runtime_bounds_checks_trap_out_of_range_accesses() {
         run.exit_code, 0,
         "out-of-range access should fail at runtime"
     );
+    let stderr = run.stderr_text().expect("runtime stderr should be UTF-8");
     assert!(
-        run.stderr.contains("Bounds check failed"),
+        stderr.contains("Bounds check failed"),
         "runtime trap should explain the out-of-range access, stderr was:\n{}",
-        run.stderr
+        stderr
     );
 }

@@ -55,6 +55,7 @@
 //!
 //! After this, the loop is entirely gone.
 
+use super::loop_utils::loop_contains_volatile_memory;
 use super::pass::Pass;
 use super::util::{find_natural_loops, predecessors, NaturalLoop};
 use crate::ir::inst::*;
@@ -121,6 +122,13 @@ fn unroll_in_function(func: &mut Function) -> bool {
     let mut changed = false;
 
     for nl in &loops {
+        // Every unroll path changes the static placement of memory
+        // operations. Keep source-language VOLATILE accesses in their
+        // original loop until an unroller has an explicit proof that it
+        // preserves their dynamic count and order.
+        if loop_contains_volatile_memory(func, nl) {
+            continue;
+        }
         if let Some(shape) = detect_simple_loop(func, nl, &preds) {
             do_unroll(func, shape);
             prune_unreachable(func);
@@ -1032,6 +1040,8 @@ fn remap_kind(kind: &InstKind, subst: &HashMap<ValueId, ValueId>) -> InstKind {
         InstKind::Alloca(t) => InstKind::Alloca(t.clone()),
         InstKind::Load(a) => InstKind::Load(r(a)),
         InstKind::Store(v, p) => InstKind::Store(r(v), r(p)),
+        InstKind::VolatileLoad(a) => InstKind::VolatileLoad(r(a)),
+        InstKind::VolatileStore(v, p) => InstKind::VolatileStore(r(v), r(p)),
         InstKind::GetElementPtr(base, idxs) => {
             InstKind::GetElementPtr(r(base), idxs.iter().map(&r).collect())
         }
@@ -3317,6 +3327,38 @@ mod tests {
         assert!(
             !changed,
             "load-bearing loop should stay out of the full-unroll fast path"
+        );
+    }
+
+    #[test]
+    fn does_not_unroll_loop_with_volatile_memory() {
+        let mut m = build_counted_loop(1, 4);
+        let store = m.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.insts.iter_mut())
+            .find(|inst| matches!(inst.kind, InstKind::Store(..)))
+            .expect("counted-loop fixture must contain its body store");
+        let InstKind::Store(value, address) = store.kind else {
+            unreachable!()
+        };
+        store.kind = InstKind::VolatileStore(value, address);
+
+        let pass = LoopUnroll;
+        let changed = pass.run(&mut m);
+        assert!(
+            !changed,
+            "loop unrolling must not duplicate or reschedule VOLATILE memory"
+        );
+        assert_eq!(
+            m.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .filter(|inst| matches!(inst.kind, InstKind::VolatileStore(..)))
+                .count(),
+            1,
+            "the original volatile access must remain exactly once in the loop body"
         );
     }
 

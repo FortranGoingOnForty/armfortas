@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::const_scalar::ConstScalar;
-use super::core::ModuleGlobalInfo;
+use super::core::{ModuleGlobalInfo, PendingGlobal};
 
 pub(super) type AmbiguousUseWarnings = Rc<RefCell<HashSet<(String, String, String)>>>;
 
@@ -146,7 +146,8 @@ pub(super) const MAX_RANK: usize = 15;
 
 /// Loop context for EXIT/CYCLE targeting.
 pub(super) struct LoopScope {
-    pub(super) name: Option<String>,
+    pub(super) cycle_name: Option<String>,
+    pub(super) exit_name: Option<String>,
     pub(super) header: BlockId, // CYCLE target
     pub(super) exit: BlockId,   // EXIT target
 }
@@ -155,10 +156,13 @@ pub(super) struct LoopScope {
 pub(super) struct ConstructExitScope {
     pub(super) name: String,
     pub(super) exit: BlockId,
+    /// Number of active lexical cleanup scopes owned outside this construct.
+    /// A named EXIT must clean every later scope before reaching `exit`.
+    pub(super) cleanup_depth: usize,
 }
 
-/// Runtime cleanup owned by an active BLOCK construct.
-pub(super) struct BlockCleanupScope {
+/// Runtime cleanup owned by an active lexical construct.
+pub(super) struct LexicalCleanupScope {
     pub(super) labels: HashSet<u64>,
     pub(super) owned_locals: HashMap<String, LocalInfo>,
 }
@@ -268,13 +272,31 @@ pub(super) struct LowerCtx<'a> {
     /// Target layout of the module under construction (x02).
     pub(super) layout: crate::target::TargetLayout,
     pub(super) locals: HashMap<String, LocalInfo>,
+    /// Stable bindings owned by the current program unit.
+    ///
+    /// Lexical constructs temporarily replace entries in `locals` when a
+    /// BLOCK declaration or associate name shadows an outer entity. Explicit
+    /// RETURN still has to finalize and deallocate the program-unit owners,
+    /// so procedure teardown must not depend on the currently visible map.
+    pub(super) procedure_locals: HashMap<String, LocalInfo>,
     /// Lowercase names of OPTIONAL dummy arguments in the current subprogram.
     /// Hidden character-length forwarding must treat an absent optional
     /// character dummy as length zero instead of dereferencing its null slot.
     pub(super) optional_locals: HashSet<String>,
     pub(super) loops: Vec<LoopScope>,
     pub(super) construct_exits: Vec<ConstructExitScope>,
-    pub(super) block_cleanups: Vec<BlockCleanupScope>,
+    pub(super) lexical_cleanups: Vec<LexicalCleanupScope>,
+    /// SAVE-promoted locals collected while lowering this procedure,
+    /// including declarations nested in BLOCK constructs. The owning
+    /// program-unit lowerer flushes these into the IR module after the
+    /// function body is complete.
+    pub(super) pending_globals: Vec<PendingGlobal>,
+    /// Stable procedure-specific prefix used for SAVE global symbols.
+    pub(super) save_owner: String,
+    /// Lexical BLOCK ordinal within this procedure. Ordinals are assigned
+    /// by deterministic AST traversal, so symbol names do not depend on
+    /// source paths, temporary directories, or compilation-unit order.
+    next_block_save_scope: u64,
     pub(super) st: &'a SymbolTable,
     /// Module-scoped globals visible by (lowercase module name,
     /// lowercase variable name). Populated by the lower_file
@@ -360,15 +382,20 @@ impl<'a> LowerCtx<'a> {
         char_len_star_params: &'a HashMap<String, Vec<bool>>,
         contained_host_refs: &'a HashMap<String, Vec<String>>,
         ambiguous_use_warnings: AmbiguousUseWarnings,
+        save_owner: String,
         layout: crate::target::TargetLayout,
     ) -> Self {
         Self {
             layout,
             locals: HashMap::new(),
+            procedure_locals: HashMap::new(),
             optional_locals: HashSet::new(),
             loops: Vec::new(),
             construct_exits: Vec::new(),
-            block_cleanups: Vec::new(),
+            lexical_cleanups: Vec::new(),
+            pending_globals: Vec::new(),
+            save_owner,
+            next_block_save_scope: 0,
             st,
             globals,
             type_layouts,
@@ -389,6 +416,22 @@ impl<'a> LowerCtx<'a> {
             ambiguous_use_warnings,
             proc_scope_id: None,
         }
+    }
+
+    pub(super) fn next_block_save_owner(&mut self) -> String {
+        let ordinal = self.next_block_save_scope;
+        self.next_block_save_scope = self
+            .next_block_save_scope
+            .checked_add(1)
+            .expect("BLOCK SAVE scope ordinal overflow");
+        // Dots cannot appear in a Fortran identifier, so this scope
+        // separator cannot collide with a procedure local such as
+        // `block_0_value` when save_global_name appends the entity name.
+        format!("{}.block.{}", self.save_owner, ordinal)
+    }
+
+    pub(super) fn capture_procedure_locals(&mut self) {
+        self.procedure_locals.clone_from(&self.locals);
     }
 
     pub(super) fn insert_scalar(&mut self, name: String, addr: ValueId, ty: IrType) {
@@ -435,8 +478,19 @@ impl<'a> LowerCtx<'a> {
         );
     }
 
-    pub(super) fn push_loop(&mut self, name: Option<String>, header: BlockId, exit: BlockId) {
-        self.loops.push(LoopScope { name, header, exit });
+    pub(super) fn push_loop(
+        &mut self,
+        cycle_name: Option<String>,
+        exit_name: Option<String>,
+        header: BlockId,
+        exit: BlockId,
+    ) {
+        self.loops.push(LoopScope {
+            cycle_name,
+            exit_name,
+            header,
+            exit,
+        });
     }
 
     pub(super) fn pop_loop(&mut self) {
@@ -448,6 +502,7 @@ impl<'a> LowerCtx<'a> {
             self.construct_exits.push(ConstructExitScope {
                 name: name.to_ascii_lowercase(),
                 exit,
+                cleanup_depth: self.lexical_cleanups.len(),
             });
         }
     }
@@ -469,11 +524,11 @@ impl<'a> LowerCtx<'a> {
         self.st.lookup_statement_function(scope_id, name)
     }
 
-    /// Find loop by construct name (or innermost if None).
-    pub(super) fn find_loop(&self, name: &Option<String>) -> Option<&LoopScope> {
+    /// Find the CYCLE target by construct name (or the innermost loop).
+    pub(super) fn find_cycle_loop(&self, name: &Option<String>) -> Option<&LoopScope> {
         if let Some(n) = name {
             self.loops.iter().rev().find(|l| {
-                l.name
+                l.cycle_name
                     .as_deref()
                     .map(|s| s.eq_ignore_ascii_case(n))
                     .unwrap_or(false)
@@ -483,12 +538,26 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    pub(super) fn find_construct_exit(&self, name: &Option<String>) -> Option<BlockId> {
+    /// Find the EXIT target by construct name (or the innermost loop).
+    pub(super) fn find_exit_loop(&self, name: &Option<String>) -> Option<&LoopScope> {
+        if let Some(n) = name {
+            self.loops.iter().rev().find(|l| {
+                l.exit_name
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case(n))
+                    .unwrap_or(false)
+            })
+        } else {
+            self.loops.last()
+        }
+    }
+
+    pub(super) fn find_construct_exit(&self, name: &Option<String>) -> Option<(BlockId, usize)> {
         let name = name.as_ref()?;
         self.construct_exits
             .iter()
             .rev()
             .find(|scope| scope.name.eq_ignore_ascii_case(name))
-            .map(|scope| scope.exit)
+            .map(|scope| (scope.exit, scope.cleanup_depth))
     }
 }

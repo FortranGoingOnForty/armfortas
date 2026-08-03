@@ -20,7 +20,7 @@ pub(crate) fn tokenize_fixed_source_view(src: &str, file_id: u32) -> Result<Vec<
 }
 
 fn tokenize_fixed_impl(src: &str, file_id: u32, source_view: bool) -> Result<Vec<Token>, LexError> {
-    let statements = preprocess_lines(src, file_id, source_view);
+    let statements = preprocess_lines(src, file_id, source_view)?;
     let mut tokens = Vec::new();
 
     for stmt in &statements {
@@ -153,6 +153,17 @@ impl MappedFixedText {
         self.end = other.end;
     }
 
+    fn physical_line_end(&self, start: usize) -> usize {
+        let Some(line) = self.positions.get(start).map(|position| position.line) else {
+            return self.text.len();
+        };
+        self.positions[start..]
+            .iter()
+            .position(|position| position.line != line)
+            .map(|offset| start + offset)
+            .unwrap_or(self.text.len())
+    }
+
     fn span(&self, file_id: u32, start: usize, end: usize) -> Span {
         let start_pos = self.positions.get(start).copied().unwrap_or_else(|| {
             self.positions
@@ -234,10 +245,15 @@ fn tokenize_body(body: &MappedFixedText, file_id: u32) -> Result<Vec<Token>, Lex
 
         // Comment (! to end).
         if ch == b'!' {
+            let end = stripped.physical_line_end(pos);
+            if end < bytes.len() {
+                pos = end;
+                continue;
+            }
             tokens.push(Token {
                 kind: TokenKind::Comment,
-                text: stripped.text[pos..].to_string(),
-                span: stripped.span(file_id, pos, bytes.len()),
+                text: stripped.text[pos..end].to_string(),
+                span: stripped.span(file_id, pos, end),
             });
             break;
         }
@@ -325,6 +341,19 @@ fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
     let mut i = 0;
 
     while i < bytes.len() {
+        // An inline comment ends at its physical record, not at the end of the
+        // concatenated logical statement. Discard comments followed by another
+        // continuation before their contents can look like strings or Hollerith.
+        if bytes[i] == b'!' {
+            let end = body.physical_line_end(i);
+            if end == bytes.len() {
+                result.push_str(&body.text[i..end]);
+                positions.extend_from_slice(&body.positions[i..end]);
+            }
+            i = end;
+            continue;
+        }
+
         // Inside a string literal: copy verbatim.
         if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
@@ -352,8 +381,10 @@ fn protect_hollerith_mapped(body: &MappedFixedText) -> MappedFixedText {
 
         // Check for Hollerith: digits followed by H, not preceded by a letter/digit.
         if bytes[i].is_ascii_digit() {
-            let preceded_by_alnum =
-                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let preceded_by_alnum = result
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
             if !preceded_by_alnum {
                 let digit_start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -423,7 +454,12 @@ fn strip_whitespace_outside_strings_mapped(body: &MappedFixedText) -> MappedFixe
     let bytes = body.text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\'' || bytes[i] == b'"' {
+        if bytes[i] == b'!' {
+            let end = body.physical_line_end(i);
+            result.push_str(&body.text[i..end]);
+            positions.extend_from_slice(&body.positions[i..end]);
+            i = end;
+        } else if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             result.push(quote as char);
             positions.push(body.positions[i]);
@@ -535,16 +571,55 @@ fn lex_fixed_dot_op(
         end += 1;
     }
 
-    if end < bytes.len() && bytes[end] == b'.' {
-        end += 1; // closing dot
+    let col = (pos as u32) + 7;
+    let start = Position { line, col };
+
+    if name.is_empty() {
+        if end < bytes.len() && bytes[end] == b'.' {
+            end += 1;
+            return Ok((
+                Token {
+                    kind: TokenKind::Identifier,
+                    text: "..".into(),
+                    span: Span {
+                        file_id,
+                        start,
+                        end: Position {
+                            line,
+                            col: col + (end - pos) as u32,
+                        },
+                    },
+                },
+                end - pos,
+            ));
+        }
+        return Err(LexError {
+            span: Span {
+                file_id,
+                start,
+                end: start,
+            },
+            msg: "unexpected '.'".into(),
+        });
     }
 
+    if end == bytes.len() || bytes[end] != b'.' {
+        return Err(LexError {
+            span: Span {
+                file_id,
+                start,
+                end: start,
+            },
+            msg: format!("expected closing '.' after .{name}"),
+        });
+    }
+    end += 1;
+
     let lower = name.to_lowercase();
-    let col = (pos as u32) + 7;
     let tok_text = format!(".{}.", name);
     let span = Span {
         file_id,
-        start: Position { line, col },
+        start,
         end: Position {
             line,
             col: col + (end - pos) as u32,
@@ -698,8 +773,9 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 /// `PROGRAM HELLO` and `INTEGER I, N` reaches us as `PROGRAMHELLO` and
 /// `INTEGERI,N`.  The parser does not have enough context to recover those
 /// boundaries reliably from a single opaque identifier token, so the fixed-form
-/// lexer splits a small set of keyword prefixes when we are at a statement
-/// boundary or another keyword-following context.
+/// lexer splits a small set of keyword prefixes when the statement shape makes
+/// the boundary unambiguous. Tails in name-bearing contexts stay intact; the
+/// parser resolves the remaining program-unit ambiguity with grammar context.
 ///
 /// The DO/assignment ambiguity still needs special handling before the generic
 /// prefix splitter because `DO10I=1,10` is a loop while `DO10I=1.10` is an
@@ -760,12 +836,16 @@ fn split_fixed_keyword_prefix(
     prior_tokens: &[Token],
 ) -> Option<usize> {
     let at_action_start = at_fixed_action_statement_start(prior_tokens);
-    if (!allow_fixed_keyword_split(prior_tokens) && !at_action_start) || run.len() <= 4 {
+    if run.len() <= 4 {
         return None;
     }
 
     let trailing = text.as_bytes().get(pos + run.len()).copied();
-    if matches!(trailing, Some(b'=') | Some(b'%')) {
+    if matches!(trailing, Some(b'=') | Some(b'%') | Some(b':'))
+        || identifier_precedes_assignment(text, pos + run.len())
+        || in_fixed_identifier_name_context(prior_tokens)
+        || (!allow_fixed_keyword_split(prior_tokens) && !at_action_start)
+    {
         return None;
     }
 
@@ -794,8 +874,98 @@ fn split_fixed_keyword_prefix(
     None
 }
 
+fn in_fixed_identifier_name_context(prior_tokens: &[Token]) -> bool {
+    let Some(previous) = prior_tokens.last() else {
+        return false;
+    };
+    if matches!(previous.kind, TokenKind::Comma | TokenKind::ColonColon) {
+        return true;
+    }
+    if previous.kind != TokenKind::Identifier {
+        return false;
+    }
+
+    let previous = previous.text.to_ascii_lowercase();
+    matches!(
+        previous.as_str(),
+        "program"
+            | "submodule"
+            | "subroutine"
+            | "function"
+            | "blockdata"
+            | "entry"
+            | "call"
+            | "procedure"
+            | "type"
+            | "class"
+            | "module"
+            | "integer"
+            | "real"
+            | "doubleprecision"
+            | "doublecomplex"
+            | "complex"
+            | "character"
+            | "logical"
+    ) || (previous.starts_with("end") && previous != "end")
+}
+
+/// Protect an array/substring designator or statement-function name on the
+/// left side of an assignment. A bare keyword-prefix scan cannot distinguish
+/// `FUNCTIONAL(I)=...` from a compact procedure header.
+fn identifier_precedes_assignment(text: &str, run_end: usize) -> bool {
+    if text.as_bytes().get(run_end) != Some(&b'(') {
+        return false;
+    }
+
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = run_end;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                if bytes.get(index + 1) == Some(&active_quote) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'(' => depth += 1,
+            b')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+            }
+            b'=' if depth == 0 => {
+                let follows_relational_operator =
+                    index > 0 && matches!(bytes[index - 1], b'=' | b'/' | b'<' | b'>');
+                if bytes.get(index + 1) != Some(&b'=') && !follows_relational_operator {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 fn at_fixed_action_statement_start(prior_tokens: &[Token]) -> bool {
     if prior_tokens.is_empty() {
+        return true;
+    }
+    if prior_tokens.len() == 2
+        && prior_tokens[0].kind == TokenKind::Identifier
+        && prior_tokens[1].kind == TokenKind::Colon
+    {
         return true;
     }
     if prior_tokens.len() < 3
@@ -832,7 +1002,6 @@ fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
     };
 
     match prev.kind {
-        TokenKind::Comma | TokenKind::ColonColon => true,
         TokenKind::Identifier => matches!(
             prev.text.to_ascii_lowercase().as_str(),
             "integer"
@@ -848,16 +1017,11 @@ fn allow_fixed_keyword_split(prior_tokens: &[Token]) -> bool {
                 | "program"
                 | "module"
                 | "submodule"
-                | "subroutine"
-                | "function"
-                | "entry"
-                | "call"
                 | "pure"
                 | "impure"
                 | "elemental"
                 | "recursive"
                 | "end"
-                | "endtype"
         ),
         _ => false,
     }
@@ -1093,9 +1257,41 @@ enum FixedLine {
     },
 }
 
+fn is_fixed_comment_record(line: &str) -> bool {
+    matches!(
+        line.as_bytes().first().copied(),
+        Some(b'C' | b'c' | b'*' | b'!')
+    )
+}
+
+fn fixed_comment_record(line: &str, file_id: u32, line_num: u32) -> FixedLine {
+    FixedLine::Comment {
+        text: line.to_string(),
+        span: Span {
+            file_id,
+            start: Position {
+                line: line_num,
+                col: 1,
+            },
+            end: Position {
+                line: line_num,
+                col: line.len() as u32,
+            },
+        },
+    }
+}
+
+fn is_fixed_continuation_gap(line: &str) -> bool {
+    line.trim().is_empty() || is_fixed_comment_record(line)
+}
+
 /// Preprocess fixed-form lines: identify comments, extract labels, join
 /// continuations, strip columns 73+, handle tab-form.
-fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine> {
+fn preprocess_lines(
+    src: &str,
+    file_id: u32,
+    source_view: bool,
+) -> Result<Vec<FixedLine>, LexError> {
     let lines: Vec<&str> = src.lines().collect();
     let mut result = Vec::new();
     let mut i = 0;
@@ -1123,26 +1319,31 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
             continue;
         }
 
-        let first_byte = line.as_bytes().first().copied().unwrap_or(0);
-
         // Comment line: C, c, *, or ! in column 1.
-        if matches!(first_byte, b'C' | b'c' | b'*' | b'!') {
-            result.push(FixedLine::Comment {
-                text: line.to_string(),
-                span: Span {
-                    file_id,
-                    start: Position {
-                        line: line_num,
-                        col: 1,
-                    },
-                    end: Position {
-                        line: line_num,
-                        col: line.len() as u32,
-                    },
-                },
-            });
+        if is_fixed_comment_record(line) {
+            result.push(fixed_comment_record(line, file_id, line_num));
             i += 1;
             continue;
+        }
+
+        if is_continuation_line_impl(line, source_view) {
+            let marker_col = if line.as_bytes().first() == Some(&b'\t') {
+                2
+            } else {
+                6
+            };
+            let marker = Position {
+                line: line_num,
+                col: marker_col,
+            };
+            return Err(LexError {
+                span: Span {
+                    file_id,
+                    start: marker,
+                    end: marker,
+                },
+                msg: "orphan fixed-form continuation line".into(),
+            });
         }
 
         // Extract columns from this line.
@@ -1154,46 +1355,32 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
         i += 1;
 
         while i < lines.len() {
-            let next = lines[i];
-
-            // Blank lines between continuations: skip them only if the line
-            // after the blank is actually a continuation. Otherwise, the blank
-            // terminates the statement and should be emitted by the outer loop.
-            if next.trim().is_empty() {
-                // Peek ahead: is the line after this blank a continuation?
-                let lookahead = i + 1;
-                if lookahead < lines.len()
-                    && is_continuation_line_impl(lines[lookahead], source_view)
-                {
-                    i += 1;
-                    continue;
-                }
-                break; // blank line ends the statement
+            // Decide a complete blank/comment run before consuming any of it:
+            // it belongs to this statement only when a continuation follows.
+            let gap_start = i;
+            let mut gap_end = gap_start;
+            while gap_end < lines.len() && is_fixed_continuation_gap(lines[gap_end]) {
+                gap_end += 1;
             }
-
-            let next_first = next.as_bytes().first().copied().unwrap_or(0);
-            // Comment lines between continuations: skip them.
-            if matches!(next_first, b'C' | b'c' | b'*' | b'!') {
-                // Emit the comment but don't break the continuation.
-                result.push(FixedLine::Comment {
-                    text: next.to_string(),
-                    span: Span {
-                        file_id,
-                        start: Position {
-                            line: (i + 1) as u32,
-                            col: 1,
-                        },
-                        end: Position {
-                            line: (i + 1) as u32,
-                            col: next.len() as u32,
-                        },
-                    },
-                });
-                i += 1;
-                continue;
+            if gap_end > gap_start {
+                if gap_end == lines.len() || !is_continuation_line_impl(lines[gap_end], source_view)
+                {
+                    break;
+                }
+                for (offset, gap) in lines[gap_start..gap_end].iter().enumerate() {
+                    if is_fixed_comment_record(gap) {
+                        result.push(fixed_comment_record(
+                            gap,
+                            file_id,
+                            (gap_start + offset + 1) as u32,
+                        ));
+                    }
+                }
+                i = gap_end;
             }
 
             // Check column 6 for continuation marker.
+            let next = lines[i];
             if is_continuation_line_impl(next, source_view) {
                 let (_, cont_body, cont_col) = extract_fixed_columns(next, source_view);
                 full_body.append(MappedFixedText::from_piece(
@@ -1219,7 +1406,7 @@ fn preprocess_lines(src: &str, file_id: u32, source_view: bool) -> Vec<FixedLine
         });
     }
 
-    result
+    Ok(result)
 }
 
 /// Check if a line is a continuation line (non-space, non-zero in column 6).
@@ -1473,6 +1660,112 @@ mod tests {
             .filter(|k| **k == TokenKind::IntegerLiteral)
             .count();
         assert_eq!(int_count, 2);
+    }
+
+    #[test]
+    fn inline_comment_does_not_swallow_continuation_body() {
+        let src = "      X = 1 ! ignored ' 99H\n     +    + 2\n";
+
+        assert_eq!(fixed_texts(src), ["X", "=", "1", "+", "2"]);
+        let two = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.text == "2")
+            .expect("continuation body was swallowed by the inline comment");
+        assert_eq!(two.span.start, Position { line: 2, col: 13 });
+    }
+
+    #[test]
+    fn inline_comment_on_continuation_does_not_swallow_the_next_record() {
+        let src = "      X = 1\n     +    + 2 ! ignored\n     +    + 3\n";
+
+        assert_eq!(fixed_texts(src), ["X", "=", "1", "+", "2", "+", "3"]);
+    }
+
+    #[test]
+    fn exclamation_in_string_before_inline_comment_is_not_a_comment() {
+        let src = "      X = 'A!B' // ! ignored\n     + 'C!D'\n";
+        let literals: Vec<_> = fixed_toks(src)
+            .into_iter()
+            .filter(|token| token.kind == TokenKind::StringLiteral)
+            .collect();
+
+        assert_eq!(literals.len(), 2);
+        assert_eq!(literals[0].text, "'A!B'");
+        assert_eq!(literals[0].span.start, Position { line: 1, col: 11 });
+        assert_eq!(literals[0].span.end, Position { line: 1, col: 16 });
+        assert_eq!(literals[1].text, "'C!D'");
+        assert_eq!(literals[1].span.start, Position { line: 2, col: 8 });
+        assert_eq!(literals[1].span.end, Position { line: 2, col: 13 });
+    }
+
+    #[test]
+    fn exclamation_in_hollerith_after_inline_comment_is_not_a_comment() {
+        let src = "      X = ! ignoredZ\n     +3HA!B\n";
+        let literal = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::StringLiteral)
+            .expect("missing continued Hollerith literal");
+
+        assert_eq!(literal.text, "'A!B'");
+        assert_eq!(literal.span.start, Position { line: 2, col: 7 });
+        assert_eq!(literal.span.end, Position { line: 2, col: 12 });
+    }
+
+    #[test]
+    fn tab_form_inline_comment_does_not_swallow_continuation_body() {
+        let src = "\tX = 40 ! ignored\n\t1+ 2\n";
+
+        assert_eq!(fixed_texts(src), ["X", "=", "40", "+", "2"]);
+    }
+
+    #[test]
+    fn large_inline_comment_continuation_chain_is_processed_iteratively() {
+        const CONTINUATIONS: usize = 20_000;
+        let mut src = String::from("      X = 0 ! ignored ' 999H\n");
+        for _ in 1..CONTINUATIONS {
+            src.push_str("     +    + 1 ! ignored \" 999H\n");
+        }
+        src.push_str("     +    + 1\n");
+
+        let tokens = fixed_toks(&src);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Plus)
+                .count(),
+            CONTINUATIONS
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::IntegerLiteral)
+                .count(),
+            CONTINUATIONS + 1
+        );
+    }
+
+    #[test]
+    fn orphan_continuation_in_column_6_is_rejected() {
+        let err = tokenize_fixed("C leading comment\n\n     + X = 1\n", 17).unwrap_err();
+
+        assert_eq!(err.span.file_id, 17);
+        assert_eq!(err.span.start, Position { line: 3, col: 6 });
+        assert_eq!(err.msg, "orphan fixed-form continuation line");
+    }
+
+    #[test]
+    fn orphan_tab_form_continuation_is_rejected() {
+        let err = tokenize_fixed("\t1X = 1\n", 0).unwrap_err();
+
+        assert_eq!(err.span.start, Position { line: 1, col: 2 });
+        assert_eq!(err.msg, "orphan fixed-form continuation line");
+    }
+
+    #[test]
+    fn zero_in_column_6_starts_an_initial_line() {
+        let texts = fixed_texts("     0X = 1\n");
+
+        assert_eq!(texts, ["X", "=", "1"]);
     }
 
     #[test]
@@ -1746,6 +2039,73 @@ C     Hello World
     }
 
     #[test]
+    fn keyword_prefixed_names_remain_single_tokens_in_name_contexts() {
+        assert_eq!(
+            fixed_texts("      PROGRAM PRINTABLE\n"),
+            vec!["PROGRAM", "PRINTABLE"]
+        );
+        assert_eq!(
+            fixed_texts("      PROGRAMPRINTABLE\n"),
+            vec!["PROGRAM", "PRINTABLE"]
+        );
+        assert_eq!(
+            fixed_texts("      SUBROUTINE CALLABLE()\n"),
+            vec!["SUBROUTINE", "CALLABLE", "(", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      INTEGER REALIGNER\n"),
+            vec!["INTEGER", "REALIGNER"]
+        );
+        assert_eq!(
+            fixed_texts("      INTEGER :: REALIGNER, PRINTABLE\n"),
+            vec!["INTEGER", "::", "REALIGNER", ",", "PRINTABLE"]
+        );
+        assert_eq!(
+            fixed_texts("      CALL CALLABLE(PRINTABLE)\n"),
+            vec!["CALL", "CALLABLE", "(", "PRINTABLE", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      CALLCALLABLE(X,REALIGNER)\n"),
+            vec!["CALL", "CALLABLE", "(", "X", ",", "REALIGNER", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      FUNCTIONAL(1)=7\n"),
+            vec!["FUNCTIONAL", "(", "1", ")", "=", "7"]
+        );
+        assert_eq!(
+            fixed_texts("      PRINTABLE: IF (I.EQ.1) THEN\n"),
+            vec!["PRINTABLE", ":", "IF", "(", "I", ".EQ.", "1", ")", "THEN"]
+        );
+    }
+
+    #[test]
+    fn module_and_typed_procedure_ambiguities_are_deferred_to_the_parser() {
+        for source in ["      MODULE PROCEDURAL\n", "      MODULEPROCEDURAL\n"] {
+            assert_eq!(
+                fixed_texts(source),
+                vec!["MODULE", "PROCEDURAL"],
+                "got different tokens for {source:?}"
+            );
+        }
+        assert_eq!(
+            fixed_texts("      MODULE PROCEDURE PRINTABLE\n"),
+            vec!["MODULE", "PROCEDUREPRINTABLE"]
+        );
+
+        for source in [
+            "      INTEGER FUNCTION F(X)\n",
+            "      INTEGER FUNCTIONF(X)\n",
+            "      INTEGERFUNCTIONF(X)\n",
+        ] {
+            assert_eq!(
+                fixed_texts(source),
+                vec!["INTEGER", "FUNCTIONF", "(", "X", ")"],
+                "got different tokens for {source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn whitespace_stripped_print_keeps_numeric_format_label() {
         let texts = fixed_texts("      PRINT 100, I\n");
         assert_eq!(texts, vec!["PRINT", "100", ",", "I"], "got: {texts:?}");
@@ -1772,12 +2132,6 @@ C     Hello World
 
         let call = fixed_texts("      CALL PRINT100()\n");
         assert_eq!(call, vec!["CALL", "PRINT100", "(", ")"], "got: {call:?}");
-    }
-
-    #[test]
-    fn whitespace_stripped_typed_function() {
-        let texts = fixed_texts("      INTEGERFUNCTIONF(X)\n");
-        assert_eq!(texts, vec!["INTEGER", "FUNCTION", "F", "(", "X", ")"]);
     }
 
     #[test]
@@ -1868,6 +2222,34 @@ C     Hello World
     }
 
     #[test]
+    fn fixed_dot_operator_requires_a_closing_dot() {
+        let err = tokenize_fixed("      X=A.EQ\n", 0).unwrap_err();
+
+        assert_eq!(err.span.start, Position { line: 1, col: 10 });
+        assert_eq!(err.msg, "expected closing '.' after .EQ");
+    }
+
+    #[test]
+    fn lone_dot_is_not_synthesized_into_assumed_rank() {
+        let err = tokenize_fixed("      X=.\n", 0).unwrap_err();
+
+        assert_eq!(err.span.start, Position { line: 1, col: 9 });
+        assert_eq!(err.msg, "unexpected '.'");
+    }
+
+    #[test]
+    fn double_dot_preserves_assumed_rank_token() {
+        let token = fixed_toks("      X=..\n")
+            .into_iter()
+            .find(|token| token.text == "..")
+            .expect("missing assumed-rank token");
+
+        assert_eq!(token.kind, TokenKind::Identifier);
+        assert_eq!(token.span.start, Position { line: 1, col: 9 });
+        assert_eq!(token.span.end, Position { line: 1, col: 11 });
+    }
+
+    #[test]
     fn whitespace_stripped_real_literal() {
         // X=1.0D0 → identifier, =, real
         let kinds = fixed_kinds("      X=1.0D0\n");
@@ -1919,6 +2301,80 @@ C     Hello World
             int_count, 2,
             "blank line should not break continuation, got: {:?}",
             kinds
+        );
+    }
+
+    #[test]
+    fn continuation_crosses_complete_blank_and_comment_gap_run() {
+        let src = concat!(
+            "      X = 1 +\n",
+            "\n",
+            "C first gap comment\n",
+            "\n",
+            "! second gap comment\n",
+            "\n",
+            "     +  2\n",
+        );
+        let lines = preprocess_lines(src, 0, false).unwrap();
+        let statements = lines
+            .iter()
+            .filter(|line| matches!(line, FixedLine::Statement { .. }))
+            .count();
+
+        assert_eq!(
+            statements, 1,
+            "the continuation body became a standalone statement"
+        );
+        let two = fixed_toks(src)
+            .into_iter()
+            .find(|token| token.kind == TokenKind::IntegerLiteral && token.text == "2")
+            .expect("missing continued integer literal");
+        assert_eq!(two.span.start, Position { line: 7, col: 9 });
+    }
+
+    #[test]
+    fn noncontinuation_after_gap_run_preserves_physical_order() {
+        let src = "      X = 1\nC boundary comment\n\n      Y = 2\n";
+        let lines = preprocess_lines(src, 0, false).unwrap();
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| match line {
+                FixedLine::Statement { .. } => "statement",
+                FixedLine::Comment { .. } => "comment",
+                FixedLine::Blank { .. } => "blank",
+            })
+            .collect();
+
+        assert_eq!(kinds, ["statement", "comment", "blank", "statement"]);
+    }
+
+    #[test]
+    fn continuation_crosses_large_gap_run_iteratively() {
+        const GAP_LINES: usize = 20_000;
+        let mut src = String::from("      X = 1 +\n");
+        for index in 0..GAP_LINES {
+            if index % 2 == 0 {
+                src.push('\n');
+            } else {
+                src.push_str("C gap comment\n");
+            }
+        }
+        src.push_str("     +  2\n");
+
+        let lines = preprocess_lines(&src, 0, false).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line, FixedLine::Statement { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line, FixedLine::Comment { .. }))
+                .count(),
+            GAP_LINES / 2
         );
     }
 

@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::LinkOperand;
 use crate::target::{Libc, Os, TargetSpec};
 
 /// The crt objects one PIE link needs, in link order.
@@ -154,20 +155,19 @@ pub fn find_crt(
             (b, e)
         } else if target.os == Os::Linux {
             let gcc_roots = linux_gcc_roots();
-            let gcc_dir = newest_gcc_dir(&gcc_roots).ok_or_else(|| {
+            let gcc_dir = newest_gcc_dir(&gcc_roots, begin_name, end_name).ok_or_else(|| {
                 format!(
-                    "cannot find {}: no crt root has it and no GCC dir found under {}; \
+                    "cannot find {} and {}: no crt root has the pair and no complete \
+                     GCC crt pair was found under {}; \
                      pass -B <dir> (or set AFS_CRT_DIR) pointing at a directory \
                      containing the crt objects",
                     begin_name,
+                    end_name,
                     format_roots(&gcc_roots)
                 )
             })?;
             let b = gcc_dir.join(begin_name);
             let e = gcc_dir.join(end_name);
-            if !b.exists() || !e.exists() {
-                return Err(missing(begin_name, &[gcc_dir]));
-            }
             (b, e)
         } else {
             return Err(missing(begin_name, &roots));
@@ -213,6 +213,7 @@ fn linux_gcc_roots() -> Vec<PathBuf> {
         PathBuf::from("/usr/lib/gcc/x86_64-unknown-linux-gnu"),
     ];
 
+    let mut discovered = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/usr/lib/gcc") {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -226,54 +227,88 @@ fn linux_gcc_roots() -> Vec<PathBuf> {
                 && name.contains("linux")
                 && !roots.iter().any(|root| root == &path)
             {
-                roots.push(path);
+                discovered.push(path);
             }
         }
     }
+    discovered.sort();
+    discovered.dedup();
+    roots.extend(discovered);
 
     roots
 }
 
-/// Highest-numbered version directory under the given GCC lib roots.
-fn newest_gcc_dir(roots: &[PathBuf]) -> Option<PathBuf> {
-    let mut best: Option<(u32, PathBuf)> = None;
-    for root in roots {
+fn parse_gcc_version(name: &std::ffi::OsStr) -> Option<Vec<u32>> {
+    let name = name.to_str()?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for component in name.split('.') {
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        components.push(component.parse().ok()?);
+    }
+    while components.len() > 1 && components.last() == Some(&0) {
+        components.pop();
+    }
+    Some(components)
+}
+
+/// Highest-numbered complete GCC crt directory under the given roots.
+///
+/// Root order is the deterministic tie-breaker for two installations with
+/// the same numeric version. Within one root, the lexical path is the final
+/// tie-breaker for equivalent spellings such as `16` and `16.0`.
+fn newest_gcc_dir(roots: &[PathBuf], begin_name: &str, end_name: &str) -> Option<PathBuf> {
+    let mut best: Option<(Vec<u32>, usize, PathBuf)> = None;
+    for (root_index, root) in roots.iter().enumerate() {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Some(major) = name
-                .to_str()
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.parse::<u32>().ok())
+            let path = entry.path();
+            if !path.is_dir() || !path.join(begin_name).is_file() || !path.join(end_name).is_file()
             {
-                if best.as_ref().map(|(b, _)| major > *b).unwrap_or(true) {
-                    best = Some((major, entry.path()));
+                continue;
+            }
+            let Some(version) = parse_gcc_version(&entry.file_name()) else {
+                continue;
+            };
+            let replace = match &best {
+                None => true,
+                Some((best_version, best_root_index, best_path)) => {
+                    version > *best_version
+                        || (version == *best_version
+                            && (root_index < *best_root_index
+                                || (root_index == *best_root_index && path < *best_path)))
                 }
+            };
+            if replace {
+                best = Some((version, root_index, path));
             }
         }
     }
-    best.map(|(_, p)| p)
+    best.map(|(_, _, path)| path)
 }
 
 /// Build the complete `ld` argv for one ELF executable link. Link
-/// order is load-bearing: crt1/crti/crtbegin precede user objects;
-/// libraries follow the runtime archive (`-lc` after
-/// libarmfortas_rt.a or runtime externs go unresolved); crtend/crtn
-/// close. `--eh-frame-hdr` because Rust unwinding needs
+/// order is load-bearing: crt1/crti/crtbegin precede the ordered user
+/// operand stream; the runtime and its native libraries follow it
+/// (`-lc` after libarmfortas_rt.a or runtime externs go unresolved);
+/// crtend/crtn close. `--eh-frame-hdr` because Rust unwinding needs
 /// `PT_GNU_EH_FRAME`; `--gc-sections` keeps the coarse Rust runtime
 /// archive from dragging unused intrinsic surfaces into small binaries.
-#[allow(clippy::too_many_arguments)]
 pub fn elf_link_args(
     target: &TargetSpec,
     crt: &CrtSet,
-    objects: &[PathBuf],
+    operands: &[LinkOperand],
     runtime_lib: &Path,
     output: &Path,
     pie: bool,
     library_search_paths: &[PathBuf],
-    link_libs: &[String],
 ) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = Vec::new();
     if pie {
@@ -288,22 +323,17 @@ pub fn elf_link_args(
     args.push(crt.crt1.to_string_lossy().into_owned());
     args.push(crt.crti.to_string_lossy().into_owned());
     args.push(crt.crtbegin.to_string_lossy().into_owned());
-    for obj in objects {
-        args.push(obj.to_string_lossy().into_owned());
-    }
-    args.push(runtime_lib.to_string_lossy().into_owned());
+
+    // Search paths precede every user library while preserving user-before-
+    // system precedence. GNU ld applies -L globally, but putting them first
+    // also preserves the contract on linkers that process argv strictly.
     for dir in library_search_paths {
         args.push(format!("-L{}", dir.display()));
     }
-    for lib in link_libs {
-        args.push(format!("-l{}", lib));
-    }
-    // System search dirs after user -L: ld resolves -l left-to-right
-    // through the -L list in argv order, so user dirs win. The crt1
-    // dir rides along so a -B/AFS_CRT_DIR root (NixOS) also resolves
-    // its libc; the crtbegin dir because on Debian/Ubuntu (and in nix
-    // gcc store paths) the unversioned libgcc_s.so linker script lives
-    // in the GCC dir, nowhere on the standard -L path.
+    // The crt1 dir rides along so a -B/AFS_CRT_DIR root (NixOS) also
+    // resolves its libc; the crtbegin dir because on Debian/Ubuntu (and in
+    // nix gcc store paths) the unversioned libgcc_s.so linker script lives in
+    // the GCC dir, nowhere on the standard -L path.
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
     if let Some(parent) = crt.crt1.parent() {
         lib_dirs.push(parent.to_path_buf());
@@ -318,6 +348,14 @@ pub fn elf_link_args(
     for dir in lib_dirs.iter().filter(|d| d.is_dir()) {
         args.push(format!("-L{}", dir.display()));
     }
+
+    for operand in operands {
+        match operand {
+            LinkOperand::Input(path) => args.push(path.to_string_lossy().into_owned()),
+            LinkOperand::Library(name) => args.push(format!("-l{name}")),
+        }
+    }
+    args.push(runtime_lib.to_string_lossy().into_owned());
     for lib in native_libs(target) {
         args.push((*lib).to_string());
     }
@@ -417,10 +455,132 @@ mod tests {
         let newer = target_root.join("16");
         std::fs::create_dir_all(&older).unwrap();
         std::fs::create_dir_all(&newer).unwrap();
+        for dir in [&older, &newer] {
+            std::fs::write(dir.join("crtbeginS.o"), b"").unwrap();
+            std::fs::write(dir.join("crtendS.o"), b"").unwrap();
+        }
 
-        assert_eq!(newest_gcc_dir(&[target_root]).unwrap(), newer);
+        assert_eq!(
+            newest_gcc_dir(&[target_root], "crtbeginS.o", "crtendS.o").unwrap(),
+            newer
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn newest_gcc_dir_compares_complete_numeric_versions() {
+        let root =
+            std::env::temp_dir().join(format!("afs_gcc_numeric_version_{}", std::process::id()));
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        let older = first_root.join("15.9.0");
+        let newer = second_root.join("15.10.0");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(&newer).unwrap();
+        for dir in [&older, &newer] {
+            std::fs::write(dir.join("crtbeginS.o"), b"").unwrap();
+            std::fs::write(dir.join("crtendS.o"), b"").unwrap();
+        }
+
+        assert_eq!(
+            newest_gcc_dir(&[first_root, second_root], "crtbeginS.o", "crtendS.o").unwrap(),
+            newer
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn newest_gcc_dir_skips_incomplete_newer_installations() {
+        let root =
+            std::env::temp_dir().join(format!("afs_gcc_complete_pair_{}", std::process::id()));
+        let complete_root = root.join("complete");
+        let missing_end_root = root.join("missing-end");
+        let missing_begin_root = root.join("missing-begin");
+        let complete = complete_root.join("15.10.0");
+        let missing_end = missing_end_root.join("16.0.0");
+        let missing_begin = missing_begin_root.join("17.0.0");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::create_dir_all(&missing_end).unwrap();
+        std::fs::create_dir_all(&missing_begin).unwrap();
+        std::fs::write(complete.join("crtbeginS.o"), b"").unwrap();
+        std::fs::write(complete.join("crtendS.o"), b"").unwrap();
+        std::fs::write(missing_end.join("crtbeginS.o"), b"").unwrap();
+        std::fs::write(missing_begin.join("crtendS.o"), b"").unwrap();
+
+        assert_eq!(
+            newest_gcc_dir(
+                &[complete_root, missing_end_root, missing_begin_root],
+                "crtbeginS.o",
+                "crtendS.o"
+            )
+            .unwrap(),
+            complete
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn newest_gcc_dir_uses_the_requested_crt_variant_and_stable_ties() {
+        let root =
+            std::env::temp_dir().join(format!("afs_gcc_requested_pair_{}", std::process::id()));
+        let preferred_root = root.join("preferred");
+        let fallback_root = root.join("fallback");
+        let preferred = preferred_root.join("16.0");
+        let fallback = fallback_root.join("16");
+        std::fs::create_dir_all(&preferred).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        for dir in [&preferred, &fallback] {
+            std::fs::write(dir.join("crtbeginS.o"), b"").unwrap();
+            std::fs::write(dir.join("crtendS.o"), b"").unwrap();
+        }
+        std::fs::write(fallback.join("crtbegin.o"), b"").unwrap();
+        std::fs::write(fallback.join("crtend.o"), b"").unwrap();
+
+        assert_eq!(
+            newest_gcc_dir(
+                &[preferred_root.clone(), fallback_root.clone()],
+                "crtbeginS.o",
+                "crtendS.o"
+            )
+            .unwrap(),
+            preferred
+        );
+        assert_eq!(
+            newest_gcc_dir(&[preferred_root, fallback_root], "crtbegin.o", "crtend.o").unwrap(),
+            fallback
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gcc_version_parser_rejects_ambiguous_names_and_component_overflow() {
+        assert_eq!(
+            parse_gcc_version(std::ffi::OsStr::new("15.10.0")),
+            Some(vec![15, 10])
+        );
+        assert_eq!(
+            parse_gcc_version(std::ffi::OsStr::new("0015.010.1")),
+            Some(vec![15, 10, 1])
+        );
+        for invalid in [
+            "",
+            ".16",
+            "16.",
+            "16..1",
+            "16-rc1",
+            "16.backup",
+            "4294967296",
+        ] {
+            assert_eq!(
+                parse_gcc_version(std::ffi::OsStr::new(invalid)),
+                None,
+                "{invalid:?} must not be treated as a GCC version"
+            );
+        }
     }
 
     #[test]
@@ -430,12 +590,15 @@ mod tests {
         let args = elf_link_args(
             &t("x86_64-freebsd"),
             &crt,
-            &[PathBuf::from("/tmp/a.o"), PathBuf::from("/tmp/b.o")],
+            &[
+                LinkOperand::Input(PathBuf::from("/tmp/a.o")),
+                LinkOperand::Library("foo".to_string()),
+                LinkOperand::Input(PathBuf::from("/tmp/b.o")),
+            ],
             Path::new("/rt/libarmfortas_rt.a"),
             Path::new("/tmp/out"),
             true,
             &[PathBuf::from("/userlibs")],
-            &["foo".to_string()],
         )
         .unwrap();
         let expect_prefix = [
@@ -453,7 +616,8 @@ mod tests {
                 .position(|a| a == needle)
                 .unwrap_or_else(|| panic!("missing {} in {:?}", needle, args))
         };
-        // crt1 < crti < crtbegin < objects < runtime < -lfoo < -lc < crtend < crtn
+        // Search paths precede an exactly ordered a.o, -lfoo, b.o stream;
+        // the compiler runtime and native libraries follow that stream.
         let crt1 = pos(crt.crt1.to_str().unwrap());
         let crti = pos(crt.crti.to_str().unwrap());
         let begin = pos(crt.crtbegin.to_str().unwrap());
@@ -465,8 +629,8 @@ mod tests {
         let libc = pos("-lc");
         let end = pos(crt.crtend.to_str().unwrap());
         let crtn = pos(crt.crtn.to_str().unwrap());
-        assert!(crt1 < crti && crti < begin && begin < a_o && a_o < b_o && b_o < rt);
-        assert!(rt < userdir && userdir < userlib && userlib < libc);
+        assert!(crt1 < crti && crti < begin && begin < userdir && userdir < a_o);
+        assert!(a_o < userlib && userlib < b_o && b_o < rt && rt < libc);
         assert!(libc < end && end < crtn && crtn == args.len() - 1);
         // User -L outranks every system -L (left-to-right resolution).
         if let Some(sys) = args
@@ -485,11 +649,10 @@ mod tests {
         let args = elf_link_args(
             &t("x86_64-freebsd"),
             &crt,
-            &[PathBuf::from("/tmp/a.o")],
+            &[LinkOperand::Input(PathBuf::from("/tmp/a.o"))],
             Path::new("/rt/libarmfortas_rt.a"),
             Path::new("/tmp/out"),
             false,
-            &[],
             &[],
         )
         .unwrap();

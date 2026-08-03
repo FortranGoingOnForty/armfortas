@@ -77,6 +77,11 @@ fn find_dead_stores(
                 });
             }
 
+            // VOLATILE accesses are explicit optimizer barriers. In addition
+            // to preserving the access itself, assume asynchronously visible
+            // storage may have changed at this point.
+            InstKind::VolatileLoad(_) | InstKind::VolatileStore(..) => pending.clear(),
+
             // The alias oracle compares point addresses, while vector memory
             // operations cover a 16-byte range. Until range aliasing exists,
             // no pending scalar store is proven disjoint from that access.
@@ -95,23 +100,23 @@ fn find_dead_stores(
                 // though their precise offsets differ. Aggregate-like
                 // pointees may also carry pointers to otherwise unrelated
                 // allocations, requiring a full pending-store barrier.
-                let pointer_args: Vec<ValueId> = args
+                let pointer_args: Vec<alias::CallArgPointer> = args
                     .iter()
                     .copied()
-                    .filter(|arg| alias_oracle.value_is_pointer(*arg))
+                    .filter_map(|arg| alias_oracle.call_arg_pointer(arg))
                     .collect();
                 if !pointer_args.is_empty() {
                     if pointer_args
                         .iter()
-                        .any(|arg| call_arg_may_carry_indirect_pointer(alias_oracle, *arg))
+                        .any(|arg| arg.may_carry_indirect_pointer)
                     {
                         pending.clear();
                         continue;
                     }
                     pending.retain(|_, entry| {
-                        pointer_args
-                            .iter()
-                            .all(|arg| !alias_oracle.may_reach_through_call_arg(entry.ptr, *arg))
+                        pointer_args.iter().all(|arg| {
+                            !alias_oracle.may_reach_through_call_arg(entry.ptr, arg.pointer)
+                        })
                     });
                 }
             }
@@ -126,20 +131,6 @@ fn find_dead_stores(
     // they stay live. Cross-block DSE requires a separate dataflow analysis.
 
     dead
-}
-
-fn call_arg_may_carry_indirect_pointer(
-    alias_oracle: &alias::AliasOracle<'_>,
-    value: ValueId,
-) -> bool {
-    matches!(
-        alias_oracle.value_type(value),
-        Some(IrType::Ptr(inner))
-            if matches!(
-                inner.as_ref(),
-                IrType::Array(..) | IrType::Struct(_) | IrType::Ptr(_) | IrType::FuncPtr(_)
-            )
-    )
 }
 
 fn remove_dead_stores(block: &mut BasicBlock, dead: &HashSet<usize>) -> bool {
@@ -262,6 +253,31 @@ mod tests {
     }
 
     #[test]
+    fn volatile_access_is_a_dead_store_barrier() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let v1 = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let v2 = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(v1, ptr), IrType::Void);
+        push(&mut f, InstKind::VolatileLoad(ptr), i32_ty());
+        push(&mut f, InstKind::Store(v2, ptr), IrType::Void);
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(!Dse.run(&mut m));
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn does_not_remove_global_store_across_zero_argument_call() {
         let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
         let mut f = Function::new("f".into(), vec![], IrType::Void);
@@ -282,6 +298,38 @@ mod tests {
         assert!(
             !Dse.run(&mut m),
             "DSE must preserve a global store observable by an intervening call"
+        );
+        assert_eq!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.kind, InstKind::Store(..)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ptr_to_int_call_arg_preserves_observable_store() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Void);
+        let ptr = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let first = push(&mut f, InstKind::ConstInt(1, IntWidth::I32), i32_ty());
+        let second = push(&mut f, InstKind::ConstInt(2, IntWidth::I32), i32_ty());
+        push(&mut f, InstKind::Store(first, ptr), IrType::Void);
+        let c_ptr = push(&mut f, InstKind::PtrToInt(ptr), IrType::Int(IntWidth::I64));
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("observe".into()), vec![c_ptr]),
+            IrType::Void,
+        );
+        push(&mut f, InstKind::Store(second, ptr), IrType::Void);
+        f.block_mut(f.entry).terminator = Some(Terminator::Return(None));
+        m.add_function(f);
+
+        assert!(
+            !Dse.run(&mut m),
+            "DSE must preserve a store observable through PtrToInt(local)"
         );
         assert_eq!(
             m.functions[0].blocks[0]

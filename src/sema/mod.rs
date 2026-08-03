@@ -6,6 +6,7 @@
 pub mod amod;
 pub mod intrinsic_modules;
 pub mod resolve;
+pub(crate) mod specific_intrinsic;
 pub mod symtab;
 pub mod type_layout;
 pub mod types;

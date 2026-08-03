@@ -19,6 +19,9 @@ pub fn emit_function(mf: &MachineFunction) -> String {
     writeln!(out, "_{}:", mf.name).unwrap();
 
     for block in &mf.blocks {
+        if let Some(label) = mf.long_branch_label(block.id) {
+            writeln!(out, "{}:", label).unwrap();
+        }
         // Don't re-emit entry label (it's the function label).
         if block.id != MBlockId(0) {
             writeln!(out, "{}:", block.label).unwrap();
@@ -948,6 +951,21 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 _ => "nop ; bad adrp+add".into(),
             }
         }
+        ArmOpcode::AdrpGotLdr => match inst.operands.as_slice() {
+            [dest, MachineOperand::GlobalLabel(name)] => {
+                let dest = op_str(dest);
+                let sym = if name.starts_with('_') {
+                    name.clone()
+                } else {
+                    format!("_{}", name)
+                };
+                format!(
+                    "adrp {0}, {1}@GOTPAGE\n    ldr {0}, [{0}, {1}@GOTPAGEOFF]",
+                    dest, sym
+                )
+            }
+            operands => panic!("malformed ARM64 AdrpGotLdr operands: {operands:?}"),
+        },
 
         ArmOpcode::B => {
             match &inst.operands[0] {
@@ -963,6 +981,18 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
                 _ => "b ???".into(),
             }
         }
+        ArmOpcode::BLong => match inst.operands.as_slice() {
+            [MachineOperand::BlockRef(id)] => {
+                let label = mf
+                    .long_branch_label(*id)
+                    .expect("long branch target must have a relocation anchor");
+                format!(
+                    "adrp x16, {0}@PAGE\n    add x16, x16, {0}@PAGEOFF\n    br x16",
+                    label
+                )
+            }
+            operands => panic!("malformed ARM64 long-branch operands: {operands:?}"),
+        },
         ArmOpcode::BCond => {
             let cond = if let MachineOperand::Cond(c) = &inst.operands[0] {
                 cond_str(*c)
@@ -1041,6 +1071,9 @@ fn emit_inst(inst: &MachineInst, mf: &MachineFunction) -> String {
         ),
         ArmOpcode::Ret => "ret".into(),
         ArmOpcode::Nop => "nop".into(),
+        ArmOpcode::CallArgCopyStart => {
+            panic!("unresolved call-argument copy marker reached ARM64 emission")
+        }
         ArmOpcode::Brk => {
             let imm = if let MachineOperand::Imm(v) = &inst.operands[0] {
                 *v
@@ -1484,6 +1517,37 @@ mod tests {
         let asm = emit_simple(|b| b.ret_void());
         assert!(asm.contains(".globl _test"), "missing .globl: {}", asm);
         assert!(asm.contains("_test:"), "missing function label: {}", asm);
+    }
+
+    #[test]
+    fn emit_external_symbol_address_through_macho_got() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::AdrpGotLdr,
+            operands: vec![
+                MachineOperand::PhysReg(PhysReg::Gp(12)),
+                MachineOperand::GlobalLabel("external_hook".into()),
+            ],
+            def: None,
+        };
+
+        assert_eq!(
+            emit_inst(&inst, &mf),
+            "adrp x12, _external_hook@GOTPAGE\n    ldr x12, [x12, _external_hook@GOTPAGEOFF]"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed ARM64 AdrpGotLdr operands")]
+    fn reject_malformed_external_symbol_address_mir() {
+        let mf = MachineFunction::new("test".into());
+        let inst = MachineInst {
+            opcode: ArmOpcode::AdrpGotLdr,
+            operands: vec![MachineOperand::PhysReg(PhysReg::Gp(12))],
+            def: None,
+        };
+
+        emit_inst(&inst, &mf);
     }
 
     #[test]

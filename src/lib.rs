@@ -30,6 +30,21 @@ pub mod testing;
 ///   3 I/O error (cannot read input, cannot write output)
 ///   4 internal compiler error (panic / assertion)
 pub fn cli_entry() -> ! {
+    cli_entry_impl(None)
+}
+
+/// CLI entry point used by the installed binaries.
+///
+/// Cargo installs executable targets but not the compiler's static runtime
+/// archive. Each binary therefore carries the target-matched archive produced
+/// by the `armfortas-rt` package and offers it to the driver as the final
+/// runtime source.
+#[doc(hidden)]
+pub fn cli_entry_with_bundled_runtime(runtime_archive: &'static [u8]) -> ! {
+    cli_entry_impl(Some(runtime_archive))
+}
+
+fn cli_entry_impl(bundled_runtime: Option<&'static [u8]>) -> ! {
     use std::env;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::process;
@@ -90,8 +105,11 @@ pub fn cli_entry() -> ! {
             let worker = match std::thread::Builder::new()
                 .name("compile".into())
                 .stack_size(COMPILE_STACK_BYTES)
-                .spawn(move || catch_unwind(AssertUnwindSafe(|| driver::execute(&opts))))
-            {
+                .spawn(move || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        driver::execute_with_bundled_runtime(&opts, bundled_runtime)
+                    }))
+                }) {
                 Ok(worker) => worker,
                 Err(e) => {
                     eprintln!("{}: cannot start compiler worker: {}", program_name, e);
@@ -115,11 +133,11 @@ pub fn cli_entry() -> ! {
 }
 
 fn emit_cli_warnings(program_name: &str, opts: &driver::Options) -> bool {
-    if opts.cli_warnings.is_empty() {
+    if !opts.warnings_enabled() || opts.cli_warnings.is_empty() {
         return false;
     }
 
-    let label = if opts.warn_as_error {
+    let label = if opts.warnings_are_errors() {
         "error"
     } else {
         "warning"
@@ -127,7 +145,7 @@ fn emit_cli_warnings(program_name: &str, opts: &driver::Options) -> bool {
     for warning in &opts.cli_warnings {
         eprintln!("{}: {}: {}", program_name, label, warning);
     }
-    opts.warn_as_error
+    opts.warnings_are_errors()
 }
 
 /// Map a compile error message to the appropriate exit code.  Today

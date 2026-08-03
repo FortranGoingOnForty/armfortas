@@ -83,7 +83,11 @@ fn fission_in_function(func: &mut Function, layout: crate::target::TargetLayout)
             func.block(bid).insts.iter().any(|inst| {
                 matches!(
                     inst.kind,
-                    InstKind::Call(..) | InstKind::RuntimeCall(..) | InstKind::VStore(..)
+                    InstKind::Call(..)
+                        | InstKind::RuntimeCall(..)
+                        | InstKind::VStore(..)
+                        | InstKind::VolatileLoad(..)
+                        | InstKind::VolatileStore(..)
                 )
             })
         }) {
@@ -184,8 +188,12 @@ fn partition_memory_accesses(func: &Function, slice: &HashSet<ValueId>) -> Vec<(
                 continue;
             }
             match inst.kind {
-                InstKind::Load(ptr) | InstKind::VLoad(ptr) => accesses.push((ptr, false)),
-                InstKind::Store(_, ptr) | InstKind::VStore(_, ptr) => {
+                InstKind::Load(ptr) | InstKind::VolatileLoad(ptr) | InstKind::VLoad(ptr) => {
+                    accesses.push((ptr, false))
+                }
+                InstKind::Store(_, ptr)
+                | InstKind::VolatileStore(_, ptr)
+                | InstKind::VStore(_, ptr) => {
                     accesses.push((ptr, true));
                 }
                 _ => {}

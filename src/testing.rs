@@ -4,10 +4,12 @@
 //! from the compiler pipeline so the external `afs-tests` runner can assert on
 //! more than just final program output.
 
+pub mod managed_process;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +25,11 @@ use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Token};
 use crate::opt::pipeline::OptLevel as IrOptLevel;
 use crate::opt::{build_i128_pipeline, build_pipeline};
 use crate::parser::Parser;
-use crate::runtime::artifact::{fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile};
+use crate::runtime::artifact::{
+    find_source_workspace_from, fresh_runtime_lib, runtime_lib_candidate, RuntimeProfile,
+};
 use crate::sema::{resolve, validate};
+use managed_process::{run as run_managed, CommandClass};
 
 /// Return the profile directory that contains the running Cargo test.
 ///
@@ -388,13 +393,40 @@ impl CapturedStage {
 #[derive(Debug, Clone)]
 pub struct RunCapture {
     pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-/// Capture the requested stages for one source file.
+impl RunCapture {
+    /// Decode standard output when a caller explicitly requires text.
+    pub fn stdout_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.stdout)
+    }
+
+    /// Decode standard error when a caller explicitly requires text.
+    pub fn stderr_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.stderr)
+    }
+}
+
+/// Capture the requested stages for one source file without external module
+/// search paths.
 pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, CaptureFailure> {
+    capture_from_path_with_module_search_paths(request, &[])
+}
+
+/// Capture the requested stages for one source file while resolving module
+/// interfaces from the supplied search paths.
+///
+/// This is the testing equivalent of the driver's `-I` surface. It lets
+/// project harnesses capture a translation unit after its dependencies have
+/// produced real `.amod` artifacts, instead of concatenating independent
+/// sources into a synthetic file.
+pub fn capture_from_path_with_module_search_paths(
+    request: &CaptureRequest,
+    module_search_paths: &[PathBuf],
+) -> Result<CaptureResult, CaptureFailure> {
     let mut stages = BTreeMap::new();
     let wants = |stage| request.requested.contains(&stage);
     let needs_backend = request.requested.iter().any(|stage| {
@@ -417,6 +449,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     let pp_config = crate::preprocess::PreprocConfig {
         filename: input.to_string_lossy().into_owned(),
         fixed_form: matches!(source_form, SourceForm::FixedForm),
+        include_paths: module_search_paths.to_vec(),
         ..crate::preprocess::PreprocConfig::default()
     };
     let pp_result =
@@ -455,7 +488,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         stages.insert(Stage::Tokens, CapturedStage::Text(format_tokens(&tokens)));
     }
 
-    let mut parser = Parser::new_source_view(&tokens);
+    let mut parser = Parser::new_source_view_for_form(&tokens, source_form);
     let units = parser.parse_file().map_err(|e| {
         let resolved = pp_result.resolve_span(e.span);
         CaptureFailure {
@@ -478,7 +511,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
 
     let rr = resolve::resolve_file(
         &units,
-        &[],
+        module_search_paths,
         crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
     )
     .map_err(|e| {
@@ -497,6 +530,21 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             stages: stages.clone(),
         }
     })?;
+    let mut external_globals = std::collections::HashMap::new();
+    let mut external_optional_params = std::collections::HashMap::new();
+    let mut external_descriptor_params = std::collections::HashMap::new();
+    let mut external_char_len_star = std::collections::HashMap::new();
+    for external_module in &rr.external_modules {
+        external_globals.extend(crate::sema::amod::extract_module_globals(external_module));
+        external_optional_params
+            .extend(crate::sema::amod::extract_optional_params(external_module));
+        external_descriptor_params.extend(crate::sema::amod::extract_descriptor_params(
+            external_module,
+        ));
+        external_char_len_star.extend(crate::sema::amod::extract_char_len_star_params(
+            external_module,
+        ));
+    }
     let st = rr.st;
     let type_layouts = rr.type_layouts;
     let diags = validate::validate_file(&units, &st);
@@ -524,10 +572,10 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         &units,
         &st,
         &type_layouts,
-        std::collections::HashMap::new(),
-        std::collections::HashMap::new(),
-        std::collections::HashMap::new(),
-        std::collections::HashMap::new(),
+        external_globals,
+        external_optional_params,
+        external_descriptor_params,
+        external_char_len_star,
         crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
     );
     let ir_errors = verify::verify_module(&ir_module);
@@ -686,6 +734,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
         for mf in &mut allocated {
             if request.opt_level == OptLevel::O0 {
                 crate::codegen::regalloc::regalloc_naive(mf);
+                linearscan::parallelize_call_arg_moves(mf);
             } else {
                 let liveness = crate::codegen::liveness::compute_liveness(mf);
                 let result = linearscan::linear_scan(mf, &liveness);
@@ -695,8 +744,8 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 // parallelize_call_arg_moves in particular fixes a w0/w1
                 // clobber pattern visible at high register pressure.
                 linearscan::parallelize_entry_arg_moves(mf);
-                linearscan::parallelize_call_arg_moves(mf);
                 linearscan::insert_split_bridges(mf, &result.split_records);
+                linearscan::parallelize_call_arg_moves(mf);
                 linearscan::insert_callee_saves(mf, &result.callee_saved_used);
                 linearscan::coalesce_moves(mf);
                 crate::codegen::tailcall::tail_call_opt(mf);
@@ -729,6 +778,7 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
             detail: format!("cannot create temp dir '{}': {}", temp_root.display(), e),
             stages: stages.clone(),
         })?;
+        let _temp_cleanup = TempTreeCleanup(temp_root.clone());
         fs::write(&asm_path, &asm_text).map_err(|e| CaptureFailure {
             input: input.clone(),
             opt_level: request.opt_level,
@@ -772,16 +822,17 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 detail: format!("cannot create run sandbox '{}': {}", sandbox.display(), e),
                 stages: stages.clone(),
             })?;
-            let output = Command::new(&bin_path)
-                .current_dir(&sandbox)
-                .output()
-                .map_err(|e| CaptureFailure {
-                    input: input.clone(),
-                    opt_level: request.opt_level,
-                    stage: FailureStage::Run,
-                    detail: format!("cannot run '{}': {}", bin_path.display(), e),
-                    stages: stages.clone(),
-                })?;
+            let output = run_managed(
+                Command::new(&bin_path).current_dir(&sandbox),
+                CommandClass::Run,
+            )
+            .map_err(|e| CaptureFailure {
+                input: input.clone(),
+                opt_level: request.opt_level,
+                stage: FailureStage::Run,
+                detail: format!("cannot run '{}': {}", bin_path.display(), e),
+                stages: stages.clone(),
+            })?;
             let files = snapshot_sandbox_files(&sandbox).map_err(|detail| CaptureFailure {
                 input: input.clone(),
                 opt_level: request.opt_level,
@@ -793,14 +844,12 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
                 Stage::Run,
                 CapturedStage::Run(RunCapture {
                     exit_code: output.status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
                     files,
                 }),
             );
         }
-
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     Ok(CaptureResult {
@@ -810,28 +859,130 @@ pub fn capture_from_path(request: &CaptureRequest) -> Result<CaptureResult, Capt
     })
 }
 
+const MAX_SANDBOX_DEPTH: usize = 64;
+const MAX_SANDBOX_FILES: usize = 4096;
+const MAX_SANDBOX_ENTRIES: usize = 8192;
+const MAX_SANDBOX_BYTES: u64 = 64 * 1024 * 1024;
+
 fn collect_sandbox_files(
     root: &Path,
     dir: &Path,
     out: &mut BTreeMap<String, Vec<u8>>,
+    depth: usize,
+    visited_entries: &mut usize,
+    total_bytes: &mut u64,
 ) -> std::io::Result<()> {
+    if depth > MAX_SANDBOX_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "sandbox directory depth exceeds limit of {}",
+                MAX_SANDBOX_DEPTH
+            ),
+        ));
+    }
+
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        *visited_entries += 1;
+        if *visited_entries > MAX_SANDBOX_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox entry count exceeds limit of {}",
+                    MAX_SANDBOX_ENTRIES
+                ),
+            ));
+        }
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            collect_sandbox_files(root, &path, out)?;
-        } else {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_sandbox_files(root, &path, out, depth + 1, visited_entries, total_bytes)?;
+        } else if file_type.is_file() {
+            if out.len() >= MAX_SANDBOX_FILES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("sandbox file count exceeds limit of {}", MAX_SANDBOX_FILES),
+                ));
+            }
             let rel = path.strip_prefix(root).unwrap();
-            out.insert(rel.to_string_lossy().replace('\\', "/"), fs::read(&path)?);
+            let rel = normalize_snapshot_path(root, rel)?;
+            let remaining = MAX_SANDBOX_BYTES.saturating_sub(*total_bytes);
+            let mut bytes = Vec::new();
+            fs::File::open(&path)?
+                .take(remaining + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("sandbox file bytes exceed limit of {}", MAX_SANDBOX_BYTES),
+                ));
+            }
+            *total_bytes += bytes.len() as u64;
+            out.insert(rel, bytes);
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox entry '{}' is not a regular file or directory",
+                    path.display()
+                ),
+            ));
         }
     }
     Ok(())
 }
 
-fn snapshot_sandbox_files(sandbox: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+fn normalize_snapshot_path(root: &Path, relative: &Path) -> std::io::Result<String> {
+    let mut normalized = String::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox path '{}' is not a normal relative path",
+                    relative.display()
+                ),
+            ));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("sandbox path below '{}' is not valid UTF-8", root.display()),
+            )
+        })?;
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    if normalized.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sandbox file path is empty",
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Snapshot regular files created below an isolated run directory.
+///
+/// The snapshot is exact and bounded. Non-UTF-8 paths, symlinks, special
+/// files, excessive nesting, too many entries or files, and oversized file sets are
+/// rejected instead of being normalized or followed.
+pub fn snapshot_sandbox_files(sandbox: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut files = BTreeMap::new();
-    collect_sandbox_files(sandbox, sandbox, &mut files)
-        .map_err(|e| format!("cannot snapshot sandbox '{}': {}", sandbox.display(), e))?;
+    let mut visited_entries = 0;
+    let mut total_bytes = 0;
+    collect_sandbox_files(
+        sandbox,
+        sandbox,
+        &mut files,
+        0,
+        &mut visited_entries,
+        &mut total_bytes,
+    )
+    .map_err(|e| format!("cannot snapshot sandbox '{}': {}", sandbox.display(), e))?;
     Ok(files)
 }
 
@@ -1117,6 +1268,14 @@ fn next_temp_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), id))
 }
 
+struct TempTreeCleanup(PathBuf);
+
+impl Drop for TempTreeCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Debug-format x86 machine functions for the Mir/Regalloc capture
 /// stages. A structured printer (MirView) is x10's call; until then a
 /// derive(Debug) dump is honest and greppable.
@@ -1129,14 +1288,15 @@ fn format_x86_functions(funcs: &[crate::codegen::x86::mir::X86Function]) -> Stri
 }
 
 fn assemble_with_system(asm_path: &Path, obj_path: &Path) -> Result<(), String> {
-    let output = Command::new("as")
-        .args([
+    let output = run_managed(
+        Command::new("as").args([
             "-o",
             obj_path.to_str().unwrap_or("output.o"),
             asm_path.to_str().unwrap_or("input.s"),
-        ])
-        .output()
-        .map_err(|e| format!("cannot run assembler: {}", e))?;
+        ]),
+        CommandClass::Tool,
+    )
+    .map_err(|e| format!("cannot run assembler: {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1166,10 +1326,11 @@ fn link_with_runtime(obj: &Path, output: &Path) -> Result<(), String> {
 
 fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
     let rt_path = find_runtime_lib()?;
-    let sdk = Command::new("xcrun")
-        .args(["--show-sdk-path"])
-        .output()
-        .map_err(|e| format!("cannot run xcrun: {}", e))?;
+    let sdk = run_managed(
+        Command::new("xcrun").args(["--show-sdk-path"]),
+        CommandClass::Tool,
+    )
+    .map_err(|e| format!("cannot run xcrun: {}", e))?;
     if !sdk.status.success() {
         return Err(format!(
             "xcrun failed:\n{}",
@@ -1178,8 +1339,8 @@ fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
     }
     let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
 
-    let ld = Command::new("ld")
-        .args([
+    let ld = run_managed(
+        Command::new("ld").args([
             obj.to_str().unwrap(),
             &rt_path,
             "-lSystem",
@@ -1189,9 +1350,10 @@ fn link_with_runtime_macho(obj: &Path, output: &Path) -> Result<(), String> {
             "_main",
             "-o",
             output.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| format!("cannot run linker: {}", e))?;
+        ]),
+        CommandClass::Compile,
+    )
+    .map_err(|e| format!("cannot run linker: {}", e))?;
     if ld.status.success() {
         Ok(())
     } else {
@@ -1238,11 +1400,13 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let output = Command::new(cargo)
-        .current_dir(workspace_root)
-        .args(profile.cargo_build_args())
-        .output()
-        .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
+    let output = run_managed(
+        Command::new(cargo)
+            .current_dir(workspace_root)
+            .args(profile.cargo_build_args()),
+        CommandClass::Compile,
+    )
+    .map_err(|e| format!("cannot rebuild libarmfortas_rt.a: {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1255,24 +1419,15 @@ fn maybe_refresh_runtime_lib(workspace_root: &Path, profile: RuntimeProfile) -> 
 
 fn find_workspace_root() -> Option<PathBuf> {
     let mut bases = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        bases.push(cwd);
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             bases.push(dir.to_path_buf());
         }
     }
-
-    for base in bases {
-        for ancestor in base.ancestors() {
-            if ancestor.join("Cargo.toml").exists() && ancestor.join("runtime/Cargo.toml").exists()
-            {
-                return Some(ancestor.to_path_buf());
-            }
-        }
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd);
     }
-    None
+    find_source_workspace_from(&bases)
 }
 
 /// Object-file inspection dispatched on object format (sprint x01).
@@ -1334,9 +1489,7 @@ pub fn find_inspection_tool(env_key: &str, candidates: &[&str]) -> String {
         return over.to_string_lossy().into_owned();
     }
     for candidate in candidates {
-        let probe = Command::new(candidate)
-            .arg("--version")
-            .output()
+        let probe = run_managed(Command::new(candidate).arg("--version"), CommandClass::Tool)
             .map(|out| out.status.success())
             .unwrap_or(false);
         if probe {
@@ -1356,9 +1509,7 @@ fn object_snapshot(path: &Path) -> Result<String, String> {
 }
 
 fn tool_output(tool: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(tool)
-        .args(args)
-        .output()
+    let output = run_managed(Command::new(tool).args(args), CommandClass::Tool)
         .map_err(|e| format!("cannot run {}: {}", tool, e))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -1386,6 +1537,70 @@ fn normalize_tool_output(text: &str) -> String {
 #[cfg(test)]
 mod inspector_tests {
     use super::*;
+
+    #[test]
+    fn sandbox_snapshot_preserves_nested_binary_files() {
+        let root = next_temp_root("afs_snapshot_nested");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/artifact.bin"), [0x00, 0xff, 0x7f]).unwrap();
+
+        let files = snapshot_sandbox_files(&root).unwrap();
+        assert_eq!(
+            files,
+            BTreeMap::from([("nested/artifact.bin".to_string(), vec![0x00, 0xff, 0x7f])])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_snapshot_does_not_collapse_literal_backslashes_into_directories() {
+        let root = next_temp_root("afs_snapshot_backslash");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/artifact"), b"directory path").unwrap();
+        fs::write(root.join("nested\\artifact"), b"literal backslash").unwrap();
+
+        let files = snapshot_sandbox_files(&root).unwrap();
+        assert_eq!(files.get("nested/artifact").unwrap(), b"directory path");
+        assert_eq!(files.get("nested\\artifact").unwrap(), b"literal backslash");
+        assert_eq!(files.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn sandbox_snapshot_rejects_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_root = next_temp_root("afs_snapshot_invalid_path");
+        fs::create_dir_all(&invalid_root).unwrap();
+        let invalid_name = std::ffi::OsString::from_vec(vec![b'f', 0xff]);
+        fs::write(invalid_root.join(invalid_name), b"bytes").unwrap();
+        let invalid_error = snapshot_sandbox_files(&invalid_root).unwrap_err();
+        assert!(invalid_error.contains("not valid UTF-8"), "{invalid_error}");
+        let _ = fs::remove_dir_all(invalid_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_snapshot_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let symlink_root = next_temp_root("afs_snapshot_symlink");
+        fs::create_dir_all(&symlink_root).unwrap();
+        let outside = next_temp_root("afs_snapshot_outside");
+        fs::write(&outside, b"outside bytes").unwrap();
+        symlink(&outside, symlink_root.join("escape")).unwrap();
+        let symlink_error = snapshot_sandbox_files(&symlink_root).unwrap_err();
+        assert!(
+            symlink_error.contains("not a regular file or directory"),
+            "{symlink_error}"
+        );
+        let _ = fs::remove_dir_all(symlink_root);
+        let _ = fs::remove_file(outside);
+    }
 
     #[test]
     fn tool_resolution_env_override_wins() {

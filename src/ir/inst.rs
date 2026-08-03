@@ -5,7 +5,7 @@
 
 use super::types::{FloatWidth, IntWidth, IrType};
 use crate::lexer::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A value identifier — unique within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +45,11 @@ pub enum RuntimeFunc {
     /// Aborts if index < lower or index > upper. Inserted at array access
     /// sites; eliminated at O2+ when provably safe.
     CheckBounds,
+    /// Array-assignment conformance check:
+    /// `afs_check_array_assignment_conformance(destination, source)`.
+    /// Aborts when ranks or per-dimension extents differ. Inserted at
+    /// descriptor-backed assignment sites and retained only by `-fcheck=all`.
+    CheckArrayAssignmentConformance,
 }
 
 /// Comparison operations.
@@ -135,7 +140,14 @@ pub enum InstKind {
     // ---- Memory ----
     Alloca(IrType),
     Load(ValueId),
-    Store(ValueId, ValueId),              // store(value, addr)
+    Store(ValueId, ValueId), // store(value, addr)
+    /// A source-language VOLATILE read. Unlike `Load`, the access itself is
+    /// observable even when the result is unused and must not be promoted,
+    /// forwarded, hoisted, combined, vectorized, or eliminated.
+    VolatileLoad(ValueId),
+    /// A source-language VOLATILE write. The store must remain in program
+    /// order with other volatile accesses.
+    VolatileStore(ValueId, ValueId), // volatile_store(value, addr)
     GetElementPtr(ValueId, Vec<ValueId>), // base, indices
     /// Address of a module-level global. Returns `Ptr<T>` where T
     /// is the global's declared type. Used by SAVE'd locals (those
@@ -265,13 +277,25 @@ pub struct Function {
     /// Dense `BlockId` to `blocks` position index. Removed block IDs retain an
     /// empty slot so normal lookup stays O(1) after pruning.
     block_positions: Vec<Option<usize>>,
+    /// Pointer-valued parameters whose ABI contract guarantees that a direct
+    /// load of the pointee is valid whenever the function is entered.
+    ///
+    /// This is deliberately distinct from alias metadata: OPTIONAL Fortran
+    /// dummies may retain normal no-alias semantics while still being null
+    /// when absent. The guarantee applies only to the parameter itself, not
+    /// to pointers loaded from it or arbitrary derived GEP addresses.
+    directly_dereferenceable_params: HashSet<ValueId>,
     pub entry: BlockId,
     next_value: u32,
     next_block: u32,
     /// O(1) type lookup cache. Populated during construction; call
     /// `rebuild_type_cache()` after optimizer passes mutate the IR.
     type_cache: HashMap<ValueId, IrType>,
-    /// Fortran PURE attribute — function has no side effects.
+    /// Fortran `PURE` source-language attribute.
+    ///
+    /// This records the semantic declaration, not an optimizer proof that the
+    /// lowered body is effect-free. Passes that remove or reuse calls must also
+    /// establish the body properties their transformation requires.
     pub is_pure: bool,
     /// Fortran ELEMENTAL attribute — operates element-wise on arrays.
     pub is_elemental: bool,
@@ -295,6 +319,7 @@ impl Function {
             return_type,
             blocks: vec![entry_block],
             block_positions: vec![Some(0)],
+            directly_dereferenceable_params: HashSet::new(),
             entry,
             next_value,
             next_block: 1,
@@ -423,7 +448,20 @@ impl Function {
         }
     }
 
-    /// Get the type of a value by ID. O(1) via cache.
+    /// Inspect the cached type recorded for a value.
+    ///
+    /// The verifier uses this to check whether a present entry agrees with
+    /// the authoritative IR definition. A missing entry remains recoverable
+    /// through [`Self::value_type`].
+    pub(super) fn cached_value_type(&self, id: ValueId) -> Option<&IrType> {
+        self.type_cache.get(&id)
+    }
+
+    /// Get the type of a value by ID, using the O(1) cache when present.
+    ///
+    /// Cache misses fall back to the authoritative IR definitions. Mutation
+    /// pipelines must reject verifier errors before optimization or code
+    /// generation so a present but stale entry cannot acquire meaning.
     pub fn value_type(&self, id: ValueId) -> Option<IrType> {
         if let Some(ty) = self.type_cache.get(&id) {
             return Some(ty.clone());
@@ -433,7 +471,8 @@ impl Function {
         // verifier silently skipped checks whenever the cache lagged
         // behind optimiser passes, which hid width mismatches and
         // pointer-type bugs for entire compilation units. Recompute
-        // on-demand so consumers always get a consistent answer.
+        // on-demand so cache misses use the defining IR type; the verifier
+        // separately rejects present entries that no longer match it.
         for p in &self.params {
             if p.id == id {
                 return Some(p.ty.clone());
@@ -464,6 +503,23 @@ impl Function {
             }
         }
         None
+    }
+
+    /// Record that a pointer parameter is valid for one direct pointee load.
+    pub fn mark_param_directly_dereferenceable(&mut self, id: ValueId) {
+        if self
+            .params
+            .iter()
+            .any(|param| param.id == id && param.ty.is_ptr())
+        {
+            self.directly_dereferenceable_params.insert(id);
+        }
+    }
+
+    /// Whether the function ABI permits a direct pointee load from `id`.
+    pub fn param_is_directly_dereferenceable(&self, id: ValueId) -> bool {
+        self.directly_dereferenceable_params.contains(&id)
+            && self.params.iter().any(|param| param.id == id)
     }
 }
 
@@ -808,10 +864,14 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
     match &inst.kind {
         InstKind::ConstInt(_, IntWidth::I128) => true,
         InstKind::Undef(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
-        InstKind::Load(_) if matches!(inst.ty, IrType::Int(IntWidth::I128)) => true,
+        InstKind::Load(_) | InstKind::VolatileLoad(_)
+            if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
+        {
+            true
+        }
         // Loading a *pointer* whose pointee happens to be i128 is just
         // an 8-byte vreg load — the wide-slot machinery isn't involved.
-        InstKind::Load(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
+        InstKind::Load(_) | InstKind::VolatileLoad(_) if matches!(inst.ty, IrType::Ptr(_)) => true,
         InstKind::IAdd(..) | InstKind::ISub(..) | InstKind::INeg(_)
             if matches!(inst.ty, IrType::Int(IntWidth::I128)) =>
         {
@@ -844,7 +904,7 @@ fn inst_i128_backend_o0_supported(module: &Module, func: &Function, inst: &Inst)
         InstKind::IntToPtr(value, _) => func
             .value_type(*value)
             .is_some_and(|ty| !type_contains_i128(module, &ty)),
-        InstKind::Store(..) => true,
+        InstKind::Store(..) | InstKind::VolatileStore(..) => true,
         // Address-producing ops are safe even when they walk storage that
         // contains i128. The widened backend already knows how to carry the
         // actual loads/stores/calls that touch the value; rejecting the byte

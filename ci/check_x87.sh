@@ -1,42 +1,26 @@
 #!/bin/sh
 # x87 gate (sprint x09, permanent).
 #
-# Compiles every test_programs/*.f90 with -S at -O2 and -Ofast on an
-# x86_64 host and fails if any x87 mnemonic appears. The compiler is
-# SSE-only by design; x87 creeps in through the assembler, not the
-# backend — system `as` accepts fld/fst silently, so nothing else
-# fails loudly if isel ever regresses.
+# Compiles every non-diagnostic test_programs/*.f90 with its declared
+# FLAGS at -O2 and -Ofast on an x86_64 host and fails if any x87 mnemonic
+# appears. The compiler is SSE-only by design; x87 creeps in through the
+# assembler, not the backend — unrestricted system `as` accepts it silently.
+# GNU as is run with the entire x87 family disabled, avoiding an incomplete
+# mnemonic list. Compiler failures, missing assembly, policy-checker errors,
+# and corpus count drift are all gate failures.
 #
 # Usage: ci/check_x87.sh [path-to-armfortas]
 set -eu
 
-afs="${1:-${CARGO_TARGET_DIR:-target}/debug/armfortas}"
-if [ ! -x "$afs" ]; then
-    echo "check_x87: compiler not found at $afs" >&2
-    exit 2
-fi
+isa_gate_name=check_x87
+isa_gate_levels="-O2 -Ofast"
+isa_gate_level_label="-O2 and -Ofast"
+isa_gate_hit_label="x87 mnemonic"
+isa_gate_scanner="${AS:-as}"
+isa_gate_arch_prelude='.arch default
+.arch .no87'
+isa_gate_allowed_probe='addsubps %xmm0, %xmm1'
+isa_gate_forbidden_probe='fildl (%rax)'
 
-tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
-
-hits=0
-checked=0
-for lvl in -O2 -Ofast; do
-    for f in test_programs/*.f90; do
-        b=$(basename "$f" .f90)
-        out="$tmpdir/$b$lvl.s"
-        # Programs that don't compile are someone else's gate.
-        "$afs" -S "$lvl" "$f" -o "$out" 2>/dev/null || continue
-        checked=$((checked + 1))
-        if grep -nE '^\s*f(ld|st|xch|add|sub|mul|div|com|sqrt|prem|sin|cos|abs|chs)' "$out"; then
-            echo "check_x87: x87 mnemonic in $b at $lvl" >&2
-            hits=$((hits + 1))
-        fi
-    done
-done
-
-if [ "$hits" -ne 0 ]; then
-    echo "check_x87: $hits file(s) contain x87 instructions" >&2
-    exit 1
-fi
-echo "check_x87: clean ($checked compilations, -O2 and -Ofast)"
+. "$(dirname "$0")/isa_gate_common.sh"
+isa_gate_run "$@"

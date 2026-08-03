@@ -288,7 +288,9 @@ pub extern "C" fn afs_string_allocated(desc: *const StringDescriptor) -> i32 {
 /// `from` is cleared back to an unallocated deferred-length descriptor.
 #[no_mangle]
 pub extern "C" fn afs_move_alloc_string(from: *mut StringDescriptor, to: *mut StringDescriptor) {
-    if from.is_null() || to.is_null() {
+    // F2018 permits the same variable only while it is unallocated. Avoid
+    // creating aliased Rust references even if an invalid caller violates it.
+    if from.is_null() || to.is_null() || std::ptr::eq(from, to) {
         return;
     }
 
@@ -1081,6 +1083,23 @@ mod tests {
         assert_eq!(data, b"hello");
 
         afs_dealloc_string(&mut to);
+    }
+
+    #[test]
+    fn move_alloc_same_string_descriptor_is_a_safe_noop() {
+        let mut desc = StringDescriptor::zeroed();
+        afs_assign_char_deferred(&mut desc, b"hello".as_ptr(), 5);
+        let original_data = desc.data;
+        let same = &mut desc as *mut StringDescriptor;
+
+        afs_move_alloc_string(same, same);
+
+        assert!(desc.is_allocated());
+        assert_eq!(desc.data, original_data);
+        assert_eq!(desc.len, 5);
+        let data = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        assert_eq!(data, b"hello");
+        afs_dealloc_string(&mut desc);
     }
 
     #[test]

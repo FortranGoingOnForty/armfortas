@@ -46,7 +46,6 @@
 use super::alias::{self, AliasResult};
 use super::pass::Pass;
 use crate::ir::inst::*;
-use crate::ir::types::IrType;
 use crate::ir::walk::{for_each_operand_mut, for_each_terminator_operand_mut};
 use std::collections::HashMap;
 
@@ -114,21 +113,25 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                         }
                     }
 
+                    InstKind::VolatileLoad(_) | InstKind::VolatileStore(..) => {
+                        available.clear();
+                    }
+
                     InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
                         // A callee may access module/global state without
                         // receiving its address as an argument.
                         available
                             .retain(|entry| !alias_oracle.requires_global_call_barrier(entry.ptr));
-                        let pointer_args: Vec<ValueId> = args
+                        let pointer_args: Vec<alias::CallArgPointer> = args
                             .iter()
                             .copied()
                             .map(|arg| resolve(&all_rewrites, arg))
-                            .filter(|arg| alias_oracle.value_is_pointer(*arg))
+                            .filter_map(|arg| alias_oracle.call_arg_pointer(arg))
                             .collect();
                         if !pointer_args.is_empty() {
                             if pointer_args
                                 .iter()
-                                .any(|arg| call_arg_may_carry_indirect_pointer(func, *arg))
+                                .any(|arg| arg.may_carry_indirect_pointer)
                             {
                                 available.clear();
                                 continue;
@@ -141,7 +144,7 @@ fn lsf_in_function(func: &mut Function, layout: crate::target::TargetLayout) -> 
                             // NoAlias" answer is unsound here.
                             available.retain(|entry| {
                                 pointer_args.iter().all(|arg| {
-                                    !alias_oracle.may_reach_through_call_arg(entry.ptr, *arg)
+                                    !alias_oracle.may_reach_through_call_arg(entry.ptr, arg.pointer)
                                 })
                             });
                         }
@@ -199,17 +202,6 @@ fn apply_rewrites(func: &mut Function, rewrites: &HashMap<ValueId, ValueId>) {
             for_each_terminator_operand_mut(term, r);
         }
     }
-}
-
-fn call_arg_may_carry_indirect_pointer(func: &Function, value: ValueId) -> bool {
-    matches!(
-        func.value_type(value),
-        Some(IrType::Ptr(inner))
-            if matches!(
-                inner.as_ref(),
-                IrType::Array(..) | IrType::Struct(_) | IrType::Ptr(_) | IrType::FuncPtr(_)
-            )
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +307,47 @@ mod tests {
     }
 
     #[test]
+    fn volatile_load_invalidates_available_value() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+        let alloca = push(
+            &mut f,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let val42 = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(&mut f, InstKind::Store(val42, alloca), IrType::Void);
+        let volatile_load = push(
+            &mut f,
+            InstKind::VolatileLoad(alloca),
+            IrType::Int(IntWidth::I32),
+        );
+        let ordinary_load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(ordinary_load)));
+        m.add_function(f);
+
+        assert!(!LocalLsf.run(&mut m));
+        let insts = &m.functions[0].blocks[0].insts;
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.id == volatile_load
+                    && matches!(inst.kind, InstKind::VolatileLoad(_)))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.id == ordinary_load && matches!(inst.kind, InstKind::Load(_))),
+            "an ordinary load after a volatile access must re-read memory"
+        );
+    }
+
+    #[test]
     fn does_not_forward_across_intervening_store() {
         // store %42, %alloca
         // store %99, %alloca     ← overwrites the 42
@@ -391,6 +424,43 @@ mod tests {
         // No forwarding should happen (call killed the available store).
         let changed = pass.run(&mut m);
         assert!(!changed, "LSF must not forward across a call");
+    }
+
+    #[test]
+    fn does_not_forward_across_ptr_to_int_call_arg() {
+        let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Int(IntWidth::I32));
+
+        let alloca = push(&mut f, InstKind::Alloca(alloca_ty()), ptr_ty());
+        let initial = push(
+            &mut f,
+            InstKind::ConstInt(42, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(&mut f, InstKind::Store(initial, alloca), IrType::Void);
+        let c_ptr = push(
+            &mut f,
+            InstKind::PtrToInt(alloca),
+            IrType::Int(IntWidth::I64),
+        );
+        push(
+            &mut f,
+            InstKind::Call(FuncRef::External("mutate".into()), vec![c_ptr]),
+            IrType::Void,
+        );
+        let load = push(&mut f, InstKind::Load(alloca), IrType::Int(IntWidth::I32));
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(load)));
+        m.add_function(f);
+
+        assert!(
+            !LocalLsf.run(&mut m),
+            "LSF must preserve a load across a call receiving PtrToInt(local)"
+        );
+        assert!(matches!(
+            m.functions[0].block(m.functions[0].entry).terminator,
+            Some(Terminator::Return(Some(value))) if value == load
+        ));
     }
 
     #[test]

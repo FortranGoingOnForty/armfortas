@@ -12,7 +12,14 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::items_after_test_module)]
 
+#[cfg(not(armfortas_staticlib_payload))]
+mod bundle;
+
+#[cfg(not(armfortas_staticlib_payload))]
+pub use bundle::bundled_archive;
+
 pub mod array;
+mod decimal_input;
 pub mod descriptor;
 pub mod format;
 pub mod ieee;
@@ -21,6 +28,7 @@ pub mod io_system;
 mod lifecycle;
 pub mod math;
 mod mem;
+mod specific_intrinsic;
 pub mod string;
 pub mod system;
 pub mod tokenize;

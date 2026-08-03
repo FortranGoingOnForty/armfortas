@@ -1,21 +1,21 @@
 //! Source-form conformance warnings (sprint l01).
 //!
-//! F2023 raised the free-form line limit to 10,000 characters and
-//! replaced the continuation-count limit with a one-million-character
-//! statement limit (23-007r1 6.3.2). armfortas accepts arbitrarily
-//! long lines and statements at every `--std` level and always will —
-//! these are warnings, never errors, and acceptance never changes
-//! (flang behaves the same; gfortran truncates, which we deliberately
-//! do not).
+//! F2023 raised the free-form line limit to 10,000 characters, replaced
+//! the continuation-count limit with a one-million-character statement
+//! limit, and removed the fixed-form continuation-count limit
+//! (23-007r1 6.3.2-6.3.3). armfortas accepts arbitrarily long lines and
+//! statements at every `--std` level and always will — these are
+//! warnings, never errors, and acceptance never changes (flang behaves
+//! the same; gfortran truncates overlong lines, which we deliberately do
+//! not).
 //!
-//! Mechanism: one standalone scan over the ORIGINAL source text,
-//! invoked by the driver before preprocessing. The sprint doc offered
-//! a choice between threading `--std` into the lexer or reporting via
-//! the driver; this is the driver route, picked because (a)
-//! `FortranStandard` lives in sema and the lexer must not depend on
-//! sema, and (b) both line joiners (the lexer's `try_continuation`
-//! and the preprocessor's logical-line join) run AFTER this scan, so
-//! the diagnostic fires identically no matter which path a file takes.
+//! Mechanism: conformance warnings use one standalone scan over the
+//! original source text before preprocessing. The unconditional
+//! compiler safety cap is checked both before and after preprocessing,
+//! so macro expansion cannot bypass it. The sprint doc offered a choice
+//! between threading `--std` into the lexer or reporting via the driver;
+//! this is the driver route, picked because `FortranStandard` lives in
+//! sema and the lexer must not depend on sema.
 //!
 //! Statement length counts the characters of every physical line of a
 //! continued statement (the standard's limit is on the statement as
@@ -42,6 +42,20 @@ fn line_limit(std: FortranStandard) -> usize {
 }
 
 const STMT_LIMIT: usize = 1_000_000;
+
+/// Maximum continuation lines for the selected pre-F2023 language level.
+/// F90/F95 retained the fixed-form F77 limit of 19 while allowing 39 in
+/// free form; F2003 raised both forms to 255, which remained through F2018.
+fn continuation_limit(std: FortranStandard, form: SourceForm) -> Option<usize> {
+    match (std, form) {
+        (FortranStandard::F77, SourceForm::FixedForm) => Some(19),
+        (FortranStandard::F77, SourceForm::FreeForm) => None,
+        (FortranStandard::F90 | FortranStandard::F95, SourceForm::FreeForm) => Some(39),
+        (FortranStandard::F90 | FortranStandard::F95, SourceForm::FixedForm) => Some(19),
+        (FortranStandard::F2003 | FortranStandard::F2008 | FortranStandard::F2018, _) => Some(255),
+        (FortranStandard::F2023, _) => None,
+    }
+}
 
 /// Unconditional statement-size cap, enforced at every `--std` level
 /// (unlike the conformance warnings). Every recursive walker in the
@@ -102,14 +116,17 @@ pub fn find_over_cap_statement(source: &str, form: SourceForm) -> Option<(Span, 
     None
 }
 
-/// Scan `source` for F2023 source-limit conformance violations.
+/// Scan `source` for source-limit conformance violations.
 /// `suppress_line_limit` is `-ffree-line-length-none`: gfortran's
 /// meaning of that flag is "no line-length conformance concern", so it
 /// silences the line warning (the statement limit still applies).
 /// `line_limit_override` is numeric `-ffree-line-length-N`: armfortas
 /// still compiles the full line, but conformance warnings use the
 /// requested GNU-compatible limit.
-/// Fixed form is untouched — F2023's new limits are free-form.
+/// The physical-line and F2023 statement-character diagnostics are
+/// free-form concerns here. Continuation-count limits apply to both
+/// source forms through F2018 and are independent of the GNU line-length
+/// compatibility flags.
 pub fn check_source_limits(
     source: &str,
     std: FortranStandard,
@@ -117,24 +134,23 @@ pub fn check_source_limits(
     suppress_line_limit: bool,
     line_limit_override: Option<usize>,
 ) -> Vec<LimitWarning> {
-    if form != SourceForm::FreeForm {
-        return Vec::new();
-    }
     let mut warnings = Vec::new();
     let limit = line_limit_override.unwrap_or_else(|| line_limit(std));
 
     // Statement tracking: in_string carries across continued lines;
-    // stmt_start/stmt_chars accumulate until a non-continued line ends
-    // the statement.
+    // stmt_start/stmt_chars/continuation_lines accumulate until a
+    // non-continued line ends the statement.
     let mut in_string: Option<char> = None;
     let mut stmt_start: u32 = 0;
     let mut stmt_chars: usize = 0;
+    let mut continuation_lines: usize = 0;
+    let lines: Vec<&str> = source.lines().collect();
 
-    for (idx, line) in source.lines().enumerate() {
+    for (idx, line) in lines.iter().enumerate() {
         let line_no = idx as u32 + 1;
         let len = line.chars().count();
 
-        if !suppress_line_limit && len > limit {
+        if form == SourceForm::FreeForm && !suppress_line_limit && len > limit {
             let at = Span {
                 file_id: 0,
                 start: Position {
@@ -173,43 +189,102 @@ pub fn check_source_limits(
         }
 
         // ---- statement accounting ----
-        if is_free_form_continuation_gap(line) {
+        let is_gap = match form {
+            SourceForm::FreeForm => is_free_form_continuation_gap(line),
+            SourceForm::FixedForm => is_fixed_form_continuation_gap(line),
+        };
+        if is_gap {
             continue;
         }
         if stmt_chars == 0 {
             stmt_start = line_no;
+            continuation_lines = 0;
+        } else {
+            continuation_lines += 1;
         }
         stmt_chars += len;
 
-        let continued = line_continues(line, &mut in_string);
+        let continued = match form {
+            SourceForm::FreeForm => line_continues(line, &mut in_string),
+            SourceForm::FixedForm => lines[idx + 1..]
+                .iter()
+                .find(|next| !is_fixed_form_continuation_gap(next))
+                .is_some_and(|next| crate::lexer::fixed::is_continuation_line(next)),
+        };
         if !continued {
-            if std >= FortranStandard::F2023 && stmt_chars > STMT_LIMIT {
-                let at = Span {
-                    file_id: 0,
-                    start: Position {
-                        line: stmt_start,
-                        col: 1,
-                    },
-                    end: Position {
-                        line: stmt_start,
-                        col: 1,
-                    },
-                };
-                warnings.push(LimitWarning {
-                    span: at,
-                    msg: format!(
-                        "statement is {} characters long, over the F2023 limit of \
-                         1,000,000 (conformance warning; the statement is compiled \
-                         in full)",
-                        stmt_chars
-                    ),
-                });
-            }
+            push_statement_limit_warnings(
+                &mut warnings,
+                std,
+                form,
+                stmt_start,
+                stmt_chars,
+                continuation_lines,
+            );
             stmt_chars = 0;
             in_string = None;
         }
     }
+
+    // A malformed final line can still carry a trailing continuation
+    // marker. Diagnose any limits reached before the parser reports the
+    // missing continuation target.
+    if stmt_chars != 0 {
+        push_statement_limit_warnings(
+            &mut warnings,
+            std,
+            form,
+            stmt_start,
+            stmt_chars,
+            continuation_lines,
+        );
+    }
     warnings
+}
+
+fn push_statement_limit_warnings(
+    warnings: &mut Vec<LimitWarning>,
+    std: FortranStandard,
+    form: SourceForm,
+    stmt_start: u32,
+    stmt_chars: usize,
+    continuation_lines: usize,
+) {
+    let at = Span {
+        file_id: 0,
+        start: Position {
+            line: stmt_start,
+            col: 1,
+        },
+        end: Position {
+            line: stmt_start,
+            col: 1,
+        },
+    };
+
+    if let Some(limit) = continuation_limit(std, form) {
+        if continuation_lines > limit {
+            warnings.push(LimitWarning {
+                span: at,
+                msg: format!(
+                    "statement has {} continuation lines, over the {:?} limit of {} \
+                     (conformance warning; the statement is compiled in full)",
+                    continuation_lines, std, limit
+                ),
+            });
+        }
+    }
+
+    if form == SourceForm::FreeForm && std >= FortranStandard::F2023 && stmt_chars > STMT_LIMIT {
+        warnings.push(LimitWarning {
+            span: at,
+            msg: format!(
+                "statement is {} characters long, over the F2023 limit of \
+                 1,000,000 (conformance warning; the statement is compiled \
+                 in full)",
+                stmt_chars
+            ),
+        });
+    }
 }
 
 fn is_free_form_continuation_gap(line: &str) -> bool {
@@ -270,6 +345,31 @@ mod tests {
     fn continued_sum_with_comment_gap(limit: usize) -> String {
         let chunk = "+1".repeat(limit / 4 + 1);
         format!("x = 0 {chunk} &\n! legal continuation gap\n\n  & {chunk}\n")
+    }
+
+    fn free_form_sum_with_continuations(continuations: usize) -> String {
+        let mut src = String::from("x = 0");
+        for continuation in 0..continuations {
+            src.push_str(" &\n");
+            if continuation == continuations / 2 {
+                src.push_str("! legal continuation gap\n\n");
+            }
+            src.push_str("  + 0");
+        }
+        src.push('\n');
+        src
+    }
+
+    fn fixed_form_sum_with_continuations(continuations: usize) -> String {
+        let mut src = String::from("      X = 0\n");
+        for continuation in 0..continuations {
+            if continuation == continuations / 2 {
+                src.push_str("C legal continuation gap\n\n");
+            }
+            src.push_str("     +  + 0\n");
+        }
+        src.push_str("      Y = 1\n");
+        src
     }
 
     fn fixed_form_sum_with_comment_gap(limit: usize) -> String {
@@ -434,7 +534,7 @@ y = 2
     }
 
     #[test]
-    fn million_char_statement_warns_under_f2023_only() {
+    fn million_char_statement_uses_standard_specific_limit_warning() {
         // 101 lines of ~9,990 chars joined by & — past one million.
         let mut src = String::from("x = 1");
         for _ in 0..101 {
@@ -444,13 +544,23 @@ y = 2
         src.push('\n');
         let w: Vec<_> = check(&src, FortranStandard::F2023)
             .into_iter()
-            .filter(|w| w.msg.contains("statement"))
+            .filter(|w| w.msg.starts_with("statement is"))
             .collect();
         assert_eq!(w.len(), 1, "expected exactly one statement-length warning");
         assert_eq!(w[0].span.start.line, 1, "warning points at statement start");
-        assert!(check(&src, FortranStandard::F2018)
-            .iter()
-            .all(|w| !w.msg.contains("statement")));
+        let f2018 = check(&src, FortranStandard::F2018);
+        assert!(
+            f2018
+                .iter()
+                .all(|warning| !warning.msg.starts_with("statement is")),
+            "the million-character statement limit is F2023-only"
+        );
+        assert!(
+            f2018
+                .iter()
+                .any(|warning| warning.msg.starts_with("line is")),
+            "the same source must retain F2018's physical-line warnings"
+        );
     }
 
     #[test]
@@ -462,6 +572,100 @@ y = 2
             .collect();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].span.start.line, 1);
+    }
+
+    #[test]
+    fn f2018_continuation_limit_covers_free_and_fixed_form_but_not_f2023() {
+        for (form, source_at_limit, source_over_limit) in [
+            (
+                SourceForm::FreeForm,
+                free_form_sum_with_continuations(255),
+                free_form_sum_with_continuations(256),
+            ),
+            (
+                SourceForm::FixedForm,
+                fixed_form_sum_with_continuations(255),
+                fixed_form_sum_with_continuations(256),
+            ),
+        ] {
+            let at_limit =
+                check_source_limits(&source_at_limit, FortranStandard::F2018, form, false, None);
+            assert!(
+                at_limit
+                    .iter()
+                    .all(|warning| !warning.msg.contains("continuation")),
+                "255 continuation lines must remain conforming in {form:?}"
+            );
+
+            let over_limit: Vec<_> =
+                check_source_limits(&source_over_limit, FortranStandard::F2018, form, true, None)
+                    .into_iter()
+                    .filter(|warning| warning.msg.contains("continuation"))
+                    .collect();
+            assert_eq!(
+                over_limit.len(),
+                1,
+                "256 continuation lines must produce one warning in {form:?}"
+            );
+            assert_eq!(over_limit[0].span.start.line, 1);
+            assert!(over_limit[0].msg.contains("256"));
+            assert!(over_limit[0].msg.contains("F2018"));
+            assert!(over_limit[0].msg.contains("255"));
+
+            let f2023 = check_source_limits(
+                &source_over_limit,
+                FortranStandard::F2023,
+                form,
+                false,
+                None,
+            );
+            assert!(
+                f2023
+                    .iter()
+                    .all(|warning| !warning.msg.contains("continuation")),
+                "F2023 removed the continuation-count limit in {form:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_limits_follow_the_selected_pre_f2023_standard() {
+        for (std, form, limit) in [
+            (FortranStandard::F77, SourceForm::FixedForm, 19),
+            (FortranStandard::F90, SourceForm::FreeForm, 39),
+            (FortranStandard::F90, SourceForm::FixedForm, 19),
+            (FortranStandard::F95, SourceForm::FreeForm, 39),
+            (FortranStandard::F95, SourceForm::FixedForm, 19),
+            (FortranStandard::F2003, SourceForm::FreeForm, 255),
+            (FortranStandard::F2003, SourceForm::FixedForm, 255),
+            (FortranStandard::F2008, SourceForm::FreeForm, 255),
+            (FortranStandard::F2008, SourceForm::FixedForm, 255),
+        ] {
+            let source_at_limit = match form {
+                SourceForm::FreeForm => free_form_sum_with_continuations(limit),
+                SourceForm::FixedForm => fixed_form_sum_with_continuations(limit),
+            };
+            let source_over_limit = match form {
+                SourceForm::FreeForm => free_form_sum_with_continuations(limit + 1),
+                SourceForm::FixedForm => fixed_form_sum_with_continuations(limit + 1),
+            };
+            assert!(
+                check_source_limits(&source_at_limit, std, form, false, None)
+                    .iter()
+                    .all(|warning| !warning.msg.contains("continuation")),
+                "{std:?} {form:?} warned at its continuation boundary"
+            );
+            let warnings: Vec<_> = check_source_limits(&source_over_limit, std, form, false, None)
+                .into_iter()
+                .filter(|warning| warning.msg.contains("continuation"))
+                .collect();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "{std:?} {form:?} did not warn immediately beyond its continuation boundary"
+            );
+            assert!(warnings[0].msg.contains(&limit.to_string()));
+        }
     }
 
     #[test]

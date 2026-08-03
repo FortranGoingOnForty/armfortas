@@ -1,18 +1,24 @@
-# Suites expected to skip on hosts without the native toolchain
-# (posix-elf profile). Regenerated after x10 enabled the vectorize
-# suites on x86_64: what remains is Mach-O artifact audits, the
-# afs-as/afs-ld standalone toolchain (x13/x14), reference-compiler
-# differentials, cli_driver's ELF-gated -shared test, and Darwin-only
-# driver link compatibility spellings.
-#
-# elf_static_link is the x16 rung-2 afs-ld static-link gate: it needs
-# FreeBSD /usr/lib crt+static-libc and skips on every other host
-# (glibc and musl included).
-abi_differential
-artifact_audit_29_10
-c_interop_differential
-cli_driver
-driver_link_compat
-elf_static_link
-standalone_toolchain
-testing
+# Exact skips expected from the complete armfortas integration suite on
+# Linux glibc x86_64. Format: <suite> <test> <positive-count>.
+# Any added, removed, duplicated, or count-changed record requires review.
+# Baseline: GitHub Actions run 29799241535 at 9d901856abceefc3b46f06301b0b06fbabfad5f5.
+abi_differential armfortas_callee_legs_pending_x05_x06 14
+abi_differential armfortas_caller_legs_pending_x05_x06 14
+artifact_audit_29_10 linked_binary_is_deterministic_for_same_output_path_and_has_uuid 1
+artifact_audit_29_10 linked_runtime_heavy_binary_is_deterministic_for_section_reads 1
+artifact_audit_29_10 object_snapshot_is_deterministic_with_module_globals_across_opt_levels 1
+artifact_audit_29_10 optimized_object_snapshot_removes_inlined_helper_symbol 1
+c_interop_differential arm64_complex_value_arguments_match_clang_in_both_directions 2
+cli_driver dynamiclib_driver_spelling_forwards_darwin_linker_flags 1
+cli_driver shared_compile_emits_amod_and_links_cleanly 1
+driver_link_compat dynamiclib_driver_spelling_forwards_darwin_linker_flags 1
+driver_link_compat verbose_link_only_darwin_line_exposes_runtime_for_cmake 1
+elf_static_link afs_ld_statically_links_and_runs_fortran 1
+standalone_toolchain hello_world_compiles_to_object_with_standalone_assembler_override 1
+standalone_toolchain hello_world_keeps_apple_ld_path_with_afs_ld_zero 1
+standalone_toolchain hello_world_runs_through_afs_as_and_afs_ld 1
+standalone_toolchain hello_world_runs_through_driver_with_afs_ld_enable_flag 1
+standalone_toolchain hello_world_runs_through_driver_with_standalone_tool_overrides 1
+standalone_toolchain shared_library_runs_through_driver_with_standalone_linker_override 1
+standalone_toolchain sprint18_program_matrix_runs_through_driver_standalone_overrides 4
+testing macho_snapshot_matches_pre_sprint_pipeline 1

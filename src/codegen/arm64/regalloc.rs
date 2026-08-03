@@ -56,9 +56,10 @@ pub fn regalloc_naive(mf: &mut MachineFunction) {
             // Identify vreg operands that are inputs (not the def).
             for (i, op) in inst.operands.iter().enumerate() {
                 if let MachineOperand::VReg(vid) = op {
-                    // If this operand is the same as the def and it's the first
-                    // operand (destination), it's an output — don't load.
-                    if Some(*vid) == def_vreg && i == 0 {
+                    // Ordinary operand-zero definitions are write-only. A
+                    // destructive definition reads its old destination value
+                    // before overwriting it, so its spill slot must be loaded.
+                    if Some(*vid) == def_vreg && i == 0 && !inst.opcode.reads_def_operand() {
                         continue;
                     }
                     loads.push((i, *vid));
@@ -263,6 +264,62 @@ mod tests {
         assert!(
             uses_scratch,
             "should use scratch registers x9-x11 or w9-w11"
+        );
+    }
+
+    #[test]
+    fn regalloc_reloads_spilled_fmla_accumulator() {
+        let mut mf = MachineFunction::new("test".into());
+        let accumulator = mf.new_vreg(RegClass::V128);
+        let lhs = mf.new_vreg(RegClass::V128);
+        let rhs = mf.new_vreg(RegClass::V128);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::FmlaV4S,
+            operands: vec![
+                MachineOperand::VReg(accumulator),
+                MachineOperand::VReg(lhs),
+                MachineOperand::VReg(rhs),
+            ],
+            def: Some(accumulator),
+        });
+
+        regalloc_naive(&mut mf);
+
+        let fmla_index = mf.blocks[0]
+            .insts
+            .iter()
+            .position(|inst| inst.opcode == ArmOpcode::FmlaV4S)
+            .expect("FMLA must survive register allocation");
+        let reloads = &mf.blocks[0].insts[..fmla_index];
+        assert_eq!(
+            reloads
+                .iter()
+                .filter(|inst| inst.opcode == ArmOpcode::LdrQ)
+                .count(),
+            3,
+            "FMLA must reload its accumulator as well as both multiplicands"
+        );
+        assert_eq!(
+            mf.blocks[0].insts[fmla_index].operands,
+            vec![
+                MachineOperand::PhysReg(PhysReg::Fp(16)),
+                MachineOperand::PhysReg(PhysReg::Fp(17)),
+                MachineOperand::PhysReg(PhysReg::Fp(18)),
+            ],
+            "the destructive destination must reuse its accumulator reload"
+        );
+        let accumulator_reload = &reloads[0];
+        let accumulator_store = &mf.blocks[0].insts[fmla_index + 1];
+        assert_eq!(accumulator_store.opcode, ArmOpcode::StrQ);
+        assert_eq!(
+            accumulator_store.operands.first(),
+            Some(&MachineOperand::PhysReg(PhysReg::Fp(16))),
+            "the updated accumulator must be stored from its reloaded register"
+        );
+        assert_eq!(
+            accumulator_store.operands.get(2),
+            accumulator_reload.operands.get(2),
+            "the updated accumulator must return to its original spill slot"
         );
     }
 }

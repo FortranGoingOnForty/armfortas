@@ -9,8 +9,9 @@ pub mod expr;
 pub mod stmt;
 pub mod unit;
 
-use crate::lexer::{Span, Token, TokenKind};
+use crate::lexer::{SourceForm, Span, Token, TokenKind};
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// Parser error.
@@ -34,31 +35,41 @@ impl std::error::Error for ParseError {}
 
 /// The parser state — holds the token stream and current position.
 pub struct Parser<'a> {
-    tokens: &'a [Token],
+    tokens: Cow<'a, [Token]>,
     pos: usize,
     expr_depth: usize,
     slash_array_ctor_depth: usize,
     source_view: bool,
+    fixed_form: bool,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(tokens: &'a [Token]) -> Self {
-        Self {
-            tokens,
-            pos: 0,
-            expr_depth: 0,
-            slash_array_ctor_depth: 0,
-            source_view: false,
-        }
+        Self::with_mode(tokens, false, false)
+    }
+
+    /// Construct a parser that can resolve source-form-specific lexical
+    /// ambiguities retained by `tokenize`.
+    pub fn new_for_form(tokens: &'a [Token], source_form: SourceForm) -> Self {
+        Self::with_mode(tokens, false, matches!(source_form, SourceForm::FixedForm))
     }
 
     pub(crate) fn new_source_view(tokens: &'a [Token]) -> Self {
+        Self::with_mode(tokens, true, false)
+    }
+
+    pub(crate) fn new_source_view_for_form(tokens: &'a [Token], source_form: SourceForm) -> Self {
+        Self::with_mode(tokens, true, matches!(source_form, SourceForm::FixedForm))
+    }
+
+    fn with_mode(tokens: &'a [Token], source_view: bool, fixed_form: bool) -> Self {
         Self {
-            tokens,
+            tokens: Cow::Borrowed(tokens),
             pos: 0,
             expr_depth: 0,
             slash_array_ctor_depth: 0,
-            source_view: true,
+            source_view,
+            fixed_form,
         }
     }
 
@@ -105,6 +116,47 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         tok
+    }
+
+    /// Materialize one grammar-proven boundary in an otherwise ambiguous
+    /// fixed-form identifier. The token buffer remains borrowed unless such a
+    /// split is actually required.
+    fn split_fixed_identifier_at(&mut self, token_index: usize, prefix_len: usize) -> bool {
+        if !self.fixed_form {
+            return false;
+        }
+        let Some(token) = self.tokens.get(token_index).cloned() else {
+            return false;
+        };
+        if token.kind != TokenKind::Identifier
+            || prefix_len == 0
+            || prefix_len >= token.text.len()
+            || !token.text.is_char_boundary(prefix_len)
+        {
+            return false;
+        }
+
+        let suffix_len = token.text.len() - prefix_len;
+        let suffix_start = if token.span.end.col >= suffix_len as u32 {
+            crate::lexer::Position {
+                line: token.span.end.line,
+                col: token.span.end.col - suffix_len as u32,
+            }
+        } else {
+            token.span.start
+        };
+        let mut prefix = token.clone();
+        prefix.text.truncate(prefix_len);
+        prefix.span.end = suffix_start;
+
+        let mut suffix = token;
+        suffix.text = suffix.text[prefix_len..].to_string();
+        suffix.span.start = suffix_start;
+
+        self.tokens
+            .to_mut()
+            .splice(token_index..=token_index, [prefix, suffix]);
+        true
     }
 
     /// Advance if the current token matches the expected kind. Returns true if consumed.

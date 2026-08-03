@@ -324,10 +324,11 @@ fn simple_local_i128_ordered_branch_runs_at_o0() {
         "expected successful ordered branch run:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains('4'),
+        stdout.contains('4'),
         "ordered i128 branch program should print score 4:\n{}",
-        run.stdout
+        stdout
     );
 }
 
@@ -357,10 +358,11 @@ fn pointer_to_i128_storage_round_trips_through_c_ptr_at_o0() {
         "expected successful i128 pointer roundtrip:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains("ok"),
+        stdout.contains("ok"),
         "i128 pointer roundtrip should print ok:\n{}",
-        run.stdout
+        stdout
     );
 }
 
@@ -437,10 +439,11 @@ fn simple_local_i128_select_runs_at_o0() {
         "expected successful integer(16) select run:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains('1'),
+        stdout.contains('1'),
         "integer(16) select program should print score 1:\n{}",
-        run.stdout
+        stdout
     );
 }
 
@@ -551,10 +554,11 @@ fn simple_internal_i128_call_runs_at_o0() {
         "expected successful internal integer(16) call run:\n{:#?}",
         run
     );
+    let stdout = run.stdout_text().expect("run stdout should be UTF-8");
     assert!(
-        run.stdout.contains('1'),
+        stdout.contains('1'),
         "internal integer(16) call program should print score 1:\n{}",
-        run.stdout
+        stdout
     );
 }
 

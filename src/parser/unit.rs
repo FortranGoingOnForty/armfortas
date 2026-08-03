@@ -11,6 +11,108 @@ use crate::ast::unit::*;
 use crate::ast::Spanned;
 use crate::lexer::TokenKind;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactFixedUnitKind {
+    Function,
+    Subroutine,
+    Procedure,
+}
+
+/// Recognize a whitespace-insensitive fixed-form program-unit header without
+/// guessing from the author's blank placement. The caller still validates the
+/// following token shape and the grammar context in which MODULE PROCEDURE is
+/// legal before applying the returned first boundary.
+fn compact_fixed_unit_split(
+    text: &str,
+    allow_procedure: bool,
+) -> Option<(usize, CompactFixedUnitKind)> {
+    fn valid_name(name: &str) -> bool {
+        let mut bytes = name.bytes();
+        matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    let mut first_prefix_len = None;
+    let mut type_allowed = true;
+    let mut has_type = false;
+    let mut procedure_allowed = allow_procedure;
+
+    loop {
+        for (keyword, kind) in [
+            ("subroutine", CompactFixedUnitKind::Subroutine),
+            ("function", CompactFixedUnitKind::Function),
+            ("procedure", CompactFixedUnitKind::Procedure),
+        ] {
+            let Some(name) = rest.strip_prefix(keyword) else {
+                continue;
+            };
+            let permitted = match kind {
+                CompactFixedUnitKind::Function => true,
+                CompactFixedUnitKind::Subroutine => !has_type,
+                CompactFixedUnitKind::Procedure => procedure_allowed && !has_type,
+            };
+            if permitted && valid_name(name) {
+                return Some((first_prefix_len.unwrap_or(keyword.len()), kind));
+            }
+        }
+
+        let mut consumed = false;
+        for keyword in [
+            "non_recursive",
+            "elemental",
+            "recursive",
+            "impure",
+            "module",
+            "pure",
+        ] {
+            let Some(tail) = rest.strip_prefix(keyword) else {
+                continue;
+            };
+            if tail.is_empty() {
+                continue;
+            }
+            first_prefix_len.get_or_insert(keyword.len());
+            procedure_allowed |= keyword == "module";
+            rest = tail;
+            consumed = true;
+            break;
+        }
+        if consumed {
+            continue;
+        }
+
+        if type_allowed {
+            for keyword in [
+                "doubleprecision",
+                "doublecomplex",
+                "character",
+                "integer",
+                "logical",
+                "complex",
+                "real",
+            ] {
+                let Some(tail) = rest.strip_prefix(keyword) else {
+                    continue;
+                };
+                if tail.is_empty() {
+                    continue;
+                }
+                first_prefix_len.get_or_insert(keyword.len());
+                type_allowed = false;
+                has_type = true;
+                rest = tail;
+                consumed = true;
+                break;
+            }
+        }
+        if !consumed {
+            return None;
+        }
+    }
+}
+
 impl<'a> Parser<'a> {
     /// Parse a complete Fortran source file — one or more program units.
     pub fn parse_file(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {
@@ -39,6 +141,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a single program unit.
     pub fn parse_program_unit(&mut self) -> Result<SpannedUnit, ParseError> {
+        self.parse_program_unit_context(false)
+    }
+
+    fn parse_program_unit_context(
+        &mut self,
+        allow_module_prefix: bool,
+    ) -> Result<SpannedUnit, ParseError> {
         self.skip_newlines();
         let start = self.current_span();
 
@@ -54,6 +163,14 @@ impl<'a> Parser<'a> {
         let mut prefixes: Vec<Prefix> = Vec::new();
         let mut return_type: Option<crate::ast::decl::TypeSpec> = None;
         loop {
+            let allow_compact_procedure = prefixes
+                .iter()
+                .any(|prefix| matches!(prefix, Prefix::Module));
+            if let Some(prefix_len) =
+                self.compact_fixed_unit_prefix_len(self.pos, allow_compact_procedure)
+            {
+                self.split_fixed_identifier_at(self.pos, prefix_len);
+            }
             let text = self.peek_text().to_lowercase();
             match text.as_str() {
                 "pure" => {
@@ -104,7 +221,16 @@ impl<'a> Parser<'a> {
                             | "type"
                             | "class"
                     );
-                    if is_simple_prefix || is_followed_by_decl_prefix || is_type_then_function {
+                    let is_compact_prefix = self
+                        .compact_fixed_unit_prefix_len(self.pos + 1, true)
+                        .is_some();
+                    let module_prefix_allowed = !self.fixed_form || allow_module_prefix;
+                    if module_prefix_allowed
+                        && (is_simple_prefix
+                            || is_followed_by_decl_prefix
+                            || is_type_then_function
+                            || is_compact_prefix)
+                    {
                         self.advance();
                         prefixes.push(Prefix::Module);
                     } else {
@@ -168,13 +294,71 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn compact_fixed_unit_prefix_len(
+        &self,
+        token_index: usize,
+        allow_procedure: bool,
+    ) -> Option<usize> {
+        if !self.fixed_form {
+            return None;
+        }
+        let token = self.tokens.get(token_index)?;
+        if token.kind != TokenKind::Identifier {
+            return None;
+        }
+        let (prefix_len, kind) = compact_fixed_unit_split(&token.text, allow_procedure)?;
+        let next = self.tokens.get(token_index + 1);
+        let mut depth = 0usize;
+        let mut has_assignment = false;
+        for candidate in self.tokens.iter().skip(token_index + 1) {
+            match candidate.kind {
+                TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon | TokenKind::Eof => {
+                    break
+                }
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth = depth.saturating_sub(1),
+                TokenKind::Assign | TokenKind::Arrow if depth == 0 => {
+                    has_assignment = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let shape_matches = match kind {
+            CompactFixedUnitKind::Function => {
+                next.is_some_and(|candidate| candidate.kind == TokenKind::LParen) && !has_assignment
+            }
+            CompactFixedUnitKind::Subroutine => next.is_some_and(|candidate| {
+                matches!(
+                    candidate.kind,
+                    TokenKind::LParen
+                        | TokenKind::Newline
+                        | TokenKind::Comment
+                        | TokenKind::Semicolon
+                        | TokenKind::Eof
+                ) || (candidate.kind == TokenKind::Identifier
+                    && candidate.text.eq_ignore_ascii_case("bind"))
+            }),
+            CompactFixedUnitKind::Procedure => next.is_some_and(|candidate| {
+                matches!(
+                    candidate.kind,
+                    TokenKind::Newline | TokenKind::Comment | TokenKind::Semicolon | TokenKind::Eof
+                )
+            }),
+        };
+        shape_matches.then_some(prefix_len)
+    }
+
+    fn expect_program_unit_name(&mut self, context: &str) -> Result<String, ParseError> {
+        if self.peek() != &TokenKind::Identifier {
+            return Err(self.error(format!("expected {context} name, got {}", self.peek())));
+        }
+        Ok(self.advance().text.clone())
+    }
+
     fn parse_program(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'program'
-        let name = if self.peek() == &TokenKind::Identifier {
-            Some(self.advance().clone().text)
-        } else {
-            None
-        };
+        let name = Some(self.expect_program_unit_name("program")?);
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, body, ifaces) = self.parse_unit_body(&["program"])?;
@@ -243,7 +427,7 @@ impl<'a> Parser<'a> {
 
     fn parse_module(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'module'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("module")?;
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, _body, ifaces) = self.parse_unit_body(&["module"])?;
@@ -268,14 +452,14 @@ impl<'a> Parser<'a> {
     fn parse_submodule(&mut self, start: crate::lexer::Span) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'submodule'
         self.expect(&TokenKind::LParen)?;
-        let parent = self.advance().clone().text;
+        let parent = self.expect_program_unit_name("submodule ancestor module")?;
         let ancestor = if self.eat(&TokenKind::Colon) {
-            Some(self.advance().clone().text)
+            Some(self.expect_program_unit_name("submodule parent")?)
         } else {
             None
         };
         self.expect(&TokenKind::RParen)?;
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("submodule")?;
         self.skip_newlines();
 
         let (uses, imports, implicit, decls, _body, ifaces) =
@@ -311,7 +495,7 @@ impl<'a> Parser<'a> {
         prefix: Vec<Prefix>,
     ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'subroutine'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("subroutine")?;
 
         let args = if self.eat(&TokenKind::LParen) {
             let a = self.parse_dummy_arg_list()?;
@@ -355,7 +539,7 @@ impl<'a> Parser<'a> {
         return_type: Option<crate::ast::decl::TypeSpec>,
     ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'function'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("function")?;
 
         self.expect(&TokenKind::LParen)?;
         let args = self.parse_dummy_arg_list()?;
@@ -421,7 +605,7 @@ impl<'a> Parser<'a> {
         prefix: Vec<Prefix>,
     ) -> Result<SpannedUnit, ParseError> {
         self.advance(); // consume 'procedure'
-        let name = self.advance().clone().text;
+        let name = self.expect_program_unit_name("module procedure")?;
         self.skip_newlines();
 
         // Body is parsed normally; declarations may appear (e.g. local
@@ -537,6 +721,18 @@ impl<'a> Parser<'a> {
             }
 
             if text == "module" {
+                let next_index = self.pos + 1;
+                let compact_procedure_prefix = if self.fixed_form {
+                    self.tokens.get(next_index).and_then(|token| {
+                        let (prefix_len, kind) = compact_fixed_unit_split(&token.text, true)?;
+                        (kind == CompactFixedUnitKind::Procedure).then_some(prefix_len)
+                    })
+                } else {
+                    None
+                };
+                if let Some(prefix_len) = compact_procedure_prefix {
+                    self.split_fixed_identifier_at(next_index, prefix_len);
+                }
                 let next = if self.pos + 1 < self.tokens.len() {
                     self.tokens[self.pos + 1].text.to_lowercase()
                 } else {
@@ -594,7 +790,7 @@ impl<'a> Parser<'a> {
             }
 
             // Try parsing as a subprogram.
-            let sub = self.parse_program_unit()?;
+            let sub = self.parse_program_unit_context(true)?;
             bodies.push(InterfaceBody::Subprogram(sub));
         }
 
@@ -769,8 +965,8 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
 
-                    // Comma-separated entity list. Each entity may
-                    // carry its own optional `=> null()` initializer.
+                    // Comma-separated entity list. Each entity may carry
+                    // its own optional procedure-pointer initializer.
                     // Previously the parser stopped after the first
                     // name, dropping `g` in `procedure(...) :: f, g`
                     // and tripping the next-token check on the comma.
@@ -782,22 +978,25 @@ impl<'a> Parser<'a> {
                             String::new()
                         };
 
-                        if self.eat(&TokenKind::Arrow)
-                            && self.peek_text().eq_ignore_ascii_case("null")
-                        {
-                            self.advance();
-                            if self.peek() == &TokenKind::LParen {
+                        let ptr_init = if self.eat(&TokenKind::Arrow) {
+                            if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                let _ = self.expect(&TokenKind::RParen);
+                                self.expect(&TokenKind::LParen)?;
+                                self.expect(&TokenKind::RParen)?;
+                                None
+                            } else {
+                                Some(self.parse_expr()?)
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         entities.push(crate::ast::decl::EntityDecl {
                             name: entity_name,
                             array_spec: None,
                             init: None,
                             char_len: None,
-                            ptr_init: None,
+                            ptr_init,
                         });
 
                         if !self.eat(&TokenKind::Comma) {
@@ -810,6 +1009,7 @@ impl<'a> Parser<'a> {
                     // pointer call semantics are deferred.
                     let span = span_from_to(start, self.prev_span());
                     let mut all_attrs = attrs;
+                    all_attrs.push(crate::ast::decl::Attribute::Procedure);
                     all_attrs.push(crate::ast::decl::Attribute::External);
                     decls.push(crate::ast::Spanned::new(
                         crate::ast::decl::Decl::TypeDecl {
@@ -891,28 +1091,56 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // INTRINSIC / EXTERNAL :: name-list — informational
-            // declarations that mark functions as intrinsic or external.
-            // We consume and discard them; sema already knows which names
-            // are intrinsic.
+            // INTRINSIC / EXTERNAL statements establish procedure identity.
+            // Preserve them so resolution can distinguish a default intrinsic
+            // from a same-named external procedure and PURE validation can
+            // require an explicit purity contract for external calls.
             if (text == "intrinsic" || text == "external")
-                && (next_tok.as_ref() == Some(&TokenKind::ColonColon)
-                    || next_tok.as_ref() == Some(&TokenKind::Identifier))
+                && matches!(
+                    next_tok.as_ref(),
+                    Some(
+                        TokenKind::ColonColon
+                            | TokenKind::Identifier
+                            | TokenKind::Newline
+                            | TokenKind::Comment
+                            | TokenKind::Semicolon
+                            | TokenKind::Eof
+                    )
+                )
             {
+                let start = self.current_span();
+                let attr = if text == "intrinsic" {
+                    crate::ast::decl::Attribute::Intrinsic
+                } else {
+                    crate::ast::decl::Attribute::External
+                };
                 self.advance(); // consume keyword
                 let _ = self.eat(&TokenKind::ColonColon);
-                // Eat the name list.
+                if self.peek() != &TokenKind::Identifier {
+                    return Err(self.error(format!(
+                        "{} statement requires at least one procedure name",
+                        text.to_ascii_uppercase()
+                    )));
+                }
+                let mut entities = Vec::new();
                 loop {
-                    if self.peek() == &TokenKind::Identifier {
-                        self.advance();
-                    } else {
-                        break;
-                    }
+                    entities.push(self.advance().clone().text);
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
+                    if self.peek() != &TokenKind::Identifier {
+                        return Err(self.error(format!(
+                            "expected procedure name after ',' in {} statement",
+                            text.to_ascii_uppercase()
+                        )));
+                    }
                 }
                 self.skip_newlines();
+                let span = span_from_to(start, self.prev_span());
+                decls.push(crate::ast::Spanned::new(
+                    crate::ast::decl::Decl::AttributeStmt { attr, entities },
+                    span,
+                ));
                 continue;
             }
 
@@ -945,7 +1173,7 @@ impl<'a> Parser<'a> {
                             if self.peek() == &TokenKind::Identifier {
                                 entities.push(self.advance().clone().text);
                             }
-                            let _ = self.eat(&TokenKind::Slash);
+                            self.expect(&TokenKind::Slash)?;
                         } else if self.peek() == &TokenKind::Identifier {
                             entities.push(self.advance().clone().text);
                         } else {
@@ -968,14 +1196,17 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // ALLOCATABLE / POINTER / TARGET attribute statements
+            // ALLOCATABLE / POINTER / TARGET / VOLATILE attribute statements
             // (F2018 R526/R535/R859): `allocatable :: a, b`, `pointer p`,
             // `target :: t`. Parsed to AttributeStmt; fold_attribute_statements
             // (run at end of the unit body) merges each into the entity's
             // type declaration. Disambiguate from a same-named variable by
             // requiring `::` or an entity identifier next — `pointer = x`
             // (`=`) and `pointer(i) = x` (`(`) fall through to assignment.
-            if text == "allocatable" || text == "pointer" || text == "target" {
+            if matches!(
+                text.as_str(),
+                "allocatable" | "pointer" | "target" | "volatile"
+            ) {
                 let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
                 let is_attr_stmt = matches!(
                     next_kind,
@@ -986,7 +1217,8 @@ impl<'a> Parser<'a> {
                     let attr = match text.as_str() {
                         "allocatable" => crate::ast::decl::Attribute::Allocatable,
                         "pointer" => crate::ast::decl::Attribute::Pointer,
-                        _ => crate::ast::decl::Attribute::Target,
+                        "target" => crate::ast::decl::Attribute::Target,
+                        _ => crate::ast::decl::Attribute::Volatile,
                     };
                     self.advance(); // consume the attribute keyword
                     let _ = self.eat(&TokenKind::ColonColon);
@@ -999,7 +1231,7 @@ impl<'a> Parser<'a> {
                         // dropping the shape.
                         if self.peek() == &TokenKind::LParen {
                             return Err(self.error(
-                                "array-spec in a standalone ALLOCATABLE/POINTER/TARGET \
+                                "array-spec in a standalone ALLOCATABLE/POINTER/TARGET/VOLATILE \
                                  statement is not supported yet; declare the shape on \
                                  the type declaration instead"
                                     .to_string(),
@@ -1015,6 +1247,23 @@ impl<'a> Parser<'a> {
                         crate::ast::decl::Decl::AttributeStmt { attr, entities },
                         span,
                     ));
+                    continue;
+                }
+            }
+
+            // Standalone DIMENSION statement (F2018 R832):
+            // `dimension [::] a(10), b(2, 3)`. Every entity has its own
+            // array-spec, so this uses a dedicated AST node rather than the
+            // shared DIMENSION(...) type-declaration attribute. As with other
+            // keyword statements, preserve Fortran's non-reserved keywords:
+            // `dimension = x` and `dimension(i) = x` remain assignments.
+            if text == "dimension" {
+                let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
+                if matches!(
+                    next_kind,
+                    Some(TokenKind::ColonColon) | Some(TokenKind::Identifier)
+                ) {
+                    decls.push(self.parse_dimension_stmt()?);
                     continue;
                 }
             }
@@ -1075,6 +1324,7 @@ impl<'a> Parser<'a> {
         }
 
         fold_attribute_statements(&mut decls);
+        fold_dimension_statements(&mut decls)?;
         Ok((uses, imports, implicit, decls, body, interfaces))
     }
 
@@ -1163,7 +1413,7 @@ impl<'a> Parser<'a> {
             ) {
                 break;
             }
-            units.push(self.parse_program_unit()?);
+            units.push(self.parse_program_unit_context(true)?);
         }
         Ok(units)
     }
@@ -1229,7 +1479,7 @@ impl<'a> Parser<'a> {
         Ok(ImportStmt::Default(names))
     }
 
-    /// Parse optional BIND(C [, NAME="..."]) clause.
+    /// Parse optional BIND(C [, NAME=scalar-default-char-constant-expr]) clause.
     /// Returns `None` if no BIND, `Some(BindInfo)` if present.
     fn try_parse_bind(&mut self) -> Result<Option<BindInfo>, ParseError> {
         if !self.peek_text().eq_ignore_ascii_case("bind") {
@@ -1237,15 +1487,19 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // bind
         self.expect(&TokenKind::LParen)?;
+        if self.peek() != &TokenKind::Identifier || !self.peek_text().eq_ignore_ascii_case("c") {
+            return Err(self.error("expected C language binding in BIND clause".into()));
+        }
         self.advance(); // c
         let name = if self.eat(&TokenKind::Comma) {
-            if self.peek_text().eq_ignore_ascii_case("name") {
-                self.advance();
-                self.expect(&TokenKind::Assign)?;
-                Some(self.advance().clone().text)
-            } else {
-                None
+            if self.peek() != &TokenKind::Identifier
+                || !self.peek_text().eq_ignore_ascii_case("name")
+            {
+                return Err(self.error("expected NAME in BIND(C) clause".into()));
             }
+            self.advance();
+            self.expect(&TokenKind::Assign)?;
+            Some(self.parse_expr()?)
         } else {
             None
         };
@@ -1254,17 +1508,18 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Fold standalone ALLOCATABLE/POINTER/TARGET attribute statements into the
-/// type declaration of each named entity, so every downstream consumer
-/// (resolve plus all lowering storage sites) sees the attribute through the
-/// normal `Decl::TypeDecl` path with no extra plumbing.
+/// Fold standalone entity attribute statements into the type declaration of
+/// each named entity, so every downstream consumer sees the attribute through
+/// the normal `Decl::TypeDecl` path with no extra plumbing.
 ///
 /// A declaration that names several entities is split so the attribute lands
 /// on only its entity: `integer :: y, z` + `allocatable :: y` becomes
 /// `integer :: z` and `integer, allocatable :: y`. An entity with no type
 /// declaration in this scope — e.g. a function result typed by its function
-/// statement — has no fold target; its statement is left in place (inert),
-/// and the allocatable-result ABI remains a separate concern.
+/// statement — has no fold target, so its statement remains available for
+/// semantic resolution. Lowering normalizes semantically typed standalone
+/// VOLATILE entities later; other result-attribute ABIs remain separate
+/// concerns.
 fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
     use crate::ast::decl::{Attribute, Decl};
     let mut i = 0;
@@ -1273,7 +1528,12 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
             Decl::AttributeStmt { attr, entities }
                 if matches!(
                     attr,
-                    Attribute::Allocatable | Attribute::Pointer | Attribute::Target
+                    Attribute::Allocatable
+                        | Attribute::Pointer
+                        | Attribute::Target
+                        | Attribute::Volatile
+                        | Attribute::External
+                        | Attribute::Intrinsic
                 ) =>
             {
                 (attr.clone(), entities.clone())
@@ -1285,7 +1545,7 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
         };
         let unfolded: Vec<String> = entities
             .into_iter()
-            .filter(|name| !fold_one_attribute(decls, name, &attr))
+            .filter(|name| !crate::ast::decl::fold_attribute_into_type_decl(decls, name, &attr))
             .collect();
         if unfolded.is_empty() {
             decls.remove(i); // fully folded — drop the now-redundant statement
@@ -1298,68 +1558,144 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
     }
 }
 
-/// Apply `attr` to the type declaration of entity `name`, splitting a
-/// multi-entity declaration so only `name` gets it. Returns false if no type
-/// declaration in `decls` declares `name`.
-fn fold_one_attribute(
+/// Fold standalone DIMENSION entities into matching type declarations.
+///
+/// A DIMENSION statement may precede or follow the entity's type declaration,
+/// so the full declaration list is searched. Entities with no explicit type
+/// declaration remain as `DimensionStmt` nodes: semantic resolution assigns
+/// their implicit type (or diagnoses IMPLICIT NONE), and the lowering
+/// normalization then materializes an equivalent typed declaration.
+fn fold_dimension_statements(decls: &mut Vec<SpannedDecl>) -> Result<(), ParseError> {
+    use crate::ast::decl::Decl;
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for decl in decls.iter() {
+        if let Decl::DimensionStmt { entities } = &decl.node {
+            for entity in entities {
+                let key = entity.name.to_ascii_lowercase();
+                if !seen.insert(key) {
+                    return Err(ParseError {
+                        span: decl.span,
+                        msg: format!(
+                            "duplicate DIMENSION attribute specified for '{}'",
+                            entity.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut i = 0;
+    while i < decls.len() {
+        let (entities, stmt_span) = match &decls[i].node {
+            Decl::DimensionStmt { entities } => (entities.clone(), decls[i].span),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let mut unfolded = Vec::new();
+        for entity in entities {
+            if !fold_one_dimension(decls, &entity.name, &entity.array_spec, stmt_span)? {
+                unfolded.push(entity);
+            }
+        }
+
+        if unfolded.is_empty() {
+            decls.remove(i);
+        } else {
+            if let Decl::DimensionStmt { entities } = &mut decls[i].node {
+                *entities = unfolded;
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn fold_one_dimension(
     decls: &mut Vec<SpannedDecl>,
     name: &str,
-    attr: &crate::ast::decl::Attribute,
-) -> bool {
-    use crate::ast::decl::Decl;
+    array_spec: &[crate::ast::decl::ArraySpec],
+    stmt_span: crate::lexer::Span,
+) -> Result<bool, ParseError> {
+    use crate::ast::decl::{Attribute, Decl};
+
     let mut found: Option<(usize, usize, usize)> = None;
-    for (di, d) in decls.iter().enumerate() {
-        if let Decl::TypeDecl { entities, .. } = &d.node {
-            if let Some(ei) = entities
+    for (decl_index, decl) in decls.iter().enumerate() {
+        if let Decl::TypeDecl { entities, .. } = &decl.node {
+            if let Some(entity_index) = entities
                 .iter()
-                .position(|e| e.name.eq_ignore_ascii_case(name))
+                .position(|entity| entity.name.eq_ignore_ascii_case(name))
             {
-                found = Some((di, ei, entities.len()));
+                found = Some((decl_index, entity_index, entities.len()));
                 break;
             }
         }
     }
-    let Some((di, ei, count)) = found else {
-        return false;
+    let Some((decl_index, entity_index, entity_count)) = found else {
+        return Ok(false);
     };
-    if count == 1 {
-        if let Decl::TypeDecl { attrs, .. } = &mut decls[di].node {
-            if !attrs.iter().any(|a| a == attr) {
-                attrs.push(attr.clone());
-            }
+
+    let has_decl_dimension = match &decls[decl_index].node {
+        Decl::TypeDecl {
+            attrs, entities, ..
+        } => {
+            attrs
+                .iter()
+                .any(|attr| matches!(attr, Attribute::Dimension(_)))
+                || entities[entity_index].array_spec.is_some()
+        }
+        _ => unreachable!(),
+    };
+    if has_decl_dimension {
+        return Err(ParseError {
+            span: stmt_span,
+            msg: format!("duplicate DIMENSION attribute specified for '{}'", name),
+        });
+    }
+
+    if entity_count == 1 {
+        if let Decl::TypeDecl { entities, .. } = &mut decls[decl_index].node {
+            entities[entity_index].array_spec = Some(array_spec.to_vec());
         }
     } else {
-        let span = decls[di].span;
-        let (type_spec, mut new_attrs, ent) = match &mut decls[di].node {
+        let decl_span = decls[decl_index].span;
+        let (type_spec, attrs, mut entity) = match &mut decls[decl_index].node {
             Decl::TypeDecl {
                 type_spec,
                 attrs,
                 entities,
-            } => {
-                let ent = entities.remove(ei);
-                (type_spec.clone(), attrs.clone(), ent)
-            }
+            } => (
+                type_spec.clone(),
+                attrs.clone(),
+                entities.remove(entity_index),
+            ),
             _ => unreachable!(),
         };
-        if !new_attrs.iter().any(|a| a == attr) {
-            new_attrs.push(attr.clone());
-        }
+        entity.array_spec = Some(array_spec.to_vec());
         decls.push(Spanned::new(
             Decl::TypeDecl {
                 type_spec,
-                attrs: new_attrs,
-                entities: vec![ent],
+                attrs,
+                entities: vec![entity],
             },
-            span,
+            decl_span,
         ));
     }
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
+    use crate::ast::decl::Decl;
+    use crate::ast::expr::Expr;
+    use crate::ast::stmt::Stmt;
+    use crate::lexer::{fixed::tokenize_fixed, Lexer};
 
     fn parse_units(src: &str) -> Vec<SpannedUnit> {
         let tokens = Lexer::tokenize(src, 0).unwrap();
@@ -1373,10 +1709,33 @@ mod tests {
         units.into_iter().next().unwrap()
     }
 
+    fn parse_fixed_unit(src: &str) -> SpannedUnit {
+        let tokens = tokenize_fixed(src, 0).unwrap();
+        let mut parser = Parser::new_for_form(&tokens, crate::lexer::SourceForm::FixedForm);
+        let units = parser.parse_file().unwrap();
+        assert_eq!(units.len(), 1, "expected 1 unit, got {}", units.len());
+        units.into_iter().next().unwrap()
+    }
+
     fn parse_error(src: &str) -> ParseError {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         parser.parse_file().unwrap_err()
+    }
+
+    fn parse_fixed_error(src: &str) -> ParseError {
+        let tokens = tokenize_fixed(src, 0).unwrap();
+        let mut parser = Parser::new_for_form(&tokens, crate::lexer::SourceForm::FixedForm);
+        parser.parse_file().unwrap_err()
+    }
+
+    #[test]
+    fn compact_fixed_unit_recognition_is_iterative_for_long_prefix_runs() {
+        let header = format!("{}functionf", "pure".repeat(20_000));
+        assert_eq!(
+            compact_fixed_unit_split(&header, false),
+            Some((4, CompactFixedUnitKind::Function))
+        );
     }
 
     // ---- PROGRAM ----
@@ -1395,6 +1754,261 @@ mod tests {
             assert!(!body.is_empty());
         } else {
             panic!("not Program");
+        }
+    }
+
+    #[test]
+    fn required_program_unit_names_must_be_present() {
+        let cases = [
+            ("program\nend program\n", "program name"),
+            ("module\nend module\n", "module name"),
+            ("subroutine\nend subroutine\n", "subroutine name"),
+            ("function()\nend function\n", "function name"),
+            ("module procedure\nend procedure\n", "module procedure name"),
+            ("submodule(parent)\nend submodule\n", "submodule name"),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_error(source);
+            assert!(
+                error.msg.contains(&format!("expected {expected}")),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_program_unit_names_must_be_identifiers() {
+        let cases = [
+            ("program 1\nend program\n", "program name"),
+            ("module 1\nend module\n", "module name"),
+            ("subroutine 1\nend subroutine\n", "subroutine name"),
+            ("function 1()\nend function\n", "function name"),
+            (
+                "module procedure 1\nend procedure\n",
+                "module procedure name",
+            ),
+            (
+                "submodule(1) child\nend submodule child\n",
+                "submodule ancestor module name",
+            ),
+            (
+                "submodule(parent:1) child\nend submodule child\n",
+                "submodule parent name",
+            ),
+            ("submodule(parent) 1\nend submodule\n", "submodule name"),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_error(source);
+            assert!(
+                error.msg.contains(&format!("expected {expected}")),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_form_program_unit_names_must_be_present() {
+        let cases = [
+            (concat!("      PROGRAM\n", "      END\n"), "program name"),
+            (
+                concat!("      MODULE\n", "      ENDMODULE\n"),
+                "module name",
+            ),
+            (
+                concat!("      SUBROUTINE\n", "      ENDSUBROUTINE\n"),
+                "subroutine name",
+            ),
+            (
+                concat!("      FUNCTION()\n", "      ENDFUNCTION\n"),
+                "function name",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let error = parse_fixed_error(source);
+            assert!(
+                error.msg.contains(&format!("expected {expected}")),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_double_is_an_identifier_in_free_and_fixed_form() {
+        let free = parse_unit(
+            "\
+program contextual_name
+  integer :: double
+  double = 41
+end program contextual_name
+",
+        );
+        let fixed = parse_fixed_unit(concat!(
+            "      PROGRAM P\n",
+            "      INTEGER DOUBLE\n",
+            "      DOUBLE = 41\n",
+            "      END\n",
+        ));
+
+        for unit in [free, fixed] {
+            let ProgramUnit::Program { body, .. } = unit.node else {
+                panic!("not Program");
+            };
+            assert!(matches!(
+                body.as_slice(),
+                [stmt]
+                    if matches!(
+                        &stmt.node,
+                        Stmt::Assignment {
+                            target,
+                            value: _,
+                        } if matches!(
+                            &target.node,
+                            Expr::Name { name } if name.eq_ignore_ascii_case("double")
+                        )
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn bare_double_declaration_is_rejected() {
+        parse_error(
+            "\
+program malformed
+  double :: value
+end program malformed
+",
+        );
+        parse_error(
+            "\
+program malformed
+  implicit double (a-h)
+end program malformed
+",
+        );
+    }
+
+    #[test]
+    fn procedure_pointer_declaration_preserves_named_initializer() {
+        let unit = parse_unit(
+            "\
+program test
+  procedure(callback), pointer :: first => action, second => null(), third
+end program test
+",
+        );
+        let ProgramUnit::Program { decls, .. } = unit.node else {
+            panic!("not Program");
+        };
+        let Some(Decl::TypeDecl { entities, .. }) =
+            decls.iter().find_map(|decl| match &decl.node {
+                Decl::TypeDecl { entities, .. }
+                    if entities.iter().any(|entity| entity.name == "first") =>
+                {
+                    Some(&decl.node)
+                }
+                _ => None,
+            })
+        else {
+            panic!("procedure-pointer declaration not preserved");
+        };
+        assert_eq!(entities.len(), 3);
+        assert!(matches!(
+            entities[0].ptr_init.as_ref().map(|expr| &expr.node),
+            Some(Expr::Name { name }) if name == "action"
+        ));
+        assert!(entities[1].ptr_init.is_none());
+        assert!(entities[2].ptr_init.is_none());
+    }
+
+    #[test]
+    fn procedure_pointer_null_initializer_requires_an_opening_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+program malformed
+  procedure(callback), pointer :: handler => null
+end program malformed
+",
+            ),
+            parse_fixed_error(concat!(
+                "      PROGRAM MALFORMED\n",
+                "      PROCEDURE(CALLBACK),POINTER::HANDLER=>NULL\n",
+                "      ENDPROGRAMMALFORMED\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected ("), "{error}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_null_initializer_requires_a_closing_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+program malformed
+  procedure(callback), pointer :: handler => null(
+end program malformed
+",
+            ),
+            parse_fixed_error(concat!(
+                "      PROGRAM MALFORMED\n",
+                "      PROCEDURE(CALLBACK),POINTER::HANDLER=>NULL(\n",
+                "      ENDPROGRAMMALFORMED\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected )"), "{error}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_component_null_initializer_requires_an_opening_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+module malformed_m
+  type :: holder
+    procedure(callback), pointer, nopass :: handler => null
+  end type holder
+end module malformed_m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE MALFORMED_M\n",
+                "      TYPE HOLDER\n",
+                "      PROCEDURE(CALLBACK),POINTER,NOPASS::HANDLER=>NULL\n",
+                "      ENDTYPEHOLDER\n",
+                "      ENDMODULEMALFORMED_M\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected ("), "{error}");
+        }
+    }
+
+    #[test]
+    fn procedure_pointer_component_null_initializer_requires_a_closing_parenthesis() {
+        for error in [
+            parse_error(
+                "\
+module malformed_m
+  type :: holder
+    procedure(callback), pointer, nopass :: handler => null(
+  end type holder
+end module malformed_m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE MALFORMED_M\n",
+                "      TYPE HOLDER\n",
+                "      PROCEDURE(CALLBACK),POINTER,NOPASS::HANDLER=>NULL(\n",
+                "      ENDTYPEHOLDER\n",
+                "      ENDMODULEMALFORMED_M\n",
+            )),
+        ] {
+            assert!(error.msg.contains("expected )"), "{error}");
         }
     }
 
@@ -1471,7 +2085,6 @@ mod tests {
     #[test]
     fn closing_name_requires_an_opening_name() {
         let sources = [
-            "program\nend program alpha\n",
             "value = 1\nend program alpha\n",
             "block data\nend block data alpha\n",
         ];
@@ -1520,6 +2133,307 @@ mod tests {
         }
         assert!(a_allocatable, "a should be allocatable");
         assert!(!b_allocatable, "b should not be allocatable");
+    }
+
+    #[test]
+    fn standalone_volatile_statement_folds_into_type_decl() {
+        use crate::ast::decl::{Attribute, Decl};
+        let unit =
+            parse_unit("program p\n  integer :: watched\n  volatile :: watched\nend program p\n");
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::TypeDecl { attrs, entities, .. }
+                    if entities.iter().any(|entity| entity.name == "watched")
+                        && attrs.iter().any(|attr| matches!(attr, Attribute::Volatile))
+            )
+        }));
+    }
+
+    #[test]
+    fn standalone_external_and_intrinsic_statements_are_preserved() {
+        use crate::ast::decl::{Attribute, Decl};
+
+        let units = [
+            parse_unit(
+                "program p\n\
+                   real :: typed_external\n\
+                   external :: typed_external\n\
+                   external :: external_work\n\
+                   intrinsic :: sin\n\
+                 end program p\n",
+            ),
+            parse_fixed_unit(concat!(
+                "      PROGRAM P\n",
+                "      REAL TYPED_EXTERNAL\n",
+                "      EXTERNAL TYPED_EXTERNAL\n",
+                "      EXTERNAL EXTERNAL_WORK\n",
+                "      INTRINSIC SIN\n",
+                "      END\n",
+            )),
+        ];
+
+        for unit in units {
+            let ProgramUnit::Program { decls, .. } = &unit.node else {
+                panic!("not Program");
+            };
+
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::TypeDecl { attrs, entities, .. }
+                        if entities
+                            .iter()
+                            .any(|entity| entity.name.eq_ignore_ascii_case("typed_external"))
+                            && attrs.iter().any(|attr| matches!(attr, Attribute::External))
+                )
+            }));
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::AttributeStmt {
+                        attr: Attribute::External,
+                        entities,
+                    } if entities.len() == 1
+                        && entities[0].eq_ignore_ascii_case("external_work")
+                )
+            }));
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::AttributeStmt {
+                        attr: Attribute::Intrinsic,
+                        entities,
+                    } if entities.len() == 1 && entities[0].eq_ignore_ascii_case("sin")
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn standalone_procedure_attribute_statements_require_a_name() {
+        for keyword in ["external", "intrinsic"] {
+            for separator in ["", " ::"] {
+                let source = format!("program p\n  {keyword}{separator}\nend program p\n");
+                let error = parse_error(&source);
+                assert!(
+                    error
+                        .msg
+                        .contains("statement requires at least one procedure name"),
+                    "unexpected error for {source:?}: {error}"
+                );
+
+                let fixed_source = format!(
+                    "      {}\n      END\n",
+                    keyword.to_ascii_uppercase() + separator
+                );
+                let error = parse_fixed_error(&fixed_source);
+                assert!(
+                    error
+                        .msg
+                        .contains("statement requires at least one procedure name"),
+                    "unexpected error for {fixed_source:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_procedure_attribute_statements_reject_trailing_commas() {
+        for keyword in ["external", "intrinsic"] {
+            let source = format!("program p\n  {keyword} :: work,\nend program p\n");
+            let error = parse_error(&source);
+            assert!(
+                error.msg.contains("expected procedure name after ','"),
+                "unexpected error for {source:?}: {error}"
+            );
+
+            let fixed_source = format!(
+                "      {} :: WORK,\n      END\n",
+                keyword.to_ascii_uppercase()
+            );
+            let error = parse_fixed_error(&fixed_source);
+            assert!(
+                error.msg.contains("expected procedure name after ','"),
+                "unexpected error for {fixed_source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_common_block_entries_parse_with_a_closing_slash() {
+        use crate::ast::decl::{Attribute, Decl};
+
+        let units = [
+            parse_unit("program p\n  save /state/, value\nend program p\n"),
+            parse_fixed_unit(concat!(
+                "      PROGRAM P\n",
+                "      SAVE /STATE/, VALUE\n",
+                "      END\n",
+            )),
+        ];
+
+        for unit in units {
+            let ProgramUnit::Program { decls, .. } = &unit.node else {
+                panic!("not Program");
+            };
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::AttributeStmt {
+                        attr: Attribute::Save,
+                        entities,
+                    } if entities.len() == 2
+                        && entities[0].eq_ignore_ascii_case("state")
+                        && entities[1].eq_ignore_ascii_case("value")
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn save_common_block_entries_require_a_closing_slash() {
+        let errors = [
+            parse_error("program p\n  save /state\nend program p\n"),
+            parse_error("program p\n  save /state, value\nend program p\n"),
+            parse_fixed_error(concat!(
+                "      PROGRAM P\n",
+                "      SAVE /STATE\n",
+                "      END\n",
+            )),
+            parse_fixed_error(concat!(
+                "      PROGRAM P\n",
+                "      SAVE /STATE, VALUE\n",
+                "      END\n",
+            )),
+        ];
+
+        for error in errors {
+            assert!(
+                error.msg.contains("expected /"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_dimension_preserves_entity_shapes_and_implicit_entities() {
+        let unit = parse_unit(
+            "program p\n\
+               dimension :: a(3), b(2, 4), x(-1:1)\n\
+               integer :: a, b\n\
+             end program p\n",
+        );
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+
+        let mut explicit_ranks = std::collections::HashMap::new();
+        let mut implicit_dimension = None;
+        for decl in decls {
+            match &decl.node {
+                Decl::TypeDecl { entities, .. } => {
+                    for entity in entities {
+                        if let Some(specs) = &entity.array_spec {
+                            explicit_ranks.insert(entity.name.to_ascii_lowercase(), specs.len());
+                        }
+                    }
+                }
+                Decl::DimensionStmt { entities } => {
+                    assert_eq!(
+                        entities.len(),
+                        1,
+                        "only the implicitly typed entity should remain standalone"
+                    );
+                    implicit_dimension = entities.first();
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(explicit_ranks.get("a"), Some(&1));
+        assert_eq!(explicit_ranks.get("b"), Some(&2));
+        let implicit = implicit_dimension.expect("missing implicit DIMENSION entity");
+        assert_eq!(implicit.name, "x");
+        assert_eq!(implicit.array_spec.len(), 1);
+    }
+
+    #[test]
+    fn standalone_dimension_rejects_duplicate_shape_sources() {
+        for source in [
+            "program p\ninteger :: a(2)\ndimension a(3)\nend program p\n",
+            "program p\ninteger, dimension(2) :: a\ndimension :: a(3)\nend program p\n",
+            "program p\ndimension a(2)\ndimension a(3)\nend program p\n",
+            "program p\ndimension :: a(2), A(3)\nend program p\n",
+        ] {
+            let error = parse_error(source);
+            assert!(
+                error.msg.contains("duplicate DIMENSION attribute"),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_dimension_requires_each_entity_shape() {
+        let error = parse_error("program p\ndimension :: a\nend program p\n");
+        assert!(
+            error.msg.contains("requires an array-spec"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fixed_form_standalone_dimension_folds_into_the_type_declaration() {
+        let unit = parse_fixed_unit(
+            "      PROGRAM P
+      INTEGER A
+      DIMENSION A(3)
+      END
+",
+        );
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        let array_rank = decls.iter().find_map(|decl| {
+            let Decl::TypeDecl { entities, .. } = &decl.node else {
+                return None;
+            };
+            entities
+                .iter()
+                .find(|entity| entity.name.eq_ignore_ascii_case("a"))
+                .and_then(|entity| entity.array_spec.as_ref())
+                .map(Vec::len)
+        });
+        assert_eq!(array_rank, Some(1));
+        assert!(!decls
+            .iter()
+            .any(|decl| matches!(decl.node, Decl::DimensionStmt { .. })));
+    }
+
+    #[test]
+    fn dimension_keyword_can_still_name_an_assignment_target() {
+        let unit = parse_unit(
+            "program p\n\
+               integer :: dimension, i\n\
+               integer :: values(2)\n\
+               dimension = 1\n\
+               values(i) = dimension\n\
+             end program p\n",
+        );
+        let ProgramUnit::Program { decls, body, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(!decls
+            .iter()
+            .any(|decl| matches!(decl.node, Decl::DimensionStmt { .. })));
+        assert_eq!(body.len(), 2);
+        assert!(body
+            .iter()
+            .all(|stmt| matches!(stmt.node, crate::ast::stmt::Stmt::Assignment { .. })));
     }
 
     // ---- SUBROUTINE ----
@@ -1574,6 +2488,44 @@ mod tests {
     }
 
     #[test]
+    fn fixed_typed_function_headers_do_not_depend_on_blank_placement() {
+        for header in [
+            "      INTEGER FUNCTION F(X)\n",
+            "      INTEGER FUNCTIONF(X)\n",
+            "      INTEGERFUNCTIONF(X)\n",
+            "      INTEGER PURE FUNCTIONF(X)\n",
+            "      PUREINTEGERFUNCTIONF(X)\n",
+        ] {
+            let source = format!("{header}      INTEGER X\n      F=X\n      END\n");
+            let unit = parse_fixed_unit(&source);
+            let ProgramUnit::Function {
+                name, return_type, ..
+            } = &unit.node
+            else {
+                panic!("not Function for {header:?}");
+            };
+            assert_eq!(name, "F");
+            assert!(return_type.is_some());
+            if header.to_ascii_lowercase().contains("pure") {
+                let ProgramUnit::Function { prefix, .. } = &unit.node else {
+                    unreachable!()
+                };
+                assert!(prefix.contains(&Prefix::Pure));
+            }
+        }
+    }
+
+    #[test]
+    fn free_form_keyword_prefixed_array_name_stays_a_declaration() {
+        let unit =
+            parse_unit("program p\n  integer functionf(3)\n  functionf(1) = 7\nend program p\n");
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(!decls.is_empty());
+    }
+
+    #[test]
     fn recursive_function() {
         let u = parse_unit("recursive function fact(n) result(f)\n  integer :: n, f\n  if (n <= 1) then\n    f = 1\n  else\n    f = n * fact(n - 1)\n  end if\nend function\n");
         if let ProgramUnit::Function { prefix, .. } = &u.node {
@@ -1594,6 +2546,56 @@ mod tests {
         } else {
             panic!("not Module");
         }
+    }
+
+    #[test]
+    fn fixed_module_name_does_not_depend_on_blank_placement() {
+        for header in ["      MODULE PROCEDURAL\n", "      MODULEPROCEDURAL\n"] {
+            let source = format!("{header}      END MODULE PROCEDURAL\n");
+            let unit = parse_fixed_unit(&source);
+            let ProgramUnit::Module { name, .. } = &unit.node else {
+                panic!("not Module for {header:?}");
+            };
+            assert_eq!(name, "PROCEDURAL");
+        }
+    }
+
+    #[test]
+    fn fixed_compact_module_procedure_headers_are_resolved_in_contains_context() {
+        let unit = parse_fixed_unit(concat!(
+            "      MODULE M\n",
+            "      CONTAINS\n",
+            "      MODULESUBROUTINECALLABLE()\n",
+            "      ENDSUBROUTINECALLABLE\n",
+            "      ENDMODULEM\n",
+        ));
+        let ProgramUnit::Module { contains, .. } = &unit.node else {
+            panic!("not Module");
+        };
+        let [contained] = contains.as_slice() else {
+            panic!("expected one contained procedure");
+        };
+        let ProgramUnit::Subroutine { name, prefix, .. } = &contained.node else {
+            panic!("not Subroutine");
+        };
+        assert_eq!(name, "CALLABLE");
+        assert!(prefix.contains(&Prefix::Module));
+    }
+
+    #[test]
+    fn fixed_compact_module_procedure_lists_stay_interface_declarations() {
+        let unit = parse_fixed_unit(concat!(
+            "      INTERFACE GENERIC_NAME\n",
+            "      MODULEPROCEDUREPRINTABLE,REALIGNER\n",
+            "      ENDINTERFACEGENERIC_NAME\n",
+        ));
+        let ProgramUnit::InterfaceBlock { bodies, .. } = &unit.node else {
+            panic!("not InterfaceBlock");
+        };
+        let [InterfaceBody::ModuleProcedure(names)] = bodies.as_slice() else {
+            panic!("expected one module-procedure declaration");
+        };
+        assert_eq!(names, &["PRINTABLE", "REALIGNER"]);
     }
 
     #[test]
@@ -1711,6 +2713,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn derived_type_requires_end_type() {
+        for error in [
+            parse_error(
+                "\
+module m
+  type :: item
+    integer :: value
+  end
+end module m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE M\n",
+                "      TYPE ITEM\n",
+                "      INTEGER VALUE\n",
+                "      END\n",
+                "      ENDMODULEM\n",
+            )),
+        ] {
+            assert!(
+                error.to_string().contains("expected 'type' after 'end'"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_requires_end_interface() {
+        for error in [
+            parse_error(
+                "\
+module m
+  interface
+    subroutine ext()
+    end subroutine ext
+  end
+end module m
+",
+            ),
+            parse_fixed_error(concat!(
+                "      MODULE M\n",
+                "      INTERFACE\n",
+                "      SUBROUTINE EXT\n",
+                "      ENDSUBROUTINEEXT\n",
+                "      END\n",
+                "      ENDMODULEM\n",
+            )),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected 'interface' after 'end'"),
+                "{error}"
+            );
+        }
+    }
+
     // ---- MULTI-UNIT FILES ----
 
     #[test]
@@ -1737,13 +2797,61 @@ mod tests {
 
     #[test]
     fn subroutine_bind_c_with_name() {
+        use crate::ast::expr::Expr;
+
         let u =
             parse_unit("subroutine foo(x) bind(c, name='c_foo')\n  real :: x\nend subroutine\n");
         if let ProgramUnit::Subroutine { bind, .. } = &u.node {
             assert!(bind.is_some());
-            assert_eq!(bind.as_ref().unwrap().name.as_deref(), Some("'c_foo'"));
+            let name = bind.as_ref().unwrap().name.as_ref().unwrap();
+            assert!(
+                matches!(
+                    &name.node,
+                    Expr::StringLiteral { value, kind: None } if value == "c_foo"
+                ),
+                "unexpected NAME expression: {name:?}"
+            );
         } else {
             panic!("not Subroutine");
         }
+    }
+
+    #[test]
+    fn bind_name_parses_constant_expression() {
+        use crate::ast::expr::{BinaryOp, Expr};
+
+        let u = parse_unit("subroutine foo() bind(c, name=prefix // suffix)\nend subroutine\n");
+        let ProgramUnit::Subroutine {
+            bind: Some(bind), ..
+        } = &u.node
+        else {
+            panic!("expected bound Subroutine");
+        };
+        assert!(
+            matches!(
+                bind.name.as_ref().map(|expr| &expr.node),
+                Some(Expr::BinaryOp {
+                    op: BinaryOp::Concat,
+                    ..
+                })
+            ),
+            "unexpected NAME expression: {:?}",
+            bind.name
+        );
+    }
+
+    #[test]
+    fn bind_rejects_non_c_language() {
+        let err = parse_error("subroutine foo() bind(fortran)\nend subroutine\n");
+        assert!(
+            err.msg.contains("expected C language binding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_rejects_unknown_specifier() {
+        let err = parse_error("subroutine foo() bind(c, value='c_foo')\nend subroutine\n");
+        assert!(err.msg.contains("expected NAME"), "unexpected error: {err}");
     }
 }

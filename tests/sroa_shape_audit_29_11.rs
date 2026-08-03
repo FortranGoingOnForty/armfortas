@@ -176,8 +176,9 @@ fn realworld_shape_guard_uses_runtime_shape_queries_and_stays_deterministic() {
             "real-world runtime-shape guard should run successfully at {:?}:\n{:#?}",
             level, run
         );
+        let stdout = run.stdout_text().expect("run stdout should be UTF-8");
         assert!(
-            stdout_has_fields(&run.stdout, &["6", "0", "5", "12", "36"]),
+            stdout_has_fields(stdout, &["6", "0", "5", "12", "36"]),
             "runtime-shape guard should preserve the descriptor-backed query results at {:?}:\n{:#?}",
             level, run
         );

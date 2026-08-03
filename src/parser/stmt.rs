@@ -781,24 +781,31 @@ impl<'a> Parser<'a> {
         start: crate::lexer::Span,
         is_error: bool,
     ) -> Result<SpannedStmt, ParseError> {
-        let code = if !self.at_stmt_end() && !self.peek_text().eq_ignore_ascii_case("quiet") {
+        let starts_quiet_spec = self.peek_text().eq_ignore_ascii_case("quiet")
+            && self.peek_kind_at(1) == Some(&TokenKind::Assign);
+        let code = if !self.at_stmt_end() && self.peek() != &TokenKind::Comma && !starts_quiet_spec
+        {
             Some(self.parse_expr()?)
         } else {
             None
         };
 
-        // Check for QUIET= specifier.
-        let mut quiet = false;
-        let _ = self.eat(&TokenKind::Comma); // optional comma before QUIET=
-        if self.peek_text().eq_ignore_ascii_case("quiet") {
+        let quiet = if self.eat(&TokenKind::Comma) {
+            if !self.peek_text().eq_ignore_ascii_case("quiet") {
+                return Err(
+                    self.error("expected QUIET= specifier after ',' in STOP statement".into())
+                );
+            }
             self.advance();
             self.expect(&TokenKind::Assign)?;
-            let val_text = self.peek_text().to_lowercase();
-            if val_text == ".true." || val_text == ".t." {
-                quiet = true;
-            }
-            self.advance(); // consume the logical literal
-        }
+            Some(self.parse_expr()?)
+        } else if self.peek_text().eq_ignore_ascii_case("quiet")
+            && self.peek_kind_at(1) == Some(&TokenKind::Assign)
+        {
+            return Err(self.error("expected ',' before QUIET= specifier".into()));
+        } else {
+            None
+        };
 
         let span = span_from_to(start, self.prev_span());
         if is_error {
@@ -902,24 +909,35 @@ impl<'a> Parser<'a> {
 
     fn parse_format(&mut self, start: crate::lexer::Span) -> Result<SpannedStmt, ParseError> {
         self.advance(); // consume FORMAT
+        if self.peek() != &TokenKind::LParen {
+            return Err(self.error("FORMAT specification must begin with '('".to_string()));
+        }
+
         let mut spec = String::new();
-        if self.peek() == &TokenKind::LParen {
-            let mut depth = 0i32;
-            while self.peek() != &TokenKind::Eof && !self.at_stmt_end() {
-                let tok = self.advance().clone();
-                spec.push_str(&tok.text);
-                match tok.kind {
-                    TokenKind::LParen => depth += 1,
-                    TokenKind::RParen => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
+        let opening = self.advance().clone();
+        spec.push_str(&opening.text);
+        let mut depth = 1usize;
+        while self.peek() != &TokenKind::Eof && !self.at_stmt_end() {
+            let tok = self.advance().clone();
+            spec.push_str(&tok.text);
+            match tok.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
+        if depth != 0 {
+            return Err(self.error(
+                "unterminated FORMAT specification: expected ')' before end of statement"
+                    .to_string(),
+            ));
+        }
+
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Format { spec }, span))
     }
@@ -1844,7 +1862,7 @@ impl<'a> Parser<'a> {
     // ---- Helpers ----
 
     pub(crate) fn consume_end(&mut self, keyword: &str) -> Result<(), ParseError> {
-        self.consume_end_prefix(keyword)?;
+        self.consume_end_prefix(keyword, false)?;
 
         // Skip optional construct name after end, but only on the same line.
         // For END INTERFACE, Fortran also permits a trailing generic-spec such
@@ -1870,7 +1888,9 @@ impl<'a> Parser<'a> {
         keyword: &str,
         expected_name: Option<&str>,
     ) -> Result<(), ParseError> {
-        self.consume_end_prefix(keyword)?;
+        // A bare END is a conforming terminator for a program unit. Structured
+        // constructs use consume_end(), which requires END <keyword>.
+        self.consume_end_prefix(keyword, true)?;
 
         if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
             let actual = self.peek_text();
@@ -1895,7 +1915,11 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn consume_end_prefix(&mut self, keyword: &str) -> Result<(), ParseError> {
+    fn consume_end_prefix(
+        &mut self,
+        keyword: &str,
+        allow_bare_end: bool,
+    ) -> Result<(), ParseError> {
         self.skip_newlines();
         let text = self.peek_text().to_lowercase();
         let joined_keyword: String = keyword.split_ascii_whitespace().collect();
@@ -1917,7 +1941,12 @@ impl<'a> Parser<'a> {
                                 matched_parts.join(" ")
                             )));
                         }
-                        break;
+                        if allow_bare_end && self.at_stmt_end() {
+                            return Ok(());
+                        }
+                        return Err(
+                            self.error(format!("expected '{}' after 'end'", joined_keyword))
+                        );
                     }
                 }
             }
@@ -1934,12 +1963,24 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
+    use crate::lexer::{fixed::tokenize_fixed, Lexer};
 
     fn parse_one(src: &str) -> SpannedStmt {
         let tokens = Lexer::tokenize(src, 0).unwrap();
         let mut parser = Parser::new(&tokens);
         parser.parse_stmt().unwrap()
+    }
+
+    fn parse_error(src: &str) -> ParseError {
+        let tokens = Lexer::tokenize(src, 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.parse_stmt().unwrap_err()
+    }
+
+    fn parse_fixed_error(src: &str) -> ParseError {
+        let tokens = tokenize_fixed(src, 0).unwrap();
+        let mut parser = Parser::new_for_form(&tokens, crate::lexer::SourceForm::FixedForm);
+        parser.parse_stmt().unwrap_err()
     }
 
     // ---- Assignment ----
@@ -2223,6 +2264,34 @@ mod tests {
     fn error_stop() {
         let s = parse_one("error stop\n");
         assert!(matches!(s.node, Stmt::ErrorStop { .. }));
+    }
+
+    #[test]
+    fn stop_quiet_accepts_a_full_logical_expression() {
+        let stmt = parse_one("error stop 'boom', quiet=(enabled .and. probe())\n");
+        let Stmt::ErrorStop {
+            quiet: Some(quiet), ..
+        } = stmt.node
+        else {
+            panic!("QUIET= expression was not retained in the AST");
+        };
+        assert!(
+            matches!(quiet.node, Expr::ParenExpr { .. }),
+            "QUIET= must retain the complete parenthesized expression"
+        );
+    }
+
+    #[test]
+    fn stop_quiet_requires_the_standard_comma() {
+        let tokens = Lexer::tokenize("error stop 'boom' quiet=.true.\n", 0).unwrap();
+        let mut parser = Parser::new(&tokens);
+        let err = parser
+            .parse_file()
+            .expect_err("QUIET= without its separating comma must be rejected");
+        assert!(
+            err.to_string().contains("expected ',' before QUIET="),
+            "unexpected diagnostic: {err}"
+        );
     }
 
     #[test]
@@ -2860,6 +2929,48 @@ end if
         } else {
             panic!("not Labeled, got {:?}", s.node);
         }
+    }
+
+    #[test]
+    fn format_requires_an_opening_parenthesis() {
+        for error in [
+            parse_error("100 format i5\n"),
+            parse_fixed_error("  100 FORMAT I5\n"),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("FORMAT specification must begin with '('"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_requires_balanced_parentheses() {
+        for error in [
+            parse_error("100 format(2(i5)\n"),
+            parse_fixed_error("  100 FORMAT(2(I5)\n"),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("unterminated FORMAT specification"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_format_preserves_nested_spec() {
+        let s = parse_one("100 format(2(1x, i0), *(f8.3))\n");
+        let Stmt::Labeled { stmt, .. } = &s.node else {
+            panic!("not a labeled statement");
+        };
+        let Stmt::Format { spec } = &stmt.node else {
+            panic!("labeled inner statement should be FORMAT");
+        };
+        assert_eq!(spec, "(2(1x,i0),*(f8.3))");
     }
 
     #[test]

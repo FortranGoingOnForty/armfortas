@@ -172,6 +172,168 @@ fn output_contains_expected(output: &str, expected: &str) -> bool {
 // ---- Tests ----
 
 #[test]
+fn volatile_module_variable_survives_amod_round_trip() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let module_source = dir.join("volatile_provider.f90");
+    let module_object = dir.join("volatile_provider.o");
+    let consumer_source = dir.join("volatile_consumer.f90");
+
+    std::fs::write(
+        &module_source,
+        "module volatile_provider\n  integer, volatile :: watched\n  volatile :: observed\n  integer :: consumer_marked\nend module volatile_provider\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_source,
+        "subroutine observe_volatile()\n  use volatile_provider, only: watched, observed, consumer_marked\n  implicit none\n  volatile :: consumer_marked\n  integer :: sink\n  real :: real_sink\n\n  sink = watched\n  watched = sink + 1\n  real_sink = observed\n  observed = real_sink + 1.0\n  sink = consumer_marked\n  consumer_marked = sink + 2\nend subroutine observe_volatile\n",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &module_source, &module_object, None);
+    let amod = std::fs::read_to_string(dir.join("volatile_provider.amod"))
+        .expect("volatile provider did not emit its module interface");
+    assert!(
+        amod.lines()
+            .any(|line| line.starts_with("@var watched :") && line.contains("volatile")),
+        "VOLATILE module-variable metadata must survive serialization:\n{amod}"
+    );
+    assert!(
+        amod.lines()
+            .any(|line| line.starts_with("@var observed :") && line.contains("volatile")),
+        "implicitly typed VOLATILE module-variable metadata must survive serialization:\n{amod}"
+    );
+    let consumer_marked_line = amod
+        .lines()
+        .find(|line| line.starts_with("@var consumer_marked :"))
+        .expect("ordinary module variable should be serialized");
+    let consumer_marked_attrs = consumer_marked_line
+        .split_once(" @ir ")
+        .map(|(attrs, _)| attrs)
+        .expect("module variable metadata should include an IR binding");
+    assert!(
+        !consumer_marked_attrs.contains("volatile"),
+        "a consumer-local VOLATILE overlay must not mutate provider metadata:\n{amod}"
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let ir = dir.join(format!(
+            "volatile_consumer_{}.ir",
+            optimization.trim_start_matches('-')
+        ));
+        let emit = Command::new(&compiler)
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "--emit-ir",
+                consumer_source.to_str().unwrap(),
+                "-o",
+                ir.to_str().unwrap(),
+            ])
+            .arg(format!("-I{}", dir.display()))
+            .output()
+            .expect("volatile consumer IR emission failed to spawn");
+        assert!(
+            emit.status.success(),
+            "{optimization}: volatile consumer IR emission failed: {}",
+            String::from_utf8_lossy(&emit.stderr)
+        );
+        let ir_text =
+            std::fs::read_to_string(&ir).expect("cannot read volatile consumer IR output");
+        assert_eq!(
+            ir_text.matches("volatile_load").count(),
+            3,
+            "{optimization}: provider and consumer-local VOLATILE loads must remain observable:\n{ir_text}"
+        );
+        assert_eq!(
+            ir_text.matches("volatile_store").count(),
+            3,
+            "{optimization}: provider and consumer-local VOLATILE stores must remain observable:\n{ir_text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn move_alloc_type_identity_survives_amod_round_trip() {
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_source = dir.join("move_alloc_types.f90");
+    let provider_object = dir.join("move_alloc_types.o");
+    let valid_source = dir.join("valid_consumer.f90");
+    let valid_object = dir.join("valid_consumer.o");
+    let valid_binary = dir.join("valid_consumer.bin");
+    let invalid_source = dir.join("invalid_consumer.f90");
+    let invalid_object = dir.join("invalid_consumer.o");
+
+    std::fs::write(
+        &provider_source,
+        "module move_alloc_types\n  implicit none\n  type :: payload_t\n    integer :: value = 0\n  end type payload_t\n  type :: other_t\n    integer :: value = 0\n  end type other_t\nend module move_alloc_types\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &provider_source, &provider_object, None);
+
+    std::fs::write(
+        &valid_source,
+        "program valid_consumer\n  use move_alloc_types, only: source_t => payload_t, target_t => payload_t\n  implicit none\n  type(source_t), allocatable :: source\n  type(target_t), allocatable :: target\n  allocate(source)\n  source%value = 42\n  call move_alloc(source, target)\n  if (allocated(source)) error stop 1\n  if (.not. allocated(target)) error stop 2\n  print *, target%value\nend program valid_consumer\n",
+    )
+    .unwrap();
+    compile_file(&compiler, &valid_source, &valid_object, Some(&dir));
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        armfortas::testing::report_harness_skip(
+            "multifile",
+            "move_alloc_type_identity_survives_amod_round_trip",
+            1,
+            &reason,
+        );
+    } else {
+        link_files(&[&provider_object, &valid_object], &valid_binary);
+        let output = run_binary(&valid_binary);
+        assert!(
+            output_contains_expected(&output, "42"),
+            "renamed aliases of one exported type must remain MOVE_ALLOC-compatible: {output}"
+        );
+    }
+
+    std::fs::write(
+        &invalid_source,
+        "subroutine invalid_consumer()\n  use move_alloc_types, only: payload_t, other_t\n  implicit none\n  type(payload_t), allocatable :: source\n  type(other_t), allocatable :: target\n  call move_alloc(source, target)\nend subroutine invalid_consumer\n",
+    )
+    .unwrap();
+    let invalid = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            invalid_source.to_str().unwrap(),
+            "-c",
+            "-o",
+            invalid_object.to_str().unwrap(),
+        ])
+        .arg(format!("-I{}", dir.display()))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("invalid MOVE_ALLOC consumer compile failed to spawn");
+    assert!(
+        !invalid.status.success(),
+        "distinct exported derived types must be rejected by MOVE_ALLOC"
+    );
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.contains(
+            "MOVE_ALLOC FROM and TO arguments must have compatible declared type and kind"
+        ) && stderr.contains("TYPE(payload_t)")
+            && stderr.contains("TYPE(other_t)"),
+        "cross-TU MOVE_ALLOC diagnostic lost exported type identity:\n{stderr}"
+    );
+    assert!(
+        !invalid_object.exists(),
+        "rejected MOVE_ALLOC consumer left an object artifact"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn serialized_intrinsic_use_keeps_provider_nature() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(
@@ -696,17 +858,42 @@ fn amod_omits_stale_abi_stamp() {
     let compiler = find_compiler();
     let dir = unique_dir();
     let module_f90 = dir.join("target_stamp.f90");
-    let module_o = dir.join("target_stamp.o");
 
     std::fs::write(
         &module_f90,
-        "module target_stamp\n  implicit none\n  integer, parameter :: answer = 42\nend module\n",
+        "module target_stamp\n  implicit none\ncontains\n  subroutine consume(text)\n    character(*), intent(in) :: text\n    if (len(text) < 0) error stop\n  end subroutine\nend module\n",
     )
     .unwrap();
-    compile_file(&compiler, &module_f90, &module_o, None);
 
-    let amod =
-        std::fs::read_to_string(dir.join("target_stamp.amod")).expect("missing target_stamp.amod");
+    let mut artifacts = Vec::new();
+    for target in ["x86_64-linux-musl", "arm64-macos"] {
+        let target_dir = dir.join(target);
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let compile = Command::new(&compiler)
+            .current_dir(&dir)
+            .args(["-c", "--target", target, "-J"])
+            .arg(&target_dir)
+            .arg(&module_f90)
+            .args(["-o"])
+            .arg(target_dir.join("target_stamp.o"))
+            .output()
+            .expect("cross-target module compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{target} module compile failed:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        artifacts.push(
+            std::fs::read_to_string(target_dir.join("target_stamp.amod"))
+                .expect("missing target_stamp.amod"),
+        );
+    }
+
+    assert_eq!(
+        artifacts[0], artifacts[1],
+        ".amod procedure metadata should be destination-independent"
+    );
+    let amod = &artifacts[0];
     assert!(
         !amod.lines().any(|line| line.starts_with("# abi:")),
         ".amod should not stamp a non-authoritative ABI line:\n{}",
@@ -715,6 +902,11 @@ fn amod_omits_stale_abi_stamp() {
     assert!(
         !amod.contains("cc=aapcs64") && !amod.contains("@abi pass="),
         ".amod should not stamp target-specific procedure ABI annotations:\n{}",
+        amod
+    );
+    assert!(
+        amod.contains("@arg text@len : integer(8)"),
+        ".amod must retain target-independent hidden-length metadata:\n{}",
         amod
     );
 
@@ -751,6 +943,102 @@ fn module_parameter_constants() {
         "program p\n  use consts\n  print *, MAX_N, HALF\nend program\n",
         "1024",
     );
+}
+
+#[test]
+fn character_parameter_length_is_independent_of_unrelated_module_order() {
+    for level in ["-O0", "-O2"] {
+        if let Err(reason) = armfortas::testing::native_e2e_level_support(level) {
+            eprintln!(
+                "\nHARNESS_SKIP suite=multifile test=character_parameter_length_is_independent_of_unrelated_module_order count=4 reason=\"{}\"",
+                reason
+            );
+            return;
+        }
+    }
+
+    let compiler = find_compiler();
+    let producer_orders = [
+        (
+            "foreign_first",
+            "\
+module foreign_m
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module foreign_m
+
+module victim_m
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: copied = seed
+end module victim_m
+",
+        ),
+        (
+            "victim_first",
+            "\
+module victim_m
+  implicit none
+  character(1), parameter :: seed = 'Z'
+  character(*), parameter :: copied = seed
+end module victim_m
+
+module foreign_m
+  implicit none
+  character(8), parameter :: seed = '12345678'
+end module foreign_m
+",
+        ),
+    ];
+
+    for (order, producer_source) in producer_orders {
+        let dir = unique_dir();
+        let producer_f90 = dir.join(format!("producer_{order}.f90"));
+        let producer_o = dir.join(format!("producer_{order}.o"));
+        let consumer_f90 = dir.join("consumer.f90");
+
+        std::fs::write(&producer_f90, producer_source).unwrap();
+        std::fs::write(
+            &consumer_f90,
+            "\
+program consumer
+  use victim_m, only: copied
+  implicit none
+  if (len(copied) /= 1) error stop 1
+  if (iachar(copied(1:1)) /= iachar('Z')) error stop 2
+  print *, len(copied), iachar(copied(1:1))
+end program consumer
+",
+        )
+        .unwrap();
+
+        compile_file(&compiler, &producer_f90, &producer_o, None);
+        let amod = std::fs::read_to_string(dir.join("victim_m.amod"))
+            .expect("producer did not emit victim_m.amod");
+        let copied = amod
+            .lines()
+            .find(|line| line.starts_with("@param copied :"))
+            .expect("victim_m.amod omitted copied");
+        assert!(
+            copied.contains("character(len=1)"),
+            "{order} serialized a non-lexical character length:\n{copied}"
+        );
+
+        for level in ["-O0", "-O2"] {
+            let suffix = level.trim_start_matches('-');
+            let consumer_o = dir.join(format!("consumer_{suffix}.o"));
+            let binary = dir.join(format!("consumer_{suffix}"));
+            compile_file_flags(&compiler, &consumer_f90, &consumer_o, Some(&dir), &[level]);
+            link_files(&[&producer_o, &consumer_o], &binary);
+            let output = run_binary(&binary);
+            assert!(
+                output_contains_expected(&output, "1 90"),
+                "{order} consumer at {level} observed the wrong value:\n{output}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
@@ -967,8 +1255,8 @@ fn generic_interface_cross_module() {
     }
     multifile_test(
         "module mgen\n  implicit none\n  interface add\n    module procedure add_int, add_real\n  end interface\ncontains\n  integer function add_int(a, b)\n    integer, intent(in) :: a, b\n    add_int = a + b\n  end function\n  real function add_real(a, b)\n    real, intent(in) :: a, b\n    add_real = a + b\n  end function\nend module\n",
-        "program p\n  use mgen\n  print *, add(1, 2)\n  print *, add(1.5, 2.5)\nend program\n",
-        "3",
+        "program p\n  use mgen\n  implicit none\n  integer :: integer_result\n  real :: real_result\n  integer_result = add(1, 2)\n  real_result = add(1.5, 2.5)\n  if (integer_result /= 3) error stop 1\n  if (abs(real_result - 4.0) > 1.0e-6) error stop 2\n  print '(a)', 'generic-dispatch-ok'\nend program\n",
+        "generic-dispatch-ok",
     );
 }
 
@@ -1496,6 +1784,547 @@ fn module_private_default() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// AR40-05: private derived-type layouts remain serialized for descendant
+// submodules, but their symbols must retain PRIVATE accessibility when an
+// ordinary consumer reconstructs the provider from its .amod.
+#[test]
+fn private_derived_type_access_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=private_derived_type_access_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    for (case, module_name, declarations) in [
+        (
+            "default_private",
+            "default_private_types",
+            "  private\n  public :: visible_t\n\n  type :: hidden_t\n    integer :: value\n  end type hidden_t\n\n  type :: visible_t\n    integer :: value\n  end type visible_t\n",
+        ),
+        (
+            "explicit_private",
+            "explicit_private_types",
+            "  type, private :: hidden_t\n    integer :: value\n  end type hidden_t\n\n  type :: visible_t\n    integer :: value\n  end type visible_t\n",
+        ),
+    ] {
+        let case_dir = dir.join(case);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let provider_f90 = case_dir.join("provider.f90");
+        let provider_o = case_dir.join("provider.o");
+        let hidden_f90 = case_dir.join("hidden_consumer.f90");
+        let hidden_o = case_dir.join("hidden_consumer.o");
+        let bare_hidden_f90 = case_dir.join("bare_hidden_consumer.f90");
+        let bare_hidden_o = case_dir.join("bare_hidden_consumer.o");
+        let child_f90 = case_dir.join("child.f90");
+        let child_o = case_dir.join("child.o");
+        let visible_f90 = case_dir.join("visible_consumer.f90");
+        let visible_o = case_dir.join("visible_consumer.o");
+
+        std::fs::write(
+            &provider_f90,
+            format!(
+                "module {module_name}\n  implicit none\n{declarations}end module {module_name}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &hidden_f90,
+            format!(
+                "program hidden_consumer\n  use {module_name}, only: hidden_t\n  implicit none\n  type(hidden_t) :: item\n  item%value = 17\nend program hidden_consumer\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &bare_hidden_f90,
+            format!(
+                "program bare_hidden_consumer\n  use {module_name}\n  implicit none\n  type(hidden_t) :: item\n  item%value = 19\nend program bare_hidden_consumer\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child_f90,
+            format!(
+                "submodule({module_name}) child\n  implicit none\n  type(hidden_t) :: item\nend submodule child\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &visible_f90,
+            format!(
+                "program visible_consumer\n  use {module_name}, only: visible_t\n  implicit none\n  type(visible_t) :: item\n  item%value = 23\nend program visible_consumer\n"
+            ),
+        )
+        .unwrap();
+
+        compile_file(&compiler, &provider_f90, &provider_o, None);
+
+        let rejected = Command::new(&compiler)
+            .current_dir(&case_dir)
+            .args([
+                hidden_f90.to_str().unwrap(),
+                "-c",
+                "-o",
+                hidden_o.to_str().unwrap(),
+            ])
+            .arg(format!("-I{}", case_dir.display()))
+            .output()
+            .expect("private-type consumer compiler launch failed");
+        assert!(
+            !rejected.status.success(),
+            "{case}: a private derived type reconstructed from .amod was USE-associated"
+        );
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "USE target 'hidden_t' is not exported by module '{module_name}'"
+            )),
+            "{case}: source and .amod private-type diagnostics diverged:\n{stderr}"
+        );
+        assert!(
+            !hidden_o.exists(),
+            "{case}: rejected private-type consumer left an object file"
+        );
+
+        let bare_rejected = Command::new(&compiler)
+            .current_dir(&case_dir)
+            .args([
+                bare_hidden_f90.to_str().unwrap(),
+                "-c",
+                "-o",
+                bare_hidden_o.to_str().unwrap(),
+            ])
+            .arg(format!("-I{}", case_dir.display()))
+            .output()
+            .expect("bare-USE private-type consumer compiler launch failed");
+        assert!(
+            !bare_rejected.status.success(),
+            "{case}: bare USE exposed a private derived type reconstructed from .amod"
+        );
+        let bare_stderr = String::from_utf8_lossy(&bare_rejected.stderr);
+        assert!(
+            bare_stderr.contains("derived type 'hidden_t' is not accessible in this scope"),
+            "{case}: bare-USE private-type diagnostic was not explicit:\n{bare_stderr}"
+        );
+        assert!(
+            !bare_hidden_o.exists(),
+            "{case}: rejected bare-USE private-type consumer left an object file"
+        );
+
+        compile_file(&compiler, &visible_f90, &visible_o, Some(&case_dir));
+        compile_file(&compiler, &child_f90, &child_o, Some(&case_dir));
+
+        let amod = std::fs::read_to_string(case_dir.join(format!("{module_name}.amod"))).unwrap();
+        let hidden_line = amod
+            .lines()
+            .find(|line| line.starts_with("@type hidden_t"))
+            .expect("private layout must remain in .amod for submodule host association");
+        let visible_line = amod
+            .lines()
+            .find(|line| line.starts_with("@type visible_t"))
+            .expect("public layout must be present in .amod");
+        assert!(
+            hidden_line.ends_with(", private"),
+            "{case}: private type accessibility missing from .amod: {hidden_line}"
+        );
+        assert!(
+            visible_line.ends_with(", public"),
+            "{case}: public type accessibility missing from .amod: {visible_line}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// AR40-06: component accessibility is part of a derived type's semantic
+// interface. It must survive .amod reconstruction without hiding the layout
+// bytes required by descendant submodules and extending types.
+#[test]
+fn private_component_access_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=private_component_access_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_f90 = dir.join("provider.f90");
+    let provider_o = dir.join("provider.o");
+    let consumer_f90 = dir.join("consumer.f90");
+    let consumer_o = dir.join("consumer.o");
+    let public_consumer_f90 = dir.join("public_consumer.f90");
+    let public_consumer_o = dir.join("public_consumer.o");
+    let child_f90 = dir.join("child.f90");
+    let child_o = dir.join("child.o");
+
+    std::fs::write(
+        &provider_f90,
+        "\
+module component_provider
+  implicit none
+  private
+  public :: explicit_box, default_box, extended_box, set_hidden
+
+  abstract interface
+    subroutine callback_iface()
+    end subroutine callback_iface
+  end interface
+
+  type :: explicit_box
+    integer, private :: explicit_hidden = 0
+    integer, public :: explicit_shown = 0
+    procedure(callback_iface), pointer, private, nopass :: private_callback
+  end type explicit_box
+
+  type :: default_box
+    private
+    integer :: default_hidden = 0
+    integer, public :: default_shown = 0
+  end type default_box
+
+  type, extends(default_box) :: extended_box
+    integer, public :: extended_shown = 0
+  end type extended_box
+
+  interface
+    module subroutine set_hidden(value)
+      type(default_box), intent(inout) :: value
+    end subroutine set_hidden
+  end interface
+end module component_provider
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_f90,
+        "\
+module foreign_extension
+  use component_provider, only: default_box
+  implicit none
+  type, extends(default_box) :: child_box
+    integer :: child_value = 0
+  end type child_box
+contains
+  subroutine touch(value)
+    type(child_box), intent(inout) :: value
+    value%default_hidden = 1
+  end subroutine touch
+end module foreign_extension
+
+program private_consumer
+  use component_provider, only: renamed_box => explicit_box, default_box
+  implicit none
+  type(renamed_box) :: left
+  type(default_box) :: right
+  left%explicit_hidden = 2
+  right%default_hidden = 3
+  if (associated(left%private_callback)) stop 1
+  left = renamed_box(explicit_hidden=4)
+  right = default_box(5)
+  associate (alias => left)
+    alias%explicit_hidden = 6
+  end associate
+end program private_consumer
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &public_consumer_f90,
+        "\
+program public_consumer
+  use component_provider, only: explicit_box, default_box, extended_box
+  implicit none
+  type(explicit_box) :: left
+  type(default_box) :: right
+  type(extended_box) :: extended
+  left%explicit_shown = 7
+  right%default_shown = 8
+  left = explicit_box(explicit_shown=9)
+  right = default_box(default_shown=10)
+  extended = extended_box(default_box(default_shown=11), 12)
+  extended = extended_box(default_box=default_box(default_shown=13), extended_shown=14)
+end program public_consumer
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &child_f90,
+        "\
+submodule(component_provider) component_child
+contains
+  module subroutine set_hidden(value)
+    type(default_box), intent(inout) :: value
+    value%default_hidden = 11
+  end subroutine set_hidden
+end submodule component_child
+",
+    )
+    .unwrap();
+
+    compile_file(&compiler, &provider_f90, &provider_o, None);
+
+    let amod = std::fs::read_to_string(dir.join("component_provider.amod")).expect("missing .amod");
+    for (field, access) in [
+        ("explicit_hidden", "private"),
+        ("explicit_shown", "public"),
+        ("private_callback", "private"),
+        ("default_hidden", "private"),
+        ("default_shown", "public"),
+    ] {
+        let line = amod
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("@field {field} ")))
+            .unwrap_or_else(|| panic!("missing {field} field record:\n{amod}"));
+        assert!(
+            line.contains(&format!("@access {access}"))
+                && line.contains("@owner component_provider"),
+            "{field} accessibility/owner missing from .amod: {line}"
+        );
+    }
+
+    let rejected = Command::new(&compiler)
+        .current_dir(&dir)
+        .args([
+            consumer_f90.to_str().unwrap(),
+            "-c",
+            "-o",
+            consumer_o.to_str().unwrap(),
+        ])
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("private-component consumer compiler launch failed");
+    assert!(
+        !rejected.status.success(),
+        "ordinary and foreign-extending consumers accessed private components"
+    );
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert_eq!(
+        stderr.matches("private component").count(),
+        7,
+        "private-component diagnostics were incomplete:\n{stderr}"
+    );
+    assert!(
+        !consumer_o.exists(),
+        "rejected private-component consumer left an object file"
+    );
+
+    compile_file(
+        &compiler,
+        &public_consumer_f90,
+        &public_consumer_o,
+        Some(&dir),
+    );
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// AR54-05 / semantics-modules-031: a constructor for an extended type
+// associates an explicit parent value with the whole immediate-parent
+// component. The physical layout remains flattened, so this must be recovered
+// from the imported semantic layout rather than by indexing its field vector;
+// ordinary positional values must still traverse the inherited fields.
+#[test]
+fn extension_constructor_parent_component_round_trips_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=extension_constructor_parent_component_round_trips_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let provider = r#"
+module extension_constructor_types
+  implicit none
+
+  type :: base_t
+    integer :: left = 1
+    integer :: right = 2
+  end type base_t
+
+  type, extends(base_t) :: child_t
+    integer :: own = 3
+  end type child_t
+
+  type, extends(child_t) :: grand_t
+    integer :: tail = 4
+  end type grand_t
+contains
+  function make_base(left, right) result(value)
+    integer, intent(in) :: left, right
+    type(base_t) :: value
+    value = base_t(left, right)
+  end function make_base
+end module extension_constructor_types
+"#;
+    let consumer = r#"
+module extension_constructor_state
+  use extension_constructor_types, only: base_t, child_t
+  implicit none
+  type(child_t), save :: frozen = child_t(base_t(101, 102), 103)
+end module extension_constructor_state
+
+program exercise_extension_constructor
+  use extension_constructor_types
+  use extension_constructor_state, only: frozen
+  implicit none
+  type(child_t) :: positional, keyword, flattened, individual, omitted, middle
+  type(grand_t) :: grand
+
+  positional = child_t(make_base(11, 22), 33)
+  keyword = child_t(base_t=make_base(21, 32), own=43)
+  flattened = child_t(left=51, right=62, own=73)
+  individual = child_t(81, 82, 83)
+  omitted = child_t(own=84)
+  middle = child_t(base_t(91, 92), 93)
+  grand = grand_t(middle, 94)
+
+  if (positional%left /= 11 .or. positional%right /= 22 .or. positional%own /= 33) error stop 1
+  if (keyword%left /= 21 .or. keyword%right /= 32 .or. keyword%own /= 43) error stop 2
+  if (flattened%left /= 51 .or. flattened%right /= 62 .or. flattened%own /= 73) error stop 3
+  if (individual%left /= 81 .or. individual%right /= 82 .or. individual%own /= 83) error stop 4
+  if (omitted%left /= 1 .or. omitted%right /= 2 .or. omitted%own /= 84) error stop 5
+  if (grand%left /= 91 .or. grand%right /= 92 .or. grand%own /= 93 .or. grand%tail /= 94) error stop 6
+  if (frozen%left /= 101 .or. frozen%right /= 102 .or. frozen%own /= 103) error stop 7
+  print *, 'AR54-05 PASS'
+end program exercise_extension_constructor
+"#;
+
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        multifile_test_flags(provider, consumer, "AR54-05 PASS", &[opt]);
+    }
+}
+
+// AR40-01: a separate module function's RESULT identity is declared by its
+// interface. Unrelated locals and named constants must not affect same-TU
+// lowering or the identity serialized for cross-TU compilation.
+#[test]
+fn separate_module_function_result_identity_ignores_unrelated_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=separate_module_function_result_identity_ignores_unrelated_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let parent_f90 = dir.join("result_parent.f90");
+    let child_f90 = dir.join("result_child.f90");
+    let main_f90 = dir.join("result_main.f90");
+    let parent_o = dir.join("result_parent.o");
+    let child_o = dir.join("result_child.o");
+    let main_o = dir.join("result_main.o");
+    let single_f90 = dir.join("result_single.f90");
+    let single_bin = dir.join("result_single_bin");
+    let cross_tu_bin = dir.join("result_cross_tu_bin");
+
+    let parent_source = r#"module result_parent
+  implicit none
+  interface
+    module function answer() result(actual_result)
+      integer, parameter :: decoy_a = 101
+      integer, parameter :: decoy_b = 102
+      integer, parameter :: decoy_c = 103
+      integer, parameter :: decoy_d = 104
+      integer, parameter :: decoy_e = 105
+      integer, parameter :: decoy_f = 106
+      integer, parameter :: decoy_g = 107
+      integer, parameter :: decoy_h = 108
+      integer, parameter :: decoy_i = 109
+      integer, parameter :: decoy_j = 110
+      integer, parameter :: decoy_k = 111
+      integer, parameter :: decoy_l = 112
+      integer, parameter :: decoy_m = 113
+      integer, parameter :: decoy_n = 114
+      integer, parameter :: decoy_o = 115
+      integer, parameter :: decoy_p = 116
+      integer :: actual_result
+    end function answer
+  end interface
+end module result_parent
+"#;
+    let child_source = r#"submodule (result_parent) result_child
+contains
+  module procedure answer
+    actual_result = 42
+  end procedure answer
+end submodule result_child
+"#;
+    let main_source = r#"program result_main
+  use result_parent, only : answer
+  implicit none
+  if (answer() /= 42) error stop 1
+  print '(a)', 'ok'
+end program result_main
+"#;
+
+    std::fs::write(&parent_f90, parent_source).unwrap();
+    std::fs::write(&child_f90, child_source).unwrap();
+    std::fs::write(&main_f90, main_source).unwrap();
+    std::fs::write(
+        &single_f90,
+        format!("{parent_source}\n{child_source}\n{main_source}"),
+    )
+    .unwrap();
+
+    for attempt in 0..8 {
+        let single_compile = Command::new(&compiler)
+            .current_dir(&dir)
+            .args([
+                single_f90.to_str().unwrap(),
+                "-o",
+                single_bin.to_str().unwrap(),
+            ])
+            .output()
+            .expect("single-TU result-identity compile failed to spawn");
+        assert!(
+            single_compile.status.success(),
+            "single-TU result-identity compile attempt {attempt} failed:\n{}",
+            String::from_utf8_lossy(&single_compile.stderr)
+        );
+        let single_run = Command::new(&single_bin)
+            .output()
+            .expect("single-TU result-identity binary failed to spawn");
+        assert!(
+            single_run.status.success()
+                && String::from_utf8_lossy(&single_run.stdout).contains("ok"),
+            "same-TU compile attempt {attempt} selected an unrelated symbol as its result:\nstatus={:?}\nstdout={}\nstderr={}",
+            single_run.status.code(),
+            String::from_utf8_lossy(&single_run.stdout),
+            String::from_utf8_lossy(&single_run.stderr)
+        );
+    }
+
+    compile_file(&compiler, &parent_f90, &parent_o, None);
+    let amod = std::fs::read_to_string(dir.join("result_parent.amod")).unwrap();
+    let function_record = amod
+        .lines()
+        .find(|line| line.starts_with("@function answer "))
+        .expect("answer function record missing from result_parent.amod");
+    assert!(
+        function_record.contains("result_name=actual_result"),
+        "serialized function lost its explicit result identity: {function_record}"
+    );
+    compile_file(&compiler, &child_f90, &child_o, Some(&dir));
+    compile_file(&compiler, &main_f90, &main_o, Some(&dir));
+    link_files(&[&main_o, &child_o, &parent_o], &cross_tu_bin);
+    let cross_tu_output = run_binary(&cross_tu_bin);
+    assert!(
+        cross_tu_output.contains("ok"),
+        "cross-TU separate module function lost its serialized result identity:\n{cross_tu_output}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // l07: a separately-compiled submodule whose body implements a parent
 // MODULE FUNCTION must return the right type. The result variable's type
 // comes from the parent interface via the `.amod`; before l07 it fell to
@@ -1662,6 +2491,87 @@ end program
     assert!(
         output.contains("ok"),
         "cross-TU submodule array result returned wrong values:\n{}",
+        output
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imported_interface_preserves_procedure_pointer_array_result_shape() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=imported_interface_preserves_procedure_pointer_array_result_shape count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let provider_f90 = dir.join("array_factory_provider.f90");
+    let consumer_f90 = dir.join("array_factory_consumer.f90");
+    let provider_o = dir.join("array_factory_provider.o");
+    let consumer_o = dir.join("array_factory_consumer.o");
+    let binary = dir.join("array_factory_bin");
+
+    std::fs::write(
+        &provider_f90,
+        r#"module array_factory_provider
+  implicit none
+  abstract interface
+    function array_factory(n) result(values)
+      integer, intent(in) :: n
+      integer :: values(2, n)
+    end function array_factory
+  end interface
+contains
+  function build_values(n) result(values)
+    integer, intent(in) :: n
+    integer :: values(2, n)
+    values(1, 1) = 11
+    values(2, 1) = 12
+    values(1, 2) = 21
+    values(2, 2) = 22
+    values(1, 3) = 31
+    values(2, 3) = 32
+  end function build_values
+end module array_factory_provider
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer_f90,
+        r#"program p
+  use array_factory_provider, only: array_factory, build_values
+  implicit none
+  procedure(array_factory), pointer :: make_values
+  integer :: got(2, 3)
+
+  make_values => build_values
+  got = make_values(3)
+  if (any(got /= reshape([11, 12, 21, 22, 31, 32], [2, 3]))) error stop 1
+  print *, "ok"
+end program p
+"#,
+    )
+    .unwrap();
+
+    compile_file(&compiler, &provider_f90, &provider_o, None);
+    let amod = std::fs::read_to_string(dir.join("array_factory_provider.amod"))
+        .expect("missing provider module artifact");
+    assert!(
+        amod.contains(
+            "@function array_factory -> integer, result_rank=2, result_name=values, result_array_bounds=\"(2; n)\""
+        ),
+        "abstract interface array-result metadata missing from .amod:\n{}",
+        amod
+    );
+    compile_file(&compiler, &consumer_f90, &consumer_o, Some(&dir));
+    link_files(&[&provider_o, &consumer_o], &binary);
+    let output = run_binary(&binary);
+    assert!(
+        output.contains("ok"),
+        "imported procedure-pointer array result returned wrong values:\n{}",
         output
     );
 
@@ -2873,4 +3783,112 @@ fn generic_dispatch_block_local_scalar_not_shadowed_by_foreign_dummy_rank() {
         "program p\n  use noise_mod\n  use wt_mod\n  implicit none\n  block\n    type(wt) :: a\n    a%v = 5\n    print '(i0)', widen(a)\n  end block\nend program\n",
         "105",
     );
+}
+
+#[test]
+fn elemental_procedure_pointer_interfaces_are_rejected_before_artifact_publication() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=elemental_procedure_pointer_interfaces_are_rejected_before_artifact_publication count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let compiler = find_compiler();
+    let dir = unique_dir();
+    let invalid_source = dir.join("invalid_elemental_pointer.f90");
+    let invalid_object = dir.join("invalid_elemental_pointer.o");
+    let invalid_amod = dir.join("invalid_elemental_pointer.amod");
+    std::fs::write(
+        &invalid_source,
+        r#"module invalid_elemental_pointer
+  implicit none
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+  procedure(callback), pointer :: handler
+end module invalid_elemental_pointer
+"#,
+    )
+    .unwrap();
+
+    let invalid = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg(&invalid_source)
+        .args(["-c", "-o"])
+        .arg(&invalid_object)
+        .output()
+        .expect("invalid elemental procedure-pointer compile failed to spawn");
+    assert!(!invalid.status.success(), "invalid declaration compiled");
+    let invalid_stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        invalid_stderr.contains("procedure pointer 'handler' may not have an ELEMENTAL interface"),
+        "invalid declaration produced the wrong diagnostic:\n{invalid_stderr}"
+    );
+    assert!(
+        !invalid_object.exists() && !invalid_amod.exists(),
+        "failed module declaration published an object or .amod"
+    );
+
+    let provider_source = dir.join("elemental_api.f90");
+    let provider_object = dir.join("elemental_api.o");
+    std::fs::write(
+        &provider_source,
+        r#"module elemental_api
+  implicit none
+  private
+  public :: callback
+  abstract interface
+    elemental integer function callback(value)
+      integer, intent(in) :: value
+    end function callback
+  end interface
+end module elemental_api
+"#,
+    )
+    .unwrap();
+    compile_file(&compiler, &provider_source, &provider_object, None);
+    assert!(
+        dir.join("elemental_api.amod").exists(),
+        "provider did not publish its module interface"
+    );
+
+    let consumer_source = dir.join("elemental_consumer.f90");
+    let consumer_object = dir.join("elemental_consumer.o");
+    std::fs::write(
+        &consumer_source,
+        r#"program elemental_consumer
+  use elemental_api, only: callback
+  implicit none
+  procedure(callback), pointer :: handler
+end program elemental_consumer
+"#,
+    )
+    .unwrap();
+    let consumer = Command::new(&compiler)
+        .current_dir(&dir)
+        .arg(&consumer_source)
+        .args(["-c", "-o"])
+        .arg(&consumer_object)
+        .arg(format!("-I{}", dir.display()))
+        .output()
+        .expect("elemental .amod consumer compile failed to spawn");
+    assert!(
+        !consumer.status.success(),
+        "consumer accepted an imported elemental procedure-pointer interface"
+    );
+    let consumer_stderr = String::from_utf8_lossy(&consumer.stderr);
+    assert!(
+        consumer_stderr.contains("procedure pointer 'handler' may not have an ELEMENTAL interface"),
+        "imported interface produced the wrong diagnostic:\n{consumer_stderr}"
+    );
+    assert!(
+        !consumer_object.exists(),
+        "failed .amod consumer published an object"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

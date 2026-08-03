@@ -11,6 +11,22 @@ use crate::lexer::TokenKind;
 impl<'a> Parser<'a> {
     // ---- Type specifier parsing ----
 
+    /// Parse the two-token `DOUBLE PRECISION` / `DOUBLE COMPLEX` spellings
+    /// without consuming a standalone contextual identifier named `double`.
+    fn try_parse_spaced_double_type_spec(&mut self) -> Option<TypeSpec> {
+        let suffix = &self.tokens.get(self.pos + 1)?.text;
+        let type_spec = if suffix.eq_ignore_ascii_case("precision") {
+            TypeSpec::DoublePrecision
+        } else if suffix.eq_ignore_ascii_case("complex") {
+            TypeSpec::DoubleComplex
+        } else {
+            return None;
+        };
+        self.advance();
+        self.advance();
+        Some(type_spec)
+    }
+
     /// Try to parse a type specifier. Returns None if current token isn't a type keyword.
     pub fn try_parse_type_spec(&mut self) -> Option<Result<TypeSpec, ParseError>> {
         let text = self.peek_text().to_lowercase();
@@ -23,19 +39,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(self.parse_kind_selector().map(TypeSpec::Real))
             }
-            "doubleprecision" | "double" => {
+            "doubleprecision" => {
                 self.advance();
-                // Handle "double precision" / "double complex" as two tokens.
-                if self.peek_text().eq_ignore_ascii_case("precision") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoublePrecision))
-                } else if self.peek_text().eq_ignore_ascii_case("complex") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoubleComplex))
-                } else {
-                    Some(Ok(TypeSpec::DoublePrecision))
-                }
+                Some(Ok(TypeSpec::DoublePrecision))
             }
+            "double" => self.try_parse_spaced_double_type_spec().map(Ok),
             "complex" => {
                 self.advance();
                 Some(self.parse_kind_selector().map(TypeSpec::Complex))
@@ -117,18 +125,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(Ok(TypeSpec::Real(None)))
             }
-            "doubleprecision" | "double" => {
+            "doubleprecision" => {
                 self.advance();
-                if self.peek_text().eq_ignore_ascii_case("precision") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoublePrecision))
-                } else if self.peek_text().eq_ignore_ascii_case("complex") {
-                    self.advance();
-                    Some(Ok(TypeSpec::DoubleComplex))
-                } else {
-                    Some(Ok(TypeSpec::DoublePrecision))
-                }
+                Some(Ok(TypeSpec::DoublePrecision))
             }
+            "double" => self.try_parse_spaced_double_type_spec().map(Ok),
             "complex" => {
                 self.advance();
                 Some(Ok(TypeSpec::Complex(None)))
@@ -422,6 +423,55 @@ impl<'a> Parser<'a> {
         let specs = self.parse_array_spec_list()?;
         self.expect(&TokenKind::RParen)?;
         Ok(specs)
+    }
+
+    /// Parse `DIMENSION [::] array-name(array-spec) [, ...]`.
+    ///
+    /// The keyword has not been consumed. A standalone DIMENSION statement
+    /// differs from a type-declaration DIMENSION attribute: each named entity
+    /// has its own parenthesized array specification.
+    pub fn parse_dimension_stmt(&mut self) -> Result<SpannedDecl, ParseError> {
+        let start = self.current_span();
+        self.advance(); // DIMENSION
+        let _ = self.eat(&TokenKind::ColonColon);
+
+        let mut entities = Vec::new();
+        loop {
+            if self.peek() != &TokenKind::Identifier {
+                return Err(
+                    self.error("expected an array name in standalone DIMENSION statement".into())
+                );
+            }
+            let name = self.advance().clone().text;
+            if !self.eat(&TokenKind::LParen) {
+                return Err(self.error(format!(
+                    "array '{}' in standalone DIMENSION statement requires an array-spec",
+                    name
+                )));
+            }
+            let array_spec = self.parse_array_spec_list()?;
+            self.expect(&TokenKind::RParen)?;
+            entities.push(DimensionEntity { name, array_spec });
+
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+            if self.at_stmt_end() {
+                return Err(self.error(
+                    "expected an array name after ',' in standalone DIMENSION statement".into(),
+                ));
+            }
+        }
+
+        if !self.at_stmt_end() {
+            return Err(self.error(format!(
+                "unexpected token '{}' after standalone DIMENSION statement",
+                self.peek_text()
+            )));
+        }
+        let span = crate::parser::expr::span_from_to(start, self.prev_span());
+        self.skip_newlines();
+        Ok(Spanned::new(Decl::DimensionStmt { entities }, span))
     }
 
     fn parse_array_spec_list(&mut self) -> Result<Vec<ArraySpec>, ParseError> {
@@ -965,6 +1015,8 @@ impl<'a> Parser<'a> {
         let mut components = Vec::new();
         let mut type_bound_procs = Vec::new();
         let mut final_procs = Vec::new();
+        let mut saw_component = false;
+        let mut saw_private_components_stmt = false;
 
         loop {
             self.skip_newlines();
@@ -1016,7 +1068,46 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // PROCEDURE(interface_name) [, attrs] :: name [=> null()]
+            // F2018 R745/C766: a bare PRIVATE statement before the first
+            // component makes the derived type's components private by
+            // default. Preserve it in the component declaration stream so
+            // layout construction can resolve each field's effective access.
+            if text == "private" {
+                if !self.at_stmt_end_after(1) {
+                    return Err(self.error(
+                        "component PRIVATE statement must be a bare PRIVATE statement".to_string(),
+                    ));
+                }
+                if saw_component {
+                    return Err(self.error(
+                        "PRIVATE statement must precede derived-type components".to_string(),
+                    ));
+                }
+                if saw_private_components_stmt {
+                    return Err(self.error(
+                        "duplicate PRIVATE statement in derived type definition".to_string(),
+                    ));
+                }
+                let private_start = self.current_span();
+                self.advance();
+                let span = crate::parser::expr::span_from_to(private_start, self.prev_span());
+                components.push(crate::ast::Spanned::new(
+                    crate::ast::decl::Decl::AccessDefault {
+                        access: crate::ast::decl::Attribute::Private,
+                    },
+                    span,
+                ));
+                saw_private_components_stmt = true;
+                self.skip_newlines();
+                continue;
+            }
+            if text == "public" {
+                return Err(self.error(
+                    "PUBLIC statement is not permitted in a derived type definition".to_string(),
+                ));
+            }
+
+            // PROCEDURE(interface_name) [, attrs] :: name [=> initial-target]
             // Procedure pointer components inside a derived type.
             if text == "procedure" {
                 let next_pos = self.pos + 1;
@@ -1043,6 +1134,14 @@ impl<'a> Parser<'a> {
                                 self.advance();
                                 comp_attrs.push(crate::ast::decl::Attribute::NoPass);
                             }
+                            "public" => {
+                                self.advance();
+                                comp_attrs.push(crate::ast::decl::Attribute::Public);
+                            }
+                            "private" => {
+                                self.advance();
+                                comp_attrs.push(crate::ast::decl::Attribute::Private);
+                            }
                             "pass" | "deferred" | "non_overridable" => {
                                 self.advance();
                             }
@@ -1064,37 +1163,29 @@ impl<'a> Parser<'a> {
                             String::new()
                         };
 
-                        // F2008 §4.5.4.5: a procedure pointer
-                        // component may carry a default initial
-                        // association `=> proc_name` or `=> null()`.
+                        // F2008 §4.5.4.5: a procedure pointer component may
+                        // carry a default initial association.
                         // Without capturing the right-hand side the
                         // pointer field stays uninitialized — calling
                         // `instance%fn(args)` then jumps through
                         // garbage memory.  stdlib_hashmaps's
                         // `procedure(hasher_fun), pointer, nopass ::
                         // hasher => default_hasher` motivated this fix.
-                        let mut ptr_init: Option<crate::ast::expr::SpannedExpr> = None;
-                        if self.eat(&TokenKind::Arrow) {
-                            let init_start = self.current_span();
+                        let ptr_init = if self.eat(&TokenKind::Arrow) {
                             if self.peek_text().eq_ignore_ascii_case("null") {
                                 self.advance();
-                                if self.peek() == &TokenKind::LParen {
-                                    self.advance();
-                                    let _ = self.expect(&TokenKind::RParen);
-                                }
+                                self.expect(&TokenKind::LParen)?;
+                                self.expect(&TokenKind::RParen)?;
                                 // Leave ptr_init as None for `=> null()`
                                 // (matches the legacy behaviour, where
                                 // the field is zero-initialised).
-                            } else if self.peek() == &TokenKind::Identifier {
-                                let target_name = self.advance().clone().text;
-                                let span =
-                                    crate::parser::expr::span_from_to(init_start, self.prev_span());
-                                ptr_init = Some(crate::ast::Spanned::new(
-                                    crate::ast::expr::Expr::Name { name: target_name },
-                                    span,
-                                ));
+                                None
+                            } else {
+                                Some(self.parse_expr()?)
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         entities.push(crate::ast::decl::EntityDecl {
                             name: entity_name,
@@ -1109,6 +1200,7 @@ impl<'a> Parser<'a> {
                         }
                     }
 
+                    comp_attrs.push(crate::ast::decl::Attribute::Procedure);
                     comp_attrs.push(crate::ast::decl::Attribute::External);
                     let span = crate::parser::expr::span_from_to(comp_start, self.prev_span());
                     components.push(crate::ast::Spanned::new(
@@ -1119,6 +1211,7 @@ impl<'a> Parser<'a> {
                         },
                         span,
                     ));
+                    saw_component = true;
                     continue;
                 }
             }
@@ -1128,6 +1221,7 @@ impl<'a> Parser<'a> {
                 let ts = ts_result?;
                 let comp = self.parse_type_decl(ts)?;
                 components.push(comp);
+                saw_component = true;
             } else {
                 // Skip unrecognized lines.
                 while !self.at_stmt_end() {
@@ -1137,13 +1231,9 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Consume 'end type [name]'.
-        if self.peek_text().eq_ignore_ascii_case("endtype") {
-            self.advance();
-        } else if self.peek_text().eq_ignore_ascii_case("end") {
-            self.advance();
-            self.eat_ident("type");
-        }
+        // Consume 'end type [name]'. A bare END belongs only to program-unit
+        // termination; accepting one here silently completes a malformed type.
+        self.consume_end("type")?;
         // Optional name after end type.
         if self.peek() == &TokenKind::Identifier {
             self.advance();
@@ -1777,6 +1867,118 @@ mod tests {
     }
 
     #[test]
+    fn derived_type_preserves_component_access_controls() {
+        let tokens = Lexer::tokenize(
+            "\
+type :: item
+  private
+  integer :: hidden
+  integer, public :: shown
+  procedure(callback_iface), pointer, private, nopass :: callback
+end type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef { components, .. } = decl.node else {
+            panic!("not a derived type definition");
+        };
+
+        assert!(matches!(
+            components.first().map(|component| &component.node),
+            Some(Decl::AccessDefault {
+                access: Attribute::Private
+            })
+        ));
+        let component_attrs = |name: &str| {
+            components.iter().find_map(|component| {
+                let Decl::TypeDecl {
+                    attrs, entities, ..
+                } = &component.node
+                else {
+                    return None;
+                };
+                entities
+                    .iter()
+                    .any(|entity| entity.name.eq_ignore_ascii_case(name))
+                    .then_some(attrs)
+            })
+        };
+        assert!(!component_attrs("hidden")
+            .expect("missing hidden component")
+            .contains(&Attribute::Private));
+        assert!(component_attrs("shown")
+            .expect("missing shown component")
+            .contains(&Attribute::Public));
+        assert!(component_attrs("callback")
+            .expect("missing callback component")
+            .contains(&Attribute::Private));
+    }
+
+    #[test]
+    fn derived_type_procedure_component_preserves_named_initializer() {
+        let tokens = Lexer::tokenize(
+            "\
+type :: item
+  procedure(callback_iface), pointer, nopass :: callback => action
+end type item",
+            0,
+        )
+        .unwrap();
+        let mut parser = Parser::new(&tokens);
+        parser.advance();
+        let decl = parser.parse_derived_type_def().unwrap();
+        let Decl::DerivedTypeDef { components, .. } = decl.node else {
+            panic!("not a derived type definition");
+        };
+        let Some(Decl::TypeDecl { entities, .. }) =
+            components.first().map(|component| &component.node)
+        else {
+            panic!("procedure-pointer component not preserved");
+        };
+        assert!(matches!(
+            entities[0].ptr_init.as_ref().map(|expr| &expr.node),
+            Some(crate::ast::expr::Expr::Name { name }) if name == "action"
+        ));
+    }
+
+    #[test]
+    fn derived_type_rejects_misplaced_component_access_statements() {
+        for (source, expected) in [
+            (
+                "type :: item\n  integer :: value\n  private\nend type item",
+                "PRIVATE statement must precede derived-type components",
+            ),
+            (
+                "type :: item\n  public\n  integer :: value\nend type item",
+                "PUBLIC statement is not permitted in a derived type definition",
+            ),
+            (
+                "type :: item\n  private\n  private\n  integer :: value\nend type item",
+                "duplicate PRIVATE statement in derived type definition",
+            ),
+            (
+                "type :: item\n  private :: value\n  integer :: value\nend type item",
+                "component PRIVATE statement must be a bare PRIVATE statement",
+            ),
+            (
+                "type :: item\n  public :: value\n  integer :: value\nend type item",
+                "PUBLIC statement is not permitted in a derived type definition",
+            ),
+        ] {
+            let tokens = Lexer::tokenize(source, 0).unwrap();
+            let mut parser = Parser::new(&tokens);
+            parser.advance();
+            let error = parser
+                .parse_derived_type_def()
+                .expect_err("invalid component access statement was accepted");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn generic_type_bound_proc_preserves_all_specific_bindings() {
         let tokens =
             Lexer::tokenize("generic :: set => set_float, set_integer, set_datetime", 0).unwrap();
@@ -1977,6 +2179,16 @@ mod tests {
         let d = parse_decl("double precision :: x");
         if let Decl::TypeDecl { type_spec, .. } = &d.node {
             assert!(matches!(type_spec, TypeSpec::DoublePrecision));
+        } else {
+            panic!("not TypeDecl");
+        }
+    }
+
+    #[test]
+    fn double_complex() {
+        let d = parse_decl("double complex :: x");
+        if let Decl::TypeDecl { type_spec, .. } = &d.node {
+            assert!(matches!(type_spec, TypeSpec::DoubleComplex));
         } else {
             panic!("not TypeDecl");
         }

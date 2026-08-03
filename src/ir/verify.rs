@@ -5,7 +5,7 @@
 //! terminator completeness, block param/branch arg matching.
 
 use super::inst::*;
-use super::types::{IntWidth, IrType};
+use super::types::{FloatWidth, IntWidth, IrType, TypeSizeError};
 use super::walk::{compute_dominator_info, inst_uses, terminator_targets, terminator_uses};
 use std::collections::{HashMap, HashSet};
 
@@ -24,10 +24,40 @@ impl std::fmt::Display for VerifyError {
 /// Verify a module. Returns a list of errors (empty = valid).
 pub fn verify_module(module: &Module) -> Vec<VerifyError> {
     let mut errors = Vec::new();
+    check_module_struct_references(module, &mut errors);
+    for global in &module.globals {
+        if type_needs_named_struct_layout(&global.ty) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "global '{}' uses named-struct storage, which is unsupported; \
+                     lower aggregate storage to an explicit byte array",
+                    global.name,
+                ),
+            });
+            continue;
+        }
+        if matches!(
+            global.ty.try_size_bytes(&module.layout),
+            Err(TypeSizeError::Overflow)
+        ) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "global '{}' has type '{}' whose byte size overflows the target address space",
+                    global.name, global.ty
+                ),
+            });
+            continue;
+        }
+        check_global_array_initializer(global, &mut errors);
+    }
     for func in &module.functions {
+        let mut function_errors = verify_function(func);
+        check_internal_call_signatures(module, func, &mut function_errors);
+        check_function_struct_storage(func, &mut function_errors);
+
         // Prefix each finding with the enclosing function so a failure
         // in a large amalgamated build points at the offending routine.
-        for mut e in verify_function(func) {
+        for mut e in function_errors {
             e.msg = format!("in '{}': {}", func.name, e.msg);
             errors.push(e);
         }
@@ -35,17 +65,278 @@ pub fn verify_module(module: &Module) -> Vec<VerifyError> {
     errors
 }
 
+fn check_module_struct_references(module: &Module, errors: &mut Vec<VerifyError>) {
+    for (id, def) in module.struct_defs.iter().enumerate() {
+        for (field_name, field_ty) in &def.fields {
+            check_defined_struct_ids(
+                module,
+                field_ty,
+                &format!("named struct.{id} field '{field_name}'"),
+                errors,
+            );
+        }
+    }
+    for global in &module.globals {
+        check_defined_struct_ids(
+            module,
+            &global.ty,
+            &format!("global '{}'", global.name),
+            errors,
+        );
+    }
+    for external in &module.extern_funcs {
+        for (index, param_ty) in external.sig.params.iter().enumerate() {
+            check_defined_struct_ids(
+                module,
+                param_ty,
+                &format!("external function '{}' parameter {index}", external.name),
+                errors,
+            );
+        }
+        check_defined_struct_ids(
+            module,
+            &external.sig.ret,
+            &format!("external function '{}' return type", external.name),
+            errors,
+        );
+    }
+    for func in &module.functions {
+        check_defined_struct_ids(
+            module,
+            &func.return_type,
+            &format!("function '{}' return type", func.name),
+            errors,
+        );
+        for (index, param) in func.params.iter().enumerate() {
+            check_defined_struct_ids(
+                module,
+                &param.ty,
+                &format!("function '{}' parameter {index}", func.name),
+                errors,
+            );
+        }
+        for block in &func.blocks {
+            for param in &block.params {
+                check_defined_struct_ids(
+                    module,
+                    &param.ty,
+                    &format!("function '{}' block '{}' parameter", func.name, block.name),
+                    errors,
+                );
+            }
+            for inst in &block.insts {
+                check_defined_struct_ids(
+                    module,
+                    &inst.ty,
+                    &format!("function '{}' instruction %{}", func.name, inst.id.0),
+                    errors,
+                );
+                if let InstKind::Alloca(allocated_ty) = &inst.kind {
+                    check_defined_struct_ids(
+                        module,
+                        allocated_ty,
+                        &format!("function '{}' alloca %{}", func.name, inst.id.0),
+                        errors,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn check_defined_struct_ids(
+    module: &Module,
+    ty: &IrType,
+    context: &str,
+    errors: &mut Vec<VerifyError>,
+) {
+    match ty {
+        IrType::Ptr(inner) | IrType::Array(inner, _) | IrType::Vector { elem: inner, .. } => {
+            check_defined_struct_ids(module, inner, context, errors);
+        }
+        IrType::Struct(id) => {
+            if module.struct_defs.get(*id as usize).is_none() {
+                errors.push(VerifyError {
+                    msg: format!("{context} references undefined named struct.{id}"),
+                });
+            }
+        }
+        IrType::FuncPtr(sig) => {
+            for param in &sig.params {
+                check_defined_struct_ids(module, param, context, errors);
+            }
+            check_defined_struct_ids(module, &sig.ret, context, errors);
+        }
+        _ => {}
+    }
+}
+
+fn type_needs_named_struct_layout(ty: &IrType) -> bool {
+    match ty {
+        IrType::Struct(_) => true,
+        IrType::Array(element, _) => type_needs_named_struct_layout(element),
+        _ => false,
+    }
+}
+
+fn check_function_struct_storage(func: &Function, errors: &mut Vec<VerifyError>) {
+    if type_needs_named_struct_layout(&func.return_type) {
+        errors.push(VerifyError {
+            msg:
+                "named-struct return values are unsupported; pass explicit byte storage by pointer"
+                    .into(),
+        });
+    }
+    for (index, param) in func.params.iter().enumerate() {
+        if type_needs_named_struct_layout(&param.ty) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "parameter {index} uses an unsupported named-struct value; \
+                     pass explicit byte storage by pointer"
+                ),
+            });
+        }
+    }
+    for block in &func.blocks {
+        for param in &block.params {
+            if type_needs_named_struct_layout(&param.ty) {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "block '{}' has an unsupported named-struct value parameter",
+                        block.name,
+                    ),
+                });
+            }
+        }
+        for inst in &block.insts {
+            if type_needs_named_struct_layout(&inst.ty) {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "instruction %{} produces an unsupported named-struct value",
+                        inst.id.0,
+                    ),
+                });
+            }
+            match &inst.kind {
+                InstKind::Alloca(allocated_ty) if type_needs_named_struct_layout(allocated_ty) => {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "alloca %{} requests named-struct stack storage, which is unsupported; \
+                             lower aggregate storage to an explicit byte array",
+                            inst.id.0,
+                        ),
+                    });
+                }
+                InstKind::GetElementPtr(_, _)
+                    if matches!(
+                        &inst.ty,
+                        IrType::Ptr(element) if type_needs_named_struct_layout(element)
+                    ) =>
+                {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "GEP %{} requires an unsupported named-struct element stride",
+                            inst.id.0,
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GlobalArrayInitializerKind {
+    Integer,
+    Float,
+}
+
+fn check_global_array_initializer(global: &Global, errors: &mut Vec<VerifyError>) {
+    let (kind, actual_entries, kind_name) = match &global.initializer {
+        Some(GlobalInit::IntArray(values)) => (
+            GlobalArrayInitializerKind::Integer,
+            values.len() as u64,
+            "integer",
+        ),
+        Some(GlobalInit::FloatArray(values)) => (
+            GlobalArrayInitializerKind::Float,
+            values.len() as u64,
+            "floating-point",
+        ),
+        _ => return,
+    };
+
+    let Some(expected_entries) = global_array_initializer_entries(&global.ty, kind) else {
+        errors.push(VerifyError {
+            msg: format!(
+                "global '{}' {}-array initializer is incompatible with type '{}'",
+                global.name, kind_name, global.ty,
+            ),
+        });
+        return;
+    };
+
+    if actual_entries != expected_entries {
+        errors.push(VerifyError {
+            msg: format!(
+                "global '{}' array initializer has {} entries, but its type requires {}",
+                global.name, actual_entries, expected_entries,
+            ),
+        });
+    }
+}
+
+fn global_array_initializer_entries(ty: &IrType, kind: GlobalArrayInitializerKind) -> Option<u64> {
+    let IrType::Array(element, count) = ty else {
+        return None;
+    };
+    global_array_initializer_element_entries(element, kind)?.checked_mul(*count)
+}
+
+fn global_array_initializer_element_entries(
+    ty: &IrType,
+    kind: GlobalArrayInitializerKind,
+) -> Option<u64> {
+    match (ty, kind) {
+        (IrType::Bool | IrType::Int(_), GlobalArrayInitializerKind::Integer)
+        | (IrType::Float(_), GlobalArrayInitializerKind::Float) => Some(1),
+        (IrType::Array(element, count), _) => {
+            global_array_initializer_element_entries(element, kind)?.checked_mul(*count)
+        }
+        _ => None,
+    }
+}
+
 /// Verify a single function.
 pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     let mut errors = Vec::new();
 
-    // 1. Every block must have exactly one terminator.
+    // 1. Every block must have a unique identity and exactly one terminator.
+    // All later CFG and dominance checks use BlockId-keyed maps, so duplicate
+    // IDs make every downstream interpretation ambiguous.
+    let mut seen_blocks: HashMap<BlockId, &str> = HashMap::new();
+    let mut has_duplicate_blocks = false;
     for block in &func.blocks {
+        if let Some(first_name) = seen_blocks.get(&block.id) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "duplicate block ID {}: blocks '{}' and '{}' share an identity",
+                    block.id.0, first_name, block.name,
+                ),
+            });
+            has_duplicate_blocks = true;
+        } else {
+            seen_blocks.insert(block.id, block.name.as_str());
+        }
         if block.terminator.is_none() {
             errors.push(VerifyError {
                 msg: format!("block '{}' has no terminator", block.name),
             });
         }
+    }
+    if has_duplicate_blocks {
+        return errors;
     }
 
     // 2. Entry block has no predecessors. The block params on entry
@@ -107,24 +398,20 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
         }
     }
 
-    // 3a. Every defined value must have an entry in the function's
-    // type cache. A miss here means rebuild_type_cache was never
-    // run after an IR-mutating pass (or the pass forgot to set
-    // inst.ty). Without the cache entry, check_type_consistency
-    // silently skips every check on that instruction — a single
-    // stale cache turns the whole verifier into a no-op. This was
-    // a latent soundness hole: wrong-width iadd, bogus pointee
-    // mismatches, and non-integer ops all sailed through. Flag it
-    // explicitly so the bug points at the actual cache bug, not
-    // the downstream codegen symptom.
-    for val in &defined {
-        if func.value_type(*val).is_none() {
-            errors.push(VerifyError {
-                msg: format!(
-                    "value %{} is defined but has no entry in the type cache (call rebuild_type_cache)",
-                    val.0,
-                ),
-            });
+    // 3a. Every present O(1) type-cache entry must match its authoritative
+    // definition. Missing entries remain safe because value_type() walks the
+    // definitions on a miss. A present hit is different: if Inst.ty changed,
+    // all later consistency checks would otherwise reuse the stale cached
+    // type and make verification false-green.
+    for param in &func.params {
+        check_type_cache_entry(func, param.id, &param.ty, &mut errors);
+    }
+    for block in &func.blocks {
+        for param in &block.params {
+            check_type_cache_entry(func, param.id, &param.ty, &mut errors);
+        }
+        for inst in &block.insts {
+            check_type_cache_entry(func, inst.id, &inst.ty, &mut errors);
         }
     }
 
@@ -158,6 +445,7 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     for block in &func.blocks {
         if let Some(term) = &block.terminator {
             check_branch_types(func, term, &block.name, &mut errors);
+            check_return_type(func, term, &block.name, &mut errors);
         }
     }
 
@@ -189,6 +477,136 @@ pub fn verify_function(func: &Function) -> Vec<VerifyError> {
     check_dominance(func, &mut errors);
 
     errors
+}
+
+fn check_internal_call_signatures(
+    module: &Module,
+    caller: &Function,
+    errors: &mut Vec<VerifyError>,
+) {
+    for block in &caller.blocks {
+        for inst in &block.insts {
+            let InstKind::Call(FuncRef::Internal(callee_index), args) = &inst.kind else {
+                continue;
+            };
+            let Some(callee) = module.functions.get(*callee_index as usize) else {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "internal call %{} refers to function index {}, but the module has {} functions",
+                        inst.id.0,
+                        callee_index,
+                        module.functions.len(),
+                    ),
+                });
+                continue;
+            };
+
+            if !internal_call_types_match(&callee.return_type, &inst.ty) {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "internal call %{} to '{}' result type mismatch: expected {}, got {}",
+                        inst.id.0, callee.name, callee.return_type, inst.ty,
+                    ),
+                });
+            }
+
+            if args.len() != callee.params.len() {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "internal call %{} to '{}' argument count mismatch: expected {}, got {}",
+                        inst.id.0,
+                        callee.name,
+                        callee.params.len(),
+                        args.len(),
+                    ),
+                });
+            }
+
+            for (index, (arg, param)) in args.iter().zip(&callee.params).enumerate() {
+                let Some(actual_type) = caller.value_type(*arg) else {
+                    continue;
+                };
+                if !internal_call_types_match(&param.ty, &actual_type) {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "internal call %{} to '{}' argument {} type mismatch: expected {}, got {}",
+                            inst.id.0, callee.name, index, param.ty, actual_type,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn internal_call_types_match(expected: &IrType, actual: &IrType) -> bool {
+    expected == actual
+        // Data-pointer pointees are lowering annotations, not distinct
+        // machine-level calling-convention types. For example, a derived
+        // object may reach a helper as either ptr<i8> or ptr<[i8 x N]>.
+        // Both backends classify every Ptr(_) identically, and the lowering
+        // layer deliberately passes such pointer reinterpretations through.
+        // Keep function pointers separate so their signatures remain checked.
+        || matches!((expected, actual), (IrType::Ptr(_), IrType::Ptr(_)))
+}
+
+fn check_type_cache_entry(
+    func: &Function,
+    value: ValueId,
+    defining_type: &IrType,
+    errors: &mut Vec<VerifyError>,
+) {
+    match func.cached_value_type(value) {
+        Some(cached_type) if cached_type != defining_type => errors.push(VerifyError {
+            msg: format!(
+                "value %{} has type '{}' in the type cache but its definition has type '{}' \
+                 (call rebuild_type_cache)",
+                value.0, cached_type, defining_type,
+            ),
+        }),
+        None | Some(_) => {}
+    }
+}
+
+fn check_return_type(
+    func: &Function,
+    term: &Terminator,
+    from_block: &str,
+    errors: &mut Vec<VerifyError>,
+) {
+    let Terminator::Return(value) = term else {
+        return;
+    };
+    match (&func.return_type, value) {
+        (IrType::Void, None) => {}
+        (IrType::Void, Some(value)) => errors.push(VerifyError {
+            msg: format!(
+                "return from block '{}': void function must not return a value (got %{})",
+                from_block, value.0,
+            ),
+        }),
+        (expected, None) => errors.push(VerifyError {
+            msg: format!(
+                "return from block '{}': non-void function must return a value of type {}",
+                from_block, expected,
+            ),
+        }),
+        (expected, Some(value)) => match func.value_type(*value) {
+            Some(actual) if &actual != expected => errors.push(VerifyError {
+                msg: format!(
+                    "return type mismatch in block '{}': expected {}, got {} from %{}",
+                    from_block, expected, actual, value.0,
+                ),
+            }),
+            None => errors.push(VerifyError {
+                msg: format!(
+                    "return from block '{}': value %{} has no type; expected {}",
+                    from_block, value.0, expected,
+                ),
+            }),
+            Some(_) => {}
+        },
+    }
 }
 
 /// Map each ValueId to the block where it's defined.
@@ -312,7 +730,9 @@ fn check_branch_types(
     }
 
     let mut check = |dest: BlockId, args: &[ValueId]| {
-        let target = func.block(dest);
+        let Some(target) = func.try_block(dest) else {
+            return;
+        };
         if target.params.len() != args.len() {
             errors.push(VerifyError {
                 msg: format!(
@@ -352,19 +772,50 @@ fn check_branch_types(
             check(*true_dest, true_args);
             check(*false_dest, false_args);
         }
-        Terminator::Switch { cases, default, .. } => {
-            // Switch targets shouldn't have block params (simplified model).
-            let default_block = func.block(*default);
-            if !default_block.params.is_empty() {
-                errors.push(VerifyError {
+        Terminator::Switch {
+            selector,
+            cases,
+            default,
+        } => {
+            match func.value_type(*selector) {
+                Some(selector_ty) if selector_ty.switch_int_width().is_some() => {
+                    for (value, _) in cases {
+                        if !selector_ty.switch_case_is_representable(*value) {
+                            errors.push(VerifyError {
+                                msg: format!(
+                                    "switch case value {value} is not representable in selector \
+                                     type {selector_ty}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                Some(selector_ty) => errors.push(VerifyError {
+                    msg: format!("switch selector must be i8, i16, i32, or i64, got {selector_ty}"),
+                }),
+                None => errors.push(VerifyError {
                     msg: format!(
-                        "switch default target '{}' has block parameters",
-                        default_block.name
+                        "switch selector %{} has no type; expected i8, i16, i32, or i64",
+                        selector.0,
                     ),
-                });
+                }),
+            }
+
+            // Switch targets shouldn't have block params (simplified model).
+            if let Some(default_block) = func.try_block(*default) {
+                if !default_block.params.is_empty() {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "switch default target '{}' has block parameters",
+                            default_block.name
+                        ),
+                    });
+                }
             }
             for (_, dest) in cases {
-                let target = func.block(*dest);
+                let Some(target) = func.try_block(*dest) else {
+                    continue;
+                };
                 if !target.params.is_empty() {
                     errors.push(VerifyError {
                         msg: format!("switch case target '{}' has block parameters", target.name),
@@ -410,10 +861,170 @@ fn vector_shape_error(ty: &IrType) -> Option<String> {
     None
 }
 
+/// Vector shapes recognized by both instruction-selection dispatchers for
+/// arithmetic opcodes. Narrow i8/i16 vectors remain valid IR for operations
+/// such as loads, stores, and bitwise manipulation, but neither backend has an
+/// arithmetic dispatcher for them.
+fn vector_arithmetic_shape_error(ty: &IrType) -> Option<String> {
+    let supported = match ty {
+        IrType::Vector { lanes: 4, elem } => matches!(
+            elem.as_ref(),
+            IrType::Int(IntWidth::I32) | IrType::Float(FloatWidth::F32)
+        ),
+        IrType::Vector { lanes: 2, elem } => matches!(
+            elem.as_ref(),
+            IrType::Int(IntWidth::I64) | IrType::Float(FloatWidth::F64)
+        ),
+        _ => false,
+    };
+    if supported {
+        None
+    } else {
+        Some(format!(
+            "vector arithmetic uses unsupported shape {}; expected <4 x i32>, \
+             <2 x i64>, <4 x f32>, or <2 x f64>",
+            ty
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeAbiType {
+    Void,
+    I32,
+    I64,
+    F32,
+    BytePtr,
+    DataPtr,
+    PrintableInt,
+}
+
+impl RuntimeAbiType {
+    fn matches(self, ty: &IrType) -> bool {
+        match self {
+            Self::Void => matches!(ty, IrType::Void),
+            Self::I32 => matches!(ty, IrType::Int(IntWidth::I32)),
+            Self::I64 => matches!(ty, IrType::Int(IntWidth::I64)),
+            Self::F32 => matches!(ty, IrType::Float(FloatWidth::F32)),
+            Self::BytePtr => {
+                matches!(ty, IrType::Ptr(inner) if matches!(inner.as_ref(), IrType::Int(IntWidth::I8)))
+            }
+            Self::DataPtr => matches!(ty, IrType::Ptr(_)),
+            Self::PrintableInt => matches!(
+                ty,
+                IrType::Int(IntWidth::I32 | IntWidth::I64 | IntWidth::I128)
+            ),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Void => "void",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::BytePtr => "ptr<i8>",
+            Self::DataPtr => "a data pointer",
+            Self::PrintableInt => "i32, i64, or i128",
+        }
+    }
+}
+
+fn runtime_signature(runtime_func: &RuntimeFunc) -> (&'static [RuntimeAbiType], RuntimeAbiType) {
+    use RuntimeAbiType::*;
+
+    match runtime_func {
+        RuntimeFunc::PrintInt => (&[PrintableInt], Void),
+        RuntimeFunc::PrintReal => (&[F32], Void),
+        RuntimeFunc::PrintString => (&[BytePtr, I64], Void),
+        RuntimeFunc::PrintLogical => (&[I32], Void),
+        RuntimeFunc::PrintNewline => (&[], Void),
+        RuntimeFunc::Allocate => (&[I64], BytePtr),
+        RuntimeFunc::Deallocate => (&[DataPtr], Void),
+        RuntimeFunc::StringConcat => (&[BytePtr, I64, BytePtr, I64], BytePtr),
+        RuntimeFunc::StringCopy => (&[BytePtr, I64, BytePtr, I64], Void),
+        RuntimeFunc::StringCompare => (&[BytePtr, I64, BytePtr, I64], I32),
+        RuntimeFunc::Stop | RuntimeFunc::ErrorStop => (&[], Void),
+        RuntimeFunc::CheckBounds => (&[I64, I64, I64], Void),
+        RuntimeFunc::CheckArrayAssignmentConformance => (&[DataPtr, DataPtr], Void),
+    }
+}
+
+fn check_runtime_call_signature(
+    func: &Function,
+    inst: &Inst,
+    runtime_func: &RuntimeFunc,
+    args: &[ValueId],
+    errors: &mut Vec<VerifyError>,
+) {
+    let (expected_args, expected_result) = runtime_signature(runtime_func);
+
+    if !expected_result.matches(&inst.ty) {
+        errors.push(VerifyError {
+            msg: format!(
+                "runtime call {:?} %{} result type mismatch: expected {}, got {}",
+                runtime_func,
+                inst.id.0,
+                expected_result.description(),
+                inst.ty,
+            ),
+        });
+    }
+
+    if args.len() != expected_args.len() {
+        errors.push(VerifyError {
+            msg: format!(
+                "runtime call {:?} %{} argument count mismatch: expected {}, got {}",
+                runtime_func,
+                inst.id.0,
+                expected_args.len(),
+                args.len(),
+            ),
+        });
+    }
+
+    for (index, (arg, expected_type)) in args.iter().zip(expected_args).enumerate() {
+        let Some(actual_type) = func.value_type(*arg) else {
+            continue;
+        };
+        if !expected_type.matches(&actual_type) {
+            errors.push(VerifyError {
+                msg: format!(
+                    "runtime call {:?} %{} argument {} type mismatch: expected {}, got {}",
+                    runtime_func,
+                    inst.id.0,
+                    index,
+                    expected_type.description(),
+                    actual_type,
+                ),
+            });
+        }
+    }
+}
+
 /// Check type consistency for instructions.
 fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyError>) {
     if let Some(msg) = vector_shape_error(&inst.ty) {
         errors.push(VerifyError { msg });
+    }
+    if matches!(
+        &inst.kind,
+        InstKind::VAdd(_, _)
+            | InstKind::VSub(_, _)
+            | InstKind::VMul(_, _)
+            | InstKind::VDiv(_, _)
+            | InstKind::VMin(_, _)
+            | InstKind::VMax(_, _)
+            | InstKind::VFma(_, _, _)
+            | InstKind::VNeg(_)
+            | InstKind::VAbs(_)
+            | InstKind::VSqrt(_)
+    ) {
+        if let Some(msg) = vector_arithmetic_shape_error(&inst.ty) {
+            errors.push(VerifyError {
+                msg: format!("vector arithmetic %{}: {}", inst.id.0, msg),
+            });
+        }
     }
     match &inst.kind {
         InstKind::IAdd(a, b)
@@ -469,6 +1080,14 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         ),
                     });
                 }
+                if ta.is_int() && ta == tb && ta != &inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "integer op %{} result type {} does not match operand type {}",
+                            inst.id.0, inst.ty, ta,
+                        ),
+                    });
+                }
             }
         }
         InstKind::FAdd(a, b)
@@ -507,9 +1126,17 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                         ),
                     });
                 }
+                if ta.is_float() && ta == tb && ta != &inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "float op %{} result type {} does not match operand type {}",
+                            inst.id.0, inst.ty, ta,
+                        ),
+                    });
+                }
             }
         }
-        InstKind::Store(val, addr) => {
+        InstKind::Store(val, addr) | InstKind::VolatileStore(val, addr) => {
             let addr_ty = func.value_type(*addr);
             if let Some(ty) = &addr_ty {
                 if !ty.is_ptr() {
@@ -542,13 +1169,24 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
-        InstKind::Load(addr) => {
+        InstKind::Load(addr) | InstKind::VolatileLoad(addr) => {
             if let Some(ty) = func.value_type(*addr) {
                 if !ty.is_ptr() {
                     errors.push(VerifyError {
                         msg: format!("load %{} from non-pointer %{} : {}", inst.id.0, addr.0, ty),
                     });
                 }
+            }
+        }
+        InstKind::GetElementPtr(_, indices) => {
+            if indices.len() > 1 {
+                errors.push(VerifyError {
+                    msg: format!(
+                        "GEP %{} has {} indices; backend lowering supports at most one",
+                        inst.id.0,
+                        indices.len(),
+                    ),
+                });
             }
         }
 
@@ -640,6 +1278,10 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                     });
                 }
             }
+        }
+
+        InstKind::RuntimeCall(runtime_func, args) => {
+            check_runtime_call_signature(func, inst, runtime_func, args, errors);
         }
 
         // ---- SIMD vector ops ----
@@ -741,6 +1383,38 @@ mod tests {
     use super::super::types::*;
     use super::*;
 
+    fn switch_verify_errors(selector_ty: IrType, case_values: &[i64]) -> Vec<VerifyError> {
+        let mut func = Function::new("switch_test".into(), vec![], IrType::Void);
+        let selector;
+        let case_block;
+        let default_block;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            selector = match selector_ty {
+                IrType::Bool => b.const_bool(false),
+                IrType::Int(width) => b.const_int(0, width),
+                IrType::Float(FloatWidth::F32) => b.const_f32(0.0),
+                IrType::Float(FloatWidth::F64) => b.const_f64(0.0),
+                ref other => panic!("unsupported switch test selector type: {other}"),
+            };
+            case_block = b.create_block("case");
+            default_block = b.create_block("default");
+            b.set_block(case_block);
+            b.ret_void();
+            b.set_block(default_block);
+            b.ret_void();
+        }
+        func.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: case_values
+                .iter()
+                .map(|value| (*value, case_block))
+                .collect(),
+            default: default_block,
+        });
+        verify_function(&func)
+    }
+
     #[test]
     fn valid_simple_function() {
         let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
@@ -755,6 +1429,533 @@ mod tests {
         module.add_function(func);
         let errs = verify_module(&module);
         assert!(errs.is_empty(), "errors: {:?}", errs);
+    }
+
+    #[test]
+    fn valid_runtime_call_signatures_are_accepted() {
+        let mut func = Function::new("runtime_calls".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let i32_value = b.const_i32(1);
+            let i64_value = b.const_i64(1);
+            let i128_value = b.const_i128(1);
+            let f32_value = b.const_f32(1.0);
+            let bytes = b.const_string(b"bytes");
+
+            b.runtime_call(RuntimeFunc::PrintInt, vec![i32_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintInt, vec![i64_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintInt, vec![i128_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintReal, vec![f32_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::PrintString,
+                vec![bytes, i64_value],
+                IrType::Void,
+            );
+            b.runtime_call(RuntimeFunc::PrintLogical, vec![i32_value], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintNewline, vec![], IrType::Void);
+
+            let allocation = b.runtime_call(
+                RuntimeFunc::Allocate,
+                vec![i64_value],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            b.runtime_call(RuntimeFunc::Deallocate, vec![allocation], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::StringConcat,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCopy,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Void,
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCompare,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Int(IntWidth::I32),
+            );
+            b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Void);
+            b.runtime_call(RuntimeFunc::ErrorStop, vec![], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::CheckBounds,
+                vec![i64_value, i64_value, i64_value],
+                IrType::Void,
+            );
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.is_empty(),
+            "valid runtime ABI calls should verify, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn malformed_runtime_call_signatures_are_rejected() {
+        let mut func = Function::new("runtime_calls".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let boolean = b.const_bool(true);
+            let i32_value = b.const_i32(1);
+            let i64_value = b.const_i64(1);
+            let f64_value = b.const_f64(1.0);
+            let bytes = b.const_string(b"bytes");
+            let byte_ptr = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+
+            b.runtime_call(RuntimeFunc::PrintInt, vec![], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintReal, vec![f64_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::PrintString,
+                vec![bytes, i32_value],
+                IrType::Void,
+            );
+            b.runtime_call(RuntimeFunc::PrintLogical, vec![boolean], IrType::Void);
+            b.runtime_call(RuntimeFunc::PrintNewline, vec![i32_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::Allocate,
+                vec![i32_value],
+                IrType::Int(IntWidth::I64),
+            );
+            b.runtime_call(RuntimeFunc::Deallocate, vec![i64_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::StringConcat,
+                vec![bytes, bytes],
+                byte_ptr.clone(),
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCopy,
+                vec![bytes, i64_value, bytes, i64_value],
+                byte_ptr,
+            );
+            b.runtime_call(
+                RuntimeFunc::StringCompare,
+                vec![bytes, i64_value, bytes, i64_value],
+                IrType::Void,
+            );
+            b.runtime_call(RuntimeFunc::Stop, vec![], IrType::Int(IntWidth::I32));
+            b.runtime_call(RuntimeFunc::ErrorStop, vec![i32_value], IrType::Void);
+            b.runtime_call(
+                RuntimeFunc::CheckBounds,
+                vec![i64_value, i32_value, i64_value],
+                IrType::Void,
+            );
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        for runtime_func in [
+            "PrintInt",
+            "PrintReal",
+            "PrintString",
+            "PrintLogical",
+            "PrintNewline",
+            "Allocate",
+            "Deallocate",
+            "StringConcat",
+            "StringCopy",
+            "StringCompare",
+            "Stop",
+            "ErrorStop",
+            "CheckBounds",
+        ] {
+            assert!(
+                errs.iter().any(|error| error.msg.contains(runtime_func)),
+                "expected a {runtime_func} ABI diagnostic, got: {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn well_typed_internal_call_is_accepted() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![
+            Param {
+                name: "integer_arg".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "real_arg".into(),
+                ty: IrType::Float(FloatWidth::F64),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut callee = Function::new("callee".into(), params, IrType::Int(IntWidth::I64));
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            let result = b.const_i64(42);
+            b.ret(Some(result));
+        }
+        let callee_index = module.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let integer_arg = b.const_i32(1);
+            let real_arg = b.const_f64(2.0);
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![integer_arg, real_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "well-typed internal call should verify, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn internal_calls_accept_data_pointer_pointee_reinterpretation() {
+        let byte_ptr = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![Param {
+            name: "data".into(),
+            ty: byte_ptr.clone(),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut callee = Function::new("callee".into(), params, byte_ptr);
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            let zero = b.const_i64(0);
+            let result = b.int_to_ptr(zero, IrType::Int(IntWidth::I8));
+            b.ret(Some(result));
+        }
+        let callee_index = module.add_function(callee);
+
+        let array_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 4);
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let data = b.alloca(array_ty.clone());
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![data],
+                IrType::Ptr(Box::new(array_ty)),
+            );
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "data-pointer pointee annotations share one internal-call ABI, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn internal_calls_reject_pointer_integer_substitution() {
+        let byte_ptr = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![Param {
+            name: "data".into(),
+            ty: byte_ptr,
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut callee = Function::new("callee".into(), params, IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            b.ret_void();
+        }
+        let callee_index = module.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let integer = b.const_i64(0);
+            b.call(FuncRef::Internal(callee_index), vec![integer], IrType::Void);
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.iter().any(|error| error
+                .msg
+                .contains("argument 0 type mismatch: expected ptr<i8>, got i64")),
+            "pointer/integer substitution must remain invalid, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn malformed_internal_call_signatures_are_rejected() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let params = vec![
+            Param {
+                name: "integer_arg".into(),
+                ty: IrType::Int(IntWidth::I32),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "real_arg".into(),
+                ty: IrType::Float(FloatWidth::F64),
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut callee = Function::new("callee".into(), params, IrType::Int(IntWidth::I64));
+        {
+            let mut b = FuncBuilder::new(&mut callee, crate::target::TargetLayout::LP64);
+            let result = b.const_i64(42);
+            b.ret(Some(result));
+        }
+        let callee_index = module.add_function(callee);
+
+        let mut caller = Function::new("caller".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut caller, crate::target::TargetLayout::LP64);
+            let integer_arg = b.const_i32(1);
+            let wrong_integer_arg = b.const_i64(1);
+            let real_arg = b.const_f64(2.0);
+            b.call(
+                FuncRef::Internal(99),
+                vec![integer_arg, real_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![integer_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![wrong_integer_arg, real_arg],
+                IrType::Int(IntWidth::I64),
+            );
+            b.call(
+                FuncRef::Internal(callee_index),
+                vec![integer_arg, real_arg],
+                IrType::Bool,
+            );
+            b.ret_void();
+        }
+        module.add_function(caller);
+
+        let errors = verify_module(&module);
+        for expected in [
+            "function index 99",
+            "argument count mismatch: expected 2, got 1",
+            "argument 0 type mismatch: expected i32, got i64",
+            "result type mismatch: expected i64, got bool",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.msg.contains(expected)),
+                "expected internal-call diagnostic containing '{expected}', got: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_global_array_layout_is_rejected() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "oversized".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 1_u64 << 61),
+            initializer: Some(GlobalInit::Zero),
+        });
+
+        let errs = verify_module(&module);
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains("global 'oversized'")
+                    && error.msg.contains("overflows the target address space")
+            }),
+            "expected an oversized-global layout error, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn named_struct_stack_storage_is_rejected_before_codegen() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let record_id = module.add_struct(StructDef {
+            name: "large_record".into(),
+            fields: vec![
+                ("first".into(), IrType::Int(IntWidth::I64)),
+                ("second".into(), IrType::Int(IntWidth::I64)),
+            ],
+        });
+        let mut func = Function::new("uses_struct_storage".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let record = b.alloca(IrType::Struct(record_id));
+            b.alloca(IrType::Array(Box::new(IrType::Struct(record_id)), 2));
+            let second_field_index = b.const_i64(1);
+            let second_field = b.gep(record, vec![second_field_index], IrType::Int(IntWidth::I64));
+            let value = b.const_i64(22);
+            b.store(value, second_field);
+            b.ret_void();
+        }
+        module.add_function(func);
+
+        let errors = verify_module(&module);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.msg.contains("named-struct stack storage"))
+                .count(),
+            2,
+            "direct and array-nested named-struct allocas must both be rejected: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn undefined_struct_references_are_rejected_but_opaque_pointers_are_accepted() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        let record_id = module.add_struct(StructDef {
+            name: "opaque_record".into(),
+            fields: vec![("value".into(), IrType::Int(IntWidth::I64))],
+        });
+        let params = vec![Param {
+            name: "record".into(),
+            ty: IrType::Ptr(Box::new(IrType::Struct(record_id))),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut opaque_user = Function::new("opaque_user".into(), params, IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut opaque_user, crate::target::TargetLayout::LP64);
+            b.ret_void();
+        }
+        module.add_function(opaque_user);
+
+        let params = vec![Param {
+            name: "records".into(),
+            ty: IrType::Ptr(Box::new(IrType::Struct(record_id))),
+            id: ValueId(0),
+            fortran_noalias: false,
+        }];
+        let mut stride_user = Function::new("stride_user".into(), params, IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut stride_user, crate::target::TargetLayout::LP64);
+            let index = b.const_i64(1);
+            b.gep(ValueId(0), vec![index], IrType::Struct(record_id));
+            b.ret_void();
+        }
+        module.add_function(stride_user);
+
+        let mut invalid_user = Function::new("invalid_user".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut invalid_user, crate::target::TargetLayout::LP64);
+            b.alloca(IrType::Struct(99));
+            b.ret_void();
+        }
+        module.add_function(invalid_user);
+
+        let errors = verify_module(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.msg.contains("undefined named struct.99")),
+            "undefined StructId must be rejected with module context: {errors:?}",
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.msg.contains("opaque_user")),
+            "an opaque pointer to a defined struct does not require layout: {errors:?}",
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.msg.contains("stride_user")
+                    && error
+                        .msg
+                        .contains("unsupported named-struct element stride")
+            }),
+            "a GEP that needs a named-struct stride must be rejected: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn mismatched_global_array_initializer_cardinalities_are_rejected() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "short_ints".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
+            initializer: Some(GlobalInit::IntArray(vec![1, 2])),
+        });
+        module.add_global(Global {
+            name: "short_complex".into(),
+            ty: IrType::Array(
+                Box::new(IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2)),
+                2,
+            ),
+            initializer: Some(GlobalInit::FloatArray(vec![1.0, 2.0, 3.0])),
+        });
+        module.add_global(Global {
+            name: "long_floats".into(),
+            ty: IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2),
+            initializer: Some(GlobalInit::FloatArray(vec![1.0, 2.0, 3.0])),
+        });
+        module.add_global(Global {
+            name: "wrong_kind".into(),
+            ty: IrType::Array(Box::new(IrType::Float(FloatWidth::F32)), 2),
+            initializer: Some(GlobalInit::IntArray(vec![1, 2])),
+        });
+        module.add_global(Global {
+            name: "scalar".into(),
+            ty: IrType::Int(IntWidth::I32),
+            initializer: Some(GlobalInit::IntArray(vec![1])),
+        });
+
+        let errors = verify_module(&module);
+        for expected in [
+            "global 'short_ints' array initializer has 2 entries, but its type requires 3",
+            "global 'short_complex' array initializer has 3 entries, but its type requires 4",
+            "global 'long_floats' array initializer has 3 entries, but its type requires 2",
+            "global 'wrong_kind' integer-array initializer is incompatible with type '[f32 x 2]'",
+            "global 'scalar' integer-array initializer is incompatible with type 'i32'",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.msg.contains(expected)),
+                "expected global-initializer diagnostic containing '{expected}', got: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_global_array_initializers_and_partial_strings_are_accepted() {
+        let mut module = Module::new("test".into(), crate::target::TargetLayout::LP64);
+        module.add_global(Global {
+            name: "ints".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I32)), 3),
+            initializer: Some(GlobalInit::IntArray(vec![1, 2, 3])),
+        });
+        module.add_global(Global {
+            name: "complex".into(),
+            ty: IrType::Array(
+                Box::new(IrType::Array(Box::new(IrType::Float(FloatWidth::F64)), 2)),
+                2,
+            ),
+            initializer: Some(GlobalInit::FloatArray(vec![1.0, 2.0, 3.0, 4.0])),
+        });
+        module.add_global(Global {
+            name: "string".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 8),
+            initializer: Some(GlobalInit::String(b"abc".to_vec())),
+        });
+        module.add_global(Global {
+            name: "empty".into(),
+            ty: IrType::Array(Box::new(IrType::Int(IntWidth::I64)), 0),
+            initializer: Some(GlobalInit::IntArray(Vec::new())),
+        });
+
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "well-shaped arrays and byte strings with implicit trailing padding should verify, got: {errors:?}",
+        );
     }
 
     #[test]
@@ -828,6 +2029,66 @@ mod tests {
     }
 
     #[test]
+    fn dangling_cfg_targets_are_reported_without_panicking() {
+        let dangling = BlockId(999);
+
+        let mut branch = Function::new("branch".into(), vec![], IrType::Void);
+        branch.blocks[0].terminator = Some(Terminator::Branch(dangling, vec![]));
+        let branch_errs = verify_function(&branch);
+        assert!(
+            branch_errs
+                .iter()
+                .any(|error| error.msg.contains("branches to undefined block 999")),
+            "expected a dangling branch diagnostic, got: {branch_errs:?}",
+        );
+
+        let mut conditional = Function::new("conditional".into(), vec![], IrType::Void);
+        let valid_conditional_target;
+        {
+            let mut b = FuncBuilder::new(&mut conditional, crate::target::TargetLayout::LP64);
+            let condition = b.const_bool(true);
+            valid_conditional_target = b.create_block("valid");
+            b.cond_branch(
+                condition,
+                dangling,
+                vec![],
+                valid_conditional_target,
+                vec![],
+            );
+            b.set_block(valid_conditional_target);
+            b.ret_void();
+        }
+        let conditional_errs = verify_function(&conditional);
+        assert!(
+            conditional_errs
+                .iter()
+                .any(|error| error.msg.contains("branches to undefined block 999")),
+            "expected a dangling conditional-branch diagnostic, got: {conditional_errs:?}",
+        );
+
+        let mut switch = Function::new("switch".into(), vec![], IrType::Void);
+        let selector;
+        {
+            let mut b = FuncBuilder::new(&mut switch, crate::target::TargetLayout::LP64);
+            selector = b.const_i32(1);
+        }
+        switch.blocks[0].terminator = Some(Terminator::Switch {
+            selector,
+            cases: vec![(1, dangling)],
+            default: dangling,
+        });
+        let switch_errs = verify_function(&switch);
+        assert_eq!(
+            switch_errs
+                .iter()
+                .filter(|error| error.msg.contains("branches to undefined block 999"))
+                .count(),
+            2,
+            "case and default edges should each be diagnosed: {switch_errs:?}",
+        );
+    }
+
+    #[test]
     fn integer_op_on_float_errors() {
         let mut func = Function::new("test".into(), vec![], IrType::Void);
         {
@@ -840,6 +2101,83 @@ mod tests {
         }
         let errs = verify_function(&func);
         assert!(errs.iter().any(|e| e.msg.contains("non-integer operand")));
+    }
+
+    #[test]
+    fn switch_rejects_non_integer_and_i128_selectors() {
+        for selector_ty in [
+            IrType::Float(FloatWidth::F32),
+            IrType::Float(FloatWidth::F64),
+            IrType::Bool,
+            IrType::Int(IntWidth::I128),
+        ] {
+            let errors = switch_verify_errors(selector_ty.clone(), &[0]);
+            assert!(
+                errors.iter().any(|error| {
+                    error
+                        .msg
+                        .contains("switch selector must be i8, i16, i32, or i64")
+                        && error.msg.contains(&selector_ty.to_string())
+                }),
+                "unsupported switch selector {selector_ty} must be rejected: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn switch_rejects_case_values_outside_selector_width() {
+        for (selector_ty, cases, expected) in [
+            (
+                IrType::Int(IntWidth::I8),
+                vec![-129, 128],
+                "selector type i8",
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                vec![-32_769, 32_768],
+                "selector type i16",
+            ),
+            (
+                IrType::Int(IntWidth::I32),
+                vec![i32::MIN as i64 - 1, i32::MAX as i64 + 1],
+                "selector type i32",
+            ),
+        ] {
+            let errors = switch_verify_errors(selector_ty, &cases);
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|error| error.msg.contains(expected))
+                    .count(),
+                2,
+                "both out-of-range cases must be rejected: {errors:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn switch_accepts_supported_integer_boundary_cases() {
+        for (selector_ty, cases) in [
+            (
+                IrType::Int(IntWidth::I8),
+                vec![i8::MIN as i64, i8::MAX as i64],
+            ),
+            (
+                IrType::Int(IntWidth::I16),
+                vec![i16::MIN as i64, i16::MAX as i64],
+            ),
+            (
+                IrType::Int(IntWidth::I32),
+                vec![i32::MIN as i64, i32::MAX as i64],
+            ),
+            (IrType::Int(IntWidth::I64), vec![i64::MIN, i64::MAX]),
+        ] {
+            let errors = switch_verify_errors(selector_ty.clone(), &cases);
+            assert!(
+                errors.is_empty(),
+                "valid switch selector {selector_ty} and boundary cases must verify: {errors:?}",
+            );
+        }
     }
 
     #[test]
@@ -865,6 +2203,26 @@ mod tests {
     }
 
     #[test]
+    fn gep_rejects_indices_the_backends_would_discard() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let base = b.alloca(IrType::Int(IntWidth::I32));
+            let first = b.const_i64(0);
+            let discarded = b.const_i64(1);
+            b.gep(base, vec![first, discarded], IrType::Int(IntWidth::I32));
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter()
+                .any(|error| error.msg.contains("GEP") && error.msg.contains("2 indices")),
+            "expected the multi-index GEP to be rejected, got: {errs:?}",
+        );
+    }
+
+    #[test]
     fn int_op_width_mismatch_errors() {
         // IMul(i32, i64) should be rejected — codegen has no
         // implicit width promotion and the verifier is the last
@@ -886,7 +2244,108 @@ mod tests {
     }
 
     #[test]
-    fn type_consistency_survives_stale_cache() {
+    fn scalar_arithmetic_result_type_must_match_operands() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let (integer_result, float_result);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let integer_lhs = b.const_i32(1);
+            let integer_rhs = b.const_i32(2);
+            integer_result = b.iadd(integer_lhs, integer_rhs);
+            let float_lhs = b.const_f32(1.0);
+            let float_rhs = b.const_f32(2.0);
+            float_result = b.fadd(float_lhs, float_rhs);
+            b.ret_void();
+        }
+
+        for inst in &mut func.blocks[0].insts {
+            if inst.id == integer_result {
+                inst.ty = IrType::Int(IntWidth::I64);
+            } else if inst.id == float_result {
+                inst.ty = IrType::Float(FloatWidth::F64);
+            }
+        }
+        func.rebuild_type_cache();
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| {
+                error
+                    .msg
+                    .contains(&format!("integer op %{}", integer_result.0))
+                    && error.msg.contains("result type i64")
+                    && error.msg.contains("operand type i32")
+            }),
+            "expected the integer result-type mismatch to be rejected, got: {errs:?}",
+        );
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains(&format!("float op %{}", float_result.0))
+                    && error.msg.contains("result type f64")
+                    && error.msg.contains("operand type f32")
+            }),
+            "expected the float result-type mismatch to be rejected, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn return_form_and_type_must_match_function_signature() {
+        let mut wrong_type = Function::new("wrong_type".into(), vec![], IrType::Int(IntWidth::I64));
+        {
+            let mut b = FuncBuilder::new(&mut wrong_type, crate::target::TargetLayout::LP64);
+            let value = b.const_i32(1);
+            b.ret(Some(value));
+        }
+        let wrong_type_errs = verify_function(&wrong_type);
+        assert!(
+            wrong_type_errs.iter().any(|error| {
+                error.msg.contains("return type mismatch")
+                    && error.msg.contains("expected i64")
+                    && error.msg.contains("got i32")
+            }),
+            "expected the returned value type to be checked, got: {wrong_type_errs:?}",
+        );
+
+        let mut missing_value =
+            Function::new("missing_value".into(), vec![], IrType::Int(IntWidth::I32));
+        missing_value.blocks[0].terminator = Some(Terminator::Return(None));
+        let missing_value_errs = verify_function(&missing_value);
+        assert!(
+            missing_value_errs.iter().any(|error| error
+                .msg
+                .contains("non-void function must return a value of type i32")),
+            "expected a missing return value to be rejected, got: {missing_value_errs:?}",
+        );
+
+        let mut unexpected_value = Function::new("unexpected_value".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut unexpected_value, crate::target::TargetLayout::LP64);
+            let value = b.const_i32(1);
+            b.ret(Some(value));
+        }
+        let unexpected_value_errs = verify_function(&unexpected_value);
+        assert!(
+            unexpected_value_errs
+                .iter()
+                .any(|error| error.msg.contains("void function must not return a value")),
+            "expected a value return from void to be rejected, got: {unexpected_value_errs:?}",
+        );
+
+        let mut valid = Function::new("valid".into(), vec![], IrType::Int(IntWidth::I32));
+        {
+            let mut b = FuncBuilder::new(&mut valid, crate::target::TargetLayout::LP64);
+            let value = b.const_i32(1);
+            b.ret(Some(value));
+        }
+        let valid_errs = verify_function(&valid);
+        assert!(
+            valid_errs.is_empty(),
+            "matching typed return should remain valid, got: {valid_errs:?}",
+        );
+    }
+
+    #[test]
+    fn type_consistency_survives_missing_cache_entries() {
         // Width-mismatched iadd inserted directly into a block (i.e.
         // bypassing the builder) used to slip past the type checker
         // because the type cache hadn't been refreshed and value_type
@@ -927,6 +2386,63 @@ mod tests {
             errs.iter().any(|e| e.msg.contains("width mismatch")),
             "expected width mismatch even without cache: {:?}",
             errs,
+        );
+    }
+
+    #[test]
+    fn present_but_stale_type_cache_entry_is_rejected() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let stale_value;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let lhs = b.const_i32(1);
+            let rhs = b.const_i32(2);
+            stale_value = b.iadd(lhs, rhs);
+            let zero = b.const_i32(0);
+            let _use_stale_value = b.iadd(stale_value, zero);
+            b.ret_void();
+        }
+
+        let defining_inst = func.blocks[0]
+            .insts
+            .iter_mut()
+            .find(|inst| inst.id == stale_value)
+            .expect("builder emitted the stale-cache witness");
+        assert_eq!(defining_inst.ty, IrType::Int(IntWidth::I32));
+        defining_inst.ty = IrType::Int(IntWidth::I64);
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains(&format!("value %{}", stale_value.0))
+                    && error.msg.contains("type cache")
+                    && error.msg.contains("i32")
+                    && error.msg.contains("i64")
+            }),
+            "expected the stale present cache entry to be rejected, got: {errs:?}",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.msg.contains("type cache"))
+                .count(),
+            1,
+            "one stale definition should produce one cache diagnostic: {errs:?}",
+        );
+
+        func.rebuild_type_cache();
+        let rebuilt_errs = verify_function(&func);
+        assert!(
+            rebuilt_errs
+                .iter()
+                .all(|error| !error.msg.contains("type cache")),
+            "rebuilding should restore cache consistency: {rebuilt_errs:?}",
+        );
+        assert!(
+            rebuilt_errs
+                .iter()
+                .any(|error| error.msg.contains("width mismatch")),
+            "verification should expose the underlying malformed iadd after rebuilding: \
+             {rebuilt_errs:?}",
         );
     }
 
@@ -1180,7 +2696,95 @@ mod tests {
         assert!(errs.iter().any(|e| e.msg.contains("duplicate value ID")));
     }
 
+    #[test]
+    fn duplicate_block_id_errors() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let first = func.create_block("first");
+        let _second = func.create_block("second");
+        for block in &mut func.blocks {
+            block.terminator = Some(Terminator::Return(None));
+        }
+
+        func.blocks[2].id = first;
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| error
+                .msg
+                .contains(&format!("duplicate block ID {}", first.0))),
+            "expected duplicate block ID {first:?} to be rejected, got: {errs:?}",
+        );
+    }
+
     // ---- SIMD vector type / verify tests ----
+
+    fn verify_vadd_with_type(ty: IrType) -> Vec<VerifyError> {
+        let mut func = Function::new("vector_add".into(), vec![], IrType::Void);
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let (lhs, rhs) = if matches!(&ty, IrType::Vector { .. }) {
+                let lhs_ptr = b.alloca(ty.clone());
+                let rhs_ptr = b.alloca(ty.clone());
+                (b.vload(lhs_ptr, ty.clone()), b.vload(rhs_ptr, ty.clone()))
+            } else {
+                (b.const_i32(1), b.const_i32(2))
+            };
+            b.vadd(lhs, rhs);
+            b.ret_void();
+        }
+        verify_function(&func)
+    }
+
+    #[test]
+    fn vector_arithmetic_accepts_backend_dispatch_shapes() {
+        for ty in [
+            IrType::Vector {
+                lanes: 4,
+                elem: Box::new(IrType::Int(IntWidth::I32)),
+            },
+            IrType::Vector {
+                lanes: 2,
+                elem: Box::new(IrType::Int(IntWidth::I64)),
+            },
+            IrType::Vector {
+                lanes: 4,
+                elem: Box::new(IrType::Float(FloatWidth::F32)),
+            },
+            IrType::Vector {
+                lanes: 2,
+                elem: Box::new(IrType::Float(FloatWidth::F64)),
+            },
+        ] {
+            let errs = verify_vadd_with_type(ty.clone());
+            assert!(
+                errs.is_empty(),
+                "expected backend-dispatched vector-arithmetic shape {ty} to verify, got: {errs:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn vector_arithmetic_rejects_shapes_without_backend_dispatch() {
+        for ty in [
+            IrType::Vector {
+                lanes: 16,
+                elem: Box::new(IrType::Int(IntWidth::I8)),
+            },
+            IrType::Vector {
+                lanes: 8,
+                elem: Box::new(IrType::Int(IntWidth::I16)),
+            },
+            IrType::Int(IntWidth::I32),
+        ] {
+            let errs = verify_vadd_with_type(ty.clone());
+            assert!(
+                errs.iter().any(|error| {
+                    error.msg.contains("vector arithmetic") && error.msg.contains(&ty.to_string())
+                }),
+                "expected unsupported vector-arithmetic shape {ty} to be rejected, got: {errs:?}",
+            );
+        }
+    }
 
     #[test]
     fn vector_shape_4xi32_ok() {

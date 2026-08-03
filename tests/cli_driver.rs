@@ -55,6 +55,10 @@ fn write_program_bytes_in(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Pa
     path
 }
 
+fn has_native_text_section(assembly: &str) -> bool {
+    assembly.contains(".text") || assembly.contains("__TEXT,__text")
+}
+
 fn diagnostic_output(source: &std::path::Path, extra_args: &[&str]) -> std::process::Output {
     let output = unique_path("diagnostic", "o");
     let result = Command::new(compiler("armfortas"))
@@ -185,6 +189,109 @@ fn help_flag_shows_usage_and_exits_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("USAGE"), "help missing USAGE line");
     assert!(stdout.contains("--std="), "help missing --std= entry");
+    assert!(
+        stdout.contains("-O1") && stdout.contains("equivalent to -O1"),
+        "help must document the conventional bare -O shorthand"
+    );
+    assert!(
+        stdout.contains("Produce shared library (Mach-O targets only)")
+            && stdout.contains("ELF targets reject this mode"),
+        "help must not advertise unsupported ELF shared-library linking:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Prefer static archives with the system Mach-O")
+            && stdout.contains("fully static ELF linking is not implemented"),
+        "help must not advertise unsupported ELF static linking:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--diagnostics-format=text")
+            && !stdout.contains("--diagnostics-format=text|json"),
+        "help must advertise only the implemented diagnostics format:\n{stdout}"
+    );
+}
+
+#[test]
+fn bare_o_runs_the_o1_pipeline_and_preserves_output_ownership() {
+    let dir = unique_dir("bare_o");
+    let source = write_program_in(
+        &dir,
+        "witness.f90",
+        "program bare_o_witness\n\
+         implicit none\n\
+         integer :: value\n\
+         value = 1\n\
+         value = value + 2\n\
+         print *, value\n\
+         end program bare_o_witness\n",
+    );
+    let compiler = compiler("armfortas");
+
+    let compile_ir = |name: &str, optimization_flags: &[&str]| {
+        let output = dir.join(format!("{name}.ir"));
+        fs::write(&output, b"stale optimization output").expect("cannot seed stale IR output");
+        let result = Command::new(&compiler)
+            .args(optimization_flags)
+            .arg("--emit-ir")
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("failed to launch compiler");
+        assert!(
+            result.status.success(),
+            "{name} IR compilation failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = fs::read_to_string(&output).expect("cannot read optimized IR output");
+        assert_ne!(
+            text, "stale optimization output",
+            "{name} retained stale IR output"
+        );
+        text
+    };
+
+    let bare = compile_ir("bare", &["-O"]);
+    let o0 = compile_ir("o0", &["-O0"]);
+    let o1 = compile_ir("o1", &["-O1"]);
+    assert_eq!(bare, o1, "bare -O must run the exact -O1 IR pipeline");
+    assert_ne!(bare, o0, "the witness must distinguish -O from -O0");
+    assert_eq!(
+        compile_ir("o0_then_bare", &["-O0", "-O"]),
+        o1,
+        "a trailing bare -O must select O1"
+    );
+    assert_eq!(
+        compile_ir("bare_then_o0", &["-O", "-O0"]),
+        o0,
+        "a trailing -O0 must restore the unoptimized pipeline"
+    );
+
+    let rejected_output = dir.join("rejected.ir");
+    fs::write(&rejected_output, b"preserved after parse failure")
+        .expect("cannot seed rejected output");
+    let rejected = Command::new(&compiler)
+        .args(["-O4", "--emit-ir"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&rejected_output)
+        .output()
+        .expect("failed to launch compiler");
+    assert!(
+        !rejected.status.success(),
+        "unknown optimization level unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unknown optimization level: -O4"),
+        "unknown optimization level produced the wrong diagnostic:\n{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        fs::read(&rejected_output).expect("cannot read rejected output"),
+        b"preserved after parse failure",
+        "optimization parse failure modified a pre-existing output"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -330,6 +437,56 @@ fn incompatible_intrinsic_assignment_is_rejected() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn move_alloc_rejects_incompatible_and_nonallocatable_arguments_before_codegen() {
+    let src = write_program(
+        "program move_alloc_invalid\n\
+         implicit none\n\
+         integer, allocatable :: scalar, vector(:), target\n\
+         real, allocatable :: real_value\n\
+         character(len=5), allocatable :: short\n\
+         character(len=9), allocatable :: long\n\
+         integer :: plain\n\
+         call move_alloc(scalar, real_value)\n\
+         call move_alloc(scalar, vector)\n\
+         call move_alloc(short, long)\n\
+         call move_alloc(plain, target)\n\
+         end program move_alloc_invalid\n",
+        "f90",
+    );
+    let result = diagnostic_output(&src, &["-std=f2018"]);
+    assert!(
+        !result.status.success(),
+        "invalid MOVE_ALLOC calls must fail before lowering"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(
+        stderr
+            .matches("must have compatible declared type and kind")
+            .count(),
+        2,
+        "missing or duplicated MOVE_ALLOC type/kind diagnostic:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("must have the same rank").count(),
+        1,
+        "missing or duplicated MOVE_ALLOC rank diagnostic:\n{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("must be a definable allocatable variable")
+            .count(),
+        1,
+        "missing or duplicated MOVE_ALLOC allocatable diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CHARACTER(kind=1,len=5)") && stderr.contains("CHARACTER(kind=1,len=9)"),
+        "missing MOVE_ALLOC character type-parameter details:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_file(src);
 }
 
 #[test]
@@ -1271,6 +1428,271 @@ end program
 }
 
 #[test]
+fn merged_use_generics_enforce_cross_tu_specific_distinguishability() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_use_generics_enforce_cross_tu_specific_distinguishability count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("indistinguishable_use_generic");
+    let left_src = write_program_in(
+        &dir,
+        "generic_left.f90",
+        r#"
+module generic_left
+  implicit none
+  interface choose
+    module procedure choose_left
+  end interface
+  interface convert
+    module procedure choose_left
+  end interface
+  interface by_rank
+    module procedure rank_scalar_left
+  end interface
+  interface by_arity
+    module procedure arity_one_left
+  end interface
+contains
+  integer function choose_left(value)
+    integer, intent(in) :: value
+    choose_left = value + 10
+  end function
+  integer function rank_scalar_left(value)
+    integer, intent(in) :: value
+    rank_scalar_left = value + 40
+  end function
+  integer function arity_one_left(value)
+    integer, intent(in) :: value
+    arity_one_left = value + 50
+  end function
+end module
+"#,
+    );
+    let right_src = write_program_in(
+        &dir,
+        "generic_right.f90",
+        r#"
+module generic_right
+  implicit none
+  interface choose
+    module procedure choose_right
+  end interface
+  interface convert
+    module procedure convert_right
+  end interface
+  interface by_rank
+    module procedure rank_vector_right
+  end interface
+  interface by_arity
+    module procedure arity_two_right
+  end interface
+contains
+  integer function choose_right(value)
+    integer, intent(in) :: value
+    choose_right = value + 20
+  end function
+  integer function convert_right(value)
+    real, intent(in) :: value
+    convert_right = int(value) + 30
+  end function
+  integer function rank_vector_right(values)
+    integer, intent(in) :: values(:)
+    rank_vector_right = sum(values) + 60
+  end function
+  integer function arity_two_right(left, right)
+    integer, intent(in) :: left, right
+    arity_two_right = left + right + 70
+  end function
+end module
+"#,
+    );
+    let legal_main_src = write_program_in(
+        &dir,
+        "legal_main.f90",
+        r#"
+program legal_demo
+  use generic_left, only : convert
+  use generic_right, only : convert
+  use generic_left, only : by_rank
+  use generic_right, only : by_rank
+  use generic_left, only : by_arity
+  use generic_right, only : by_arity
+  implicit none
+  if (convert(1) /= 11) error stop 1
+  if (convert(1.0) /= 31) error stop 2
+  if (by_rank(2) /= 42) error stop 3
+  if (by_rank([2, 3]) /= 65) error stop 4
+  if (by_arity(1) /= 51) error stop 5
+  if (by_arity(1, 2) /= 73) error stop 6
+  print *, "ok"
+end program
+"#,
+    );
+    let rejected_main_src = write_program_in(
+        &dir,
+        "rejected_main.f90",
+        r#"
+program demo
+  use generic_left, only : choose
+  use generic_right, only : choose
+  implicit none
+  print *, choose(1)
+end program
+"#,
+    );
+    let reversed_main_src = write_program_in(
+        &dir,
+        "reversed_main.f90",
+        r#"
+program reversed_demo
+  use generic_right, only : choose
+  use generic_left, only : choose
+  implicit none
+  print *, choose(1)
+end program
+"#,
+    );
+    let unused_main_src = write_program_in(
+        &dir,
+        "unused_main.f90",
+        r#"
+program unused_demo
+  use generic_left, only : choose
+  use generic_right, only : choose
+  implicit none
+end program
+"#,
+    );
+    let block_main_src = write_program_in(
+        &dir,
+        "block_main.f90",
+        r#"
+program block_demo
+  implicit none
+  block
+    use generic_left, only : choose
+    use generic_right, only : choose
+    integer :: untouched
+    untouched = 1
+  end block
+end program
+"#,
+    );
+
+    for (src, object_name) in [
+        (&left_src, "generic_left.o"),
+        (&right_src, "generic_right.o"),
+    ] {
+        let object = dir.join(object_name);
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                src.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("provider compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "generic provider {} should compile: {}",
+            src.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    let legal_object = dir.join("legal_main.o");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            legal_main_src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            legal_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("legal consumer compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "distinguishable USE-associated specifics should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let legal_executable = dir.join("legal_main.bin");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            dir.join("generic_left.o").to_str().unwrap(),
+            dir.join("generic_right.o").to_str().unwrap(),
+            legal_object.to_str().unwrap(),
+            "-o",
+            legal_executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("legal consumer link failed to spawn");
+    assert!(
+        result.status.success(),
+        "distinguishable USE-associated specifics should link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = Command::new(&legal_executable)
+        .output()
+        .expect("legal consumer run failed to spawn");
+    assert!(
+        result.status.success() && String::from_utf8_lossy(&result.stdout).contains("ok"),
+        "distinguishable USE-associated specifics should run: status={:?} stdout={} stderr={}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let diagnostic = "generic interface 'choose' has indistinguishable specific procedures \
+                      'choose_left' and 'choose_right'";
+    for (source, object_name) in [
+        (&rejected_main_src, "rejected_main.o"),
+        (&reversed_main_src, "reversed_main.o"),
+        (&unused_main_src, "unused_main.o"),
+        (&block_main_src, "block_main.o"),
+    ] {
+        let out = dir.join(object_name);
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                source.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("consumer compile failed to spawn");
+        assert!(
+            !result.status.success(),
+            "indistinguishable USE-associated generic specifics should be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "expected one stable indistinguishable-generic diagnostic: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn direct_use_association_conflicts_with_local_declarations() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -1393,6 +1815,985 @@ fn direct_use_association_conflicts_with_local_declarations() {
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(&src);
     }
+}
+
+#[test]
+fn contained_procedure_names_must_be_unique_in_the_host_scope() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_procedure_names_must_be_unique_in_the_host_scope count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "contained_variable_collision",
+            "program collision\n  implicit none\n  integer :: child\ncontains\n  subroutine child()\n  end subroutine child\nend program collision\n",
+        ),
+        (
+            "contained_parameter_collision",
+            "program collision\n  implicit none\n  integer, parameter :: child = 1\ncontains\n  integer function child()\n    child = 2\n  end function child\nend program collision\n",
+        ),
+        (
+            "contained_dummy_collision",
+            "subroutine outer(child)\n  implicit none\n  integer, intent(in) :: child\ncontains\n  subroutine child()\n  end subroutine child\nend subroutine outer\n",
+        ),
+        (
+            "contained_type_collision",
+            "program collision\n  implicit none\n  type :: child\n  end type child\ncontains\n  integer function child()\n    child = 1\n  end function child\nend program collision\n",
+        ),
+        (
+            "duplicate_contained_procedure",
+            "program collision\n  implicit none\ncontains\n  subroutine child()\n  end subroutine child\n  subroutine child()\n  end subroutine child\nend program collision\n",
+        ),
+    ];
+
+    let diagnostic = "symbol 'child' already defined in this scope";
+    for (stem, source) in rejected {
+        let src = write_program(source, "f90");
+        let out = unique_path(stem, "o");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("contained-procedure collision compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable collision diagnostic: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{stem} published an object despite the semantic error"
+        );
+        let _ = std::fs::remove_file(&src);
+    }
+
+    let legal_src = write_program(
+        "module same_name_host\n  implicit none\n  interface child\n    module procedure child\n    module procedure child_real\n  end interface child\ncontains\n  integer function child(value)\n    integer, intent(in) :: value\n    child = value + 1\n  end function child\n  integer function child_real(value)\n    real, intent(in) :: value\n    child_real = int(value) + 2\n  end function child_real\nend module same_name_host\n",
+        "f90",
+    );
+    let legal_out = unique_path("contained_same_name_generic", "o");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            legal_src.to_str().unwrap(),
+            "-o",
+            legal_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name generic compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "a generic may share its name with one of its specifics: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        legal_out.exists(),
+        "legal same-name generic did not produce an object"
+    );
+    let _ = std::fs::remove_file(&legal_out);
+    let _ = std::fs::remove_file(&legal_src);
+}
+
+#[test]
+fn explicit_interface_names_must_not_collide_with_local_entities() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_interface_names_must_not_collide_with_local_entities count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "interface_variable_collision",
+            "interface_variable_collision_m",
+            "module interface_variable_collision_m\n  implicit none\n  integer :: collide\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\nend module interface_variable_collision_m\n",
+        ),
+        (
+            "interface_reversed_case_collision",
+            "interface_reversed_case_collision_m",
+            "module interface_reversed_case_collision_m\n  implicit none\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\n  integer :: COLLIDE\nend module interface_reversed_case_collision_m\n",
+        ),
+        (
+            "interface_parameter_collision",
+            "interface_parameter_collision_m",
+            "module interface_parameter_collision_m\n  implicit none\n  integer, parameter :: collide = 1\n  interface\n    integer function collide()\n    end function collide\n  end interface\nend module interface_parameter_collision_m\n",
+        ),
+        (
+            "interface_type_collision",
+            "interface_type_collision_m",
+            "module interface_type_collision_m\n  implicit none\n  type :: collide\n    integer :: value\n  end type collide\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\nend module interface_type_collision_m\n",
+        ),
+        (
+            "interface_procedure_collision",
+            "interface_procedure_collision_m",
+            "module interface_procedure_collision_m\n  implicit none\n  interface\n    integer function collide()\n    end function collide\n  end interface\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\nend module interface_procedure_collision_m\n",
+        ),
+        (
+            "interface_contained_collision",
+            "interface_contained_collision_m",
+            "module interface_contained_collision_m\n  implicit none\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\ncontains\n  subroutine collide()\n  end subroutine collide\nend module interface_contained_collision_m\n",
+        ),
+        (
+            "interface_value_dummy_collision",
+            "interface_value_dummy_collision_m",
+            "module interface_value_dummy_collision_m\n  implicit none\ncontains\n  subroutine outer(collide)\n    integer, value :: collide\n    interface\n      subroutine collide()\n      end subroutine collide\n    end interface\n  end subroutine outer\nend module interface_value_dummy_collision_m\n",
+        ),
+    ];
+
+    let diagnostic = "symbol 'collide' already defined in this scope";
+    for (stem, module_name, source) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "provider.f90", source);
+        let object = dir.join("provider.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", src.to_str().unwrap(), "-o", object.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("explicit-interface collision compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable collision diagnostic: {stderr}"
+        );
+        assert!(
+            !object.exists()
+                && !dir.join(format!("{module_name}.amod")).exists()
+                && !dir.join(format!("{module_name}.mod")).exists(),
+            "{stem} published compiler artifacts despite the semantic error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("interface_dummy_merge");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module callback_provider\n  implicit none\ncontains\n  subroutine invoke(callback, value)\n    interface\n      integer function callback(argument)\n        integer, intent(in) :: argument\n      end function callback\n    end interface\n    integer, intent(out) :: value\n    value = callback(5)\n  end subroutine invoke\nend module callback_provider\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-dummy provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "legal procedure-dummy interface should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consume_callback\n  use callback_provider, only: invoke\n  implicit none\n  integer :: value\n  call invoke(add_one, value)\n  if (value /= 6) error stop 1\ncontains\n  integer function add_one(argument)\n    integer, intent(in) :: argument\n    add_one = argument + 1\n  end function add_one\nend program consume_callback\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-dummy consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "serialized procedure-dummy interface should remain usable: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("procedure-dummy consumer failed to run");
+    assert!(
+        run.status.success(),
+        "procedure-dummy consumer failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn named_generic_specifics_must_be_unique() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=named_generic_specifics_must_be_unique count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "generic_duplicate_same_statement",
+            "module duplicate_same_statement_m\n  implicit none\n  interface generic_value\n    module procedure integer_value, INTEGER_VALUE\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_same_statement_m\n",
+        ),
+        (
+            "generic_duplicate_across_statements",
+            "module duplicate_across_statements_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n    procedure :: INTEGER_VALUE\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_across_statements_m\n",
+        ),
+        (
+            "generic_duplicate_reopened_interface",
+            "module duplicate_reopened_interface_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n  end interface generic_value\n  interface generic_value\n    module procedure INTEGER_VALUE\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_reopened_interface_m\n",
+        ),
+        (
+            "generic_duplicate_imported_specific",
+            "module duplicate_import_base_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\nend module duplicate_import_base_m\n\nmodule duplicate_import_extension_m\n  use duplicate_import_base_m, only: generic_value, integer_value\n  implicit none\n  interface generic_value\n    module procedure INTEGER_VALUE\n  end interface generic_value\nend module duplicate_import_extension_m\n",
+        ),
+    ];
+    let diagnostic =
+        "specific procedure 'integer_value' is already present in generic interface 'generic_value'";
+
+    for (stem, source) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "provider.f90", source);
+        let object = dir.join("provider.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("duplicate generic provider compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable duplicate-specific diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("generic_distinct_split");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module generic_provider_m\n  implicit none\n  interface generic_value\n    module procedure integer_value\n  end interface generic_value\n  interface generic_value\n    procedure :: real_value\n  end interface generic_value\ncontains\n  integer function integer_value(value)\n    integer, intent(in) :: value\n    integer_value = value\n  end function integer_value\n  integer function real_value(value)\n    real, intent(in) :: value\n    real_value = int(value)\n  end function real_value\nend module generic_provider_m\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("distinct generic provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "distinct generic provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+    let amod = std::fs::read_to_string(dir.join("generic_provider_m.amod"))
+        .expect("distinct generic provider did not publish its module interface");
+    assert_eq!(
+        amod.matches("@specific integer_value").count(),
+        1,
+        "integer specific should be serialized exactly once: {amod}"
+    );
+    assert_eq!(
+        amod.matches("@specific real_value").count(),
+        1,
+        "real specific should be serialized exactly once: {amod}"
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consume_generic\n  use generic_provider_m, only: generic_value\n  implicit none\n  if (generic_value(42) /= 42) error stop 1\n  if (generic_value(19.0) /= 19) error stop 2\n  print *, 'ok'\nend program consume_generic\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("distinct generic consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "serialized distinct generic should remain usable: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("distinct generic consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "distinct generic consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let owner_extension = write_program_in(
+        &dir,
+        "owner_extension.f90",
+        "module same_name_owner_base_m\n  implicit none\n  private\n  public :: select_value\n  interface select_value\n    module procedure pick\n  end interface select_value\ncontains\n  integer function pick(value)\n    integer, intent(in) :: value\n    pick = value\n  end function pick\nend module same_name_owner_base_m\n\nmodule same_name_owner_extension_m\n  use same_name_owner_base_m, only: select_value\n  implicit none\n  interface select_value\n    module procedure pick\n  end interface select_value\ncontains\n  integer function pick(value)\n    real, intent(in) :: value\n    pick = int(value)\n  end function pick\nend module same_name_owner_extension_m\n\nprogram consume_same_name_owners\n  use same_name_owner_extension_m, only: select_value\n  implicit none\n  if (select_value(42) /= 42) error stop 1\n  if (select_value(19.0) /= 19) error stop 2\n  print *, 'owner-ok'\nend program consume_same_name_owners\n",
+    );
+    let owner_executable = dir.join("owner_consumer");
+    let owner_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            owner_extension.to_str().unwrap(),
+            "-o",
+            owner_executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-name owner extension compile failed to spawn");
+    assert!(
+        owner_result.status.success(),
+        "same spelling from distinct procedure owners should compile: {}",
+        String::from_utf8_lossy(&owner_result.stderr)
+    );
+    let owner_run = Command::new(&owner_executable)
+        .output()
+        .expect("same-name owner extension failed to run");
+    assert!(
+        owner_run.status.success()
+            && String::from_utf8_lossy(&owner_run.stdout).contains("owner-ok"),
+        "same-name owner extension failed: status={:?} stdout={} stderr={}",
+        owner_run.status,
+        String::from_utf8_lossy(&owner_run.stdout),
+        String::from_utf8_lossy(&owner_run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ordinary_type_declarations_must_not_replace_local_symbols() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ordinary_type_declarations_must_not_replace_local_symbols count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "duplicate_local_declaration",
+            "program duplicate_local\n  implicit none\n  integer :: value\n  real :: VALUE\nend program duplicate_local\n",
+            "VALUE",
+        ),
+        (
+            "duplicate_dummy_declaration",
+            "subroutine duplicate_dummy(value)\n  implicit none\n  integer, intent(in) :: value\n  real, intent(in) :: VALUE\nend subroutine duplicate_dummy\n",
+            "VALUE",
+        ),
+        (
+            "retyped_function_result",
+            "integer function retyped_result()\n  implicit none\n  real :: RETYPED_RESULT\n  retyped_result = 1.0\nend function retyped_result\n",
+            "RETYPED_RESULT",
+        ),
+        (
+            "dummy_replaced_by_parameter",
+            "subroutine parameter_dummy(value)\n  implicit none\n  integer, parameter :: VALUE = 1\nend subroutine parameter_dummy\n",
+            "VALUE",
+        ),
+        (
+            "result_replaced_by_parameter",
+            "function parameter_result() result(value)\n  implicit none\n  integer, parameter :: VALUE = 1\nend function parameter_result\n",
+            "VALUE",
+        ),
+        (
+            "replaced_parameter",
+            "module replaced_parameter_m\n  implicit none\n  integer, parameter :: value = 1\n  real :: VALUE\nend module replaced_parameter_m\n",
+            "VALUE",
+        ),
+        (
+            "replaced_derived_type",
+            "module replaced_type_m\n  implicit none\n  type :: payload\n    integer :: value\n  end type payload\n  integer :: PAYLOAD\nend module replaced_type_m\n",
+            "PAYLOAD",
+        ),
+    ];
+
+    for (stem, source, repeated_name) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("declaration-collision compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let diagnostic = format!("symbol '{repeated_name}' already defined in this scope");
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(&diagnostic).count(),
+            1,
+            "{stem} should emit one stable declaration-collision diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("valid_declaration_placeholders");
+    let src = write_program_in(
+        &dir,
+        "valid.f90",
+        "module declaration_placeholders_m\n  implicit none\ncontains\n  subroutine accept_value(value)\n    integer, intent(in), optional :: value\n    if (.not. present(value)) error stop 1\n    if (value /= 7) error stop 2\n  end subroutine accept_value\n\n  function make_value() result(value)\n    integer :: value\n    value = 9\n  end function make_value\nend module declaration_placeholders_m\n\nprogram valid_declaration_placeholders\n  use declaration_placeholders_m\n  implicit none\n  call accept_value(7)\n  if (make_value() /= 9) error stop 3\n  print *, 'ok'\nend program valid_declaration_placeholders\n",
+    );
+    let executable = dir.join("valid");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            src.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("valid placeholder declaration compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "valid dummy and result declarations should compile: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("valid placeholder declaration program failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "valid placeholder declaration program failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn generic_interfaces_must_not_mix_functions_and_subroutines() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_interfaces_must_not_mix_functions_and_subroutines count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "mixed_generic_module_procedures",
+            "module mixed_module_procedures_m\n  implicit none\n  interface dispatch\n    module procedure compute_value, update_value\n  end interface dispatch\ncontains\n  integer function compute_value(value)\n    integer, intent(in) :: value\n    compute_value = value\n  end function compute_value\n  subroutine update_value(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_value\nend module mixed_module_procedures_m\n",
+        ),
+        (
+            "mixed_generic_explicit_bodies",
+            "module mixed_explicit_bodies_m\n  implicit none\n  interface dispatch\n    integer function compute_value(value)\n      integer, intent(in) :: value\n    end function compute_value\n    subroutine update_value(value)\n      integer, intent(inout) :: value\n    end subroutine update_value\n  end interface dispatch\nend module mixed_explicit_bodies_m\n",
+        ),
+        (
+            "mixed_generic_reopened_interface",
+            "module mixed_reopened_interface_m\n  implicit none\n  interface dispatch\n    module procedure compute_value\n  end interface dispatch\n  interface DISPATCH\n    procedure :: update_value\n  end interface DISPATCH\ncontains\n  integer function compute_value(value)\n    integer, intent(in) :: value\n    compute_value = value\n  end function compute_value\n  subroutine update_value(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_value\nend module mixed_reopened_interface_m\n",
+        ),
+    ];
+    let diagnostic =
+        "generic interface 'dispatch' may not mix function and subroutine specific procedures";
+
+    for (stem, source) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("mixed generic provider compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable mixed-generic diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("mixed_generic_separate_compilation");
+    let function_provider = write_program_in(
+        &dir,
+        "function_provider.f90",
+        "module function_provider_m\n  implicit none\n  interface dispatch\n    module procedure compute_integer\n  end interface dispatch\ncontains\n  integer function compute_integer(value)\n    integer, intent(in) :: value\n    compute_integer = value\n  end function compute_integer\nend module function_provider_m\n",
+    );
+    let function_object = dir.join("function_provider.o");
+    let function_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            function_provider.to_str().unwrap(),
+            "-o",
+            function_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("function generic provider compile failed to spawn");
+    assert!(
+        function_result.status.success(),
+        "function generic provider should compile: {}",
+        String::from_utf8_lossy(&function_result.stderr)
+    );
+
+    let mixed_extension = write_program_in(
+        &dir,
+        "mixed_extension.f90",
+        "module mixed_extension_m\n  use function_provider_m, only: dispatch\n  implicit none\n  interface dispatch\n    module procedure update_integer\n  end interface dispatch\ncontains\n  subroutine update_integer(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_integer\nend module mixed_extension_m\n",
+    );
+    let mixed_extension_object = dir.join("mixed_extension.o");
+    let mixed_extension_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            mixed_extension.to_str().unwrap(),
+            "-o",
+            mixed_extension_object.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("mixed generic extension compile failed to spawn");
+    let mixed_extension_stderr = String::from_utf8_lossy(&mixed_extension_result.stderr);
+    assert!(
+        !mixed_extension_result.status.success(),
+        "cross-module mixed generic extension should be rejected: {mixed_extension_stderr}"
+    );
+    assert_eq!(
+        mixed_extension_stderr.matches(diagnostic).count(),
+        1,
+        "cross-module extension should emit one stable diagnostic: {mixed_extension_stderr}"
+    );
+    assert!(
+        !mixed_extension_object.exists()
+            && !dir.join("mixed_extension_m.amod").exists()
+            && !dir.join("mixed_extension_m.mod").exists(),
+        "rejected cross-module extension published compiler artifacts"
+    );
+
+    let subroutine_provider = write_program_in(
+        &dir,
+        "subroutine_provider.f90",
+        "module subroutine_provider_m\n  implicit none\n  interface dispatch\n    module procedure update_integer\n  end interface dispatch\ncontains\n  subroutine update_integer(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine update_integer\nend module subroutine_provider_m\n",
+    );
+    let subroutine_object = dir.join("subroutine_provider.o");
+    let subroutine_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            subroutine_provider.to_str().unwrap(),
+            "-o",
+            subroutine_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("subroutine generic provider compile failed to spawn");
+    assert!(
+        subroutine_result.status.success(),
+        "subroutine generic provider should compile: {}",
+        String::from_utf8_lossy(&subroutine_result.stderr)
+    );
+
+    let mixed_consumer = write_program_in(
+        &dir,
+        "mixed_consumer.f90",
+        "program mixed_consumer\n  use function_provider_m, only: dispatch\n  use subroutine_provider_m, only: dispatch\n  implicit none\nend program mixed_consumer\n",
+    );
+    let mixed_consumer_object = dir.join("mixed_consumer.o");
+    let mixed_consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            mixed_consumer.to_str().unwrap(),
+            "-o",
+            mixed_consumer_object.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("mixed imported generic consumer compile failed to spawn");
+    let mixed_consumer_stderr = String::from_utf8_lossy(&mixed_consumer_result.stderr);
+    assert!(
+        !mixed_consumer_result.status.success(),
+        "merged imported function/subroutine generics should be rejected: {mixed_consumer_stderr}"
+    );
+    assert_eq!(
+        mixed_consumer_stderr.matches(diagnostic).count(),
+        1,
+        "merged imported generics should emit one stable diagnostic: {mixed_consumer_stderr}"
+    );
+    assert!(
+        !mixed_consumer_object.exists(),
+        "rejected mixed-generic consumer published an object"
+    );
+
+    let valid_extension = write_program_in(
+        &dir,
+        "valid_extension.f90",
+        "module valid_extension_m\n  use function_provider_m, only: dispatch\n  implicit none\n  interface dispatch\n    module procedure compute_real\n  end interface dispatch\n  interface mutate\n    module procedure increment_integer, increment_real\n  end interface mutate\ncontains\n  integer function compute_real(value)\n    real, intent(in) :: value\n    compute_real = int(value)\n  end function compute_real\n  subroutine increment_integer(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine increment_integer\n  subroutine increment_real(value)\n    real, intent(inout) :: value\n    value = value + 1.0\n  end subroutine increment_real\nend module valid_extension_m\n",
+    );
+    let valid_extension_object = dir.join("valid_extension.o");
+    let valid_extension_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            valid_extension.to_str().unwrap(),
+            "-o",
+            valid_extension_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-nature generic extension compile failed to spawn");
+    assert!(
+        valid_extension_result.status.success(),
+        "function-only extension and subroutine-only generic should compile: {}",
+        String::from_utf8_lossy(&valid_extension_result.stderr)
+    );
+
+    let valid_consumer = write_program_in(
+        &dir,
+        "valid_consumer.f90",
+        "program valid_consumer\n  use valid_extension_m, only: dispatch, mutate\n  implicit none\n  integer :: integer_value\n  real :: real_value\n  if (dispatch(7) /= 7) error stop 1\n  if (dispatch(2.5) /= 2) error stop 2\n  integer_value = 4\n  real_value = 1.5\n  call mutate(integer_value)\n  call mutate(real_value)\n  if (integer_value /= 5) error stop 3\n  if (abs(real_value - 2.5) > 0.0001) error stop 4\n  print *, 'ok'\nend program valid_consumer\n",
+    );
+    let valid_executable = dir.join("valid_consumer");
+    let valid_consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            valid_consumer.to_str().unwrap(),
+            function_object.to_str().unwrap(),
+            valid_extension_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            valid_executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-nature generic consumer compile failed to spawn");
+    assert!(
+        valid_consumer_result.status.success(),
+        "single-nature generics should remain usable across .amod files: {}",
+        String::from_utf8_lossy(&valid_consumer_result.stderr)
+    );
+    let valid_run = Command::new(&valid_executable)
+        .output()
+        .expect("single-nature generic consumer failed to run");
+    assert!(
+        valid_run.status.success() && String::from_utf8_lossy(&valid_run.stdout).contains("ok"),
+        "single-nature generic consumer failed: status={:?} stdout={} stderr={}",
+        valid_run.status,
+        String::from_utf8_lossy(&valid_run.stdout),
+        String::from_utf8_lossy(&valid_run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn accessibility_may_be_specified_only_once_per_entity_or_default() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=accessibility_may_be_specified_only_once_per_entity_or_default count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "repeated_same_access",
+            "module repeated_same_access_m\n  implicit none\n  integer :: value\n  public :: value\n  public :: VALUE\nend module repeated_same_access_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_conflicting_access",
+            "module repeated_conflicting_access_m\n  implicit none\n  integer :: value\n  public :: value\n  private :: value\nend module repeated_conflicting_access_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_access_in_one_list",
+            "module repeated_access_in_one_list_m\n  implicit none\n  integer :: value\n  public :: value, VALUE\nend module repeated_access_in_one_list_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "access_attribute_then_list",
+            "module access_attribute_then_list_m\n  implicit none\n  integer, public :: value\n  private :: value\nend module access_attribute_then_list_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "access_list_then_attribute",
+            "module access_list_then_attribute_m\n  implicit none\n  public :: value\n  integer, private :: value\nend module access_list_then_attribute_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_access_attribute",
+            "module repeated_access_attribute_m\n  implicit none\n  integer, public, PUBLIC :: value\nend module repeated_access_attribute_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "conflicting_access_attributes",
+            "module conflicting_access_attributes_m\n  implicit none\n  integer, public, private :: value\nend module conflicting_access_attributes_m\n",
+            "accessibility of 'value' is specified more than once in this scope",
+        ),
+        (
+            "repeated_type_access_attribute",
+            "module repeated_type_access_attribute_m\n  implicit none\n  type, public, PUBLIC :: item\n    integer :: value\n  end type item\nend module repeated_type_access_attribute_m\n",
+            "accessibility of 'item' is specified more than once in this scope",
+        ),
+        (
+            "repeated_derived_type_access",
+            "module repeated_derived_type_access_m\n  implicit none\n  type, public :: item\n    integer :: value\n  end type item\n  public :: item\nend module repeated_derived_type_access_m\n",
+            "accessibility of 'item' is specified more than once in this scope",
+        ),
+        (
+            "repeated_default_access",
+            "module repeated_default_access_m\n  implicit none\n  private\n  private\nend module repeated_default_access_m\n",
+            "default accessibility is specified more than once in this scope",
+        ),
+        (
+            "conflicting_default_access",
+            "module conflicting_default_access_m\n  implicit none\n  private\n  public\nend module conflicting_default_access_m\n",
+            "default accessibility is specified more than once in this scope",
+        ),
+        (
+            "repeated_generic_access",
+            "module repeated_generic_access_m\n  implicit none\n  public :: dispatch\n  private :: DISPATCH\n  interface dispatch\n    module procedure compute_value\n  end interface dispatch\ncontains\n  integer function compute_value(value)\n    integer, intent(in) :: value\n    compute_value = value\n  end function compute_value\nend module repeated_generic_access_m\n",
+            "accessibility of 'dispatch' is specified more than once in this scope",
+        ),
+        (
+            "repeated_component_access_attribute",
+            "module repeated_component_access_attribute_m\n  implicit none\n  type :: item\n    integer, public, PUBLIC :: value\n  end type item\nend module repeated_component_access_attribute_m\n",
+            "derived-type component accessibility is specified more than once",
+        ),
+    ];
+
+    for (stem, source, diagnostic) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("repeated-access compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable repeated-access diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("single_access_specification");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module access_contract_m\n  implicit none\n  private\n  public :: visible_value, evaluate\n  integer, parameter :: visible_value = 7\n  type, public :: exported_item\n    private\n    integer, public :: value\n  end type exported_item\n  interface evaluate\n    module procedure evaluate_integer\n  end interface evaluate\ncontains\n  integer function evaluate_integer(value)\n    integer, intent(in) :: value\n    evaluate_integer = value + visible_value\n  end function evaluate_integer\nend module access_contract_m\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-access provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "one default, named override, type access, and component access should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program access_consumer\n  use access_contract_m, only: visible_value, exported_item, evaluate\n  implicit none\n  type(exported_item) :: item\n  item%value = evaluate(5)\n  if (visible_value /= 7 .or. item%value /= 12) error stop 1\n  print *, 'ok'\nend program access_consumer\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("single-access consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "single accessibility specifications should survive .amod loading: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("single-access consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "single-access consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2382,7 +3783,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 8\n", "#!amod 7\n", 1);
+        .replacen("#!amod 12\n", "#!amod 11\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -2409,7 +3810,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 7 (compiler requires 8)")
+        stderr.contains("incompatible .amod version 11 (compiler requires 12)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -2522,6 +3923,58 @@ fn fixed_form_program_compiles_and_runs() {
         stdout.trim().ends_with('6'),
         "unexpected fixed-form output: {}",
         stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_inline_comments_preserve_later_continuations() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_inline_comments_preserve_later_continuations count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        concat!(
+            "      PROGRAM P\n",
+            "      INTEGER X\n",
+            "      X = 39 ! ignored ' 99H\n",
+            "     +    + 1 ! ignored \" 77H\n",
+            "     +    + 2\n",
+            "      PRINT *, X\n",
+            "      END\n",
+        ),
+        "f",
+    );
+    let out = unique_path("fixed_inline_comment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed inline-comment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed inline-comment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed inline-comment run failed");
+    assert!(
+        run.status.success(),
+        "fixed inline-comment run failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).trim().ends_with("42"),
+        "unexpected fixed inline-comment output: {}",
+        String::from_utf8_lossy(&run.stdout)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -4099,6 +5552,73 @@ fn stop_with_integer_code_exits_with_that_status() {
 }
 
 #[test]
+fn stop_quiet_expression_controls_diagnostics_and_is_evaluated() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stop_quiet_expression_controls_diagnostics_and_is_evaluated count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=1) :: mode\n  logical :: host_quiet\n  call get_command_argument(1, mode)\n  host_quiet = mode /= 'l'\n  select case (mode)\n  case ('z')\n    stop, quiet=quiet_probe()\n  case ('s')\n    stop 'stop-visible', quiet=quiet_probe()\n  case ('i')\n    stop 7, quiet=quiet_probe()\n  case ('e')\n    error stop 'error-visible', quiet=quiet_probe()\n  case ('r')\n    error stop 13, quiet=quiet_probe()\n  case ('n')\n    error stop, quiet=quiet_probe()\n  case ('l')\n    error stop 'error-visible', quiet=quiet_probe()\n  case default\n    error stop 99\n  end select\ncontains\n  logical function quiet_probe()\n    print '(a)', 'quiet-evaluated'\n    quiet_probe = host_quiet\n  end function quiet_probe\nend program\n",
+        "stop_quiet_expr.f90",
+    );
+    let out = unique_path("stop_quiet_expr", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("STOP QUIET expression compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "STOP QUIET expression compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    for (mode, expected_status, expect_banner) in [
+        ("z", 0, false),
+        ("s", 0, false),
+        ("i", 7, false),
+        ("e", 1, false),
+        ("r", 13, false),
+        ("n", 1, false),
+        ("l", 1, true),
+    ] {
+        let run = Command::new(&out)
+            .arg(mode)
+            .output()
+            .expect("STOP QUIET expression run failed");
+        assert_eq!(
+            run.status.code(),
+            Some(expected_status),
+            "mode={mode}: status={:?}, stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("quiet-evaluated"),
+            "mode={mode}: QUIET expression was not evaluated; stdout={}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        if expect_banner {
+            assert!(
+                stderr.contains("error-visible"),
+                "mode={mode}: missing STOP diagnostic: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.is_empty(),
+                "mode={mode}: QUIET=.TRUE. emitted a STOP diagnostic: {stderr}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn error_stop_with_allocatable_character_message_prints_user_text() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -5659,6 +7179,300 @@ fn bind_c_name_call_uses_declared_c_symbol() {
 }
 
 #[test]
+fn bind_c_name_named_constant_exports_evaluated_label() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_name_named_constant_exports_evaluated_label count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_name_named_constant");
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        "#include <stdint.h>\n\nextern void armfortas_named_binding(int32_t *value);\n\nint main(void) {\n    int32_t value = -1;\n    armfortas_named_binding(&value);\n    return value == 42 ? 0 : 1;\n}\n",
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let fortran_src = write_program_in(
+        &dir,
+        "binding.f90",
+        "module bindings\n  use iso_c_binding, only: c_int\n  implicit none\n  character(len=*), parameter :: exported_name = 'armfortas_named_binding'\ncontains\n  subroutine set_answer(value) bind(c, name=exported_name)\n    integer(c_int), intent(out) :: value\n    value = 42_c_int\n  end subroutine set_answer\nend module bindings\n",
+    );
+    let fortran_obj = dir.join("binding.o");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            fortran_src.to_str().unwrap(),
+            "-o",
+            fortran_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("named BIND(C) constant compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "named BIND(C) constant should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let exe = dir.join("bind_c_name_named_constant.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            fortran_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("named BIND(C) constant link failed to spawn");
+    assert!(
+        link.status.success(),
+        "BIND(C) must export the evaluated constant label: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("named BIND(C) constant executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "named BIND(C) constant executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_c_name_use_associated_concat_survives_amod_and_links() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=bind_c_name_use_associated_concat_survives_amod_and_links count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_name_cross_tu");
+    let labels_src = write_program_in(
+        &dir,
+        "binding_labels.f90",
+        "module binding_labels\n  implicit none\n  character(len=*), parameter :: label_prefix = 'armfortas_cross_'\n  character(len=*), parameter :: label_suffix = 'tu_binding'\nend module binding_labels\n",
+    );
+    let labels_obj = dir.join("binding_labels.o");
+    let labels_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            labels_src.to_str().unwrap(),
+            "-o",
+            labels_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("binding-label parameter module compile failed to spawn");
+    assert!(
+        labels_compile.status.success(),
+        "binding-label parameter module should compile: {}",
+        String::from_utf8_lossy(&labels_compile.stderr)
+    );
+
+    let binding_src = write_program_in(
+        &dir,
+        "binding.f90",
+        "module bindings\n  use iso_c_binding, only: c_int\n  use binding_labels, only: label_prefix, label_suffix\n  implicit none\ncontains\n  subroutine set_answer(value) bind(c, name=label_prefix // label_suffix)\n    integer(c_int), intent(out) :: value\n    value = 42_c_int\n  end subroutine set_answer\nend module bindings\n",
+    );
+    let binding_obj = dir.join("binding.o");
+    let binding_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            binding_src.to_str().unwrap(),
+            "-o",
+            binding_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("use-associated BIND(C) label compile failed to spawn");
+    assert!(
+        binding_compile.status.success(),
+        "use-associated BIND(C) label should compile: {}",
+        String::from_utf8_lossy(&binding_compile.stderr)
+    );
+
+    let c_src = write_program_in(
+        &dir,
+        "main.c",
+        "#include <stdint.h>\n\nextern void armfortas_cross_tu_binding(int32_t *value);\n\nint main(void) {\n    int32_t value = -1;\n    armfortas_cross_tu_binding(&value);\n    return value == 42 ? 0 : 1;\n}\n",
+    );
+    let c_obj = dir.join("main.o");
+    compile_c_object(&c_src, &c_obj);
+
+    let exe = dir.join("bind_c_name_cross_tu.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            labels_obj.to_str().unwrap(),
+            binding_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("use-associated BIND(C) label link failed to spawn");
+    assert!(
+        link.status.success(),
+        "evaluated BIND(C) label must survive .amod import: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("cross-TU BIND(C) label executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "cross-TU BIND(C) label executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_bind_c_name_preserves_native_module_linkage_across_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_bind_c_name_preserves_native_module_linkage_across_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("bind_c_empty_name_cross_tu");
+    let binding_src = write_program_in(
+        &dir,
+        "empty_binding.f90",
+        "module empty_binding\n  use iso_c_binding, only: c_char, c_int\n  implicit none\ncontains\n  subroutine set_answer(value) bind(c, name='')\n    integer(c_int), intent(out) :: value\n    value = 42_c_int\n  end subroutine set_answer\n\n  function answer_marker() result(marker) bind(c, name='')\n    character(kind=c_char) :: marker\n    marker = 'Z'\n  end function answer_marker\nend module empty_binding\n",
+    );
+    let binding_obj = dir.join("empty_binding.o");
+    let binding_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            binding_src.to_str().unwrap(),
+            "-o",
+            binding_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty-label BIND(C) module compile failed to spawn");
+    assert!(
+        binding_compile.status.success(),
+        "empty-label BIND(C) module should compile: {}",
+        String::from_utf8_lossy(&binding_compile.stderr)
+    );
+    let amod = std::fs::read_to_string(dir.join("empty_binding.amod"))
+        .expect("empty-label BIND(C) module did not emit .amod");
+    assert!(
+        amod.lines().any(|line| {
+            line.starts_with("@function answer_marker ")
+                && line.contains(", bind_c")
+                && !line.contains("bind=")
+        }),
+        "NAME='' must serialize BIND(C) independently of a binding label:\n{amod}"
+    );
+
+    let caller_src = write_program_in(
+        &dir,
+        "caller.f90",
+        "program caller\n  use iso_c_binding, only: c_int\n  use empty_binding, only: answer_marker, set_answer\n  implicit none\n  integer(c_int) :: value\n  call set_answer(value)\n  if (value /= 42_c_int) error stop 1\n  if (answer_marker() /= 'Z') error stop 2\nend program caller\n",
+    );
+    let caller_obj = dir.join("caller.o");
+    let caller_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            caller_src.to_str().unwrap(),
+            "-o",
+            caller_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty-label BIND(C) caller compile failed to spawn");
+    assert!(
+        caller_compile.status.success(),
+        "empty-label BIND(C) .amod consumer should compile: {}",
+        String::from_utf8_lossy(&caller_compile.stderr)
+    );
+
+    let exe = dir.join("bind_c_empty_name_cross_tu.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            binding_obj.to_str().unwrap(),
+            caller_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("empty-label BIND(C) cross-TU link failed to spawn");
+    assert!(
+        link.status.success(),
+        "NAME='' must use native module linkage across .amod: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("empty-label BIND(C) executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "empty-label BIND(C) executable failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_bind_c_name_expression_removes_stale_object() {
+    let dir = unique_dir("bind_c_name_invalid");
+    let src = write_program_in(
+        &dir,
+        "invalid.f90",
+        "module invalid_binding\n  implicit none\n  character(len=32) :: mutable_name = 'not_constant'\ncontains\n  subroutine bad() bind(c, name=mutable_name)\n  end subroutine bad\nend module invalid_binding\n",
+    );
+    let output = dir.join("invalid.o");
+    std::fs::write(&output, b"stale object").expect("cannot seed stale BIND(C) object");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", src.to_str().unwrap(), "-o", output.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("invalid BIND(C) label compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "nonconstant BIND(C) NAME= unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("BIND(C) NAME= must be a scalar default-character constant expression"),
+        "unexpected BIND(C) diagnostic:\n{stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "failed BIND(C) compilation left a stale object looking successful"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fortran_name_precedes_bind_c_label_for_result_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -6157,8 +7971,8 @@ fn bind_c_c_char_buffer_survives_amod_import_without_hidden_lengths() {
 
     let amod = std::fs::read_to_string(dir.join("c_strings.amod")).expect("missing c_strings.amod");
     assert!(
-        amod.contains("@abi cc=aapcs64 hidden_char_lens=0"),
-        "bind(c) c_char buffer interface should not advertise hidden lengths: {}",
+        !amod.contains("@abi cc="),
+        "bind(c) c_char buffer interface should not advertise a target calling convention: {}",
         amod
     );
     assert!(
@@ -6265,8 +8079,8 @@ fn amod_preserves_allocatable_assumed_len_char_array_hidden_len() {
     );
     let amod = std::fs::read_to_string(dir.join("provider.amod")).expect("missing provider.amod");
     assert!(
-        amod.contains("@abi cc=aapcs64 hidden_char_lens=1"),
-        "provider .amod should advertise the vector element length: {}",
+        !amod.contains("@abi cc="),
+        "provider .amod should not advertise a target calling convention: {}",
         amod
     );
     assert!(
@@ -7395,6 +9209,581 @@ fn ieee_value_quiet_nan_from_intrinsic_module_compiles_and_runs() {
         "unexpected ieee quiet nan output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exported_ieee_functions_compile_and_run_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=exported_ieee_functions_compile_and_run_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_exported_functions");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: ieee_arithmetic, only : fused => ieee_fma, ieee_rem, &
+       ieee_selected_real_kind, ieee_copy_sign
+  implicit none
+  integer, parameter :: static_ieee_kind = ieee_selected_real_kind(p=15)
+  real(kind=4) :: delta4, a4, b4, fused4
+  real(kind=4) :: fma_a(2), fma_b(2), fma_c(2), fma_result(2)
+  real(kind=4) :: rem_x(2), rem_y(2), rem_result(2)
+  real(kind=8) :: delta8, a8, b8, fused8, rem8, zero8
+  real(kind=static_ieee_kind) :: static_value
+  integer(kind=8) :: precision, exponent_range, requested_radix
+
+  delta4 = scale(1.0_4, -13)
+  a4 = 1.0_4 + delta4
+  b4 = 1.0_4 - delta4
+  fused4 = fused(a4, b4, -1.0_4)
+  if (fused4 /= -scale(1.0_4, -26)) error stop 1
+
+  delta8 = scale(1.0_8, -27)
+  a8 = 1.0_8 + delta8
+  b8 = 1.0_8 - delta8
+  fused8 = fused(a8, b8, -1.0_8)
+  if (fused8 /= -scale(1.0_8, -54)) error stop 2
+
+  rem8 = ieee_rem(1.0_4, 1.0_8 - scale(1.0_8, -30))
+  if (rem8 /= scale(1.0_8, -30)) error stop 3
+  if (ieee_rem(5.0_4, 2.0_4) /= 1.0_4) error stop 4
+  zero8 = ieee_rem(-4.0_8, 2.0_8)
+  if (zero8 /= 0.0_8) error stop 5
+  if (ieee_copy_sign(1.0_8, zero8) > 0.0_8) error stop 6
+
+  fma_a(1) = a4
+  fma_b(1) = b4
+  fma_c(1) = -1.0_4
+  fma_a(2) = 2.0_4
+  fma_b(2) = 3.0_4
+  fma_c(2) = 4.0_4
+  fma_result = fused(fma_a, fma_b, fma_c)
+  if (fma_result(1) /= -scale(1.0_4, -26)) error stop 7
+  if (fma_result(2) /= 10.0_4) error stop 8
+
+  rem_x(1) = 7.0_4
+  rem_y(1) = 2.0_4
+  rem_x(2) = 5.0_4
+  rem_y(2) = 2.0_4
+  rem_result = ieee_rem(rem_x, rem_y)
+  if (rem_result(1) /= -1.0_4) error stop 9
+  if (rem_result(2) /= 1.0_4) error stop 10
+
+  static_value = 1.0_static_ieee_kind
+  if (kind(static_value) /= 8) error stop 11
+  precision = 6
+  exponent_range = 100
+  requested_radix = 2
+  if (ieee_selected_real_kind(p=precision) /= 4) error stop 12
+  if (ieee_selected_real_kind(r=exponent_range) /= 8) error stop 13
+  if (ieee_selected_real_kind(radix=requested_radix) /= 4) error stop 14
+  precision = 15
+  exponent_range = 307
+  if (ieee_selected_real_kind(r=exponent_range, radix=requested_radix, p=precision) /= 8) error stop 15
+  precision = 16
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -1) error stop 16
+  precision = 15
+  exponent_range = 308
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -2) error stop 17
+  precision = 16
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -3) error stop 18
+  requested_radix = 10
+  if (ieee_selected_real_kind(precision, exponent_range, requested_radix) /= -5) error stop 19
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_exported_functions_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "--std=f2023",
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("exported IEEE function compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: exported IEEE functions should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("exported IEEE function executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: exported IEEE functions must retain their specified semantics: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected exported IEEE function output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ieee_status_procedures_export_and_restore_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=ieee_status_procedures_export_and_restore_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_status_procedures");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use, intrinsic :: ieee_exceptions, only : ieee_status_type, &
+       save_status => ieee_get_status, restore_status => ieee_set_status, &
+       ieee_inexact, ieee_get_flag, ieee_set_flag
+  implicit none
+  type(ieee_status_type) :: saved
+  logical :: raised
+
+  call ieee_set_flag(ieee_inexact, .false.)
+  call save_status(saved)
+  call ieee_set_flag(ieee_inexact, .true.)
+  call ieee_get_flag(ieee_inexact, raised)
+  if (.not. raised) error stop 1
+  call restore_status(saved)
+  call ieee_get_flag(ieee_inexact, raised)
+  if (raised) error stop 2
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_status_procedures_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("IEEE status procedure compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: IEEE status procedures should be exported: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("IEEE status procedure executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: IEEE status procedures must restore the saved environment: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected IEEE status procedure output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=signaling_comparison_reraises_invalid_after_flag_reset_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_signaling_comparison");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_value, ieee_signaling_nan\n  use, intrinsic :: ieee_exceptions, only : ieee_invalid, ieee_set_flag, ieee_get_flag\n  implicit none\n  real :: x\n  logical :: first_result, second_result, first_raised, second_raised\n\n  x = ieee_value(0.0, ieee_signaling_nan)\n  call ieee_set_flag(ieee_invalid, .false.)\n  first_result = (x == 0.0)\n  call ieee_get_flag(ieee_invalid, first_raised)\n  call ieee_set_flag(ieee_invalid, .false.)\n  second_result = (x == 0.0)\n  call ieee_get_flag(ieee_invalid, second_raised)\n\n  if (first_result .or. second_result) error stop 1\n  if (.not. first_raised) error stop 2\n  if (.not. second_raised) error stop 3\n  print *, 'ok'\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_signaling_comparison_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("signaling comparison compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: signaling comparison should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("signaling comparison executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: each signaling comparison must raise IEEE_INVALID after a reset: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected signaling comparison output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dead_float_result_still_raises_observed_flag_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dead_float_result_still_raises_observed_flag_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_dead_float_result");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use, intrinsic :: ieee_arithmetic, only : ieee_value, ieee_positive_zero, ieee_positive_normal\n  use, intrinsic :: ieee_exceptions, only : ieee_divide_by_zero, ieee_set_flag, ieee_get_flag\n  implicit none\n  real :: zero, one, unused_result\n  logical :: raised\n\n  zero = ieee_value(0.0, ieee_positive_zero)\n  one = ieee_value(0.0, ieee_positive_normal)\n  call ieee_set_flag(ieee_divide_by_zero, .false.)\n  unused_result = one / zero\n  call ieee_get_flag(ieee_divide_by_zero, raised)\n\n  if (.not. raised) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_dead_float_result_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("dead floating-result compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: dead floating-result witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("dead floating-result executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: a dead FP result must retain its observed IEEE flag effect: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected dead floating-result output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn float_to_int_keeps_observed_inexact_flag_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=float_to_int_keeps_observed_inexact_flag_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("ieee_live_float_to_int");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use, intrinsic :: ieee_exceptions, only : ieee_inexact, ieee_set_flag, ieee_get_flag\n  implicit none\n  real(kind=8) :: input\n  integer(kind=4) :: converted\n  logical :: raised\n\n  input = 1.5_8\n  call ieee_set_flag(ieee_inexact, .false.)\n  converted = int(input, kind=4)\n  call ieee_get_flag(ieee_inexact, raised)\n\n  if (converted /= 1) error stop 1\n  if (.not. raised) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "ieee_live_float_to_int_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("live float-to-int compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: live float-to-int witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("live float-to-int executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: a live conversion must retain its observed IEEE_INEXACT effect: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: unexpected live float-to-int output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn volatile_scalar_accesses_survive_every_optimization_level() {
+    let dir = unique_dir("volatile_scalar_accesses");
+    let src = write_program_in(
+        &dir,
+        "volatile_scalar.f90",
+        "subroutine touch_volatile()\n  implicit none\n  integer, volatile :: watched\n  integer :: sink\n\n  watched = 41\n  sink = watched\nend subroutine touch_volatile\n\nsubroutine touch_standalone()\n  implicit none\n  integer :: watched\n  integer :: sink\n  volatile :: watched\n\n  watched = 42\n  sink = watched\nend subroutine touch_standalone\n\nsubroutine touch_implicit()\n  volatile :: watched\n  integer :: sink\n\n  watched = 42.5\n  sink = int(watched)\nend subroutine touch_implicit\n\nsubroutine touch_dummy(watched)\n  implicit none\n  integer, volatile, intent(inout) :: watched\n  integer :: sink\n\n  sink = watched\n  watched = sink + 1\nend subroutine touch_dummy\n\nsubroutine touch_array()\n  implicit none\n  integer, volatile :: watched(2)\n  integer :: sink\n\n  watched(1) = 43\n  sink = watched(1)\nend subroutine touch_array\n\nsubroutine touch_loop()\n  implicit none\n  integer, volatile :: watched(4)\n  integer :: sink\n  integer :: i\n\n  do i = 1, 4\n    watched(i) = i\n    sink = watched(i)\n  end do\nend subroutine touch_loop\n\nsubroutine touch_nonvolatile()\n  implicit none\n  integer :: ordinary\n  integer :: sink\n\n  ordinary = 44\n  sink = ordinary\nend subroutine touch_nonvolatile\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let ir = dir.join(format!(
+            "volatile_scalar_{}.ir",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "--emit-ir",
+                src.to_str().unwrap(),
+                "-o",
+                ir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("volatile scalar IR compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: volatile scalar witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let ir_text = std::fs::read_to_string(&ir).expect("cannot read volatile scalar IR");
+        let volatile_stores = ir_text.matches("volatile_store").count();
+        let volatile_loads = ir_text.matches("volatile_load").count();
+        assert_eq!(
+            volatile_stores, 6,
+            "{optimization}: each explicit, standalone, implicitly typed, dummy, array, and loop-body VOLATILE store must remain exactly once in static IR while the ordinary boundary stays nonvolatile:\n{ir_text}"
+        );
+        assert_eq!(
+            volatile_loads, 6,
+            "{optimization}: each explicit, standalone, implicitly typed, dummy, array, and loop-body VOLATILE load must remain exactly once in static IR even when its result is dead, while the ordinary boundary stays nonvolatile:\n{ir_text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn standalone_dimension_and_volatile_share_one_module_global() {
+    let dir = unique_dir("volatile_dimension_global");
+    let src = write_program_in(
+        &dir,
+        "provider.f90",
+        "module implicit_volatile_array\n  dimension :: watched(2)\n  volatile :: watched\nend module implicit_volatile_array\n",
+    );
+
+    for optimization in ["-O0", "-O3", "-Ofast"] {
+        let ir = dir.join(format!(
+            "provider_{}.ir",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "--emit-ir",
+                src.to_str().unwrap(),
+                "-o",
+                ir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("standalone DIMENSION/VOLATILE IR compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: standalone DIMENSION/VOLATILE module should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let ir_text =
+            std::fs::read_to_string(&ir).expect("cannot read DIMENSION/VOLATILE module IR");
+        let global = "global @afs_mod_implicit_volatile_array_watched:";
+        assert_eq!(
+            ir_text.matches(global).count(),
+            1,
+            "{optimization}: standalone attributes must normalize to one module global:\n{ir_text}"
+        );
+        assert!(
+            ir_text.contains(
+                "global @afs_mod_implicit_volatile_array_watched: [f32 x 2] = zeroinit"
+            ),
+            "{optimization}: the sole module global must retain its implicit type and DIMENSION shape:\n{ir_text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn volatile_accesses_execute_correctly_at_every_optimization_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=volatile_accesses_execute_correctly_at_every_optimization_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("volatile_runtime");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  integer, volatile :: watched\n  integer :: observed\n\n  watched = 40\n  call bump(watched)\n  observed = watched\n  if (observed /= 42) error stop 1\n  print *, 'volatile-ok'\ncontains\n  subroutine bump(value)\n    integer, volatile, intent(inout) :: value\n    value = value + 2\n  end subroutine bump\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "volatile_runtime_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("volatile runtime compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: volatile runtime witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&executable)
+            .output()
+            .expect("volatile runtime executable failed to run");
+        assert!(
+            run.status.success(),
+            "{optimization}: volatile runtime witness failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("volatile-ok"),
+            "{optimization}: unexpected volatile runtime output: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_infinite_loop_remains_nonterminating_at_every_opt_level() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=empty_infinite_loop_remains_nonterminating_at_every_opt_level count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("empty_infinite_loop");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  do\n  end do\n  error stop 99\nend program p\n",
+    );
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let executable = dir.join(format!(
+            "empty_infinite_loop_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                src.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("empty infinite-loop compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "{optimization}: empty infinite-loop witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        assert!(
+            run_binary_with_timeout(&executable, std::time::Duration::from_secs(1)).is_none(),
+            "{optimization}: empty infinite loop terminated after CFG simplification"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -9358,7 +11747,7 @@ fn explicit_shape_runtime_bound_function_result_array_compiles_and_runs() {
         return;
     }
     let src = write_program(
-        "program p\n  implicit none\n  integer :: idx\n  idx = strstr('ababa', 'aba')\n  if (idx /= 1) error stop 1\n  print *, 'ok'\ncontains\n  integer function strstr(string, pattern) result(res)\n    character(*), intent(in) :: string\n    character(*), intent(in) :: pattern\n    integer :: lps_array(len(pattern))\n    integer :: res, s_i, p_i, length_string, length_pattern\n    res = 0\n    length_string = len(string)\n    length_pattern = len(pattern)\n    if (length_pattern > 0 .and. length_pattern <= length_string) then\n      lps_array = compute_lps(pattern)\n      s_i = 1\n      p_i = 1\n      do while (s_i <= length_string)\n        if (string(s_i:s_i) == pattern(p_i:p_i)) then\n          if (p_i == length_pattern) then\n            res = s_i - length_pattern + 1\n            exit\n          end if\n          s_i = s_i + 1\n          p_i = p_i + 1\n        else if (p_i > 1) then\n          p_i = lps_array(p_i - 1) + 1\n        else\n          s_i = s_i + 1\n        end if\n      end do\n    end if\n  contains\n    pure function compute_lps(string) result(lps_array)\n      character(*), intent(in) :: string\n      integer :: lps_array(len(string))\n      integer :: i, j, length_string\n      length_string = len(string)\n      if (length_string > 0) then\n        lps_array(1) = 0\n        i = 2\n        j = 1\n        do while (i <= length_string)\n          if (string(j:j) == string(i:i)) then\n            lps_array(i) = j\n            i = i + 1\n            j = j + 1\n          else if (j > 1) then\n            j = lps_array(j - 1) + 1\n          else\n            lps_array(i) = 0\n            i = i + 1\n          end if\n        end do\n      end if\n    end function compute_lps\n  end function strstr\nend program\n",
+        "program p\n  implicit none\n  integer :: idx\n  idx = strstr('ababa', 'aba')\n  if (idx /= 1) error stop 1\n  print *, 'ok'\ncontains\n  function strstr(string, pattern) result(res)\n    character(*), intent(in) :: string\n    character(*), intent(in) :: pattern\n    integer :: lps_array(len(pattern))\n    integer :: res, s_i, p_i, length_string, length_pattern\n    res = 0\n    length_string = len(string)\n    length_pattern = len(pattern)\n    if (length_pattern > 0 .and. length_pattern <= length_string) then\n      lps_array = compute_lps(pattern)\n      s_i = 1\n      p_i = 1\n      do while (s_i <= length_string)\n        if (string(s_i:s_i) == pattern(p_i:p_i)) then\n          if (p_i == length_pattern) then\n            res = s_i - length_pattern + 1\n            exit\n          end if\n          s_i = s_i + 1\n          p_i = p_i + 1\n        else if (p_i > 1) then\n          p_i = lps_array(p_i - 1) + 1\n        else\n          s_i = s_i + 1\n        end if\n      end do\n    end if\n  contains\n    pure function compute_lps(string) result(lps_array)\n      character(*), intent(in) :: string\n      integer :: lps_array(len(string))\n      integer :: i, j, length_string\n      length_string = len(string)\n      if (length_string > 0) then\n        lps_array(1) = 0\n        i = 2\n        j = 1\n        do while (i <= length_string)\n          if (string(j:j) == string(i:i)) then\n            lps_array(i) = j\n            i = i + 1\n            j = j + 1\n          else if (j > 1) then\n            j = lps_array(j - 1) + 1\n          else\n            lps_array(i) = 0\n            i = i + 1\n          end if\n        end do\n      end if\n    end function compute_lps\n  end function strstr\nend program\n",
         "f90",
     );
     let out = unique_path("runtime_bound_result_array", "bin");
@@ -13887,6 +16276,396 @@ fn multi_input_dash_c_produces_one_object_per_source() {
 }
 
 #[test]
+fn multi_input_dash_c_rejects_same_stem_output_collisions() {
+    let dir = unique_dir("multi_c_same_stem");
+    write_program_in(&dir, "a.f", "      subroutine from_fixed()\n      end\n");
+    write_program_in(&dir, "a.f90", "subroutine from_free()\nend subroutine\n");
+
+    let output = dir.join("a.o");
+    let input_orders = [["a.f", "a.f90"], ["a.f90", "a.f"], ["./a.f", "./a.f90"]];
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        for inputs in input_orders {
+            for stale in [false, true] {
+                if stale {
+                    std::fs::write(&output, b"preexisting object")
+                        .expect("cannot seed stale object");
+                } else {
+                    let _ = std::fs::remove_file(&output);
+                }
+                let before = std::fs::read(&output).ok();
+                let result = Command::new(compiler("armfortas"))
+                    .current_dir(&dir)
+                    .args([optimization, "-c", inputs[0], inputs[1]])
+                    .output()
+                    .expect("colliding multi-input compile failed to spawn");
+                assert!(
+                    !result.status.success(),
+                    "same-stem multi-input -c unexpectedly succeeded for {inputs:?} at {optimization} with stale={stale}"
+                );
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let first_input = format!("'{}'", inputs[0]);
+                let second_input = format!("'{}'", inputs[1]);
+                assert!(
+                    stderr.contains(&first_input)
+                        && stderr.contains(&second_input)
+                        && stderr.contains("a.o")
+                        && stderr.contains("same output"),
+                    "collision diagnostic must name both inputs and their output:\n{stderr}"
+                );
+                assert_eq!(
+                    std::fs::read(&output).ok(),
+                    before,
+                    "collision preflight mutated the destination for {inputs:?} at {optimization} with stale={stale}"
+                );
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_input_dash_c_rejects_output_collisions_through_directory_symlinks() {
+    let dir = unique_dir("multi_c_symlink_collision");
+    let real = dir.join("real");
+    std::fs::create_dir(&real).expect("cannot create real source directory");
+    std::os::unix::fs::symlink(&real, dir.join("alias")).expect("cannot create source symlink");
+    write_program_in(&real, "a.f", "      subroutine from_fixed()\n      end\n");
+    write_program_in(&real, "a.f90", "subroutine from_free()\nend subroutine\n");
+
+    let output = real.join("a.o");
+    std::fs::write(&output, b"preexisting object").expect("cannot seed stale object");
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "real/a.f", "alias/a.f90"])
+        .output()
+        .expect("symlink-colliding multi-input compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "directory aliases must not evade output collision detection"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("real/a.f")
+            && stderr.contains("alias/a.f90")
+            && stderr.contains("alias/a.o")
+            && stderr.contains("same output"),
+        "collision diagnostic must retain the user-spelled paths:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&output).expect("stale output disappeared"),
+        b"preexisting object",
+        "collision preflight mutated the aliased destination"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_dash_c_allows_same_stem_outputs_in_distinct_directories() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=multi_input_dash_c_allows_same_stem_outputs_in_distinct_directories count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("multi_c_distinct_dirs");
+    let fixed_dir = dir.join("fixed");
+    let free_dir = dir.join("free");
+    std::fs::create_dir(&fixed_dir).expect("cannot create fixed-form directory");
+    std::fs::create_dir(&free_dir).expect("cannot create free-form directory");
+    write_program_in(
+        &fixed_dir,
+        "a.f",
+        "      subroutine from_fixed()\n      end\n",
+    );
+    write_program_in(
+        &free_dir,
+        "a.f90",
+        "subroutine from_free()\nend subroutine\n",
+    );
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "fixed/a.f", "free/a.f90"])
+        .output()
+        .expect("distinct-output multi-input compile failed to spawn");
+    assert!(
+        result.status.success(),
+        "distinct output paths were rejected:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(fixed_dir.join("a.o").exists(), "fixed/a.o was not written");
+    assert!(free_dir.join("a.o").exists(), "free/a.o was not written");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_terminal_modes_preserve_requested_artifacts() {
+    let file_modes = [
+        ("-S", "s", ".text"),
+        ("--emit-ir", "ir", "helper"),
+        ("--emit-ast", "ast", "Subroutine"),
+        ("--emit-tokens", "tokens", "Token { kind:"),
+    ];
+
+    for (flag, suffix, helper_marker) in file_modes {
+        let dir = unique_dir(&format!("multi_terminal_{}", suffix));
+        write_program_in(
+            &dir,
+            "helper.F90",
+            "#define HELPER_VALUE 41\nsubroutine helper(x)\n  integer, intent(out) :: x\n  x = HELPER_VALUE\nend subroutine helper\n",
+        );
+        write_program_in(
+            &dir,
+            "main.F90",
+            "#define MAIN_VALUE 77\nprogram p\n  integer :: x\n  call helper(x)\n  print *, x + MAIN_VALUE\nend program p\n",
+        );
+
+        let helper_output = dir.join(format!("helper.{suffix}"));
+        let main_output = dir.join(format!("main.{suffix}"));
+        assert!(!helper_output.exists(), "test output must start fresh");
+        assert!(!main_output.exists(), "test output must start fresh");
+
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([flag, "helper.F90", "main.F90"])
+            .output()
+            .expect("multi-input terminal-mode compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "{flag} multi-input compile failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let helper_text =
+            std::fs::read_to_string(&helper_output).expect("missing first per-source output");
+        let main_text =
+            std::fs::read_to_string(&main_output).expect("missing second per-source output");
+        let has_expected_artifact = if flag == "-S" {
+            has_native_text_section(&helper_text)
+        } else {
+            helper_text.contains(helper_marker)
+        };
+        assert!(
+            has_expected_artifact,
+            "{flag} first output has the wrong artifact type:\n{helper_text}"
+        );
+        assert!(
+            !main_text.is_empty(),
+            "{flag} second per-source output should not be empty"
+        );
+        assert!(
+            !dir.join("a.out").exists(),
+            "{flag} must not replace the requested terminal mode with a link"
+        );
+        assert!(
+            !dir.join("helper.o").exists() && !dir.join("main.o").exists(),
+            "{flag} must not leave child objects behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("multi_terminal_pp");
+    write_program_in(
+        &dir,
+        "helper.F90",
+        "#define HELPER_VALUE 41\nsubroutine helper(x)\n  integer, intent(out) :: x\n  x = HELPER_VALUE\nend subroutine helper\n",
+    );
+    write_program_in(
+        &dir,
+        "main.F90",
+        "#define MAIN_VALUE 77\nprogram p\n  integer :: x\n  call helper(x)\n  print *, x + MAIN_VALUE\nend program p\n",
+    );
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "helper.F90", "main.F90"])
+        .output()
+        .expect("multi-input preprocessing failed to spawn");
+    assert!(
+        result.status.success(),
+        "-E multi-input preprocessing failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("x = 41") && stdout.contains("x + 77"),
+        "-E should write both preprocessed inputs to stdout:\n{stdout}"
+    );
+    assert!(
+        !dir.join("a.out").exists(),
+        "-E must not replace preprocessing with a link"
+    );
+    assert!(
+        !dir.join("helper.o").exists() && !dir.join("main.o").exists(),
+        "-E must not leave child objects behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_preprocess_does_not_lex_fortran_or_reorder_inputs() {
+    let dir = unique_dir("multi_terminal_pp_raw");
+    let first = b"#define FIRST 11\nFIRST @@@ is deliberately not Fortran\n";
+    let second = b"#define SECOND 22\nSECOND ### is also deliberately not Fortran\n";
+    write_program_bytes_in(&dir, "first.F90", first);
+    write_program_bytes_in(&dir, "second.F90", second);
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-E", "first.F90", "second.F90"])
+        .output()
+        .expect("raw multi-input preprocessing failed to spawn");
+    assert!(
+        result.status.success(),
+        "-E should not lex or parse its inputs: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let first_pos = stdout
+        .find("11 @@@ is deliberately not Fortran")
+        .expect("missing first preprocessed input");
+    let second_pos = stdout
+        .find("22 ### is also deliberately not Fortran")
+        .expect("missing second preprocessed input");
+    assert!(
+        first_pos < second_pos,
+        "-E should preserve positional input order:\n{stdout}"
+    );
+    assert!(
+        !dir.join("a.out").exists(),
+        "-E must not create a linked output"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn multi_input_syntax_dumps_do_not_resolve_module_cycles() {
+    for (flag, suffix) in [("--emit-tokens", "tokens"), ("--emit-ast", "ast")] {
+        let dir = unique_dir(&format!("multi_terminal_cycle_{suffix}"));
+        write_program_in(
+            &dir,
+            "left.f90",
+            "module left\n  use right\nend module left\n",
+        );
+        write_program_in(
+            &dir,
+            "right.f90",
+            "module right\n  use left\nend module right\n",
+        );
+
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([flag, "left.f90", "right.f90"])
+            .output()
+            .expect("multi-input syntax dump failed to spawn");
+        assert!(
+            result.status.success(),
+            "{flag} should stop before semantic module dependency resolution: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            dir.join(format!("left.{suffix}")).exists()
+                && dir.join(format!("right.{suffix}")).exists(),
+            "{flag} should produce one output per syntactically valid input"
+        );
+        assert!(
+            !dir.join("a.out").exists(),
+            "{flag} must not create a linked output"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn multi_input_terminal_modes_reject_a_shared_output() {
+    for flag in ["-S", "-E", "--emit-ir", "--emit-ast", "--emit-tokens"] {
+        let dir = unique_dir("multi_terminal_o");
+        write_program_in(
+            &dir,
+            "first.f90",
+            "subroutine first()\nend subroutine first\n",
+        );
+        write_program_in(
+            &dir,
+            "second.f90",
+            "subroutine second()\nend subroutine second\n",
+        );
+
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([flag, "first.f90", "second.f90", "-o", "combined.out"])
+            .output()
+            .expect("multi-input shared-output rejection failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{flag} with multiple inputs and one -o should fail"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("-o") && stderr.contains("multiple input files"),
+            "expected a multi-input -o diagnostic for {flag}: {stderr}"
+        );
+        assert!(
+            !dir.join("combined.out").exists(),
+            "{flag} rejection must not create the requested shared output"
+        );
+        assert!(
+            !dir.join("a.out").exists(),
+            "{flag} rejection must not link an executable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn multi_input_terminal_mode_failure_removes_only_the_failed_stale_output() {
+    let dir = unique_dir("multi_terminal_partial");
+    write_program_in(
+        &dir,
+        "good.f90",
+        "subroutine good()\n  print *, 1\nend subroutine good\n",
+    );
+    write_program_in(
+        &dir,
+        "broken.f90",
+        "program broken\n  integer :: x\n  x =\nend program broken\n",
+    );
+    std::fs::write(dir.join("broken.s"), "stale assembly\n").expect("write stale output");
+
+    let result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-S", "good.f90", "broken.f90"])
+        .output()
+        .expect("partial multi-input compile failed to spawn");
+    assert!(
+        !result.status.success(),
+        "a malformed second input should fail the overall command"
+    );
+    let good_asm =
+        std::fs::read_to_string(dir.join("good.s")).expect("successful first output is missing");
+    assert!(
+        has_native_text_section(&good_asm),
+        "successful first input should retain its requested assembly output"
+    );
+    assert!(
+        !dir.join("broken.s").exists(),
+        "the failed input must not leave a stale output looking successful"
+    );
+    assert!(
+        !dir.join("a.out").exists(),
+        "a partial terminal-mode failure must not link an executable"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn compile_only_explicit_object_path_keeps_module_in_current_dir() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -14110,6 +16889,233 @@ fn prebuilt_archive_input_links_after_objects() {
 }
 
 #[test]
+fn elf_link_preserves_object_and_dash_l_operand_order() {
+    if armfortas::target::TargetSpec::host().object_format() != armfortas::target::ObjectFormat::Elf
+    {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elf_link_preserves_object_and_dash_l_operand_order count=1 reason=\"ELF archive-order contract requires an ELF host\""
+        );
+        return;
+    }
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elf_link_preserves_object_and_dash_l_operand_order count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("link_operand_order");
+    let provider_src = write_program_in(
+        &dir,
+        "provider.f90",
+        "integer function provider()\n  provider = 42\nend function provider\n",
+    );
+    let consumer_src = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module consumer_mod\ncontains\n  integer function consumer()\n    integer, external :: provider\n    consumer = provider()\n  end function consumer\nend module consumer_mod\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use consumer_mod, only: consumer\n  print *, consumer()\nend program p\n",
+    );
+
+    let provider_obj = dir.join("provider.o");
+    let consumer_obj = dir.join("consumer.o");
+    let main_obj = dir.join("main.o");
+    for (source, object) in [
+        (&provider_src, &provider_obj),
+        (&consumer_src, &consumer_obj),
+        (&main_src, &main_obj),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .args([
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("archive-order fixture compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "archive-order fixture compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let archive = dir.join("libprovider.a");
+    let ar = Command::new("ar")
+        .args([
+            "rcs",
+            archive.to_str().unwrap(),
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("archive-order fixture ar failed to spawn");
+    assert!(
+        ar.status.success(),
+        "archive-order fixture ar failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
+
+    let correct = dir.join("correct-order");
+    let correct_link = Command::new(compiler("armfortas"))
+        .env("AFS_LD", "0")
+        .args([
+            main_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-lprovider",
+            "-o",
+            correct.to_str().unwrap(),
+        ])
+        .output()
+        .expect("correct-order link failed to spawn");
+    assert!(
+        correct_link.status.success(),
+        "objects before their provider archive should link: {}",
+        String::from_utf8_lossy(&correct_link.stderr)
+    );
+    let run = Command::new(&correct)
+        .output()
+        .expect("correct-order executable failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("42"),
+        "correct-order executable produced the wrong result:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let wrong = dir.join("wrong-order");
+    assert!(!wrong.exists(), "failure output must start fresh");
+    let wrong_link = Command::new(compiler("armfortas"))
+        .env("AFS_LD", "0")
+        .args([
+            main_obj.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-lprovider",
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            wrong.to_str().unwrap(),
+        ])
+        .output()
+        .expect("wrong-order link failed to spawn");
+    assert!(
+        !wrong_link.status.success(),
+        "an archive before the object that needs it must not be silently moved after that object"
+    );
+    assert!(
+        !wrong.exists(),
+        "a failed order-sensitive link must not leave a fresh executable"
+    );
+
+    let stale_wrong = dir.join("stale-wrong-order");
+    std::fs::copy(&correct, &stale_wrong).expect("failed to seed stale executable");
+    let stale_wrong_link = Command::new(compiler("armfortas"))
+        .env("AFS_LD", "0")
+        .args([
+            main_obj.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-lprovider",
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            stale_wrong.to_str().unwrap(),
+        ])
+        .output()
+        .expect("stale wrong-order link failed to spawn");
+    assert!(
+        !stale_wrong_link.status.success(),
+        "a stale output must not turn an order-sensitive link failure into success"
+    );
+    assert!(
+        !stale_wrong.exists(),
+        "a failed order-sensitive link must not preserve a stale executable"
+    );
+
+    // The sources are deliberately supplied consumer-last even though the
+    // module dependency requires compiling consumer.f90 before main.f90.
+    // Compilation order must not leak into the reconstructed linker stream.
+    for opt in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let label = &opt[1..];
+        let source_correct = dir.join(format!("source-correct-order-{label}"));
+        let source_correct_link = Command::new(compiler("armfortas"))
+            .env("AFS_LD", "0")
+            .args([
+                opt,
+                "-J",
+                dir.to_str().unwrap(),
+                main_src.to_str().unwrap(),
+                consumer_src.to_str().unwrap(),
+                "-L",
+                dir.to_str().unwrap(),
+                "-lprovider",
+                "-o",
+                source_correct.to_str().unwrap(),
+            ])
+            .output()
+            .expect("correct-order source link failed to spawn");
+        assert!(
+            source_correct_link.status.success(),
+            "{opt}: source objects before their provider archive should link: {}",
+            String::from_utf8_lossy(&source_correct_link.stderr)
+        );
+        let source_run = Command::new(&source_correct)
+            .output()
+            .expect("correct-order source executable failed to run");
+        assert!(
+            source_run.status.success()
+                && String::from_utf8_lossy(&source_run.stdout).contains("42"),
+            "{opt}: correct-order source executable produced the wrong result:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&source_run.stdout),
+            String::from_utf8_lossy(&source_run.stderr)
+        );
+
+        let source_wrong = dir.join(format!("source-wrong-order-{label}"));
+        assert!(
+            !source_wrong.exists(),
+            "{opt}: source failure output must start fresh"
+        );
+        let source_wrong_link = Command::new(compiler("armfortas"))
+            .env("AFS_LD", "0")
+            .args([
+                opt,
+                "-J",
+                dir.to_str().unwrap(),
+                main_src.to_str().unwrap(),
+                "-L",
+                dir.to_str().unwrap(),
+                "-lprovider",
+                consumer_src.to_str().unwrap(),
+                "-o",
+                source_wrong.to_str().unwrap(),
+            ])
+            .output()
+            .expect("wrong-order source link failed to spawn");
+        assert!(
+            !source_wrong_link.status.success(),
+            "{opt}: dependency-order compilation must not move consumer.f90 before its archive"
+        );
+        assert!(
+            !source_wrong.exists(),
+            "{opt}: a failed source order-sensitive link must not leave a fresh executable"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dash_capital_s_produces_assembly_text() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -14131,7 +17137,7 @@ fn dash_capital_s_produces_assembly_text() {
     );
     let asm = std::fs::read_to_string(&out).expect("missing asm output");
     assert!(
-        asm.contains("__TEXT") || asm.contains(".text"),
+        has_native_text_section(&asm),
         ".s output should contain a text-section directive"
     );
     let _ = std::fs::remove_file(&out);
@@ -14162,6 +17168,296 @@ fn dash_capital_e_preprocesses_only() {
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn dash_capital_e_recognizes_bom_prefixed_first_line_directive() {
+    let source =
+        b"\xef\xbb\xbf#define VALUE 73\nprogram p\n  integer :: value = VALUE\nend program\n";
+    let src = write_program_bytes(source, "F90");
+    let out = unique_path("pp_bom_directive", "f90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-E", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "BOM-prefixed -E preprocess failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let preprocessed = std::fs::read(&out).expect("missing preprocessed output");
+    assert!(
+        !preprocessed.starts_with(b"\xef\xbb\xbf"),
+        "preprocessed output retained its leading BOM: {preprocessed:?}"
+    );
+    assert!(
+        !preprocessed
+            .windows(b"#define".len())
+            .any(|bytes| bytes == b"#define"),
+        "preprocessed output retained the first-line directive: {preprocessed:?}"
+    );
+    assert!(
+        preprocessed
+            .windows(b"integer :: value = 73".len())
+            .any(|bytes| bytes == b"integer :: value = 73"),
+        "preprocessed output did not expand the first-line macro: {preprocessed:?}"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn dash_capital_e_rejects_macro_arity_without_publishing_output() {
+    let cases = [
+        (
+            "missing",
+            "#define PAIR(a, b) ((a) + (b))\nvalue = PAIR(1)\n",
+            "macro \"PAIR\" requires 2 arguments, but only 1 given",
+        ),
+        (
+            "extra",
+            "#define ID(x) (x)\nvalue = ID(1, 2)\n",
+            "macro \"ID\" passed 2 arguments, but takes just 1",
+        ),
+    ];
+
+    for (kind, source, expected) in cases {
+        let src = write_program(source, "F90");
+        let out = unique_path(&format!("pp_macro_arity_{kind}"), "f90");
+        assert!(!out.exists(), "test output must start absent");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("macro-arity preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} macro arguments unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{kind} macro-arity diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{kind} macro-arity failure retained a preprocess output"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
+fn dash_capital_e_rejects_conditionals_crossing_include_boundaries() {
+    let cases = [
+        (
+            "close",
+            "#endif\n",
+            "#if 1\n#include \"case.inc\"\nparent = 1\n",
+            "#endif cannot match a conditional opened outside this include file",
+        ),
+        (
+            "else",
+            "#else\nchild_else = 1\n",
+            "#if 1\n#include \"case.inc\"\nparent = 1\n#endif\n",
+            "#else cannot match a conditional opened outside this include file",
+        ),
+        (
+            "open",
+            "#if 1\nincluded = 1\n",
+            "#include \"case.inc\"\n#endif\nparent = 1\n",
+            "unterminated #if/#ifdef in include file (1 level(s) still open)",
+        ),
+    ];
+
+    for (kind, included, parent, expected) in cases {
+        let dir = unique_dir(&format!("pp_conditional_boundary_{kind}"));
+        let include = write_program_in(&dir, "case.inc", included);
+        let source = write_program_in(&dir, "main.F90", parent);
+        let output = dir.join("main.pp.f90");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("conditional-boundary preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} include conditional unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(include.to_string_lossy().as_ref()) && stderr.contains(expected),
+            "{kind} include conditional diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{kind} include conditional failure published preprocess output"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn dash_capital_e_rejects_repeated_conditional_alternatives_without_output() {
+    let cases = [
+        (
+            "duplicate_else",
+            "#if 1\nselected = 1\n#else\nfirst_else = 1\n#else\nsecond_else = 1\n#endif\n",
+            "#else after #else",
+        ),
+        (
+            "elif_after_else",
+            "#if 0\nfirst = 1\n#else\nselected = 1\n#elif 1 / 0\nlate = 1\n#endif\n",
+            "#elif after #else",
+        ),
+        (
+            "skipped_parent",
+            "#if 0\n#if 1\nfirst = 1\n#else\nsecond = 1\n#else\nthird = 1\n#endif\n#endif\n",
+            "#else after #else",
+        ),
+    ];
+
+    for (kind, source, expected) in cases {
+        let src = write_program(source, "F90");
+        let out = unique_path(&format!("pp_repeated_alternative_{kind}"), "f90");
+        assert!(!out.exists(), "test output must start absent");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("repeated-alternative preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} repeated conditional alternative unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{kind} conditional-order diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{kind} conditional-order failure published preprocess output"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
+fn dash_capital_e_rejects_unknown_active_directives_without_output() {
+    let cases = [
+        (
+            "top_level",
+            "#incldue \"missing.inc\"\nprogram p\nend program\n",
+            "#incldue",
+        ),
+        (
+            "selected_arm",
+            "#if 1\n#not_a_directive payload\n#endif\nprogram p\nend program\n",
+            "#not_a_directive",
+        ),
+    ];
+
+    for (kind, source, expected_directive) in cases {
+        let src = write_program(source, "F90");
+        let out = unique_path(&format!("pp_unknown_directive_{kind}"), "f90");
+        assert!(!out.exists(), "test output must start absent");
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("unknown-directive preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} unknown directive unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("unknown preprocessing directive")
+                && stderr.contains(expected_directive),
+            "{kind} unknown-directive diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{kind} unknown-directive failure published preprocess output"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
+fn dash_capital_e_short_circuits_if_expressions_without_skipping_syntax() {
+    let dir = unique_dir("pp_if_short_circuit");
+    let source = write_program_in(
+        &dir,
+        "valid.F90",
+        "#if 0 && (1 / 0)\ndead_and = 1\n#else\nand_ok = 1\n#endif\n\
+         #if 1 || (1 % 0)\nor_ok = 1\n#else\ndead_or = 1\n#endif\n",
+    );
+    let output = dir.join("valid.pp.f90");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-E"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("short-circuit preprocess failed to spawn");
+    assert!(
+        result.status.success(),
+        "dead arithmetic fault was evaluated: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let preprocessed = std::fs::read_to_string(&output).expect("missing preprocess output");
+    assert!(
+        preprocessed.contains("and_ok = 1") && preprocessed.contains("or_ok = 1"),
+        "short-circuit preprocess selected the wrong branches: {preprocessed}"
+    );
+    assert!(
+        !preprocessed.contains("dead_and") && !preprocessed.contains("dead_or"),
+        "short-circuit preprocess retained a dead branch: {preprocessed}"
+    );
+
+    for (kind, expression, diagnostic) in [
+        ("malformed", "0 && (1 / )", "unexpected token"),
+        ("live", "0 && (1 / 0) || (1 / 0)", "division by zero"),
+    ] {
+        let source = write_program_in(
+            &dir,
+            &format!("{kind}.F90"),
+            &format!("#if {expression}\nunexpected = 1\n#endif\n"),
+        );
+        let output = dir.join(format!("{kind}.pp.f90"));
+        let result = Command::new(compiler("armfortas"))
+            .args(["-E"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("invalid short-circuit preprocess failed to spawn");
+        assert!(
+            !result.status.success(),
+            "{kind} short-circuit operand unexpectedly succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(diagnostic),
+            "{kind} short-circuit diagnostic mismatch: {stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{kind} short-circuit failure published preprocess output"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -14403,6 +17699,7 @@ fn preprocessor_errors_display_invalid_bytes_without_internal_markers() {
             b"#if \xff\n#endif\n",
             "unexpected token in #if expression: '\u{fffd}'",
         ),
+        (b"#\xff\n", "unknown preprocessing directive #\u{fffd}"),
     ];
 
     for &(source, expected) in cases {
@@ -16513,9 +19810,10 @@ fn response_file_supplies_arguments() {
 }
 
 #[test]
-fn diagnostics_format_json_is_rejected_until_implemented() {
+fn diagnostics_format_contract_advertises_and_accepts_only_text() {
     let src = write_program("program p\n  print *, 7\nend program\n", "f90");
     let out = unique_path("diag_json", "bin");
+    std::fs::write(&out, b"preexisting output").unwrap();
     let result = Command::new(compiler("armfortas"))
         .args([
             "--diagnostics-format=json",
@@ -16527,16 +19825,46 @@ fn diagnostics_format_json_is_rejected_until_implemented() {
         .expect("spawn failed");
     assert!(
         !result.status.success(),
-        "--diagnostics-format=json should be rejected until implemented"
+        "--diagnostics-format=json must be rejected as unsupported"
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("JSON diagnostics are not yet implemented"),
-        "expected explicit json-format diagnostic: {}",
+        stderr.contains("unsupported --diagnostics-format value 'json'; supported value: text"),
+        "expected explicit supported-format diagnostic: {}",
         stderr
     );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"preexisting output",
+        "CLI parsing failure must not claim or mutate the requested output"
+    );
+
+    let asm = unique_path("diag_text", "s");
+    std::fs::write(&asm, b"stale assembly").unwrap();
+    let text_result = Command::new(compiler("armfortas"))
+        .args([
+            "--diagnostics-format=text",
+            "-S",
+            src.to_str().unwrap(),
+            "-o",
+            asm.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn failed");
+    assert!(
+        text_result.status.success(),
+        "the documented text diagnostics mode must compile:\n{}",
+        String::from_utf8_lossy(&text_result.stderr)
+    );
+    assert_ne!(
+        std::fs::read(&asm).unwrap(),
+        b"stale assembly",
+        "successful text-mode compilation retained stale output"
+    );
+
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&asm);
 }
 
 #[test]
@@ -16752,13 +20080,396 @@ fn fcheck_all_warns_about_partial_support() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains(
-            "-fcheck=all is accepted, but only array bounds checks are implemented today"
+            "-fcheck=all is accepted, but only array bounds and derived-array assignment conformance checks are implemented today"
         ),
         "expected -fcheck=all warning: {}",
         stderr
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn fcheck_all_controls_derived_array_assignment_conformance_checks() {
+    let src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(3), rhs(2)\n\
+         call assign_items(lhs, rhs)\n\
+         contains\n\
+         subroutine assign_items(dest, source)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           dest = source\n\
+         end subroutine assign_items\n\
+         end program p\n",
+        "f90",
+    );
+    let unchecked_ir = unique_path("derived_shape_unchecked", "ir");
+    let bounds_only_ir = unique_path("derived_shape_bounds_only", "ir");
+    let checked_ir = unique_path("derived_shape_checked", "ir");
+
+    let unchecked = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            unchecked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("unchecked derived-array emit-ir spawn failed");
+    assert!(
+        unchecked.status.success(),
+        "unchecked derived-array IR should compile: {}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+    let unchecked_text = fs::read_to_string(&unchecked_ir).expect("read unchecked IR");
+    assert!(
+        !unchecked_text.contains("rt_call @__afs_check_array_assignment_conformance"),
+        "default CLI IR should not retain array-assignment conformance checks:\n{}",
+        unchecked_text
+    );
+
+    let bounds_only = Command::new(compiler("armfortas"))
+        .args([
+            "-fcheck=bounds",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            bounds_only_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bounds-only derived-array emit-ir spawn failed");
+    assert!(
+        bounds_only.status.success(),
+        "bounds-only derived-array IR should compile: {}",
+        String::from_utf8_lossy(&bounds_only.stderr)
+    );
+    let bounds_only_text = fs::read_to_string(&bounds_only_ir).expect("read bounds-only IR");
+    assert!(
+        !bounds_only_text.contains("rt_call @__afs_check_array_assignment_conformance"),
+        "-fcheck=bounds must not enable broader assignment checks:\n{}",
+        bounds_only_text
+    );
+
+    let checked = Command::new(compiler("armfortas"))
+        .args([
+            "-fcheck=all",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            checked_ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("checked derived-array emit-ir spawn failed");
+    assert!(
+        checked.status.success(),
+        "checked derived-array IR should compile: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked_text = fs::read_to_string(&checked_ir).expect("read checked IR");
+    let check_position = checked_text
+        .find("rt_call @__afs_check_array_assignment_conformance")
+        .unwrap_or_else(|| {
+            panic!(
+                "-fcheck=all IR must retain an array-assignment conformance check:\n{}",
+                checked_text
+            )
+        });
+    let loop_position = checked_text
+        .find("br derived_array_assign_check")
+        .expect("derived-array assignment IR must contain the copy loop");
+    assert!(
+        check_position < loop_position,
+        "-fcheck=all IR must retain an array-assignment conformance check before the copy:\n{}",
+        checked_text
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&unchecked_ir);
+    let _ = std::fs::remove_file(&bounds_only_ir);
+    let _ = std::fs::remove_file(&checked_ir);
+}
+
+#[test]
+fn derived_array_assignment_rejects_provable_shape_mismatch() {
+    let whole_array_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         integer, parameter :: rows = 2, cols = 3\n\
+         type(item) :: lhs(rows, cols), rhs(cols, rows)\n\
+         lhs = rhs\n\
+         end program p\n",
+        "f90",
+    );
+    let section_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(4), rhs(4)\n\
+         lhs(1:3) = rhs(1:2)\n\
+         end program p\n",
+        "f90",
+    );
+
+    for (source, expected) in [
+        (
+            whole_array_src.as_path(),
+            "intrinsic assignment shape mismatch in dimension 1: target extent 2, value extent 3",
+        ),
+        (
+            section_src.as_path(),
+            "intrinsic assignment shape mismatch in dimension 1: target extent 3, value extent 2",
+        ),
+    ] {
+        let result = diagnostic_output(source, &[]);
+        assert!(
+            !result.status.success(),
+            "provably nonconforming derived-array assignment must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected),
+            "missing static shape diagnostic: {}",
+            stderr
+        );
+    }
+
+    let _ = std::fs::remove_file(&whole_array_src);
+    let _ = std::fs::remove_file(&section_src);
+}
+
+#[test]
+fn fcheck_all_rejects_derived_array_assignment_shape_mismatch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fcheck_all_rejects_derived_array_assignment_shape_mismatch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let mismatch_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(3), rhs(2)\n\
+         lhs%value = -1\n\
+         rhs(1)%value = 10\n\
+         rhs(2)%value = 20\n\
+         call assign_items(lhs, rhs)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_items(dest, source)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           dest = source\n\
+         end subroutine assign_items\n\
+         end program p\n",
+        "f90",
+    );
+    let matching_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(2), rhs(2)\n\
+         lhs%value = -1\n\
+         rhs(1)%value = 10\n\
+         rhs(2)%value = 20\n\
+         call assign_items(lhs, rhs)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_items(dest, source)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           dest = source\n\
+         end subroutine assign_items\n\
+         end program p\n",
+        "f90",
+    );
+    let section_mismatch_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(4), rhs(4)\n\
+         lhs%value = -1\n\
+         rhs%value = 7\n\
+         call assign_sections(lhs, rhs, 3, 2)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_sections(dest, source, dest_count, source_count)\n\
+           type(item), intent(inout) :: dest(:)\n\
+           type(item), intent(in) :: source(:)\n\
+           integer, intent(in) :: dest_count, source_count\n\
+           dest(1:dest_count) = source(1:source_count)\n\
+         end subroutine assign_sections\n\
+         end program p\n",
+        "f90",
+    );
+    let equal_count_mismatch_src = write_program(
+        "program p\n\
+         implicit none\n\
+         type :: item\n\
+           integer :: value\n\
+         end type item\n\
+         type(item) :: lhs(2, 3), rhs(3, 2)\n\
+         lhs%value = -1\n\
+         rhs%value = 7\n\
+         call assign_matrices(lhs, rhs)\n\
+         print *, lhs%value\n\
+         contains\n\
+         subroutine assign_matrices(dest, source)\n\
+           type(item), intent(inout) :: dest(:, :)\n\
+           type(item), intent(in) :: source(:, :)\n\
+           dest = source\n\
+         end subroutine assign_matrices\n\
+         end program p\n",
+        "f90",
+    );
+    let checked_mismatch = unique_path("derived_shape_checked_mismatch", "bin");
+    let unchecked_mismatch = unique_path("derived_shape_unchecked_mismatch", "bin");
+    let checked_match = unique_path("derived_shape_checked_match", "bin");
+    let checked_section_mismatch = unique_path("derived_shape_checked_section_mismatch", "bin");
+    let checked_equal_count_mismatch =
+        unique_path("derived_shape_checked_equal_count_mismatch", "bin");
+
+    for (source, output, flags) in [
+        (
+            mismatch_src.as_path(),
+            checked_mismatch.as_path(),
+            &["-fcheck=all"][..],
+        ),
+        (
+            mismatch_src.as_path(),
+            unchecked_mismatch.as_path(),
+            &[][..],
+        ),
+        (
+            matching_src.as_path(),
+            checked_match.as_path(),
+            &["-fcheck=all"][..],
+        ),
+        (
+            section_mismatch_src.as_path(),
+            checked_section_mismatch.as_path(),
+            &["-fcheck=all"][..],
+        ),
+        (
+            equal_count_mismatch_src.as_path(),
+            checked_equal_count_mismatch.as_path(),
+            &["-fcheck=all"][..],
+        ),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .args(flags)
+            .arg(source)
+            .args(["-o", output.to_str().unwrap()])
+            .output()
+            .expect("derived-array conformance compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "derived-array conformance witness should compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let checked_failure = Command::new(&checked_mismatch)
+        .output()
+        .expect("checked mismatch run spawn failed");
+    assert!(
+        !checked_failure.status.success(),
+        "-fcheck=all must reject a derived-array shape mismatch; stdout={} stderr={}",
+        String::from_utf8_lossy(&checked_failure.stdout),
+        String::from_utf8_lossy(&checked_failure.stderr)
+    );
+    let checked_stderr = String::from_utf8_lossy(&checked_failure.stderr);
+    assert!(
+        checked_stderr.contains("Array assignment: destination shape does not conform to source"),
+        "checked mismatch should explain the conformance failure: {}",
+        checked_stderr
+    );
+
+    let unchecked = Command::new(&unchecked_mismatch)
+        .output()
+        .expect("unchecked mismatch run spawn failed");
+    assert!(
+        unchecked.status.success(),
+        "unchecked mismatch preserves the existing no-check policy: {}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&unchecked.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["10", "20", "-1"]
+    );
+
+    let matching = Command::new(&checked_match)
+        .output()
+        .expect("checked matching-shape run spawn failed");
+    assert!(
+        matching.status.success(),
+        "matching derived-array shapes must remain valid: {}",
+        String::from_utf8_lossy(&matching.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&matching.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["10", "20"]
+    );
+
+    for (label, executable) in [
+        ("array-section mismatch", &checked_section_mismatch),
+        (
+            "equal-element-count mismatch",
+            &checked_equal_count_mismatch,
+        ),
+    ] {
+        let failure = Command::new(executable)
+            .output()
+            .unwrap_or_else(|error| panic!("{label} run spawn failed: {error}"));
+        assert!(
+            !failure.status.success(),
+            "-fcheck=all must reject {label}; stdout={} stderr={}",
+            String::from_utf8_lossy(&failure.stdout),
+            String::from_utf8_lossy(&failure.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&failure.stderr)
+                .contains("Array assignment: destination shape does not conform to source"),
+            "{label} should explain the conformance failure: {}",
+            String::from_utf8_lossy(&failure.stderr)
+        );
+    }
+
+    for path in [
+        mismatch_src,
+        matching_src,
+        section_mismatch_src,
+        equal_count_mismatch_src,
+        checked_mismatch,
+        unchecked_mismatch,
+        checked_match,
+        checked_section_mismatch,
+        checked_equal_count_mismatch,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[test]
@@ -17057,6 +20768,161 @@ fn wdeprecated_warns_on_common_block() {
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn specific_warning_suppressions_control_semantic_diagnostics() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=specific_warning_suppressions_control_semantic_diagnostics count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    for (group, source, expected_warning) in [
+        (
+            "pedantic",
+            "program p\n  integer :: i\n  i = 0\n  if (i) 10, 20, 30\n10 continue\n20 continue\n30 continue\nend program\n",
+            "arithmetic IF is an obsolescent feature",
+        ),
+        (
+            "deprecated",
+            "program p\n  integer :: x\n  common /blk/ x\nend program\n",
+            "COMMON block is an obsolescent feature",
+        ),
+    ] {
+        let src = write_program(source, "f90");
+        for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+            let suppressed_out =
+                unique_path(&format!("wno_{group}_{}", &optimization[2..]), "o");
+            let suppressed = Command::new(compiler("armfortas"))
+                .args(["-c", optimization])
+                .arg(format!("-W{group}"))
+                .arg(format!("-Wno-{group}"))
+                .arg("-Werror")
+                .arg(&src)
+                .arg("-o")
+                .arg(&suppressed_out)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("suppressed warning compile failed to spawn");
+            assert!(
+                suppressed.status.success(),
+                "-Wno-{group} must suppress -W{group} under -Werror at {optimization}: {}",
+                String::from_utf8_lossy(&suppressed.stderr)
+            );
+            assert!(
+                !String::from_utf8_lossy(&suppressed.stderr).contains(expected_warning),
+                "-Wno-{group} leaked its semantic warning at {optimization}: {}",
+                String::from_utf8_lossy(&suppressed.stderr)
+            );
+            assert!(
+                suppressed_out.is_file(),
+                "suppressed {group} warning did not publish its object at {optimization}"
+            );
+            let _ = std::fs::remove_file(&suppressed_out);
+        }
+
+        let enabled_out = unique_path(&format!("wno_{group}_reenabled"), "o");
+        let enabled = Command::new(compiler("armfortas"))
+            .arg("-c")
+            .arg(format!("-Wno-{group}"))
+            .arg(format!("-W{group}"))
+            .arg(&src)
+            .arg("-o")
+            .arg(&enabled_out)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("re-enabled warning compile failed to spawn");
+        assert!(
+            enabled.status.success(),
+            "re-enabled {group} warning compile failed: {}",
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&enabled.stderr).contains(expected_warning),
+            "the last same-specificity warning option must win: {}",
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&enabled_out);
+    }
+}
+
+#[test]
+fn lowercase_w_suppresses_warnings_but_not_errors() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=lowercase_w_suppresses_warnings_but_not_errors count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let warning_source = format!(
+        "program p\n!{}\n  integer :: i\n  integer, allocatable :: x\n  character(32) :: msg\n  i = 0\n  allocate(x, errmsg=msg)\n  deallocate(x, errmsg=msg)\n  if (i) 10, 20, 30\n10 continue\n20 continue\n30 continue\nend program\n",
+        "x".repeat(140)
+    );
+    let warning_src = write_program(&warning_source, "f90");
+    for (label, warning_args) in [
+        (
+            "first",
+            ["--std=f2018", "-w", "-Wpedantic", "-Wall", "-Werror"],
+        ),
+        (
+            "last",
+            ["--std=f2018", "-Wpedantic", "-Wall", "-Werror", "-w"],
+        ),
+    ] {
+        let out = unique_path(&format!("lowercase_w_{label}"), "o");
+        let result = Command::new(compiler("armfortas"))
+            .arg("-c")
+            .args(warning_args)
+            .arg(&warning_src)
+            .arg("-o")
+            .arg(&out)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("-w warning suppression compile failed to spawn");
+        assert!(
+            result.status.success(),
+            "-w must suppress semantic and CLI warnings regardless of position: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.stderr.is_empty(),
+            "-w must keep stderr warning-clean, got: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(out.is_file(), "-w compile did not publish its object");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    let error_src = write_program(
+        "program p\n  integer :: i\n  i = 'not an integer'\nend program\n",
+        "f90",
+    );
+    let error_out = unique_path("lowercase_w_error", "o");
+    let error = Command::new(compiler("armfortas"))
+        .args(["-c", "-w"])
+        .arg(&error_src)
+        .arg("-o")
+        .arg(&error_out)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("-w error preservation compile failed to spawn");
+    assert!(!error.status.success(), "-w suppressed a semantic error");
+    assert!(
+        String::from_utf8_lossy(&error.stderr).contains("error:"),
+        "-w lost the semantic error diagnostic: {}",
+        String::from_utf8_lossy(&error.stderr)
+    );
+    assert!(!error_out.exists(), "failed -w compile published an object");
+
+    let _ = std::fs::remove_file(&warning_src);
+    let _ = std::fs::remove_file(&error_src);
 }
 
 #[test]
@@ -20474,8 +24340,8 @@ fn imported_type_finalizer_round_trips_through_amod_and_runs() {
     let amod = dir.join("m.amod");
     let amod_text = std::fs::read_to_string(&amod).expect("missing m.amod");
     assert!(
-        amod_text.contains("@final afs_modproc_m_destroy_box"),
-        "module finalizer should round-trip with ABI-qualified name: {}",
+        amod_text.contains("@final afs_modproc_m_destroy_box rank=0 elemental=false"),
+        "module finalizer should round-trip with ABI-qualified characteristics: {}",
         amod_text
     );
 
@@ -23715,6 +27581,84 @@ fn rank_remap_strided_sections_copy_in_to_explicit_shape_dummies() {
 }
 
 #[test]
+fn strided_pointer_unit_sections_copy_for_sequence_association() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=strided_pointer_unit_sections_copy_for_sequence_association count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §15.5.2.11: an explicit-shape dummy may receive a
+    // non-contiguous actual through a contiguous temporary. A unit-stride
+    // triplet is only relative to its source descriptor: `view(:)` and
+    // `view(::1)` still have memory stride two when `view` points at
+    // `backing(1:12:2)`. The same remains true after forwarding the view
+    // through an assumed-shape dummy or when the elements are CHARACTER.
+    // Each caller must copy in and, for INTENT(INOUT), copy back instead of
+    // passing the view's base directly.
+    let src = write_program(
+        include_str!("../test_programs/sequence_strided_pointer_unit_section.f90"),
+        "f90",
+    );
+    let ir = unique_path("sequence_strided_pointer_unit_section", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("strided pointer sequence-association IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "strided pointer sequence-association IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read sequence-association IR");
+    assert_eq!(
+        ir_text.matches("call @afs_copy_array_data(").count(),
+        4,
+        "numeric, character, and assumed-shape unit sections need contiguous copy-in temporaries:\n{}",
+        ir_text
+    );
+    assert_eq!(
+        ir_text
+            .matches("call @afs_copy_array_data_no_realloc(")
+            .count(),
+        4,
+        "numeric, character, and assumed-shape INTENT(INOUT) sections need copy-out:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("sequence_strided_pointer_unit_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("strided pointer sequence-association compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "strided pointer sequence-association compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("strided pointer sequence-association run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "strided pointer sequence-association run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -24191,21 +28135,23 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     // We split the test across two compilation invocations so the
     // submodule must rehydrate the parent's renames from the .amod
     // alone (no in-memory symbol table carryover).
-    let parent_src = write_program(
+    let dir = unique_dir("amod_use_rename");
+    let parent_src = write_program_in(
+        &dir,
+        "parent.f90",
         "module reexport3\n  use iso_fortran_env, only: int32, int64\n  implicit none\n  public :: int32, int64\nend module\n\nmodule mb_amod\n  use reexport3, only: bits_kind => int32, block_kind => int64\n  type :: ts\n    integer(bits_kind) :: n = 0_bits_kind\n    integer(block_kind) :: blk = 0_block_kind\n  end type\n  interface\n    module subroutine setbit(self, pos)\n      type(ts), intent(inout) :: self\n      integer(bits_kind), intent(in) :: pos\n    end subroutine\n  end interface\nend module\n",
-        "f90",
     );
-    let parent_dir = parent_src.parent().unwrap().to_path_buf();
-    let parent_obj = unique_path("mb_amod_parent", "o");
+    let parent_obj = dir.join("parent.o");
     let compile_parent = Command::new(compiler("armfortas"))
         .args([
             "-c",
             parent_src.to_str().unwrap(),
             "-J",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-o",
             parent_obj.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("compile parent failed");
     assert!(
@@ -24214,22 +28160,24 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         String::from_utf8_lossy(&compile_parent.stderr)
     );
 
-    let sub_src = write_program(
+    let sub_src = write_program_in(
+        &dir,
+        "submodule.f90",
         "submodule(mb_amod) sub\ncontains\n  module subroutine setbit(self, pos)\n    type(ts), intent(inout) :: self\n    integer(bits_kind), intent(in) :: pos\n    integer(block_kind) :: dummy\n    dummy = ibset(self%blk, pos)\n    self%blk = dummy\n  end subroutine\nend submodule\n",
-        "f90",
     );
-    let sub_obj = unique_path("amod_use_rename_sub", "o");
+    let sub_obj = dir.join("submodule.o");
     let compile_sub = Command::new(compiler("armfortas"))
         .args([
             "-c",
             sub_src.to_str().unwrap(),
             "-I",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-J",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-o",
             sub_obj.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("compile sub failed");
     assert!(
@@ -24238,20 +28186,22 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         String::from_utf8_lossy(&compile_sub.stderr)
     );
 
-    let prog_src = write_program(
+    let prog_src = write_program_in(
+        &dir,
+        "program.f90",
         "program t\n  use mb_amod\n  type(ts) :: s\n  s%n = 33\n  s%blk = 0_8\n  call setbit(s, 32)\n  if (s%blk /= 4294967296_8) error stop 1\n  print *, 'ok'\nend program\n",
-        "f90",
     );
-    let prog_obj = unique_path("amod_use_rename_prog", "o");
+    let prog_obj = dir.join("program.o");
     let compile_prog = Command::new(compiler("armfortas"))
         .args([
             "-c",
             prog_src.to_str().unwrap(),
             "-I",
-            parent_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "-o",
             prog_obj.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("compile prog failed");
     assert!(
@@ -24260,7 +28210,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
         String::from_utf8_lossy(&compile_prog.stderr)
     );
 
-    let out = unique_path("amod_use_rename_roundtrip", "bin");
+    let out = dir.join("roundtrip");
     let link = Command::new(compiler("armfortas"))
         .args([
             prog_obj.to_str().unwrap(),
@@ -24269,6 +28219,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
             "-o",
             out.to_str().unwrap(),
         ])
+        .current_dir(&dir)
         .output()
         .expect("link failed");
     assert!(
@@ -24288,15 +28239,7 @@ fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
 
-    let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&parent_obj);
-    let _ = std::fs::remove_file(&sub_obj);
-    let _ = std::fs::remove_file(&prog_obj);
-    let _ = std::fs::remove_file(&parent_src);
-    let _ = std::fs::remove_file(&sub_src);
-    let _ = std::fs::remove_file(&prog_src);
-    let _ = std::fs::remove_file(parent_dir.join("mb_amod.amod"));
-    let _ = std::fs::remove_file(parent_dir.join("reexport3.amod"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -24546,6 +28489,55 @@ fn proc_pointer_component_explicit_shape_intent_in_accepts_array_expression_actu
     assert!(stdout.contains("ok"), "expected ok, got: {}", stdout);
 
     let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn procedure_pointer_array_result_uses_hidden_descriptor() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_array_result_uses_hidden_descriptor count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  abstract interface\n    function array_factory(n) result(values)\n      integer, intent(in) :: n\n      integer :: values(n)\n    end function array_factory\n  end interface\n  procedure(array_factory), pointer :: make_values\n  integer :: got(3)\n\n  make_values => build_values\n  got = make_values(3)\n  if (any(got /= [11, 22, 33])) error stop 1\n  print *, 'ok'\ncontains\n  function build_values(n) result(values)\n    integer, intent(in) :: n\n    integer :: values(n)\n    values(1) = 11\n    values(2) = 22\n    values(3) = 33\n  end function build_values\nend program p\n",
+        "f90",
+    );
+    for level in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let out = unique_path(
+            &format!("procedure_pointer_array_result_{}", &level[1..]),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), level, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("procedure-pointer array-result compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "procedure-pointer array-result compile failed at {level}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("procedure-pointer array-result run failed");
+        assert!(
+            run.status.success(),
+            "procedure-pointer array-result run failed at {level}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected procedure-pointer array-result output at {level}: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
     let _ = std::fs::remove_file(&src);
 }
 
@@ -29615,12 +33607,10 @@ fn shared_compile_emits_amod_and_links_cleanly() {
         );
         return;
     }
-    // -shared on ELF is rejected by design until the x11 link work
-    // (driver: "executables only this sprint"); the dylib flow is
-    // Mach-O-only today.
+    // Shared-library linking is a Mach-O-only capability today.
     if armfortas::testing::native_macho_toolchain_support().is_err() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=shared_compile_emits_amod_and_links_cleanly count=1 reason=\"-shared on ELF lands in x11\""
+            "\nHARNESS_SKIP suite=cli_driver test=shared_compile_emits_amod_and_links_cleanly count=1 reason=\"shared-library linking is available only on Mach-O\""
         );
         return;
     }
@@ -30134,6 +34124,46 @@ fn fixed_form_continuation_diagnostic_uses_physical_line() {
 }
 
 #[test]
+fn orphan_fixed_form_continuation_diagnostic_points_to_marker() {
+    let source = write_program("C leading comment\n\n     + X = 1\n", "f");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:3:6: error:", source.display())),
+        "orphan continuation diagnostic used the wrong location: {stderr}"
+    );
+    assert!(
+        stderr.contains("orphan fixed-form continuation line"),
+        "orphan continuation diagnostic used the wrong message: {stderr}"
+    );
+    assert_diagnostic_caret(&stderr, "     + X = 1", '+');
+
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
+fn unterminated_fixed_dot_operator_diagnostic_points_to_opening_dot() {
+    let source = write_program("      X=A.EQ\n", "f");
+
+    let result = diagnostic_output(&source, &[]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(&format!("{}:1:10: error:", source.display())),
+        "dot-operator diagnostic used the wrong location: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected closing '.' after .EQ"),
+        "dot-operator diagnostic used the wrong message: {stderr}"
+    );
+    assert_diagnostic_caret(&stderr, "      X=A.EQ", '.');
+
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
 fn garbage_text_is_rejected_as_parse_error() {
     let src = write_program("this is garbage\n", "f90");
     let out = unique_path("garbage", "bin");
@@ -30203,31 +34233,82 @@ fn utf8_lexer_error_reports_character_and_caret() {
 }
 
 #[test]
-fn bom_prefixed_source_compiles_cleanly() {
+fn bom_prefixed_first_line_directive_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=bom_prefixed_source_compiles_cleanly count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=bom_prefixed_first_line_directive_compiles_and_runs count=1 reason=\"{}\"",
             reason
         );
         return;
     }
-    let src = write_program("\u{feff}program p\n  print *, 1\nend program\n", "f90");
-    let out = unique_path("bom", "o");
+    let src = write_program(
+        "\u{feff}#define VALUE 73\n\
+         program p\n\
+           implicit none\n\
+           integer, parameter :: answer = VALUE\n\
+           print *, answer\n\
+         end program\n",
+        "F90",
+    );
+    let out = unique_path("bom_directive", "bin");
     let result = Command::new(compiler("armfortas"))
-        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
         .expect("spawn failed");
     assert!(
         result.status.success(),
-        "BOM-prefixed source should compile: {}",
+        "BOM-prefixed first-line directive should compile: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(
         out.exists(),
-        "BOM-prefixed compile should produce an object"
+        "BOM-prefixed compile should produce an executable"
     );
+    let run = Command::new(&out).output().expect("run failed to spawn");
+    assert!(
+        run.status.success(),
+        "BOM-prefixed program failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "73");
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn mid_file_bom_is_rejected_without_publishing_output() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=mid_file_bom_is_rejected_without_publishing_output count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n\u{feff}  integer :: value\n  value = 1\nend program\n",
+        "f90",
+    );
+    let out = unique_path("mid_file_bom", "o");
+    assert!(!out.exists(), "test output must start absent");
+    let result = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        !result.status.success(),
+        "a mid-file BOM must not be silently discarded"
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("lexer error: unexpected character"),
+        "expected a lexical rejection for the mid-file BOM: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "a failed mid-file BOM compile must not publish an object"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -30265,6 +34346,88 @@ fn deeply_nested_expression_fails_gracefully() {
     );
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn oversized_static_array_layout_fails_before_codegen() {
+    let src = write_program(
+        "module overflow_global\n\
+           implicit none\n\
+           integer(8), save :: payload(2305843009213693952_8)\n\
+         end module overflow_global\n",
+        "f90",
+    );
+
+    let configurations = [
+        ("-O0", None),
+        ("-O1", None),
+        ("-O2", None),
+        ("-O3", None),
+        ("-Os", None),
+        ("-Ofast", None),
+        ("-O0", Some("x86_64-linux-musl")),
+        ("-O2", Some("x86_64-linux-musl")),
+        ("-O0", Some("x86_64-freebsd")),
+        ("-O2", Some("x86_64-freebsd")),
+        ("-O0", Some("arm64-macos")),
+        ("-O2", Some("arm64-macos")),
+    ];
+    let mut baseline_stderr = None;
+    for (optimization, target) in configurations {
+        let configuration = format!(
+            "{}_{}",
+            optimization.trim_start_matches('-'),
+            target.unwrap_or("native").replace('-', "_")
+        );
+        let out = unique_path(&format!("oversized_static_array_{configuration}"), "s");
+        assert!(!out.exists(), "test output must start absent");
+        let mut command = Command::new(compiler("armfortas"));
+        command.arg(optimization);
+        if let Some(target) = target {
+            command.args(["--target", target]);
+        }
+        let result = command
+            .args(["-S", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("oversized static-array compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "{configuration}: oversized static array should be a compile failure: {stderr}"
+        );
+        assert_eq!(
+            stderr
+                .matches("whose byte size overflows the target address space")
+                .count(),
+            1,
+            "{configuration}: expected one stable layout diagnostic: {stderr}"
+        );
+        assert!(
+            stderr.contains("afs_mod_overflow_global_payload"),
+            "{configuration}: diagnostic should identify the rejected global: {stderr}"
+        );
+        assert!(
+            !stderr.contains("INTERNAL COMPILER ERROR"),
+            "{configuration}: layout rejection must not use the panic path: {stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "{configuration}: failed layout verification published assembly"
+        );
+        if let Some(baseline) = baseline_stderr.as_ref() {
+            assert_eq!(
+                stderr.as_ref(),
+                baseline,
+                "{configuration}: layout diagnostic changed across optimization or target"
+            );
+        } else {
+            baseline_stderr = Some(stderr.into_owned());
+        }
+    }
+
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -30747,6 +34910,475 @@ fn coarray_sync_reports_not_implemented() {
     );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn procedure_pointer_assignment_requires_a_compatible_procedure_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_pointer_assignment_requires_a_compatible_procedure_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let rejected = [
+        (
+            "procptr_data_scalar",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  integer, target :: storage\n  handler => storage\nend program\n",
+            "target 'storage' is not a procedure or procedure pointer",
+        ),
+        (
+            "procptr_data_component",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  type :: holder_t\n    procedure(callback), pointer, nopass :: handler\n  end type\n  type(holder_t) :: holder\n  integer, target :: storage\n  holder%handler => storage\nend program\n",
+            "target 'storage' is not a procedure or procedure pointer",
+        ),
+        (
+            "procptr_data_function",
+            "program p\n  implicit none\n  abstract interface\n    integer function callback()\n    end function\n  end interface\n  procedure(callback), pointer :: handler\n  handler => make_data()\ncontains\n  integer function make_data()\n    make_data = 7\n  end function\nend program\n",
+            "target 'make_data()' is not a procedure-pointer function result",
+        ),
+        (
+            "procptr_abstract_interface",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback()\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => callback\nend program\n",
+            "target 'callback' is an abstract interface and cannot be a procedure target",
+        ),
+        (
+            "procptr_nature_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => transform\ncontains\n  integer function transform(value)\n    integer, intent(in) :: value\n    transform = value\n  end function\nend program\n",
+            "incompatible characteristics: procedure nature differs",
+        ),
+        (
+            "procptr_dummy_count_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value, extra)\n    integer, intent(in) :: value, extra\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument count differs",
+        ),
+        (
+            "procptr_dummy_type_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer(8), intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    logical(1), intent(in) :: value\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has a different type",
+        ),
+        (
+            "procptr_dummy_rank_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer, intent(in) :: value(:)\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has a different rank or shape",
+        ),
+        (
+            "procptr_dummy_intent_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, intent(in) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer, intent(out) :: value\n    value = 1\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has a different INTENT",
+        ),
+        (
+            "procptr_dummy_value_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    subroutine callback(value)\n      integer, value :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer :: value\n  end subroutine\nend program\n",
+            "incompatible characteristics: dummy argument 1 has different VALUE attributes",
+        ),
+        (
+            "procptr_result_type_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    integer function callback(value)\n      integer, intent(in) :: value\n    end function\n  end interface\n  procedure(callback), pointer :: handler\n  handler => transform\ncontains\n  logical function transform(value)\n    integer, intent(in) :: value\n    transform = value > 0\n  end function\nend program\n",
+            "incompatible characteristics: function result has a different type",
+        ),
+        (
+            "procptr_result_rank_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    integer function callback(value)\n      integer, intent(in) :: value\n    end function\n  end interface\n  procedure(callback), pointer :: handler\n  handler => transform\ncontains\n  function transform(value) result(result)\n    integer, intent(in) :: value\n    integer :: result(1)\n    result = value\n  end function\nend program\n",
+            "incompatible characteristics: function result has a different rank or shape",
+        ),
+        (
+            "procptr_pure_mismatch",
+            "program p\n  implicit none\n  abstract interface\n    pure subroutine callback(value)\n      integer, intent(inout) :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer, intent(inout) :: value\n    value = value + 1\n  end subroutine\nend program\n",
+            "incompatible characteristics: target is not PURE",
+        ),
+        (
+            "procptr_bind_mismatch",
+            "program p\n  use iso_c_binding, only: c_int\n  implicit none\n  abstract interface\n    subroutine callback(value) bind(c)\n      import :: c_int\n      integer(c_int), value :: value\n    end subroutine\n  end interface\n  procedure(callback), pointer :: handler\n  handler => action\ncontains\n  subroutine action(value)\n    integer(c_int), value :: value\n  end subroutine\nend program\n",
+            "incompatible characteristics: BIND(C) attributes differ",
+        ),
+    ];
+
+    for (stem, source, diagnostic) in rejected {
+        let dir = unique_dir(stem);
+        let src = write_program_in(&dir, "invalid.f90", source);
+        let object = dir.join("invalid.o");
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("procedure-pointer invalid compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable diagnostic: {stderr}"
+        );
+        let published: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("o" | "amod" | "mod")
+                )
+            })
+            .collect();
+        assert!(
+            published.is_empty(),
+            "{stem} published compiler artifacts despite the semantic error: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    let dir = unique_dir("procptr_compatible_import");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module callback_api\n  implicit none\n  private\n  public :: callback, handler, invoke, make_handler, rich_callback, rich_handler\n  abstract interface\n    integer function callback(values)\n      integer, intent(in) :: values(:)\n    end function callback\n    subroutine rich_callback(optional_value, alloc_value, contiguous_value, watched_value, count, shaped_values, trailing_values)\n      integer, optional, intent(in) :: optional_value\n      integer, allocatable, intent(inout) :: alloc_value\n      integer, contiguous, intent(in) :: contiguous_value(:)\n      integer, target, asynchronous, volatile, intent(inout) :: watched_value\n      integer, intent(in) :: count\n      integer, intent(in) :: shaped_values(0:count - 1)\n      integer, intent(in) :: trailing_values(*)\n    end subroutine rich_callback\n  end interface\n  procedure(callback), pointer :: handler => null()\n  procedure(rich_callback), pointer :: rich_handler => null()\ncontains\n  integer function invoke(values)\n    integer, intent(in) :: values(:)\n    invoke = handler(values)\n  end function invoke\n\n  function make_handler() result(result)\n    procedure(callback), pointer :: result\n    result => provider_sum\n  end function make_handler\n\n  integer function provider_sum(values)\n    integer, intent(in) :: values(:)\n    provider_sum = sum(values)\n  end function provider_sum\nend module callback_api\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-pointer provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "procedure-pointer provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let invalid_consumer = write_program_in(
+        &dir,
+        "invalid_consumer.f90",
+        "program p\n  use callback_api, only: callback, handler\n  implicit none\n  handler => callback\nend program p\n",
+    );
+    let invalid_object = dir.join("invalid_consumer.o");
+    let invalid_consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            invalid_consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            invalid_object.to_str().unwrap(),
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("abstract-interface consumer compile failed to spawn");
+    let invalid_stderr = String::from_utf8_lossy(&invalid_consumer_result.stderr);
+    assert!(
+        !invalid_consumer_result.status.success()
+            && invalid_stderr
+                .contains("target 'callback' is an abstract interface and cannot be a procedure target")
+            && !invalid_object.exists(),
+        "imported abstract interface must not be a procedure target: status={:?} stderr={invalid_stderr}",
+        invalid_consumer_result.status
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module callback_impl\n  use callback_api, only: handler, make_handler, rich_handler\n  implicit none\ncontains\n  subroutine configure()\n    handler => sum_values\n    handler => make_handler()\n    rich_handler => rich_action\n  end subroutine configure\n\n  integer function sum_values(values)\n    integer, intent(in) :: values(:)\n    sum_values = sum(values)\n  end function sum_values\n\n  subroutine rich_action(optional_value, alloc_value, contiguous_value, watched_value, size, items, tail)\n    integer, optional, intent(in) :: optional_value\n    integer, allocatable, intent(inout) :: alloc_value\n    integer, contiguous, intent(in) :: contiguous_value(:)\n    integer, target, asynchronous, volatile, intent(inout) :: watched_value\n    integer, intent(in) :: size\n    integer, intent(in) :: items(0:size - 1)\n    integer, intent(in) :: tail(*)\n  end subroutine rich_action\nend module callback_impl\n\nprogram p\n  use callback_api, only: invoke\n  use callback_impl, only: configure\n  implicit none\n  call configure()\n  if (invoke([1, 2, 3, 4]) /= 10) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-pointer consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "compatible imported procedure-pointer assignment should compile: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("procedure-pointer consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure-pointer consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn procedure_dummy_actuals_require_callable_compatible_effective_arguments() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_actuals_require_callable_compatible_effective_arguments count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let provider_source = "\
+module callback_api
+  implicit none
+  private
+  public :: callback, invoke, borrow, evaluate, mutate, make_handler
+  abstract interface
+    subroutine callback(value, result)
+      integer, intent(in) :: value
+      integer, intent(out) :: result
+    end subroutine callback
+  end interface
+contains
+  subroutine invoke(candidate, value, result)
+    procedure(callback) :: candidate
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    call candidate(value, result)
+  end subroutine invoke
+
+  subroutine borrow(candidate, value, result)
+    procedure(callback), pointer, intent(in) :: candidate
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    call candidate(value, result)
+  end subroutine borrow
+
+  integer function evaluate(candidate, value)
+    procedure(callback), pointer, intent(in) :: candidate
+    integer, intent(in) :: value
+    call candidate(value, evaluate)
+  end function evaluate
+
+  subroutine mutate(candidate)
+    procedure(callback), pointer :: candidate
+    nullify(candidate)
+  end subroutine mutate
+
+  function make_handler() result(candidate)
+    procedure(callback), pointer :: candidate
+    candidate => double_value
+  end function make_handler
+
+  subroutine double_value(value, result)
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    result = value * 2
+  end subroutine double_value
+end module callback_api
+";
+
+    let invalid_dir = unique_dir("procedure_dummy_invalid");
+    let provider = write_program_in(&invalid_dir, "provider.f90", provider_source);
+    let provider_object = invalid_dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&invalid_dir)
+        .args([
+            "-O0",
+            "-c",
+            "-J",
+            invalid_dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("procedure-dummy provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "procedure-dummy provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let rejected = [
+        (
+            "data",
+            "program p\n  use callback_api, only: invoke\n  implicit none\n  integer :: storage, result\n  call invoke(storage, 1, result)\nend program p\n",
+            "actual argument for procedure dummy 'candidate' is not a procedure or procedure pointer",
+        ),
+        (
+            "characteristics",
+            "program p\n  use callback_api, only: invoke\n  implicit none\n  integer :: result\n  call invoke(action, 1, result)\ncontains\n  subroutine action(value, result)\n    real, intent(in) :: value\n    integer, intent(out) :: result\n    result = int(value)\n  end subroutine action\nend program p\n",
+            "actual procedure 'action' for dummy 'candidate' has incompatible characteristics: dummy argument 1 has a different type",
+        ),
+        (
+            "pointer_intent",
+            "program p\n  use callback_api, only: mutate\n  implicit none\n  call mutate(action)\ncontains\n  subroutine action(value, result)\n    integer, intent(in) :: value\n    integer, intent(out) :: result\n    result = value\n  end subroutine action\nend program p\n",
+            "nonpointer actual procedure 'action' requires procedure pointer dummy 'candidate' to have INTENT(IN)",
+        ),
+        (
+            "abstract",
+            "program p\n  use callback_api, only: callback, invoke\n  implicit none\n  integer :: result\n  call invoke(callback, 1, result)\nend program p\n",
+            "actual procedure 'callback' for dummy 'candidate' is an abstract interface and is not callable",
+        ),
+    ];
+
+    for (stem, source, diagnostic) in rejected {
+        let src = write_program_in(&invalid_dir, &format!("{stem}.f90"), source);
+        let object = invalid_dir.join(format!("{stem}.o"));
+        let result = Command::new(compiler("armfortas"))
+            .current_dir(&invalid_dir)
+            .args([
+                "-O0",
+                "-c",
+                src.to_str().unwrap(),
+                "-I",
+                invalid_dir.to_str().unwrap(),
+                "-J",
+                invalid_dir.to_str().unwrap(),
+                "-o",
+                object.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("invalid procedure-dummy consumer compile failed to spawn");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "{stem} should be rejected: status={:?} stderr={stderr}",
+            result.status
+        );
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            1,
+            "{stem} should emit one stable diagnostic: {stderr}"
+        );
+        assert!(
+            !object.exists(),
+            "{stem} published an object despite the semantic error"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&invalid_dir);
+
+    let consumer_source = "\
+program p
+  use callback_api, only: invoke, borrow, evaluate, mutate, make_handler
+  implicit none
+  abstract interface
+    subroutine callback_shape(value, result)
+      integer, intent(in) :: value
+      integer, intent(out) :: result
+    end subroutine callback_shape
+  end interface
+  procedure(callback_shape), pointer :: handler
+  integer :: result
+
+  handler => double_value
+  call invoke(double_value, 4, result)
+  if (result /= 8) error stop 1
+  call invoke(handler, 5, result)
+  if (result /= 10) error stop 2
+  call borrow(double_value, 6, result)
+  if (result /= 12) error stop 3
+  call borrow(handler, 7, result)
+  if (result /= 14) error stop 4
+  call borrow(make_handler(), 8, result)
+  if (result /= 16) error stop 5
+  result = evaluate(double_value, 9)
+  if (result /= 18) error stop 6
+  result = evaluate(handler, 10)
+  if (result /= 20) error stop 7
+  result = evaluate(make_handler(), 11)
+  if (result /= 22) error stop 8
+  call mutate(handler)
+  if (associated(handler)) error stop 9
+  print *, 'ok'
+contains
+  subroutine double_value(value, result)
+    integer, intent(in) :: value
+    integer, intent(out) :: result
+    result = value * 2
+  end subroutine double_value
+end program p
+";
+
+    for optimization in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        let dir = unique_dir(&format!(
+            "procedure_dummy_compatible_{}",
+            optimization.trim_start_matches('-')
+        ));
+        let provider = write_program_in(&dir, "provider.f90", provider_source);
+        let consumer = write_program_in(&dir, "consumer.f90", consumer_source);
+        let provider_object = dir.join("provider.o");
+        let provider_result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                "-c",
+                "-J",
+                dir.to_str().unwrap(),
+                provider.to_str().unwrap(),
+                "-o",
+                provider_object.to_str().unwrap(),
+            ])
+            .output()
+            .expect("optimized procedure-dummy provider compile failed to spawn");
+        assert!(
+            provider_result.status.success(),
+            "{optimization}: procedure-dummy provider should compile: {}",
+            String::from_utf8_lossy(&provider_result.stderr)
+        );
+
+        let executable = dir.join("consumer");
+        let consumer_result = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                optimization,
+                consumer.to_str().unwrap(),
+                provider_object.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                executable.to_str().unwrap(),
+            ])
+            .output()
+            .expect("optimized procedure-dummy consumer compile failed to spawn");
+        assert!(
+            consumer_result.status.success(),
+            "{optimization}: compatible procedure-dummy consumer should compile: {}",
+            String::from_utf8_lossy(&consumer_result.stderr)
+        );
+        let run = Command::new(&executable)
+            .output()
+            .expect("optimized procedure-dummy consumer failed to run");
+        assert!(
+            run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "{optimization}: procedure-dummy consumer failed: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
@@ -32969,7 +37601,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 8\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 12\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
@@ -36372,6 +41004,51 @@ fn saved_derived_global_after_small_globals_keeps_descriptor_alignment() {
 }
 
 #[test]
+fn two_i64_derived_local_preserves_full_stack_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=two_i64_derived_local_preserves_full_stack_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: pair_t\n    integer(8) :: first\n    integer(8) :: second\n  end type pair_t\n  integer(8) :: guard_before, guard_after\n  type(pair_t) :: pair\n  guard_before = 101_8\n  pair%first = 11_8\n  pair%second = 22_8\n  guard_after = 202_8\n  if (pair%first + pair%second /= 33_8) error stop 1\n  if (guard_before /= 101_8 .or. guard_after /= 202_8) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path("two_i64_derived_stack_storage", "bin");
+        let compile = Command::new(compiler("armfortas"))
+            .args([src.to_str().unwrap(), opt, "-o", out.to_str().unwrap()])
+            .output()
+            .expect("two-i64 derived local compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "two-i64 derived local should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out).output().expect("run failed");
+        assert!(
+            run.status.success(),
+            "two-i64 derived local should preserve adjacent stack storage at {opt}: \
+             status={:?} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected two-i64 derived local output at {opt}: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_char_component_store_accepts_component_subscript_expr() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -38947,6 +43624,52 @@ fn get_environment_variable_literal_name_populates_value_and_status() {
         stdout.contains("/tmp"),
         "unexpected literal-name get_environment_variable output: {}",
         stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[cfg(unix)]
+#[test]
+fn get_environment_variable_trim_name_false_preserves_trailing_blanks() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=get_environment_variable_trim_name_false_preserves_trailing_blanks count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=14) :: name\n  character(len=16) :: value\n  integer :: length, status\n  name = 'AFS_AR53_TRIM'\n  value = '?'\n  call get_environment_variable(name, value, length, status)\n  if (status /= 0 .or. length /= 7 .or. value(1:length) /= 'trimmed') error stop 1\n  value = '?'\n  call get_environment_variable(name, value, length, status, trim_name=.false.)\n  if (status /= 0 .or. length /= 5 .or. value(1:length) /= 'exact') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("get_environment_variable_trim_name", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("TRIM_NAME get_environment_variable compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "TRIM_NAME get_environment_variable should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .env("AFS_AR53_TRIM", "trimmed")
+        .env("AFS_AR53_TRIM ", "exact")
+        .output()
+        .expect("TRIM_NAME get_environment_variable run failed");
+    assert!(
+        run.status.success(),
+        "TRIM_NAME get_environment_variable should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected TRIM_NAME get_environment_variable output: {}",
+        String::from_utf8_lossy(&run.stdout)
     );
 
     let _ = std::fs::remove_file(&out);

@@ -47,13 +47,14 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
     for mf in &mut allocated {
         if use_naive_regalloc {
             regalloc::regalloc_naive(mf);
+            linearscan::parallelize_call_arg_moves(mf);
         } else {
             let liveness = liveness::compute_liveness(mf);
             let result = linearscan::linear_scan(mf, &liveness);
             linearscan::apply_allocation(mf, &result, &liveness);
             linearscan::parallelize_entry_arg_moves(mf);
-            linearscan::parallelize_call_arg_moves(mf);
             linearscan::insert_split_bridges(mf, &result.split_records);
+            linearscan::parallelize_call_arg_moves(mf);
             linearscan::insert_callee_saves(mf, &result.callee_saved_used);
             linearscan::coalesce_moves(mf);
             // Tail call optimization (O1+): BL + epilogue → epilogue + B.
@@ -63,10 +64,10 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
                 tailcall::tail_call_opt(mf);
             }
         }
-        // Branch relaxation: any B.cond whose target lies outside the
-        // ±1MB conditional-branch window is expanded to a
-        // `B.{!cond} skip; B far_target; skip:` trampoline so the
-        // assembler doesn't choke on the encoding.
+        // Branch relaxation: widen out-of-range B.cond/CBZ/TBZ-family
+        // branches through an inverted short branch, and replace an
+        // out-of-range local B with a position-independent x16 veneer.
+        // Iterate to a fixed point because either rewrite changes layout.
         relax_branches::relax_branches(mf);
     }
 

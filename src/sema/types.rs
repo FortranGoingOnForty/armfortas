@@ -158,6 +158,37 @@ impl FortranType {
     }
 }
 
+/// F2023 17.11.38 kind selection over the IEC 60559 formats implemented by
+/// ARMFORTAS. Missing P/R are represented by zero; `None` for RADIX means no
+/// radix constraint.
+pub(crate) fn ieee_selected_real_kind_value(
+    precision: i128,
+    exponent_range: i128,
+    radix: Option<i128>,
+) -> i32 {
+    if radix.is_some_and(|value| value != 2) {
+        return -5;
+    }
+    if precision <= 6 && exponent_range <= 37 {
+        return 4;
+    }
+    if precision <= 15 && exponent_range <= 307 {
+        return 8;
+    }
+
+    let precision_supported = precision <= 15;
+    let range_supported = exponent_range <= 307;
+    match (precision_supported, range_supported) {
+        (false, true) => -1,
+        (true, false) => -2,
+        (false, false) => -3,
+        // With nested binary32/binary64 capabilities this cannot occur, but
+        // it is the standard result when separate kinds satisfy P and R
+        // without one kind satisfying both.
+        (true, true) => -4,
+    }
+}
+
 /// Compute the result type of a binary arithmetic operation.
 /// Implements Fortran's type promotion rules.
 pub fn arithmetic_result_type(left: &FortranType, right: &FortranType) -> Option<FortranType> {
@@ -466,20 +497,234 @@ fn resolve_kind_suffix(kind: &str, symtab: &super::symtab::SymbolTable) -> Optio
     })
 }
 
-fn resolve_intrinsic_kind_arg(
-    expr: &crate::ast::expr::SpannedExpr,
-    symtab: &super::symtab::SymbolTable,
-) -> Option<u8> {
+/// Canonical dummy-argument names for intrinsic procedures whose contract is
+/// defined in terms of character data.  Semantic validation and lowering both
+/// consume this table so keyword association cannot drift between the two.
+pub(crate) fn character_intrinsic_signature(
+    name: &str,
+) -> Option<(&'static [&'static str], usize)> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "len" | "len_trim" => (&["string", "kind"], 1),
+        "ichar" | "iachar" => (&["c", "kind"], 1),
+        "char" | "achar" => (&["i", "kind"], 1),
+        "index" => (&["string", "substring", "back", "kind"], 2),
+        "scan" | "verify" => (&["string", "set", "back", "kind"], 2),
+        "adjustl" | "adjustr" | "trim" => (&["string"], 1),
+        "repeat" => (&["string", "ncopies"], 2),
+        "lge" | "lgt" | "lle" | "llt" => (&["string_a", "string_b"], 2),
+        // The standard dummy name is A even though some documentation renders
+        // the syntax as NEW_LINE(C); both gfortran and flang accept A=.
+        "new_line" => (&["a"], 1),
+        "f_c_string" => (&["string", "asis"], 1),
+        _ => return None,
+    })
+}
+
+/// Zero-based position of the optional KIND dummy for character intrinsics
+/// whose result is INTEGER.  A single table keeps expression typing,
+/// validation metadata, and IR lowering in lockstep.
+pub(crate) fn character_integer_result_kind_position(name: &str) -> Option<usize> {
+    match name.to_ascii_lowercase().as_str() {
+        "len" | "len_trim" | "ichar" | "iachar" => Some(1),
+        "index" | "scan" | "verify" => Some(3),
+        _ => None,
+    }
+}
+
+fn intrinsic_element_argument<'a>(
+    args: &'a [crate::ast::expr::Argument],
+    positional_index: usize,
+    keyword: &str,
+) -> Option<&'a crate::ast::expr::SpannedExpr> {
+    args.iter()
+        .find(|arg| {
+            arg.keyword
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(keyword))
+        })
+        .or_else(|| {
+            args.iter()
+                .filter(|arg| arg.keyword.is_none())
+                .nth(positional_index)
+        })
+        .and_then(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+            crate::ast::expr::SectionSubscript::Range { .. } => None,
+        })
+}
+
+pub(crate) fn selected_kind_value(name: &str, argument: i128) -> Option<i128> {
+    Some(match name {
+        "selected_int_kind" => {
+            if argument <= 2 {
+                1
+            } else if argument <= 4 {
+                2
+            } else if argument <= 9 {
+                4
+            } else if argument <= 18 {
+                8
+            } else if argument <= 38 {
+                16
+            } else {
+                -1
+            }
+        }
+        "selected_real_kind" => {
+            if argument <= 6 {
+                4
+            } else if argument <= 15 {
+                8
+            } else {
+                -1
+            }
+        }
+        "selected_logical_kind" => {
+            if argument <= 8 {
+                1
+            } else if argument <= 16 {
+                2
+            } else if argument <= 32 {
+                4
+            } else if argument <= 64 {
+                8
+            } else if argument <= 128 {
+                16
+            } else {
+                -1
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn resolve_intrinsic_character_constant<'a>(
+    expr: &'a crate::ast::expr::SpannedExpr,
+    symtab: &'a super::symtab::SymbolTable,
+) -> Option<std::borrow::Cow<'a, str>> {
     use crate::ast::expr::Expr;
     match &expr.node {
-        Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
+        Expr::StringLiteral { value, .. } => Some(value.to_string_lossy()),
+        Expr::Name { name } => symtab
+            .find_symbol_any_scope(name)
+            .and_then(|symbol| symbol.const_char_value.as_deref())
+            .map(std::borrow::Cow::Borrowed),
+        Expr::ParenExpr { inner } => resolve_intrinsic_character_constant(inner, symtab),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_intrinsic_kind_value(
+    expr: &crate::ast::expr::SpannedExpr,
+    symtab: &super::symtab::SymbolTable,
+) -> Option<i128> {
+    use crate::ast::expr::{BinaryOp, Expr, UnaryOp};
+    match &expr.node {
+        Expr::IntegerLiteral { text, .. } => {
+            text.split('_').next().unwrap_or(text).parse::<i128>().ok()
+        }
         Expr::Name { name } => symtab
             .find_symbol_any_scope(name)
             .and_then(|sym| sym.const_value)
-            .and_then(|v| u8::try_from(v).ok()),
-        Expr::ParenExpr { inner } => resolve_intrinsic_kind_arg(inner, symtab),
+            .map(i128::from),
+        Expr::UnaryOp { op, operand } => {
+            let value = resolve_intrinsic_kind_value(operand, symtab)?;
+            match op {
+                UnaryOp::Plus => Some(value),
+                UnaryOp::Minus => value.checked_neg(),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { op, left, right } => {
+            let left = resolve_intrinsic_kind_value(left, symtab)?;
+            let right = resolve_intrinsic_kind_value(right, symtab)?;
+            match op {
+                BinaryOp::Add => left.checked_add(right),
+                BinaryOp::Sub => left.checked_sub(right),
+                BinaryOp::Mul => left.checked_mul(right),
+                BinaryOp::Div if right != 0 => left.checked_div(right),
+                BinaryOp::Pow => u32::try_from(right)
+                    .ok()
+                    .and_then(|exponent| left.checked_pow(exponent)),
+                _ => None,
+            }
+        }
+        Expr::ParenExpr { inner } => resolve_intrinsic_kind_value(inner, symtab),
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            match name.to_ascii_lowercase().as_str() {
+                "kind" => intrinsic_element_argument(args, 0, "x")
+                    .map(|argument| expr_type(argument, symtab))?
+                    .kind()
+                    .map(i128::from),
+                "selected_int_kind" => {
+                    let range = resolve_intrinsic_kind_value(
+                        intrinsic_element_argument(args, 0, "r")?,
+                        symtab,
+                    )?;
+                    selected_kind_value("selected_int_kind", range)
+                }
+                "selected_logical_kind" => {
+                    let bits = resolve_intrinsic_kind_value(
+                        intrinsic_element_argument(args, 0, "bits")?,
+                        symtab,
+                    )?;
+                    selected_kind_value("selected_logical_kind", bits)
+                }
+                "selected_char_kind" => {
+                    let name = resolve_intrinsic_character_constant(
+                        intrinsic_element_argument(args, 0, "name")?,
+                        symtab,
+                    )?;
+                    let name = name.trim_end_matches(' ');
+                    Some(
+                        if name.eq_ignore_ascii_case("default")
+                            || name.eq_ignore_ascii_case("ascii")
+                        {
+                            1
+                        } else {
+                            -1
+                        },
+                    )
+                }
+                "selected_real_kind" => {
+                    let precision_arg = intrinsic_element_argument(args, 0, "p");
+                    let exponent_range_arg = intrinsic_element_argument(args, 1, "r");
+                    if precision_arg.is_none() && exponent_range_arg.is_none() {
+                        return None;
+                    }
+                    let precision = match precision_arg {
+                        Some(argument) => resolve_intrinsic_kind_value(argument, symtab)?,
+                        None => 0,
+                    };
+                    let exponent_range = match exponent_range_arg {
+                        Some(argument) => resolve_intrinsic_kind_value(argument, symtab)?,
+                        None => 0,
+                    };
+                    let radix = match intrinsic_element_argument(args, 2, "radix") {
+                        Some(argument) => Some(resolve_intrinsic_kind_value(argument, symtab)?),
+                        None => None,
+                    };
+                    Some(i128::from(ieee_selected_real_kind_value(
+                        precision,
+                        exponent_range,
+                        radix,
+                    )))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+pub(crate) fn resolve_intrinsic_kind_arg(
+    expr: &crate::ast::expr::SpannedExpr,
+    symtab: &super::symtab::SymbolTable,
+) -> Option<u8> {
+    resolve_intrinsic_kind_value(expr, symtab).and_then(|value| u8::try_from(value).ok())
 }
 
 fn resolve_intrinsic_kind_call_arg(
@@ -488,19 +733,10 @@ fn resolve_intrinsic_kind_call_arg(
     keyword: &str,
     symtab: &super::symtab::SymbolTable,
 ) -> Option<u8> {
-    let arg = args
-        .iter()
-        .find(|arg| {
-            arg.keyword
-                .as_deref()
-                .map(|kw| kw.eq_ignore_ascii_case(keyword))
-                .unwrap_or(false)
-        })
-        .or_else(|| args.get(positional_index))?;
-    match &arg.value {
-        crate::ast::expr::SectionSubscript::Element(e) => resolve_intrinsic_kind_arg(e, symtab),
-        crate::ast::expr::SectionSubscript::Range { .. } => None,
-    }
+    resolve_intrinsic_kind_arg(
+        intrinsic_element_argument(args, positional_index, keyword)?,
+        symtab,
+    )
 }
 
 /// Resolve a typed-array-constructor type spec rendered as a string
@@ -711,7 +947,6 @@ pub fn expr_type(
         // Function call / array access — disambiguate based on callee
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
-                // Check intrinsics first
                 let arg_types: Vec<FortranType> = args
                     .iter()
                     .map(|a| match &a.value {
@@ -720,45 +955,72 @@ pub fn expr_type(
                     })
                     .collect();
 
-                if matches!(name.to_lowercase().as_str(), "real" | "float") {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
-                        return FortranType::Real { kind };
+                let lexical_symbol = symtab.lookup(name);
+                let visible_symbol = lexical_symbol.or_else(|| symtab.find_symbol_any_scope(name));
+                // A USE rename retains the imported symbol's canonical name.
+                // Dispatch and result typing must use that name, while a visible
+                // user procedure of the same local name must continue to shadow
+                // the intrinsic.
+                let intrinsic_name = match lexical_symbol {
+                    Some(sym)
+                        if sym.attrs.intrinsic
+                            || matches!(sym.kind, super::symtab::SymbolKind::IntrinsicProc) =>
+                    {
+                        Some(sym.name.as_str())
+                    }
+                    Some(_) => None,
+                    None => Some(name.as_str()),
+                };
+
+                if let Some(intrinsic_name) = intrinsic_name {
+                    let intrinsic_key = intrinsic_name.to_lowercase();
+                    if matches!(intrinsic_key.as_str(), "real" | "float") {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab)
+                        {
+                            return FortranType::Real { kind };
+                        }
+                    }
+
+                    if matches!(intrinsic_key.as_str(), "int" | "nint" | "floor" | "ceiling") {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab)
+                        {
+                            return FortranType::Integer { kind };
+                        }
+                    }
+
+                    if let Some(kind_position) =
+                        character_integer_result_kind_position(&intrinsic_key)
+                    {
+                        if let Some(kind) =
+                            resolve_intrinsic_kind_call_arg(args, kind_position, "kind", symtab)
+                        {
+                            return FortranType::Integer { kind };
+                        }
+                    }
+
+                    if intrinsic_key == "cmplx" {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab)
+                        {
+                            return FortranType::Complex { kind };
+                        }
+                    }
+
+                    if matches!(intrinsic_key.as_str(), "char" | "achar") {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab)
+                        {
+                            return FortranType::Character {
+                                kind,
+                                len: CharLen::Known(1),
+                            };
+                        }
+                    }
+
+                    if let Some(result) = intrinsic_result_type(&intrinsic_key, &arg_types) {
+                        return result;
                     }
                 }
 
-                if matches!(
-                    name.to_lowercase().as_str(),
-                    "int" | "nint" | "floor" | "ceiling"
-                ) {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
-                        return FortranType::Integer { kind };
-                    }
-                }
-
-                if matches!(name.to_lowercase().as_str(), "cmplx") {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab) {
-                        return FortranType::Complex { kind };
-                    }
-                }
-
-                if matches!(name.to_lowercase().as_str(), "char" | "achar") {
-                    if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 1, "kind", symtab) {
-                        return FortranType::Character {
-                            kind,
-                            len: CharLen::Known(1),
-                        };
-                    }
-                }
-
-                if let Some(result) = intrinsic_result_type(name, &arg_types) {
-                    return result;
-                }
-
-                // Look up in symbol table
-                if let Some(sym) = symtab
-                    .lookup(name)
-                    .or_else(|| symtab.find_symbol_any_scope(name))
-                {
+                if let Some(sym) = visible_symbol {
                     if matches!(sym.kind, super::symtab::SymbolKind::DerivedType)
                         && !sym.arg_names.is_empty()
                     {
@@ -1107,6 +1369,8 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "ieee_min_num"
             | "ieee_max_num_mag"
             | "ieee_min_num_mag"
+            | "ieee_fma"
+            | "ieee_rem"
             | "len_trim"
             | "index"
             | "scan"
@@ -1174,6 +1438,20 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
             }
             _ => None,
         },
+        "ieee_fma" => match args.first()? {
+            FortranType::Real { kind } => Some(FortranType::Real { kind: *kind }),
+            _ => None,
+        },
+        "ieee_rem" => {
+            let kind = args
+                .iter()
+                .filter_map(|arg| match arg {
+                    FortranType::Real { kind } => Some(*kind),
+                    _ => None,
+                })
+                .max()?;
+            Some(FortranType::Real { kind })
+        }
 
         // Real-valued math.
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
@@ -1191,9 +1469,11 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "int" | "nint" | "floor" | "ceiling" => Some(FortranType::default_integer()),
         "len" | "len_trim" | "index" | "scan" | "verify" => Some(FortranType::default_integer()),
         "size" | "lbound" | "ubound" | "shape" | "rank" => Some(FortranType::default_integer()),
-        "kind" | "selected_int_kind" | "selected_real_kind" | "selected_char_kind" => {
-            Some(FortranType::default_integer())
-        }
+        "kind"
+        | "selected_int_kind"
+        | "selected_real_kind"
+        | "selected_char_kind"
+        | "ieee_selected_real_kind" => Some(FortranType::default_integer()),
         "iand" | "ior" | "ieor" | "not" | "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta"
         | "ibits" | "ibset" | "ibclr" | "merge_bits" | "dshiftl" | "dshiftr" => {
             args.first().cloned()
@@ -2920,6 +3200,42 @@ mod tests {
             span,
         );
         assert_eq!(expr_type(&expr, &st), FortranType::Complex { kind: 8 });
+    }
+
+    #[test]
+    fn expr_type_character_intrinsic_keyword_kind_respects_requested_kind() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        let st = super::super::symtab::SymbolTable::new();
+        let cases = [
+            ("len(kind=8, string='abcd')", 8),
+            ("len(kind=kind(0_8), string='abcd')", 8),
+            ("len_trim(kind=2, string='ab  ')", 2),
+            ("ichar(kind=8, c='A')", 8),
+            ("iachar(kind=selected_char_kind('ascii'), c='B')", 1),
+            ("index(kind=16, substring='na', string='banana')", 16),
+            (
+                "index(kind=selected_int_kind(18), substring='na', string='banana')",
+                8,
+            ),
+            ("scan(kind=2*4, set='ab', string='cabca')", 8),
+            (
+                "verify(kind=selected_real_kind(r=300, p=15), set='ab', string='abXba')",
+                8,
+            ),
+        ];
+
+        for (source, kind) in cases {
+            let tokens = Lexer::tokenize(source, 0).unwrap();
+            let mut parser = Parser::new(&tokens);
+            let expr = parser.parse_expr().unwrap();
+            assert_eq!(
+                expr_type(&expr, &st),
+                FortranType::Integer { kind },
+                "wrong result type for {source}"
+            );
+        }
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //! Gated on body size (≤ UNSWITCH_MAX_BODY instructions) to prevent
 //! code bloat. Fires at O2+.
 
-use super::loop_utils::{find_preheader, loop_defined_values};
+use super::loop_utils::{find_preheader, loop_contains_volatile_memory, loop_defined_values};
 use super::pass::Pass;
 use crate::ir::inst::*;
 use crate::ir::walk::{
@@ -73,6 +73,9 @@ fn unswitch_in_function(func: &mut Function) -> bool {
     let preds = predecessors(func);
 
     for lp in &loops {
+        if loop_contains_volatile_memory(func, lp) {
+            continue;
+        }
         let Some(ph_id) = find_preheader(func, lp, &preds) else {
             continue;
         };

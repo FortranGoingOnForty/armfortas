@@ -332,6 +332,136 @@ fn duplicate_allocation_options_are_rejected() {
 }
 
 #[test]
+fn duplicate_allocate_and_deallocate_objects_are_rejected_before_lowering() {
+    let cases = [
+        (
+            "duplicate_allocate_object",
+            "program p\n  implicit none\n  integer, allocatable :: values(:)\n  allocate(values(2), values(3))\nend program\n",
+            "same entity as an earlier ALLOCATE object",
+        ),
+        (
+            "duplicate_deallocate_object",
+            "program p\n  implicit none\n  integer, allocatable :: value\n  deallocate(value, value)\nend program\n",
+            "same entity as an earlier DEALLOCATE object",
+        ),
+        (
+            "duplicate_component_object",
+            "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: value\n  end type\n  type(box_t) :: boxes(2)\n  integer :: index\n  allocate(boxes(index)%value, boxes(index)%value)\nend program\n",
+            "same entity as an earlier ALLOCATE object",
+        ),
+    ];
+
+    for (stem, source, expected) in cases {
+        let (dir, compile) = compile_source(stem, source);
+        assert!(
+            !compile.status.success(),
+            "{stem} unexpectedly compiled:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{stem} produced the wrong diagnostic: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn side_effect_selected_allocate_objects_remain_distinct() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=allocate_validation test=side_effect_selected_allocate_objects_remain_distinct count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let (dir, compile) = compile_source(
+        "side_effect_selected_objects",
+        "integer function next_index()\n  implicit none\n  integer, save :: index = 0\n  index = index + 1\n  next_index = index\nend function\n\nprogram p\n  implicit none\n  type :: box_t\n    integer, allocatable :: value\n  end type\n  type(box_t) :: boxes(2)\n  integer, external :: next_index\n\n  allocate(boxes(next_index())%value, boxes(next_index())%value)\n  if (.not. allocated(boxes(1)%value)) error stop 1\n  if (.not. allocated(boxes(2)%value)) error stop 2\nend program\n",
+    );
+    assert!(
+        compile.status.success(),
+        "side-effect-selected objects failed to compile:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let exe = dir.join("side_effect_selected_objects.bin");
+    let run = Command::new(&exe)
+        .output()
+        .expect("failed to run side-effect-selected allocation program");
+    assert!(
+        run.status.success(),
+        "side-effect-selected allocation program failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn duplicate_import_aliases_are_rejected_after_amod_round_trip() {
+    let dir = unique_dir("duplicate_import_alias");
+    let module_source = write_program_in(
+        &dir,
+        "storage_m.f90",
+        "module storage_m\n  implicit none\n  integer, allocatable :: storage\nend module storage_m\n",
+    );
+    let module_object = dir.join("storage_m.o");
+    let module_compile = compile_with_args(&[
+        "-c",
+        module_source.to_str().unwrap(),
+        "-J",
+        dir.to_str().unwrap(),
+        "-o",
+        module_object.to_str().unwrap(),
+    ]);
+    assert!(
+        module_compile.status.success(),
+        "module compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&module_compile.stdout),
+        String::from_utf8_lossy(&module_compile.stderr)
+    );
+
+    let consumer_source = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consumer\n  use storage_m, only: left => storage, right => storage\n  implicit none\n  allocate(left, right)\nend program consumer\n",
+    );
+    let consumer_object = dir.join("consumer.o");
+    let consumer_compile = compile_with_args(&[
+        "-c",
+        consumer_source.to_str().unwrap(),
+        "-I",
+        dir.to_str().unwrap(),
+        "-o",
+        consumer_object.to_str().unwrap(),
+    ]);
+    assert!(
+        !consumer_compile.status.success(),
+        "duplicate aliases unexpectedly compiled:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&consumer_compile.stdout),
+        String::from_utf8_lossy(&consumer_compile.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&consumer_compile.stderr);
+    assert!(
+        stderr.contains("same entity as an earlier ALLOCATE object"),
+        "duplicate aliases produced the wrong diagnostic: {stderr}"
+    );
+    assert!(
+        !consumer_object.exists(),
+        "rejected duplicate aliases left an object artifact"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn allocation_options_are_rejected_where_they_do_not_apply() {
     let cases = [
         (

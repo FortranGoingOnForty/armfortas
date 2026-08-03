@@ -200,6 +200,8 @@ fn key_of(inst: &Inst) -> Option<Key> {
         // Impure / not handled ------------------------------------------
         InstKind::Load(..)
         | InstKind::Store(..)
+        | InstKind::VolatileLoad(..)
+        | InstKind::VolatileStore(..)
         | InstKind::Alloca(..)
         | InstKind::Call(..)
         | InstKind::RuntimeCall(..)
@@ -243,7 +245,7 @@ impl Pass for LocalCse {
     }
 
     fn run(&self, module: &mut Module) -> bool {
-        let rounding_effects = super::fpenv::analyze_rounding_effects(module);
+        let fpenv_effects = super::fpenv::analyze_fpenv_effects(module);
         let mut changed = false;
         for (func_idx, func) in module.functions.iter_mut().enumerate() {
             // Collect all (old, new) rewrites first, then apply them
@@ -252,15 +254,16 @@ impl Pass for LocalCse {
             // function with N CSE candidates ran N full walks for an
             // overall O(N · function_size). The batched form is one
             // walk with HashMap-driven renaming.
-            // In a function that changes the FP rounding mode, rounding-
-            // dependent FP ops must not be CSE'd (two identical `fdiv`
-            // across a mode change differ); l09.
-            let fpenv_barrier = rounding_effects.may_change_rounding[func_idx];
+            // In a function that accesses the floating-point environment,
+            // sensitive FP ops must not be CSE'd. Their values can differ
+            // across rounding-mode changes, and repeated execution can
+            // re-raise a sticky IEEE status flag after a reset.
+            let fpenv_barrier = fpenv_effects.may_cross_fpenv_barrier[func_idx];
             let mut rewrite_map: HashMap<ValueId, ValueId> = HashMap::new();
             for block in &func.blocks {
                 let mut seen: HashMap<Key, ValueId> = HashMap::new();
                 for inst in &block.insts {
-                    if fpenv_barrier && super::fpenv::is_rounding_dependent_fp(&inst.kind) {
+                    if fpenv_barrier && super::fpenv::is_fpenv_sensitive(&inst.kind) {
                         continue;
                     }
                     let Some(k) = key_of(inst) else { continue };
@@ -528,6 +531,95 @@ mod tests {
         assert!(
             !LocalCse.run(&mut m),
             "an indirect call may change the rounding mode between FP expressions"
+        );
+    }
+
+    #[test]
+    fn keeps_fcmp_distinct_when_function_accesses_fp_environment() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Bool);
+        let snan = push(
+            &mut f,
+            InstKind::ConstFloat(f64::from_bits(0x7ff0_0000_0000_0001), FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let first = push(&mut f, InstKind::FCmp(CmpOp::Eq, snan, zero), IrType::Bool);
+        let invalid = push(
+            &mut f,
+            InstKind::ConstInt(1, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let clear = push(
+            &mut f,
+            InstKind::ConstInt(0, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(
+            &mut f,
+            InstKind::Call(
+                FuncRef::External("afs_ieee_set_flag".into()),
+                vec![invalid, clear],
+            ),
+            IrType::Void,
+        );
+        let second = push(&mut f, InstKind::FCmp(CmpOp::Eq, snan, zero), IrType::Bool);
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(f);
+
+        assert!(
+            !LocalCse.run(&mut m),
+            "the second signaling comparison must execute after IEEE_INVALID is cleared"
+        );
+        let comparisons = m.functions[0].blocks[0]
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.kind, InstKind::FCmp(..)))
+            .map(|inst| inst.id)
+            .collect::<Vec<_>>();
+        assert_eq!(comparisons, vec![first, second]);
+        assert!(matches!(
+            m.functions[0].blocks[0].terminator,
+            Some(Terminator::Return(Some(value))) if value == second
+        ));
+    }
+
+    #[test]
+    fn fcmp_still_dedupes_without_fp_environment_access() {
+        let mut m = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let mut f = Function::new("f".into(), vec![], IrType::Bool);
+        let value = push(
+            &mut f,
+            InstKind::ConstFloat(1.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let zero = push(
+            &mut f,
+            InstKind::ConstFloat(0.0, FloatWidth::F64),
+            IrType::Float(FloatWidth::F64),
+        );
+        let first = push(&mut f, InstKind::FCmp(CmpOp::Gt, value, zero), IrType::Bool);
+        let second = push(&mut f, InstKind::FCmp(CmpOp::Gt, value, zero), IrType::Bool);
+        let entry = f.entry;
+        f.block_mut(entry).terminator = Some(Terminator::Return(Some(second)));
+        m.add_function(f);
+
+        assert!(LocalCse.run(&mut m));
+        assert!(matches!(
+            m.functions[0].blocks[0].terminator,
+            Some(Terminator::Return(Some(value))) if value == first
+        ));
+        assert!(
+            m.functions[0].blocks[0]
+                .insts
+                .iter()
+                .all(|inst| inst.id != second),
+            "ordinary comparison CSE must remain enabled without an FP-environment barrier"
         );
     }
 

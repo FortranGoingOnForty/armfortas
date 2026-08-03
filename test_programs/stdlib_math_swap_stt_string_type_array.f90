@@ -36,7 +36,6 @@ contains
   elemental logical function gt_string_char(lhs, rhs) result(is_gt)
     type(string_type), intent(in) :: lhs
     character(len=*), intent(in) :: rhs
-    logical :: is_gt
 
     if (allocated(lhs%raw)) then
       is_gt = lhs%raw > rhs
@@ -48,7 +47,6 @@ contains
   elemental logical function gt_char_string(lhs, rhs) result(is_gt)
     character(len=*), intent(in) :: lhs
     type(string_type), intent(in) :: rhs
-    logical :: is_gt
 
     if (allocated(rhs%raw)) then
       is_gt = lhs > rhs%raw
@@ -60,7 +58,6 @@ contains
   elemental logical function eq_string_char(lhs, rhs) result(is_eq)
     type(string_type), intent(in) :: lhs
     character(len=*), intent(in) :: rhs
-    logical :: is_eq
 
     is_eq = .not.(lhs > rhs)
     if (is_eq) then

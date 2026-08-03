@@ -148,8 +148,35 @@ main:
 mod tests {
     use super::{emit_module, x86_use_linear_scan};
     use crate::driver::{OptLevel, Options};
-    use crate::ir::inst::Module;
+    use crate::ir::builder::FuncBuilder;
+    use crate::ir::inst::{Function, Module};
+    use crate::ir::types::IrType;
+    use crate::ir::verify::verify_module;
     use crate::target::{TargetLayout, TargetSpec};
+
+    fn wide_switch_module(target: &TargetSpec) -> Module {
+        let layout = TargetLayout::of(target);
+        let mut module = Module::new("wide_switch".into(), layout);
+        let mut func = Function::new("wide_switch".into(), vec![], IrType::Void);
+        {
+            let mut builder = FuncBuilder::new(&mut func, layout);
+            let selector = builder.const_i64(0);
+            let case = builder.create_block("case");
+            let default = builder.create_block("default");
+            builder.switch(selector, vec![(i64::MAX, case)], default);
+            builder.set_block(case);
+            builder.ret_void();
+            builder.set_block(default);
+            builder.ret_void();
+        }
+        module.add_function(func);
+        let errors = verify_module(&module);
+        assert!(
+            errors.is_empty(),
+            "wide i64 switch test module must verify: {errors:?}"
+        );
+        module
+    }
 
     /// The x86 backend must use linear-scan at EVERY opt level (the naive
     /// spill-everything allocator overflows the stack on deep recursion).
@@ -186,5 +213,51 @@ mod tests {
         };
         let asm = emit_module(&module, &opts).unwrap();
         assert!(asm.ends_with(".section .note.GNU-stack,\"\",@progbits\n"));
+    }
+
+    #[test]
+    fn x86_wide_switch_reaches_assembly_as_a_register_compare() {
+        let target = TargetSpec::parse("x86_64-linux-gnu").unwrap();
+        let module = wide_switch_module(&target);
+        let opts = Options {
+            target,
+            ..Options::default()
+        };
+        let asm = emit_module(&module, &opts).unwrap();
+        let compare = asm
+            .lines()
+            .find(|line| line.trim_start().starts_with("cmpq "))
+            .expect("wide i64 switch compare in x86 assembly");
+        assert!(
+            !compare.contains('$'),
+            "wide i64 switch case must not reach cmpq as an immediate:\n{asm}"
+        );
+        assert!(
+            asm.contains("$9223372036854775807"),
+            "wide i64 switch case must be materialized exactly:\n{asm}"
+        );
+        afs_as::x86::assemble::assemble_x86(&asm, afs_as::elf::ELFOSABI_NONE)
+            .expect("afs-as must encode the emitted x86 wide-switch assembly");
+    }
+
+    #[test]
+    fn arm64_wide_switch_reaches_assembly_as_a_register_compare() {
+        let target = TargetSpec::parse("arm64-macos").unwrap();
+        let module = wide_switch_module(&target);
+        let opts = Options {
+            target,
+            ..Options::default()
+        };
+        let asm = emit_module(&module, &opts).unwrap();
+        let compare = asm
+            .lines()
+            .find(|line| line.trim_start().starts_with("cmp "))
+            .expect("wide i64 switch compare in ARM64 assembly");
+        assert!(
+            !compare.contains('#'),
+            "wide i64 switch case must not reach ARM64 cmp as an immediate:\n{asm}"
+        );
+        afs_as::assemble::assemble_source(&asm)
+            .expect("afs-as must encode the emitted ARM64 wide-switch assembly");
     }
 }
