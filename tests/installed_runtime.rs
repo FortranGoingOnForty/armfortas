@@ -300,11 +300,8 @@ fn installed_compiler_ignores_unrelated_cargo_runtime_trees() {
             for archive in &unrelated_archives {
                 fs::create_dir_all(archive.parent().unwrap())
                     .expect("create unrelated target directory");
-                let ar = Command::new("ar")
-                    .args(["rcs", archive.to_str().unwrap()])
-                    .output()
-                    .expect("create unrelated empty archive");
-                assert_success(&ar, "create unrelated empty archive");
+                // An empty System V/BSD ar archive is just this global header.
+                fs::write(archive, b"!<arch>\n").expect("create unrelated empty archive");
             }
         }
         let unrelated_archive_snapshots: Vec<Vec<u8>> = unrelated_archives
