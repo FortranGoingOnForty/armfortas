@@ -7689,7 +7689,10 @@ mod tests {
         assert!(msg.contains(&path), "expected filename in iomsg: {msg:?}");
     }
 
-    #[cfg(unix)]
+    // Darwin rejects arbitrary invalid UTF-8 path bytes before the runtime can
+    // exercise its byte-preservation contract. Other Unix filesystems accept
+    // this witness and still verify that OPEN does not transcode the name.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn open_preserves_non_utf8_filename_bytes() {
         use std::os::unix::ffi::OsStringExt;
