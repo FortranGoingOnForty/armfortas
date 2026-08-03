@@ -1188,6 +1188,7 @@ multifile module_parameter_constants 1
 multifile module_private_default 1
 multifile module_with_allocatable_array 1
 multifile module_with_derived_type 1
+multifile move_alloc_type_identity_survives_amod_round_trip 1
 multifile multi_source_submodule_wrong_order_builds_and_runs 1
 multifile parent_vtable_references_submodule_tbp_target 1
 multifile private_component_access_round_trips_through_amod 1

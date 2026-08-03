@@ -280,12 +280,21 @@ fn move_alloc_type_identity_survives_amod_round_trip() {
     )
     .unwrap();
     compile_file(&compiler, &valid_source, &valid_object, Some(&dir));
-    link_files(&[&provider_object, &valid_object], &valid_binary);
-    let output = run_binary(&valid_binary);
-    assert!(
-        output_contains_expected(&output, "42"),
-        "renamed aliases of one exported type must remain MOVE_ALLOC-compatible: {output}"
-    );
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        armfortas::testing::report_harness_skip(
+            "multifile",
+            "move_alloc_type_identity_survives_amod_round_trip",
+            1,
+            &reason,
+        );
+    } else {
+        link_files(&[&provider_object, &valid_object], &valid_binary);
+        let output = run_binary(&valid_binary);
+        assert!(
+            output_contains_expected(&output, "42"),
+            "renamed aliases of one exported type must remain MOVE_ALLOC-compatible: {output}"
+        );
+    }
 
     std::fs::write(
         &invalid_source,
