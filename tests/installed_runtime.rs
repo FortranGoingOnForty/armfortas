@@ -41,8 +41,22 @@ fn assert_success(output: &Output, context: &str) {
     );
 }
 
+fn native_e2e_or_report_skip(test: &str) -> bool {
+    match armfortas::testing::native_e2e_support() {
+        Ok(()) => true,
+        Err(reason) => {
+            armfortas::testing::report_harness_skip("installed_runtime", test, 1, &reason);
+            false
+        }
+    }
+}
+
 #[test]
 fn isolated_compiler_binaries_carry_their_runtime_archive() {
+    if !native_e2e_or_report_skip("isolated_compiler_binaries_carry_their_runtime_archive") {
+        return;
+    }
+
     let root = TestDir::new("clean-prefix");
     let prefix_bin = root.as_ref().join("install/bin");
     let outside = root.as_ref().join("outside");
@@ -138,11 +152,7 @@ fn isolated_compiler_binaries_carry_their_runtime_archive() {
 fn successful_runtime_rebuild_diagnostics_reach_compiler_stderr() {
     use std::os::unix::fs::PermissionsExt;
 
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
-        eprintln!(
-            "\nHARNESS_SKIP suite=installed_runtime test=successful_runtime_rebuild_diagnostics_reach_compiler_stderr count=1 reason=\"{}\"",
-            reason
-        );
+    if !native_e2e_or_report_skip("successful_runtime_rebuild_diagnostics_reach_compiler_stderr") {
         return;
     }
 
@@ -247,6 +257,10 @@ fn successful_runtime_rebuild_diagnostics_reach_compiler_stderr() {
 
 #[test]
 fn installed_compiler_ignores_unrelated_cargo_runtime_trees() {
+    if !native_e2e_or_report_skip("installed_compiler_ignores_unrelated_cargo_runtime_trees") {
+        return;
+    }
+
     let root = TestDir::new("unrelated-workspace");
     let prefix_bin = root.as_ref().join("install/bin");
     let runtime_tmp = root.as_ref().join("runtime-tmp");
