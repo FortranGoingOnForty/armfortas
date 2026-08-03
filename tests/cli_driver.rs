@@ -55,6 +55,10 @@ fn write_program_bytes_in(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Pa
     path
 }
 
+fn has_native_text_section(assembly: &str) -> bool {
+    assembly.contains(".text") || assembly.contains("__TEXT,__text")
+}
+
 fn diagnostic_output(source: &std::path::Path, extra_args: &[&str]) -> std::process::Output {
     let output = unique_path("diagnostic", "o");
     let result = Command::new(compiler("armfortas"))
@@ -16440,8 +16444,13 @@ fn multi_input_terminal_modes_preserve_requested_artifacts() {
             std::fs::read_to_string(&helper_output).expect("missing first per-source output");
         let main_text =
             std::fs::read_to_string(&main_output).expect("missing second per-source output");
+        let has_expected_artifact = if flag == "-S" {
+            has_native_text_section(&helper_text)
+        } else {
+            helper_text.contains(helper_marker)
+        };
         assert!(
-            helper_text.contains(helper_marker),
+            has_expected_artifact,
             "{flag} first output has the wrong artifact type:\n{helper_text}"
         );
         assert!(
@@ -16641,7 +16650,7 @@ fn multi_input_terminal_mode_failure_removes_only_the_failed_stale_output() {
     let good_asm =
         std::fs::read_to_string(dir.join("good.s")).expect("successful first output is missing");
     assert!(
-        good_asm.contains(".text"),
+        has_native_text_section(&good_asm),
         "successful first input should retain its requested assembly output"
     );
     assert!(
@@ -17128,7 +17137,7 @@ fn dash_capital_s_produces_assembly_text() {
     );
     let asm = std::fs::read_to_string(&out).expect("missing asm output");
     assert!(
-        asm.contains("__TEXT") || asm.contains(".text"),
+        has_native_text_section(&asm),
         ".s output should contain a text-section directive"
     );
     let _ = std::fs::remove_file(&out);
