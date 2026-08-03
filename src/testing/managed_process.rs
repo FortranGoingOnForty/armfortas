@@ -653,11 +653,26 @@ fn terminate_and_reap(
 
     // Always reap the direct child, including when signaling reported an
     // error, so callers never inherit a zombie owned by the harness itself.
-    let status = child.wait();
+    let status = child.wait()?;
     if let Some(error) = lifecycle_error {
+        // Darwin can report EPERM when the only remaining group member is the
+        // unreaped leader. Reaping releases that zombie; suppress the signal
+        // error only when a non-signaling probe then proves the group is gone.
+        // A live or inaccessible group remains a hard cleanup failure.
+        #[cfg(unix)]
+        match process_group_is_absent(process_group) {
+            Ok(true) => {}
+            Ok(false) => return Err(error),
+            Err(probe_error) => {
+                return Err(io::Error::other(format!(
+                    "process-tree cleanup failed: {error}; cannot verify process-group exit: {probe_error}"
+                )));
+            }
+        }
+        #[cfg(not(unix))]
         return Err(error);
     }
-    status
+    Ok(status)
 }
 
 fn kill_lingering_group(process_group: u32) -> io::Result<()> {
@@ -700,6 +715,26 @@ fn signal_process_group(process_group: u32, signal: i32) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn process_group_is_absent(process_group: u32) -> io::Result<bool> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    let process_group = i32::try_from(process_group)
+        .map_err(|_| io::Error::other("managed process-group id exceeds i32"))?;
+    let result = unsafe { kill(-process_group, 0) };
+    if result == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +745,19 @@ mod tests {
             kill_grace: Duration::from_millis(50),
             capture_limit,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_probe_distinguishes_live_and_missing_groups() {
+        unsafe extern "C" {
+            fn getpgrp() -> i32;
+        }
+
+        let current_group = unsafe { getpgrp() };
+        assert!(current_group > 0);
+        assert!(!process_group_is_absent(current_group as u32).unwrap());
+        assert!(process_group_is_absent(i32::MAX as u32).unwrap());
     }
 
     #[cfg(unix)]
