@@ -635,23 +635,12 @@ fn terminate_and_reap(
         let _ = child.kill();
     }
 
-    let deadline = Instant::now() + grace;
-    let mut status = None;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(exited)) => {
-                status = Some(exited);
-                break;
-            }
-            Ok(None) => thread::sleep(POLL_INTERVAL),
-            Err(error) => {
-                if lifecycle_error.is_none() {
-                    lifecycle_error = Some(error);
-                }
-                break;
-            }
-        }
-    }
+    // Do not reap the process-group leader before the final group signal.
+    // Once that PID is released, a busy host can reuse it for an unrelated
+    // process group, turning the escalation into either EPERM or, worse, a
+    // signal aimed at the wrong command tree. Retaining the exited child as a
+    // zombie for this bounded grace period keeps its PID reserved.
+    thread::sleep(grace);
 
     #[cfg(unix)]
     if let Err(error) = signal_process_group(process_group, SIGKILL) {
@@ -659,14 +648,16 @@ fn terminate_and_reap(
             lifecycle_error = Some(error);
         }
     }
-    if status.is_none() {
-        let _ = child.kill();
-        status = Some(child.wait()?);
-    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+
+    // Always reap the direct child, including when signaling reported an
+    // error, so callers never inherit a zombie owned by the harness itself.
+    let status = child.wait();
     if let Some(error) = lifecycle_error {
         return Err(error);
     }
-    status.ok_or_else(|| io::Error::other("managed command exited without a wait status"))
+    status
 }
 
 fn kill_lingering_group(process_group: u32) -> io::Result<()> {
@@ -758,7 +749,7 @@ mod tests {
             .parse::<i32>()
             .unwrap();
         assert!(
-            !process_exists(descendant),
+            !process_is_running(descendant),
             "descendant {descendant} survived process-group timeout cleanup"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -838,7 +829,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn process_exists(pid: i32) -> bool {
+    fn process_is_running(pid: i32) -> bool {
+        // Minimal containers do not always reap orphaned grandchildren
+        // promptly. A zombie cannot execute or retain the capture pipes, so
+        // it satisfies the command-tree termination contract even though
+        // kill(pid, 0) continues to report the PID until init reaps it.
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some((_, fields)) = stat.rsplit_once(") ") {
+                if fields.starts_with('Z') {
+                    return false;
+                }
+            }
+        }
+
         unsafe extern "C" {
             fn kill(pid: i32, signal: i32) -> i32;
         }
