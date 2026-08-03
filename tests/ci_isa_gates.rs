@@ -1,5 +1,6 @@
-#[cfg(unix)]
-mod unix {
+// These policy scripts invoke GNU `as --64` and inspect x86_64 ELF output.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod x86_64_linux {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
