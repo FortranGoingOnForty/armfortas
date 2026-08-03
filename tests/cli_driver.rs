@@ -16409,7 +16409,7 @@ fn multi_input_terminal_modes_preserve_requested_artifacts() {
     ];
 
     for (flag, suffix, helper_marker) in file_modes {
-        let dir = unique_dir(&format!("multi_terminal_{}", &suffix));
+        let dir = unique_dir(&format!("multi_terminal_{}", suffix));
         write_program_in(
             &dir,
             "helper.F90",
