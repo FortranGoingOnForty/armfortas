@@ -1569,11 +1569,10 @@ mod inspector_tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn sandbox_snapshot_rejects_non_utf8_paths_and_symlinks() {
+    fn sandbox_snapshot_rejects_non_utf8_paths() {
         use std::os::unix::ffi::OsStringExt;
-        use std::os::unix::fs::symlink;
 
         let invalid_root = next_temp_root("afs_snapshot_invalid_path");
         fs::create_dir_all(&invalid_root).unwrap();
@@ -1582,6 +1581,12 @@ mod inspector_tests {
         let invalid_error = snapshot_sandbox_files(&invalid_root).unwrap_err();
         assert!(invalid_error.contains("not valid UTF-8"), "{invalid_error}");
         let _ = fs::remove_dir_all(invalid_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_snapshot_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
 
         let symlink_root = next_temp_root("afs_snapshot_symlink");
         fs::create_dir_all(&symlink_root).unwrap();
