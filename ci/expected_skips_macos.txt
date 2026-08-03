@@ -1,7 +1,7 @@
 # Exact skips expected from the complete armfortas integration suite on
 # macOS arm64. Format: <suite> <test> <positive-count>.
 # Any added, removed, duplicated, or count-changed record requires review.
-# Baseline: GitHub Actions run 29799241535 at 9d901856abceefc3b46f06301b0b06fbabfad5f5.
+# Baseline: GitHub Actions run 30779651399 at 9fb5b36eb4eae4da1883b55ce6331225199c664d.
 abi_differential all_c_self_check 14
 abi_differential armfortas_callee_legs_pending_x05_x06 14
 abi_differential armfortas_caller_legs_pending_x05_x06 14
