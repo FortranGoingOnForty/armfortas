@@ -1487,6 +1487,21 @@ impl FormatEngine {
         {
             return self.format_e_style_default(v, decimals, exp_width, exp_char);
         }
+        if matches!(
+            self.round_mode,
+            RoundMode::Compatible | RoundMode::ProcessorDefined
+        ) && self.scale_factor == 1
+        {
+            // 1P,E is ordinary scientific notation. Format the original
+            // binary value directly so an intermediate decimal rescaling
+            // cannot introduce a second rounding before digit selection.
+            let raw = if v.is_sign_positive() && matches!(self.sign_mode, SignMode::Plus) {
+                format!("{:+.*E}", decimals, v)
+            } else {
+                format!("{:.*E}", decimals, v)
+            };
+            return pad_exponent_width(&raw, exp_width, exp_char);
+        }
 
         let fractional_digits = self.e_fractional_digits(decimals);
         if v == 0.0 {
@@ -2977,6 +2992,18 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(value)]);
         assert_eq!(out.trim().parse::<f64>().unwrap(), value);
+    }
+
+    #[test]
+    fn format_one_scale_e_dp_precision_roundtrips() {
+        // PRIMA's REAL2STR_SCALAR uses 1PE24.16E3 for binary64. Scaling the
+        // mantissa with floating-point division before decimal formatting
+        // moved this value across its round-trip boundary by one ULP.
+        let value = f64::from_bits(0x3ea2_66ae_e8fb_049a);
+        let descs = valid_format("(1PE24.16E3)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(value)]);
+        assert_eq!(out.trim().parse::<f64>().unwrap(), value, "{out}");
     }
 
     #[test]
