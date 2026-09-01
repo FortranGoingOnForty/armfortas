@@ -3864,7 +3864,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 12\n", "#!amod 11\n", 1);
+        .replacen("#!amod 13\n", "#!amod 12\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3891,7 +3891,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 11 (compiler requires 12)")
+        stderr.contains("incompatible .amod version 12 (compiler requires 13)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -37640,6 +37640,73 @@ fn empty_facade_module_reexports_public_use_associated_params_through_amod() {
 }
 
 #[test]
+fn private_default_stops_transitive_reexports_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=private_default_stops_transitive_reexports_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("private_default_amod");
+    let provider_src = write_program_in(
+        &dir,
+        "access_provider.f90",
+        "module access_provider\n  implicit none\n  integer, parameter :: alpha = 7, exposed = 9\nend module\n",
+    );
+    let facade_src = write_program_in(
+        &dir,
+        "private_facade.f90",
+        "module private_facade\n  use access_provider\n  implicit none\n  private\n  public :: exposed\nend module\n",
+    );
+    let consumer_src = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use private_facade\n  implicit none\n  integer :: alpha\n  alpha = exposed\n  if (alpha /= 9) error stop 1\nend program\n",
+    );
+
+    for (src, obj) in [
+        (&provider_src, dir.join("access_provider.o")),
+        (&facade_src, dir.join("private_facade.o")),
+        (&consumer_src, dir.join("consumer.o")),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                src.to_str().unwrap(),
+                "-o",
+                obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("private-default .amod compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "private-default .amod compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let facade_amod =
+        fs::read_to_string(dir.join("private_facade.amod")).expect("missing private facade .amod");
+    assert!(
+        facade_amod.contains("# default-access: private\n"),
+        "private module default was not serialized:\n{facade_amod}"
+    );
+    assert!(
+        facade_amod.contains("@access public :: exposed\n"),
+        "named public re-export was not serialized:\n{facade_amod}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn amod_only_edges_preserve_filtered_reexports() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -37720,7 +37787,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 12\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 13\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

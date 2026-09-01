@@ -21,10 +21,11 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 12;
+const AMOD_VERSION: u32 = 13;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
+const AMOD_DEFAULT_ACCESS_VERSION: u32 = 13;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -320,6 +321,16 @@ pub fn write_amod(
     // ---- Header ----
     writeln!(out, "#!amod {}", AMOD_VERSION).unwrap();
     writeln!(out, "# module: {}", mod_key).unwrap();
+    writeln!(
+        out,
+        "# default-access: {}",
+        if matches!(scope.default_access, Access::Private) {
+            "private"
+        } else {
+            "public"
+        }
+    )
+    .unwrap();
     if matches!(scope.kind, ScopeKind::Submodule(_)) {
         if let Some(ancestor) = &scope.submodule_ancestor {
             writeln!(out, "# ancestor-module: {}", ancestor.to_lowercase()).unwrap();
@@ -387,6 +398,24 @@ pub fn write_amod(
         .unwrap();
     }
     if !deps.is_empty() {
+        writeln!(out).unwrap();
+    }
+
+    // Named accessibility statements also govern USE-associated names, which
+    // have no local Symbol record on which to carry an access attribute. Keep
+    // these overrides explicit so a private-default facade can deliberately
+    // re-export selected imports (and a public-default facade can hide them).
+    let mut named_access: Vec<_> = scope.pending_access.iter().collect();
+    named_access.sort_by_key(|(name, _)| name.as_str());
+    for (name, access) in named_access {
+        let access = match access {
+            Access::Public => "public",
+            Access::Private => "private",
+            Access::Default => continue,
+        };
+        writeln!(out, "@access {access} :: {name}").unwrap();
+    }
+    if !scope.pending_access.is_empty() {
         writeln!(out).unwrap();
     }
 
@@ -1661,6 +1690,8 @@ pub enum AmodHostAssociation {
 #[derive(Debug, Clone)]
 pub struct ModuleInterface {
     pub module_name: String,
+    pub default_access: Access,
+    pub named_access: Vec<(String, Access)>,
     pub submodule_ancestor: Option<String>,
     pub submodule_parent: Option<String>,
     pub host_association: AmodHostAssociation,
@@ -1918,6 +1949,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let mut module_name = String::new();
+    let mut default_access = None;
     let mut submodule_ancestor = None;
     let mut submodule_parent = None;
     let mut host_association = AmodHostAssociation::All;
@@ -1929,6 +1961,18 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             if let Some((key, val)) = rest.split_once(": ") {
                 match key {
                     "module" => module_name = val.trim().to_string(),
+                    "default-access" => {
+                        default_access = Some(match val.trim() {
+                            "public" => Access::Public,
+                            "private" => Access::Private,
+                            _ => {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (malformed default-access header); rebuild the provider module",
+                                    path.display()
+                                ));
+                            }
+                        });
+                    }
                     "ancestor-module" => submodule_ancestor = Some(val.trim().to_string()),
                     "parent-submodule" => submodule_parent = Some(val.trim().to_string()),
                     "host-association" => {
@@ -1949,8 +1993,19 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     if module_name.is_empty() {
         return Err(format!("{}: missing # module: header", path.display()));
     }
+    let default_access = match default_access {
+        Some(access) => access,
+        None if version >= AMOD_DEFAULT_ACCESS_VERSION => {
+            return Err(format!(
+                "{}: corrupt .amod file (missing default-access header); rebuild the provider module",
+                path.display()
+            ));
+        }
+        None => Access::Public,
+    };
 
     let mut dependencies = Vec::new();
+    let mut named_access = Vec::new();
     let mut only_imports: Vec<UseRename> = Vec::new();
     let mut renames: Vec<UseRename> = Vec::new();
     let mut variables = Vec::new();
@@ -1967,6 +2022,31 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
             dependencies.push(parse_module_reference(dep.trim(), "@uses", path)?);
+        } else if let Some(rest) = trimmed.strip_prefix("@access ") {
+            let Some((access, name)) = rest.split_once(" :: ") else {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @access record); rebuild the provider module",
+                    path.display()
+                ));
+            };
+            let access = match access.trim() {
+                "public" => Access::Public,
+                "private" => Access::Private,
+                _ => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (malformed @access accessibility); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+            };
+            let name = name.trim();
+            if name.is_empty() || name.split_whitespace().count() != 1 {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @access name); rebuild the provider module",
+                    path.display()
+                ));
+            }
+            named_access.push((name.to_ascii_lowercase(), access));
         } else if trimmed == "@use_only" {
             only_imports.push(parse_use_binding("", "@use_only", path)?);
         } else if let Some(rest) = trimmed.strip_prefix("@use_only ") {
@@ -2057,6 +2137,8 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
     Ok(ModuleInterface {
         module_name,
+        default_access,
+        named_access,
         submodule_ancestor,
         submodule_parent,
         host_association,
@@ -3335,6 +3417,49 @@ mod tests {
     }
 
     #[test]
+    fn current_default_access_header_is_required_and_preserved() {
+        let private = r#"#!amod 13
+# module: private_facade
+# default-access: private
+
+@uses provider
+@access private :: hidden
+@access public :: selected
+"#;
+        let iface = parse_amod(private, Path::new("private_facade.amod")).unwrap();
+        assert_eq!(iface.default_access, Access::Private);
+        assert_eq!(
+            iface.named_access,
+            vec![
+                ("hidden".into(), Access::Private),
+                ("selected".into(), Access::Public)
+            ]
+        );
+
+        let missing = r#"#!amod 13
+# module: missing_default_access
+
+@uses provider
+"#;
+        let error = parse_amod(missing, Path::new("missing_default_access.amod"))
+            .expect_err("current .amod without module default access was accepted");
+        assert!(
+            error.contains("corrupt .amod file")
+                && error.contains("missing default-access header")
+                && error.contains("rebuild the provider module"),
+            "unexpected missing-default-access diagnostic: {error}"
+        );
+
+        let legacy = r#"#!amod 12
+# module: legacy_default_access
+
+@uses provider
+"#;
+        let iface = parse_amod(legacy, Path::new("legacy_default_access.amod")).unwrap();
+        assert_eq!(iface.default_access, Access::Public);
+    }
+
+    #[test]
     fn current_type_records_require_and_preserve_accessibility() {
         let amod_text = r#"#!amod 12
 # module: type_access
@@ -3751,8 +3876,9 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 13
 # module: cache_test
+# default-access: public
 # source: cache_test.f90
 
 @param k : integer = 7
@@ -3783,8 +3909,9 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 13
 # module: cached_parent
+# default-access: public
 # source: cached_parent.f90
 
 @param cached : integer = 1
@@ -3796,8 +3923,9 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 13
 # module: supplied_parent
+# default-access: private
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
 # host-association: only kept local_value
@@ -3813,6 +3941,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert_eq!(supplied.module_name, "supplied_parent");
+        assert_eq!(supplied.default_access, Access::Private);
         assert_eq!(
             supplied.host_association,
             AmodHostAssociation::Only(vec!["kept".into(), "local_value".into()])
@@ -3828,8 +3957,9 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 13
 # module: child
+# default-access: public
 # ancestor-module: root
 # parent-submodule: middle
 # source: child.f90
@@ -3927,7 +4057,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 12)")
+            err.contains("incompatible .amod version 6 (compiler requires 13)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

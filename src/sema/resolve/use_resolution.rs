@@ -602,6 +602,10 @@ fn install_external_interface(
         ScopeKind::Module(iface.module_name.clone())
     };
     let scope_id = st.push_scope(scope_kind);
+    let _ = st.set_default_access(iface.default_access);
+    for (name, access) in &iface.named_access {
+        let _ = st.set_symbol_access(name, *access);
+    }
     if let Some((ancestor, parent_scope)) = &semantic_parent {
         st.set_submodule_ancestor(scope_id, ancestor);
         let policy = match &iface.host_association {
