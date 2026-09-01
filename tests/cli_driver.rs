@@ -28734,6 +28734,49 @@ fn contained_proc_call_resolves_to_caller_host_not_lexical_last() {
 }
 
 #[test]
+fn contained_proc_call_uses_caller_relative_argument_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_proc_call_uses_caller_relative_argument_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // fpm_filesystem::canon_path contains a four-argument helper named NEXT,
+    // while later modules declare unrelated two-argument NEXT procedures.
+    // The call target was host-relative, but the argument-order and character
+    // length ABI lookups still used the lexically-last bare-name scope.  That
+    // dropped IEND and passed the hidden string length as IS_PATH's address.
+    let src = write_program(
+        "module path_owner\n  implicit none\ncontains\n  subroutine inspect_path(path, got_start, got_end, got_path)\n    character(len=*), intent(in) :: path\n    integer, intent(out) :: got_start, got_end\n    logical, intent(out) :: got_path\n    call next(path, got_start, got_end, got_path)\n  contains\n    subroutine next(string, istart, iend, is_path)\n      character(len=*), intent(in) :: string\n      integer, intent(out) :: istart, iend\n      logical, intent(out) :: is_path\n      istart = 1\n      iend = len(string)\n      is_path = iend > 0\n    end subroutine next\n  end subroutine inspect_path\nend module path_owner\n\nmodule later_owner\n  implicit none\ncontains\n  subroutine next(lexer, token)\n    integer, intent(in) :: lexer\n    integer, intent(out) :: token\n    token = lexer\n  end subroutine next\nend module later_owner\n\nprogram p\n  use path_owner, only: inspect_path\n  implicit none\n  integer :: first, last\n  logical :: is_path\n  call inspect_path('build', first, last, is_path)\n  if (first /= 1) error stop 1\n  if (last /= 5) error stop 2\n  if (.not. is_path) error stop 3\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("contained_proc_caller_relative_abi", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained-procedure ABI compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained-procedure ABI compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained-procedure ABI run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained-procedure ABI run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -25004,6 +25004,21 @@ pub(super) fn callee_scope_id_for_lookup(
         return Some(scope_id);
     }
 
+    // Bare names of contained procedures are only unique within their host.
+    // Resolve them from the procedure currently being lowered before trying
+    // module/global same-name fallbacks.  The call target itself already uses
+    // this host-association walk in `same_unit_func_ref`; ABI queries must use
+    // the same scope or argument order and masks can come from an unrelated
+    // contained procedure.  fpm has several internal subroutines named `next`:
+    // canon_path's four-argument helper was called using a two-argument
+    // lexically unrelated `next` signature, shifting its hidden character
+    // length into the IS_PATH address slot.
+    if let Some(scope_id) =
+        find_procedure_scope_id_for_caller_strict(st, callee_name, current_proc_scope())
+    {
+        return Some(scope_id);
+    }
+
     // When a bare procedure name matches several definitions (e.g. fpm has
     // ten `next` subroutines across modules), the plain name scan below
     // returns whichever was defined last — the wrong ABI/descriptor mask
