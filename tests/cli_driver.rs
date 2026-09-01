@@ -28777,6 +28777,48 @@ fn contained_proc_call_uses_caller_relative_argument_abi() {
 }
 
 #[test]
+fn nested_component_type_bound_call_resolves_scope_qualified_base_layout() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nested_component_type_bound_call_resolves_scope_qualified_base_layout count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // toml-f's lexer calls `lexer%context%push_back(token)`.  Its imported
+    // TOML_LEXER layout needs a scope-qualified registry key; resolving the
+    // nested method base by the bare type name silently omitted the CALL.
+    // Keep a same-named decoy type here so the bare lookup is ambiguous.
+    let src = write_program(
+        "module context_owner\n  implicit none\n  type :: context_t\n    integer :: top = 0\n  contains\n    procedure :: push_back\n  end type\ncontains\n  subroutine push_back(self, value)\n    class(context_t), intent(inout) :: self\n    integer, intent(in) :: value\n    self%top = self%top + value\n  end subroutine\nend module\n\nmodule decoy_owner\n  implicit none\n  type :: lexer_t\n    integer :: unrelated = -1\n  end type\nend module\n\nmodule lexer_owner\n  use context_owner, only: context_t\n  implicit none\n  type, abstract :: base_t\n  end type\n  type, extends(base_t) :: lexer_t\n    type(context_t) :: context\n  contains\n    procedure :: fill_buffer\n  end type\ncontains\n  subroutine fill_buffer(self)\n    class(lexer_t), intent(inout) :: self\n    integer :: token\n    token = 7\n    call self%context%push_back(token)\n  end subroutine\nend module\n\nprogram p\n  use lexer_owner, only: lexer_t\n  implicit none\n  type(lexer_t) :: lexer\n  call lexer%fill_buffer()\n  if (lexer%context%top /= 7) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nested_component_bound_qualified_layout", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested component type-bound compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested component type-bound compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("nested component type-bound run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "nested component type-bound run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn use_rename_survives_amod_round_trip_for_submodule_kind_lookup() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

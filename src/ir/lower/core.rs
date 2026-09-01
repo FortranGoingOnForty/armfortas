@@ -61992,7 +61992,12 @@ pub(super) fn resolve_component_base_for_method(
         Expr::Name { name } => {
             let key = name.to_lowercase();
             let info = locals.get(&key)?;
-            let type_name = info.derived_type.as_ref()?.clone();
+            let raw_type_name = info.derived_type.as_ref()?.clone();
+            let proc_scope_id =
+                callee_scope_id_for_lookup(st, b.func().name.as_str()).or_else(current_proc_scope);
+            let type_name =
+                canonical_layout_type_name_for_scope(st, proc_scope_id, &raw_type_name, tl)
+                    .unwrap_or(raw_type_name);
             let addr =
                 if info.is_pointer && local_uses_array_descriptor(info) && info.dims.is_empty() {
                     array_base_addr(b, info)
