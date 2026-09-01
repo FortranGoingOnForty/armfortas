@@ -1873,6 +1873,29 @@ fn validate_const_int_ac_value(ctx: &mut Ctx<'_>, value: &crate::ast::expr::AcVa
     }
 }
 
+fn validate_io_item_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    // The parser represents an I/O implied-do with the array-constructor
+    // expression shape so the lowering machinery can reuse AcValue and
+    // ImpliedDoLoop. Unlike a real array constructor, however, its output
+    // items need not have one common declared type. Walk the contained
+    // expressions without applying array-constructor homogeneity to this
+    // synthetic outer wrapper. Real array constructors nested in an item
+    // still flow through validate_const_int_expr_tree below.
+    if let Expr::ArrayConstructor {
+        type_spec: None,
+        values,
+    } = &expr.node
+    {
+        if matches!(values.as_slice(), [crate::ast::expr::AcValue::ImpliedDo(_)]) {
+            for value in values {
+                validate_const_int_ac_value(ctx, value);
+            }
+            return;
+        }
+    }
+    validate_const_int_expr_tree(ctx, expr);
+}
+
 fn validate_const_int_array_spec(ctx: &mut Ctx<'_>, spec: &crate::ast::decl::ArraySpec) {
     match spec {
         crate::ast::decl::ArraySpec::Explicit { lower, upper } => {
@@ -2258,7 +2281,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 validate_const_int_expr_tree(ctx, &control.value);
             }
             for item in items {
-                validate_const_int_expr_tree(ctx, item);
+                validate_io_item_expr_tree(ctx, item);
             }
         }
         Stmt::Open { specs }
@@ -2299,7 +2322,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         }
         Stmt::Print { items, .. } => {
             for item in items {
-                validate_const_int_expr_tree(ctx, item);
+                validate_io_item_expr_tree(ctx, item);
             }
         }
         Stmt::Block { .. }
@@ -14059,6 +14082,40 @@ end program
                 |err| err.contains("array constructor element type mismatch")
                     && err.contains("expected INTEGER(4), got LOGICAL(4)")
             ),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_mixed_type_io_implied_do_items() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: i
+  character(8) :: names(2) = ['first   ', 'second  ']
+  logical :: present(2) = [.true., .false.]
+  write(*, '(i0,1x,a,1x,l1)') (i, names(i), present(i), i=1,2)
+  print *, (i, '[', names(i), ']', i=1,2)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_mixed_array_constructor_used_as_io_item() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  write(*, *) [1, .true.]
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("array constructor element type mismatch")),
             "{errs:?}"
         );
     }
