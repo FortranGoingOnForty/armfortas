@@ -11423,9 +11423,10 @@ fn character_intrinsic_integer_result_type(
     kind_expr: Option<&crate::ast::expr::SpannedExpr>,
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<IrType> {
     let kind = match kind_expr {
-        Some(expr) => intrinsic_kind_arg_width(expr, Some(locals), st)?,
+        Some(expr) => intrinsic_kind_arg_width(expr, Some(locals), st, type_layouts)?,
         None => crate::driver::defaults::default_int_kind(),
     };
     int_width_from_kind_value(i64::from(kind)).map(IrType::Int)
@@ -11496,7 +11497,8 @@ pub(super) fn lower_char_intrinsic(
         .map(|(ptr, _)| ptr),
         "len" => {
             let arg = arg_spanned(0)?;
-            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
+            let result_type =
+                character_intrinsic_integer_result_type(arg_spanned(1), locals, st, type_layouts)?;
             let (ptr_to_release, len) =
                 if actual_expr_rank(arg, locals, st, type_layouts).is_some_and(|rank| rank > 0) {
                     if let Some(len) = actual_char_arg_runtime_len(
@@ -11527,7 +11529,8 @@ pub(super) fn lower_char_intrinsic(
         }
         "len_trim" => {
             let arg = arg_spanned(0)?;
-            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
+            let result_type =
+                character_intrinsic_integer_result_type(arg_spanned(1), locals, st, type_layouts)?;
             let (ptr, len_val) = lower_string_arg(b, arg);
             let raw = b.call(
                 FuncRef::External("afs_len_trim".into()),
@@ -11539,7 +11542,8 @@ pub(super) fn lower_char_intrinsic(
         }
         "ichar" | "iachar" => {
             let arg = arg_spanned(0)?;
-            let result_type = character_intrinsic_integer_result_type(arg_spanned(1), locals, st)?;
+            let result_type =
+                character_intrinsic_integer_result_type(arg_spanned(1), locals, st, type_layouts)?;
             let (ptr, _) = lower_string_arg(b, arg);
             let raw = b.call(
                 FuncRef::External("afs_ichar_ptr".into()),
@@ -11581,7 +11585,8 @@ pub(super) fn lower_char_intrinsic(
         "index" => {
             let hay = arg_spanned(0)?;
             let needle = arg_spanned(1)?;
-            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
+            let result_type =
+                character_intrinsic_integer_result_type(arg_spanned(3), locals, st, type_layouts)?;
             let (hay_ptr, hay_len_val) = lower_string_arg(b, hay);
             let (needle_ptr, needle_len_val) = lower_string_arg(b, needle);
             let back_val = arg_spanned(2)
@@ -11599,7 +11604,8 @@ pub(super) fn lower_char_intrinsic(
         "scan" => {
             let src = arg_spanned(0)?;
             let set = arg_spanned(1)?;
-            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
+            let result_type =
+                character_intrinsic_integer_result_type(arg_spanned(3), locals, st, type_layouts)?;
             let (src_ptr, src_len_val) = lower_string_arg(b, src);
             let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
@@ -11617,7 +11623,8 @@ pub(super) fn lower_char_intrinsic(
         "verify" => {
             let src = arg_spanned(0)?;
             let set = arg_spanned(1)?;
-            let result_type = character_intrinsic_integer_result_type(arg_spanned(3), locals, st)?;
+            let result_type =
+                character_intrinsic_integer_result_type(arg_spanned(3), locals, st, type_layouts)?;
             let (src_ptr, src_len_val) = lower_string_arg(b, src);
             let (set_ptr, set_len_val) = lower_string_arg(b, set);
             let back_val = arg_spanned(2)
@@ -16596,11 +16603,50 @@ pub(super) fn intrinsic_kind_arg_width(
     expr: &crate::ast::expr::SpannedExpr,
     locals: Option<&HashMap<String, LocalInfo>>,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<u8> {
     match &expr.node {
         Expr::Name { name } => named_kind_value(name, locals, None, Some(st))
             .or_else(|| crate::sema::types::resolve_intrinsic_kind_arg(expr, st)),
+        Expr::FunctionCall { callee, args } if matches!(&callee.node, Expr::Name { name } if name.eq_ignore_ascii_case("kind")) =>
+        {
+            let inquiry_expr = args.iter().find_map(|arg| {
+                if arg
+                    .keyword
+                    .as_deref()
+                    .is_some_and(|keyword| !keyword.eq_ignore_ascii_case("x"))
+                {
+                    return None;
+                }
+                match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+                    crate::ast::expr::SectionSubscript::Range { .. } => None,
+                }
+            })?;
+            operator_expr_type_info(inquiry_expr, locals, st, type_layouts)
+                .as_ref()
+                .and_then(type_info_kind_value)
+        }
         _ => crate::sema::types::resolve_intrinsic_kind_arg(expr, st),
+    }
+}
+
+pub(super) fn type_info_kind_value(type_info: &crate::sema::symtab::TypeInfo) -> Option<u8> {
+    use crate::sema::symtab::TypeInfo;
+
+    match type_info {
+        TypeInfo::Integer { kind } | TypeInfo::Logical { kind } => {
+            Some(kind.unwrap_or_else(crate::driver::defaults::default_int_kind))
+        }
+        TypeInfo::Real { kind } | TypeInfo::Complex { kind } => {
+            Some(kind.unwrap_or_else(crate::driver::defaults::default_real_kind))
+        }
+        TypeInfo::DoublePrecision => Some(8),
+        TypeInfo::Character { kind, .. } => Some(kind.unwrap_or(1)),
+        TypeInfo::Enumeration(_) => Some(crate::driver::defaults::default_int_kind()),
+        TypeInfo::Derived(_) | TypeInfo::Class(_) | TypeInfo::ClassStar | TypeInfo::TypeStar => {
+            None
+        }
     }
 }
 
@@ -16610,6 +16656,7 @@ pub(super) fn intrinsic_kind_call_arg_width(
     keyword: &str,
     locals: Option<&HashMap<String, LocalInfo>>,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<u8> {
     let arg = args
         .iter()
@@ -16622,7 +16669,7 @@ pub(super) fn intrinsic_kind_call_arg_width(
         .or_else(|| args.get(positional_index))?;
     match &arg.value {
         crate::ast::expr::SectionSubscript::Element(expr) => {
-            intrinsic_kind_arg_width(expr, locals, st)
+            intrinsic_kind_arg_width(expr, locals, st, type_layouts)
         }
         crate::ast::expr::SectionSubscript::Range { .. } => None,
     }
@@ -17028,13 +17075,14 @@ pub(super) fn local_intrinsic_call_type_info(
         });
     if let Some(positional_index) = integer_inquiry_kind_pos {
         if let Some(kind) =
-            intrinsic_kind_call_arg_width(args, positional_index, "kind", locals, st)
+            intrinsic_kind_call_arg_width(args, positional_index, "kind", locals, st, type_layouts)
         {
             return Some(crate::sema::symtab::TypeInfo::Integer { kind: Some(kind) });
         }
     }
     if matches!(lower_name.as_str(), "real" | "float") && (args.len() > 1 || has_keyword) {
-        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st, type_layouts)
+        {
             return Some(crate::sema::symtab::TypeInfo::Real { kind: Some(kind) });
         }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
@@ -17042,19 +17090,22 @@ pub(super) fn local_intrinsic_call_type_info(
     if matches!(lower_name.as_str(), "int" | "nint" | "floor" | "ceiling")
         && (args.len() > 1 || has_keyword)
     {
-        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st, type_layouts)
+        {
             return Some(crate::sema::symtab::TypeInfo::Integer { kind: Some(kind) });
         }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
     if lower_name == "cmplx" && (args.len() > 2 || has_keyword) {
-        if let Some(kind) = intrinsic_kind_call_arg_width(args, 2, "kind", locals, st) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 2, "kind", locals, st, type_layouts)
+        {
             return Some(crate::sema::symtab::TypeInfo::Complex { kind: Some(kind) });
         }
         return fortran_type_to_type_info(&crate::sema::types::expr_type(expr, st));
     }
     if matches!(lower_name.as_str(), "char" | "achar") {
-        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st) {
+        if let Some(kind) = intrinsic_kind_call_arg_width(args, 1, "kind", locals, st, type_layouts)
+        {
             return Some(crate::sema::symtab::TypeInfo::Character {
                 len: Some(1),
                 kind: Some(kind),
@@ -55998,8 +56049,9 @@ fn size_intrinsic_result_type(
     args: &[crate::ast::expr::Argument],
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> IrType {
-    let kind = intrinsic_kind_call_arg_width(args, 2, "kind", Some(locals), st)
+    let kind = intrinsic_kind_call_arg_width(args, 2, "kind", Some(locals), st, type_layouts)
         .unwrap_or_else(crate::driver::defaults::default_int_kind);
     int_width_from_kind_value(i64::from(kind))
         .map(IrType::Int)
@@ -56064,7 +56116,8 @@ pub(super) fn lower_array_intrinsic(
             None
         }
     })?;
-    let size_result_type = (name == "size").then(|| size_intrinsic_result_type(args, locals, st));
+    let size_result_type =
+        (name == "size").then(|| size_intrinsic_result_type(args, locals, st, type_layouts));
     if name == "rank" {
         if let Some(rank) = actual_expr_rank(first_expr, locals, st, type_layouts) {
             return Some(b.const_i32(rank as i32));

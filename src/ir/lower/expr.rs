@@ -61,6 +61,36 @@ pub(crate) fn lower_expr_ctx(
     )
 }
 
+/// Lower KIND(X) from X's semantic type without evaluating X.
+///
+/// KIND is an inquiry intrinsic (F2018 §16.9.98). Value-first intrinsic
+/// lowering cannot reliably infer the declared kind of address-valued ABI
+/// forms such as by-reference dummies, descriptors, or complex buffers.
+fn lower_kind_inquiry_ast(
+    b: &mut FuncBuilder,
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<ValueId> {
+    let arg_expr = args.iter().find_map(|arg| {
+        let accepts = arg
+            .keyword
+            .as_deref()
+            .is_none_or(|keyword| keyword.eq_ignore_ascii_case("x"));
+        if !accepts {
+            return None;
+        }
+        match &arg.value {
+            crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+            crate::ast::expr::SectionSubscript::Range { .. } => None,
+        }
+    })?;
+    let type_info = generic_actual_expr_type_info(arg_expr, locals, st, type_layouts)?;
+    let kind = type_info_kind_value(&type_info)?;
+    Some(b.const_i32(i32::from(kind)))
+}
+
 pub(crate) fn lower_expr_tl(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -2376,7 +2406,13 @@ pub(crate) fn lower_expr_full(
                 }
                 let intrinsic_result = if !has_named_interface && !user_shadows_intrinsic {
                     if let Some(intrinsic_name) = resolved_intrinsic_name.as_deref() {
-                        if crate::sema::types::character_intrinsic_signature(intrinsic_name)
+                        if intrinsic_name.eq_ignore_ascii_case("kind") {
+                            // Value-first lowering sees a by-reference real(8)
+                            // dummy as a pointer and reports kind 4. Query the
+                            // semantic type directly instead; this also avoids
+                            // evaluating an inquiry argument.
+                            lower_kind_inquiry_ast(b, original_args, locals, st, type_layouts)
+                        } else if crate::sema::types::character_intrinsic_signature(intrinsic_name)
                             .is_some()
                         {
                             // These intrinsics need the original character AST
@@ -2557,33 +2593,41 @@ pub(crate) fn lower_expr_full(
                             || original_args.iter().all(|arg| arg.keyword.is_none()))
                     {
                         if let Some(intrinsic_name) = generic_intrinsic_fallback {
-                            let intrinsic_arg_slots =
-                                reorder_args_by_keyword_slots(original_args, intrinsic_name, st);
-                            let intrinsic_args: Vec<crate::ast::expr::Argument> =
-                                intrinsic_arg_slots.iter().flatten().cloned().collect();
-                            let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
-                                .iter()
-                                .map(|a| match &a.value {
-                                    crate::ast::expr::SectionSubscript::Element(e) => {
-                                        lower_expr_full(
-                                            b,
-                                            locals,
-                                            e,
-                                            st,
-                                            type_layouts,
-                                            internal_funcs,
-                                            contained_host_refs,
-                                            descriptor_params,
-                                        )
-                                    }
-                                    _ => b.const_i32(0),
-                                })
-                                .collect();
-                            if let Some(result) = super::intrinsic::lower_intrinsic(
-                                b,
-                                intrinsic_name,
-                                &intrinsic_arg_vals,
-                            ) {
+                            let result = if intrinsic_name.eq_ignore_ascii_case("kind") {
+                                lower_kind_inquiry_ast(b, original_args, locals, st, type_layouts)
+                            } else {
+                                let intrinsic_arg_slots = reorder_args_by_keyword_slots(
+                                    original_args,
+                                    intrinsic_name,
+                                    st,
+                                );
+                                let intrinsic_args: Vec<crate::ast::expr::Argument> =
+                                    intrinsic_arg_slots.iter().flatten().cloned().collect();
+                                let intrinsic_arg_vals: Vec<ValueId> = intrinsic_args
+                                    .iter()
+                                    .map(|a| match &a.value {
+                                        crate::ast::expr::SectionSubscript::Element(e) => {
+                                            lower_expr_full(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                internal_funcs,
+                                                contained_host_refs,
+                                                descriptor_params,
+                                            )
+                                        }
+                                        _ => b.const_i32(0),
+                                    })
+                                    .collect();
+                                super::intrinsic::lower_intrinsic(
+                                    b,
+                                    intrinsic_name,
+                                    &intrinsic_arg_vals,
+                                )
+                            };
+                            if let Some(result) = result {
                                 return result;
                             }
                         }

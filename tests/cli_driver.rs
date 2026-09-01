@@ -10492,6 +10492,90 @@ fn local_scalar_allocatable_real_kind_assignment_allocates_payload() {
 }
 
 #[test]
+fn kind_inquiry_on_byref_dummy_preserves_real_conversion_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=kind_inquiry_on_byref_dummy_preserves_real_conversion_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // KIND is determined from the declared type of its argument. A by-reference
+    // dummy must not be mistaken for a pointer-kind value when KIND is used as
+    // REAL's result-kind argument. This is stdlib_codata_type%to_real_dp's shape.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  integer, parameter :: dp = kind(1.0d0)
+contains
+  pure real(dp) function convert(value, mold) result(r)
+    real(dp), intent(in) :: value, mold
+    r = real(value, kind(mold))
+  end function
+end module
+program p
+  use m
+  implicit none
+  real(dp) :: expected, actual
+  expected = 7294.29954171d0
+  actual = convert(expected, 1.0d0)
+  if (abs(actual - expected) > 1.0d-12) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("kind_byref_real_conversion", "bin");
+    let ir = unique_path("kind_byref_real_conversion", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("kind-byref real conversion emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "kind-byref real conversion should emit IR: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = std::fs::read_to_string(&ir).expect("read kind-byref real conversion IR");
+    assert!(
+        !ir_text.contains("float_trunc"),
+        "REAL(..., KIND(real(8) dummy)) must not narrow through f32:\n{}",
+        ir_text
+    );
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("kind-byref real conversion compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "kind-byref real conversion should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "kind-byref real conversion runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn scalar_allocatable_component_actuals_pass_payloads() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
