@@ -40650,6 +40650,44 @@ fn formatted_internal_write_reallocates_allocated_deferred_char() {
 }
 
 #[test]
+fn formatted_internal_write_keeps_newline_character_data_in_one_record() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_keeps_newline_character_data_in_one_record count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // An LF supplied as character data to an A edit descriptor is part of the
+    // internal record; it is not a record boundary produced by `/` or format
+    // reversion. stdlib_logger uses this form to assemble its STAT suffix.
+    let src = write_program(
+        "program p\n  implicit none\n  character(28) :: buffer\n  character(128) :: iomsg\n  integer :: ios\n  write(buffer, '(a,i0)', iostat=ios, iomsg=iomsg) new_line('a') // 'With stat = ', 0\n  if (ios /= 0) error stop 1\n  if (iachar(buffer(1:1)) /= 10) error stop 2\n  if (buffer(2:14) /= 'With stat = 0') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("internal_write_newline_character_data", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("internal-write newline character data compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "internal-write newline character data should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "internal-write newline character data should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn labeled_format_internal_write_print_and_read_run() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

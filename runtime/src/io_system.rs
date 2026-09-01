@@ -5466,9 +5466,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     // one record, so a second scan (or an explicit '/')
                     // is an overflow — previously the excess values were
                     // silently dropped.
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
-                            if output.contains(&b'\n') {
+                    match engine.format_values_reverting_records_checked(&c.values) {
+                        Ok(records) => {
+                            if records.len() != 1 {
                                 io_status = 1;
                                 io_msg = Some(
                                     "internal WRITE of more than one record into a character scalar",
@@ -5479,7 +5479,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     );
                                     std::process::exit(2);
                                 }
-                            } else if output.len() > buf_len {
+                            } else if records[0].len() > buf_len {
                                 io_status = IOSTAT_EOR;
                                 io_msg = Some("end of record");
                             } else {
@@ -5487,7 +5487,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     buf,
                                     buf_len,
                                     0,
-                                    &output,
+                                    &records[0],
                                     std::ptr::null_mut(),
                                 );
                             }
@@ -5504,9 +5504,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         engine.set_leading_zero(mode);
                     }
                     // Same one-record rule as FmtSink::Internal.
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
-                            if output.contains(&b'\n') {
+                    match engine.format_values_reverting_records_checked(&c.values) {
+                        Ok(records) => {
+                            if records.len() != 1 {
                                 io_status = 1;
                                 io_msg = Some(
                                     "internal WRITE of more than one record into a character scalar",
@@ -5519,7 +5519,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                 }
                             } else if !store_internal_alloc_record(
                                 desc as *mut crate::descriptor::StringDescriptor,
-                                &output,
+                                &records[0],
                             ) {
                                 io_status = 1;
                                 io_msg = Some("out of memory");
@@ -5542,8 +5542,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     }
                     // Reverting: each new format scan starts a new record,
                     // i.e. the next array element.
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
+                    match engine.format_values_reverting_records_checked(&c.values) {
+                        Ok(records) => {
                             if buf.is_null() || elem_len <= 0 || nelems <= 0 {
                                 io_status = 1;
                                 io_msg = Some(
@@ -5556,8 +5556,6 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     std::process::exit(2);
                                 }
                             } else {
-                                let records: Vec<&[u8]> =
-                                    output.split(|&b| b == b'\n').collect();
                                 if records.len() as i64 > nelems {
                                     io_status = 1;
                                     io_msg = Some("write exceeds internal file size");
