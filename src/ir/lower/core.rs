@@ -59575,6 +59575,16 @@ fn emit_derived_value_copy_inline(
         }
 
         if field.allocatable && field.size == 392 {
+            if let crate::sema::symtab::TypeInfo::Class(base_type) = &field.type_info {
+                copy_polymorphic_allocatable_descriptor(
+                    b,
+                    dest_field,
+                    src_field,
+                    base_type,
+                    type_layouts,
+                );
+                continue;
+            }
             if matches!(
                 field.type_info,
                 crate::sema::symtab::TypeInfo::ClassStar | crate::sema::symtab::TypeInfo::TypeStar
@@ -59778,8 +59788,23 @@ pub(super) fn copy_unlimited_polymorphic_allocatable_descriptor(
     source_desc: ValueId,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
 ) {
-    let (source_desc, snapshot_desc) =
-        stabilize_dynamic_scalar_assignment_source(b, dest_desc, source_desc, "", type_layouts);
+    copy_polymorphic_allocatable_descriptor(b, dest_desc, source_desc, "", type_layouts);
+}
+
+fn copy_polymorphic_allocatable_descriptor(
+    b: &mut FuncBuilder,
+    dest_desc: ValueId,
+    source_desc: ValueId,
+    base_type: &str,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let (source_desc, snapshot_desc) = stabilize_dynamic_scalar_assignment_source(
+        b,
+        dest_desc,
+        source_desc,
+        base_type,
+        type_layouts,
+    );
     let stat_addr = b.alloca(IrType::Int(IntWidth::I32));
     let zero_i32 = b.const_i32(0);
     b.store(zero_i32, stat_addr);
@@ -59798,9 +59823,9 @@ pub(super) fn copy_unlimited_polymorphic_allocatable_descriptor(
     let zero_i64 = b.const_i64(0);
     let source_has_base = b.icmp(CmpOp::Ne, source_base_raw, zero_i64);
     let source_is_present = b.or(source_is_allocated, source_has_base);
-    let copy_bb = b.create_block("class_star_component_copy");
-    let clear_bb = b.create_block("class_star_component_clear");
-    let done_bb = b.create_block("class_star_component_copy_done");
+    let copy_bb = b.create_block("polymorphic_component_copy");
+    let clear_bb = b.create_block("polymorphic_component_clear");
+    let done_bb = b.create_block("polymorphic_component_copy_done");
     b.cond_branch(source_is_present, copy_bb, vec![], clear_bb, vec![]);
 
     b.set_block(clear_bb);
@@ -59817,7 +59842,7 @@ pub(super) fn copy_unlimited_polymorphic_allocatable_descriptor(
         vec![dest_desc, source_desc, stat_addr],
         IrType::Void,
     );
-    emit_dynamic_derived_scalar_copy(b, dest_desc, source_desc, "", type_layouts);
+    emit_dynamic_derived_scalar_copy(b, dest_desc, source_desc, base_type, type_layouts);
     b.branch(done_bb, vec![]);
 
     b.set_block(done_bb);
