@@ -12114,6 +12114,71 @@ end program
 }
 
 #[test]
+fn rank_remap_pointer_to_section_with_omitted_lower_bound() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_remap_pointer_to_section_with_omitted_lower_bound count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §10.2.2.3: a simply contiguous rank-one section may be
+    // remapped to a pointer of another rank. The omitted lower bound in
+    // `hcol(:k)` is the source's declared lower bound (zero here), not
+    // necessarily one. This is the form used by stdlib's GMRES solver.
+    let src = write_program(
+        r#"
+program t
+  implicit none
+  real, target :: storage(0:3) = [10.0, 20.0, 30.0, 40.0]
+  call remap(storage)
+  if (abs(storage(1) - 99.0) > 1.0e-6) error stop 5
+  print *, 'ok'
+contains
+  subroutine remap(hcol)
+    real, target, contiguous, intent(inout) :: hcol(0:)
+    real, pointer :: hmat(:, :)
+    integer :: k
+    k = 2
+    hmat(2:4, -1:-1) => hcol(:k)
+    if (lbound(hmat, 1) /= 2 .or. lbound(hmat, 2) /= -1) error stop 1
+    if (ubound(hmat, 1) /= 4 .or. ubound(hmat, 2) /= -1) error stop 2
+    if (any(abs(hmat(:, -1) - [10.0, 20.0, 30.0]) > 1.0e-6)) error stop 3
+    hmat(3, -1) = 99.0
+    if (abs(hcol(1) - 99.0) > 1.0e-6) error stop 4
+  end subroutine
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("rank_remap_omitted_section_lower", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-remap omitted-lower compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "rank-remap omitted-lower runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected 'ok' from rank-remap omitted-lower: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn print_complex_array_emits_each_element_as_complex() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

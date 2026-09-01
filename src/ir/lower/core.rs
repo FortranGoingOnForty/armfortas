@@ -40652,18 +40652,19 @@ pub(super) fn lower_rank_remap_pointer_assignment(
             }
             (
                 array_data_ptr_for_call(b, &src_info),
-                ir_scalar_byte_size(&src_info.ty, ctx.layout),
+                b.const_i64(ir_scalar_byte_size(&src_info.ty, ctx.layout)),
             )
         }
         Expr::FunctionCall {
             callee,
             args: src_args,
         } => {
-            // RHS is a designator like `q(1:k, 1)`.  Compute the base
-            // address as the address of the FIRST included element —
-            // for each Range, take the lower bound; for each Element,
-            // take that index.  Then the resulting pointer plus the
-            // target's bounds form the remapped view.
+            // RHS is a rank-one section designator such as `q(1:k, 1)`
+            // or `hcol(:k)`. Rank remapping requires a simply contiguous
+            // rank-one target. Keep this lowering conservative: a single
+            // unit-stride range in the first source dimension is contiguous,
+            // while a surviving later dimension (for example `q(1, :)`)
+            // generally is not.
             let Expr::Name { name: src_name } = &callee.node else {
                 return false;
             };
@@ -40674,35 +40675,41 @@ pub(super) fn lower_rank_remap_pointer_assignment(
             if src_info.dims.is_empty() && !src_info.allocatable && !src_info.descriptor_arg {
                 return false;
             }
-            // Build first-element subscripts: turn each Range(lower:..)
-            // into Element(lower).  We use lower_array_element_addr
-            // which expects all-Element args.  Defer Range with no
-            // explicit `start` (`q(:, 1)`) — synthesizing a literal `1`
-            // here would need a span and the AST IntegerLiteral takes
-            // a `text` field; the explicit-start form covers stdlib's
-            // qr/eig usage `q(1:k, 1)` end-to-end.
-            use crate::ast::expr::{Argument, SectionSubscript};
-            let mut first_elem_args: Vec<Argument> = Vec::with_capacity(src_args.len());
-            for a in src_args {
-                let elem_expr = match &a.value {
-                    SectionSubscript::Element(e) => e.clone(),
-                    SectionSubscript::Range { start: Some(s), .. } => s.clone(),
-                    _ => return false,
-                };
-                first_elem_args.push(Argument {
-                    keyword: None,
-                    value: SectionSubscript::Element(elem_expr),
-                });
+            if actual_expr_rank(value, &ctx.locals, ctx.st, Some(ctx.type_layouts)) != Some(1) {
+                return false;
             }
-            let base = lower_array_element_addr(
+            let mut ranges = src_args.iter().enumerate().filter_map(|(i, arg)| {
+                if let crate::ast::expr::SectionSubscript::Range { stride, .. } = &arg.value {
+                    Some((i, stride))
+                } else {
+                    None
+                }
+            });
+            if !matches!(ranges.next(), Some((0, None))) || ranges.next().is_some() {
+                return false;
+            }
+
+            // Let the normal section lowering compute the first included
+            // address. In particular, an omitted lower bound comes from the
+            // source descriptor rather than being guessed as one.
+            let Some((section_desc, _elem_ty)) = lower_array_expr_descriptor(
                 b,
                 &ctx.locals,
-                &src_info,
-                &first_elem_args,
+                value,
                 ctx.st,
                 Some(ctx.type_layouts),
+                Some(ctx.internal_funcs),
+                Some(ctx.contained_host_refs),
+                Some(ctx.descriptor_params),
+            ) else {
+                return false;
+            };
+            let base = b.load_typed(
+                section_desc,
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
             );
-            (base, ir_scalar_byte_size(&src_info.ty, ctx.layout))
+            let elem_bytes = load_array_desc_i64_field(b, section_desc, 8);
+            (base, elem_bytes)
         }
         _ => return false,
     };
@@ -40755,8 +40762,7 @@ pub(super) fn lower_rank_remap_pointer_assignment(
         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
         src_base,
     );
-    let elem_bytes_v = b.const_i64(elem_bytes);
-    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes_v);
+    store_byte_aggregate_field(b, desc, 8, IrType::Int(IntWidth::I64), elem_bytes);
     let rank = b.const_i32(bounds.len() as i32);
     store_byte_aggregate_field(b, desc, 16, IrType::Int(IntWidth::I32), rank);
     // flags: bit 1 marks pointer association (matches existing
