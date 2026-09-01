@@ -11992,6 +11992,79 @@ fn type_bound_runtime_bound_bulk_array_expr_uses_runtime_extent() {
 }
 
 #[test]
+fn array_valued_generic_call_is_not_treated_as_bulk_scalar_fill() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_valued_generic_call_is_not_treated_as_bulk_scalar_fill count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("array_generic_not_scalar_fill");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module arrays_m\n  implicit none\n  interface make_array\n    module procedure make_square\n    module procedure make_rect\n  end interface\ncontains\n  function make_square(n) result(x)\n    integer, intent(in) :: n\n    real(8) :: x(max(n, 0), max(n, 0))\n    integer :: i\n    x = 0.0_8\n    do i = 1, n\n      x(i, i) = 1.0_8\n    end do\n  end function make_square\n\n  function make_rect(m, n) result(x)\n    integer, intent(in) :: m, n\n    real(8) :: x(max(m, 0), max(n, 0))\n    integer :: i\n    x = 0.0_8\n    do i = 1, min(m, n)\n      x(i, i) = 1.0_8\n    end do\n  end function make_rect\nend module arrays_m\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("array provider compile failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "array provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use arrays_m, only: make_array\n  implicit none\n  real(8) :: rectangular(2, 3), square(2, 2)\n  rectangular = make_array(2, 3) * 3.0_8\n  square = make_array(2) / 2.0_8\n  if (any(abs(rectangular - reshape([3.0_8, 0.0_8, 0.0_8, 3.0_8, 0.0_8, 0.0_8], [2, 3])) > 1.0e-12_8)) error stop 1\n  if (any(abs(square - reshape([0.5_8, 0.0_8, 0.0_8, 0.5_8], [2, 2])) > 1.0e-12_8)) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("array consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "array-valued generic expression should compile: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("array consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "array-valued generic expression failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn contained_runtime_bound_local_array_closure_passes_data_pointer() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

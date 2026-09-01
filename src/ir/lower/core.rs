@@ -30261,7 +30261,14 @@ pub(super) fn try_lower_bulk_do_concurrent(
     if !control_covers_full_array(ctrl, &dest) {
         return false;
     }
-    let Some(plan) = build_loop_bulk_plan(&ctx.locals, &dest.info, &ctrl.var, value) else {
+    let Some(plan) = build_loop_bulk_plan(
+        &ctx.locals,
+        &dest.info,
+        &ctrl.var,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+    ) else {
         return false;
     };
     let n = array_total_elems_value(b, &dest.info);
@@ -43146,6 +43153,8 @@ pub(super) fn build_whole_array_bulk_plan(
     locals: &HashMap<String, LocalInfo>,
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<BulkArrayPlan> {
     if let Expr::BinaryOp { op, left, right } = &value.node {
         if let Some(kernel) = bulk_array_binary_runtime_name(op.clone(), &dest_info.ty) {
@@ -43166,8 +43175,14 @@ pub(super) fn build_whole_array_bulk_plan(
 
         let lhs_info = whole_array_expr_info(locals, left);
         let rhs_info = whole_array_expr_info(locals, right);
-        let lhs_scalar = !expr_contains_array_refs(left, locals);
-        let rhs_scalar = !expr_contains_array_refs(right, locals);
+        // Absence of a named local array does not make an expression scalar:
+        // an imported generic can select an array-returning function (PRIMA's
+        // `eye(n, m)`, for example). Only scalar-ranked operands may enter a
+        // bulk array/scalar kernel.
+        let lhs_scalar = !expr_contains_array_refs(left, locals)
+            && actual_expr_rank(left, locals, st, type_layouts) == Some(0);
+        let rhs_scalar = !expr_contains_array_refs(right, locals)
+            && actual_expr_rank(right, locals, st, type_layouts) == Some(0);
 
         if let Some(lhs_info) = lhs_info {
             if rhs_scalar && bulk_arrays_compatible(dest_info, &lhs_info) {
@@ -43212,7 +43227,10 @@ pub(super) fn build_whole_array_bulk_plan(
         }
     }
 
-    if !expr_contains_array_refs(value, locals) && !expr_contains_array_constructor(value) {
+    if !expr_contains_array_refs(value, locals)
+        && !expr_contains_array_constructor(value)
+        && actual_expr_rank(value, locals, st, type_layouts) == Some(0)
+    {
         if let Some(kernel) = bulk_fill_runtime_name(&dest_info.ty) {
             return Some(BulkArrayPlan::Fill {
                 kernel,
@@ -51514,6 +51532,8 @@ pub(super) fn build_loop_bulk_plan(
     dest_info: &LocalInfo,
     loop_var: &str,
     value: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<BulkArrayPlan> {
     if let Expr::BinaryOp { op, left, right } = &value.node {
         if let Some(kernel) = bulk_array_binary_runtime_name(op.clone(), &dest_info.ty) {
@@ -51534,10 +51554,12 @@ pub(super) fn build_loop_bulk_plan(
 
         let lhs = loop_indexed_array_ref(locals, left, loop_var);
         let rhs = loop_indexed_array_ref(locals, right, loop_var);
-        let lhs_scalar =
-            !expr_contains_array_refs(left, locals) && !expr_mentions_name(left, loop_var);
-        let rhs_scalar =
-            !expr_contains_array_refs(right, locals) && !expr_mentions_name(right, loop_var);
+        let lhs_scalar = !expr_contains_array_refs(left, locals)
+            && !expr_mentions_name(left, loop_var)
+            && actual_expr_rank(left, locals, st, type_layouts) == Some(0);
+        let rhs_scalar = !expr_contains_array_refs(right, locals)
+            && !expr_mentions_name(right, loop_var)
+            && actual_expr_rank(right, locals, st, type_layouts) == Some(0);
 
         if let Some(lhs) = lhs {
             if rhs_scalar && bulk_arrays_compatible(dest_info, &lhs.info) {
@@ -51582,7 +51604,10 @@ pub(super) fn build_loop_bulk_plan(
         }
     }
 
-    if !expr_contains_array_refs(value, locals) && !expr_mentions_name(value, loop_var) {
+    if !expr_contains_array_refs(value, locals)
+        && !expr_mentions_name(value, loop_var)
+        && actual_expr_rank(value, locals, st, type_layouts) == Some(0)
+    {
         if let Some(kernel) = bulk_fill_runtime_name(&dest_info.ty) {
             return Some(BulkArrayPlan::Fill {
                 kernel,
@@ -51600,7 +51625,13 @@ pub(super) fn try_lower_bulk_array_assign(
     dest_info: &LocalInfo,
     value: &crate::ast::expr::SpannedExpr,
 ) -> bool {
-    if let Some(plan) = build_whole_array_bulk_plan(&ctx.locals, dest_info, value) {
+    if let Some(plan) = build_whole_array_bulk_plan(
+        &ctx.locals,
+        dest_info,
+        value,
+        ctx.st,
+        Some(ctx.type_layouts),
+    ) {
         let n = array_total_elems_value(b, dest_info);
         emit_bulk_array_plan(b, ctx, dest_info, n, plan);
         return true;
