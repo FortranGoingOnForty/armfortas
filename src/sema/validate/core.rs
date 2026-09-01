@@ -6440,6 +6440,14 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     .and_then(|symbol| symbol.type_info.clone())
             }),
         Expr::ParenExpr { inner } => validation_expr_type_info(ctx, inner),
+        Expr::ComponentAccess { base, component }
+            if component.eq_ignore_ascii_case("re") || component.eq_ignore_ascii_case("im") =>
+        {
+            match validation_expr_type_info(ctx, base) {
+                Some(TypeInfo::Complex { kind }) => Some(TypeInfo::Real { kind }),
+                _ => None,
+            }
+        }
         Expr::ArrayConstructor { type_spec, values } => {
             validation_array_constructor_type_info(ctx, type_spec.as_deref(), values)
         }
@@ -12002,6 +12010,56 @@ end module call_contracts
             }),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn direct_call_validation_preserves_complex_part_kind_in_current_scope() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  real(8) function earlier(a) result(value)
+    real(8), intent(in) :: a
+    value = a
+  end function earlier
+
+  real(4) function accept_good(value_good) result(value)
+    real(4), intent(in) :: value_good
+    value = value_good
+  end function accept_good
+
+  real(4) function accept_bad(value_bad) result(value)
+    real(4), intent(in) :: value_bad
+    value = value_bad
+  end function accept_bad
+
+  subroutine invoke(a, z)
+    complex(4), intent(in) :: a
+    complex(8), intent(in) :: z
+    real(4) :: value
+    value = accept_good(a%re) + accept_good(a%im)
+    value = accept_bad(z%re) + accept_bad(z%im)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            !errs.iter().any(|err| err.contains("'value_good'")),
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| {
+                    err.contains("argument 'value_bad' type mismatch")
+                        && err.contains("expected REAL(4), got REAL(8)")
+                })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
     }
 
     #[test]

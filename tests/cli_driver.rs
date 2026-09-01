@@ -54590,6 +54590,80 @@ fn complex_re_im_designators_lower_to_correct_lane_and_dispatch_real_kind() {
 }
 
 #[test]
+fn split_module_procedure_calls_preserve_complex_part_kind_during_validation() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=split_module_procedure_calls_preserve_complex_part_kind_during_validation count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // The validator must derive `%re` / `%im` from the current separate
+    // module procedure's dummy, rather than a homonymous dummy in another
+    // parent-module interface. This is the shape used by stdlib's generated
+    // is_close implementations.
+    let dir = unique_dir("complex_part_smp_validation");
+    let parent = write_program_in(
+        &dir,
+        "parent.f90",
+        "module close_api\n  implicit none\n  interface is_close\n    elemental logical module function is_close_rsp(a, b) result(close)\n      real(4), intent(in) :: a, b\n    end function is_close_rsp\n    elemental logical module function is_close_rdp(a, b) result(close)\n      real(8), intent(in) :: a, b\n    end function is_close_rdp\n    elemental logical module function is_close_csp(a, b) result(close)\n      complex(4), intent(in) :: a, b\n    end function is_close_csp\n    elemental logical module function is_close_cdp(a, b) result(close)\n      complex(8), intent(in) :: a, b\n    end function is_close_cdp\n  end interface is_close\nend module close_api\n",
+    );
+    let good_submodule = write_program_in(
+        &dir,
+        "good.f90",
+        "submodule (close_api) close_good\ncontains\n  elemental logical module function is_close_rsp(a, b) result(close)\n    real(4), intent(in) :: a, b\n    close = a == b\n  end function is_close_rsp\n  elemental logical module function is_close_rdp(a, b) result(close)\n    real(8), intent(in) :: a, b\n    close = a == b\n  end function is_close_rdp\n  elemental logical module function is_close_csp(a, b) result(close)\n    complex(4), intent(in) :: a, b\n    close = is_close_rsp(a%re, b%re) .and. is_close_rsp(a%im, b%im)\n  end function is_close_csp\nend submodule close_good\n",
+    );
+    let bad_submodule = write_program_in(
+        &dir,
+        "bad.f90",
+        "submodule (close_api) close_bad\ncontains\n  elemental logical module function is_close_cdp(a, b) result(close)\n    complex(8), intent(in) :: a, b\n    close = is_close_rsp(a%re, b%re) .and. is_close_rsp(a%im, b%im)\n  end function is_close_cdp\nend submodule close_bad\n",
+    );
+    let parent_o = dir.join("parent.o");
+    let good_o = dir.join("good.o");
+    let bad_o = dir.join("bad.o");
+    let compile = |source: &std::path::Path, output: &std::path::Path| {
+        Command::new(compiler("armfortas"))
+            .args([
+                "-c",
+                source.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .args(["-J", dir.to_str().unwrap(), "-I", dir.to_str().unwrap()])
+            .output()
+            .expect("separate module procedure compile failed to spawn")
+    };
+
+    let parent_result = compile(&parent, &parent_o);
+    assert!(
+        parent_result.status.success(),
+        "parent module compile failed: {}",
+        String::from_utf8_lossy(&parent_result.stderr)
+    );
+    let good_result = compile(&good_submodule, &good_o);
+    assert!(
+        good_result.status.success(),
+        "valid complex(4) part calls were rejected: {}",
+        String::from_utf8_lossy(&good_result.stderr)
+    );
+    let bad_result = compile(&bad_submodule, &bad_o);
+    let bad_stderr = String::from_utf8_lossy(&bad_result.stderr);
+    assert!(
+        !bad_result.status.success(),
+        "complex(8) parts were accepted by a real(4) dummy"
+    );
+    assert_eq!(
+        bad_stderr
+            .matches("type mismatch: expected REAL(4), got REAL(8)")
+            .count(),
+        4,
+        "unexpected kind-mismatch diagnostics: {bad_stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn f2008_submodule_explicit_iface_smp_body_split_file_runtime_shape_result() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
