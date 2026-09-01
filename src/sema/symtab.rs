@@ -2448,6 +2448,11 @@ pub struct SymbolAttrs {
     pub pure: bool,
     /// Procedure declared with the ELEMENTAL prefix.
     pub elemental: bool,
+    /// Procedure body declared with the MODULE prefix. This remains distinct
+    /// from a descendant submodule implementation: a module may provide the
+    /// implementation in the same scoping unit as its explicit MODULE
+    /// interface body.
+    pub module_prefix: bool,
     /// For Function symbols whose result is an array (allocatable,
     /// automatic, or fixed-shape): rank of the result.  0 for scalar
     /// results.  Used by lowering to route array-returning calls
@@ -2496,6 +2501,7 @@ impl Default for SymbolAttrs {
             intrinsic: false,
             pure: false,
             elemental: false,
+            module_prefix: false,
             result_rank: 0,
             array_spec: Vec::new(),
             is_separate_module_procedure: false,

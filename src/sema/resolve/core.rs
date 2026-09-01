@@ -1351,6 +1351,7 @@ pub(super) fn resolve_unit(
                     let scope_id = st.current_scope();
                     let is_dummy_arg = st.scope(scope_id).arg_order.iter().any(|arg| arg == &key);
                     let mut merged_dummy = false;
+                    let mut merged_module_body = false;
                     if is_dummy_arg {
                         if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
                             if can_merge_interface_body_with_dummy(existing) {
@@ -1367,7 +1368,7 @@ pub(super) fn resolve_unit(
                                 attrs.array_spec = result_attrs.array_spec;
                                 attrs.is_separate_module_interface =
                                     result_attrs.is_separate_module_interface;
-                                existing.kind = kind;
+                                existing.kind = kind.clone();
                                 existing.type_info = ti;
                                 existing.attrs = attrs;
                                 existing.arg_names = arg_names;
@@ -1375,7 +1376,14 @@ pub(super) fn resolve_unit(
                             }
                         }
                     }
-                    if !merged_dummy {
+                    if result_attrs.is_separate_module_interface {
+                        if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
+                            merged_module_body = existing.kind == kind
+                                && existing.attrs.module_prefix
+                                && !existing.attrs.external;
+                        }
+                    }
+                    if !merged_dummy && !merged_module_body {
                         return Err(err);
                     }
                 }
@@ -3639,6 +3647,9 @@ fn process_contains(
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
+                    module_prefix: prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
                     bind_c: binding.bind_c,
                     binding_label: binding.label,
                     is_separate_module_procedure: is_smp,
@@ -3716,6 +3727,9 @@ fn process_contains(
                     pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
+                    module_prefix: prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
                     bind_c: binding.bind_c,
                     binding_label: binding.label,
                     result_rank: result_attrs.result_rank,

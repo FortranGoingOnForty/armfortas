@@ -1946,6 +1946,16 @@ fn explicit_interface_names_must_not_collide_with_local_entities() {
             "module interface_contained_collision_m\n  implicit none\n  interface\n    subroutine collide()\n    end subroutine collide\n  end interface\ncontains\n  subroutine collide()\n  end subroutine collide\nend module interface_contained_collision_m\n",
         ),
         (
+            "module_interface_plain_body_collision",
+            "module_interface_plain_body_collision_m",
+            "module module_interface_plain_body_collision_m\n  implicit none\n  interface collide\n    module subroutine collide()\n    end subroutine collide\n  end interface\ncontains\n  subroutine collide()\n  end subroutine collide\nend module module_interface_plain_body_collision_m\n",
+        ),
+        (
+            "plain_interface_module_body_collision",
+            "plain_interface_module_body_collision_m",
+            "module plain_interface_module_body_collision_m\n  implicit none\n  interface collide\n    subroutine collide()\n    end subroutine collide\n  end interface\ncontains\n  module subroutine collide()\n  end subroutine collide\nend module plain_interface_module_body_collision_m\n",
+        ),
+        (
             "interface_value_dummy_collision",
             "interface_value_dummy_collision_m",
             "module interface_value_dummy_collision_m\n  implicit none\ncontains\n  subroutine outer(collide)\n    integer, value :: collide\n    interface\n      subroutine collide()\n      end subroutine collide\n    end interface\n  end subroutine outer\nend module interface_value_dummy_collision_m\n",
@@ -2038,6 +2048,77 @@ fn explicit_interface_names_must_not_collide_with_local_entities() {
         run.status,
         String::from_utf8_lossy(&run.stderr)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_scope_module_interface_body_compiles_across_units() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_scope_module_interface_body_compiles_across_units count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("same_scope_module_interface_body");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module report_provider\n  implicit none\n  interface report\n    module subroutine report(message, status)\n      character(*), intent(in) :: message\n      integer, intent(out), optional :: status\n    end subroutine report\n  end interface report\ncontains\n  module subroutine report(message, status)\n    character(*), intent(in) :: message\n    integer, intent(out), optional :: status\n    if (present(status)) status = len(message)\n  end subroutine report\nend module report_provider\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-scope module procedure provider failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "same-scope MODULE interface and body should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consume_report\n  use report_provider, only: report\n  implicit none\n  integer :: status\n  call report('ready', status)\n  if (status /= 5) error stop 1\n  print *, 'ok'\nend program consume_report\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("same-scope module procedure consumer failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "serialized same-scope module procedure should link: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("same-scope module procedure consumer failed to run");
+    assert!(
+        run.status.success(),
+        "same-scope module procedure consumer failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
