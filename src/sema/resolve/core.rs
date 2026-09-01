@@ -3574,7 +3574,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
     // Apply deferred access-list overrides after all symbols are declared.
     for (access, names, span) in &pending_access {
         for name in names {
-            if !st.set_symbol_access(name, *access) {
+            if !st.set_symbol_access_at(name, *access, *span) {
                 return Err(repeated_symbol_access_error(name, *span));
             }
         }

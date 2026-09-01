@@ -12063,6 +12063,49 @@ end module call_contracts
     }
 
     #[test]
+    fn named_access_declares_late_host_entity_for_module_interface_body() {
+        let conforming = errors_from(
+            "\
+module late_host
+  implicit none
+  private :: callback
+  interface
+    module subroutine invoke(callback_arg)
+      procedure(callback) :: callback_arg
+    end subroutine invoke
+  end interface
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+end module late_host
+",
+        );
+        assert!(conforming.is_empty(), "{conforming:?}");
+
+        let nonconforming = errors_from(
+            "\
+module late_host
+  implicit none
+  interface
+    module subroutine invoke(callback_arg)
+      procedure(callback) :: callback_arg
+    end subroutine invoke
+  end interface
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+end module late_host
+",
+        );
+        assert_eq!(
+            nonconforming,
+            ["host entity 'callback' is not accessible under this IMPORT policy"]
+        );
+    }
+
+    #[test]
     fn rejects_direct_call_argument_association_errors() {
         let errs = errors_from(
             "\
