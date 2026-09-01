@@ -30507,6 +30507,7 @@ pub(super) fn lower_select_case(
         .map(|(ptr, _)| b.take_owned_string_temp_bases(ptr))
         .unwrap_or_default();
     let sel_val = (!selector_is_char).then(|| super::expr::lower_expr_ctx(b, ctx, selector));
+    let selector_ty = sel_val.and_then(|value| b.func().value_type(value));
     let bb_end = b.create_block("select_end");
     ctx.push_construct_exit(name.clone(), bb_end);
 
@@ -30559,7 +30560,11 @@ pub(super) fn lower_select_case(
                         let zero = b.const_i32(0);
                         b.icmp(CmpOp::Eq, cmp, zero)
                     } else {
-                        let val = super::expr::lower_expr_ctx(b, ctx, expr);
+                        let raw = super::expr::lower_expr_ctx(b, ctx, expr);
+                        let val = selector_ty
+                            .as_ref()
+                            .map(|ty| coerce_to_type(b, raw, ty))
+                            .unwrap_or(raw);
                         b.icmp(CmpOp::Eq, sel_val.expect("non-character selector"), val)
                     }
                 }
@@ -30583,7 +30588,11 @@ pub(super) fn lower_select_case(
                             let zero = b.const_i32(0);
                             Some(b.icmp(CmpOp::Ge, cmp, zero))
                         } else {
-                            let lo_val = super::expr::lower_expr_ctx(b, ctx, lo);
+                            let raw = super::expr::lower_expr_ctx(b, ctx, lo);
+                            let lo_val = selector_ty
+                                .as_ref()
+                                .map(|ty| coerce_to_type(b, raw, ty))
+                                .unwrap_or(raw);
                             Some(b.icmp(
                                 CmpOp::Ge,
                                 sel_val.expect("non-character selector"),
@@ -30612,7 +30621,11 @@ pub(super) fn lower_select_case(
                             let zero = b.const_i32(0);
                             Some(b.icmp(CmpOp::Le, cmp, zero))
                         } else {
-                            let hi_val = super::expr::lower_expr_ctx(b, ctx, hi);
+                            let raw = super::expr::lower_expr_ctx(b, ctx, hi);
+                            let hi_val = selector_ty
+                                .as_ref()
+                                .map(|ty| coerce_to_type(b, raw, ty))
+                                .unwrap_or(raw);
                             Some(b.icmp(
                                 CmpOp::Le,
                                 sel_val.expect("non-character selector"),
@@ -65263,6 +65276,34 @@ end program
         assert!(
             !ir.contains("switch %"),
             "general source SELECT CASE intentionally uses typed comparison chains:\n{ir}",
+        );
+    }
+
+    #[test]
+    fn source_i64_select_case_coerces_default_kind_values_and_ranges() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer(8) :: selector, result
+  selector = 3_8
+  select case (selector)
+  case (0)
+    result = 10
+  case (1:2)
+    result = 20
+  case (3:4)
+    result = 30
+  case default
+    result = 40
+  end select
+  if (result /= 30) error stop 1
+end program
+",
+        );
+        assert!(
+            ir.contains("icmp eq") && ir.contains("icmp ge") && ir.contains("icmp le"),
+            "mixed-kind SELECT CASE comparisons should lower with typed equality and ranges:\n{ir}",
         );
     }
 
