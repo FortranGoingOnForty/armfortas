@@ -57542,6 +57542,46 @@ fn allocatable_array_component_passed_to_assumed_size_unwraps_descriptor() {
 }
 
 #[test]
+fn assumed_size_rank2_column_section_assignment_honors_scalar_subscript() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_size_rank2_column_section_assignment_honors_scalar_subscript count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // stdlib_sparse_conversion fills the temporary coordinate pairs used by
+    // coo2csc through this exact shape: `a(1:2, ed) = [row, col]`, where
+    // `a` is an explicit-shape/assumed-size dummy. The scalar second
+    // subscript must contribute `2 * (ed - 1)` to the section base address;
+    // dropping it repeatedly overwrites column 1 and corrupts every CSC index.
+    let src = write_program(
+        "module m\ncontains\n  subroutine fill(a, n)\n    integer, intent(inout) :: a(2, *)\n    integer, value :: n\n    integer :: ed\n    do ed = 1, n\n      a(1:2, ed) = [ed, ed + 10]\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: a(2, 4)\n  integer :: j\n  a = 0\n  call fill(a, 4)\n  do j = 1, 4\n    if (a(1,j) /= j .or. a(2,j) /= j + 10) error stop j\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("assumed_size_rank2_column_section", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("assumed-size rank-2 column section compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "assumed-size rank-2 column section compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "assumed-size rank-2 column section run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_rank2_section_row_assignment_uses_columnmajor_stride() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

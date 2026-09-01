@@ -40912,6 +40912,24 @@ pub(super) fn materialize_array_descriptor_for_info(
     b: &mut FuncBuilder,
     info: &LocalInfo,
 ) -> ValueId {
+    materialize_array_descriptor_for_info_impl(b, info, false)
+}
+
+/// Materialize a descriptor for section addressing while retaining every
+/// declared dimension of an assumed-size dummy. The general materializer
+/// intentionally exposes such a dummy as a rank-one storage sequence when it
+/// is forwarded to an assumed-rank argument (F2018 15.5.2.4). A section such
+/// as `a(1:2, ed)` instead needs the declared leading extent so that the scalar
+/// second subscript contributes the correct column-major base offset.
+fn materialize_array_section_source_descriptor(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
+    materialize_array_descriptor_for_info_impl(b, info, true)
+}
+
+fn materialize_array_descriptor_for_info_impl(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    preserve_assumed_size_declared_shape: bool,
+) -> ValueId {
     let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
     let descriptor_bytes = b.const_i64(392);
@@ -40932,7 +40950,7 @@ pub(super) fn materialize_array_descriptor_for_info(
     // rank (for example, `a(2, *)`). Preserve that view in the descriptor
     // instead of exposing the explicit leading dimensions as a concrete
     // rank.
-    let descriptor_rank = if info.last_dim_assumed_size {
+    let descriptor_rank = if info.last_dim_assumed_size && !preserve_assumed_size_declared_shape {
         1
     } else {
         info.dims.len() as i32
@@ -40949,7 +40967,7 @@ pub(super) fn materialize_array_descriptor_for_info(
     let flags = b.const_i32(flags);
     store_byte_aggregate_field(b, desc, 20, IrType::Int(IntWidth::I32), flags);
 
-    if info.last_dim_assumed_size {
+    if info.last_dim_assumed_size && !preserve_assumed_size_declared_shape {
         let lower = b.const_i64(1);
         let upper = b.const_i64(0);
         let stride = b.const_i64(1);
@@ -50523,7 +50541,7 @@ pub(super) fn lower_vector_subscript_section_assign(
     let dest_desc = if local_uses_array_descriptor(dest_info) {
         array_descriptor_addr(b, dest_info)
     } else {
-        materialize_array_descriptor_for_info(b, dest_info)
+        materialize_array_section_source_descriptor(b, dest_info)
     };
 
     let zero64 = b.const_i64(0);
@@ -54295,7 +54313,7 @@ pub(super) fn lower_array_section_with_vector_subscripts(
     let source_desc = if local_uses_array_descriptor(info) {
         array_descriptor_addr(b, info)
     } else {
-        materialize_array_descriptor_for_info(b, info)
+        materialize_array_section_source_descriptor(b, info)
     };
 
     let elem_ty = info.ty.clone();
@@ -54733,7 +54751,7 @@ pub(super) fn lower_array_section(
     let source_desc = if local_uses_array_descriptor(info) {
         array_descriptor_addr(b, info)
     } else {
-        materialize_array_descriptor_for_info(b, info)
+        materialize_array_section_source_descriptor(b, info)
     };
     b.call(
         FuncRef::External("afs_create_section".into()),
