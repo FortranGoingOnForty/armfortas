@@ -2480,6 +2480,23 @@ fn find_scope_for_unit(
         return Some(s.id);
     }
 
+    // Interface bodies are resolved beneath a synthetic Interface scope,
+    // while validation visits the InterfaceBlock without entering that
+    // implementation-only scope. Match the procedure through that one hop
+    // before considering the legacy all-scope fallback. Otherwise a large
+    // source containing repeated interface procedure names (for example,
+    // several unrelated `destroy` interfaces) can validate a body in the
+    // first same-named scope from a different module.
+    let interface_child = st.scopes.iter().find(|scope| {
+        scope.parent.is_some_and(|interface_scope| {
+            matches!(st.scope(interface_scope).kind, ScopeKind::Interface)
+                && st.scope(interface_scope).parent == Some(parent_scope)
+        }) && kind_matcher(&scope.kind)
+    });
+    if let Some(scope) = interface_child {
+        return Some(scope.id);
+    }
+
     // Fall back to any matching scope.
     st.scopes
         .iter()
@@ -12132,6 +12149,53 @@ end module late_host
             nonconforming,
             ["host entity 'callback' is not accessible under this IMPORT policy"]
         );
+    }
+
+    #[test]
+    fn private_module_interface_imports_local_and_use_associated_types() {
+        let errors = errors_from(
+            "\
+module token_owner
+  implicit none
+  type :: token_t
+  end type token_t
+end module token_owner
+
+module other_owner
+  implicit none
+  type :: other_t
+  end type other_t
+  abstract interface
+    subroutine next_i(self)
+      import :: other_t
+      type(other_t), intent(inout) :: self
+    end subroutine next_i
+  end interface
+end module other_owner
+
+module lexer_owner
+  use token_owner, only: token_t
+  implicit none
+  private
+  public :: lexer_t
+
+  type, abstract :: lexer_t
+  contains
+    procedure(next_i), deferred :: next
+  end type lexer_t
+
+  abstract interface
+    subroutine next_i(self, token)
+      import :: lexer_t, token_t
+      class(lexer_t), intent(inout) :: self
+      type(token_t), intent(out) :: token
+    end subroutine next_i
+  end interface
+end module lexer_owner
+",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
