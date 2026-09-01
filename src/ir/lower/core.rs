@@ -62516,7 +62516,7 @@ fn proven_contiguous_sequence_section_actual(
     // and assumed-shape/assumed-rank descriptors may carry arbitrary runtime
     // strides, so their sections need the conservative copy path. Allocatable
     // storage and ordinary explicit-shape locals are contiguous by contract.
-    if info.is_pointer || info.descriptor_arg {
+    if info.is_pointer || (info.descriptor_arg && !info.allocatable) {
         return false;
     }
     if args.len() == 1 {

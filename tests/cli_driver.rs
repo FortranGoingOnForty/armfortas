@@ -27927,6 +27927,114 @@ fn strided_pointer_unit_sections_copy_for_sequence_association() {
 }
 
 #[test]
+fn allocatable_component_associate_section_keeps_sequence_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_component_associate_section_keeps_sequence_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // An associate-name for an allocatable array component is descriptor-backed,
+    // but its target storage remains contiguous. When a full leading-dimension
+    // section is sequence-associated with a larger explicit-shape dummy, pass
+    // the section's starting address. Copying only the rank-one section leaves
+    // the dummy reading beyond a four-element temporary. stdlib's SELL-C kernels
+    // use this shape for `data(:, ia(i))` associated with `a(4, n)`.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+  type :: holder_t
+    real, allocatable :: data(:,:)
+  end type
+contains
+  subroutine consume(n, a, total)
+    integer, value :: n
+    real, intent(in) :: a(4,n)
+    real, intent(out) :: total
+    integer :: i, j
+    total = 0.0
+    do j = 1, n
+      do i = 1, 4
+        total = total + a(i,j)
+      end do
+    end do
+  end subroutine
+
+  subroutine run()
+    type(holder_t) :: holder
+    real :: total
+    integer :: i, j
+    allocate(holder%data(4,7))
+    do j = 1, 7
+      do i = 1, 4
+        holder%data(i,j) = real((j-1)*4+i)
+      end do
+    end do
+    associate (view => holder%data)
+      call consume(4, view(:,1), total)
+    end associate
+    if (total /= 136.0) error stop 1
+  end subroutine
+end module
+
+program p
+  use m
+  implicit none
+  call run()
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let ir = unique_path("alloc_component_associate_sequence", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("allocatable component associate sequence emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "allocatable component associate sequence should emit IR: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("read allocatable component sequence IR");
+    assert!(
+        !ir_text.contains("call @afs_copy_array_data("),
+        "contiguous allocatable component section must not use a short copy temporary:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("alloc_component_associate_sequence", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("allocatable component associate sequence compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "allocatable component associate sequence should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "allocatable component associate sequence failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
