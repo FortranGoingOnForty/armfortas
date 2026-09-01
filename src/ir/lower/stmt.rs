@@ -2711,6 +2711,39 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // Fixed-length character assignment: copy with space padding.
                                 // Get source pointer and length from the expression.
                                 let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
+                                if local_fixed_char_allocatable_scalar_len(&info).is_some() {
+                                    let desc = array_descriptor_addr(b, &info);
+                                    let allocated = b.call(
+                                        FuncRef::External("afs_array_allocated".into()),
+                                        vec![desc],
+                                        IrType::Int(IntWidth::I32),
+                                    );
+                                    let zero = b.const_i32(0);
+                                    let needs_allocation = b.icmp(CmpOp::Eq, allocated, zero);
+                                    let allocate_bb =
+                                        b.create_block("fixed_char_scalar_assign_allocate");
+                                    let ready_bb = b.create_block("fixed_char_scalar_assign_ready");
+                                    b.cond_branch(
+                                        needs_allocation,
+                                        allocate_bb,
+                                        vec![],
+                                        ready_bb,
+                                        vec![],
+                                    );
+
+                                    b.set_block(allocate_bb);
+                                    let elem_size = b.const_i64(*len);
+                                    let rank = b.const_i32(0);
+                                    let null_dims = b.const_i64(0);
+                                    let null_stat = b.const_i64(0);
+                                    b.call(
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![desc, elem_size, rank, null_dims, null_stat],
+                                        IrType::Void,
+                                    );
+                                    b.branch(ready_bb, vec![]);
+                                    b.set_block(ready_bb);
+                                }
                                 if let Some((dest_ptr, dest_len)) = local_char_ptr_and_len(b, &info)
                                 {
                                     b.call(

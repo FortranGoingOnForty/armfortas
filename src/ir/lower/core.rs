@@ -10307,7 +10307,12 @@ pub(super) fn char_addr_and_len(
                     if !info.dims.is_empty() {
                         return None;
                     }
-                    let ptr = if info.by_ref {
+                    let ptr = if local_fixed_char_allocatable_scalar_len(info).is_some() {
+                        let desc = array_descriptor_addr(b, info);
+                        let base = b.load_typed(desc, IrType::Ptr(Box::new(info.ty.clone())));
+                        let zero = b.const_i64(0);
+                        b.gep(base, vec![zero], IrType::Int(IntWidth::I8))
+                    } else if info.by_ref {
                         let outer = b.load(info.addr);
                         b.load_typed(outer, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))))
                     } else {
@@ -10346,7 +10351,12 @@ pub(super) fn local_char_ptr_and_len(
             if !info.dims.is_empty() {
                 return None;
             }
-            let ptr = if info.is_pointer {
+            let ptr = if local_fixed_char_allocatable_scalar_len(info).is_some() {
+                let desc = array_descriptor_addr(b, info);
+                let base = b.load_typed(desc, IrType::Ptr(Box::new(info.ty.clone())));
+                let zero = b.const_i64(0);
+                b.gep(base, vec![zero], IrType::Int(IntWidth::I8))
+            } else if info.is_pointer {
                 let slot = if info.by_ref {
                     b.load(info.addr)
                 } else {
@@ -25618,11 +25628,13 @@ pub(super) fn callee_hidden_result_abi(
 }
 
 pub(super) fn local_fixed_char_allocatable_scalar_len(info: &LocalInfo) -> Option<i64> {
-    if !info.allocatable
-        || !info.dims.is_empty()
-        || info.char_kind != CharKind::None
-        || info.derived_type.is_some()
-    {
+    if !info.allocatable || local_declared_rank(info) != 0 || info.derived_type.is_some() {
+        return None;
+    }
+    if let CharKind::Fixed(len) = info.char_kind {
+        return Some(len);
+    }
+    if info.char_kind != CharKind::None {
         return None;
     }
     match &info.ty {

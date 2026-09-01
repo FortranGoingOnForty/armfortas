@@ -62245,6 +62245,44 @@ fn character_star_parameter_array_constructor_hidden_len_uses_element_len() {
     let _ = std::fs::remove_file(&src);
 }
 
+#[test]
+fn fixed_len_one_allocatable_character_scalar_supports_assignment_and_substrings() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_len_one_allocatable_character_scalar_supports_assignment_and_substrings count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character, allocatable :: hold\n  hold = 'TRUE'\n  if (.not. allocated(hold)) error stop 1\n  if (len(hold) /= 1) error stop 2\n  if (hold /= 'T') error stop 3\n  if (hold(1:1) /= 'T') error stop 4\n  hold = '.'\n  if (hold(1:1) /= '.') error stop 5\n  deallocate(hold)\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("fixed_len_one_allocatable_char_scalar", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-length allocatable character scalar compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-length allocatable character scalar compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-length allocatable character scalar failed to run");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "fixed-length allocatable character scalar failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
 // ---- Sprint l00: --std=f2023 wiring ----
 
 #[test]
