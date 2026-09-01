@@ -6493,6 +6493,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     )
                     .or(match key.as_str() {
                         "cmplx" => Some(2),
+                        "size" => Some(2),
                         "int" | "nint" | "floor" | "ceiling" | "real" | "logical" | "char"
                         | "achar" => Some(1),
                         _ => None,
@@ -6506,7 +6507,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     if let Some(kind) = requested_kind {
                         let type_info = match key.as_str() {
                             "int" | "nint" | "floor" | "ceiling" | "len" | "len_trim" | "index"
-                            | "scan" | "verify" | "ichar" | "iachar" => {
+                            | "scan" | "verify" | "ichar" | "iachar" | "size" => {
                                 TypeInfo::Integer { kind: Some(kind) }
                             }
                             "real" => TypeInfo::Real { kind: Some(kind) },
@@ -11063,7 +11064,7 @@ fn intrinsic_real_kind(info: &TypeInfo) -> Option<u8> {
     }
 }
 
-fn validate_character_intrinsic_kind(
+fn validate_intrinsic_result_kind(
     ctx: &mut Ctx<'_>,
     span: Span,
     intrinsic: &str,
@@ -11190,11 +11191,11 @@ fn validate_character_intrinsic_call(
     if let Some(position) = crate::sema::types::character_integer_result_kind_position(intrinsic) {
         require_type(ctx, position, "kind", IntrinsicArgumentType::Integer);
         require_scalar(ctx, position, "kind");
-        validate_character_intrinsic_kind(ctx, span, intrinsic, args, position, false);
+        validate_intrinsic_result_kind(ctx, span, intrinsic, args, position, false);
     } else if matches!(intrinsic, "char" | "achar") {
         require_type(ctx, 1, "kind", IntrinsicArgumentType::Integer);
         require_scalar(ctx, 1, "kind");
-        validate_character_intrinsic_kind(ctx, span, intrinsic, args, 1, true);
+        validate_intrinsic_result_kind(ctx, span, intrinsic, args, 1, true);
     }
 }
 
@@ -11257,6 +11258,31 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 "i",
                 IntrinsicArgumentType::Integer,
             );
+        }
+        "size" => {
+            const FORMALS: [&str; 3] = ["array", "dim", "kind"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 1);
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                1,
+                "dim",
+                IntrinsicArgumentType::Integer,
+            );
+            require_intrinsic_scalar_argument(ctx, span, &key, args, 1, "dim");
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                2,
+                "kind",
+                IntrinsicArgumentType::Integer,
+            );
+            require_intrinsic_scalar_argument(ctx, span, &key, args, 2, "kind");
+            validate_intrinsic_result_kind(ctx, span, &key, args, 2, false);
         }
         "ieee_fma" => {
             const FORMALS: [&str; 3] = ["a", "b", "c"];
@@ -12146,14 +12172,36 @@ contains
   end subroutine accept
 
   subroutine invoke()
+    integer :: values(2)
     call accept(int(1, kind=8), real(1, 8), cmplx(1.0, 2.0, kind=8))
     call accept(1_8, 2.0_8, (1.0_8, 2.0_8))
+    call accept(size(values, kind=8), 2.0_8, (1.0_8, 2.0_8))
   end subroutine invoke
 end module call_contracts
 ",
         );
 
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_unsupported_size_result_kind() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: values(2)
+  print *, size(values, kind=3)
+end program p
+",
+        );
+
+        assert!(
+            errs.iter()
+                .any(|err| err
+                    .contains("intrinsic 'size' requests unsupported INTEGER result kind 3")),
+            "{errs:?}"
+        );
     }
 
     #[test]

@@ -55988,6 +55988,18 @@ fn static_array_ubound(lower: i64, extent: i64) -> i64 {
     }
 }
 
+fn size_intrinsic_result_type(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+) -> IrType {
+    let kind = intrinsic_kind_call_arg_width(args, 2, "kind", Some(locals), st)
+        .unwrap_or_else(crate::driver::defaults::default_int_kind);
+    int_width_from_kind_value(i64::from(kind))
+        .map(IrType::Int)
+        .unwrap_or(IrType::Int(IntWidth::I32))
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -56046,6 +56058,7 @@ pub(super) fn lower_array_intrinsic(
             None
         }
     })?;
+    let size_result_type = (name == "size").then(|| size_intrinsic_result_type(args, locals, st));
     if name == "rank" {
         if let Some(rank) = actual_expr_rank(first_expr, locals, st, type_layouts) {
             return Some(b.const_i32(rank as i32));
@@ -56164,13 +56177,26 @@ pub(super) fn lower_array_intrinsic(
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
                             let extent = info.dims[dim as usize - 1].1;
                             let r64 = b.const_i64(extent.max(0));
-                            return Some(b.int_trunc(r64, IntWidth::I32));
+                            return Some(coerce_to_type(
+                                b,
+                                r64,
+                                size_result_type.as_ref().expect("SIZE result type"),
+                            ));
                         }
-                    } else if args.len() == 1 {
+                    } else if !args.iter().enumerate().any(|(index, arg)| {
+                        arg.keyword
+                            .as_deref()
+                            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("dim"))
+                            || (arg.keyword.is_none() && index == 1)
+                    }) {
                         // SIZE(array) with no dim: fold to product of extents.
                         let total: i64 = info.dims.iter().map(|(_, extent)| *extent).product();
                         let r64 = b.const_i64(total.max(0));
-                        return Some(b.int_trunc(r64, IntWidth::I32));
+                        return Some(coerce_to_type(
+                            b,
+                            r64,
+                            size_result_type.as_ref().expect("SIZE result type"),
+                        ));
                     }
                 }
                 "lbound" => {
@@ -56291,7 +56317,11 @@ pub(super) fn lower_array_intrinsic(
                             IrType::Int(IntWidth::I64),
                         )
                     };
-                    Some(b.int_trunc(result64, IntWidth::I32))
+                    Some(coerce_to_type(
+                        b,
+                        result64,
+                        size_result_type.as_ref().expect("SIZE result type"),
+                    ))
                 }
             } else {
                 // SIZE(array)
@@ -56313,7 +56343,11 @@ pub(super) fn lower_array_intrinsic(
                         IrType::Int(IntWidth::I64),
                     )
                 };
-                Some(b.int_trunc(result64, IntWidth::I32))
+                Some(coerce_to_type(
+                    b,
+                    result64,
+                    size_result_type.as_ref().expect("SIZE result type"),
+                ))
             }
         }
         "lbound" => {

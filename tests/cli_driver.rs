@@ -24824,6 +24824,44 @@ fn size_with_kind_keyword_arg_returns_total_size_not_size_along_dim() {
 }
 
 #[test]
+fn size_kind_result_matches_explicit_integer_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=size_kind_result_matches_explicit_integer_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module size_kind_call\n  implicit none\ncontains\n  subroutine take(n, expected, status)\n    integer(8), intent(in) :: n, expected\n    integer, intent(inout) :: status\n    if (n /= expected) status = status + 1\n  end subroutine take\n  subroutine run(status)\n    integer, intent(out) :: status\n    integer :: fixed(2, 3)\n    integer, allocatable :: dynamic(:, :)\n    status = 0\n    allocate(dynamic(2, 4))\n    call take(size(fixed, kind=8), 6_8, status)\n    call take(size(dynamic, kind=8), 8_8, status)\n  end subroutine run\nend module size_kind_call\nprogram p\n  use size_kind_call\n  implicit none\n  integer :: status\n  call run(status)\n  if (status /= 0) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("size_kind_explicit_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("SIZE kind explicit-dummy repro compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "SIZE kind result should match INTEGER(8) dummy: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("SIZE kind explicit-dummy repro failed to run");
+    assert!(
+        run.status.success(),
+        "SIZE kind explicit-dummy repro failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn smp_body_parameter_initialized_from_imported_kind_constant() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
