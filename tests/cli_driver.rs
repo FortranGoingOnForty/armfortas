@@ -41357,6 +41357,44 @@ fn contained_subroutine_uses_host_parameter_array_storage() {
 }
 
 #[test]
+fn contained_subroutine_materializes_host_character_parameter() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_subroutine_materializes_host_character_parameter count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module host_character_parameter\n  implicit none\ncontains\n  subroutine outer(result)\n    integer, intent(out) :: result\n    character(*), parameter :: procedure_name = 'OUTER'\n    call inner()\n  contains\n    subroutine inner()\n      call consume(procedure_name, result)\n    end subroutine inner\n  end subroutine outer\n  subroutine consume(text, result)\n    character(*), intent(in) :: text\n    integer, intent(out) :: result\n    if (text /= 'OUTER') error stop 1\n    result = len(text)\n  end subroutine consume\nend module\nprogram p\n  use host_character_parameter\n  implicit none\n  integer :: result\n  call outer(result)\n  if (result /= 5) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_host_character_parameter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("host character parameter repro compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "host character parameter repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("host character parameter repro failed to run");
+    assert!(
+        run.status.success(),
+        "host character parameter repro failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_array_dummy_uses_real_element_stride() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

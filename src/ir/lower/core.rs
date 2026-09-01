@@ -10722,7 +10722,7 @@ pub(super) fn actual_char_arg_runtime_len(
         }
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            locals.get(&key).and_then(|info| {
+            if let Some(len) = locals.get(&key).and_then(|info| {
                 let by_ref_absence_guard = info.by_ref
                     && (info.char_kind != CharKind::None
                         || descriptor_backed_runtime_char_array(info));
@@ -10735,7 +10735,27 @@ pub(super) fn actual_char_arg_runtime_len(
                 } else {
                     local_char_runtime_len(b, info)
                 }
-            })
+            }) {
+                return Some(len);
+            }
+
+            // Scalar PARAMETERs are deliberately omitted from an internal
+            // procedure's closure because their values can be materialized
+            // at compile time.  Preserve that rule for named character
+            // constants while still supplying the hidden character length
+            // expected by an assumed-length dummy.
+            let sym = match callee_scope_id_for_lookup(st, b.func().name.as_str())
+                .or_else(current_proc_scope)
+            {
+                Some(scope_id) => st.lookup_in(scope_id, &key),
+                None => st.find_symbol_any_scope(&key),
+            };
+            sym.filter(|sym| sym.attrs.parameter)
+                .and_then(|sym| sym.const_char_value.as_ref())
+                .map(|value| {
+                    let len = crate::source_bytes::from_source_view(value).len();
+                    b.const_i64(len as i64)
+                })
         }
         Expr::ParenExpr { inner } => actual_char_arg_runtime_len(
             b,
@@ -26162,18 +26182,30 @@ pub(super) fn lower_string_expr_full(
                     }
                 }
             } else {
-                if let Some(sym) = st.find_symbol_any_scope(&key) {
-                    if sym.attrs.parameter {
+                let sym = match callee_scope_id_for_lookup(st, b.func().name.as_str())
+                    .or_else(current_proc_scope)
+                {
+                    Some(scope_id) => st.lookup_in(scope_id, &key),
+                    None => st.find_symbol_any_scope(&key),
+                };
+                if let Some(sym) = sym {
+                    if sym.attrs.parameter
+                        && matches!(
+                            sym.type_info,
+                            Some(crate::sema::symtab::TypeInfo::Character { .. })
+                        )
+                    {
+                        if let Some(value) = &sym.const_char_value {
+                            let bytes = crate::source_bytes::from_source_view(value);
+                            let ptr = b.const_string(&bytes);
+                            let len = b.const_i64(bytes.len() as i64);
+                            return (ptr, len);
+                        }
                         if let Some(cv) = sym.const_value {
-                            if matches!(
-                                sym.type_info,
-                                Some(crate::sema::symtab::TypeInfo::Character { .. })
-                            ) {
-                                let byte = [cv as u8];
-                                let ptr = b.const_string(&byte);
-                                let len = b.const_i64(1);
-                                return (ptr, len);
-                            }
+                            let byte = [cv as u8];
+                            let ptr = b.const_string(&byte);
+                            let len = b.const_i64(1);
+                            return (ptr, len);
                         }
                     }
                 }
