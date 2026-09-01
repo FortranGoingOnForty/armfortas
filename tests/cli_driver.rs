@@ -58697,6 +58697,43 @@ fn empty_typed_scalar_constructor_allocates_zero_size_array() {
 }
 
 #[test]
+fn reshape_allocated_zero_size_source_preserves_allocatable_result() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=reshape_allocated_zero_size_source_preserves_allocatable_result count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine build(out)\n    real(8), allocatable, intent(out) :: out(:, :)\n    real(8), allocatable :: source(:)\n    allocate(source(0))\n    allocate(out(2, 0))\n    out = reshape(source, shape(out))\n    if (.not. allocated(out)) error stop 1\n    if (size(out, 1) /= 2 .or. size(out, 2) /= 0) error stop 2\n    deallocate(source)\n  end subroutine build\nend module m\nprogram p\n  use m, only : build\n  implicit none\n  real(8), allocatable :: out(:, :)\n  call build(out)\n  if (.not. allocated(out)) error stop 3\n  if (size(out, 1) /= 2 .or. size(out, 2) /= 0) error stop 4\n  deallocate(out)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("reshape_zero_size_source", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero-size RESHAPE source compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero-size RESHAPE source compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("zero-size RESHAPE source run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "zero-size RESHAPE source run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn empty_typed_derived_constructor_actual_to_assumed_shape_dummy_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
