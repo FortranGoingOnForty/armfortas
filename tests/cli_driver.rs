@@ -39676,6 +39676,44 @@ fn formatted_write_of_concat_string_runs() {
 }
 
 #[test]
+fn print_routes_derived_function_results_through_defined_io() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=print_routes_derived_function_results_through_defined_io count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module print_dtio_m\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface make\n    module procedure make_box\n  end interface\n  interface write(formatted)\n    module procedure write_box\n  end interface\ncontains\n  function make_box(value) result(box)\n    integer, intent(in) :: value\n    type(box_t) :: box\n    box%value = value\n  end function\n  subroutine write_box(box, unit, iotype, v_list, iostat, iomsg)\n    type(box_t), intent(in) :: box\n    integer, intent(in) :: unit\n    character(*), intent(in) :: iotype\n    integer, intent(in) :: v_list(:)\n    integer, intent(out) :: iostat\n    character(*), intent(inout) :: iomsg\n    write(unit, '(a,i0)', iostat=iostat, iomsg=iomsg) 'BOX=', box%value\n  end subroutine\nend module\nprogram p\n  use print_dtio_m, only: box_t, make, write(formatted)\n  implicit none\n  print '(dt)', make(42)\n  print *, make(7)\nend program\n",
+        "f90",
+    );
+    let out = unique_path("print_derived_function_dtio", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("PRINT defined-I/O function-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "PRINT defined-I/O function-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("PRINT defined-I/O function-result run failed to spawn");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("BOX=42") && stdout.contains("BOX=7"),
+        "PRINT did not route derived function results through defined I/O: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_write_of_concat_with_internal_char_function_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

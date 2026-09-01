@@ -4706,7 +4706,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // 'area = ', area(r)` printed E-notation in every real program
             // that prints a computed value.
             let is_formatted = is_formatted_format_expr(ctx, format);
+            let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(b, ctx, None, true);
+            let (iomsg_arg, iomsg_ptr, iomsg_len) = scratch_char_buffer_arg(b);
             if is_formatted {
+                let explicit_dtio_edits = explicit_defined_io_edits(ctx, format, items.len());
+                if try_lower_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    Some("DT"),
+                    explicit_dtio_edits.as_deref(),
+                    iostat_ptr,
+                    Some((iomsg_arg, iomsg_len)),
+                ) {
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        None,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        false,
+                    );
+                    return;
+                }
                 let null_i64 = b.const_i64(0);
                 let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
                 let zero_i64 = b.const_i64(0);
@@ -4734,6 +4759,52 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             } else {
+                if try_lower_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    Some("LISTDIRECTED"),
+                    None,
+                    iostat_ptr,
+                    Some((iomsg_arg, iomsg_len)),
+                ) {
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        None,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        false,
+                    );
+                    return;
+                }
+                let advance = b.const_i32(1);
+                if try_lower_mixed_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    Some("LISTDIRECTED"),
+                    advance,
+                    iostat_ptr,
+                    Some((iomsg_arg, iomsg_len)),
+                    (iomsg_ptr, iomsg_len),
+                ) {
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        None,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        false,
+                    );
+                    return;
+                }
                 lower_write_items(b, ctx, items, unit);
             }
         }
