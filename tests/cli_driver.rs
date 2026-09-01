@@ -62368,6 +62368,44 @@ fn fixed_len_one_allocatable_character_scalar_supports_assignment_and_substrings
     let _ = std::fs::remove_file(&src);
 }
 
+#[test]
+fn external_read_targets_scalar_allocatable_integer_payloads() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=external_read_targets_scalar_allocatable_integer_payloads count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: cache_t\n    integer(8), allocatable :: digest\n  end type cache_t\n  type(cache_t) :: cache\n  integer(8), allocatable :: direct\n  integer :: unit, ios\n  integer(8), parameter :: expected = 1234567890123_8\n\n  allocate(cache%digest, direct)\n  cache%digest = -1_8\n  direct = -2_8\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, *) expected\n  write(unit, *) expected + 1_8\n  rewind(unit)\n  read(unit, *, iostat=ios) cache%digest\n  if (ios /= 0) error stop 1\n  read(unit, *, iostat=ios) direct\n  close(unit)\n  if (ios /= 0) error stop 2\n  if (.not. allocated(cache%digest)) error stop 3\n  if (.not. allocated(direct)) error stop 4\n  if (cache%digest /= expected) error stop 5\n  if (direct /= expected + 1_8) error stop 6\n  deallocate(cache%digest, direct)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("read_scalar_allocatable_integer_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar allocatable integer component read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar allocatable integer component read compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar allocatable integer component read failed to run");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "scalar allocatable integer component read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
 // ---- Sprint l00: --std=f2023 wiring ----
 
 #[test]

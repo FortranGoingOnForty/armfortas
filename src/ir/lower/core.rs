@@ -36911,7 +36911,12 @@ pub(super) fn lower_read_target_addr(
             if local_is_array_like(info) {
                 return None;
             }
-            let addr = if info.by_ref {
+            let addr = if info.allocatable && !matches!(info.char_kind, CharKind::Deferred) {
+                // Rank-0 intrinsic allocatables use the same descriptor as
+                // arrays.  A READ item designates the allocated scalar, not
+                // its descriptor header, so transfer into base_addr.
+                array_base_addr(b, info)
+            } else if info.by_ref {
                 b.load(info.addr)
             } else {
                 info.addr
@@ -36957,8 +36962,22 @@ pub(super) fn lower_read_target_addr(
             }
             let offset = b.const_i64(field.offset as i64);
             let field_ptr = b.gep(base_addr, vec![offset], IrType::Int(IntWidth::I8));
+            let ty = type_info_to_ir_type(&field.type_info);
+            let target_ptr = if field.allocatable
+                && field.size == 392
+                && field.dims.is_empty()
+                && !field.declared_array
+            {
+                // Scalar allocatable components also occupy a 392-byte array
+                // descriptor.  Passing field_ptr to afs_read_* overwrites its
+                // base_addr with the input value; load base_addr so the input
+                // is written to the component payload instead.
+                b.load_typed(field_ptr, IrType::Ptr(Box::new(ty.clone())))
+            } else {
+                field_ptr
+            };
             let logical = field_logical_kind(field).is_some();
-            Some((field_ptr, type_info_to_ir_type(&field.type_info), logical))
+            Some((target_ptr, ty, logical))
         }
         _ => None,
     }
