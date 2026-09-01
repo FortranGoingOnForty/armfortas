@@ -58775,7 +58775,7 @@ pub(super) fn expr_is_array_designator(
                     local_is_array_like(info)
                         && (!info.dims.is_empty() || local_uses_array_descriptor(info))
                 } else {
-                    !info.dims.is_empty() || local_uses_array_descriptor(info)
+                    local_is_array_like(info)
                 }
             })
             .unwrap_or(false),

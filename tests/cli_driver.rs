@@ -61064,6 +61064,44 @@ fn class_star_character_elements_preserve_dynamic_type() {
 }
 
 #[test]
+fn select_type_character_scalar_is_a_valid_output_item() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_type_character_scalar_is_a_valid_output_item count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module select_type_character_output_m\n  implicit none\ncontains\n  function make_text() result(value)\n    character(len=:), allocatable :: value\n    value = 'Another value'\n  end function make_text\nend module select_type_character_output_m\nprogram p\n  use select_type_character_output_m\n  implicit none\n  class(*), allocatable :: data\n  character(len=64) :: line\n  data = make_text()\n  select type (data)\n  type is (character(*))\n    print *, 'Value is = ', data\n    write(line, '(a)') data\n    if (trim(line) /= 'Another value') error stop 1\n  class default\n    error stop 2\n  end select\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("select_type_character_output", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("SELECT TYPE character output repro compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "SELECT TYPE character scalar should compile as an output item: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("SELECT TYPE character output repro failed to run");
+    assert!(
+        run.status.success(),
+        "SELECT TYPE character output repro failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Another value"));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn character_star_parameter_array_constructor_hidden_len_uses_element_len() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
