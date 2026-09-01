@@ -277,7 +277,7 @@ impl<'a> Ctx<'a> {
     /// construct. Associate-names alias their selector and shadow any
     /// USE-imported or host-scope symbol with the same name within the
     /// construct body.
-    fn is_associate_name(&self, name: &str) -> bool {
+    pub(super) fn is_associate_name(&self, name: &str) -> bool {
         let key = name.to_lowercase();
         self.associate_frames
             .iter()

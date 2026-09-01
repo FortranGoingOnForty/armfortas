@@ -281,6 +281,13 @@ pub(super) fn validate_pure_call(
     let Some(name) = extract_base_name(callee) else {
         return;
     };
+    // ASSOCIATE and SELECT TYPE names live in validator-side lexical frames,
+    // not the procedure symbol table. Parenthesized references to those data
+    // objects are array subscripts, even when the selector is unlimited
+    // polymorphic, and therefore carry no procedure-purity contract.
+    if ctx.is_associate_name(&name) || ctx.is_block_local_name(&name) {
+        return;
+    }
     if resolved_intrinsic_name(ctx, &name).is_some() {
         return;
     }

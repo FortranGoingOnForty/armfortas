@@ -243,6 +243,52 @@ end module callbacks
 }
 
 #[test]
+fn pure_array_associate_names_are_not_treated_as_calls() {
+    let dir = unique_dir("array_associate_names");
+    let source = write_source(
+        &dir,
+        "\
+module associate_arrays
+contains
+  pure integer function first_integer(values) result(value)
+    class(*), intent(in) :: values(:)
+    select type (items => values)
+    type is (integer)
+      value = items(1)
+    class default
+      value = -1
+    end select
+  end function first_integer
+
+  pure integer function first_alias(values) result(value)
+    integer, intent(in) :: values(:)
+    associate (items => values)
+      value = items(1)
+    end associate
+  end function first_alias
+end module associate_arrays
+",
+    );
+    let object = dir.join("associate-arrays.o");
+    let compile = Command::new(compiler())
+        .args([
+            "-O0",
+            "-c",
+            source.to_str().unwrap(),
+            "-o",
+            object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn armfortas");
+    assert!(
+        compile.status.success(),
+        "array associate names in PURE procedures should remain data references:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn pure_contract_survives_separate_module_compilation() {
     for (prefix, should_succeed) in [("pure ", true), ("", false)] {
         let dir = unique_dir(if should_succeed {
