@@ -13309,6 +13309,64 @@ end program
 }
 
 #[test]
+fn all_over_zero_size_array_comparison_returns_true() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=all_over_zero_size_array_comparison_returns_true count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Fortran's ALL identity is true. Stdlib's Matrix Market tests compare
+    // matching allocated zero-size COO arrays; their logical comparison
+    // temporary has a null payload by design, but is still a valid array.
+    let src = write_program(
+        r#"
+program p
+  implicit none
+  integer, allocatable :: rank1_a(:), rank1_b(:)
+  integer, allocatable :: rank2_a(:, :), rank2_b(:, :)
+
+  allocate(rank1_a(0), rank1_b(0))
+  allocate(rank2_a(2, 0), rank2_b(2, 0))
+  if (.not. all(rank1_a == rank1_b)) error stop 1
+  if (.not. all(rank2_a == rank2_b)) error stop 2
+  if (.not. (all(rank2_a == rank2_b) .and. all(rank1_a == rank1_b))) error stop 3
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("all_zero_size_comparison", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("zero-size ALL comparison compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "zero-size ALL comparison should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("zero-size ALL comparison run failed");
+    assert!(
+        run.status.success(),
+        "zero-size ALL comparison should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected zero-size ALL comparison output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn maxloc_dim_returns_per_slice_indices_without_scalar_broadcast() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

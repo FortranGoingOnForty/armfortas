@@ -3753,6 +3753,33 @@ mod tests {
     }
 
     #[test]
+    fn logical_reductions_use_identities_for_zero_size_arrays() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let dims = [
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 2,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 0,
+                stride: 2,
+            },
+        ];
+        afs_allocate_array(&mut desc, 1, 2, dims.as_ptr(), ptr::null_mut());
+
+        assert!(desc.is_allocated());
+        assert_eq!(desc.total_elements(), 0);
+        assert!(desc.base_addr.is_null());
+        assert_eq!(afs_array_all_logical(&desc), 1);
+        assert_eq!(afs_array_any_logical(&desc), 0);
+        assert_eq!(afs_array_count_logical(&desc), 0);
+
+        afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
     fn array_size_unallocated_descriptor_returns_zero() {
         let mut desc = ArrayDescriptor::zeroed();
         desc.elem_size = 4;
@@ -4243,7 +4270,7 @@ pub extern "C" fn afs_array_all_logical(desc: *const ArrayDescriptor) -> i32 {
         return 0;
     }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(d) {
         return 0;
     }
     let mut all_true = true;
