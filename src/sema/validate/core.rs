@@ -11223,6 +11223,9 @@ fn validate_character_intrinsic_call(
 
 pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
     let key = name.to_ascii_lowercase();
+    if ctx.is_associate_name(&key) || ctx.is_block_local_name(&key) {
+        return None;
+    }
     if let Some(symbol) = ctx.lookup_lexical(&key) {
         if !symbol.attrs.external
             && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
@@ -11372,8 +11375,11 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
 }
 
 fn intrinsic_name_is_shadowed(ctx: &Ctx<'_>, name: &str) -> bool {
-    ctx.lookup_lexical(name)
-        .is_some_and(|symbol| !symbol.attrs.intrinsic)
+    ctx.is_associate_name(name)
+        || ctx.is_block_local_name(name)
+        || ctx
+            .lookup_lexical(name)
+            .is_some_and(|symbol| !symbol.attrs.intrinsic)
         || !ctx.lookup_lexical_named_interfaces(name).is_empty()
 }
 
@@ -14002,6 +14008,22 @@ end program
                 .any(|err| err.contains("intrinsic 'scale' takes")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn associate_array_name_shadows_intrinsic_contract() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: coordinates(2, 2), row
+  associate (index => coordinates)
+    row = index(1, 2)
+  end associate
+end program p
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]

@@ -47521,6 +47521,43 @@ end program
 }
 
 #[test]
+fn associate_array_named_index_shadows_character_intrinsic() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=associate_array_named_index_shadows_character_intrinsic count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: coordinates(2, 2), total\n  coordinates(1, 1) = 11\n  coordinates(2, 1) = 21\n  coordinates(1, 2) = 12\n  coordinates(2, 2) = 22\n  associate (index => coordinates)\n    total = index(1, 1) + index(2, 1) + index(1, 2) + index(2, 2)\n  end associate\n  if (total /= 66) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("associate_array_index_shadow", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("associate-array intrinsic-shadow compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "associate array named INDEX was treated as the intrinsic: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("associate-array intrinsic-shadow run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "associate-array intrinsic-shadow run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn nested_imported_generic_result_rank_dispatches_outer_call() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
