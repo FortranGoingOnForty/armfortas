@@ -1281,6 +1281,10 @@ pub(super) fn resolve_unit(
                         if let Some(proc_scope) = find_unit_scope(st, interface_scope, &sub.node) {
                             let bind_c = st.scope(proc_scope).bind_c;
                             let binding_label = st.scope(proc_scope).binding_label.clone();
+                            let resolved_result_type = st
+                                .scope(proc_scope)
+                                .procedure_result_symbol()
+                                .and_then(|result| result.type_info.clone());
                             let (name, kind) = match &sub.node {
                                 ProgramUnit::Function { name, .. } => (name, SymbolKind::Function),
                                 ProgramUnit::Subroutine { name, .. } => {
@@ -1293,6 +1297,17 @@ pub(super) fn resolve_unit(
                             }) {
                                 outer_ref.bind_c = bind_c;
                                 outer_ref.binding_label = binding_label;
+                                // Kind selectors in an interface body's result declaration may
+                                // depend on a USE statement local to that body. The preliminary
+                                // outer reference is collected before those USE statements are
+                                // processed, so refresh it from the resolved result entity. This
+                                // is ABI-relevant state that must survive into the module symbol
+                                // and its .amod record.
+                                if kind == SymbolKind::Function {
+                                    if let Some(type_info) = resolved_result_type {
+                                        outer_ref.type_info = Some(type_info);
+                                    }
+                                }
                             }
                         }
                     }

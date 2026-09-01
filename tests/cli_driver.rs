@@ -35816,6 +35816,116 @@ end program p
 }
 
 #[test]
+fn abstract_interface_result_kind_survives_separate_compilation() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=abstract_interface_result_kind_survives_separate_compilation count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("abstract_interface_result_kind");
+    let precision = write_program_in(
+        &dir,
+        "precision.f90",
+        "module precision_m\n  implicit none\n  integer, parameter :: rp = 8\nend module precision_m\n",
+    );
+    let api = write_program_in(
+        &dir,
+        "api.f90",
+        "module callback_api\n  implicit none\n  private\n  public :: apply\n  abstract interface\n    function callback(x, args) result(f)\n      use precision_m, only: rp\n      implicit none\n      real(rp), intent(in) :: x\n      real(rp), intent(in) :: args(:)\n      real(rp) :: f\n    end function callback\n  end interface\ncontains\n  function apply(fun, args) result(value)\n    use precision_m, only: rp\n    implicit none\n    procedure(callback) :: fun\n    real(rp), intent(in) :: args(:)\n    real(rp) :: value\n    value = fun(args(1), args)\n  end function apply\nend module callback_api\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "module callback_impl\n  use precision_m, only: rp\n  use callback_api, only: apply\n  implicit none\ncontains\n  function evaluate(x, args) result(f)\n    real(rp), intent(in) :: x\n    real(rp), intent(in) :: args(:)\n    real(rp) :: f\n    f = x + sum(args)\n  end function evaluate\n\n  subroutine run\n    real(rp) :: value\n    value = apply(evaluate, [1.0_rp, 2.0_rp])\n    if (abs(value - 4.0_rp) > 1.0e-12_rp) error stop 1\n  end subroutine run\nend module callback_impl\n\nprogram p\n  use callback_impl, only: run\n  implicit none\n  call run\n  print *, 'ok'\nend program p\n",
+    );
+
+    let precision_object = dir.join("precision.o");
+    let precision_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            precision.to_str().unwrap(),
+            "-o",
+            precision_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("precision provider compile failed to spawn");
+    assert!(
+        precision_result.status.success(),
+        "precision provider should compile: {}",
+        String::from_utf8_lossy(&precision_result.stderr)
+    );
+
+    let api_object = dir.join("api.o");
+    let api_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            api.to_str().unwrap(),
+            "-o",
+            api_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callback API compile failed to spawn");
+    assert!(
+        api_result.status.success(),
+        "callback API should compile: {}",
+        String::from_utf8_lossy(&api_result.stderr)
+    );
+    let amod = fs::read_to_string(dir.join("callback_api.amod"))
+        .expect("callback API did not publish its .amod");
+    assert!(
+        amod.contains("@function callback -> real(8)"),
+        "abstract-interface result kind was not serialized concretely:\n{amod}"
+    );
+
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            api_object.to_str().unwrap(),
+            precision_object.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callback consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "compatible callback should compile across translation units: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("callback consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "callback consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn procedure_pointer_decl_compiles_through_wrapper_calls() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
