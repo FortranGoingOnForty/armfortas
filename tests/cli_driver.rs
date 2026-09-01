@@ -48282,6 +48282,42 @@ fn scope_local_named_kinds_do_not_bleed_across_sibling_functions() {
 }
 
 #[test]
+fn small_integer_intrinsics_preserve_operand_widths() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=small_integer_intrinsics_preserve_operand_widths count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module small_int_intrinsics\n  implicit none\n  integer, parameter :: i1 = selected_int_kind(2)\n  integer, parameter :: i2 = selected_int_kind(4)\ncontains\n  pure integer function check_i1(val) result(status)\n    integer(i1), intent(in) :: val\n    integer(i1) :: n\n    n = abs(val)\n    if (n /= 7_i1) then\n      status = 1\n    else if (sign(3_i1, val) /= -3_i1) then\n      status = 2\n    else if (modulo(-7_i1, 4_i1) /= 1_i1) then\n      status = 3\n    else\n      status = 0\n    end if\n  end function\n  pure integer function check_i2(val) result(status)\n    integer(i2), intent(in) :: val\n    integer(i2) :: n\n    n = abs(val)\n    if (n /= 257_i2) then\n      status = 4\n    else if (sign(11_i2, val) /= -11_i2) then\n      status = 5\n    else if (modulo(-257_i2, 100_i2) /= 43_i2) then\n      status = 6\n    else\n      status = 0\n    end if\n  end function\nend module\nprogram p\n  use small_int_intrinsics\n  implicit none\n  if (check_i1(-7_i1) /= 0) error stop 1\n  if (check_i2(-257_i2) /= 0) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("small_integer_intrinsic_widths", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("small-integer intrinsic repro compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "small-integer intrinsic repro should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "small-integer intrinsic repro should run:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok output, got: {}", stdout);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_deferred_char_function_inside_concat_uses_hidden_result_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
