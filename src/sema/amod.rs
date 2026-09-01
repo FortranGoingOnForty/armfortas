@@ -21,7 +21,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 13;
+const AMOD_VERSION: u32 = 14;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
@@ -292,6 +292,35 @@ fn resolved_module_nature(scope: &Scope) -> UseNature {
     } else {
         UseNature::NonIntrinsic
     }
+}
+
+fn module_nature_token(nature: UseNature) -> &'static str {
+    match nature {
+        UseNature::Normal => "normal",
+        UseNature::Intrinsic => "intrinsic",
+        UseNature::NonIntrinsic => "non_intrinsic",
+    }
+}
+
+fn procedure_interface_import(
+    st: &SymbolTable,
+    procedure_scope: &Scope,
+    interface_name: &str,
+) -> Option<UseRename> {
+    let association = procedure_scope
+        .use_associations
+        .iter()
+        .find(|association| association.local_name.eq_ignore_ascii_case(interface_name))?;
+    let source_scope = st.scope(association.source_scope);
+    let ScopeKind::Module(source_module) = &source_scope.kind else {
+        return None;
+    };
+    Some(UseRename {
+        local: association.local_name.clone(),
+        original: association.original_name.clone(),
+        source_module: source_module.to_ascii_lowercase(),
+        source_nature: resolved_module_nature(source_scope),
+    })
 }
 
 fn format_module_reference(module_name: &str, nature: UseNature) -> String {
@@ -1003,11 +1032,23 @@ fn emit_procedure(
         if sym.attrs.pointer {
             write!(out, ", result_pointer").unwrap();
         }
-        if let Some(interface_name) = result_var
+        let result_interface_name = result_var
             .filter(|result| result.kind == SymbolKind::ProcedurePointer)
-            .and_then(|result| result.attrs.procedure_iface.as_deref())
-        {
+            .and_then(|result| result.attrs.procedure_iface.as_deref());
+        if let Some(interface_name) = result_interface_name {
             write!(out, ", result_procedure={interface_name}").unwrap();
+        }
+        if let Some(import) = result_interface_name.and_then(|interface_name| {
+            proc_scope.and_then(|scope| procedure_interface_import(st, scope, interface_name))
+        }) {
+            write!(
+                out,
+                ", result_procedure_original={}, result_procedure_module={}, result_procedure_nature={}",
+                import.original,
+                import.source_module,
+                module_nature_token(import.source_nature)
+            )
+            .unwrap();
         }
         if sym.attrs.result_rank > 0 {
             write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
@@ -1200,6 +1241,26 @@ fn emit_procedure(
                     .map(|n| format!("procedure({})", n));
                 if let Some(s) = proc_iface_attr.as_ref() {
                     arg_attrs.push(s.as_str());
+                }
+                let proc_iface_import_attrs = arg_sym
+                    .attrs
+                    .procedure_iface
+                    .as_deref()
+                    .and_then(|interface_name| {
+                        procedure_interface_import(st, pscope, interface_name)
+                    })
+                    .map(|import| {
+                        vec![
+                            format!("procedure_original={}", import.original),
+                            format!("procedure_module={}", import.source_module),
+                            format!(
+                                "procedure_nature={}",
+                                module_nature_token(import.source_nature)
+                            ),
+                        ]
+                    });
+                if let Some(import_attrs) = proc_iface_import_attrs.as_ref() {
+                    arg_attrs.extend(import_attrs.iter().map(String::as_str));
                 }
                 // Sprint35-SMP Phase 1: emit the dummy's rank so SMP-body
                 // synthesis on the consumer side can rebuild a same-rank
@@ -1558,6 +1619,10 @@ pub struct AmodArg {
     /// the dummy name as an external symbol — see the SGGES3 / selctg
     /// failure in stdlib_lapack_eigv_gen.
     pub procedure_iface: Option<String>,
+    /// Procedure-local USE association that supplies `procedure_iface`.
+    /// Keeping this on the dummy avoids hoisting a signature dependency to
+    /// module scope, where a public-default module could re-export it.
+    pub procedure_iface_import: Option<UseRename>,
     /// True when the source dummy used DIMENSION(..). Rank alone cannot
     /// distinguish assumed-rank from a rank-one assumed-shape dummy.
     pub assumed_rank: bool,
@@ -1585,6 +1650,9 @@ pub struct AmodProc {
     /// `result_pointer` is insufficient because data pointers can also have
     /// a derived declared type.
     pub result_procedure_iface: Option<String>,
+    /// Procedure-local USE association that supplies the declared interface
+    /// for a procedure-pointer function result.
+    pub result_procedure_iface_import: Option<UseRename>,
     pub result_rank: u8,
     /// Sprint35-SMP Phase 2: the result variable's user-declared name
     /// (from `result(X)` clause). None when the result name matches
@@ -2323,6 +2391,15 @@ fn split_attrs_top_level(attrs: &str) -> Vec<String> {
     out
 }
 
+fn parse_module_nature_token(token: &str) -> Option<UseNature> {
+    match token.trim() {
+        "normal" => Some(UseNature::Normal),
+        "intrinsic" => Some(UseNature::Intrinsic),
+        "non_intrinsic" => Some(UseNature::NonIntrinsic),
+        _ => None,
+    }
+}
+
 fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> AmodProc {
     let is_func = header.starts_with("@function ");
     let rest = if is_func {
@@ -2382,6 +2459,24 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         .iter()
         .find_map(|attr| attr.strip_prefix("result_procedure="))
         .map(str::to_string);
+    let result_procedure_iface_import = result_procedure_iface.as_ref().and_then(|local| {
+        let original = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("result_procedure_original="))?;
+        let source_module = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("result_procedure_module="))?;
+        let source_nature = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("result_procedure_nature="))
+            .and_then(parse_module_nature_token)?;
+        Some(UseRename {
+            local: local.clone(),
+            original: original.to_string(),
+            source_module: source_module.to_string(),
+            source_nature,
+        })
+    });
     let result_rank = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("result_rank="))
@@ -2437,6 +2532,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_allocatable,
         result_pointer,
         result_procedure_iface,
+        result_procedure_iface_import,
         result_rank,
         result_name,
         result_array_bounds,
@@ -2510,6 +2606,24 @@ fn parse_arg(line: &str) -> AmodArg {
         let inner = attr.strip_prefix("procedure(")?;
         inner.strip_suffix(')').map(|s| s.trim().to_string())
     });
+    let procedure_iface_import = procedure_iface.as_ref().and_then(|local| {
+        let original = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("procedure_original="))?;
+        let source_module = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("procedure_module="))?;
+        let source_nature = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("procedure_nature="))
+            .and_then(parse_module_nature_token)?;
+        Some(UseRename {
+            local: local.clone(),
+            original: original.to_string(),
+            source_module: source_module.to_string(),
+            source_nature,
+        })
+    });
     let array_spec = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("array_spec="))
@@ -2532,6 +2646,7 @@ fn parse_arg(line: &str) -> AmodArg {
         hidden,
         external,
         procedure_iface,
+        procedure_iface_import,
         assumed_rank,
         rank,
         array_spec,
@@ -3418,7 +3533,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 13
+        let private = r#"#!amod 14
 # module: private_facade
 # default-access: private
 
@@ -3436,7 +3551,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 13
+        let missing = r#"#!amod 14
 # module: missing_default_access
 
 @uses provider
@@ -3822,6 +3937,8 @@ mod tests {
             "@arg values : integer, intent(inout), optional, value, descriptor, \
              allocatable, pointer, target, asynchronous, contiguous, volatile, \
              external, procedure(callback), rank=6, \
+             procedure_original=remote_callback, procedure_module=callback_shapes, \
+             procedure_nature=non_intrinsic, \
              array_spec=\"(count; 0:max(count, 1); :; 1:*; deferred; ..)\"",
         );
         assert_eq!(arg.intent, Some(Intent::InOut));
@@ -3836,6 +3953,11 @@ mod tests {
         assert!(arg.volatile);
         assert!(arg.external);
         assert_eq!(arg.procedure_iface.as_deref(), Some("callback"));
+        let arg_import = arg.procedure_iface_import.as_ref().unwrap();
+        assert_eq!(arg_import.local, "callback");
+        assert_eq!(arg_import.original, "remote_callback");
+        assert_eq!(arg_import.source_module, "callback_shapes");
+        assert_eq!(arg_import.source_nature, UseNature::NonIntrinsic);
         assert_eq!(arg.rank, 6);
         assert!(matches!(
             arg.array_spec.as_deref(),
@@ -3852,7 +3974,9 @@ mod tests {
         let mut lines = "@end function\n".lines().peekable();
         let procedure = parse_proc(
             "@function factory -> type(callback), result_pointer, \
-             result_procedure=callback, result_name=result",
+             result_procedure=callback, result_procedure_original=remote_callback, \
+             result_procedure_module=callback_shapes, \
+             result_procedure_nature=non_intrinsic, result_name=result",
             &mut lines,
         );
         assert!(procedure.result_pointer);
@@ -3861,6 +3985,11 @@ mod tests {
             procedure.result_procedure_iface.as_deref(),
             Some("callback")
         );
+        let result_import = procedure.result_procedure_iface_import.as_ref().unwrap();
+        assert_eq!(result_import.local, "callback");
+        assert_eq!(result_import.original, "remote_callback");
+        assert_eq!(result_import.source_module, "callback_shapes");
+        assert_eq!(result_import.source_nature, UseNature::NonIntrinsic);
         assert_eq!(procedure.result_name.as_deref(), Some("result"));
 
         let mut lines = "@end subroutine\n".lines().peekable();
@@ -3876,7 +4005,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 13
+            r#"#!amod 14
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -3909,7 +4038,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 13
+            r#"#!amod 14
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -3923,7 +4052,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 13
+            r#"#!amod 14
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -3957,7 +4086,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 13
+            r#"#!amod 14
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -4057,7 +4186,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 13)")
+            err.contains("incompatible .amod version 6 (compiler requires 14)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

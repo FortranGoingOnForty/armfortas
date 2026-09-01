@@ -3864,7 +3864,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 13\n", "#!amod 12\n", 1);
+        .replacen("#!amod 14\n", "#!amod 13\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3891,7 +3891,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 12 (compiler requires 13)")
+        stderr.contains("incompatible .amod version 13 (compiler requires 14)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -35999,6 +35999,121 @@ fn abstract_interface_result_kind_survives_separate_compilation() {
 }
 
 #[test]
+fn procedure_local_interface_import_survives_amod_without_reexport() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_local_interface_import_survives_amod_without_reexport count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("procedure_local_interface_import");
+    let shapes = write_program_in(
+        &dir,
+        "shapes.f90",
+        "module callback_shapes\n  implicit none\n  abstract interface\n    subroutine callback(x, value)\n      real(8), intent(in) :: x\n      real(8), intent(out) :: value\n    end subroutine callback\n  end interface\nend module callback_shapes\n",
+    );
+    let shapes_object = dir.join("shapes.o");
+    let shapes_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            shapes.to_str().unwrap(),
+            "-o",
+            shapes_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callback-shape provider compile failed to spawn");
+    assert!(
+        shapes_result.status.success(),
+        "callback-shape provider should compile: {}",
+        String::from_utf8_lossy(&shapes_result.stderr)
+    );
+
+    let api = write_program_in(
+        &dir,
+        "api.f90",
+        "module solver_api\n  implicit none\ncontains\n  subroutine apply(fun, x, value)\n    use callback_shapes, only: local_callback => callback\n    procedure(local_callback) :: fun\n    real(8), intent(in) :: x\n    real(8), intent(out) :: value\n    call fun(x, value)\n  end subroutine apply\n\n  function choose() result(fun)\n    use callback_shapes, only: local_callback => callback\n    procedure(local_callback), pointer :: fun\n    fun => builtin\n  end function choose\n\n  subroutine builtin(x, value)\n    real(8), intent(in) :: x\n    real(8), intent(out) :: value\n    value = x * 3.0_8\n  end subroutine builtin\nend module solver_api\n",
+    );
+    let api_object = dir.join("api.o");
+    let api_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            api.to_str().unwrap(),
+            "-o",
+            api_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("solver API compile failed to spawn");
+    assert!(
+        api_result.status.success(),
+        "solver API should compile: {}",
+        String::from_utf8_lossy(&api_result.stderr)
+    );
+    let amod = fs::read_to_string(dir.join("solver_api.amod"))
+        .expect("solver API did not publish its .amod");
+    assert!(
+        amod.contains("procedure(local_callback), procedure_original=callback, procedure_module=callback_shapes, procedure_nature=non_intrinsic"),
+        "procedure-dummy interface import was not serialized:\n{amod}"
+    );
+    assert!(
+        amod.contains("result_procedure=local_callback, result_procedure_original=callback, result_procedure_module=callback_shapes, result_procedure_nature=non_intrinsic"),
+        "procedure-result interface import was not serialized:\n{amod}"
+    );
+    assert!(
+        !amod.lines().any(|line| line.starts_with("@use_only")),
+        "procedure-local signature dependency leaked into module scope:\n{amod}"
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use solver_api, only: apply, choose\n  implicit none\n  real(8) :: value\n  call apply(actual, 4.0_8, value)\n  if (abs(value - 5.0_8) > 1.0e-12_8) error stop 1\n  call apply(choose(), 4.0_8, value)\n  if (abs(value - 12.0_8) > 1.0e-12_8) error stop 2\n  print *, 'ok'\ncontains\n  subroutine actual(x, result)\n    real(8), intent(in) :: x\n    real(8), intent(out) :: result\n    result = x + 1.0_8\n  end subroutine actual\nend program p\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            api_object.to_str().unwrap(),
+            shapes_object.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("solver consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "procedure-local interface imports should resolve across translation units: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("solver consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "solver consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn procedure_pointer_decl_compiles_through_wrapper_calls() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -38285,7 +38400,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 13\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 14\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))
