@@ -1730,9 +1730,23 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     .filter(|symbol| matches!(symbol.kind, SymbolKind::DerivedType))
                     .map(|symbol| symbol.name.clone());
                 if let Some(type_name) = derived_constructor {
-                    validate_structure_constructor_component_access(
-                        ctx, expr.span, &type_name, args,
-                    );
+                    let interfaces = ctx.lookup_lexical_named_interfaces(name);
+                    let resolves_generic = !interfaces.is_empty()
+                        && matches!(
+                            resolve_generic_procedure_interface(
+                                ctx,
+                                name,
+                                args,
+                                DirectProcedureKind::Function,
+                                &interfaces,
+                            ),
+                            ExplicitInterfaceResolution::Resolved(_)
+                        );
+                    if !resolves_generic {
+                        validate_structure_constructor_component_access(
+                            ctx, expr.span, &type_name, args,
+                        );
+                    }
                 }
                 let enum_ctor = ctx.lookup(name).and_then(|sym| {
                     matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
@@ -11806,6 +11820,41 @@ end module foreign_extension
             .count();
         assert_eq!(inaccessible, 8, "{errors:?}");
         assert_eq!(errors.len(), 8, "{errors:?}");
+    }
+
+    #[test]
+    fn same_named_generic_bypasses_private_structure_constructor_checks() {
+        let errors = errors_from(
+            "\
+module string_owner
+  implicit none
+  private
+  public :: string_type
+  type :: string_type
+    private
+    character(len=:), allocatable :: raw
+  end type string_type
+  interface string_type
+    module procedure new_string
+  end interface string_type
+contains
+  function new_string(text) result(value)
+    character(len=*), intent(in) :: text
+    type(string_type) :: value
+    value%raw = text
+  end function new_string
+end module string_owner
+
+program consumer
+  use string_owner, only: string_type
+  implicit none
+  type(string_type) :: value
+  value = string_type('ok')
+end program consumer
+",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
