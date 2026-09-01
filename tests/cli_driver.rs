@@ -29608,6 +29608,55 @@ fn complex_dp_array_constructor_preserves_imaginary_lane_in_assignment() {
 }
 
 #[test]
+fn array_constructor_assignment_evaluates_overlapping_rhs_first() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_constructor_assignment_evaluates_overlapping_rhs_first count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §10.2.1.3 requires the complete RHS to be evaluated before
+    // any part of the LHS is defined. PRIMA's HYPOTENUSE helper uses the
+    // reduction form below. Directly streaming constructor elements into y
+    // changed y(1) before MAXVAL evaluated, collapsing both results to the
+    // original minimum. The indexed permutation exercises the same rule
+    // without relying on reduction lowering.
+    let src = write_program(
+        "program t\n  implicit none\n  real(8) :: y(2)\n  integer :: i(3)\n  y = [3.0_8, 1.0_8]\n  y = [minval(y), maxval(y)]\n  if (any(abs(y - [1.0_8, 3.0_8]) > 1.0e-12_8)) error stop 1\n  i = [1, 2, 3]\n  i = [i(3), i(2), i(1)]\n  if (any(i /= [3, 2, 1])) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("array_constructor_overlap", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("overlapping array constructor compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "overlapping array constructor should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("overlapping array constructor run failed");
+    assert!(
+        run.status.success(),
+        "overlapping array constructor should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected overlapping array constructor output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn nested_array_constructor_into_allocatable_rank1_flattens_full_size() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

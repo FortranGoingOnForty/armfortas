@@ -53370,36 +53370,44 @@ pub(super) fn lower_array_assign(
                 }
             }
         }
-        let dest_base = array_base_addr(b, dest_info);
-        if let CharKind::Fixed(len) = dest_info.char_kind {
-            store_char_ac_values_into(
-                b,
-                &ctx.locals,
-                dest_base,
-                len,
-                values,
-                ctx.st,
-                Some(ctx.type_layouts),
-                Some(ctx.internal_funcs),
-                Some(ctx.contained_host_refs),
-                Some(ctx.descriptor_params),
-            );
-        } else {
-            store_ac_values_into(
-                b,
-                &ctx.locals,
-                dest_base,
-                &dest_info.ty,
-                dest_info.derived_type.as_deref(),
-                values,
-                ctx.st,
-                Some(ctx.type_layouts),
-                Some(ctx.internal_funcs),
-                Some(ctx.contained_host_refs),
-                Some(ctx.descriptor_params),
-            );
+        // F2018 §10.2.1.3: the RHS is fully evaluated before the LHS is
+        // defined. Streaming constructor elements directly into the LHS is
+        // only valid when none of those elements references the destination.
+        // For an overlap such as `y = [minval(y), maxval(y)]`, fall through to
+        // the descriptor path below so the complete constructor is
+        // materialized before any destination element is overwritten.
+        if dest_name.is_empty() || !expr_mentions_name(value, dest_name) {
+            let dest_base = array_base_addr(b, dest_info);
+            if let CharKind::Fixed(len) = dest_info.char_kind {
+                store_char_ac_values_into(
+                    b,
+                    &ctx.locals,
+                    dest_base,
+                    len,
+                    values,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                );
+            } else {
+                store_ac_values_into(
+                    b,
+                    &ctx.locals,
+                    dest_base,
+                    &dest_info.ty,
+                    dest_info.derived_type.as_deref(),
+                    values,
+                    ctx.st,
+                    Some(ctx.type_layouts),
+                    Some(ctx.internal_funcs),
+                    Some(ctx.contained_host_refs),
+                    Some(ctx.descriptor_params),
+                );
+            }
+            return;
         }
-        return;
     }
 
     if try_lower_char_array_expr_assign(b, ctx, dest_name, dest_info, value) {
