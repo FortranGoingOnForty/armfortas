@@ -10576,6 +10576,119 @@ end program
 }
 
 #[test]
+fn kind_inquiry_of_named_kind_literal_preserves_callback_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=kind_inquiry_of_named_kind_literal_preserves_callback_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("kind_inquiry_named_literal_callback");
+    let api = write_program_in(
+        &dir,
+        "api.f90",
+        r#"
+module callback_api
+  implicit none
+  abstract interface
+    subroutine callback(x)
+      real(8), intent(in) :: x(:)
+    end subroutine callback
+  end interface
+contains
+  subroutine invoke(fun)
+    procedure(callback) :: fun
+    real(8) :: x(1)
+    x = 2.0_8
+    call fun(x)
+  end subroutine invoke
+end module callback_api
+"#,
+    );
+    let api_object = dir.join("api.o");
+    let api_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            api.to_str().unwrap(),
+            "-o",
+            api_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callback API compile failed to spawn");
+    assert!(
+        api_result.status.success(),
+        "callback API should compile: {}",
+        String::from_utf8_lossy(&api_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        r#"
+module callback_impl
+  implicit none
+  integer, parameter :: RP = kind(0.0d0)
+  integer, parameter :: KP = kind(1.0_RP)
+contains
+  subroutine actual(x)
+    real(kind(1.0_RP)), intent(in) :: x(:)
+    print *, 'ok'
+  end subroutine actual
+end module callback_impl
+
+program p
+  use callback_api, only: invoke
+  use callback_impl, only: actual
+  implicit none
+  call invoke(actual)
+end program p
+"#,
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-O0",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            api_object.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("callback consumer compile failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "KIND(1.0_RP) must retain RP when declaring the callback dummy: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let amod = fs::read_to_string(dir.join("callback_impl.amod"))
+        .expect("callback implementation did not publish its .amod");
+    assert!(
+        amod.contains("@param kp : integer = 8") && amod.contains("@arg x : real(8)"),
+        "literal KIND inquiries did not preserve the named kind suffix:\n{amod}"
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("callback consumer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "callback consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scalar_allocatable_component_actuals_pass_payloads() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

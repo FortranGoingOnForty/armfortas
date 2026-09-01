@@ -2475,15 +2475,29 @@ fn eval_const_int_expr_with_params(
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                         return None;
                     };
+                    let literal_kind = |kind: &Option<String>, default| match kind.as_deref() {
+                        Some(name) => name
+                            .parse::<i64>()
+                            .ok()
+                            .or_else(|| const_params.get(&name.to_lowercase()).copied()),
+                        None => Some(default),
+                    };
                     match &e.node {
-                        Expr::RealLiteral { text, .. } => {
-                            Some(if text.contains('d') || text.contains('D') {
+                        Expr::RealLiteral { text, kind } => literal_kind(
+                            kind,
+                            if text.contains('d') || text.contains('D') {
                                 8
                             } else {
-                                4
-                            })
+                                i64::from(crate::driver::defaults::default_real_kind())
+                            },
+                        ),
+                        Expr::IntegerLiteral { kind, .. } | Expr::LogicalLiteral { kind, .. } => {
+                            literal_kind(
+                                kind,
+                                i64::from(crate::driver::defaults::default_int_kind()),
+                            )
                         }
-                        Expr::IntegerLiteral { .. } => Some(4),
+                        Expr::StringLiteral { kind, .. } => literal_kind(kind, 1),
                         _ => None,
                     }
                 }
@@ -3924,15 +3938,38 @@ pub(super) fn eval_const_int_expr_in_scope(
                     "kind" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                let literal_kind =
+                                    |kind: &Option<String>, default| match kind.as_deref() {
+                                        Some(name) => name.parse::<i64>().ok().or_else(|| {
+                                            st.lookup_in(scope_id, &name.to_lowercase())
+                                                .filter(|symbol| symbol.attrs.parameter)
+                                                .and_then(|symbol| symbol.const_value)
+                                        }),
+                                        None => Some(default),
+                                    };
                                 match &e.node {
-                                    Expr::RealLiteral { text, .. } => {
-                                        Some(if text.contains('d') || text.contains('D') {
+                                    Expr::RealLiteral { text, kind } => literal_kind(
+                                        kind,
+                                        if text.contains('d') || text.contains('D') {
                                             8
                                         } else {
-                                            4
-                                        })
-                                    }
-                                    Expr::IntegerLiteral { .. } => Some(4),
+                                            i64::from(crate::driver::defaults::default_real_kind())
+                                        },
+                                    ),
+                                    Expr::IntegerLiteral { kind, .. }
+                                    | Expr::LogicalLiteral { kind, .. } => literal_kind(
+                                        kind,
+                                        i64::from(crate::driver::defaults::default_int_kind()),
+                                    ),
+                                    Expr::StringLiteral { kind, .. } => literal_kind(kind, 1),
+                                    Expr::Name { name } => st
+                                        .lookup_in(scope_id, &name.to_lowercase())
+                                        .and_then(|symbol| symbol.type_info.as_ref())
+                                        .and_then(|type_info| {
+                                            crate::sema::types::type_info_to_fortran_type(type_info)
+                                                .kind()
+                                                .map(i64::from)
+                                        }),
                                     _ => None,
                                 }
                             } else {
