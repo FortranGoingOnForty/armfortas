@@ -12281,11 +12281,14 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
             vec![desc],
             IrType::Int(IntWidth::I32),
         );
-        if name == "count" {
-            return Some(raw);
-        }
-        let zero = b.const_i32(0);
-        return Some(b.icmp(CmpOp::Ne, raw, zero));
+        let result = if name == "count" {
+            raw
+        } else {
+            let zero = b.const_i32(0);
+            b.icmp(CmpOp::Ne, raw, zero)
+        };
+        deallocate_array_expr_descriptor_if_temp(b, locals, arg0, st, desc);
+        return Some(result);
     }
 
     // F2018 §16.9.5/§16.9.6: ANY/ALL of an array-vs-scalar comparison
@@ -12460,7 +12463,14 @@ pub(super) fn lower_logical_reduction_intrinsic_ast(
                     b.branch(bb_check, vec![]);
 
                     b.set_block(bb_exit);
-                    return Some(b.load(acc_addr));
+                    let result = b.load(acc_addr);
+                    if let Some((desc, _)) = lhs {
+                        deallocate_array_expr_descriptor_if_temp(b, locals, left, st, desc);
+                    }
+                    if let Some((desc, _)) = rhs {
+                        deallocate_array_expr_descriptor_if_temp(b, locals, right, st, desc);
+                    }
+                    return Some(result);
                 }
             }
         }
@@ -31783,7 +31793,7 @@ fn array_constructor_expr_size_descriptor(
     internal_funcs: Option<&HashMap<String, u32>>,
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
-) -> Option<ValueId> {
+) -> Option<(ValueId, bool)> {
     if let Some(desc) = transformational_intrinsic_call_descriptor(
         b,
         locals,
@@ -31794,10 +31804,10 @@ fn array_constructor_expr_size_descriptor(
         contained_host_refs,
         descriptor_params,
     ) {
-        return Some(desc);
+        return Some((desc, true));
     }
     if let Some((desc, _)) = whole_array_expr_descriptor(b, locals, expr, st, type_layouts) {
-        return Some(desc);
+        return Some((desc, false));
     }
 
     match &expr.node {
@@ -31883,7 +31893,7 @@ fn array_constructor_expr_size_descriptor(
                 contained_host_refs,
                 descriptor_params,
             )
-            .map(|(desc, _)| desc)
+            .map(|(desc, _)| (desc, array_expr_descriptor_may_own_temp(expr, locals, st)))
         }
         _ => None,
     }
@@ -32121,7 +32131,7 @@ pub(super) fn lower_runtime_array_constructor_len(
                         contained_host_refs,
                         descriptor_params,
                     )?
-                } else if let Some(desc) = array_constructor_expr_size_descriptor(
+                } else if let Some((desc, owns_temp)) = array_constructor_expr_size_descriptor(
                     b,
                     locals,
                     expr,
@@ -32131,11 +32141,15 @@ pub(super) fn lower_runtime_array_constructor_len(
                     contained_host_refs,
                     descriptor_params,
                 ) {
-                    b.call(
+                    let len = b.call(
                         FuncRef::External("afs_array_size".into()),
                         vec![desc],
                         IrType::Int(IntWidth::I64),
-                    )
+                    );
+                    if owns_temp {
+                        deallocate_array_temp_descriptor(b, desc);
+                    }
+                    len
                 } else {
                     b.const_i64(1)
                 }
@@ -32336,7 +32350,9 @@ fn lower_runtime_char_array_constructor_elem_len(
                     contained_host_refs,
                     descriptor_params,
                 ) {
-                    descriptor_elem_size(b, desc)
+                    let len = descriptor_elem_size(b, desc);
+                    deallocate_array_expr_descriptor_if_temp(b, locals, expr, st, desc);
+                    len
                 } else if expr_is_character_expr(b, locals, expr, st, type_layouts) {
                     let (_, len) = lower_string_expr_full(
                         b,
@@ -32496,6 +32512,7 @@ fn store_runtime_char_ac_values_at_index(
                         src_desc,
                         zero32,
                     );
+                    deallocate_array_expr_descriptor_if_temp(b, locals, expr, st, src_desc);
                     continue;
                 }
 
@@ -32933,6 +32950,7 @@ pub(super) fn store_ac_values_at_off(
                     b.branch(bb_check, vec![]);
 
                     b.set_block(bb_exit);
+                    deallocate_array_expr_descriptor_if_temp(b, locals, e, st, src_desc);
                     continue;
                 }
 
@@ -65257,6 +65275,66 @@ end program
         assert!(
             ir.contains("call @afs_deallocate_array"),
             "expected reduction operand temporary cleanup in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_array_constructor_releases_sizing_and_copy_temporaries() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine test(x, r)
+  implicit none
+  real(8), intent(in) :: x(:)
+  real(8), intent(out) :: r
+  r = maxval([abs(x), 0.0_8])
+end subroutine
+",
+        );
+        let allocate_count = ir.matches("call @afs_allocate_like(").count()
+            + ir.matches("call @afs_allocate_array(").count();
+        let deallocate_count = ir.matches("call @afs_deallocate_array(").count();
+        assert_eq!(
+            allocate_count, 3,
+            "expected sizing, copying, and constructor allocations in:\n{}",
+            ir
+        );
+        assert_eq!(
+            deallocate_count, allocate_count,
+            "every constructor-expression allocation must be released in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_logical_reduction_releases_array_expression_temporary() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine test(x, flag)
+  implicit none
+  real(8), intent(in) :: x(:)
+  logical, intent(out) :: flag
+  flag = all(abs(x) < tiny(1.0_8))
+end subroutine
+",
+        );
+        let allocate_count = ir.matches("call @afs_allocate_like(").count()
+            + ir.matches("call @afs_allocate_like_with_elem_size(")
+                .count();
+        let deallocate_count = ir.matches("call @afs_deallocate_array(").count();
+        assert!(
+            ir.contains("call @afs_array_all_logical("),
+            "expected logical reduction runtime call in:\n{}",
+            ir
+        );
+        assert!(
+            allocate_count >= 2,
+            "expected ABS and comparison array temporaries in:\n{}",
+            ir
+        );
+        assert_eq!(
+            deallocate_count, allocate_count,
+            "every logical-reduction array temporary must be released in:\n{}",
             ir
         );
     }
