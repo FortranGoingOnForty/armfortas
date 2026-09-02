@@ -47405,6 +47405,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
     let mut loop_locals = locals.clone();
     let mut array_actuals: Vec<(String, ValueId, IrType, usize, Option<CharKind>, bool)> =
         Vec::new();
+    let mut array_actual_temps = Vec::new();
     let mut control_desc = None;
     let mut control_rank = None;
     let mut fallback_control_desc = None;
@@ -47479,6 +47480,9 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 contained_host_refs,
                 descriptor_params,
             )?;
+            if array_expr_descriptor_may_own_temp(base, locals, st) {
+                array_actual_temps.push(actual_desc);
+            }
             let actual_rank = actual_expr_rank(base, locals, st, type_layouts)
                 .unwrap_or(1)
                 .max(1);
@@ -47547,6 +47551,9 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
             contained_host_refs,
             descriptor_params,
         ) {
+            if array_expr_descriptor_may_own_temp(actual_expr, locals, st) {
+                array_actual_temps.push(actual_desc);
+            }
             let actual_rank = actual_expr_rank(actual_expr, locals, st, type_layouts)
                 .unwrap_or(1)
                 .max(1);
@@ -47898,6 +47905,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
+    deallocate_call_arg_array_temp_descriptors(b, &array_actual_temps);
     Some((result_desc, result_elem_ty))
 }
 
@@ -65415,6 +65423,38 @@ end program
         assert!(
             ir.contains("call @afs_deallocate_array"),
             "expected reduction operand temporary cleanup in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_elemental_array_call_releases_function_result_actual() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: values(4)
+  values = nint(make_values(size(values)))
+contains
+  function make_values(n) result(result_values)
+    integer, intent(in) :: n
+    real(8) :: result_values(max(n, 0))
+    result_values = 1.0_8
+  end function
+end program
+",
+        );
+        let caller = ir
+            .split("\n  func @afs_internal___prog_test_1")
+            .next()
+            .expect("expected program function");
+        let call_pos = caller
+            .find("call @afs_internal___prog_test_1")
+            .unwrap_or_else(|| panic!("expected array-result function call in:\n{}", ir));
+        let post_call = &caller[call_pos..];
+        assert!(
+            post_call.matches("call @afs_deallocate_array").count() >= 3,
+            "expected the function result, elemental result, and assignment copy to be released:\n{}",
             ir
         );
     }
