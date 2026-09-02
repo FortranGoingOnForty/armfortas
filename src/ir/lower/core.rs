@@ -52124,7 +52124,8 @@ fn try_lower_typed_char_allocatable_constructor_assign(
         return false;
     };
 
-    lower_allocatable_char_array_assign_from_desc(b, dest_desc, src_desc, None);
+    let dest_elem_len = fixed_char_allocatable_array_elem_len(b, dest_info);
+    lower_allocatable_char_array_assign_from_desc(b, dest_desc, src_desc, dest_elem_len);
     let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
     let zero32 = b.const_i32(0);
     b.store(zero32, tmp_stat);
@@ -52822,8 +52823,12 @@ pub(super) fn lower_array_assign(
                             Some(ctx.contained_host_refs),
                             Some(ctx.descriptor_params),
                         ) {
+                            let dest_elem_len = fixed_char_allocatable_array_elem_len(b, dest_info);
                             lower_allocatable_char_array_assign_from_desc(
-                                b, dest_desc, src_desc, None,
+                                b,
+                                dest_desc,
+                                src_desc,
+                                dest_elem_len,
                             );
                             let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
                             let zero32 = b.const_i32(0);
@@ -52873,8 +52878,13 @@ pub(super) fn lower_array_assign(
                                             Some(ctx.descriptor_params),
                                         )
                                     {
+                                        let dest_elem_len =
+                                            fixed_char_allocatable_array_elem_len(b, dest_info);
                                         lower_allocatable_char_array_assign_from_desc(
-                                            b, dest_desc, src_desc, None,
+                                            b,
+                                            dest_desc,
+                                            src_desc,
+                                            dest_elem_len,
                                         );
                                         let tmp_stat = b.alloca(IrType::Int(IntWidth::I32));
                                         let zero32 = b.const_i32(0);

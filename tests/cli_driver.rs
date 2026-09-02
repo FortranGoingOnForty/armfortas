@@ -60181,6 +60181,43 @@ fn allocatable_fixed_character_array_constructor_copies_trimmed_deferred_char() 
 }
 
 #[test]
+fn contained_assignment_preserves_host_fixed_character_allocatable_array_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_assignment_preserves_host_fixed_character_allocatable_array_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=15), allocatable :: name(:)\n  call assign_name()\n  if (.not. allocated(name)) error stop 1\n  if (size(name) /= 1) error stop 2\n  if (len(name) /= 15) error stop 3\n  if (trim(name(1)) /= 'my_project') error stop 4\n  if (name(1)(11:15) /= '     ') error stop 5\n  call assign_typed_name()\n  if (len(name) /= 15) error stop 6\n  if (trim(name(1)) /= 'typed') error stop 7\n  if (name(1)(6:15) /= '          ') error stop 8\n  print *, 'ok'\ncontains\n  subroutine assign_name()\n    character(len=:), allocatable :: source\n    source = 'my_project   '\n    name = [trim(source)]\n  end subroutine\n  subroutine assign_typed_name()\n    name = [character(len=5) :: 'typed']\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_host_fixed_char_alloc_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained host fixed-char allocatable array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained host fixed-char allocatable array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained host fixed-char allocatable array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained host fixed-char allocatable array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_fixed_character_array_assignment_preserves_declared_length() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
