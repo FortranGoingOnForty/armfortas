@@ -1,4 +1,5 @@
 ! Closes the l05 deferral: list-directed internal WRITE to a
+! FLAGS: --std=f2023
 ! deferred-length allocatable character scalar. Previously the
 ! fixed-buffer path saw a len-0 view for an UNALLOCATED target and
 ! produced an empty string with exit 0 — the silent wrong answer

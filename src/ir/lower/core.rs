@@ -11,6 +11,7 @@ use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
+use crate::sema::validate::FortranStandard;
 
 use crate::ast::decl::ArraySpec;
 use std::cell::RefCell;
@@ -52,6 +53,7 @@ pub fn lower_file(
     external_descriptor_params: HashMap<String, Vec<bool>>,
     external_char_len_star: HashMap<String, Vec<bool>>,
     layout: crate::target::TargetLayout,
+    standard: FortranStandard,
 ) -> (Module, HashMap<(String, String), ModuleGlobalInfo>) {
     // Some declaration forms resolve their concrete type only after sema.
     // Normalize an owned copy at the lowering boundary so every caller of
@@ -168,6 +170,7 @@ pub fn lower_file(
             st,
             &globals,
             type_layouts,
+            standard,
             &no_host,
             &no_host_param_consts,
             &no_host,
@@ -34958,6 +34961,9 @@ pub(super) fn internal_io_alloc_target(
     ctx: &LowerCtx,
     control: &crate::ast::stmt::IoControl,
 ) -> Option<ValueId> {
+    if ctx.standard < FortranStandard::F2023 {
+        return None;
+    }
     if control
         .keyword
         .as_deref()
@@ -64446,6 +64452,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             crate::target::TargetLayout::LP64,
+            FortranStandard::F2023,
         )
     }
 

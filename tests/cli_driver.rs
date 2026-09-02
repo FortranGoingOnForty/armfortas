@@ -41978,10 +41978,61 @@ fn list_directed_internal_write_tiny_real_uses_bounded_field() {
 }
 
 #[test]
-fn formatted_internal_write_reallocates_allocated_deferred_char() {
+fn formatted_internal_write_f2018_preserves_allocated_deferred_char() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_reallocates_allocated_deferred_char count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_f2018_preserves_allocated_deferred_char count=2 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 §12.4: the allocated scalar's length is the internal record
+    // length, and a short record is blank-filled without reallocating it.
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: s\n  integer :: n\n  n = 33\n  allocate(character(len=8) :: s)\n  s = repeat('?', len(s))\n  write(s, \"('S', i0)\") n\n  if (len(s) /= 8) error stop 1\n  if (s /= 'S33     ') error stop 2\n  print '(a,a,a,1x,i0)', '|', s, '|', len(s)\nend program\n",
+        "f90",
+    );
+
+    for (label, standard) in [("default", None), ("f2018", Some("--std=f2018"))] {
+        let out = unique_path(&format!("formatted_internal_alloc_char_{label}"), "bin");
+        let mut command = Command::new(compiler("armfortas"));
+        command.arg(src.to_str().unwrap());
+        if let Some(standard) = standard {
+            command.arg(standard);
+        }
+        let compile = command
+            .args(["-o", out.to_str().unwrap()])
+            .output()
+            .expect("formatted F2018 internal alloc char compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "formatted F2018 internal alloc char should compile ({label}): {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out).output().expect("run failed");
+        assert!(
+            run.status.success(),
+            "formatted F2018 internal alloc char should run ({label}): status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("|S33     | 8"),
+            "expected preserved deferred-character record ({label}), got: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn formatted_internal_write_f2023_reallocates_allocated_deferred_char() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=formatted_internal_write_f2023_reallocates_allocated_deferred_char count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -41995,7 +42046,12 @@ fn formatted_internal_write_reallocates_allocated_deferred_char() {
     );
     let out = unique_path("formatted_internal_alloc_char_len", "bin");
     let compile = Command::new(compiler("armfortas"))
-        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .args([
+            src.to_str().unwrap(),
+            "--std=f2023",
+            "-o",
+            out.to_str().unwrap(),
+        ])
         .output()
         .expect("formatted internal alloc char compile spawn failed");
     assert!(

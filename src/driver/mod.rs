@@ -2274,6 +2274,8 @@ fn compile_with_bundled_runtime_inner(
         external_descriptor_params,
         external_char_len_star,
         target_layout,
+        opts.std
+            .unwrap_or(crate::sema::validate::FortranStandard::F2018),
     );
     strip_disabled_runtime_check_calls(&mut ir_module, opts.check_bounds, opts.check_all);
     let ir_errors = verify::verify_module(&ir_module);
