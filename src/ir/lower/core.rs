@@ -56244,7 +56244,15 @@ fn lower_minmaxloc_rank1_scalar(
     b.branch(bb_check, vec![]);
 
     b.set_block(bb_exit);
-    Some(b.load(result_addr))
+    let result = b.load(result_addr);
+    if let (Some(mask_expr), Some((mask_desc, _))) = (mask_expr, mask_array.as_ref()) {
+        deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, *mask_desc);
+    }
+    // This fast path returns directly from `lower_array_intrinsic`, bypassing
+    // its common operand cleanup. Release an owning ARRAY actual here once
+    // its last element has been inspected.
+    deallocate_array_expr_descriptor_if_temp(b, locals, first_expr, st, desc);
+    Some(result)
 }
 
 fn static_array_lbound(lower: i64, extent: i64) -> i64 {
@@ -65448,6 +65456,32 @@ end program
         assert!(
             ir.contains("call @afs_deallocate_array"),
             "expected reduction operand temporary cleanup in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_rank1_minloc_releases_array_constructor() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine test(x, location)
+  implicit none
+  real(8), intent(in) :: x(:)
+  integer, intent(out) :: location
+  location = minloc([1.0_8, x], dim=1)
+end subroutine
+",
+        );
+        let allocate_count = ir.matches("call @afs_allocate_array(").count();
+        let deallocate_count = ir.matches("call @afs_deallocate_array(").count();
+        assert_eq!(
+            allocate_count, 1,
+            "expected one constructor allocation in:\n{}",
+            ir
+        );
+        assert_eq!(
+            deallocate_count, allocate_count,
+            "the MINLOC constructor must be released after the scalar result is selected:\n{}",
             ir
         );
     }
