@@ -3908,8 +3908,18 @@ pub(super) fn collect_host_refs_expr(
     sub_locals: &std::collections::HashSet<String>,
     refs: &mut std::collections::HashSet<String>,
 ) {
-    use crate::ast::expr::Expr;
+    use crate::ast::expr::{Expr, SectionSubscript};
     match &expr.node {
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::NilArgument => {}
+        Expr::ComplexLiteral { real, imag } => {
+            collect_host_refs_expr(real, host_names, sub_locals, refs);
+            collect_host_refs_expr(imag, host_names, sub_locals, refs);
+        }
         Expr::Name { name } => {
             let key = name.to_lowercase();
             if host_names.contains(&key) && !sub_locals.contains(&key) {
@@ -3932,9 +3942,21 @@ pub(super) fn collect_host_refs_expr(
             // their subexpression tree.
             collect_host_refs_expr(callee, host_names, sub_locals, refs);
             for arg in args {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
-                    collect_host_refs_expr(e, host_names, sub_locals, refs);
+                match &arg.value {
+                    SectionSubscript::Element(e) => {
+                        collect_host_refs_expr(e, host_names, sub_locals, refs);
+                    }
+                    SectionSubscript::Range { start, end, stride } => {
+                        for bound in start.iter().chain(end.iter()).chain(stride.iter()) {
+                            collect_host_refs_expr(bound, host_names, sub_locals, refs);
+                        }
+                    }
                 }
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                collect_host_refs_ac_value(value, host_names, sub_locals, refs);
             }
         }
         Expr::ComponentAccess { base, .. } => {
@@ -3943,7 +3965,39 @@ pub(super) fn collect_host_refs_expr(
         Expr::ParenExpr { inner } => {
             collect_host_refs_expr(inner, host_names, sub_locals, refs);
         }
-        _ => {}
+        Expr::ConditionalExpr {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_host_refs_expr(cond, host_names, sub_locals, refs);
+            collect_host_refs_expr(then_val, host_names, sub_locals, refs);
+            collect_host_refs_expr(else_val, host_names, sub_locals, refs);
+        }
+    }
+}
+
+fn collect_host_refs_ac_value(
+    value: &crate::ast::expr::AcValue,
+    host_names: &std::collections::HashSet<String>,
+    sub_locals: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    use crate::ast::expr::AcValue;
+    match value {
+        AcValue::Expr(value) => collect_host_refs_expr(value, host_names, sub_locals, refs),
+        AcValue::ImpliedDo(implied) => {
+            collect_host_refs_expr(&implied.start, host_names, sub_locals, refs);
+            collect_host_refs_expr(&implied.end, host_names, sub_locals, refs);
+            if let Some(step) = &implied.step {
+                collect_host_refs_expr(step, host_names, sub_locals, refs);
+            }
+            let mut implied_locals = sub_locals.clone();
+            implied_locals.insert(implied.var.to_lowercase());
+            for value in &implied.values {
+                collect_host_refs_ac_value(value, host_names, &implied_locals, refs);
+            }
+        }
     }
 }
 

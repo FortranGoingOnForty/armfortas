@@ -60218,6 +60218,80 @@ fn contained_assignment_preserves_host_fixed_character_allocatable_array_length(
 }
 
 #[test]
+fn contained_array_constructor_captures_host_deferred_character() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_array_constructor_captures_host_deferred_character count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=:), allocatable :: source\n  character(len=15), allocatable :: name(:)\n  source = 'my_project   '\n  call assign_name()\n  if (.not. allocated(name)) error stop 1\n  if (size(name) /= 1) error stop 2\n  if (trim(name(1)) /= 'my_project') error stop 3\n  print *, 'ok'\ncontains\n  subroutine assign_name()\n    name = [trim(source)]\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_ctor_host_deferred_char", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained constructor host deferred-char compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained constructor host deferred-char compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained constructor host deferred-char run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained constructor host deferred-char run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn contained_implied_do_constructor_captures_host_values_and_bounds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_implied_do_constructor_captures_host_values_and_bounds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: lower, upper\n  integer :: values(3), result(2)\n  lower = 2\n  upper = 3\n  values = [10, 20, 30]\n  call gather()\n  if (any(result /= [20, 30])) error stop 1\n  print *, 'ok'\ncontains\n  subroutine gather()\n    integer :: i\n    result = [(values(i), i=lower,upper)]\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_implied_do_host_refs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained implied-do host refs compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained implied-do host refs compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained implied-do host refs run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained implied-do host refs run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_fixed_character_array_assignment_preserves_declared_length() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
