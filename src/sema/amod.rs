@@ -1138,13 +1138,11 @@ fn emit_procedure(
                     let arg_sym = pscope.symbols.get(&arg_name.to_lowercase())?;
                     let is_assumed_len = declared_char_len_star_params
                         .and_then(|flags| flags.get(arg_idx).copied())
-                        .unwrap_or({
-                            matches!(
-                                arg_sym.type_info,
-                                Some(TypeInfo::Character { len: None, .. })
-                            ) && !arg_sym.attrs.allocatable
-                                && !is_bind_c
-                        });
+                        .unwrap_or(
+                            arg_sym.attrs.assumed_length_character
+                                && !arg_sym.attrs.allocatable
+                                && !is_bind_c,
+                        );
                     is_assumed_len.then(|| arg_name.clone())
                 })
                 .collect()

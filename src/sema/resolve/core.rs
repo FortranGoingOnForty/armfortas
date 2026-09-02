@@ -3232,6 +3232,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     // wins; otherwise fall back to the decl-level dimension
                     // attribute).
                     let mut entity_attrs = sym_attrs.clone();
+                    entity_attrs.assumed_length_character =
+                        entity_is_assumed_length_character(type_spec, entity.char_len.as_ref());
                     let entity_array_spec = entity
                         .array_spec
                         .clone()
@@ -3609,6 +3611,22 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
         }
     }
     Ok(())
+}
+
+fn entity_is_assumed_length_character(
+    type_spec: &TypeSpec,
+    entity_len: Option<&decl::LenSpec>,
+) -> bool {
+    let TypeSpec::Character(selector) = type_spec else {
+        return false;
+    };
+    match entity_len {
+        Some(decl::LenSpec::Star) => true,
+        Some(_) => false,
+        None => selector
+            .as_ref()
+            .is_some_and(|selector| matches!(selector.len, Some(decl::LenSpec::Star))),
+    }
 }
 
 fn process_namelists(st: &mut SymbolTable, body: &[SpannedStmt]) -> Result<(), SemaError> {

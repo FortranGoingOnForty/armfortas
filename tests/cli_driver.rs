@@ -6689,6 +6689,145 @@ fn default_character_dummy_does_not_shift_assumed_length_hidden_args() {
 }
 
 #[test]
+fn dependent_character_length_dummy_does_not_add_hidden_length_arg() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dependent_character_length_dummy_does_not_add_hidden_length_arg count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // TypeInfo represents both len=* and nonconstant explicit lengths as
+    // `len: None`. Only the first dummy below belongs in the trailing hidden
+    // character-length ABI; `len=len(array)` is evaluated by the callee.
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine wrapper(array, work, observed)\n    character(len=*), intent(in) :: array(0:)\n    character(len=len(array)), intent(out) :: work(0:)\n    integer, intent(out) :: observed\n    call worker(array, work, observed)\n  end subroutine\n\n  subroutine worker(array, work, observed)\n    character(len=*), intent(in) :: array(0:)\n    character(len=len(array)), intent(out) :: work(0:)\n    integer, intent(out) :: observed\n    call inspect_lengths(array, work, observed)\n  contains\n    subroutine inspect_lengths(array, buffer, observed)\n      character(len=*), intent(in) :: array(0:)\n      character(len=len(array)), intent(out) :: buffer(0:)\n      integer, intent(out) :: observed\n      observed = 100 * len(array) + len(buffer)\n    end subroutine\n  end subroutine\nend module\n\nprogram p\n  use m\n  implicit none\n  character(4) :: input(0:1), output(0:1)\n  integer :: observed\n  input = ['left', 'rite']\n  call wrapper(input, output, observed)\n  if (observed /= 404) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("dependent_char_len_hidden_abi", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .args(["-O2", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("dependent character length compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "dependent character length should compile at O2: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn amod_preserves_assumed_length_but_not_dependent_character_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=amod_preserves_assumed_length_but_not_dependent_character_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("amod_dependent_char_len");
+    let mod_src = write_program_in(
+        &dir,
+        "lengths.f90",
+        "module lengths\n  implicit none\ncontains\n  subroutine observe_lengths(array, work, observed)\n    character(len=*), intent(in) :: array(0:)\n    character(len=len(array)), intent(inout) :: work(0:)\n    integer, intent(out) :: observed\n    observed = 100 * len(array) + len(work)\n  end subroutine\nend module\n",
+    );
+    let user_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use lengths\n  implicit none\n  character(4) :: input(0:1), output(0:1)\n  integer :: observed\n  input = ['left', 'rite']\n  output = '----'\n  call observe_lengths(input, output, observed)\n  if (observed /= 404) error stop 1\n  print *, 'ok'\nend program\n",
+    );
+
+    let mod_obj = dir.join("lengths.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .args([
+            "-O2",
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("dependent character module compile failed to spawn");
+    assert!(
+        compile_mod.status.success(),
+        "dependent character module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let user_obj = dir.join("main.o");
+    let compile_user = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .args([
+            "-O2",
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            user_src.to_str().unwrap(),
+            "-o",
+            user_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("dependent character caller compile failed to spawn");
+    assert!(
+        compile_user.status.success(),
+        "dependent character caller should compile from .amod: {}",
+        String::from_utf8_lossy(&compile_user.stderr)
+    );
+
+    let out = dir.join("p.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            user_obj.to_str().unwrap(),
+            mod_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("dependent character link failed to spawn");
+    assert!(
+        link.status.success(),
+        "dependent character objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("dependent character program run failed");
+    assert!(
+        run.status.success(),
+        "dependent character program should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fixed_char_out_dummy_writes_back_to_caller() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -9,6 +9,7 @@
 use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl, UseNature};
 use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
+use std::collections::HashSet;
 
 use super::core::{
     backfill_procedure_interfaces, merge_specific_names, resolve_unit, LOADED_EXTERNAL_MODULES,
@@ -977,6 +978,13 @@ fn install_external_interface(
         {
             install_procedure_interface_import(st, proc_scope, import, search_paths, type_layouts);
         }
+        let hidden_char_len_args: HashSet<String> = proc
+            .args
+            .iter()
+            .filter(|arg| arg.hidden)
+            .filter_map(|arg| arg.name.strip_suffix("@len"))
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
         for arg in &proc.args {
             if arg.hidden {
                 continue;
@@ -1028,6 +1036,8 @@ fn install_external_interface(
                 asynchronous: arg.asynchronous,
                 contiguous: arg.contiguous,
                 volatile: arg.volatile,
+                assumed_length_character: hidden_char_len_args
+                    .contains(&arg.name.to_ascii_lowercase()),
                 external: arg.external,
                 procedure_iface: arg.procedure_iface.clone(),
                 array_spec,

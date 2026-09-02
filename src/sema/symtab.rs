@@ -2448,6 +2448,11 @@ pub struct SymbolAttrs {
     pub asynchronous: bool,
     pub contiguous: bool,
     pub volatile: bool,
+    /// The entity is a `character(len=*)` dummy and therefore carries a
+    /// trailing hidden length in the non-BIND(C) procedure ABI. This must
+    /// remain distinct from other nonconstant character lengths such as
+    /// `len=len(other)`, which also lower to `TypeInfo::Character { len: None }`.
+    pub assumed_length_character: bool,
     /// Whether the procedure has a `BIND(C)` language-binding
     /// specification, independent of whether it has a binding label.
     pub bind_c: bool,
@@ -2512,6 +2517,7 @@ impl Default for SymbolAttrs {
             asynchronous: false,
             contiguous: false,
             volatile: false,
+            assumed_length_character: false,
             bind_c: false,
             binding_label: None,
             procedure_iface: None,

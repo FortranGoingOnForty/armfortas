@@ -25444,7 +25444,6 @@ pub(super) fn callee_is_bind_c(st: &SymbolTable, callee_name: &str) -> bool {
 /// Check if a callee has `character(len=*)` dummies via its scope in the
 /// symbol table. Returns a positional bitmap for the visible arguments.
 pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> Option<Vec<bool>> {
-    use crate::sema::symtab::TypeInfo;
     let callee_scope = callee_scope_for_lookup(st, callee_name)?;
     let mask: Vec<bool> = callee_scope
         .arg_order
@@ -25454,7 +25453,7 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
                 .symbols
                 .get(arg_name)
                 .map(|sym| {
-                    matches!(sym.type_info, Some(TypeInfo::Character { len: None, .. }))
+                    sym.attrs.assumed_length_character
                         && !callee_is_bind_c(st, callee_name)
                         && !sym.attrs.allocatable
                         && !sym.attrs.pointer
