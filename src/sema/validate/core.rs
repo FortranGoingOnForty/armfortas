@@ -9410,9 +9410,18 @@ fn actual_is_definable(
         Expr::Name { name } => named_actual_is_definable(ctx, name, false, defines_association),
         Expr::ComponentAccess { .. } => {
             let base = extract_base_name(actual)?;
-            let through_pointer = leaf_field_layout(ctx, actual)
-                .is_some_and(|leaf| leaf.field.pointer || leaf.ancestor_is_pointer);
-            named_actual_is_definable(ctx, &base, through_pointer, defines_association)
+            let leaf = leaf_field_layout(ctx, actual)?;
+            let through_pointer = leaf.field.pointer || leaf.ancestor_is_pointer;
+            // An INTENT(IN) pointer's association is protected, but its
+            // target remains definable.  When the association being changed
+            // belongs to a descendant component reached through an ancestor
+            // pointer (for example MOVE_ALLOC(..., node%child%values)), the
+            // root pointer association is not the association being defined.
+            // Keep `defines_association` for a direct pointer component so
+            // object%pointer still cannot be re-associated through an
+            // INTENT(IN) nonpointer object.
+            let defines_base_association = defines_association && !leaf.ancestor_is_pointer;
+            named_actual_is_definable(ctx, &base, through_pointer, defines_base_association)
         }
         Expr::FunctionCall { callee, args } => {
             let has_vector_subscript = args.iter().any(|arg| match &arg.value {
@@ -9444,11 +9453,12 @@ fn actual_is_definable(
                         return Some(false);
                     }
                     let base = extract_base_name(callee)?;
+                    let defines_base_association = defines_association && !leaf.ancestor_is_pointer;
                     named_actual_is_definable(
                         ctx,
                         &base,
                         leaf.field.pointer || leaf.ancestor_is_pointer,
-                        defines_association,
+                        defines_base_association,
                     )
                 }
                 _ => Some(false),
@@ -14598,6 +14608,33 @@ program p
     call move_alloc(local_from, local_to)
   end block
 end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("MOVE_ALLOC")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_move_alloc_component_reached_through_intent_in_pointer() {
+        let errs = errors_from(
+            "\
+module nested_move
+  implicit none
+  type :: leaf_t
+    integer, allocatable :: values(:)
+  end type
+  type :: holder_t
+    type(leaf_t), pointer :: leaf
+  end type
+contains
+  subroutine replace(holder)
+    type(holder_t), pointer, intent(in) :: holder
+    integer, allocatable :: temporary(:)
+    call move_alloc(temporary, holder%leaf%values)
+  end subroutine
+end module
 ",
         );
         assert!(

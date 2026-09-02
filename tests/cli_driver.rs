@@ -18312,6 +18312,46 @@ fn move_alloc_into_allocatable_component_of_class_dummy_compiles_and_runs() {
 }
 
 #[test]
+fn move_alloc_into_nested_component_through_intent_in_pointer_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=move_alloc_into_nested_component_through_intent_in_pointer_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: simple_t\n    integer, allocatable :: words(:)\n  end type\n  type :: command_t\n    type(simple_t), pointer :: simple => null()\n  end type\n  type :: pipeline_t\n    type(command_t), pointer :: commands(:) => null()\n  end type\n  type :: node_t\n    type(pipeline_t), pointer :: pipeline => null()\n  end type\ncontains\n  subroutine replace_words(node)\n    type(node_t), pointer, intent(in) :: node\n    integer, allocatable :: temporary(:)\n    allocate(temporary(2))\n    temporary = [4, 9]\n    call move_alloc(temporary, node%pipeline%commands(1)%simple%words)\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  type(node_t), pointer :: node\n  allocate(node)\n  allocate(node%pipeline)\n  allocate(node%pipeline%commands(1))\n  allocate(node%pipeline%commands(1)%simple)\n  call replace_words(node)\n  if (any(node%pipeline%commands(1)%simple%words /= [4, 9])) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("move_alloc_nested_pointer_component", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("nested pointer-component MOVE_ALLOC compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "nested pointer-component MOVE_ALLOC should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "nested pointer-component MOVE_ALLOC should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected nested pointer-component MOVE_ALLOC output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn move_alloc_between_scalar_allocatable_derived_components_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
