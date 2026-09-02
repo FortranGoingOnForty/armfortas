@@ -5382,8 +5382,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_bind_c_char_arg_mask(ctx.st, k)
                     });
                     let char_len_star_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
-                            .or_else(|| callee_char_len_star_mask(ctx.st, k))
+                        callee_char_len_star_mask(ctx.st, k).or_else(|| {
+                            cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
+                        })
                     });
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
@@ -5970,8 +5971,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_bind_c_char_arg_mask(ctx.st, k)
                     });
                     let char_len_star_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
-                            .or_else(|| callee_char_len_star_mask(ctx.st, k))
+                        callee_char_len_star_mask(ctx.st, k).or_else(|| {
+                            cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
+                        })
                     });
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)

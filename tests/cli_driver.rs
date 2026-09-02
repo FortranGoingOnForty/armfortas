@@ -29002,6 +29002,47 @@ fn contained_proc_call_uses_caller_relative_argument_abi() {
 }
 
 #[test]
+fn contained_proc_char_length_abi_is_caller_relative() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_proc_char_length_abi_is_caller_relative count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // stdlib_sorting repeats its contained helper names for every type. The
+    // final character variant has a hidden element-length argument; global
+    // link-name lookup incorrectly appended that length to calls targeting
+    // earlier numeric variants, while their definitions had no such param.
+    let src = write_program(
+        "module numeric_owner\ncontains\n  subroutine apply_numeric(value)\n    integer, intent(inout) :: value\n    call helper(value)\n  contains\n    subroutine helper(item)\n      integer, intent(inout) :: item\n      item = item + 1\n    end subroutine\n  end subroutine\nend module\nmodule character_owner\ncontains\n  subroutine apply_character(value)\n    character(len=*), intent(inout) :: value\n    call helper(value)\n  contains\n    subroutine helper(text)\n      character(len=*), intent(inout) :: text\n      text = 'done'\n    end subroutine\n  end subroutine\nend module\nprogram p\n  use numeric_owner\n  use character_owner\n  integer :: value\n  character(4) :: text\n  value = 1\n  text = 'xxxx'\n  call apply_numeric(value)\n  call apply_character(text)\n  if (value /= 2) error stop 1\n  if (text /= 'done') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("contained_char_len_caller_relative", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O1", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("caller-relative character-length ABI compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "caller-relative character-length ABI should compile at O1: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn nested_component_type_bound_call_resolves_scope_qualified_base_layout() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
