@@ -115,7 +115,9 @@ pub fn clone_loop(
     };
     for &old_id in &body_sorted {
         let old_name = &func.block(old_id).name;
+        let loop_unswitch_generated = func.block(old_id).loop_unswitch_generated;
         let new_id = func.create_block(&format!("{}_clone", old_name));
+        func.block_mut(new_id).loop_unswitch_generated = loop_unswitch_generated;
         block_map.insert(old_id, new_id);
         new_blocks.push(new_id);
     }

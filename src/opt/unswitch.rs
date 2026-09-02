@@ -76,6 +76,9 @@ fn unswitch_in_function(func: &mut Function) -> bool {
         if loop_contains_volatile_memory(func, lp) {
             continue;
         }
+        if func.block(lp.header).loop_unswitch_generated {
+            continue;
+        }
         let Some(ph_id) = find_preheader(func, lp, &preds) else {
             continue;
         };
@@ -136,6 +139,8 @@ fn unswitch_in_function(func: &mut Function) -> bool {
         // the appropriate clone's header.
         let true_header = true_map[&lp.header];
         let false_header = false_map[&lp.header];
+        func.block_mut(true_header).loop_unswitch_generated = true;
+        func.block_mut(false_header).loop_unswitch_generated = true;
 
         // Get the preheader's original branch args to the header.
         let ph_args = match &func.block(ph_id).terminator {
@@ -262,7 +267,8 @@ mod tests {
     use crate::ir::types::{IntWidth, IrType};
     use crate::ir::verify::verify_module;
     use crate::lexer::{Position, Span};
-    use crate::opt::pass::Pass;
+    use crate::opt::pass::{Pass, PassManager};
+    use crate::opt::preheader::PreheaderInsert;
 
     fn span() -> Span {
         let pos = Position { line: 0, col: 0 };
@@ -399,6 +405,70 @@ mod tests {
             "preheader should now have a CondBranch: {:?}",
             preheader.terminator
         );
+    }
+
+    #[test]
+    fn does_not_recursively_unswitch_generated_loop_versions() {
+        let mut module = build_unswitchable_loop();
+        let func = &mut module.functions[0];
+        let entry = func.entry;
+        let true_body = func
+            .blocks
+            .iter()
+            .find(|block| block.name.starts_with("t_body_"))
+            .expect("true body")
+            .id;
+        let false_body = func
+            .blocks
+            .iter()
+            .find(|block| block.name.starts_with("f_body_"))
+            .expect("false body")
+            .id;
+        let latch = func
+            .blocks
+            .iter()
+            .find(|block| block.name.starts_with("latch_"))
+            .expect("latch")
+            .id;
+
+        let second_cond = func.create_block("second_cond");
+        let second_true = func.create_block("second_true");
+        let second_false = func.create_block("second_false");
+        let second_flag = func.next_value_id();
+        func.register_type(second_flag, IrType::Bool);
+        func.block_mut(entry).insts.push(Inst {
+            id: second_flag,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ConstBool(false),
+        });
+        func.block_mut(true_body).terminator = Some(Terminator::Branch(second_cond, vec![]));
+        func.block_mut(false_body).terminator = Some(Terminator::Branch(second_cond, vec![]));
+        func.block_mut(second_cond).terminator = Some(Terminator::CondBranch {
+            cond: second_flag,
+            true_dest: second_true,
+            true_args: vec![],
+            false_dest: second_false,
+            false_args: vec![],
+        });
+        func.block_mut(second_true).terminator = Some(Terminator::Branch(latch, vec![]));
+        func.block_mut(second_false).terminator = Some(Terminator::Branch(latch, vec![]));
+
+        let mut manager = PassManager::new();
+        manager.max_iterations = 4;
+        manager.add(Box::new(PreheaderInsert));
+        manager.add(Box::new(LoopUnswitch));
+        let result = manager
+            .run(&mut module)
+            .expect("unswitching one loop version must reach a fixed point");
+
+        assert_eq!(result.iterations, 3);
+        let func = &module.functions[0];
+        let loops = find_natural_loops(func);
+        assert_eq!(loops.len(), 2);
+        assert!(loops
+            .iter()
+            .all(|lp| func.block(lp.header).loop_unswitch_generated));
     }
 
     #[test]
