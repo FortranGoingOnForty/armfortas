@@ -5136,6 +5136,94 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.const_i32(6)
             };
 
+            if let Some(rec_ctrl) = io_control_by_keyword(controls, "rec") {
+                if io_control_by_keyword(controls, "pos").is_some() {
+                    lower_stmt_error(rec_ctrl.value.span, "REC= and POS= may not appear together");
+                }
+                if let Some(control) = advance_ctrl {
+                    lower_stmt_error(
+                        control.value.span,
+                        "ADVANCE= is not valid for direct-access I/O",
+                    );
+                }
+                if let Some(control) = fmt_control {
+                    if matches!(&control.value.node, Expr::Name { name } if name == "*") {
+                        lower_stmt_error(
+                            control.value.span,
+                            "list-directed format is not valid with REC=",
+                        );
+                    }
+                }
+
+                let raw_rec = super::expr::lower_expr_ctx(b, ctx, &rec_ctrl.value);
+                let rec = coerce_to_type(b, raw_rec, &IrType::Int(IntWidth::I64));
+                let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+
+                if let Some(format_control) = fmt_control {
+                    let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &format_control.value);
+                    b.call(
+                        FuncRef::External("afs_fmt_begin_direct_ex".into()),
+                        vec![
+                            unit_i32, rec, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len,
+                        ],
+                        IrType::Void,
+                    );
+                    lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
+                    for item in items {
+                        lower_fmt_push(b, ctx, item);
+                    }
+                    let no_advance = b.const_i32(0);
+                    b.call(
+                        FuncRef::External("afs_fmt_end".into()),
+                        vec![no_advance],
+                        IrType::Void,
+                    );
+                    deallocate_owned_string_expr_temp(
+                        b,
+                        &ctx.locals,
+                        &format_control.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        fmt_ptr,
+                    );
+                } else {
+                    b.call(
+                        FuncRef::External("afs_direct_write_begin".into()),
+                        vec![unit_i32, rec, iostat_ptr, iomsg_ptr, iomsg_len],
+                        IrType::Void,
+                    );
+                    let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+                    let zero = b.const_i32(0);
+                    let failed = b.icmp(CmpOp::Ne, status, zero);
+                    let transfer_bb = b.create_block("direct_write_ok");
+                    let done_bb = b.create_block("direct_write_done");
+                    b.cond_branch(failed, done_bb, vec![], transfer_bb, vec![]);
+
+                    b.set_block(transfer_bb);
+                    lower_write_items_adv(b, ctx, items, unit_i32, false);
+                    let advance = b.const_i32(1);
+                    b.call(
+                        FuncRef::External("afs_list_write_end".into()),
+                        vec![unit_i32, advance, iostat_ptr, iomsg_ptr, iomsg_len],
+                        IrType::Void,
+                    );
+                    b.branch(done_bb, vec![]);
+                    b.set_block(done_bb);
+                }
+
+                lower_write_status_completion(
+                    b,
+                    ctx,
+                    err_label,
+                    iostat_ptr,
+                    iomsg_ptr,
+                    iomsg_len,
+                    &iostat_storeback,
+                    iostat_ctrl.is_some(),
+                );
+                return;
+            }
+
             let positioning_done = lower_external_write_pos_seek(
                 b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len,
             );
@@ -9876,7 +9964,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let needs_hidden_iostat = end_label.is_some()
                 || err_label.is_some()
                 || iomsg_ctrl.is_some()
-                || io_control_by_keyword(controls, "pos").is_some();
+                || io_control_by_keyword(controls, "pos").is_some()
+                || io_control_by_keyword(controls, "rec").is_some();
             let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
             let (iostat_addr, iostat_storeback) =
                 lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
@@ -9978,6 +10067,95 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(5) // default stdin
             };
+
+            if let Some(rec_ctrl) = io_control_by_keyword(controls, "rec") {
+                if io_control_by_keyword(controls, "pos").is_some() {
+                    lower_stmt_error(rec_ctrl.value.span, "REC= and POS= may not appear together");
+                }
+                if let Some(control) = advance_ctrl {
+                    lower_stmt_error(
+                        control.value.span,
+                        "ADVANCE= is not valid for direct-access I/O",
+                    );
+                }
+                if let Some(control) = fmt_control {
+                    if matches!(&control.value.node, Expr::Name { name } if name == "*") {
+                        lower_stmt_error(
+                            control.value.span,
+                            "list-directed format is not valid with REC=",
+                        );
+                    }
+                }
+
+                let raw_rec = super::expr::lower_expr_ctx(b, ctx, &rec_ctrl.value);
+                let rec = coerce_to_type(b, raw_rec, &IrType::Int(IntWidth::I64));
+                let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+                let formatted = b.const_i32(i32::from(fmt_control.is_some()));
+                b.call(
+                    FuncRef::External("afs_direct_read_begin".into()),
+                    vec![
+                        unit_i32,
+                        rec,
+                        formatted,
+                        iostat_addr,
+                        read_iomsg_ptr,
+                        read_iomsg_len,
+                    ],
+                    IrType::Void,
+                );
+                let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                let failed = b.icmp(CmpOp::Ne, status, zero);
+                let transfer_bb = b.create_block("direct_read_ok");
+                let done_bb = b.create_block("direct_read_done");
+                b.cond_branch(failed, done_bb, vec![], transfer_bb, vec![]);
+
+                b.set_block(transfer_bb);
+                if let Some(format_control) = fmt_control {
+                    let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &format_control.value);
+                    lower_formatted_read_items_with_runtime_advance(
+                        b,
+                        ctx,
+                        items,
+                        unit_i32,
+                        fmt_ptr,
+                        fmt_len,
+                        false,
+                        None,
+                        iostat_addr,
+                        size_addr,
+                    );
+                    b.call(
+                        FuncRef::External("afs_direct_formatted_read_end".into()),
+                        vec![unit_i32],
+                        IrType::Void,
+                    );
+                    deallocate_owned_string_expr_temp(
+                        b,
+                        &ctx.locals,
+                        &format_control.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        fmt_ptr,
+                    );
+                } else {
+                    lower_list_read_items(b, ctx, items, unit_i32, iostat_addr);
+                    b.call(
+                        FuncRef::External("afs_list_read_end".into()),
+                        vec![unit_i32, iostat_addr, read_iomsg_ptr, read_iomsg_len],
+                        IrType::Void,
+                    );
+                }
+                b.branch(done_bb, vec![]);
+                b.set_block(done_bb);
+
+                lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+                lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
+                lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
+                return;
+            }
+
             let positioning_done = lower_external_read_pos_seek(
                 b,
                 ctx,
