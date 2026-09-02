@@ -27467,6 +27467,52 @@ fn inline_transfer_array_call_actual_carries_correct_extent_into_callee() {
 }
 
 #[test]
+fn character_transfer_array_actual_uses_runtime_source_length() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_transfer_array_actual_uses_runtime_source_length count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Regression from stdlib_hash_32bit_fnv: an inline array-result
+    // TRANSFER with an assumed-length character source fell through the
+    // descriptor path and passed const i64 zero to the assumed-shape callee.
+    // O0 silently emitted the bad call; O1 call resolution exposed the type
+    // mismatch when the same-module callee became an internal FuncRef.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: int8\n  implicit none\n  character(2) :: left, right\n  left = 'AB'\n  right = 'CD'\n  if (hash_key('ABCD') /= 4266) error stop 1\n  if (consume(transfer(left // right, 0_int8, len(left // right))) /= 4266) error stop 2\n  print *, 'ok'\ncontains\n  integer function hash_key(key)\n    character(*), intent(in) :: key\n    hash_key = consume(transfer(key, 0_int8, len(key)))\n  end function\n  integer function consume(bytes)\n    integer(int8), intent(in) :: bytes(:)\n    consume = 1000 * size(bytes) + sum(int(bytes))\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("character_transfer_array_actual", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O1", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "should compile at O1: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn assumed_shape_lower_bound_override_rebases_dummy_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

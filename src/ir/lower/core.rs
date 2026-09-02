@@ -44081,14 +44081,17 @@ pub(super) fn lower_transfer_array_expr_descriptor(
     let mold_ir_ty = type_info_to_ir_type(&mold_ti);
 
     // Resolve the source's contiguous byte storage and its total size.
-    // Three source forms are supported here:
+    // Four source forms are supported here:
     //   * an array expression/section/name — read base_addr and element
     //     count from the runtime descriptor
     //   * an inline ArrayConstructor — materialize once via
     //     lower_array_expr_descriptor and read its base_addr; total
     //     bytes are constant from the constructor length × elem size.
+    //   * a scalar character expression — use its canonical data pointer
+    //     and runtime length, scaled by the character kind width
     //   * a scalar expression — spill it into a byte temp and expose
     //     that temp as the result storage.
+    let mut owned_character_bases = Vec::new();
     let (src_base, src_total_bytes_v, src_total_bytes_const): (ValueId, ValueId, Option<i64>) =
         if let Some((src_desc, src_elem_ty)) = lower_array_expr_descriptor(
             b,
@@ -44144,6 +44147,35 @@ pub(super) fn lower_transfer_array_expr_descriptor(
             };
             let total_const = n_elems * src_elem_bytes;
             (base, b.const_i64(total_const), Some(total_const))
+        } else if expr_is_character_expr(b, locals, src_expr, st, type_layouts)
+            && !expr_returns_array(src_expr, locals, st)
+        {
+            let (base, char_len) = lower_string_expr_full(
+                b,
+                locals,
+                src_expr,
+                st,
+                type_layouts,
+                internal_funcs,
+                contained_host_refs,
+                descriptor_params,
+            );
+            let char_bytes = match operator_expr_type_info(src_expr, Some(locals), st, type_layouts)
+            {
+                Some(TypeInfo::Character { kind, .. }) => kind.unwrap_or(1) as i64,
+                _ => 1,
+            };
+            if char_bytes <= 0 {
+                return None;
+            }
+            let total_v = if char_bytes == 1 {
+                char_len
+            } else {
+                let width = b.const_i64(char_bytes);
+                b.imul(char_len, width)
+            };
+            owned_character_bases = b.take_owned_string_temp_bases(base);
+            (base, total_v, None)
         } else {
             let src_val = super::expr::lower_expr_full(
                 b,
@@ -44229,6 +44261,7 @@ pub(super) fn lower_transfer_array_expr_descriptor(
     store_byte_aggregate_field(b, desc, 24, IrType::Int(IntWidth::I64), one);
     store_byte_aggregate_field(b, desc, 32, IrType::Int(IntWidth::I64), result_extent);
     store_byte_aggregate_field(b, desc, 40, IrType::Int(IntWidth::I64), one);
+    b.mark_owned_string_temp_bases(desc, owned_character_bases);
     let _ = src_total_bytes_v;
     Some((desc, mold_ir_ty))
 }
