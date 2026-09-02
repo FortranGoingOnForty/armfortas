@@ -25995,8 +25995,7 @@ fn symbol_returns_owned_character_temp(sym: &crate::sema::symtab::Symbol) -> boo
     matches!(
         sym.type_info,
         Some(crate::sema::symtab::TypeInfo::Character { .. })
-    ) && sym.attrs.allocatable
-        && !sym.attrs.pointer
+    ) && !sym.attrs.pointer
         && sym.attrs.result_rank == 0
         && !sym.attrs.bind_c
 }
@@ -66062,6 +66061,53 @@ end program
             !borrowed_tail[..next_owned].contains("rt_call @__afs_deallocate"),
             "pointer character result must remain borrowed:\n{}",
             &borrowed_tail[..next_owned]
+        );
+    }
+
+    #[test]
+    fn releases_nonpointer_character_results_for_all_length_forms() {
+        let (_, ir) = lower_and_verify(
+            "\
+module character_result_ownership_m
+  implicit none
+contains
+  function make_fixed() result(value)
+    character(7) :: value
+    value = 'payload'
+  end function
+  function make_runtime(source) result(value)
+    character(*), intent(in) :: source
+    character(len_trim(source)) :: value
+    value = trim(source)
+  end function
+  function make_borrowed() result(value)
+    character(:), pointer :: value
+    character(8), target, save :: storage = 'borrowed'
+    value => storage
+  end function
+  subroutine consume()
+    integer :: length
+    length = len(make_fixed())
+    length = len(make_runtime('payload  '))
+    length = len(make_borrowed())
+  end subroutine
+end module
+",
+        );
+        let consume_start = ir
+            .find("func @afs_modproc_character_result_ownership_m_consume")
+            .expect("missing character result caller IR");
+        let consume_tail = &ir[consume_start..];
+        let consume_end = consume_tail
+            .find("\n  func @")
+            .unwrap_or(consume_tail.len());
+        let consume_ir = &consume_tail[..consume_end];
+
+        assert_eq!(
+            consume_ir.matches("rt_call @__afs_deallocate").count(),
+            2,
+            "fixed and runtime-length results must be released while pointer results remain borrowed:\n{}",
+            consume_ir
         );
     }
 
