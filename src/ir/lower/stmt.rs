@@ -8177,8 +8177,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             let elem_size_bytes =
                                 local_storage_size_bytes(&field_info, ctx.type_layouts, ctx.layout);
                             let size_val = b.const_i64(elem_size_bytes);
+                            let allocate_fn = if field.pointer {
+                                "afs_allocate_pointer"
+                            } else {
+                                "afs_allocate_scalar"
+                            };
                             b.call(
-                                FuncRef::External("afs_allocate_scalar".into()),
+                                FuncRef::External(allocate_fn.into()),
                                 vec![field_ptr, size_val, runtime_stat_arg],
                                 IrType::Void,
                             );
@@ -8650,28 +8655,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 info.addr
                             };
-                            if info.is_pointer {
-                                let size_val = b.const_i64(elem_size_bytes);
-                                b.call(
-                                    FuncRef::External("afs_allocate_scalar".into()),
-                                    vec![slot, size_val, runtime_stat_arg],
-                                    IrType::Void,
-                                );
-                                emit_runtime_errmsg_on_failure(
-                                    b,
-                                    stat_addr,
-                                    errmsg_target.as_ref(),
-                                    "ALLOCATE failed",
-                                );
+                            let allocate_fn = if info.is_pointer {
+                                "afs_allocate_pointer"
                             } else {
-                                let size_val = b.const_i32(elem_size_bytes as i32);
-                                let ptr = b.runtime_call(
-                                    RuntimeFunc::Allocate,
-                                    vec![size_val],
-                                    IrType::Ptr(Box::new(info.ty.clone())),
-                                );
-                                b.store(ptr, slot);
-                            }
+                                "afs_allocate_scalar"
+                            };
+                            let size_val = b.const_i64(elem_size_bytes);
+                            b.call(
+                                FuncRef::External(allocate_fn.into()),
+                                vec![slot, size_val, runtime_stat_arg],
+                                IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
+                            );
                             emit_raw_scalar_allocate_initialization(
                                 b,
                                 ctx,

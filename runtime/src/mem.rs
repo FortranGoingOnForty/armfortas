@@ -29,11 +29,10 @@ pub extern "C" fn afs_allocate(size: i64) -> *mut u8 {
     ptr
 }
 
-/// Allocate storage for an explicit scalar allocatable or pointer.
+/// Allocate storage for an explicit scalar allocatable.
 ///
 /// The destination slot is published only on success. An existing allocation
-/// or association is reported through STAT when present and terminates
-/// execution otherwise.
+/// is reported through STAT when present and terminates execution otherwise.
 #[no_mangle]
 pub extern "C" fn afs_allocate_scalar(slot: *mut *mut u8, size: i64, stat: *mut i32) {
     let fail = |code, message: &str| {
@@ -52,7 +51,7 @@ pub extern "C" fn afs_allocate_scalar(slot: *mut *mut u8, size: i64, stat: *mut 
         return;
     }
     if !unsafe { *slot }.is_null() {
-        fail(2, "scalar is already allocated or associated");
+        fail(2, "scalar is already allocated");
         return;
     }
     let Ok(size) = usize::try_from(size) else {
@@ -63,6 +62,46 @@ pub extern "C" fn afs_allocate_scalar(slot: *mut *mut u8, size: i64, stat: *mut 
     // can represent successful pointer allocation.
     let allocation_size = size.max(1);
 
+    let allocation = unsafe { malloc(allocation_size) };
+    if allocation.is_null() {
+        fail(3, "out of memory");
+        return;
+    }
+    unsafe {
+        *slot = allocation;
+        if !stat.is_null() {
+            *stat = 0;
+        }
+    }
+}
+
+/// Allocate a new target for an explicit scalar pointer.
+///
+/// Fortran permits allocating a pointer that is already associated. The
+/// pointer is reassociated with the new target; the old target remains alive
+/// and can still be reached through any other pointers associated with it.
+#[no_mangle]
+pub extern "C" fn afs_allocate_pointer(slot: *mut *mut u8, size: i64, stat: *mut i32) {
+    let fail = |code, message: &str| {
+        if !stat.is_null() {
+            unsafe {
+                *stat = code;
+            }
+            return;
+        }
+        eprintln!("ALLOCATE: {message}");
+        std::process::exit(1);
+    };
+
+    if slot.is_null() {
+        fail(1, "null scalar pointer slot");
+        return;
+    }
+    let Ok(size) = usize::try_from(size) else {
+        fail(4, "allocation byte count is invalid");
+        return;
+    };
+    let allocation_size = size.max(1);
     let allocation = unsafe { malloc(allocation_size) };
     if allocation.is_null() {
         fail(3, "out of memory");
@@ -179,7 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scalar_allocation_preserves_an_existing_target_on_failure() {
+    fn scalar_allocatable_preserves_an_existing_target_on_failure() {
         let mut slot = ptr::null_mut();
         let mut stat = 99;
 
@@ -192,6 +231,27 @@ mod tests {
         assert_eq!(stat, 2);
         assert_eq!(slot, original);
 
+        afs_deallocate_pointer(&mut slot, &mut stat);
+        assert_eq!(stat, 0);
+        assert!(slot.is_null());
+    }
+
+    #[test]
+    fn scalar_pointer_allocation_reassociates_with_a_new_target() {
+        let mut slot = ptr::null_mut();
+        let mut stat = 99;
+
+        afs_allocate_pointer(&mut slot, 8, &mut stat);
+        assert_eq!(stat, 0);
+        assert!(!slot.is_null());
+        let original = slot;
+
+        afs_allocate_pointer(&mut slot, 8, &mut stat);
+        assert_eq!(stat, 0);
+        assert!(!slot.is_null());
+        assert_ne!(slot, original);
+
+        afs_deallocate(original);
         afs_deallocate_pointer(&mut slot, &mut stat);
         assert_eq!(stat, 0);
         assert!(slot.is_null());
