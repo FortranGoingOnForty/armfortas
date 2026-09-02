@@ -43798,11 +43798,14 @@ pub(super) fn lower_reshape_array_expr_descriptor(
             descriptor_params,
         )?
     };
+    let source_is_temp = array_expr_descriptor_may_own_temp(source_expr, locals, st);
 
     // Fast path: when shape is a literal `[k1, k2, ...]` and there's no
-    // pad/order, build the result descriptor inline. The bytes of the
-    // source are reinterpreted in column-major order — no copy needed.
-    if pad_arg.is_none() && order_arg.is_none() {
+    // pad/order and SOURCE is borrowed, build the result descriptor inline.
+    // The bytes of the source are reinterpreted in column-major order — no
+    // copy needed. An owning temporary cannot use this view path because the
+    // returned descriptor would lose the allocation that keeps its base live.
+    if !source_is_temp && pad_arg.is_none() && order_arg.is_none() {
         if let Some(extents) = reshape_shape_extents(shape_expr, st) {
             if !extents.is_empty() {
                 let desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
@@ -43888,7 +43891,7 @@ pub(super) fn lower_reshape_array_expr_descriptor(
     .0;
     let null_i64 = b.const_i64(0);
     let null_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
-    let order_desc = if let Some(arg) = order_arg {
+    let order_temp = if let Some(arg) = order_arg {
         if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
             lower_array_expr_descriptor(
                 b,
@@ -43900,15 +43903,18 @@ pub(super) fn lower_reshape_array_expr_descriptor(
                 contained_host_refs,
                 descriptor_params,
             )
-            .map(|(d, _)| d)
-            .unwrap_or(null_ptr)
+            .map(|(desc, _)| (e, desc))
         } else {
-            null_ptr
+            None
         }
     } else {
-        null_ptr
+        None
     };
-    let pad_desc = if let Some(arg) = pad_arg {
+    let order_desc = order_temp
+        .as_ref()
+        .map(|(_, desc)| *desc)
+        .unwrap_or(null_ptr);
+    let pad_temp = if let Some(arg) = pad_arg {
         if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
             lower_array_expr_descriptor(
                 b,
@@ -43920,14 +43926,14 @@ pub(super) fn lower_reshape_array_expr_descriptor(
                 contained_host_refs,
                 descriptor_params,
             )
-            .map(|(d, _)| d)
-            .unwrap_or(null_ptr)
+            .map(|(desc, _)| (e, desc))
         } else {
-            null_ptr
+            None
         }
     } else {
-        null_ptr
+        None
     };
+    let pad_desc = pad_temp.as_ref().map(|(_, desc)| *desc).unwrap_or(null_ptr);
 
     let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
@@ -43942,6 +43948,14 @@ pub(super) fn lower_reshape_array_expr_descriptor(
         vec![source_desc, shape_desc, order_desc, pad_desc, result_desc],
         IrType::Void,
     );
+    deallocate_array_expr_descriptor_if_temp(b, locals, source_expr, st, source_desc);
+    deallocate_array_expr_descriptor_if_temp(b, locals, shape_expr, st, shape_desc);
+    if let Some((order_expr, order_desc)) = order_temp {
+        deallocate_array_expr_descriptor_if_temp(b, locals, order_expr, st, order_desc);
+    }
+    if let Some((pad_expr, pad_desc)) = pad_temp {
+        deallocate_array_expr_descriptor_if_temp(b, locals, pad_expr, st, pad_desc);
+    }
 
     Some((result_desc, elem_ty))
 }
@@ -65494,6 +65508,34 @@ end program
             caller.matches("call @afs_deallocate_array").count(),
             2,
             "the array function source and PACK result must both be released:\n{}",
+            caller
+        );
+    }
+
+    #[test]
+    fn lower_reshape_copies_and_releases_temporary_source() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: values(2, 2)
+  values = reshape([1, 2, 3, 4], [2, 2])
+end program
+",
+        );
+        let caller = ir
+            .split("\n  func @afs_internal___prog_test_1")
+            .next()
+            .expect("expected program function");
+
+        assert!(
+            caller.contains("call @afs_array_reshape"),
+            "an owning SOURCE must use the copying RESHAPE path:\n{}",
+            caller
+        );
+        assert!(
+            caller.matches("call @afs_deallocate_array").count() >= 2,
+            "the RESHAPE source and result must both be released:\n{}",
             caller
         );
     }
