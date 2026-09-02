@@ -46,7 +46,7 @@
 //! semantically distinct (in our IR allocas are entry-block-only in
 //! practice, but we don't bet on that here).
 
-use super::alias::{self, AliasResult};
+use super::alias::{AliasOracle, AliasResult};
 use super::pass::Pass;
 use super::util::{find_natural_loops, inst_uses, predecessors, NaturalLoop};
 use crate::ir::inst::*;
@@ -82,11 +82,11 @@ fn is_non_memory_hoist_candidate(kind: &InstKind) -> bool {
 }
 
 fn load_is_loop_invariant(
-    layout: crate::target::TargetLayout,
     func: &Function,
     lp: &NaturalLoop,
     load_id: ValueId,
     load_ptr: ValueId,
+    alias_oracle: &mut AliasOracle<'_>,
 ) -> bool {
     for block in &func.blocks {
         if !lp.body.contains(&block.id) {
@@ -98,10 +98,7 @@ fn load_is_loop_invariant(
             }
             match &inst.kind {
                 InstKind::Store(_, ptr) | InstKind::VolatileStore(_, ptr)
-                    if !matches!(
-                        alias::query(func, *ptr, load_ptr, layout),
-                        AliasResult::NoAlias
-                    ) =>
+                    if !matches!(alias_oracle.query(*ptr, load_ptr), AliasResult::NoAlias) =>
                 {
                     return false;
                 }
@@ -207,37 +204,45 @@ fn licm_function(func: &mut Function, layout: crate::target::TargetLayout) -> bo
 
         loop {
             let mut hoists: Vec<Hoist> = Vec::new();
-            for (bi, block) in func.blocks.iter().enumerate() {
-                if !lp.body.contains(&block.id) {
-                    continue;
-                }
-                for (ii, inst) in block.insts.iter().enumerate() {
-                    if !loop_defs.contains(&inst.id) {
-                        // Already hoisted (we mark it removed from
-                        // loop_defs after a successful hoist).
+            // Loads may require many alias queries against stores in the
+            // loop. Reuse one whole-function oracle for this discovery
+            // sweep; the convenience `alias::query` would rebuild all of
+            // its value maps for every load/store pair. Drop the oracle
+            // before moving any instructions so its indexes remain valid.
+            {
+                let mut alias_oracle = AliasOracle::new(func, layout);
+                for (bi, block) in func.blocks.iter().enumerate() {
+                    if !lp.body.contains(&block.id) {
                         continue;
                     }
-                    // All operands must be outside the loop OR already
-                    // not in the loop_defs set (i.e., previously
-                    // hoisted, or defined outside).
-                    let operands = inst_uses(&inst.kind);
-                    if operands.iter().any(|v| loop_defs.contains(v)) {
-                        continue;
-                    }
-                    let hoistable = match &inst.kind {
-                        InstKind::Load(ptr) => {
-                            load_is_loop_invariant(layout, func, lp, inst.id, *ptr)
-                                && load_is_safe_to_move_to_preheader(func, lp, block.id, *ptr)
+                    for (ii, inst) in block.insts.iter().enumerate() {
+                        if !loop_defs.contains(&inst.id) {
+                            // Already hoisted (we mark it removed from
+                            // loop_defs after a successful hoist).
+                            continue;
                         }
-                        _ => is_non_memory_hoist_candidate(&inst.kind),
-                    };
-                    if !hoistable {
-                        continue;
+                        // All operands must be outside the loop OR already
+                        // not in the loop_defs set (i.e., previously
+                        // hoisted, or defined outside).
+                        let operands = inst_uses(&inst.kind);
+                        if operands.iter().any(|v| loop_defs.contains(v)) {
+                            continue;
+                        }
+                        let hoistable = match &inst.kind {
+                            InstKind::Load(ptr) => {
+                                load_is_loop_invariant(func, lp, inst.id, *ptr, &mut alias_oracle)
+                                    && load_is_safe_to_move_to_preheader(func, lp, block.id, *ptr)
+                            }
+                            _ => is_non_memory_hoist_candidate(&inst.kind),
+                        };
+                        if !hoistable {
+                            continue;
+                        }
+                        hoists.push(Hoist {
+                            block_idx: bi,
+                            inst_idx: ii,
+                        });
                     }
-                    hoists.push(Hoist {
-                        block_idx: bi,
-                        inst_idx: ii,
-                    });
                 }
             }
             if hoists.is_empty() {
