@@ -5503,14 +5503,14 @@ fn collect_const_array_conversion_intrinsic(
 
     let mut out = Vec::new();
     if source_is_complex {
-        let mut chunks = source_values.chunks_exact(2);
-        for lanes in &mut chunks {
+        let (chunks, remainder) = source_values.as_chunks::<2>();
+        for lanes in chunks {
             out.extend(coerce_scalar_to_array_lanes(
                 ConstScalar::Float(lanes[0].to_float()),
                 elem_ty,
             ));
         }
-        if !chunks.remainder().is_empty() {
+        if !remainder.is_empty() {
             return None;
         }
     } else {

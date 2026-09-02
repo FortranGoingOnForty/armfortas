@@ -1858,15 +1858,12 @@ pub(crate) fn detect_reduction_plan(
     {
         return None;
     }
-    let body_term_arg_iv;
-    let body_term_arg_acc;
-    match &body_block.terminator {
+    let (body_term_arg_iv, body_term_arg_acc) = match &body_block.terminator {
         Some(Terminator::Branch(dest, args)) if *dest == header && args.len() == 2 => {
-            body_term_arg_iv = args[0];
-            body_term_arg_acc = args[1];
+            (args[0], args[1])
         }
         _ => return None,
-    }
+    };
 
     let defs = inst_map(func);
     // The acc-update is one of:
