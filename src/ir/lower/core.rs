@@ -21134,6 +21134,21 @@ pub(super) fn emit_named_function_call(
         }
     }
 
+    // Hidden-result function calls are routed through this helper instead
+    // of expr.rs's ordinary direct-call path. Procedure dummy closure slots
+    // are still part of the callee ABI and must trail the visible/character
+    // arguments here as well, including null slots for an absent OPTIONAL
+    // callback.
+    append_procedure_dummy_closure_args_for_call(
+        b,
+        locals,
+        st,
+        &callee_key,
+        &arg_slots,
+        contained_host_refs,
+        &mut call_args,
+    );
+
     let closure_key = if contained_host_refs
         .map(|m| m.contains_key(&callee_key))
         .unwrap_or(false)

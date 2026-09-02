@@ -27193,6 +27193,51 @@ fn deallocate_disassociates_pointer_per_f2018_9_7_3_2() {
 }
 
 #[test]
+fn hidden_result_function_forwards_procedure_dummy_closure_at_o1() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=hidden_result_function_forwards_procedure_dummy_closure_at_o1 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    subroutine callback_i()\n    end subroutine\n  end interface\ncontains\n  function invoke(callback) result(text)\n    procedure(callback_i), optional :: callback\n    character(len=:), allocatable :: text\n    if (present(callback)) call callback()\n    text = 'ok'\n  end function\n  subroutine run(callback)\n    procedure(callback_i), optional :: callback\n    if (invoke(callback) /= 'ok') error stop 1\n  end subroutine\nend module\nprogram p\n  use m, only: run\n  implicit none\n  integer :: marker\n  marker = 0\n  call run(mark)\n  if (marker /= 42) error stop 2\n  call run()\n  print *, 'ok'\ncontains\n  subroutine mark()\n    marker = 42\n  end subroutine\nend program\n",
+        "f90",
+    );
+    let out = unique_path("hidden_result_proc_dummy_closure_o1", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .args(["-O1", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("hidden-result procedure-dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "hidden-result calls should forward procedure-dummy closure slots: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("hidden-result procedure-dummy program failed to run");
+    assert!(
+        run.status.success(),
+        "forwarded callback should retain its host closure: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected hidden-result callback output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn class_star_optional_argument_forwards_through_intermediate_subroutine() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
