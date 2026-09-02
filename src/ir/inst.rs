@@ -244,6 +244,10 @@ pub struct BasicBlock {
     /// provenance prevents the pass from recursively unswitching its own
     /// clones and bypassing its code-size guard.
     pub(crate) loop_unswitch_generated: bool,
+    /// True for the scalar remainder header produced by runtime partial
+    /// unrolling. The remainder must not itself be runtime-partial-unrolled,
+    /// or every optimizer iteration appends another remainder loop.
+    pub(crate) partial_unroll_remainder: bool,
 }
 
 impl BasicBlock {
@@ -255,6 +259,7 @@ impl BasicBlock {
             insts: Vec::new(),
             terminator: None,
             loop_unswitch_generated: false,
+            partial_unroll_remainder: false,
         }
     }
 }
