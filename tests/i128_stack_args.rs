@@ -34,12 +34,14 @@ fn assert_i128_return_stored_after_call(asm: &str, call_marker: &str, context: &
         );
         return;
     }
-    assert!(
-        asm[call_idx..].contains("stp x0, x1, [x29, #-"),
-        "{}:\n{}",
-        context,
-        asm
-    );
+    let post_call = asm[call_idx..]
+        .lines()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stores_pair = post_call.contains("stp x0, x1, [x29, #-");
+    let stores_limbs = post_call.contains("str x0, [") && post_call.contains("str x1, [");
+    assert!(stores_pair || stores_limbs, "{}:\n{}", context, asm);
 }
 
 #[test]
