@@ -3865,7 +3865,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             if local_is_array_like(&info)
                                 && !is_scalar_fixed_alloc_char
-                                && lower_1d_section_assign(b, ctx, &info, args, value)
+                                && lower_1d_section_assign(b, ctx, &akey, &info, args, value)
                             {
                                 return;
                             }
@@ -4196,7 +4196,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 return;
                             }
                             if local_is_array_like(&info)
-                                && lower_1d_section_assign(b, ctx, &info, args, value)
+                                && lower_1d_section_assign(
+                                    b,
+                                    ctx,
+                                    root_object_name(callee).as_deref().unwrap_or(""),
+                                    &info,
+                                    args,
+                                    value,
+                                )
                             {
                                 return;
                             }

@@ -51117,6 +51117,194 @@ pub(super) fn lower_vector_subscript_section_assign(
     true
 }
 
+fn section_subscripts_match_ignoring_spans(
+    lhs: &[crate::ast::expr::Argument],
+    rhs: &[crate::ast::expr::Argument],
+) -> bool {
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs).all(|(lhs, rhs)| {
+            let keywords_match = match (&lhs.keyword, &rhs.keyword) {
+                (None, None) => true,
+                (Some(lhs), Some(rhs)) => lhs.eq_ignore_ascii_case(rhs),
+                _ => false,
+            };
+            keywords_match
+                && lhs
+                    .value
+                    .to_sexpr()
+                    .eq_ignore_ascii_case(&rhs.value.to_sexpr())
+        })
+}
+
+/// Return true when every array-valued reference in `expr` can be safely
+/// scalarized alongside a one-dimensional section assignment.  This is the
+/// common column-update shape used by small linear-algebra kernels:
+///
+/// `z(:, j) = z(:, j) + x(:, i) * y(i, j)`
+///
+/// The general descriptor path must remain the fallback for partial ranges,
+/// multi-rank sections, whole arrays, and overlapping views.  In particular,
+/// a reference back to the destination is only stream-safe when it names the
+/// exact same section; shifted/reversed overlaps require the ordinary RHS
+/// snapshot.
+fn can_scalarize_multi_d_section_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    dest_name: &str,
+    dest_args: &[crate::ast::expr::Argument],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    match &expr.node {
+        Expr::IntegerLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::LogicalLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::BozLiteral { .. }
+        | Expr::ComplexLiteral { .. }
+        | Expr::NilArgument => true,
+        Expr::Name { name } => {
+            // A bare array name is a whole-array operand, not a scalar.
+            !locals
+                .get(&name.to_lowercase())
+                .is_some_and(local_is_array_like)
+        }
+        Expr::ParenExpr { inner } | Expr::UnaryOp { operand: inner, .. } => {
+            can_scalarize_multi_d_section_expr(
+                inner,
+                locals,
+                dest_name,
+                dest_args,
+                st,
+                type_layouts,
+            )
+        }
+        Expr::BinaryOp { op, left, right } => {
+            matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
+            ) && can_scalarize_multi_d_section_expr(
+                left,
+                locals,
+                dest_name,
+                dest_args,
+                st,
+                type_layouts,
+            ) && can_scalarize_multi_d_section_expr(
+                right,
+                locals,
+                dest_name,
+                dest_args,
+                st,
+                type_layouts,
+            )
+        }
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key).filter(|info| local_is_array_like(info)) {
+                    if info.is_pointer {
+                        return false;
+                    }
+                    let ranges = args
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(dim, arg)| match &arg.value {
+                            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                                Some((dim, start.is_none() && end.is_none() && stride.is_none()))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+
+                    if ranges.is_empty() {
+                        // Ordinary scalar element access, such as y(i,j).
+                        return args.iter().all(|arg| match &arg.value {
+                            crate::ast::expr::SectionSubscript::Element(index) => {
+                                can_scalarize_multi_d_section_expr(
+                                    index,
+                                    locals,
+                                    dest_name,
+                                    dest_args,
+                                    st,
+                                    type_layouts,
+                                )
+                            }
+                            crate::ast::expr::SectionSubscript::Range { .. } => false,
+                        });
+                    }
+
+                    // The existing scalarizer maps a full slice to a one-based
+                    // synthetic loop index.  Keep that truthful by accepting a
+                    // statically one-based dimension, or a descriptor argument
+                    // whose assumed-shape view has already been normalized.
+                    let [(slice_dim, true)] = ranges.as_slice() else {
+                        return false;
+                    };
+                    let one_based = info
+                        .dims
+                        .get(*slice_dim)
+                        .map(|(lower, _)| *lower == 1)
+                        .unwrap_or(info.descriptor_arg);
+                    if !one_based {
+                        return false;
+                    }
+                    if key.eq_ignore_ascii_case(dest_name)
+                        && !section_subscripts_match_ignoring_spans(args, dest_args)
+                    {
+                        return false;
+                    }
+                    return args.iter().all(|arg| match &arg.value {
+                        crate::ast::expr::SectionSubscript::Element(index) => {
+                            can_scalarize_multi_d_section_expr(
+                                index,
+                                locals,
+                                dest_name,
+                                dest_args,
+                                st,
+                                type_layouts,
+                            )
+                        }
+                        crate::ast::expr::SectionSubscript::Range { .. } => true,
+                    });
+                }
+
+                if is_array_reducing_intrinsic(name)
+                    || is_whole_array_transformational_call(name)
+                    || call_has_array_shaped_actual(args, locals)
+                    || actual_expr_rank(expr, locals, st, type_layouts).is_some_and(|rank| rank > 0)
+                {
+                    return false;
+                }
+            }
+
+            can_scalarize_multi_d_section_expr(
+                callee,
+                locals,
+                dest_name,
+                dest_args,
+                st,
+                type_layouts,
+            ) && args.iter().all(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(value) => {
+                    can_scalarize_multi_d_section_expr(
+                        value,
+                        locals,
+                        dest_name,
+                        dest_args,
+                        st,
+                        type_layouts,
+                    )
+                }
+                crate::ast::expr::SectionSubscript::Range { .. } => false,
+            })
+        }
+        Expr::ComponentAccess { .. }
+        | Expr::ArrayConstructor { .. }
+        | Expr::ConditionalExpr { .. } => false,
+    }
+}
+
 /// Multi-dim section assignment: `dest(s_0, s_1, ..., s_{N-1}) = value`
 /// where one or more `s_k` is a Range subscript.  Builds a section
 /// descriptor for the LHS via `afs_create_section`, then iterates
@@ -51131,6 +51319,7 @@ pub(super) fn lower_vector_subscript_section_assign(
 pub(super) fn lower_multi_d_section_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    dest_name: &str,
     dest_info: &LocalInfo,
     dest_args: &[crate::ast::expr::Argument],
     value: &crate::ast::expr::SpannedExpr,
@@ -51160,18 +51349,76 @@ pub(super) fn lower_multi_d_section_assign(
         Some(ctx.type_layouts),
     );
 
+    // Fuse one-dimensional full-slice expressions into the destination
+    // iteration. This avoids materializing every binary subexpression in a
+    // heap-backed descriptor while retaining the general snapshot path for
+    // potentially overlapping sections.
+    let scalarized_value = if matches!(dest_info.ty, IrType::Int(_) | IrType::Float(_))
+        && !dest_info.is_pointer
+        && !dest_name.is_empty()
+        && can_scalarize_multi_d_section_expr(
+            value,
+            &ctx.locals,
+            dest_name,
+            dest_args,
+            ctx.st,
+            Some(ctx.type_layouts),
+        )
+        && !expr_contains_named_interface_call_with_array_actual(
+            value,
+            &ctx.locals,
+            ctx.st,
+            Some(ctx.type_layouts),
+        ) {
+        let loop_var = fresh_synth_loop_var(&ctx.locals);
+        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, dest_info, &loop_var).and_then(
+            |(mapped, changed)| {
+                if !changed {
+                    return None;
+                }
+                let index_addr = b.alloca(IrType::Int(IntWidth::I32));
+                ctx.locals.insert(
+                    loop_var,
+                    LocalInfo {
+                        addr: index_addr,
+                        ty: IrType::Int(IntWidth::I32),
+                        dims: vec![],
+                        allocatable: false,
+                        descriptor_arg: false,
+                        by_ref: false,
+                        char_kind: CharKind::None,
+                        derived_type: None,
+                        inline_const: None,
+                        is_pointer: false,
+                        runtime_dim_upper: vec![],
+                        is_class: false,
+                        logical_kind: None,
+                        last_dim_assumed_size: false,
+                    },
+                );
+                Some((index_addr, mapped))
+            },
+        )
+    } else {
+        None
+    };
+
     // Try to lower RHS as an array descriptor (e.g. `beta * b(1:n,1:m)`
     // is a binary descriptor expression with element type elem_ty).
-    let src_desc = lower_array_expr_descriptor(
-        b,
-        &ctx.locals,
-        value,
-        ctx.st,
-        Some(ctx.type_layouts),
-        Some(ctx.internal_funcs),
-        Some(ctx.contained_host_refs),
-        Some(ctx.descriptor_params),
-    );
+    let src_desc = if scalarized_value.is_none() {
+        lower_array_expr_descriptor(
+            b,
+            &ctx.locals,
+            value,
+            ctx.st,
+            Some(ctx.type_layouts),
+            Some(ctx.internal_funcs),
+            Some(ctx.contained_host_refs),
+            Some(ctx.descriptor_params),
+        )
+    } else {
+        None
+    };
 
     let elem_ty = dest_info.ty.clone();
     let elem_bytes = ir_scalar_byte_size(&elem_ty, ctx.layout);
@@ -51198,7 +51445,7 @@ pub(super) fn lower_multi_d_section_assign(
         total = b.imul(total, ext);
     }
 
-    let (scalar_value, scalar_complex_src) = if src_desc.is_none() {
+    let (scalar_value, scalar_complex_src) = if src_desc.is_none() && scalarized_value.is_none() {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
         if is_complex_ty(&elem_ty) {
             let src = match b.func().value_type(raw) {
@@ -51228,6 +51475,12 @@ pub(super) fn lower_multi_d_section_assign(
     b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
 
     b.set_block(bb_body);
+    if let Some((index_addr, _)) = scalarized_value.as_ref() {
+        let one = b.const_i64(1);
+        let one_based = b.iadd(i, one);
+        let one_based_i32 = coerce_to_type(b, one_based, &IrType::Int(IntWidth::I32));
+        b.store(one_based_i32, *index_addr);
+    }
     let elem_size_v = b.const_i64(elem_bytes);
     // Decompose flat i into per-dim coords; accumulate stride-weighted
     // byte offset into dest_off.  For dim k, coord_k = (i / prod_{j<k} ext_j) mod ext_k.
@@ -51247,7 +51500,10 @@ pub(super) fn lower_multi_d_section_assign(
     }
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
 
-    let (stored, complex_src_ptr) = if let Some((sd, src_ty)) = src_desc.as_ref() {
+    let (stored, complex_src_ptr) = if let Some((_, mapped)) = scalarized_value.as_ref() {
+        let raw = super::expr::lower_expr_ctx_tl(b, ctx, mapped);
+        (Some(coerce_to_type(b, raw, &elem_ty)), None)
+    } else if let Some((sd, src_ty)) = src_desc.as_ref() {
         let src_base = b.load_typed(*sd, IrType::Ptr(Box::new(src_ty.clone())));
         // Re-decompose the same flat i for the source descriptor (its
         // strides may differ from the destination's).
@@ -51413,6 +51669,7 @@ fn try_lower_transfer_char_expr_into_section(
 pub(super) fn lower_1d_section_assign(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
+    dest_name: &str,
     dest_info: &LocalInfo,
     dest_args: &[crate::ast::expr::Argument],
     value: &crate::ast::expr::SpannedExpr,
@@ -51428,7 +51685,7 @@ pub(super) fn lower_1d_section_assign(
     // wrong when there's more than one dim.  Route those out through
     // the generalized helper.
     if dest_args.len() != 1 {
-        return lower_multi_d_section_assign(b, ctx, dest_info, dest_args, value);
+        return lower_multi_d_section_assign(b, ctx, dest_name, dest_info, dest_args, value);
     }
 
     let dest_desc = lower_array_section(
@@ -65615,6 +65872,49 @@ end program
         );
         assert!(ir.contains("doconc_check"));
         assert!(ir.contains("call @afs_internal___prog_test_1("));
+    }
+
+    #[test]
+    fn lower_matching_column_update_fuses_array_expression() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y, z, i, j)
+  implicit none
+  real(8), intent(in) :: x(:, :), y(:, :)
+  real(8), intent(inout) :: z(:, :)
+  integer, value :: i, j
+  z(:, j) = z(:, j) + x(:, i) * y(i, j)
+end subroutine
+",
+        );
+        assert_eq!(
+            ir.matches("call @afs_create_section(").count(),
+            1,
+            "the fused update should only construct the destination section:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like_with_elem_size("),
+            "the fused RHS should not allocate array temporaries:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_different_column_read_keeps_array_snapshot() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, z, i, j)
+  implicit none
+  real(8), intent(in) :: x(:, :)
+  real(8), intent(inout) :: z(:, :)
+  integer, value :: i, j
+  z(:, j) = z(:, i) + x(:, i)
+end subroutine
+",
+        );
+        assert!(
+            ir.contains("call @afs_allocate_like_with_elem_size("),
+            "a potentially overlapping destination view must retain RHS snapshotting:\n{ir}"
+        );
     }
 
     #[test]
