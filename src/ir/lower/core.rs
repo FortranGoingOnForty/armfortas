@@ -19575,7 +19575,8 @@ fn callee_arg_call_ir_type(
         && symbol.attrs.array_spec.is_empty();
     let is_derived = matches!(
         symbol.type_info,
-        Some(crate::sema::symtab::TypeInfo::Derived(_))
+        Some(crate::sema::symtab::TypeInfo::Derived(ref name))
+            if !is_opaque_c_handle_name(name)
     );
     Some(by_ref_storage_ir_type(
         &element_type,
@@ -23978,6 +23979,17 @@ pub(super) fn arg_derived_type_name(
             for entity in entities {
                 if entity.name.to_lowercase() == key {
                     if let TypeSpec::Type(ref name) | TypeSpec::Class(ref name) = type_spec {
+                        // ISO_C_BINDING pointer handles and the IEEE
+                        // intrinsic-module opaque types have scalar payloads.
+                        // A non-VALUE dummy therefore needs the ordinary
+                        // extra reference layer, not the address-shaped
+                        // aggregate ABI used for real derived types.
+                        if is_opaque_c_handle_name(name)
+                            || crate::sema::resolve::type_resolution::ieee_opaque_int_kind(name)
+                                .is_some()
+                        {
+                            return None;
+                        }
                         // TYPE(enumeration) dummies are plain by-ref
                         // i32 scalars, not derived aggregates.
                         if type_name_is_enumeration(name, st) {

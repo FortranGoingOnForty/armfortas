@@ -8554,6 +8554,51 @@ fn bind_c_c_ptr_value_and_i64_values_survive_wrapper_dummy_call() {
 }
 
 #[test]
+fn nonvalue_c_ptr_dummy_in_allocatable_character_function_uses_reference_abi_at_o1() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nonvalue_c_ptr_dummy_in_allocatable_character_function_uses_reference_abi_at_o1 count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  use iso_c_binding, only: c_ptr, c_int, c_f_pointer\n  implicit none\ncontains\n  function from_pointer(raw) result(text)\n    type(c_ptr), intent(in) :: raw\n    character(len=:), allocatable :: text\n    integer(c_int), pointer :: value\n    call c_f_pointer(raw, value)\n    if (value == 42_c_int) then\n      text = 'ok'\n    else\n      text = 'bad'\n    end if\n  end function\nend module\nprogram p\n  use iso_c_binding, only: c_ptr, c_int, c_loc\n  use m, only: from_pointer\n  implicit none\n  integer(c_int), target :: value\n  type(c_ptr) :: raw\n  value = 42_c_int\n  raw = c_loc(value)\n  if (from_pointer(raw) /= 'ok') error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("nonvalue_c_ptr_char_result_o1", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .args(["-O1", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("non-VALUE c_ptr character-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "non-VALUE c_ptr dummy should use a reference ABI at O1: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("non-VALUE c_ptr character-result run failed");
+    assert!(
+        run.status.success(),
+        "non-VALUE c_ptr character-result program should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "non-VALUE c_ptr dummy should preserve the pointed-to value: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn bind_c_c_char_function_result_round_trips_through_wrapper_module() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
