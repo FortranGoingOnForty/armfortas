@@ -33999,6 +33999,49 @@ fn sum_along_dim_returns_reduced_array() {
 }
 
 #[test]
+fn product_along_dim_returns_reduced_array() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=product_along_dim_returns_reduced_array count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // PRODUCT with DIM returns rank N-1. This used to take the scalar
+    // whole-array PRODUCT path and pass the resulting f64 to descriptor-copy
+    // code, where an assumed-shape destination exposed it as an invalid
+    // descriptor pointer.
+    let src = write_program(
+        "program t\n  implicit none\n  real(8) :: y(2,3) = reshape([1.0_8,2.0_8,3.0_8,4.0_8,5.0_8,6.0_8], [2,3])\n  real(8) :: r1(3), r2(2)\n  r1 = product(-y, dim=1)\n  r2 = product(-y, dim=2)\n  if (any(abs(r1 - [2.0_8, 12.0_8, 30.0_8]) > 1.0e-12_8)) error stop 1\n  if (any(abs(r2 - [-15.0_8, -48.0_8]) > 1.0e-12_8)) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("product_along_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("product-with-dim compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "product-with-dim should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("product-with-dim run failed");
+    assert!(
+        run.status.success(),
+        "product-with-dim should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn maxval_minval_with_dim_return_reduced_arrays() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

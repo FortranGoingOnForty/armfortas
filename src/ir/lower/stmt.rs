@@ -3306,60 +3306,27 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         // (solve_cg/bicgstab/pcg).
                                                         | "merge"
                                                 ) || (
-                                                    // sum(arr, dim) is rank-N-1: route to
-                                                    // lower_array_assign so the sum-dim arm
-                                                    // in lower_array_expr_descriptor fills
-                                                    // the result descriptor. Plain sum(arr)
-                                                    // is scalar; that arm returns None and
-                                                    // assignment falls through to scalar
-                                                    // broadcast.
-                                                    lname == "sum"
-                                                        && call_args.iter().enumerate().any(
-                                                            |(i, a)| {
-                                                                let kw = a
-                                                                    .keyword
-                                                                    .as_deref()
-                                                                    .map(|s| s.to_lowercase());
-                                                                matches!(kw.as_deref(), Some("dim"))
-                                                                    || (i == 1 && kw.is_none())
-                                                            },
-                                                        )
-                                                ) || (
-                                                    // count(mask, dim) is rank-N-1 integer
-                                                    // array: same routing as sum(arr, dim).
-                                                    // Without this, the scalar logical-
-                                                    // reduction path returns a single i32
-                                                    // total and the array-assign treats it
-                                                    // as a source descriptor, dereferencing
-                                                    // a tiny address (e.g. 0x3) and aborting
-                                                    // in afs_assign_allocatable. Surfaced
-                                                    // in stdlib_stats var_mask_2_*.
-                                                    lname == "count"
-                                                        && call_args.iter().enumerate().any(
-                                                            |(i, a)| {
-                                                                let kw = a
-                                                                    .keyword
-                                                                    .as_deref()
-                                                                    .map(|s| s.to_lowercase());
-                                                                matches!(kw.as_deref(), Some("dim"))
-                                                                    || (i == 1 && kw.is_none())
-                                                            },
-                                                        )
-                                                ) || (
-                                                    // maxval/minval(arr, dim) are also rank-N-1
-                                                    // when the source rank is greater than one.
-                                                    // Keep rank-1 reductions on the scalar path
-                                                    // so nested forms such as
-                                                    // maxval(sum(abs(A), dim=1), 1) still return
-                                                    // a scalar.
-                                                    matches!(lname.as_str(), "maxval" | "minval")
-                                                        && actual_expr_rank(
-                                                            array_rhs,
-                                                            &ctx.locals,
-                                                            ctx.st,
-                                                            Some(ctx.type_layouts),
-                                                        )
-                                                        .is_some_and(|rank| rank > 0)
+                                                    // DIM reductions return rank N-1 arrays.
+                                                    // Route every reduction that the shared
+                                                    // rank classifier proves array-valued
+                                                    // through lower_array_expr_descriptor.
+                                                    // Otherwise the scalar intrinsic path can
+                                                    // hand a numeric result to descriptor-copy
+                                                    // code (PRODUCT was the remaining case).
+                                                    resolved_intrinsic_name_for_call(
+                                                        ctx.st,
+                                                        ctx.proc_scope_id,
+                                                        b.func().name.as_str(),
+                                                        &lname,
+                                                    )
+                                                    .is_some_and(|intrinsic_name| {
+                                                        is_array_reducing_intrinsic(&intrinsic_name)
+                                                            && expr_returns_array(
+                                                                array_rhs,
+                                                                &ctx.locals,
+                                                                ctx.st,
+                                                            )
+                                                    })
                                                 )
                                             } else {
                                                 false

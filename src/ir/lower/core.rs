@@ -50512,7 +50512,14 @@ pub(super) fn expr_returns_array(
                 }
                 if matches!(
                     key.as_str(),
-                    "count" | "sum" | "maxval" | "minval" | "maxloc" | "minloc" | "norm2"
+                    "count"
+                        | "sum"
+                        | "product"
+                        | "maxval"
+                        | "minval"
+                        | "maxloc"
+                        | "minloc"
+                        | "norm2"
                 ) && has_reduction_dim_arg(args, locals, st, None)
                     && actual_expr_rank(expr, locals, st, None).is_some_and(|rank| rank > 0)
                 {
@@ -65697,6 +65704,31 @@ end subroutine
             ir.matches("call @afs_deallocate_array(").count(),
             2,
             "the MINVAL mask and dimension-reduction result must be released:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_product_dim_as_array_result() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine test(matrix, values)
+  implicit none
+  real(8), intent(in) :: matrix(:, :)
+  real(8), intent(out) :: values(:)
+  values = product(-matrix, dim=1)
+end subroutine
+",
+        );
+        assert!(
+            ir.contains("call @afs_array_product_real8_dim("),
+            "PRODUCT with DIM must use the array-result reducer:\n{}",
+            ir
+        );
+        assert!(!ir.contains("call @afs_array_product_real8("));
+        assert!(
+            ir.matches("call @afs_deallocate_array(").count() >= 2,
+            "the PRODUCT input and result must be released:\n{}",
             ir
         );
     }
