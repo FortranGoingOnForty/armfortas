@@ -18,23 +18,88 @@ const GP_SCRATCH: [u8; 3] = [9, 10, 11];
 /// Float scratch registers (caller-saved, safe to clobber).
 const FP_SCRATCH: [u8; 3] = [16, 17, 18];
 
+#[derive(Clone, Copy)]
+struct SpillSlot {
+    offset: i32,
+    size: u32,
+}
+
+fn spill_size(class: RegClass) -> u32 {
+    match class {
+        RegClass::Gp64 | RegClass::Fp64 => 8,
+        RegClass::Gp32 | RegClass::Fp32 => 4,
+        RegClass::V128 => 16,
+    }
+}
+
+fn spill_align(size: u32) -> u32 {
+    if size >= 16 {
+        16
+    } else if size >= 8 {
+        8
+    } else {
+        4
+    }
+}
+
+/// Assign memory to the spill-everything allocator without making every
+/// short-lived vreg permanently enlarge the frame.  The liveness intervals
+/// are conservative across the CFG, so sharing slots whose intervals are
+/// disjoint cannot make values on different paths alias while live.
+fn allocate_spill_slots(mf: &mut MachineFunction) -> HashMap<VRegId, i32> {
+    let intervals = super::liveness::compute_spill_liveness(mf).intervals;
+    let mut slots = HashMap::with_capacity(intervals.len());
+    let mut active: Vec<(u32, SpillSlot)> = Vec::new();
+    let mut free: Vec<SpillSlot> = Vec::new();
+
+    for interval in intervals {
+        // An interval ending at this instruction still overlaps a value
+        // defined by the same instruction: the old operands are read before
+        // the result is stored.  Only strictly earlier intervals may expire.
+        let mut index = 0;
+        while index < active.len() {
+            if active[index].0 < interval.start {
+                let (_, slot) = active.swap_remove(index);
+                free.push(slot);
+            } else {
+                index += 1;
+            }
+        }
+
+        let size = spill_size(interval.class);
+        let align = spill_align(size);
+        let reusable = free
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.size >= size && slot.offset.unsigned_abs().is_multiple_of(align)
+            })
+            .min_by_key(|(_, slot)| (slot.size, slot.offset.unsigned_abs()))
+            .map(|(index, _)| index);
+        let slot = if let Some(index) = reusable {
+            free.swap_remove(index)
+        } else {
+            SpillSlot {
+                offset: mf.alloc_local(size),
+                size,
+            }
+        };
+
+        slots.insert(interval.vreg, slot.offset);
+        active.push((interval.end, slot));
+    }
+
+    slots
+}
+
 /// Allocate registers for a machine function using spill-everything strategy.
 /// Modifies the function in place: replaces VReg operands with PhysReg,
 /// inserts loads/stores around each instruction.
 pub fn regalloc_naive(mf: &mut MachineFunction) {
-    // Phase 1: assign a stack slot to every vreg.
-    let mut vreg_slots: HashMap<VRegId, i32> = HashMap::new();
-    for vreg in &mf.vregs {
-        let size = match vreg.class {
-            RegClass::Gp64 => 8,
-            RegClass::Gp32 => 4,
-            RegClass::Fp64 => 8,
-            RegClass::Fp32 => 4,
-            RegClass::V128 => 16,
-        };
-        let offset = mf.frame.alloc_local(size);
-        vreg_slots.insert(vreg.id, offset);
-    }
+    // Phase 1: spill every vreg, but reuse storage after its conservative
+    // live interval ends.  This keeps -O0 simple without making large
+    // recursive procedures consume tens of kilobytes per call.
+    let vreg_slots = allocate_spill_slots(mf);
 
     // Build class map for quick lookup.
     let vreg_classes: HashMap<VRegId, RegClass> =
@@ -229,6 +294,70 @@ mod tests {
         assert!(
             mf.frame.size >= before,
             "frame should grow to accommodate spill slots"
+        );
+    }
+
+    #[test]
+    fn regalloc_reuses_slots_for_disjoint_intervals() {
+        let mut mf = MachineFunction::new("test".into());
+        for value in 0..128 {
+            let vreg = mf.new_vreg(RegClass::Gp64);
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::Movz,
+                operands: vec![MachineOperand::VReg(vreg), MachineOperand::Imm(value)],
+                def: Some(vreg),
+            });
+            mf.blocks[0].insts.push(MachineInst {
+                opcode: ArmOpcode::MovReg,
+                operands: vec![
+                    MachineOperand::PhysReg(PhysReg::Gp(0)),
+                    MachineOperand::VReg(vreg),
+                ],
+                def: None,
+            });
+        }
+
+        regalloc_naive(&mut mf);
+
+        assert_eq!(
+            mf.frame.locals.len(),
+            1,
+            "all sequential spill values should share one frame slot"
+        );
+    }
+
+    #[test]
+    fn regalloc_does_not_reuse_slots_with_same_instruction_uses() {
+        let mut mf = MachineFunction::new("test".into());
+        let lhs = mf.new_vreg(RegClass::Gp64);
+        let rhs = mf.new_vreg(RegClass::Gp64);
+        let result = mf.new_vreg(RegClass::Gp64);
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![MachineOperand::VReg(lhs), MachineOperand::Imm(19)],
+            def: Some(lhs),
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::Movz,
+            operands: vec![MachineOperand::VReg(rhs), MachineOperand::Imm(23)],
+            def: Some(rhs),
+        });
+        mf.blocks[0].insts.push(MachineInst {
+            opcode: ArmOpcode::AddReg,
+            operands: vec![
+                MachineOperand::VReg(result),
+                MachineOperand::VReg(lhs),
+                MachineOperand::VReg(rhs),
+            ],
+            def: Some(result),
+        });
+
+        regalloc_naive(&mut mf);
+
+        assert_eq!(
+            mf.frame.locals.len(),
+            3,
+            "inputs and output at one instruction must retain distinct spill slots"
         );
     }
 
