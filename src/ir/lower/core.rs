@@ -44453,6 +44453,7 @@ pub(super) fn lower_array_norm2_dim_descriptor(
         vec![src_desc, dim_val, result_desc],
         IrType::Void,
     );
+    deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
     Some((result_desc, elem_ty))
 }
 
@@ -44705,6 +44706,10 @@ pub(super) fn lower_array_product_dim_descriptor(
         call_args.push(md);
     }
     b.call(FuncRef::External(helper.into()), call_args, IrType::Void);
+    deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
+    if let (Some(mask_expr), Some(mask_desc)) = (mask_expr, mask_desc) {
+        deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask_desc);
+    }
     Some((result_desc, elem_ty))
 }
 
@@ -44825,6 +44830,10 @@ pub(super) fn lower_array_minmax_dim_descriptor(
         call_args.push(md);
     }
     b.call(FuncRef::External(helper.into()), call_args, IrType::Void);
+    deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
+    if let (Some(mask_expr), Some(mask_desc)) = (mask_expr, mask_desc) {
+        deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask_desc);
+    }
     Some((result_desc, elem_ty))
 }
 
@@ -65639,6 +65648,55 @@ end subroutine
         assert_eq!(
             deallocation_count, allocation_count,
             "every scalar-reduction mask temporary must be released:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn lower_dimension_reductions_release_expression_inputs() {
+        for intrinsic in ["norm2", "minval", "maxval"] {
+            let source = format!(
+                "\
+subroutine test(matrix, values)
+  implicit none
+  real(8), intent(in) :: matrix(:, :)
+  real(8), intent(out) :: values(:)
+  values = {}(-matrix, dim=1)
+end subroutine
+",
+                intrinsic
+            );
+            let (_, ir) = lower_and_verify(&source);
+            let reduction_call = format!("call @afs_array_{}_real8_dim(", intrinsic);
+            let post_reduction = ir
+                .split(&reduction_call)
+                .nth(1)
+                .unwrap_or_else(|| panic!("expected {} reduction call in:\n{}", intrinsic, ir));
+            assert!(
+                post_reduction
+                    .matches("call @afs_deallocate_array(")
+                    .count()
+                    >= 2,
+                "the {} input and result must be released after the reduction:\n{}",
+                intrinsic,
+                ir
+            );
+        }
+
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine test(matrix, values)
+  implicit none
+  real(8), intent(in) :: matrix(:, :)
+  real(8), intent(out) :: values(:)
+  values = minval(matrix, dim=1, mask=(matrix > 0.0_8))
+end subroutine
+",
+        );
+        assert_eq!(
+            ir.matches("call @afs_deallocate_array(").count(),
+            2,
+            "the MINVAL mask and dimension-reduction result must be released:\n{}",
             ir
         );
     }
