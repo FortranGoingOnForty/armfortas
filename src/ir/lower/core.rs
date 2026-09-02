@@ -25801,6 +25801,15 @@ pub(super) fn allocated_array_elem_size(
     fallback_bytes: i64,
     typed_char_len: Option<ValueId>,
 ) -> ValueId {
+    // An allocatable scalar with an explicit CHARACTER length keeps that
+    // declared length under SOURCE= allocation.  Its LocalInfo uses the
+    // descriptor-backed fixed-scalar representation, so letting the generic
+    // descriptor case below prefer typed_char_len would allocate only the
+    // source's bytes (for example 2 bytes for a CHARACTER(5) destination),
+    // leaving the required padding outside the allocation.
+    if let Some(len) = local_fixed_char_allocatable_scalar_len(info) {
+        return b.const_i64(len);
+    }
     if let Some(len) = typed_char_len {
         if local_uses_array_descriptor(info)
             && matches!(info.char_kind, CharKind::Fixed(_) | CharKind::Deferred)
