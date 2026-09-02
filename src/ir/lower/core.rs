@@ -45442,7 +45442,7 @@ pub(super) fn lower_pack_array_expr_descriptor(
         descriptor_params,
     )?;
 
-    let vector_desc = if let Some(vec_arg) = vector_arg {
+    let vector_temp = if let Some(vec_arg) = vector_arg {
         if let crate::ast::expr::SectionSubscript::Element(vec_expr) = &vec_arg.value {
             lower_array_expr_descriptor(
                 b,
@@ -45454,7 +45454,7 @@ pub(super) fn lower_pack_array_expr_descriptor(
                 contained_host_refs,
                 descriptor_params,
             )
-            .map(|(d, _)| d)
+            .map(|(desc, _)| (vec_expr, desc))
         } else {
             None
         }
@@ -45464,7 +45464,10 @@ pub(super) fn lower_pack_array_expr_descriptor(
 
     let null_desc = b.const_i64(0);
     let null_desc_ptr = b.int_to_ptr(null_desc, IrType::Int(IntWidth::I8));
-    let vector_desc = vector_desc.unwrap_or(null_desc_ptr);
+    let vector_desc = vector_temp
+        .as_ref()
+        .map(|(_, desc)| *desc)
+        .unwrap_or(null_desc_ptr);
 
     let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
     let zero32 = b.const_i32(0);
@@ -45480,6 +45483,11 @@ pub(super) fn lower_pack_array_expr_descriptor(
         vec![src_desc, mask_desc, vector_desc, result_desc],
         IrType::Void,
     );
+    deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
+    deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask_desc);
+    if let Some((vector_expr, vector_desc)) = vector_temp {
+        deallocate_array_expr_descriptor_if_temp(b, locals, vector_expr, st, vector_desc);
+    }
 
     Some((result_desc, elem_ty))
 }
@@ -65455,6 +65463,38 @@ end program
             post_call.matches("call @afs_deallocate_array").count() >= 3,
             "expected the function result, elemental result, and assignment copy to be released:\n{}",
             ir
+        );
+    }
+
+    #[test]
+    fn lower_pack_releases_array_function_source() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  integer :: values(2)
+  logical :: mask(4)
+  mask = [.true., .false., .true., .false.]
+  values = pack(make_values(4), mask)
+contains
+  function make_values(n) result(result_values)
+    integer, intent(in) :: n
+    integer :: result_values(max(n, 0))
+    result_values = 1
+  end function
+end program
+",
+        );
+        let caller = ir
+            .split("\n  func @afs_internal___prog_test_1")
+            .next()
+            .expect("expected program function");
+
+        assert_eq!(
+            caller.matches("call @afs_deallocate_array").count(),
+            2,
+            "the array function source and PACK result must both be released:\n{}",
+            caller
         );
     }
 
