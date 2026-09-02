@@ -44554,6 +44554,10 @@ pub(super) fn lower_array_sum_dim_descriptor(
         call_args.push(md);
     }
     b.call(FuncRef::External(helper.into()), call_args, IrType::Void);
+    deallocate_array_expr_descriptor_if_temp(b, locals, array_expr, st, src_desc);
+    if let (Some(mask_expr), Some(mask_desc)) = (mask_expr, mask_desc) {
+        deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask_desc);
+    }
     Some((result_desc, elem_ty))
 }
 
@@ -65536,6 +65540,35 @@ end program
         assert!(
             caller.matches("call @afs_deallocate_array").count() >= 2,
             "the RESHAPE source and result must both be released:\n{}",
+            caller
+        );
+    }
+
+    #[test]
+    fn lower_sum_dim_releases_array_expression_source() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  real(8) :: values(2)
+  values = sum(abs(make_matrix()), dim=1)
+contains
+  function make_matrix() result(result_values)
+    real(8) :: result_values(2, 2)
+    result_values = 1.0_8
+  end function
+end program
+",
+        );
+        let caller = ir
+            .split("\n  func @afs_internal___prog_test_1")
+            .next()
+            .expect("expected program function");
+
+        assert_eq!(
+            caller.matches("call @afs_deallocate_array").count(),
+            3,
+            "the function result, ABS temporary, and SUM result must be released:\n{}",
             caller
         );
     }
