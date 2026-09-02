@@ -63319,7 +63319,47 @@ pub(super) fn lower_bind_c_char_call_arg(
 ) -> super::stmt::MaterializedCallArg {
     use crate::ast::expr::Expr;
 
-    let direct = match &expr.node {
+    // A CHARACTER array expression remains an array even though its element
+    // type also satisfies `expr_is_character_expr`.  In particular, stdlib's
+    // `to_c_char(trim(path))` is a generic function returning
+    // `character(c_char) :: cstr(n)`.  Sending that through
+    // `lower_string_expr_full` allocated the scalar 32-byte StringDescriptor;
+    // the callee then wrote a 392-byte ArrayDescriptor over the caller's stack
+    // before we passed its first word to C.  Materialize rankful character
+    // expressions with the array-result ABI and pass their contiguous data
+    // address, as required by an interoperable assumed-size CHARACTER dummy.
+    let array_direct = if actual_expr_rank(expr, locals, st, type_layouts)
+        .is_some_and(|rank| rank > 0)
+        && expr_is_character_expr(b, locals, expr, st, type_layouts)
+    {
+        lower_array_expr_descriptor(
+            b,
+            locals,
+            expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )
+        .map(|(desc, elem_ty)| {
+            let raw_base = b.load_typed(desc, IrType::Ptr(Box::new(elem_ty)));
+            let base = ptr_i8_value(b, raw_base);
+            let elem_len = descriptor_elem_size(b, desc);
+            if array_expr_descriptor_may_own_temp(expr, locals, st) {
+                // Array results use the same runtime allocation underneath as
+                // owned character temporaries.  Associate the data allocation
+                // with the pointer handed to C so the normal post-call cleanup
+                // frees it after the interoperable callee returns.
+                b.mark_owned_string_temp(base);
+            }
+            (base, Some(elem_len))
+        })
+    } else {
+        None
+    };
+
+    let direct = array_direct.or_else(|| match &expr.node {
         Expr::Name { name } => locals.get(&name.to_lowercase()).and_then(|info| {
             if !info.dims.is_empty() || local_uses_array_descriptor(info) {
                 Some((
@@ -63348,7 +63388,7 @@ pub(super) fn lower_bind_c_char_call_arg(
             })
         }),
         _ => None,
-    };
+    });
 
     let (ptr, character_len) = if let Some(direct) = direct {
         direct

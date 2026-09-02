@@ -28988,6 +28988,156 @@ fn cross_unit_char_array_result_uses_array_descriptor_abi() {
 }
 
 #[test]
+fn imported_generic_char_array_result_reaches_bind_c_assumed_size_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_generic_char_array_result_reaches_bind_c_assumed_size_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // stdlib_system calls C wrappers as
+    // `stdlib_is_file(to_c_char(trim(path)))`.  TO_C_CHAR is an imported
+    // generic whose selected specific returns CHARACTER(C_CHAR), rank 1.
+    // The BIND(C) argument materializer used the character-scalar path before
+    // considering rank, allocated a 32-byte StringDescriptor for that result,
+    // and let the function overwrite the caller's stack with its 392-byte
+    // ArrayDescriptor.  Exercise the same cross-unit generic -> assumed-size
+    // interoperable dummy chain at O1 and require verifier-clean IR.
+    let dir = unique_dir("generic_char_array_bind_c_actual");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        r#"
+module generic_char_array_provider
+  use iso_c_binding, only: c_char, c_null_char
+  implicit none
+  private
+  public :: to_c_chars
+  interface to_c_chars
+    module procedure to_c_chars_from_char
+    module procedure to_c_chars_from_integer
+  end interface
+contains
+  pure function to_c_chars_from_char(value) result(chars)
+    character(len=*), intent(in) :: value
+    character(kind=c_char) :: chars(len(value) + 1)
+    integer :: i
+    do i = 1, len(value)
+      chars(i) = value(i:i)
+    end do
+    chars(len(value) + 1) = c_null_char
+  end function
+
+  pure function to_c_chars_from_integer(value) result(chars)
+    integer, intent(in) :: value
+    character(kind=c_char) :: chars(2)
+    chars = ['i', c_null_char]
+  end function
+end module
+"#,
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        r#"
+program p
+  use iso_c_binding, only: c_char, c_int
+  use generic_char_array_provider, only: to_c_chars
+  implicit none
+  interface
+    integer(c_int) function first_c_char(chars) bind(C, name='first_c_char')
+      import c_char, c_int
+      character(kind=c_char), intent(in) :: chars(*)
+    end function
+  end interface
+  if (first_c_char(to_c_chars('ok')) /= iachar('o')) error stop 1
+  print *, 'ok'
+end program
+"#,
+    );
+    let c_source = write_program_in(
+        &dir,
+        "first_c_char.c",
+        "int first_c_char(const char *chars) { return (unsigned char)chars[0]; }\n",
+    );
+    let provider_obj = dir.join("provider.o");
+    let consumer_obj = dir.join("consumer.o");
+    let c_obj = dir.join("first_c_char.o");
+    let executable = dir.join("test_generic_char_array_bind_c");
+
+    let compile_provider = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-O1",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .output()
+        .expect("generic character-array provider compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "generic character-array provider should compile at O1: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-O1",
+            "-I",
+            dir.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .env("AFS_VERIFY_AFTER_EACH", "1")
+        .output()
+        .expect("BIND(C) character-array consumer compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "BIND(C) character-array consumer should compile at O1: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    compile_c_object(&c_source, &c_obj);
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            provider_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            c_obj.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("generic character-array BIND(C) link failed to spawn");
+    assert!(
+        link.status.success(),
+        "generic character-array BIND(C) objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&executable)
+        .output()
+        .expect("generic character-array BIND(C) binary failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "generic character-array BIND(C) binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn contained_proc_call_resolves_to_caller_host_not_lexical_last() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
