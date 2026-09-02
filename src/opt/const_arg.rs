@@ -195,16 +195,18 @@ fn wrapper_const_value(
                     }
                 }
                 InstKind::Call(FuncRef::Internal(idx), args) => {
-                    let valid = args.iter().enumerate().any(|(arg_idx, arg)| {
-                        *arg == ptr_value
-                            && param_modes
+                    let mut matching_modes = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, arg)| **arg == ptr_value)
+                        .map(|(arg_idx, _)| {
+                            param_modes
                                 .get(*idx as usize)
                                 .and_then(|modes| modes.get(arg_idx))
                                 .copied()
                                 .flatten()
-                                == Some(ParamMode::ReadOnlyScalarPtr)
-                    });
-                    if !valid {
+                        });
+                    if !matching_modes.all(|mode| mode == Some(ParamMode::ReadOnlyScalarPtr)) {
                         return None;
                     }
                     saw_call_use = true;
@@ -562,5 +564,75 @@ mod tests {
 
         assert!(!ConstArgSpecialize.run(&mut module));
         assert_eq!(module.functions[0].params.len(), 2);
+    }
+
+    #[test]
+    fn does_not_specialize_read_only_alias_of_mutating_call_argument() {
+        let mut module = Module::new("t".into(), crate::target::TargetLayout::LP64);
+        let ptr_i32 = IrType::Ptr(Box::new(IrType::Int(IntWidth::I32)));
+
+        let params = vec![
+            Param {
+                name: "mutating".into(),
+                ty: ptr_i32.clone(),
+                id: ValueId(0),
+                fortran_noalias: false,
+            },
+            Param {
+                name: "captured".into(),
+                ty: ptr_i32,
+                id: ValueId(1),
+                fortran_noalias: false,
+            },
+        ];
+        let mut callee = Function::new("helper".into(), params, IrType::Int(IntWidth::I32));
+        callee.internal_only = true;
+        let replacement = push(
+            &mut callee,
+            InstKind::ConstInt(8, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(
+            &mut callee,
+            InstKind::Store(replacement, ValueId(0)),
+            IrType::Void,
+        );
+        let observed = push(
+            &mut callee,
+            InstKind::Load(ValueId(1)),
+            IrType::Int(IntWidth::I32),
+        );
+        let callee_entry = callee.entry;
+        callee.block_mut(callee_entry).terminator = Some(Terminator::Return(Some(observed)));
+        module.add_function(callee);
+
+        let mut caller = Function::new("main".into(), vec![], IrType::Int(IntWidth::I32));
+        let slot = push(
+            &mut caller,
+            InstKind::Alloca(IrType::Int(IntWidth::I32)),
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let initial = push(
+            &mut caller,
+            InstKind::ConstInt(4, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        push(&mut caller, InstKind::Store(initial, slot), IrType::Void);
+        let call = push(
+            &mut caller,
+            InstKind::Call(FuncRef::Internal(0), vec![slot, slot]),
+            IrType::Int(IntWidth::I32),
+        );
+        let caller_entry = caller.entry;
+        caller.block_mut(caller_entry).terminator = Some(Terminator::Return(Some(call)));
+        module.add_function(caller);
+
+        assert!(!ConstArgSpecialize.run(&mut module));
+        assert_eq!(module.functions[0].params.len(), 2);
+        assert!(module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::Load(ValueId(1)))));
     }
 }
