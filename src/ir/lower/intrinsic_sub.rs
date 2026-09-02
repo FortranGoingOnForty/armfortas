@@ -753,6 +753,13 @@ pub(crate) fn lower_intrinsic_subroutine(
                         vec![desc],
                         IrType::Void,
                     );
+                    deallocate_array_expr_descriptor_if_temp(
+                        b,
+                        &ctx.locals,
+                        put_expr,
+                        ctx.st,
+                        desc,
+                    );
                 } else {
                     let seed = super::expr::lower_expr_ctx(b, ctx, put_expr);
                     let widened = b.int_extend(seed, IntWidth::I64, true);

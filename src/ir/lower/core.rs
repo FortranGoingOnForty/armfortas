@@ -65568,6 +65568,39 @@ end module
     }
 
     #[test]
+    fn lower_random_seed_put_releases_array_function_actual() {
+        let (_, ir) = lower_and_verify(
+            "\
+program test
+  implicit none
+  call random_seed(put=make_seed(8))
+contains
+  function make_seed(n) result(seed)
+    integer, intent(in) :: n
+    integer :: seed(n)
+    seed = 17
+  end function
+end program
+",
+        );
+        let caller = ir
+            .split("\n  func @afs_internal___prog_test_1")
+            .next()
+            .expect("expected program function");
+        assert!(
+            caller.contains("call @afs_random_seed_put("),
+            "expected RANDOM_SEED PUT runtime call:\n{}",
+            caller
+        );
+        assert_eq!(
+            caller.matches("call @afs_deallocate_array(").count(),
+            1,
+            "the array function PUT actual must be released after RANDOM_SEED consumes it:\n{}",
+            caller
+        );
+    }
+
+    #[test]
     fn lower_elemental_array_call_releases_function_result_actual() {
         let (_, ir) = lower_and_verify(
             "\
