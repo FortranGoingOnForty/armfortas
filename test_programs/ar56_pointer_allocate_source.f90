@@ -9,7 +9,7 @@
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 ! PHASE_TRIANGULATE: ir|asm|obj|clean|repro
-! IR_CHECK: call @afs_allocate_scalar
+! IR_CHECK: call @afs_allocate_pointer
 ! IR_CHECK: call @afs_assign_char_fixed
 program ar56_pointer_allocate_source
   implicit none
