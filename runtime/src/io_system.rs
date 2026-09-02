@@ -1284,6 +1284,7 @@ const LIST_INT16_WIDTH: usize = 7;
 const LIST_INT32_WIDTH: usize = 12;
 const LIST_INT64_WIDTH: usize = 21;
 const LIST_INT128_WIDTH: usize = 41;
+const LIST_INTERNAL_REAL64_MAX_COMPACT_FIELD: usize = 32;
 
 fn list_directed_integer_field<T: std::fmt::Display>(val: T, width: usize) -> String {
     format!("{:>width$}", val, width = width)
@@ -1291,11 +1292,17 @@ fn list_directed_integer_field<T: std::fmt::Display>(val: T, width: usize) -> St
 
 fn list_directed_internal_real64_field(val: f64) -> String {
     // Rust's default Display expands sufficiently small finite values into an
-    // unbounded fixed-point string.  Internal list output must use a bounded
-    // representation so that an ordinary record can hold any real(8) value.
-    // Sixteen digits after the leading digit preserve all 17 significant
-    // decimal digits needed to round-trip an f64.
-    format!(" {val:.16E}")
+    // unbounded fixed-point string.  Keep its shortest representation for
+    // ordinary values, but fall back to a bounded exponential field when it
+    // grows too long for an ordinary internal record.  Sixteen digits after
+    // the leading digit preserve all 17 significant decimal digits needed to
+    // round-trip an f64.
+    let compact = format!(" {val}");
+    if compact.len() <= LIST_INTERNAL_REAL64_MAX_COMPACT_FIELD {
+        compact
+    } else {
+        format!(" {val:.16E}")
+    }
 }
 
 fn mark_list_output_nonchar(u: &mut Unit) {
@@ -8923,6 +8930,11 @@ mod tests {
         assert_eq!(text.parse::<f64>().unwrap(), value);
 
         crate::string::afs_dealloc_string(desc_ptr as *mut StringDescriptor);
+    }
+
+    #[test]
+    fn internal_list_ordinary_real_keeps_compact_field() {
+        assert_eq!(list_directed_internal_real64_field(2.5), " 2.5");
     }
 
     #[test]
