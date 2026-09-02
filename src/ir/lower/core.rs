@@ -14850,6 +14850,39 @@ pub(super) fn actual_expr_rank(
                         return Some(max_rank);
                     }
                 }
+                // A user-defined ELEMENTAL procedure has the rank and shape
+                // of its highest-rank actual. Its declared result symbol is
+                // necessarily scalar, so consulting only that declaration
+                // below loses the array rank of calls such as IS_NAN(x(:)).
+                // Besides misdirecting generic dispatch, that made call-arg
+                // ownership tracking treat the materialized array result as
+                // scalar and leave it allocated after the consuming call.
+                let resolved_elemental = resolve_generic_call_by_semantics_and_rank(
+                    st,
+                    Some(locals),
+                    name,
+                    args,
+                    type_layouts,
+                )
+                .is_some_and(|candidate| specific_candidate_is_elemental(st, &candidate))
+                    || st
+                        .lookup_local_then_any(current_proc_scope(), &key)
+                        .is_some_and(procedure_symbol_is_elemental);
+                if resolved_elemental {
+                    let mut max_rank = 0usize;
+                    let mut saw_rank = false;
+                    for arg in args {
+                        if let crate::ast::expr::SectionSubscript::Element(actual) = &arg.value {
+                            if let Some(rank) = actual_expr_rank(actual, locals, st, type_layouts) {
+                                saw_rank = true;
+                                max_rank = max_rank.max(rank);
+                            }
+                        }
+                    }
+                    if saw_rank {
+                        return Some(max_rank);
+                    }
+                }
                 if let Some(rank) =
                     function_call_declared_result_rank(st, locals, name, args, type_layouts)
                 {
@@ -65483,6 +65516,54 @@ end subroutine
             deallocate_count, allocate_count,
             "the MINLOC constructor must be released after the scalar result is selected:\n{}",
             ir
+        );
+    }
+
+    #[test]
+    fn lower_call_releases_generic_elemental_array_actual() {
+        let (_, ir) = lower_and_verify(
+            "\
+module helpers
+  implicit none
+  interface is_bad
+    module procedure is_bad_r8
+  end interface
+contains
+  elemental logical function is_bad_r8(x)
+    real(8), intent(in) :: x
+    is_bad_r8 = x < 0.0_8
+  end function
+
+  logical function any_bad(mask)
+    logical, intent(in) :: mask(:)
+    any_bad = any(mask)
+  end function
+
+  subroutine test(x, flag)
+    real(8), intent(in) :: x(:)
+    logical, intent(out) :: flag
+    flag = any_bad(is_bad(x))
+  end subroutine
+end module
+",
+        );
+        let test_ir = ir
+            .split("  func @afs_modproc_helpers_test")
+            .nth(1)
+            .expect("expected test procedure");
+        assert_eq!(
+            test_ir
+                .matches("call @afs_allocate_like_with_elem_size(")
+                .count(),
+            1,
+            "expected one generic elemental array-result allocation:\n{}",
+            test_ir
+        );
+        assert_eq!(
+            test_ir.matches("call @afs_deallocate_array(").count(),
+            1,
+            "the generic elemental array actual must be released after the consuming call:\n{}",
+            test_ir
         );
     }
 
