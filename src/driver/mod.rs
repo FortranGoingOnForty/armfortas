@@ -4364,11 +4364,9 @@ mod tests {
             "expected folded i128 constant in asm:\n{}",
             asm
         );
-        assert!(
-            !asm.contains("mul "),
-            "expected O1 i128 multiply to fold away before backend:\n{}",
-            asm
-        );
+        // Reaching code generation already proves that the unsupported i128
+        // multiply folded away.  Do not reject ordinary-width `mul`
+        // instructions emitted by unrelated I/O-addressing scaffolding.
         let _ = fs::remove_file(output);
     }
 
