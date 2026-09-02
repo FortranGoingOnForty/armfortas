@@ -6606,6 +6606,47 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 }
 
 #[test]
+fn entity_star_assumed_length_uses_hidden_length_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=entity_star_assumed_length_uses_hidden_length_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // LAPACK uses the standard legacy entity-length spelling
+    // `character :: name*(*)`. The caller saw assumed-length semantic types
+    // and appended hidden lengths, while the definition-side AST check only
+    // recognized `character(len=*)` and emitted a shorter signature.
+    let src = write_program(
+        "module m\ncontains\n  integer function forward(name, opts) result(code)\n    character(len=*), intent(in) :: name, opts\n    code = legacy_pair(name, opts)\n  end function\n  integer function legacy_pair(name, opts) result(code)\n    character, intent(in) :: name*(*), opts*(*)\n    code = inspect_lengths()\n  contains\n    integer function inspect_lengths() result(value)\n      value = 100 * len(name) + 10 * len(opts) + iachar(name(1:1))\n    end function\n  end function\nend module\nprogram p\n  use m\n  if (forward('ABCD', 'xy') /= 485) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("entity_star_assumed_length", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O1", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("entity-star assumed-length compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "entity-star assumed-length should compile at O1: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn default_character_dummy_does_not_shift_assumed_length_hidden_args() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -1489,6 +1489,24 @@ pub(super) fn collect_alloc_return_funcs(unit: &ProgramUnit, out: &mut HashSet<S
 /// and self-aware sites (where bare-name map lookups produce the wrong
 /// answer when several contained procedures across different hosts
 /// share an arg name).
+fn entity_is_assumed_len_character(
+    type_spec: &TypeSpec,
+    entity: &crate::ast::decl::EntityDecl,
+) -> bool {
+    if !matches!(type_spec, TypeSpec::Character(_)) {
+        return false;
+    }
+    match entity.char_len.as_ref() {
+        Some(crate::ast::decl::LenSpec::Star) => true,
+        Some(_) => false,
+        None => matches!(
+            type_spec,
+            TypeSpec::Character(Some(sel))
+                if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Star))
+        ),
+    }
+}
+
 pub(super) fn compute_char_len_star_flags(
     args: &[crate::ast::unit::DummyArg],
     decls: &[crate::ast::decl::SpannedDecl],
@@ -1510,12 +1528,8 @@ pub(super) fn compute_char_len_star_flags(
                     ..
                 } = &d.node
                 {
-                    if entities.iter().any(|e| e.name.to_lowercase() == pname) {
-                        if let TypeSpec::Character(Some(sel)) = type_spec {
-                            if matches!(&sel.len, Some(crate::ast::decl::LenSpec::Star)) {
-                                return true;
-                            }
-                        }
+                    if let Some(entity) = entities.iter().find(|e| e.name.to_lowercase() == pname) {
+                        return entity_is_assumed_len_character(type_spec, entity);
                     }
                 }
             }
@@ -24718,10 +24732,7 @@ pub(super) fn arg_is_assumed_len_char(
         {
             for entity in entities {
                 if entity.name.to_lowercase() == key {
-                    if let TypeSpec::Character(Some(sel)) = type_spec {
-                        return matches!(sel.len, Some(crate::ast::decl::LenSpec::Star));
-                    }
-                    return false;
+                    return entity_is_assumed_len_character(type_spec, entity);
                 }
             }
         }
