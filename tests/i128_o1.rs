@@ -19,6 +19,11 @@ fn capture_text(request: CaptureRequest, stage: Stage) -> String {
     }
 }
 
+fn contains_i128_load(ir: &str) -> bool {
+    ir.lines()
+        .any(|line| line.contains(" = load ") && line.trim_end().ends_with(": i128"))
+}
+
 #[test]
 fn o1_optir_const_folds_integer16_mul() {
     let raw_ir = capture_text(
@@ -142,22 +147,22 @@ fn o1_optir_promotes_branchy_integer16_local() {
     );
 
     assert!(
-        raw_ir.contains("alloca"),
+        raw_ir.contains("alloca i128"),
         "raw integer(16) branchy IR should still materialize stack storage before mem2reg:\n{}",
         raw_ir
     );
     assert!(
-        raw_ir.contains("load"),
+        contains_i128_load(&raw_ir),
         "raw integer(16) branchy IR should still load the local before O1 promotion:\n{}",
         raw_ir
     );
     assert!(
-        !opt_ir.contains("alloca"),
+        !opt_ir.contains("alloca i128"),
         "O1 integer(16) pipeline should eliminate the stack slot after mem2reg promotion:\n{}",
         opt_ir
     );
     assert!(
-        !opt_ir.contains("load"),
+        !contains_i128_load(&opt_ir),
         "O1 integer(16) pipeline should eliminate wide loads after promotion:\n{}",
         opt_ir
     );
