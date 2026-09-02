@@ -20338,20 +20338,25 @@ fn find_linkable_symbol_for_callee<'a>(
     st: &'a SymbolTable,
     callee_name: &str,
 ) -> Option<&'a crate::sema::symtab::Symbol> {
+    let key = callee_name.to_ascii_lowercase();
+    // Bare names of contained procedures are only unique within their host.
+    // Consult the caller's lexical scope before scanning equal link names in
+    // source order; otherwise an earlier same-named helper can supply the
+    // wrong return ABI (for example REAL `recast` hiding a later COMPLEX
+    // `recast`, so the caller omits the complex hidden-result buffer).
+    if let Some(symbol) = current_proc_scope()
+        .and_then(|scope_id| st.lookup_in(scope_id, &key))
+        .filter(|symbol| is_linkable_callable_symbol(symbol))
+    {
+        return Some(symbol);
+    }
+
     if let Some(symbol) = st.all_scopes().iter().find_map(|scope| {
         scope.symbols.values().find(|symbol| {
             is_linkable_callable_symbol(symbol)
                 && symbol_link_name(st, symbol).eq_ignore_ascii_case(callee_name)
         })
     }) {
-        return Some(symbol);
-    }
-
-    let key = callee_name.to_ascii_lowercase();
-    if let Some(symbol) = current_proc_scope()
-        .and_then(|scope_id| st.lookup_in(scope_id, &key))
-        .filter(|symbol| is_linkable_callable_symbol(symbol))
-    {
         return Some(symbol);
     }
 

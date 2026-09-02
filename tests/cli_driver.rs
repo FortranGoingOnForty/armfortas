@@ -33942,6 +33942,47 @@ fn same_name_contained_function_return_type_is_caller_relative() {
 }
 
 #[test]
+fn same_name_contained_complex_return_abi_is_caller_relative() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_name_contained_complex_return_abi_is_caller_relative count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // stdlib_intrinsics_sum repeats `sum_recast` below real and complex
+    // wrappers. ABI lookup used the first same-named symbol globally, so a
+    // later complex helper call omitted its hidden result buffer. O1 call
+    // resolution then exposed the malformed call against the internal body.
+    let src = write_program(
+        "program p\n  implicit none\n  complex :: x(2,2), got\n  x = (1.0, -1.0)\n  if (abs(outer_real([1.0, 2.0]) - 3.0) > 1.0e-6) error stop 1\n  got = outer_complex(x)\n  if (abs(real(got) - 4.0) > 1.0e-6) error stop 2\n  if (abs(aimag(got) + 4.0) > 1.0e-6) error stop 3\n  print *, 'ok'\ncontains\n  real function outer_real(values) result(total)\n    real, intent(in) :: values(:)\n    total = recast(values, size(values))\n  contains\n    real function recast(flat, n) result(value)\n      integer, intent(in) :: n\n      real, intent(in) :: flat(n)\n      value = sum(flat)\n    end function\n  end function\n  complex function outer_complex(values) result(total)\n    complex, intent(in) :: values(:,:)\n    total = recast(values, size(values))\n  contains\n    complex function recast(flat, n) result(value)\n      integer, intent(in) :: n\n      complex, intent(in) :: flat(n)\n      value = sum(flat)\n    end function\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("same_name_contained_complex_abi", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O1", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-name contained complex ABI compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-name contained complex ABI should compile at O1: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("ok"));
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_generic_array_function_assignment_keeps_whole_array_actual() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
