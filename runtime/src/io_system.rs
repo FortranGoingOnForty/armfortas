@@ -1243,6 +1243,15 @@ fn list_directed_integer_field<T: std::fmt::Display>(val: T, width: usize) -> St
     format!("{:>width$}", val, width = width)
 }
 
+fn list_directed_internal_real64_field(val: f64) -> String {
+    // Rust's default Display expands sufficiently small finite values into an
+    // unbounded fixed-point string.  Internal list output must use a bounded
+    // representation so that an ordinary record can hold any real(8) value.
+    // Sixteen digits after the leading digit preserve all 17 significant
+    // decimal digits needed to round-trip an f64.
+    format!(" {val:.16E}")
+}
+
 fn mark_list_output_nonchar(u: &mut Unit) {
     u.last_list_output_char = false;
 }
@@ -3755,7 +3764,7 @@ pub extern "C" fn afs_write_internal_logical(buf: *mut u8, buf_len: i64, val: i3
 #[no_mangle]
 pub extern "C" fn afs_write_internal_real64(buf: *mut u8, buf_len: i64, val: f64, pos: *mut i64) {
     let buf_len = buf_len.max(0) as usize;
-    let s = format!(" {}", val);
+    let s = list_directed_internal_real64_field(val);
     let start = if !pos.is_null() {
         (unsafe { *pos }) as usize
     } else {
@@ -5246,7 +5255,8 @@ pub extern "C" fn afs_lst_ia_logical(val: i32) {
 pub extern "C" fn afs_lst_ia_real(val: f64) {
     LST_IA_CTX.with(|ctx| {
         if let Some(c) = ctx.borrow_mut().last_mut() {
-            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+            c.record
+                .extend_from_slice(list_directed_internal_real64_field(val).as_bytes());
         }
     });
 }
@@ -8830,6 +8840,31 @@ mod tests {
     }
 
     #[test]
+    fn deferred_internal_list_tiny_real_uses_bounded_exponential_field() {
+        use crate::descriptor::StringDescriptor;
+
+        let mut desc = StringDescriptor::zeroed();
+        let desc_ptr = &mut desc as *mut StringDescriptor as *mut u8;
+        let mut iostat = 77;
+        let value = 1.0e-200_f64;
+
+        afs_lst_ia_begin(desc_ptr, &mut iostat, std::ptr::null_mut(), 0);
+        afs_lst_ia_real(value);
+        afs_lst_ia_end();
+
+        assert_eq!(iostat, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        let text = std::str::from_utf8(bytes).unwrap().trim();
+        assert!(
+            text.contains('E'),
+            "expected exponential field, got {text:?}"
+        );
+        assert_eq!(text.parse::<f64>().unwrap(), value);
+
+        crate::string::afs_dealloc_string(desc_ptr as *mut StringDescriptor);
+    }
+
+    #[test]
     fn fixed_internal_list_overflow_restores_target() {
         let mut buf = *b"???";
         let mut iostat = 77;
@@ -8858,6 +8893,33 @@ mod tests {
         assert_eq!(iostat, IOSTAT_EOR);
         assert_eq!(&iomsg[..13], b"end of record");
         assert!(iomsg[13..].iter().all(|byte| *byte == b' '));
+    }
+
+    #[test]
+    fn fixed_internal_list_tiny_real_uses_bounded_exponential_field() {
+        let mut buf = [b' '; 128];
+        let mut iostat = 77;
+        let mut pos = 0;
+        let value = 1.0e-200_f64;
+
+        afs_lst_begin_internal_fixed(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            1,
+            &mut iostat,
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_write_internal_real64(buf.as_mut_ptr(), buf.len() as i64, value, &mut pos);
+        afs_lst_end_internal_fixed();
+
+        assert_eq!(iostat, 0);
+        let text = std::str::from_utf8(&buf[..pos as usize]).unwrap().trim();
+        assert!(
+            text.contains('E'),
+            "expected exponential field, got {text:?}"
+        );
+        assert_eq!(text.parse::<f64>().unwrap(), value);
     }
 
     #[test]

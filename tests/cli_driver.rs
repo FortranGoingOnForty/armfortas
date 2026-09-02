@@ -41250,6 +41250,48 @@ fn formatted_e_huge_real_internal_write_round_trips() {
 }
 
 #[test]
+fn list_directed_internal_write_tiny_real_uses_bounded_field() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_internal_write_tiny_real_uses_bounded_field count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real(kind=8) :: value, got\n  character(len=128) :: buffer\n  value = 1.0e-200_8\n  write(buffer, *) value\n  if (index(buffer, 'E') == 0) error stop 1\n  read(buffer, *) got\n  if (got /= value) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("list_internal_tiny_real", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("list-directed tiny-real internal write compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "list-directed tiny-real internal write should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "list-directed tiny-real internal write should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected success marker, got: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_internal_write_reallocates_allocated_deferred_char() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
