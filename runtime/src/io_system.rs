@@ -219,6 +219,11 @@ struct Unit {
     /// seeing a newline. If the next terminal read hits EOF, report EOR
     /// once for that open record before reporting END.
     terminal_nonadvancing_open_record: bool,
+    /// Bytes fetched by a raw non-advancing read after the first record
+    /// boundary. Pipes can return several newline-delimited records in one
+    /// syscall; later formatted statements must still observe them one at a
+    /// time.
+    nonadvancing_read_ahead: VecDeque<u8>,
     /// True when the most recent formatted list-directed output item was
     /// character. Adjacent character items concatenate without another
     /// separator; any non-character item breaks the run.
@@ -362,6 +367,7 @@ impl Unit {
         self.formatted_read_record = None;
         self.formatted_read_cursor = 0;
         self.terminal_nonadvancing_open_record = false;
+        self.nonadvancing_read_ahead.clear();
         self.pending_read = None;
         self.list_read_depth = 0;
     }
@@ -450,6 +456,12 @@ impl Unit {
 
     fn read_line_bytes(&mut self) -> io::Result<Vec<u8>> {
         let mut line = Vec::new();
+        while let Some(byte) = self.nonadvancing_read_ahead.pop_front() {
+            line.push(byte);
+            if byte == b'\n' {
+                return Ok(line);
+            }
+        }
         match &mut self.stream {
             UnitStream::Stdin => {
                 io::stdin().lock().read_until(b'\n', &mut line)?;
@@ -506,14 +518,44 @@ impl Unit {
     }
 
     fn read_nonadvancing_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.stream {
-            UnitStream::Stdin => read_stdin_unbuffered(buf),
-            UnitStream::FileRead(r) => r.read(buf),
-            UnitStream::FileRaw(f) => f.read(buf),
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let Some(byte) = self.nonadvancing_read_ahead.pop_front() else {
+                break;
+            };
+            buf[filled] = byte;
+            filled += 1;
+            if byte == b'\n' {
+                return Ok(filled);
+            }
+        }
+        if filled == buf.len() {
+            return Ok(filled);
+        }
+
+        let read = match &mut self.stream {
+            UnitStream::Stdin => read_stdin_unbuffered(&mut buf[filled..]),
+            UnitStream::FileRead(r) => r.read(&mut buf[filled..]),
+            UnitStream::FileRaw(f) => f.read(&mut buf[filled..]),
+            #[cfg(test)]
+            UnitStream::TestRead(r) => r.read(&mut buf[filled..]),
             _ => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unit not open for reading",
             )),
+        }?;
+        let fresh = &buf[filled..filled + read];
+        if let Some(newline) = fresh.iter().position(|&byte| byte == b'\n') {
+            let record_len = newline + 1;
+            self.nonadvancing_read_ahead
+                .extend(fresh[record_len..].iter().copied());
+            Ok(filled + record_len)
+        } else {
+            Ok(filled + read)
         }
     }
 
@@ -680,6 +722,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -706,6 +749,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -732,6 +776,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -1104,6 +1149,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -6961,6 +7007,7 @@ mod tests {
             formatted_read_record: None,
             formatted_read_cursor: 0,
             terminal_nonadvancing_open_record: false,
+            nonadvancing_read_ahead: VecDeque::new(),
             last_list_output_char: false,
             list_write_active: false,
             list_write_depth: 0,
@@ -6971,6 +7018,19 @@ mod tests {
             pending_read: None,
             list_read_depth: 0,
         }
+    }
+
+    #[test]
+    fn raw_nonadvancing_read_preserves_following_records_for_advancing_input() {
+        let stream = UnitStream::TestRead(Box::new(std::io::Cursor::new(
+            b"line\\\ncontinued\n".to_vec(),
+        )));
+        let mut unit = test_unit(84, stream, b"record-boundary".to_vec(), false);
+        let mut first = [0u8; 64];
+
+        let count = unit.read_nonadvancing_bytes(&mut first).unwrap();
+        assert_eq!(&first[..count], b"line\\\n");
+        assert_eq!(unit.read_line_bytes().unwrap(), b"continued\n");
     }
 
     #[test]
@@ -7159,6 +7219,7 @@ mod tests {
             formatted_read_record: None,
             formatted_read_cursor: 0,
             terminal_nonadvancing_open_record: false,
+            nonadvancing_read_ahead: VecDeque::new(),
             last_list_output_char: false,
             list_write_active: false,
             list_write_depth: 0,

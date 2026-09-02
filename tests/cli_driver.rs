@@ -4193,6 +4193,62 @@ fn nonadvancing_a1_read_returns_before_newline_or_eof() {
 }
 
 #[test]
+fn piped_nonadvancing_read_preserves_following_record() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=piped_nonadvancing_read_preserves_following_record count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: input_unit, iostat_eor\n  implicit none\n  character(len=16) :: first, second\n  integer :: ios, n\n  read(input_unit, '(a)', advance='no', iostat=ios, size=n) first\n  if (ios /= iostat_eor) error stop 1\n  if (n /= 5) error stop 2\n  if (first(:n) /= 'line\\') error stop 3\n  read(input_unit, '(a)', iostat=ios) second\n  if (ios /= 0) error stop 4\n  if (trim(second) /= 'continued') error stop 5\n  print *, 'ok'\nend program\n",
+        "piped_nonadvancing_records.f90",
+    );
+    let out = unique_path("piped_nonadvancing_records", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("piped nonadvancing-record compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "piped nonadvancing-record compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut child = Command::new(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("piped nonadvancing-record run failed to spawn");
+    child
+        .stdin
+        .take()
+        .expect("child stdin must be piped")
+        .write_all(b"line\\\ncontinued\n")
+        .expect("cannot write piped formatted records");
+    let run = child
+        .wait_with_output()
+        .expect("cannot collect piped nonadvancing-record output");
+    assert!(
+        run.status.success(),
+        "piped nonadvancing-record run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected piped nonadvancing-record output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn nonadvancing_unbounded_a_read_chunks_long_record() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
