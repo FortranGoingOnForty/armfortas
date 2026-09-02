@@ -24190,6 +24190,48 @@ fn elemental_character_call_over_array_expr_materializes_descriptor_actual() {
 }
 
 #[test]
+fn character_merge_normalizes_char_and_literal_storage_pointers() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=character_merge_normalizes_char_and_literal_storage_pointers count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character :: delim\n  logical :: use_tab\n  use_tab = .true.\n  delim = merge(char(9), ' ', use_tab)\n  if (iachar(delim) /= 9) error stop 1\n  use_tab = .false.\n  delim = merge(char(9), ' ', use_tab)\n  if (delim /= ' ') error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("character_merge_ptr_types", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character MERGE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character MERGE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "character MERGE should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected character MERGE output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn module_character_star_parameter_from_component_concat_initializes_runtime_bytes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

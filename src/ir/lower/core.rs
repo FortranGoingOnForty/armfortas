@@ -26878,7 +26878,19 @@ pub(super) fn lower_string_expr_full(
                                 descriptor_params,
                             );
                             let mask = coerce_to_type(b, mask_raw, &IrType::Bool);
-                            let ptr = b.select(mask, t_ptr, f_ptr);
+                            // Character expressions can expose equivalent
+                            // storage through differently typed IR pointers.
+                            // CHAR/ACHAR, for example, materializes a one-byte
+                            // array (`ptr<[i8 x 1]>`), while a literal is a
+                            // byte pointer (`ptr<i8>`). SELECT requires both
+                            // arms to have one concrete IR type, so normalize
+                            // each source to the character-data ABI before
+                            // choosing between them.
+                            let zero = b.const_i64(0);
+                            let t_data = b.gep(t_ptr, vec![zero], IrType::Int(IntWidth::I8));
+                            let zero = b.const_i64(0);
+                            let f_data = b.gep(f_ptr, vec![zero], IrType::Int(IntWidth::I8));
+                            let ptr = b.select(mask, t_data, f_data);
                             let len = b.select(mask, t_len, f_len);
                             b.mark_owned_string_temp_bases(ptr, owned_bases);
                             return (ptr, len);
