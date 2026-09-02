@@ -56867,8 +56867,7 @@ pub(super) fn lower_array_intrinsic(
                 deallocate_array_expr_descriptor_if_temp(b, locals, first_expr, st, desc);
                 return Some(out);
             }
-            let is_real = elem_ty.is_float();
-            if is_real {
+            let result = if elem_ty.is_float() {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_sum_real8_mask", vec![desc, md]),
                     None => ("afs_array_sum_real8", vec![desc]),
@@ -56878,7 +56877,7 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Float(FloatWidth::F64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
             } else {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_sum_int_mask", vec![desc, md]),
@@ -56889,8 +56888,12 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
+            };
+            if let (Some(mask_expr), Some(mask)) = (mask_arg_expr, mask_desc) {
+                deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask);
             }
+            Some(result)
         }
         "product" => {
             // F2018 §16.9.196: PRODUCT(ARRAY [, DIM] [, MASK]).
@@ -56917,8 +56920,7 @@ pub(super) fn lower_array_intrinsic(
                 )
                 .map(|(d, _)| d)
             });
-            let is_real = elem_ty.is_float();
-            if is_real {
+            let result = if elem_ty.is_float() {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_product_real8_mask", vec![desc, md]),
                     None => ("afs_array_product_real8", vec![desc]),
@@ -56928,7 +56930,7 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Float(FloatWidth::F64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
             } else {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_product_int_mask", vec![desc, md]),
@@ -56939,8 +56941,12 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
+            };
+            if let (Some(mask_expr), Some(mask)) = (mask_arg_expr, mask_desc) {
+                deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask);
             }
+            Some(result)
         }
         "maxval" => {
             // F2018 §16.9.146: MAXVAL(ARRAY [, DIM] [, MASK]).
@@ -56967,8 +56973,7 @@ pub(super) fn lower_array_intrinsic(
                 )
                 .map(|(d, _)| d)
             });
-            let is_real = elem_ty.is_float();
-            if is_real {
+            let result = if elem_ty.is_float() {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_maxval_real8_mask", vec![desc, md]),
                     None => ("afs_array_maxval_real8", vec![desc]),
@@ -56978,7 +56983,7 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Float(FloatWidth::F64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
             } else {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_maxval_int_mask", vec![desc, md]),
@@ -56989,8 +56994,12 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
+            };
+            if let (Some(mask_expr), Some(mask)) = (mask_arg_expr, mask_desc) {
+                deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask);
             }
+            Some(result)
         }
         "minval" => {
             // F2018 §16.9.151: MINVAL(ARRAY [, DIM] [, MASK]).
@@ -57017,8 +57026,7 @@ pub(super) fn lower_array_intrinsic(
                 )
                 .map(|(d, _)| d)
             });
-            let is_real = elem_ty.is_float();
-            if is_real {
+            let result = if elem_ty.is_float() {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_minval_real8_mask", vec![desc, md]),
                     None => ("afs_array_minval_real8", vec![desc]),
@@ -57028,7 +57036,7 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Float(FloatWidth::F64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
             } else {
                 let (func, args_vec): (&str, Vec<ValueId>) = match mask_desc {
                     Some(md) => ("afs_array_minval_int_mask", vec![desc, md]),
@@ -57039,8 +57047,12 @@ pub(super) fn lower_array_intrinsic(
                     args_vec,
                     IrType::Int(IntWidth::I64),
                 );
-                Some(coerce_to_type(b, raw, &elem_ty))
+                coerce_to_type(b, raw, &elem_ty)
+            };
+            if let (Some(mask_expr), Some(mask)) = (mask_arg_expr, mask_desc) {
+                deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask);
             }
+            Some(result)
         }
         "maxloc" => {
             if let Some(v) = lower_minmaxloc_rank1_scalar(
@@ -65597,6 +65609,37 @@ end program
             1,
             "the array function PUT actual must be released after RANDOM_SEED consumes it:\n{}",
             caller
+        );
+    }
+
+    #[test]
+    fn lower_scalar_reductions_release_array_expression_masks() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine test(values, result)
+  implicit none
+  real(8), intent(in) :: values(:)
+  real(8), intent(out) :: result
+  result = sum(values, mask=(values > 0.0_8))
+  result = result + product(values, mask=(values > 0.0_8))
+  result = result + maxval(values, mask=(values > 0.0_8))
+  result = result + minval(values, mask=(values > 0.0_8))
+end subroutine
+",
+        );
+        let allocation_count = ir
+            .matches("call @afs_allocate_like_with_elem_size(")
+            .count();
+        let deallocation_count = ir.matches("call @afs_deallocate_array(").count();
+        assert_eq!(
+            allocation_count, 4,
+            "expected one array-expression mask for each scalar reduction:\n{}",
+            ir
+        );
+        assert_eq!(
+            deallocation_count, allocation_count,
+            "every scalar-reduction mask temporary must be released:\n{}",
+            ir
         );
     }
 
