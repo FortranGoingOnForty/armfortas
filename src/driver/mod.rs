@@ -3179,6 +3179,12 @@ fn print_verbose_command_line(program: &str, args: &[String]) {
 }
 
 fn push_afs_ld_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
+    if !opts.shared {
+        // Match the default Apple ld route: the runtime archive intentionally
+        // groups several entry points per member, so executable links must
+        // discard the unused surfaces pulled in with a referenced member.
+        args.push("-dead_strip".into());
+    }
     for path in &opts.rpath {
         args.push("-rpath".into());
         args.push(path.to_string_lossy().into_owned());
@@ -3614,6 +3620,21 @@ fn runtime_from_workspace(workspace_root: &Path) -> Result<Option<RuntimeArchive
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn afs_ld_executables_dead_strip_coarse_runtime_members() {
+        let mut executable_args = Vec::new();
+        push_afs_ld_tail_link_flags(&mut executable_args, &Options::default());
+        assert_eq!(executable_args, ["-dead_strip"]);
+
+        let mut shared_args = Vec::new();
+        let shared = Options {
+            shared: true,
+            ..Options::default()
+        };
+        push_afs_ld_tail_link_flags(&mut shared_args, &shared);
+        assert!(shared_args.is_empty());
+    }
 
     #[test]
     fn pending_external_output_rejects_and_cleans_uncommitted_artifacts() {
