@@ -65918,6 +65918,31 @@ end subroutine
     }
 
     #[test]
+    fn lower_real_sqrt_evaluates_reduction_argument_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y)
+  implicit none
+  real(8), intent(in) :: x(:)
+  real(8), intent(out) :: y
+  y = sqrt(sum(x**2))
+end subroutine
+",
+        );
+        assert_eq!(
+            ir.matches("call @afs_array_sum_real8(").count(),
+            1,
+            "SQRT must not lower its real reduction argument twice:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_allocate_like_with_elem_size(")
+                .count(),
+            1,
+            "SQRT(SUM(X**2)) should materialize X**2 only once:\n{ir}"
+        );
+    }
+
+    #[test]
     fn lower_chained_array_expr_assignment_deallocates_temporaries() {
         let (_, ir) = lower_and_verify(
             "\

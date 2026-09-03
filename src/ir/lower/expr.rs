@@ -2058,6 +2058,16 @@ pub(crate) fn lower_expr_full(
                                 b.store(im_out, out_im);
                                 return out;
                             }
+                            // The complex probe has already evaluated the
+                            // argument. Reuse that scalar value for ordinary
+                            // SQRT instead of falling through to generic
+                            // intrinsic dispatch, which would evaluate the
+                            // argument a second time. Besides observable side
+                            // effects, the fallthrough doubled expensive
+                            // reductions such as PRIMA's SQRT(SUM(X**2)).
+                            if key == "sqrt" {
+                                return b.fsqrt(val);
+                            }
                         }
                     }
                 }
