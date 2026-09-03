@@ -5115,6 +5115,33 @@ fn maxval_minval_abs_dim_reduction_fixture_passes_all_opts() {
 }
 
 #[test]
+fn maxmin_elemental_direct_reduction_fixture_passes_all_opts() {
+    if skip_native_e2e(
+        "maxmin_elemental_direct_reduction_fixture_passes_all_opts",
+        1,
+    ) {
+        return;
+    }
+    let compiler = find_compiler();
+    let test_dir = find_test_programs();
+    let source = test_dir.join("maxmin_elemental_direct_reduction.f90");
+    assert!(
+        source.exists(),
+        "maxmin_elemental_direct_reduction.f90 missing"
+    );
+
+    for opt_flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Ofast"] {
+        match run_test(&compiler, &source, opt_flag) {
+            TestOutcome::Pass => {}
+            other => panic!(
+                "maxmin_elemental_direct_reduction.f90 should pass at {}, got {:?}",
+                opt_flag, other
+            ),
+        }
+    }
+}
+
+#[test]
 fn array_constructor_whole_array_exprs_fixture_passes_all_opts() {
     if skip_native_e2e(
         "array_constructor_whole_array_exprs_fixture_passes_all_opts",

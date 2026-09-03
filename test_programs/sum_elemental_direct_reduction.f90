@@ -1,7 +1,8 @@
-! SUM over a side-effect-free rank-1 real elemental expression should fold the
-! element expression directly into the reduction loop. The assumed-shape
-! dummy receives a descending-stride section, while LOWERED exercises a fixed
-! array whose lower bound is not one. Empty arrays retain SUM's zero identity.
+! SUM over a side-effect-free real elemental expression should fold the
+! element expression directly into the reduction loop. The rank-1
+! assumed-shape dummy receives a descending-stride section, while MATRIX
+! exercises rank-N descriptor traversal and LOWERED exercises a fixed array
+! whose lower bound is not one. Empty arrays retain SUM's zero identity.
 !
 ! CHECK: ok
 ! IR_CHECK: direct_sum_check
@@ -17,6 +18,7 @@ program sum_elemental_direct_reduction
   integer :: i
   real :: single(4)
   real(8) :: storage(12), lowered(-2:2)
+  real(8) :: matrix(-1:0, 3:4)
 
   do i = 1, size(storage)
     storage(i) = real(i - 7, 8)
@@ -25,12 +27,17 @@ program sum_elemental_direct_reduction
     lowered(i) = real(i, 8)
   end do
   single = [1.0, 2.0, 3.0, 4.0]
+  matrix(-1, 3) = -1.0_8
+  matrix( 0, 3) =  2.0_8
+  matrix(-1, 4) = -3.0_8
+  matrix( 0, 4) =  4.0_8
 
   call check_strided(storage(12:2:-2), 2.0_8)
   call check_empty(storage(2:1), 2.0_8)
 
   if (sum((lowered / 2.0_8)**2) /= 2.5_8) error stop 7
   if (sum(single**2) /= 30.0) error stop 8
+  if (sum(abs(matrix)) /= 10.0_8) error stop 9
 
   print *, "ok"
 
@@ -50,7 +57,7 @@ contains
   subroutine check_empty(x, scaling)
     real(8), intent(in) :: x(:), scaling
 
-    if (sum((x / scaling)**2) /= 0.0_8) error stop 9
-    if (sum(abs(x)) /= 0.0_8) error stop 10
+    if (sum((x / scaling)**2) /= 0.0_8) error stop 10
+    if (sum(abs(x)) /= 0.0_8) error stop 11
   end subroutine check_empty
 end program sum_elemental_direct_reduction
