@@ -34737,9 +34737,10 @@ fn maxval_minval_with_dim_return_reduced_arrays() {
         return;
     }
     // F2018 16.9.146 / 16.9.151: MAXVAL/MINVAL with DIM return
-    // rank-(N-1) arrays. The scalar reduction path used to ignore DIM
-    // for maxval(abs(array), dim=1), then passed the scalar result as a
-    // descriptor to afs_assign_allocatable. This surfaced as the
+    // rank-(N-1) arrays. Real elemental expressions now reduce directly,
+    // while the complex ABS case remains on the general descriptor/runtime
+    // path. The scalar reduction path used to ignore DIM and pass its scalar
+    // result as a descriptor to afs_assign_allocatable. This surfaced as the
     // stdlib_linalg_norm maxabs dim=1 cluster.
     let src = write_program(
         include_str!("../test_programs/maxval_minval_abs_dim_reduction.f90"),
@@ -34762,18 +34763,28 @@ fn maxval_minval_with_dim_return_reduced_arrays() {
     );
     let ir_text = fs::read_to_string(&ir).expect("cannot read maxval/minval dim IR");
     assert!(
-        ir_text.contains("call @afs_array_maxval_real8_dim"),
-        "maxval(dim) should lower through dim helper:\n{}",
+        ir_text.contains("direct_maxval_dim_check"),
+        "real maxval(dim) should lower through a direct loop:\n{}",
         ir_text
     );
     assert!(
-        ir_text.contains("call @afs_array_minval_real8_dim"),
-        "minval(dim) should lower through dim helper:\n{}",
+        ir_text.contains("direct_minval_dim_check"),
+        "real minval(dim) should lower through a direct loop:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("call @afs_array_maxval_real8_dim"),
+        "complex ABS maxval(dim) should retain the runtime fallback:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @afs_array_minval_real8_dim"),
+        "real minval(dim) should not retain the runtime reducer:\n{}",
         ir_text
     );
     assert!(
         !ir_text.contains("call @afs_array_maxval_real8(%"),
-        "maxval(dim) should not use scalar maxval helper:\n{}",
+        "maxval(dim) should not use the scalar maxval helper:\n{}",
         ir_text
     );
 
