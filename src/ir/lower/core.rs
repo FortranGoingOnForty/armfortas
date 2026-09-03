@@ -44609,6 +44609,27 @@ pub(super) fn lower_array_sum_dim_descriptor(
     }
     let dim_expr = dim_expr?;
 
+    // A common numerical-kernel shape is SUM(ABS(x), DIM=k). When k is
+    // compile-time known and the elemental expression has one safe array
+    // control, reduce it directly into the rank-N-1 result. Keep every other
+    // form on the descriptor-materialization/runtime path below.
+    if args.len() == 2 && mask_expr.is_none() {
+        if let Some(result) = lower_direct_real_dim_reduction_expr(
+            b,
+            locals,
+            "sum",
+            array_expr,
+            dim_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            return Some(result);
+        }
+    }
+
     let (src_desc, elem_ty) = lower_array_expr_descriptor(
         b,
         locals,
@@ -44869,6 +44890,27 @@ pub(super) fn lower_array_minmax_dim_descriptor(
         }
     }
     let dim_expr = dim_expr?;
+
+    // Match the direct SUM(DIM=) boundary above. Masked, dynamic-DIM,
+    // multi-array, volatile, and potentially side-effecting expressions stay
+    // on the existing materialize-then-reduce implementation.
+    if args.len() == 2 && mask_expr.is_none() {
+        let reduction = if is_max { "maxval" } else { "minval" };
+        if let Some(result) = lower_direct_real_dim_reduction_expr(
+            b,
+            locals,
+            reduction,
+            array_expr,
+            dim_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            return Some(result);
+        }
+    }
 
     let (src_desc, elem_ty) = lower_array_expr_descriptor(
         b,
@@ -56991,6 +57033,242 @@ fn lower_direct_real_reduction_expr(
     Some(coerce_to_type(b, result, &result_ty))
 }
 
+/// Lower a real reduction with a compile-time DIM over the same deliberately
+/// narrow elemental-expression subset as `lower_direct_real_reduction_expr`.
+/// The source descriptor supplies extents and physical strides; only the
+/// rank-reduced result is allocated. Accumulating in `result_ty` preserves the
+/// existing DIM runtime's real(4) rounding behavior.
+#[allow(clippy::too_many_arguments)]
+fn lower_direct_real_dim_reduction_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    reduction: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    dim_expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    if !matches!(reduction, "sum" | "maxval" | "minval") {
+        return None;
+    }
+    let rank = actual_expr_rank(expr, locals, st, type_layouts)?;
+    if rank <= 1 || !array_expr_descriptor_may_own_temp(expr, locals, st) {
+        return None;
+    }
+    let dim = eval_const_int_in_scope_or_any_scope(dim_expr, &HashMap::new(), st)?;
+    if !(1..=rank as i64).contains(&dim) {
+        return None;
+    }
+    let reduced_dim = dim as usize - 1;
+
+    let result_ty = operator_expr_type_info(expr, Some(locals), st, type_layouts)
+        .map(|type_info| type_info_to_ir_type(&type_info))?;
+    if !matches!(result_ty, IrType::Float(_)) {
+        return None;
+    }
+
+    let mut arrays = Vec::new();
+    collect_scalarized_control_array_names(expr, locals, &mut arrays);
+    let [control_name] = arrays.as_slice() else {
+        return None;
+    };
+    let control = locals.get(control_name)?;
+    if local_declared_rank(control) != rank
+        || control.last_dim_assumed_size
+        || !matches!(control.ty, IrType::Float(_))
+        || current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, control_name))
+            .or_else(|| st.lookup(control_name))
+            .is_some_and(|symbol| symbol.attrs.volatile)
+    {
+        return None;
+    }
+
+    let element_name = fresh_direct_reduction_element_name(locals);
+    let (scalar_expr, changed) = rewrite_direct_real_reduction_expr(
+        expr,
+        control_name,
+        &element_name,
+        locals,
+        st,
+        b.func().name.as_str(),
+    )?;
+    if !changed {
+        return None;
+    }
+
+    let element_addr = b.alloca(control.ty.clone());
+    let mut scalar_locals = locals.clone();
+    scalar_locals.insert(
+        element_name,
+        LocalInfo {
+            addr: element_addr,
+            ty: control.ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let source_desc = if local_uses_array_descriptor(control) {
+        array_descriptor_addr(b, control)
+    } else {
+        materialize_array_descriptor_for_info(b, control)
+    };
+    let zero64 = b.const_i64(0);
+    let one64 = b.const_i64(1);
+    let mut source_total = one64;
+    let mut result_total = one64;
+    let mut lower_product = one64;
+    let mut extents = Vec::with_capacity(rank);
+    for k in 0..rank {
+        let dim_offset = 24 + (k as i64) * 24;
+        let lower = load_array_desc_i64_field(b, source_desc, dim_offset);
+        let upper = load_array_desc_i64_field(b, source_desc, dim_offset + 8);
+        let span = b.isub(upper, lower);
+        let raw_extent = b.iadd(span, one64);
+        let positive = b.icmp(CmpOp::Gt, raw_extent, zero64);
+        let extent = b.select(positive, raw_extent, zero64);
+        source_total = b.imul(source_total, extent);
+        if k != reduced_dim {
+            result_total = b.imul(result_total, extent);
+        }
+        if k < reduced_dim {
+            lower_product = b.imul(lower_product, extent);
+        }
+        extents.push(extent);
+    }
+
+    let result_rank = rank - 1;
+    let result_desc = zeroed_array_temp_descriptor(b);
+    let bounds = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        (result_rank * 24) as u64,
+    ));
+    let mut result_dim = 0usize;
+    for (source_dim, extent) in extents.iter().copied().enumerate() {
+        if source_dim == reduced_dim {
+            continue;
+        }
+        let offset = (result_dim * 24) as i64;
+        store_byte_aggregate_field(b, bounds, offset, IrType::Int(IntWidth::I64), one64);
+        store_byte_aggregate_field(b, bounds, offset + 8, IrType::Int(IntWidth::I64), extent);
+        store_byte_aggregate_field(b, bounds, offset + 16, IrType::Int(IntWidth::I64), one64);
+        result_dim += 1;
+    }
+    let zero32 = b.const_i32(0);
+    let stat = b.alloca(IrType::Int(IntWidth::I32));
+    b.store(zero32, stat);
+    let elem_size = b.const_i64(ir_scalar_byte_size(&result_ty, b.layout));
+    let result_rank_value = b.const_i32(result_rank as i32);
+    b.call(
+        FuncRef::External("afs_allocate_array".into()),
+        vec![result_desc, elem_size, result_rank_value, bounds, stat],
+        IrType::Void,
+    );
+
+    let initial = match (reduction, &result_ty) {
+        ("sum", IrType::Float(FloatWidth::F32)) => b.const_f32(0.0),
+        ("sum", IrType::Float(FloatWidth::F64)) => b.const_f64(0.0),
+        ("maxval", IrType::Float(FloatWidth::F32)) => b.const_f32(-f32::MAX),
+        ("maxval", IrType::Float(FloatWidth::F64)) => b.const_f64(-f64::MAX),
+        ("minval", IrType::Float(FloatWidth::F32)) => b.const_f32(f32::MAX),
+        ("minval", IrType::Float(FloatWidth::F64)) => b.const_f64(f64::MAX),
+        _ => return None,
+    };
+    let init_index_addr = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero64, init_index_addr);
+    let init_check = b.create_block(&format!("direct_{reduction}_dim_init_check"));
+    let init_body = b.create_block(&format!("direct_{reduction}_dim_init_body"));
+    let init_exit = b.create_block(&format!("direct_{reduction}_dim_init_exit"));
+    b.branch(init_check, vec![]);
+
+    b.set_block(init_check);
+    let init_index = b.load(init_index_addr);
+    let init_done = b.icmp(CmpOp::Ge, init_index, result_total);
+    b.cond_branch(init_done, init_exit, vec![], init_body, vec![]);
+
+    b.set_block(init_body);
+    let init_index = b.load(init_index_addr);
+    store_array_desc_elem_rank(b, result_desc, &result_ty, init_index, result_rank, initial);
+    let next_init_index = b.iadd(init_index, one64);
+    b.store(next_init_index, init_index_addr);
+    b.branch(init_check, vec![]);
+
+    b.set_block(init_exit);
+    let source_index_addr = b.alloca(IrType::Int(IntWidth::I64));
+    b.store(zero64, source_index_addr);
+    let reduce_check = b.create_block(&format!("direct_{reduction}_dim_check"));
+    let reduce_body = b.create_block(&format!("direct_{reduction}_dim_body"));
+    let reduce_exit = b.create_block(&format!("direct_{reduction}_dim_exit"));
+    b.branch(reduce_check, vec![]);
+
+    b.set_block(reduce_check);
+    let source_index = b.load(source_index_addr);
+    let reduce_done = b.icmp(CmpOp::Ge, source_index, source_total);
+    b.cond_branch(reduce_done, reduce_exit, vec![], reduce_body, vec![]);
+
+    b.set_block(reduce_body);
+    let source_index = b.load(source_index_addr);
+    let element = load_array_desc_elem_rank(b, source_desc, &control.ty, source_index, rank);
+    b.store(element, element_addr);
+    let value = super::expr::lower_expr_full(
+        b,
+        &scalar_locals,
+        &scalar_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let candidate = coerce_to_type(b, value, &result_ty);
+
+    // Column-major flat source positions group the reduced coordinate in
+    // blocks of lower_product * reduced_extent. Removing that coordinate
+    // maps each source element to the corresponding flat result position.
+    let reduced_extent = extents[reduced_dim];
+    let block = b.imul(lower_product, reduced_extent);
+    let inner = b.imod(source_index, lower_product);
+    let outer = b.idiv(source_index, block);
+    let outer_offset = b.imul(outer, lower_product);
+    let result_index = b.iadd(outer_offset, inner);
+    let result_ptr =
+        array_desc_elem_ptr_rank(b, result_desc, &result_ty, result_index, result_rank);
+    let accumulator = b.load_typed(result_ptr, result_ty.clone());
+    let next = match reduction {
+        "sum" => b.fadd(accumulator, candidate),
+        "maxval" => {
+            let replace = b.fcmp(CmpOp::Gt, candidate, accumulator);
+            b.select(replace, candidate, accumulator)
+        }
+        "minval" => {
+            let replace = b.fcmp(CmpOp::Lt, candidate, accumulator);
+            b.select(replace, candidate, accumulator)
+        }
+        _ => unreachable!("direct real DIM reduction was validated above"),
+    };
+    b.store(next, result_ptr);
+    let next_source_index = b.iadd(source_index, one64);
+    b.store(next_source_index, source_index_addr);
+    b.branch(reduce_check, vec![]);
+
+    b.set_block(reduce_exit);
+    Some((result_desc, result_ty))
+}
+
 fn size_intrinsic_result_type(
     args: &[crate::ast::expr::Argument],
     locals: &HashMap<String, LocalInfo>,
@@ -66418,6 +66696,99 @@ end subroutine
     }
 
     #[test]
+    fn lower_rank_n_real_dim_reductions_fuse_inert_elemental_expressions() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(z, sums, maxima, minima)
+  implicit none
+  integer, parameter :: reduction_dim = 2
+  real(8), intent(in) :: z(:, :, :)
+  real(8), intent(out) :: sums(:, :), maxima(:, :), minima(:, :)
+  sums = sum(abs(z), dim=reduction_dim)
+  maxima = maxval(z**2, dim=2)
+  minima = minval(abs(z + 1.0_8), dim=2)
+end subroutine
+",
+        );
+        assert!(ir.contains("direct_sum_dim_check"));
+        assert!(ir.contains("direct_maxval_dim_check"));
+        assert!(ir.contains("direct_minval_dim_check"));
+        assert!(
+            !ir.contains("call @afs_allocate_like"),
+            "direct DIM reductions must not materialize their elemental inputs:\n{ir}"
+        );
+        for intrinsic in ["sum", "maxval", "minval"] {
+            assert!(
+                !ir.contains(&format!("call @afs_array_{intrinsic}_real8_dim(")),
+                "direct {intrinsic}(DIM=) must not call the runtime reducer:\n{ir}"
+            );
+        }
+        assert_eq!(
+            ir.matches("call @afs_allocate_array(").count(),
+            3,
+            "each direct reduction should allocate only its rank-reduced result:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_deallocate_array(").count(),
+            3,
+            "each direct reduction result must be released after assignment:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_real_dim_reductions_preserve_unsafe_fallbacks() {
+        let (_, ir) = lower_and_verify(
+            "\
+module reductions
+contains
+  subroutine kernel(x, y, mask, dim, values)
+    implicit none
+    real(8), intent(in) :: x(:, :), y(:, :)
+    logical, intent(in) :: mask(:, :)
+    integer, value :: dim
+    real(8), intent(out) :: values(:)
+    values = sum(abs(x), dim=dim)
+    values = maxval(abs(x), dim=1, mask=mask)
+    values = minval(abs(x + y), dim=1)
+  end subroutine
+
+  subroutine procedure_operand(x, values)
+    implicit none
+    real(8), intent(in) :: x(:, :)
+    real(8), intent(out) :: values(:)
+    values = sum(x * mark(), dim=1)
+  contains
+    function mark() result(value)
+      real(8) :: value
+      value = 2.0_8
+    end function mark
+  end subroutine
+
+  subroutine volatile_operand(x, values)
+    implicit none
+    real(8), intent(in), volatile :: x(:, :)
+    real(8), intent(out) :: values(:)
+    values = minval(abs(x), dim=1)
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !ir.contains("direct_sum_dim_check")
+                && !ir.contains("direct_maxval_dim_check")
+                && !ir.contains("direct_minval_dim_check"),
+            "unsafe DIM operands must remain on the general path:\n{ir}"
+        );
+        assert!(ir.matches("call @afs_array_sum_real8_dim(").count() >= 2);
+        assert!(ir.contains("call @afs_array_maxval_real8_dim_mask("));
+        assert!(ir.matches("call @afs_array_minval_real8_dim(").count() >= 2);
+        assert!(
+            ir.matches("call @afs_allocate_like").count() >= 5,
+            "each fallback should retain its input materialization:\n{ir}"
+        );
+    }
+
+    #[test]
     fn lower_real_maxval_does_not_fuse_scalar_procedure_references() {
         let (_, ir) = lower_and_verify(
             "\
@@ -66607,11 +66978,12 @@ end subroutine
         for intrinsic in ["norm2", "minval", "maxval"] {
             let source = format!(
                 "\
-subroutine test(matrix, values)
+subroutine test(matrix, values, dim)
   implicit none
   real(8), intent(in) :: matrix(:, :)
   real(8), intent(out) :: values(:)
-  values = {}(-matrix, dim=1)
+  integer, value :: dim
+  values = {}(-matrix, dim=dim)
 end subroutine
 ",
                 intrinsic
