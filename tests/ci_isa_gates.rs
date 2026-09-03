@@ -104,7 +104,7 @@ mod x86_64_linux {
             "{script} did not report the erased compilation evidence:\n{stderr}"
         );
         assert!(
-            stderr.contains("expected 1508 checked assemblies, got 0"),
+            stderr.contains("expected 1510 checked assemblies, got 0"),
             "{script} did not enforce the exact checked-assembly count:\n{stderr}"
         );
     }

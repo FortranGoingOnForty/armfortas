@@ -56679,6 +56679,295 @@ fn static_array_ubound(lower: i64, extent: i64) -> i64 {
     }
 }
 
+fn fresh_direct_sum_element_name(locals: &HashMap<String, LocalInfo>) -> String {
+    let mut index = 0usize;
+    loop {
+        let name = if index == 0 {
+            "afs_sum_element".to_string()
+        } else {
+            format!("afs_sum_element{index}")
+        };
+        if !locals.contains_key(&name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+/// Replace the single whole-array operand of a side-effect-free elemental
+/// expression with a scalar loop value. This is intentionally narrower than
+/// the general array-expression scalarizer: scalar procedure references are
+/// rejected because moving one into the reduction loop could change its
+/// evaluation count, and a second array would require position-based mapping
+/// across potentially different lower bounds.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_direct_sum_real_expr(
+    expr: &crate::ast::expr::SpannedExpr,
+    control_name: &str,
+    element_name: &str,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    caller_name: &str,
+) -> Option<(crate::ast::expr::SpannedExpr, bool)> {
+    match &expr.node {
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            if key == control_name {
+                return Some((synth_name_expr(element_name, expr.span), true));
+            }
+            if locals.get(&key).is_some_and(local_is_array_like) {
+                return None;
+            }
+            Some((expr.clone(), false))
+        }
+        Expr::IntegerLiteral { .. } | Expr::RealLiteral { .. } => Some((expr.clone(), false)),
+        Expr::ParenExpr { inner } => {
+            let (inner, changed) = rewrite_direct_sum_real_expr(
+                inner,
+                control_name,
+                element_name,
+                locals,
+                st,
+                caller_name,
+            )?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::ParenExpr {
+                        inner: Box::new(inner),
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        Expr::UnaryOp { op, operand } if matches!(op, UnaryOp::Plus | UnaryOp::Minus) => {
+            let (operand, changed) = rewrite_direct_sum_real_expr(
+                operand,
+                control_name,
+                element_name,
+                locals,
+                st,
+                caller_name,
+            )?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::UnaryOp {
+                        op: op.clone(),
+                        operand: Box::new(operand),
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        Expr::BinaryOp { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
+            ) =>
+        {
+            let (left, left_changed) = rewrite_direct_sum_real_expr(
+                left,
+                control_name,
+                element_name,
+                locals,
+                st,
+                caller_name,
+            )?;
+            let (right, right_changed) = rewrite_direct_sum_real_expr(
+                right,
+                control_name,
+                element_name,
+                locals,
+                st,
+                caller_name,
+            )?;
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::BinaryOp {
+                        op: op.clone(),
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    expr.span,
+                ),
+                left_changed || right_changed,
+            ))
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            if !name.eq_ignore_ascii_case("abs")
+                || user_callable_shadows_intrinsic(st, current_proc_scope(), caller_name, "abs")
+                || args.len() != 1
+            {
+                return None;
+            }
+            let crate::ast::expr::SectionSubscript::Element(argument) = &args[0].value else {
+                return None;
+            };
+            let (argument, changed) = rewrite_direct_sum_real_expr(
+                argument,
+                control_name,
+                element_name,
+                locals,
+                st,
+                caller_name,
+            )?;
+            let mut mapped_args = args.clone();
+            mapped_args[0].value = crate::ast::expr::SectionSubscript::Element(argument);
+            Some((
+                crate::ast::Spanned::new(
+                    Expr::FunctionCall {
+                        callee: Box::new((**callee).clone()),
+                        args: mapped_args,
+                    },
+                    expr.span,
+                ),
+                changed,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Lower `SUM(elemental-real-expression)` as one descriptor-stride-aware
+/// reduction loop instead of allocating and then reducing one or more array
+/// temporaries. The f64 accumulator deliberately matches
+/// `afs_array_sum_real8`, including for real(4) operands.
+#[allow(clippy::too_many_arguments)]
+fn lower_direct_sum_real_expr(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<ValueId> {
+    if actual_expr_rank(expr, locals, st, type_layouts) != Some(1)
+        || !array_expr_descriptor_may_own_temp(expr, locals, st)
+    {
+        return None;
+    }
+
+    let result_ty = operator_expr_type_info(expr, Some(locals), st, type_layouts)
+        .map(|type_info| type_info_to_ir_type(&type_info))?;
+    if !matches!(result_ty, IrType::Float(_)) {
+        return None;
+    }
+
+    let mut arrays = Vec::new();
+    collect_scalarized_control_array_names(expr, locals, &mut arrays);
+    let [control_name] = arrays.as_slice() else {
+        return None;
+    };
+    let control = locals.get(control_name)?;
+    if !matches!(control.ty, IrType::Float(_))
+        || current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, control_name))
+            .or_else(|| st.lookup(control_name))
+            .is_some_and(|symbol| symbol.attrs.volatile)
+    {
+        return None;
+    }
+
+    let element_name = fresh_direct_sum_element_name(locals);
+    let (scalar_expr, changed) = rewrite_direct_sum_real_expr(
+        expr,
+        control_name,
+        &element_name,
+        locals,
+        st,
+        b.func().name.as_str(),
+    )?;
+    if !changed {
+        return None;
+    }
+
+    let element_addr = b.alloca(control.ty.clone());
+    let mut scalar_locals = locals.clone();
+    scalar_locals.insert(
+        element_name,
+        LocalInfo {
+            addr: element_addr,
+            ty: control.ty.clone(),
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let descriptor =
+        local_uses_array_descriptor(control).then(|| array_descriptor_addr(b, control));
+    let base = descriptor.is_none().then(|| array_base_addr(b, control));
+    let element_count = array_total_elems_value(b, control);
+    let index_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let accumulator_addr = b.alloca(IrType::Float(FloatWidth::F64));
+    let zero_index = b.const_i64(0);
+    let zero_sum = b.const_f64(0.0);
+    b.store(zero_index, index_addr);
+    b.store(zero_sum, accumulator_addr);
+
+    let check = b.create_block("direct_sum_check");
+    let body = b.create_block("direct_sum_body");
+    let exit = b.create_block("direct_sum_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let index = b.load(index_addr);
+    let done = b.icmp(CmpOp::Ge, index, element_count);
+    b.cond_branch(done, exit, vec![], body, vec![]);
+
+    b.set_block(body);
+    let index = b.load(index_addr);
+    let element = if let Some(descriptor) = descriptor {
+        load_rank1_array_desc_elem(b, descriptor, &control.ty, index)
+    } else {
+        let element_ptr = b.gep(
+            base.expect("non-descriptor array base"),
+            vec![index],
+            control.ty.clone(),
+        );
+        b.load_typed(element_ptr, control.ty.clone())
+    };
+    b.store(element, element_addr);
+    let value = super::expr::lower_expr_full(
+        b,
+        &scalar_locals,
+        &scalar_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    );
+    let rounded = coerce_to_type(b, value, &result_ty);
+    let widened = coerce_to_type(b, rounded, &IrType::Float(FloatWidth::F64));
+    let accumulator = b.load(accumulator_addr);
+    let next_sum = b.fadd(accumulator, widened);
+    b.store(next_sum, accumulator_addr);
+    let one = b.const_i64(1);
+    let next_index = b.iadd(index, one);
+    b.store(next_index, index_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
+    let sum = b.load(accumulator_addr);
+    Some(coerce_to_type(b, sum, &result_ty))
+}
+
 fn size_intrinsic_result_type(
     args: &[crate::ast::expr::Argument],
     locals: &HashMap<String, LocalInfo>,
@@ -56752,6 +57041,20 @@ pub(super) fn lower_array_intrinsic(
     })?;
     let size_result_type =
         (name == "size").then(|| size_intrinsic_result_type(args, locals, st, type_layouts));
+    if name == "sum" && args.len() == 1 {
+        if let Some(result) = lower_direct_sum_real_expr(
+            b,
+            locals,
+            first_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            return Some(result);
+        }
+    }
     if name == "rank" {
         if let Some(rank) = actual_expr_rank(first_expr, locals, st, type_layouts) {
             return Some(b.const_i32(rank as i32));
@@ -65931,15 +66234,74 @@ end subroutine
         );
         assert_eq!(
             ir.matches("call @afs_array_sum_real8(").count(),
-            1,
-            "SQRT must not lower its real reduction argument twice:\n{ir}"
+            0,
+            "SQRT(SUM(X**2)) should use the direct reduction loop:\n{ir}"
         );
         assert_eq!(
             ir.matches("call @afs_allocate_like_with_elem_size(")
                 .count(),
-            1,
-            "SQRT(SUM(X**2)) should materialize X**2 only once:\n{ir}"
+            0,
+            "SQRT(SUM(X**2)) should not materialize X**2:\n{ir}"
         );
+        assert!(ir.contains("direct_sum_check"));
+    }
+
+    #[test]
+    fn lower_sum_fuses_inert_rank1_real_elemental_expressions() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, scaling, p, y)
+  implicit none
+  real(8), intent(in) :: x(:), scaling
+  integer, intent(in) :: p
+  real(8), intent(out) :: y(5)
+  y(1) = sum(x**2)
+  y(2) = sum((x / scaling)**2)
+  y(3) = sum(abs(x))
+  y(4) = sum(abs(x)**p)
+  y(5) = sum(x)
+end subroutine
+",
+        );
+        assert_eq!(
+            ir.matches("call @afs_allocate_like_with_elem_size(")
+                .count(),
+            0,
+            "direct reductions must not allocate array temporaries:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_array_sum_real8(").count(),
+            1,
+            "only the already-temporary-free SUM(X) should use the runtime reduction:\n{ir}"
+        );
+        assert!(
+            ir.contains("direct_sum_check"),
+            "elemental SUM operands should lower to direct loops:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_sum_does_not_fuse_scalar_procedure_references() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y)
+  implicit none
+  real(8), intent(in) :: x(:)
+  real(8), intent(out) :: y
+  y = sum(x * mark())
+contains
+  function mark() result(value)
+    real(8) :: value
+    value = 2.0_8
+  end function mark
+end subroutine
+",
+        );
+        assert!(
+            !ir.contains("direct_sum_check"),
+            "a scalar procedure reference must retain the general evaluation path:\n{ir}"
+        );
+        assert!(ir.contains("call @afs_allocate_like_with_elem_size("));
     }
 
     #[test]
