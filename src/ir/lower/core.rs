@@ -65943,6 +65943,31 @@ end subroutine
     }
 
     #[test]
+    fn lower_real_math_intrinsics_evaluate_arguments_once() {
+        let (_, ir) = lower_and_verify(
+            "\
+program kernel
+  implicit none
+  real(8) :: y
+  y = abs(mark(-2.0_8)) + exp(mark(0.0_8)) + sin(mark(0.0_8)) &
+      + cos(mark(0.0_8)) + log(mark(1.0_8))
+contains
+  function mark(value) result(marked)
+    real(8), intent(in) :: value
+    real(8) :: marked
+    marked = value
+  end function mark
+end program
+",
+        );
+        assert_eq!(
+            ir.matches("call @afs_internal_").count(),
+            5,
+            "real intrinsic probes must not lower their arguments twice:\n{ir}"
+        );
+    }
+
+    #[test]
     fn lower_chained_array_expr_assignment_deallocates_temporaries() {
         let (_, ir) = lower_and_verify(
             "\

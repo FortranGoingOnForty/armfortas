@@ -20,6 +20,26 @@ use super::ctx::{current_proc_scope, CharKind, HiddenResultAbi, LocalInfo, Lower
 use super::helpers::coerce_to_type;
 use crate::ast::expr::{BinaryOp, UnaryOp};
 
+/// Decide whether a scalar-math intrinsic needs the complex lowering path
+/// without emitting IR for its argument. The old value-first probe evaluated
+/// every real argument once here and again in generic intrinsic dispatch.
+fn first_arg_is_scalar_complex(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    let Some(crate::ast::expr::SectionSubscript::Element(expr)) =
+        args.first().map(|arg| &arg.value)
+    else {
+        return false;
+    };
+    matches!(
+        generic_actual_expr_type_info(expr, locals, st, type_layouts),
+        Some(crate::sema::symtab::TypeInfo::Complex { .. })
+    ) && actual_expr_rank(expr, locals, st, type_layouts).is_none_or(|rank| rank == 0)
+}
+
 /// Lower an expression to a ValueId.
 pub(crate) fn lower_expr(
     b: &mut FuncBuilder,
@@ -1706,6 +1726,7 @@ pub(crate) fn lower_expr_full(
                 // complex values may be pointer-backed or aggregate pairs.
                 if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs")
                     && args.len() == 1
+                    && first_arg_is_scalar_complex(args, locals, st, type_layouts)
                 {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
@@ -1746,7 +1767,10 @@ pub(crate) fn lower_expr_full(
                 // Keep this on the expression side of intrinsic lowering so
                 // the scalar libm path never sees the pointer-backed complex
                 // buffer as its argument.
-                if key == "exp" && args.len() == 1 {
+                if key == "exp"
+                    && args.len() == 1
+                    && first_arg_is_scalar_complex(args, locals, st, type_layouts)
+                {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
                             let val = lower_expr_full(
@@ -1819,6 +1843,7 @@ pub(crate) fn lower_expr_full(
                     || key == "ccos"
                     || key == "zcos")
                     && args.len() == 1
+                    && first_arg_is_scalar_complex(args, locals, st, type_layouts)
                 {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
@@ -1903,6 +1928,7 @@ pub(crate) fn lower_expr_full(
                 // buffer is passed to `log` as if it were a real value.
                 if (key == "log" || key == "clog" || key == "zlog" || key == "cdlog")
                     && args.len() == 1
+                    && first_arg_is_scalar_complex(args, locals, st, type_layouts)
                 {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
@@ -1979,6 +2005,7 @@ pub(crate) fn lower_expr_full(
                 // emit `fsqrt` on a GPR register.
                 if (key == "sqrt" || key == "csqrt" || key == "zsqrt" || key == "cdsqrt")
                     && args.len() == 1
+                    && first_arg_is_scalar_complex(args, locals, st, type_layouts)
                 {
                     if let Some(arg0) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(e) = &arg0.value {
@@ -2057,16 +2084,6 @@ pub(crate) fn lower_expr_full(
                                 b.store(re_out, out_re);
                                 b.store(im_out, out_im);
                                 return out;
-                            }
-                            // The complex probe has already evaluated the
-                            // argument. Reuse that scalar value for ordinary
-                            // SQRT instead of falling through to generic
-                            // intrinsic dispatch, which would evaluate the
-                            // argument a second time. Besides observable side
-                            // effects, the fallthrough doubled expensive
-                            // reductions such as PRIMA's SQRT(SUM(X**2)).
-                            if key == "sqrt" {
-                                return b.fsqrt(val);
                             }
                         }
                     }
