@@ -1,6 +1,8 @@
 ! CHECK: ok
-! IR_CHECK: call @afs_array_sum_real8(
+! IR_CHECK: direct_sum_check
 ! IR_CHECK: fsqrt
+! IR_NOT: call @afs_array_sum_real8(
+! IR_NOT: call @afs_allocate_like_with_elem_size(
 ! REPRO_CHECK: asm
 ! REPRO_CHECK: obj
 ! REPRO_CHECK: run
