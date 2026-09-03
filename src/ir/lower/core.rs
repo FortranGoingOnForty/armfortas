@@ -56679,13 +56679,13 @@ fn static_array_ubound(lower: i64, extent: i64) -> i64 {
     }
 }
 
-fn fresh_direct_sum_element_name(locals: &HashMap<String, LocalInfo>) -> String {
+fn fresh_direct_reduction_element_name(locals: &HashMap<String, LocalInfo>) -> String {
     let mut index = 0usize;
     loop {
         let name = if index == 0 {
-            "afs_sum_element".to_string()
+            "afs_reduction_element".to_string()
         } else {
-            format!("afs_sum_element{index}")
+            format!("afs_reduction_element{index}")
         };
         if !locals.contains_key(&name) {
             return name;
@@ -56701,7 +56701,7 @@ fn fresh_direct_sum_element_name(locals: &HashMap<String, LocalInfo>) -> String 
 /// evaluation count, and a second array would require position-based mapping
 /// across potentially different lower bounds.
 #[allow(clippy::too_many_arguments)]
-fn rewrite_direct_sum_real_expr(
+fn rewrite_direct_real_reduction_expr(
     expr: &crate::ast::expr::SpannedExpr,
     control_name: &str,
     element_name: &str,
@@ -56722,7 +56722,7 @@ fn rewrite_direct_sum_real_expr(
         }
         Expr::IntegerLiteral { .. } | Expr::RealLiteral { .. } => Some((expr.clone(), false)),
         Expr::ParenExpr { inner } => {
-            let (inner, changed) = rewrite_direct_sum_real_expr(
+            let (inner, changed) = rewrite_direct_real_reduction_expr(
                 inner,
                 control_name,
                 element_name,
@@ -56741,7 +56741,7 @@ fn rewrite_direct_sum_real_expr(
             ))
         }
         Expr::UnaryOp { op, operand } if matches!(op, UnaryOp::Plus | UnaryOp::Minus) => {
-            let (operand, changed) = rewrite_direct_sum_real_expr(
+            let (operand, changed) = rewrite_direct_real_reduction_expr(
                 operand,
                 control_name,
                 element_name,
@@ -56766,7 +56766,7 @@ fn rewrite_direct_sum_real_expr(
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
             ) =>
         {
-            let (left, left_changed) = rewrite_direct_sum_real_expr(
+            let (left, left_changed) = rewrite_direct_real_reduction_expr(
                 left,
                 control_name,
                 element_name,
@@ -56774,7 +56774,7 @@ fn rewrite_direct_sum_real_expr(
                 st,
                 caller_name,
             )?;
-            let (right, right_changed) = rewrite_direct_sum_real_expr(
+            let (right, right_changed) = rewrite_direct_real_reduction_expr(
                 right,
                 control_name,
                 element_name,
@@ -56807,7 +56807,7 @@ fn rewrite_direct_sum_real_expr(
             let crate::ast::expr::SectionSubscript::Element(argument) = &args[0].value else {
                 return None;
             };
-            let (argument, changed) = rewrite_direct_sum_real_expr(
+            let (argument, changed) = rewrite_direct_real_reduction_expr(
                 argument,
                 control_name,
                 element_name,
@@ -56832,14 +56832,16 @@ fn rewrite_direct_sum_real_expr(
     }
 }
 
-/// Lower `SUM(elemental-real-expression)` as one descriptor-stride-aware
-/// reduction loop instead of allocating and then reducing one or more array
-/// temporaries. The f64 accumulator deliberately matches
-/// `afs_array_sum_real8`, including for real(4) operands.
+/// Lower a no-DIM real reduction over a side-effect-free elemental expression
+/// as one descriptor-stride-aware loop instead of allocating and then reducing
+/// one or more array temporaries. The f64 accumulator deliberately matches the
+/// runtime reduction entry points, including their real(4) rounding and empty
+/// array identities.
 #[allow(clippy::too_many_arguments)]
-fn lower_direct_sum_real_expr(
+fn lower_direct_real_reduction_expr(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
+    reduction: &str,
     expr: &crate::ast::expr::SpannedExpr,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
@@ -56847,9 +56849,11 @@ fn lower_direct_sum_real_expr(
     contained_host_refs: Option<&HashMap<String, Vec<String>>>,
     descriptor_params: Option<&HashMap<String, Vec<bool>>>,
 ) -> Option<ValueId> {
-    if actual_expr_rank(expr, locals, st, type_layouts) != Some(1)
-        || !array_expr_descriptor_may_own_temp(expr, locals, st)
-    {
+    if !matches!(reduction, "sum" | "maxval" | "minval") {
+        return None;
+    }
+    let rank = actual_expr_rank(expr, locals, st, type_layouts)?;
+    if rank == 0 || !array_expr_descriptor_may_own_temp(expr, locals, st) {
         return None;
     }
 
@@ -56874,8 +56878,8 @@ fn lower_direct_sum_real_expr(
         return None;
     }
 
-    let element_name = fresh_direct_sum_element_name(locals);
-    let (scalar_expr, changed) = rewrite_direct_sum_real_expr(
+    let element_name = fresh_direct_reduction_element_name(locals);
+    let (scalar_expr, changed) = rewrite_direct_real_reduction_expr(
         expr,
         control_name,
         &element_name,
@@ -56916,13 +56920,21 @@ fn lower_direct_sum_real_expr(
     let index_addr = b.alloca(IrType::Int(IntWidth::I64));
     let accumulator_addr = b.alloca(IrType::Float(FloatWidth::F64));
     let zero_index = b.const_i64(0);
-    let zero_sum = b.const_f64(0.0);
+    let initial = match (reduction, &result_ty) {
+        ("sum", _) => 0.0,
+        ("maxval", IrType::Float(FloatWidth::F32)) => -(f32::MAX as f64),
+        ("maxval", _) => -f64::MAX,
+        ("minval", IrType::Float(FloatWidth::F32)) => f32::MAX as f64,
+        ("minval", _) => f64::MAX,
+        _ => unreachable!("direct real reduction was validated above"),
+    };
+    let initial = b.const_f64(initial);
     b.store(zero_index, index_addr);
-    b.store(zero_sum, accumulator_addr);
+    b.store(initial, accumulator_addr);
 
-    let check = b.create_block("direct_sum_check");
-    let body = b.create_block("direct_sum_body");
-    let exit = b.create_block("direct_sum_exit");
+    let check = b.create_block(&format!("direct_{reduction}_check"));
+    let body = b.create_block(&format!("direct_{reduction}_body"));
+    let exit = b.create_block(&format!("direct_{reduction}_exit"));
     b.branch(check, vec![]);
 
     b.set_block(check);
@@ -56933,7 +56945,7 @@ fn lower_direct_sum_real_expr(
     b.set_block(body);
     let index = b.load(index_addr);
     let element = if let Some(descriptor) = descriptor {
-        load_rank1_array_desc_elem(b, descriptor, &control.ty, index)
+        load_array_desc_elem_rank(b, descriptor, &control.ty, index, rank)
     } else {
         let element_ptr = b.gep(
             base.expect("non-descriptor array base"),
@@ -56956,16 +56968,27 @@ fn lower_direct_sum_real_expr(
     let rounded = coerce_to_type(b, value, &result_ty);
     let widened = coerce_to_type(b, rounded, &IrType::Float(FloatWidth::F64));
     let accumulator = b.load(accumulator_addr);
-    let next_sum = b.fadd(accumulator, widened);
-    b.store(next_sum, accumulator_addr);
+    let next = match reduction {
+        "sum" => b.fadd(accumulator, widened),
+        "maxval" => {
+            let replace = b.fcmp(CmpOp::Gt, widened, accumulator);
+            b.select(replace, widened, accumulator)
+        }
+        "minval" => {
+            let replace = b.fcmp(CmpOp::Lt, widened, accumulator);
+            b.select(replace, widened, accumulator)
+        }
+        _ => unreachable!("direct real reduction was validated above"),
+    };
+    b.store(next, accumulator_addr);
     let one = b.const_i64(1);
     let next_index = b.iadd(index, one);
     b.store(next_index, index_addr);
     b.branch(check, vec![]);
 
     b.set_block(exit);
-    let sum = b.load(accumulator_addr);
-    Some(coerce_to_type(b, sum, &result_ty))
+    let result = b.load(accumulator_addr);
+    Some(coerce_to_type(b, result, &result_ty))
 }
 
 fn size_intrinsic_result_type(
@@ -57041,10 +57064,11 @@ pub(super) fn lower_array_intrinsic(
     })?;
     let size_result_type =
         (name == "size").then(|| size_intrinsic_result_type(args, locals, st, type_layouts));
-    if name == "sum" && args.len() == 1 {
-        if let Some(result) = lower_direct_sum_real_expr(
+    if matches!(name, "sum" | "maxval" | "minval") && args.len() == 1 {
+        if let Some(result) = lower_direct_real_reduction_expr(
             b,
             locals,
+            name,
             first_expr,
             st,
             type_layouts,
@@ -66353,27 +66377,91 @@ end program
     }
 
     #[test]
-    fn lower_reduction_over_array_expr_deallocates_operand_temporary() {
+    fn lower_rank_n_real_reductions_fuse_inert_elemental_expressions() {
         let (_, ir) = lower_and_verify(
             "\
-program test
+subroutine kernel(z, r)
   implicit none
-  real(8) :: z(4), r
-  z = [-1.0_8, 2.0_8, -3.0_8, 4.0_8]
-  r = maxval(abs(z))
-end program
+  real(8), intent(in) :: z(:, :)
+  real(8), intent(out) :: r(5)
+  r(1) = maxval(abs(z))
+  r(2) = minval(abs(z + 1.0_8))
+  r(3) = sum(z**2)
+  r(4) = maxval(z)
+  r(5) = minval(z)
+end subroutine
+",
+        );
+        assert_eq!(
+            ir.matches("call @afs_allocate_like_with_elem_size(")
+                .count(),
+            0,
+            "direct rank-N reductions must not allocate array temporaries:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like("),
+            "direct ABS reductions must not allocate same-kind temporaries:\n{ir}"
+        );
+        assert!(ir.contains("direct_maxval_check"));
+        assert!(ir.contains("direct_minval_check"));
+        assert!(ir.contains("direct_sum_check"));
+        assert_eq!(
+            ir.matches("call @afs_array_maxval_real8(").count(),
+            1,
+            "plain MAXVAL(Z) should retain the runtime path:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_array_minval_real8(").count(),
+            1,
+            "plain MINVAL(Z) should retain the runtime path:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_real_maxval_does_not_fuse_scalar_procedure_references() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y)
+  implicit none
+  real(8), intent(in) :: x(:, :)
+  real(8), intent(out) :: y
+  y = maxval(x * mark())
+contains
+  function mark() result(value)
+    real(8) :: value
+    value = 2.0_8
+  end function mark
+end subroutine
 ",
         );
         assert!(
-            ir.contains("call @afs_array_maxval_real8"),
-            "expected maxval runtime reduction in:\n{}",
-            ir
+            !ir.contains("direct_maxval_check"),
+            "a scalar procedure reference must retain the general evaluation path:\n{ir}"
+        );
+        assert!(ir.contains("call @afs_allocate_like_with_elem_size("));
+        assert!(ir.contains("call @afs_array_maxval_real8("));
+        assert!(ir.contains("call @afs_deallocate_array"));
+    }
+
+    #[test]
+    fn lower_real_minval_does_not_fuse_volatile_arrays() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y)
+  implicit none
+  real(8), intent(in), volatile :: x(:, :)
+  real(8), intent(out) :: y
+  y = minval(abs(x))
+end subroutine
+",
         );
         assert!(
-            ir.contains("call @afs_deallocate_array"),
-            "expected reduction operand temporary cleanup in:\n{}",
-            ir
+            !ir.contains("direct_minval_check"),
+            "a volatile operand must retain the general evaluation path:\n{ir}"
         );
+        assert!(ir.contains("call @afs_allocate_like("));
+        assert!(ir.contains("call @afs_array_minval_real8("));
+        assert!(ir.contains("call @afs_deallocate_array"));
     }
 
     #[test]
