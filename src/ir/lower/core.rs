@@ -56736,25 +56736,85 @@ fn fresh_direct_reduction_element_name(locals: &HashMap<String, LocalInfo>) -> S
     }
 }
 
-/// Replace the single whole-array operand of a side-effect-free elemental
-/// expression with a scalar loop value. This is intentionally narrower than
-/// the general array-expression scalarizer: scalar procedure references are
-/// rejected because moving one into the reduction loop could change its
-/// evaluation count, and a second array would require position-based mapping
-/// across potentially different lower bounds.
+/// Find rank-preserving local-array sections that could provide the element
+/// stream for a direct reduction. Section bounds are deliberately not walked:
+/// they are scalar descriptor setup expressions, evaluated once by
+/// `lower_array_section`, rather than part of the elemental expression.
+fn collect_direct_real_reduction_sections<'a>(
+    expr: &'a crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    out: &mut Vec<(&'a crate::ast::expr::SpannedExpr, String)>,
+) {
+    match &expr.node {
+        Expr::BinaryOp { left, right, .. } => {
+            collect_direct_real_reduction_sections(left, locals, out);
+            collect_direct_real_reduction_sections(right, locals, out);
+        }
+        Expr::UnaryOp { operand, .. } => {
+            collect_direct_real_reduction_sections(operand, locals, out)
+        }
+        Expr::ParenExpr { inner } => collect_direct_real_reduction_sections(inner, locals, out),
+        Expr::ComponentAccess { base, .. } => {
+            collect_direct_real_reduction_sections(base, locals, out)
+        }
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
+                    let rank = local_declared_rank(info);
+                    if rank > 0 {
+                        if args.len() == rank
+                            && args.iter().all(|arg| {
+                                matches!(
+                                    arg.value,
+                                    crate::ast::expr::SectionSubscript::Range { .. }
+                                )
+                            })
+                        {
+                            out.push((expr, key));
+                        }
+                        // Any local-array reference is one designator. Its
+                        // scalar subscripts and section bounds are not array
+                        // operands of the surrounding elemental expression.
+                        return;
+                    }
+                }
+            }
+            collect_direct_real_reduction_sections(callee, locals, out);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(argument) = &arg.value {
+                    collect_direct_real_reduction_sections(argument, locals, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace the single whole-array operand, or one exact rank-preserving array
+/// section, of a side-effect-free elemental expression with a scalar loop
+/// value. This is intentionally narrower than the general array-expression
+/// scalarizer: scalar procedure references are rejected because moving one
+/// into the reduction loop could change its evaluation count, and a second
+/// array would require position-based mapping across potentially different
+/// lower bounds.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_direct_real_reduction_expr(
     expr: &crate::ast::expr::SpannedExpr,
     control_name: &str,
+    control_section: Option<&crate::ast::expr::SpannedExpr>,
     element_name: &str,
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
     caller_name: &str,
 ) -> Option<(crate::ast::expr::SpannedExpr, bool)> {
+    if control_section.is_some_and(|section| expr == section) {
+        return Some((synth_name_expr(element_name, expr.span), true));
+    }
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            if key == control_name {
+            if control_section.is_none() && key == control_name {
                 return Some((synth_name_expr(element_name, expr.span), true));
             }
             if locals.get(&key).is_some_and(local_is_array_like) {
@@ -56767,6 +56827,7 @@ fn rewrite_direct_real_reduction_expr(
             let (inner, changed) = rewrite_direct_real_reduction_expr(
                 inner,
                 control_name,
+                control_section,
                 element_name,
                 locals,
                 st,
@@ -56786,6 +56847,7 @@ fn rewrite_direct_real_reduction_expr(
             let (operand, changed) = rewrite_direct_real_reduction_expr(
                 operand,
                 control_name,
+                control_section,
                 element_name,
                 locals,
                 st,
@@ -56811,6 +56873,7 @@ fn rewrite_direct_real_reduction_expr(
             let (left, left_changed) = rewrite_direct_real_reduction_expr(
                 left,
                 control_name,
+                control_section,
                 element_name,
                 locals,
                 st,
@@ -56819,6 +56882,7 @@ fn rewrite_direct_real_reduction_expr(
             let (right, right_changed) = rewrite_direct_real_reduction_expr(
                 right,
                 control_name,
+                control_section,
                 element_name,
                 locals,
                 st,
@@ -56852,6 +56916,7 @@ fn rewrite_direct_real_reduction_expr(
             let (argument, changed) = rewrite_direct_real_reduction_expr(
                 argument,
                 control_name,
+                control_section,
                 element_name,
                 locals,
                 st,
@@ -56924,6 +56989,7 @@ fn lower_direct_real_reduction_expr(
     let (scalar_expr, changed) = rewrite_direct_real_reduction_expr(
         expr,
         control_name,
+        None,
         &element_name,
         locals,
         st,
@@ -57072,7 +57138,16 @@ fn lower_direct_real_dim_reduction_expr(
 
     let mut arrays = Vec::new();
     collect_scalarized_control_array_names(expr, locals, &mut arrays);
-    let [control_name] = arrays.as_slice() else {
+    let mut sections = Vec::new();
+    collect_direct_real_reduction_sections(expr, locals, &mut sections);
+    let (control_name, control_section) = if let [control_name] = arrays.as_slice() {
+        if !sections.is_empty() {
+            return None;
+        }
+        (control_name.as_str(), None)
+    } else if arrays.is_empty() && sections.len() == 1 {
+        (sections[0].1.as_str(), Some(sections[0].0))
+    } else {
         return None;
     };
     let control = locals.get(control_name)?;
@@ -57091,6 +57166,7 @@ fn lower_direct_real_dim_reduction_expr(
     let (scalar_expr, changed) = rewrite_direct_real_reduction_expr(
         expr,
         control_name,
+        control_section,
         &element_name,
         locals,
         st,
@@ -57122,7 +57198,19 @@ fn lower_direct_real_dim_reduction_expr(
         },
     );
 
-    let source_desc = if local_uses_array_descriptor(control) {
+    let source_desc = if let Some(section) = control_section {
+        lower_array_expr_descriptor(
+            b,
+            locals,
+            section,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        )?
+        .0
+    } else if local_uses_array_descriptor(control) {
         array_descriptor_addr(b, control)
     } else {
         materialize_array_descriptor_for_info(b, control)
@@ -66733,6 +66821,71 @@ end subroutine
             3,
             "each direct reduction result must be released after assignment:\n{ir}"
         );
+    }
+
+    #[test]
+    fn lower_real_dim_reductions_fuse_one_rank_preserving_section() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(z, first, last, sums, maxima, minima)
+  implicit none
+  real(8), intent(in) :: z(:, :, :)
+  integer, intent(in) :: first, last
+  real(8), intent(out) :: sums(:, :), maxima(:, :), minima(:, :)
+  sums = sum(z(first:last:2, :, :)**2, dim=2)
+  maxima = maxval(abs(z(first:last:2, :, :)), dim=2)
+  minima = minval(abs(z(first:last:2, :, :) + 1.0_8), dim=2)
+end subroutine
+",
+        );
+        assert!(ir.contains("direct_sum_dim_check"));
+        assert!(ir.contains("direct_maxval_dim_check"));
+        assert!(ir.contains("direct_minval_dim_check"));
+        assert_eq!(
+            ir.matches("call @afs_create_section(").count(),
+            3,
+            "each direct reduction must evaluate its section once:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like"),
+            "direct section reductions must not materialize their elemental inputs:\n{ir}"
+        );
+        for intrinsic in ["sum", "maxval", "minval"] {
+            assert!(
+                !ir.contains(&format!("call @afs_array_{intrinsic}_real8_dim(")),
+                "direct section {intrinsic}(DIM=) must not call the runtime reducer:\n{ir}"
+            );
+        }
+        assert_eq!(
+            ir.matches("call @afs_allocate_array(").count(),
+            3,
+            "each direct reduction should allocate only its rank-reduced result:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_deallocate_array(").count(),
+            3,
+            "each direct reduction result must be released after assignment:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_real_dim_section_reductions_preserve_ambiguous_fallbacks() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, values)
+  implicit none
+  real(8), intent(in) :: x(:, :)
+  real(8), intent(out) :: values(:)
+  values = sum(x(:, :)**2 + x(:, :), dim=1)
+end subroutine
+",
+        );
+        assert!(
+            !ir.contains("direct_sum_dim_check"),
+            "an expression with two section occurrences must retain the general path:\n{ir}"
+        );
+        assert!(ir.contains("call @afs_array_sum_real8_dim("));
+        assert!(ir.contains("call @afs_allocate_like_with_elem_size("));
     }
 
     #[test]
