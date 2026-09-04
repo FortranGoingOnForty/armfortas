@@ -117,48 +117,63 @@ impl Pass for LoopUnroll {
 // ---------------------------------------------------------------------------
 
 fn unroll_in_function(func: &mut Function) -> bool {
-    let loops = find_natural_loops(func);
-    let preds = predecessors(func);
     let mut changed = false;
 
-    for nl in &loops {
-        // Every unroll path changes the static placement of memory
-        // operations. Keep source-language VOLATILE accesses in their
-        // original loop until an unroller has an explicit proof that it
-        // preserves their dynamic count and order.
-        if loop_contains_volatile_memory(func, nl) {
-            continue;
+    // Every transform mutates the CFG, so rediscover loops before selecting
+    // the next candidate. Drain all currently eligible loops here instead of
+    // using the global pass-manager fixpoint as a one-loop-at-a-time worklist;
+    // large generated routines can contain more loops than that manager's
+    // defensive iteration limit.
+    loop {
+        let loops = find_natural_loops(func);
+        let preds = predecessors(func);
+        let mut transformed = false;
+
+        for nl in &loops {
+            // Every unroll path changes the static placement of memory
+            // operations. Keep source-language VOLATILE accesses in their
+            // original loop until an unroller has an explicit proof that it
+            // preserves their dynamic count and order.
+            if loop_contains_volatile_memory(func, nl) {
+                continue;
+            }
+            if let Some(shape) = detect_simple_loop(func, nl, &preds) {
+                do_unroll(func, shape);
+                prune_unreachable(func);
+                changed = true;
+                transformed = true;
+                break;
+            }
+            // Try partial unrolling for trip > FULL_UNROLL_MAX. Keeps the
+            // loop intact but clones body U times and bumps step by U.
+            if let Some(shape) = detect_partial_unroll_loop(func, nl, &preds) {
+                do_partial_unroll(func, shape);
+                changed = true;
+                transformed = true;
+                break;
+            }
+            // Same shape but with a runtime (non-constant) bound — emits
+            // a head_bound computation in the preheader and a scalar
+            // remainder loop after the unrolled main loop.
+            if !func.block(nl.header).partial_unroll_remainder {
+                if let Some(shape) = detect_partial_unroll_runtime_loop(func, nl, &preds) {
+                    do_partial_unroll_runtime(func, shape);
+                    changed = true;
+                    transformed = true;
+                    break;
+                }
+            }
+            // Multi-block partial unroll: 3-block (or longer) linear-chain
+            // body. Allocates fresh BlockIds for each cloned iteration.
+            if let Some(shape) = detect_partial_unroll_multiblock_loop(func, nl, &preds) {
+                do_partial_unroll_multiblock(func, shape);
+                changed = true;
+                transformed = true;
+                break;
+            }
         }
-        if let Some(shape) = detect_simple_loop(func, nl, &preds) {
-            do_unroll(func, shape);
-            prune_unreachable(func);
-            changed = true;
-            // After structural changes, re-running loop detection in the next
-            // pass manager iteration handles any inner loops that became
-            // exposed. Don't iterate here — return and let the pass manager
-            // fix-point loop drive re-runs.
-            break;
-        }
-        // Try partial unrolling for trip > FULL_UNROLL_MAX. Keeps the
-        // loop intact but clones body U times and bumps step by U.
-        if let Some(shape) = detect_partial_unroll_loop(func, nl, &preds) {
-            do_partial_unroll(func, shape);
-            changed = true;
-            break;
-        }
-        // Same shape but with a runtime (non-constant) bound — emits
-        // a head_bound computation in the preheader and a scalar
-        // remainder loop after the unrolled main loop.
-        if let Some(shape) = detect_partial_unroll_runtime_loop(func, nl, &preds) {
-            do_partial_unroll_runtime(func, shape);
-            changed = true;
-            break;
-        }
-        // Multi-block partial unroll: 3-block (or longer) linear-chain
-        // body. Allocates fresh BlockIds for each cloned iteration.
-        if let Some(shape) = detect_partial_unroll_multiblock_loop(func, nl, &preds) {
-            do_partial_unroll_multiblock(func, shape);
-            changed = true;
+
+        if !transformed {
             break;
         }
     }
@@ -1826,6 +1841,7 @@ fn do_partial_unroll_runtime(func: &mut Function, shape: PartialRuntimeShape) {
     // ---- 3. Allocate remainder loop blocks ----
     let header_remain = func.create_block("partial_remain_header");
     let latch_remain = func.create_block("partial_remain_latch");
+    func.block_mut(header_remain).partial_unroll_remainder = true;
     let remain_iv_id = func.next_value_id();
     func.register_type(remain_iv_id, int_ty.clone());
     func.block_mut(header_remain).params.push(BlockParam {
@@ -2712,6 +2728,96 @@ mod tests {
         m
     }
 
+    fn append_runtime_counted_loop(m: &mut Module, lo: i64) {
+        let f = &mut m.functions[0];
+        let n_param = f.params[0].id;
+        let slot = f
+            .blocks
+            .iter()
+            .flat_map(|block| block.insts.iter())
+            .find_map(|inst| match inst.kind {
+                InstKind::Store(_, ptr) => Some(ptr),
+                _ => None,
+            })
+            .expect("first loop should store through a local slot");
+        let preheader = f
+            .blocks
+            .iter()
+            .find(|block| matches!(block.terminator, Some(Terminator::Return(None))))
+            .map(|block| block.id)
+            .expect("first loop should have a return block");
+        let header = f.create_block("second_do_check");
+        let latch = f.create_block("second_do_body");
+        let exit = f.create_block("second_exit");
+
+        let lo_value = f.next_value_id();
+        f.register_type(lo_value, IrType::Int(IntWidth::I64));
+        f.block_mut(preheader).insts.push(Inst {
+            id: lo_value,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(lo as i128, IntWidth::I64),
+        });
+        f.block_mut(preheader).terminator = Some(Terminator::Branch(header, vec![lo_value]));
+
+        let iv = f.next_value_id();
+        f.register_type(iv, IrType::Int(IntWidth::I64));
+        f.block_mut(header).params.push(BlockParam {
+            id: iv,
+            ty: IrType::Int(IntWidth::I64),
+        });
+        let cmp = f.next_value_id();
+        f.register_type(cmp, IrType::Bool);
+        f.block_mut(header).insts.push(Inst {
+            id: cmp,
+            ty: IrType::Bool,
+            span: span(),
+            kind: InstKind::ICmp(CmpOp::Le, iv, n_param),
+        });
+        f.block_mut(header).terminator = Some(Terminator::CondBranch {
+            cond: cmp,
+            true_dest: latch,
+            true_args: vec![],
+            false_dest: exit,
+            false_args: vec![],
+        });
+
+        let value = f.next_value_id();
+        f.register_type(value, IrType::Int(IntWidth::I64));
+        f.block_mut(latch).insts.push(Inst {
+            id: value,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(7, IntWidth::I64),
+        });
+        let store = f.next_value_id();
+        f.register_type(store, IrType::Void);
+        f.block_mut(latch).insts.push(Inst {
+            id: store,
+            ty: IrType::Void,
+            span: span(),
+            kind: InstKind::Store(value, slot),
+        });
+        let one = f.next_value_id();
+        f.register_type(one, IrType::Int(IntWidth::I64));
+        f.block_mut(latch).insts.push(Inst {
+            id: one,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::ConstInt(1, IntWidth::I64),
+        });
+        let next = f.next_value_id();
+        f.register_type(next, IrType::Int(IntWidth::I64));
+        f.block_mut(latch).insts.push(Inst {
+            id: next,
+            ty: IrType::Int(IntWidth::I64),
+            span: span(),
+            kind: InstKind::IAdd(iv, one),
+        });
+        f.block_mut(latch).terminator = Some(Terminator::Branch(header, vec![next]));
+        f.block_mut(exit).terminator = Some(Terminator::Return(None));
+    }
+
     /// Build a 3-block counted loop: header + body_block (unconditional
     /// br to latch) + latch (with iadd + br header). Trip is statically
     /// known (`hi`); body_block stores `42` to a local alloca.
@@ -2882,6 +2988,47 @@ mod tests {
         let kinds: Vec<&InstKind> = preheader.insts.iter().map(|i| &i.kind).collect();
         let has_imod = kinds.iter().any(|k| matches!(k, InstKind::IMod(..)));
         assert!(has_imod, "preheader should compute head_bound via IMod");
+    }
+
+    #[test]
+    fn runtime_partial_unroll_does_not_reprocess_generated_remainder() {
+        let mut m = build_runtime_counted_loop(1);
+        let mut manager = crate::opt::pass::PassManager::new();
+        manager.max_iterations = 4;
+        manager.add(Box::new(crate::opt::preheader::PreheaderInsert));
+        manager.add(Box::new(LoopUnroll));
+
+        let result = manager
+            .run(&mut m)
+            .expect("runtime partial unrolling must reach a fixed point");
+        assert_eq!(result.iterations, 3);
+
+        let remainder_headers: Vec<_> = m.functions[0]
+            .blocks
+            .iter()
+            .filter(|block| block.partial_unroll_remainder)
+            .collect();
+        assert_eq!(remainder_headers.len(), 1);
+        assert!(remainder_headers[0]
+            .name
+            .starts_with("partial_remain_header"));
+    }
+
+    #[test]
+    fn unroll_pass_drains_multiple_runtime_loops_in_one_function() {
+        let mut m = build_runtime_counted_loop(1);
+        append_runtime_counted_loop(&mut m, 1);
+
+        assert!(LoopUnroll.run(&mut m));
+        let remainder_count = m.functions[0]
+            .blocks
+            .iter()
+            .filter(|block| block.partial_unroll_remainder)
+            .count();
+        assert_eq!(
+            remainder_count, 2,
+            "one pass invocation should transform both original loops"
+        );
     }
 
     #[test]

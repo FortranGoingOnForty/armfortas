@@ -11,7 +11,11 @@ program sequence_strided_pointer_unit_section
   character(len=2), pointer :: char_view(:)
   integer :: i
 
-  backing = [(i, i = 1, size(backing))]
+  ! Initialize element-by-element so this fixture's copy-helper count only
+  ! measures the sequence-association temporaries exercised below.
+  do i = 1, size(backing)
+    backing(i) = i
+  end do
   view => backing(1:12:2)
 
   call bump(view(:))

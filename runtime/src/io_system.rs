@@ -219,6 +219,11 @@ struct Unit {
     /// seeing a newline. If the next terminal read hits EOF, report EOR
     /// once for that open record before reporting END.
     terminal_nonadvancing_open_record: bool,
+    /// Bytes fetched by a raw non-advancing read after the first record
+    /// boundary. Pipes can return several newline-delimited records in one
+    /// syscall; later formatted statements must still observe them one at a
+    /// time.
+    nonadvancing_read_ahead: VecDeque<u8>,
     /// True when the most recent formatted list-directed output item was
     /// character. Adjacent character items concatenate without another
     /// separator; any non-character item breaks the run.
@@ -362,6 +367,7 @@ impl Unit {
         self.formatted_read_record = None;
         self.formatted_read_cursor = 0;
         self.terminal_nonadvancing_open_record = false;
+        self.nonadvancing_read_ahead.clear();
         self.pending_read = None;
         self.list_read_depth = 0;
     }
@@ -450,6 +456,12 @@ impl Unit {
 
     fn read_line_bytes(&mut self) -> io::Result<Vec<u8>> {
         let mut line = Vec::new();
+        while let Some(byte) = self.nonadvancing_read_ahead.pop_front() {
+            line.push(byte);
+            if byte == b'\n' {
+                return Ok(line);
+            }
+        }
         match &mut self.stream {
             UnitStream::Stdin => {
                 io::stdin().lock().read_until(b'\n', &mut line)?;
@@ -506,14 +518,44 @@ impl Unit {
     }
 
     fn read_nonadvancing_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.stream {
-            UnitStream::Stdin => read_stdin_unbuffered(buf),
-            UnitStream::FileRead(r) => r.read(buf),
-            UnitStream::FileRaw(f) => f.read(buf),
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let Some(byte) = self.nonadvancing_read_ahead.pop_front() else {
+                break;
+            };
+            buf[filled] = byte;
+            filled += 1;
+            if byte == b'\n' {
+                return Ok(filled);
+            }
+        }
+        if filled == buf.len() {
+            return Ok(filled);
+        }
+
+        let read = match &mut self.stream {
+            UnitStream::Stdin => read_stdin_unbuffered(&mut buf[filled..]),
+            UnitStream::FileRead(r) => r.read(&mut buf[filled..]),
+            UnitStream::FileRaw(f) => f.read(&mut buf[filled..]),
+            #[cfg(test)]
+            UnitStream::TestRead(r) => r.read(&mut buf[filled..]),
             _ => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unit not open for reading",
             )),
+        }?;
+        let fresh = &buf[filled..filled + read];
+        if let Some(newline) = fresh.iter().position(|&byte| byte == b'\n') {
+            let record_len = newline + 1;
+            self.nonadvancing_read_ahead
+                .extend(fresh[record_len..].iter().copied());
+            Ok(filled + record_len)
+        } else {
+            Ok(filled + read)
         }
     }
 
@@ -680,6 +722,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -706,6 +749,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -732,6 +776,7 @@ impl IoState {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -865,8 +910,21 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
         std::process::exit(1);
     }
 
-    if access_str.trim() == "direct" {
-        let message = "OPEN: ACCESS='DIRECT' is not implemented";
+    if access_str.trim() == "direct" && recl <= 0 {
+        let message = "OPEN: ACCESS='DIRECT' requires a positive RECL=";
+        assign_iomsg(iomsg, iomsg_len, message);
+        if !iostat.is_null() {
+            unsafe {
+                *iostat = 1;
+            }
+            return;
+        }
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
+    if access_str.trim() == "direct" && !position_str.trim().is_empty() {
+        let message = "OPEN: POSITION= is not valid for direct access";
         assign_iomsg(iomsg, iomsg_len, message);
         if !iostat.is_null() {
             unsafe {
@@ -1104,6 +1162,7 @@ pub extern "C" fn afs_open(cb: *const OpenControlBlock) {
                 formatted_read_record: None,
                 formatted_read_cursor: 0,
                 terminal_nonadvancing_open_record: false,
+                nonadvancing_read_ahead: VecDeque::new(),
                 last_list_output_char: false,
                 list_write_active: false,
                 list_write_depth: 0,
@@ -1238,9 +1297,25 @@ const LIST_INT16_WIDTH: usize = 7;
 const LIST_INT32_WIDTH: usize = 12;
 const LIST_INT64_WIDTH: usize = 21;
 const LIST_INT128_WIDTH: usize = 41;
+const LIST_INTERNAL_REAL64_MAX_COMPACT_FIELD: usize = 32;
 
 fn list_directed_integer_field<T: std::fmt::Display>(val: T, width: usize) -> String {
     format!("{:>width$}", val, width = width)
+}
+
+fn list_directed_internal_real64_field(val: f64) -> String {
+    // Rust's default Display expands sufficiently small finite values into an
+    // unbounded fixed-point string.  Keep its shortest representation for
+    // ordinary values, but fall back to a bounded exponential field when it
+    // grows too long for an ordinary internal record.  Sixteen digits after
+    // the leading digit preserve all 17 significant decimal digits needed to
+    // round-trip an f64.
+    let compact = format!(" {val}");
+    if compact.len() <= LIST_INTERNAL_REAL64_MAX_COMPACT_FIELD {
+        compact
+    } else {
+        format!(" {val:.16E}")
+    }
 }
 
 fn mark_list_output_nonchar(u: &mut Unit) {
@@ -1551,6 +1626,15 @@ pub extern "C" fn afs_list_write_begin(
             u.list_write_depth = depth;
             return None;
         }
+        if u.access == Access::Direct {
+            u.last_list_output_char = false;
+            u.list_write_active = true;
+            u.list_write_depth = 1;
+            let message = "direct-access WRITE requires REC=".to_string();
+            u.list_write_error = Some(message.clone());
+            u.pending_record = None;
+            return Some(message);
+        }
 
         u.last_list_output_char = false;
         u.list_write_active = true;
@@ -1566,6 +1650,54 @@ pub extern "C" fn afs_list_write_begin(
     if let Some(message) = err {
         write_i32_ptr(iostat, 1);
         assign_iomsg(iomsg, iomsg_len, &message);
+    }
+}
+
+/// Begin an unformatted direct-access WRITE at the specified record.
+/// The ordinary typed write helpers append native bytes to the shared
+/// `pending_record`; `afs_list_write_end` pads and commits the fixed-length
+/// record without sequential-unformatted record markers.
+#[no_mangle]
+pub extern "C" fn afs_direct_write_begin(
+    unit: i32,
+    rec: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    write_i32_ptr(iostat, 0);
+    assign_iomsg(iomsg, iomsg_len, "");
+
+    let err = with_unit(unit, |u| {
+        if u.list_write_depth > 0 {
+            return Some("nested direct-access WRITE is not supported".to_string());
+        }
+        if u.access != Access::Direct {
+            return Some("REC= requires a direct-access unit".to_string());
+        }
+        if u.form != Form::Unformatted {
+            return Some("unformatted WRITE requires FORM='UNFORMATTED'".to_string());
+        }
+        if let Err(error) = u.seek_to_record(rec) {
+            return Some(error.to_string());
+        }
+
+        u.last_list_output_char = false;
+        u.list_write_active = true;
+        u.list_write_depth = 1;
+        u.list_write_error = None;
+        u.pending_record = Some(Vec::new());
+        None
+    })
+    .unwrap_or_else(|| Some("unit not connected".to_string()));
+
+    if let Some(message) = err {
+        write_i32_ptr(iostat, 1);
+        assign_iomsg(iomsg, iomsg_len, &message);
+        if iostat.is_null() {
+            eprintln!("Fortran runtime error: {message}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1611,13 +1743,31 @@ pub extern "C" fn afs_list_write_end(
         }
         u.list_write_depth = 0;
 
-        if let Some(buf) = u.pending_record.take() {
-            let len_bytes = (buf.len() as u32).to_ne_bytes();
-            u.list_write_raw_or_buffer(&len_bytes);
-            if !buf.is_empty() {
-                u.list_write_raw_or_buffer(&buf);
+        if let Some(mut buf) = u.pending_record.take() {
+            if u.access == Access::Direct {
+                let recl = u.recl.and_then(|value| usize::try_from(value).ok());
+                match recl {
+                    Some(recl) if buf.len() <= recl => {
+                        buf.resize(recl, 0);
+                        u.list_write_raw_or_buffer(&buf);
+                    }
+                    Some(_) => {
+                        u.list_write_error =
+                            Some("unformatted direct-access record exceeds RECL=".to_string());
+                    }
+                    None => {
+                        u.list_write_error =
+                            Some("direct access requires a valid RECL=".to_string());
+                    }
+                }
+            } else {
+                let len_bytes = (buf.len() as u32).to_ne_bytes();
+                u.list_write_raw_or_buffer(&len_bytes);
+                if !buf.is_empty() {
+                    u.list_write_raw_or_buffer(&buf);
+                }
+                u.list_write_raw_or_buffer(&len_bytes);
             }
-            u.list_write_raw_or_buffer(&len_bytes);
         }
         u.list_write_flush();
         let err = u.list_write_error.take();
@@ -2271,6 +2421,20 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
         }
     }
     if with_unit(unit, |u| {
+        if u.access == Access::Direct && u.list_read_depth > 0 {
+            let Some(depth) = u.list_read_depth.checked_add(1) else {
+                set_read_status_or_exit(iostat, 1);
+                return;
+            };
+            u.list_read_depth = depth;
+            return;
+        }
+        if u.access == Access::Direct {
+            u.pending_read = Some((Vec::new(), 0));
+            u.list_read_depth = 1;
+            set_read_iostat_or_exit(iostat, 1, "direct-access READ requires REC=");
+            return;
+        }
         if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
             return;
         }
@@ -2330,6 +2494,83 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
     }
 }
 
+/// Begin a direct-access READ. Unformatted records are exposed through
+/// `pending_read` for the ordinary typed read helpers. Formatted records are
+/// cached for the explicit-format helpers, which parse fields from the same
+/// fixed-length record throughout the statement.
+#[no_mangle]
+pub extern "C" fn afs_direct_read_begin(
+    unit: i32,
+    rec: i64,
+    formatted: i32,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    write_i32_ptr(iostat, 0);
+    assign_iomsg(iomsg, iomsg_len, "");
+
+    let result = with_unit(unit, |u| -> Result<(), String> {
+        if u.list_read_depth > 0 {
+            return Err("nested direct-access READ is not supported".to_string());
+        }
+        if u.access != Access::Direct {
+            return Err("REC= requires a direct-access unit".to_string());
+        }
+        let statement_form = if formatted != 0 {
+            Form::Formatted
+        } else {
+            Form::Unformatted
+        };
+        if u.form != statement_form {
+            return Err(if formatted != 0 {
+                "formatted READ requires FORM='FORMATTED'".to_string()
+            } else {
+                "unformatted READ requires FORM='UNFORMATTED'".to_string()
+            });
+        }
+        u.seek_to_record(rec).map_err(|error| error.to_string())?;
+        let recl = u
+            .recl
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "direct access requires a valid RECL=".to_string())?;
+        let mut record = Vec::new();
+        record
+            .try_reserve_exact(recl)
+            .map_err(|_| "direct-access record allocation failed".to_string())?;
+        record.resize(recl, 0);
+        match read_raw_exact(u, &mut record).map_err(|error| error.to_string())? {
+            ExactRawRead::Complete => {}
+            ExactRawRead::EndOfFile => {
+                return Err("direct-access record does not exist".to_string())
+            }
+            ExactRawRead::Truncated => return Err("truncated direct-access record".to_string()),
+        }
+
+        u.list_read_depth = 1;
+        if formatted != 0 {
+            u.pending_read = None;
+            u.formatted_read_record = Some(record);
+            u.formatted_read_cursor = 0;
+        } else {
+            u.formatted_read_record = None;
+            u.formatted_read_cursor = 0;
+            u.pending_read = Some((record, 0));
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err("unit not connected".to_string()));
+
+    if let Err(message) = result {
+        write_i32_ptr(iostat, 1);
+        assign_iomsg(iomsg, iomsg_len, &message);
+        if iostat.is_null() {
+            eprintln!("READ direct: {message}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// End a list-directed READ statement. The outermost sequential
 /// unformatted transfer drops any unread bytes left in the in-flight
 /// record buffer (the standard does not require the program to consume
@@ -2342,7 +2583,8 @@ pub extern "C" fn afs_list_read_end(
     _iomsg_len: i64,
 ) {
     with_unit(unit, |u| {
-        if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
+        if !(u.form == Form::Unformatted && matches!(u.access, Access::Sequential | Access::Direct))
+        {
             return;
         }
         if u.list_read_depth > 1 {
@@ -2351,6 +2593,18 @@ pub extern "C" fn afs_list_read_end(
         }
         u.list_read_depth = 0;
         u.pending_read = None;
+    });
+}
+
+/// End a formatted direct-access READ and release its cached record.
+#[no_mangle]
+pub extern "C" fn afs_direct_formatted_read_end(unit: i32) {
+    with_unit(unit, |u| {
+        if u.access == Access::Direct {
+            u.list_read_depth = 0;
+            u.formatted_read_record = None;
+            u.formatted_read_cursor = 0;
+        }
     });
 }
 
@@ -3755,7 +4009,7 @@ pub extern "C" fn afs_write_internal_logical(buf: *mut u8, buf_len: i64, val: i3
 #[no_mangle]
 pub extern "C" fn afs_write_internal_real64(buf: *mut u8, buf_len: i64, val: f64, pos: *mut i64) {
     let buf_len = buf_len.max(0) as usize;
-    let s = format!(" {}", val);
+    let s = list_directed_internal_real64_field(val);
     let start = if !pos.is_null() {
         (unsafe { *pos }) as usize
     } else {
@@ -4908,6 +5162,12 @@ use std::cell::RefCell;
 
 enum FmtSink {
     Unit(i32),
+    /// One fixed-length formatted direct-access record. Formatting must
+    /// produce exactly one record; it is blank-padded to RECL before write.
+    DirectUnit {
+        unit: i32,
+        rec: i64,
+    },
     Internal {
         buf: *mut u8,
         buf_len: usize,
@@ -5005,6 +5265,31 @@ pub extern "C" fn afs_fmt_begin_ex(
     FMT_CTX.with(|ctx| {
         ctx.borrow_mut().push(FmtContext {
             sink: FmtSink::Unit(unit),
+            format_str: fmt,
+            values: Vec::with_capacity(1),
+            iostat,
+            iomsg,
+            iomsg_len,
+            stmt_leading_zero: None,
+        });
+    });
+}
+
+/// Begin an explicit-format direct-access write operation.
+#[no_mangle]
+pub extern "C" fn afs_fmt_begin_direct_ex(
+    unit: i32,
+    rec: i64,
+    fmt_str: *const u8,
+    fmt_len: i64,
+    iostat: *mut i32,
+    iomsg: *mut u8,
+    iomsg_len: i64,
+) {
+    let fmt = unsafe_str(fmt_str, fmt_len);
+    FMT_CTX.with(|ctx| {
+        ctx.borrow_mut().push(FmtContext {
+            sink: FmtSink::DirectUnit { unit, rec },
             format_str: fmt,
             values: Vec::with_capacity(1),
             iostat,
@@ -5246,7 +5531,8 @@ pub extern "C" fn afs_lst_ia_logical(val: i32) {
 pub extern "C" fn afs_lst_ia_real(val: f64) {
     LST_IA_CTX.with(|ctx| {
         if let Some(c) = ctx.borrow_mut().last_mut() {
-            c.record.extend_from_slice(format!(" {}", val).as_bytes());
+            c.record
+                .extend_from_slice(list_directed_internal_real64_field(val).as_bytes());
         }
     });
 }
@@ -5420,6 +5706,11 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         None
                     };
                     if with_unit(unit, |u| {
+                        if u.access == Access::Direct {
+                            io_status = 1;
+                            io_msg = Some("direct-access WRITE requires REC=");
+                            return;
+                        }
                         if let Some(bytes) = fast_character {
                             if u.write_bytes(bytes).is_err()
                                 || (advance != 0 && u.write_bytes(b"\n").is_err())
@@ -5457,6 +5748,62 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         io_msg = Some("unit not connected");
                     }
                     }
+                    FmtSink::DirectUnit { unit, rec } => {
+                    if with_unit(unit, |u| {
+                        if u.access != Access::Direct {
+                            io_status = 1;
+                            io_msg = Some("REC= requires a direct-access unit");
+                            return;
+                        }
+                        if u.form != Form::Formatted {
+                            io_status = 1;
+                            io_msg = Some("formatted WRITE requires FORM='FORMATTED'");
+                            return;
+                        }
+                        let Some(recl) = u.recl.and_then(|value| usize::try_from(value).ok()) else {
+                            io_status = 1;
+                            io_msg = Some("direct access requires a valid RECL=");
+                            return;
+                        };
+                        let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
+                        engine.set_leading_zero(c.stmt_leading_zero.unwrap_or(u.leading_zero));
+                        let records = match engine.format_values_reverting_records_checked(&c.values) {
+                            Ok(records) => records,
+                            Err(_) => {
+                                io_status = 1;
+                                io_msg = Some("format error");
+                                return;
+                            }
+                        };
+                        if records.len() != 1 {
+                            io_status = 1;
+                            io_msg = Some("formatted direct WRITE must produce exactly one record");
+                            return;
+                        }
+                        if records[0].len() > recl {
+                            io_status = 1;
+                            io_msg = Some("formatted direct-access record exceeds RECL=");
+                            return;
+                        }
+                        let mut output = Vec::new();
+                        if output.try_reserve_exact(recl).is_err() {
+                            io_status = 1;
+                            io_msg = Some("direct-access record allocation failed");
+                            return;
+                        }
+                        output.extend_from_slice(&records[0]);
+                        output.resize(recl, b' ');
+                        if u.seek_to_record(rec).is_err() || u.write_raw(&output).is_err() {
+                            io_status = 1;
+                            io_msg = Some("direct-access write failed");
+                        }
+                    })
+                    .is_none()
+                    {
+                        io_status = 1;
+                        io_msg = Some("unit not connected");
+                    }
+                    }
                     FmtSink::Internal { buf, buf_len } => {
                     let mut engine = FormatEngine::from_shared(Arc::clone(&descriptors));
                     if let Some(mode) = c.stmt_leading_zero {
@@ -5466,9 +5813,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     // one record, so a second scan (or an explicit '/')
                     // is an overflow — previously the excess values were
                     // silently dropped.
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
-                            if output.contains(&b'\n') {
+                    match engine.format_values_reverting_records_checked(&c.values) {
+                        Ok(records) => {
+                            if records.len() != 1 {
                                 io_status = 1;
                                 io_msg = Some(
                                     "internal WRITE of more than one record into a character scalar",
@@ -5479,7 +5826,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     );
                                     std::process::exit(2);
                                 }
-                            } else if output.len() > buf_len {
+                            } else if records[0].len() > buf_len {
                                 io_status = IOSTAT_EOR;
                                 io_msg = Some("end of record");
                             } else {
@@ -5487,7 +5834,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     buf,
                                     buf_len,
                                     0,
-                                    &output,
+                                    &records[0],
                                     std::ptr::null_mut(),
                                 );
                             }
@@ -5504,9 +5851,9 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                         engine.set_leading_zero(mode);
                     }
                     // Same one-record rule as FmtSink::Internal.
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
-                            if output.contains(&b'\n') {
+                    match engine.format_values_reverting_records_checked(&c.values) {
+                        Ok(records) => {
+                            if records.len() != 1 {
                                 io_status = 1;
                                 io_msg = Some(
                                     "internal WRITE of more than one record into a character scalar",
@@ -5519,7 +5866,7 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                 }
                             } else if !store_internal_alloc_record(
                                 desc as *mut crate::descriptor::StringDescriptor,
-                                &output,
+                                &records[0],
                             ) {
                                 io_status = 1;
                                 io_msg = Some("out of memory");
@@ -5542,8 +5889,8 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                     }
                     // Reverting: each new format scan starts a new record,
                     // i.e. the next array element.
-                    match engine.format_values_reverting_bytes_checked(&c.values) {
-                        Ok(output) => {
+                    match engine.format_values_reverting_records_checked(&c.values) {
+                        Ok(records) => {
                             if buf.is_null() || elem_len <= 0 || nelems <= 0 {
                                 io_status = 1;
                                 io_msg = Some(
@@ -5556,8 +5903,6 @@ pub extern "C" fn afs_fmt_end(advance: i32) {
                                     std::process::exit(2);
                                 }
                             } else {
-                                let records: Vec<&[u8]> =
-                                    output.split(|&b| b == b'\n').collect();
                                 if records.len() as i64 > nelems {
                                     io_status = 1;
                                     io_msg = Some("write exceeds internal file size");
@@ -6078,6 +6423,9 @@ fn read_nonadvancing_chunk(
 
 fn formatted_read_record_for_unit(unit: i32, starts_new_record: bool) -> Result<Vec<u8>, i32> {
     with_unit(unit, |u| {
+        if u.access == Access::Direct {
+            return u.formatted_read_record.clone().ok_or(1);
+        }
         if starts_new_record || u.formatted_read_record.is_none() {
             u.formatted_read_record = None;
             u.formatted_read_cursor = 0;
@@ -6953,6 +7301,7 @@ mod tests {
             formatted_read_record: None,
             formatted_read_cursor: 0,
             terminal_nonadvancing_open_record: false,
+            nonadvancing_read_ahead: VecDeque::new(),
             last_list_output_char: false,
             list_write_active: false,
             list_write_depth: 0,
@@ -6963,6 +7312,19 @@ mod tests {
             pending_read: None,
             list_read_depth: 0,
         }
+    }
+
+    #[test]
+    fn raw_nonadvancing_read_preserves_following_records_for_advancing_input() {
+        let stream = UnitStream::TestRead(Box::new(std::io::Cursor::new(
+            b"line\\\ncontinued\n".to_vec(),
+        )));
+        let mut unit = test_unit(84, stream, b"record-boundary".to_vec(), false);
+        let mut first = [0u8; 64];
+
+        let count = unit.read_nonadvancing_bytes(&mut first).unwrap();
+        assert_eq!(&first[..count], b"line\\\n");
+        assert_eq!(unit.read_line_bytes().unwrap(), b"continued\n");
     }
 
     #[test]
@@ -7151,6 +7513,7 @@ mod tests {
             formatted_read_record: None,
             formatted_read_cursor: 0,
             terminal_nonadvancing_open_record: false,
+            nonadvancing_read_ahead: VecDeque::new(),
             last_list_output_char: false,
             list_write_active: false,
             list_write_depth: 0,
@@ -7737,9 +8100,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_access_open_reports_iostat_without_creating() {
+    fn direct_access_unformatted_records_round_trip() {
         let path = format!(
-            "/tmp/afs_direct_access_reject_{}_{}.dat",
+            "/tmp/afs_direct_access_roundtrip_{}_{}.dat",
             std::process::id(),
             line!()
         );
@@ -7770,11 +8133,148 @@ mod tests {
         };
 
         afs_open(&cb);
-        assert_ne!(iostat, 0, "direct access OPEN must be rejected");
+        assert_eq!(iostat, 0, "direct access OPEN should succeed");
+
+        afs_direct_write_begin(783, 3, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+        afs_write_int(783, 30);
+        afs_list_write_end(783, 1, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+
+        afs_direct_write_begin(783, 1, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+        afs_write_int(783, 10);
+        afs_list_write_end(783, 1, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+
+        let mut value = 0;
+        afs_direct_read_begin(783, 3, 0, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+        afs_read_int(783, &mut value, &mut iostat);
+        afs_list_read_end(783, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!((iostat, value), (0, 30));
+
+        afs_direct_read_begin(783, 1, 0, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+        afs_read_int(783, &mut value, &mut iostat);
+        afs_list_read_end(783, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!((iostat, value), (0, 10));
+
+        afs_close_ex(783, "delete".as_ptr(), 6, &mut iostat);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "STATUS='DELETE' should remove the direct-access file"
+        );
+    }
+
+    #[test]
+    fn direct_access_open_without_recl_reports_iostat_without_creating() {
+        let path = format!(
+            "/tmp/afs_direct_access_missing_recl_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 784,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "readwrite".as_ptr(),
+            action_len: 9,
+            access: "direct".as_ptr(),
+            access_len: 6,
+            form: "unformatted".as_ptr(),
+            form_len: 11,
+            recl: 0,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_ne!(iostat, 0, "direct access OPEN must require RECL=");
         assert!(
             !std::path::Path::new(&path).exists(),
             "rejected direct access OPEN must not create a file"
         );
+    }
+
+    #[test]
+    fn direct_access_formatted_records_round_trip_and_pad_to_recl() {
+        let path = format!(
+            "/tmp/afs_direct_access_formatted_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let mut iostat = -99i32;
+        let cb = OpenControlBlock {
+            unit: 785,
+            filename: path.as_ptr(),
+            filename_len: path.len() as i64,
+            status: "replace".as_ptr(),
+            status_len: 7,
+            action: "readwrite".as_ptr(),
+            action_len: 9,
+            access: "direct".as_ptr(),
+            access_len: 6,
+            form: "formatted".as_ptr(),
+            form_len: 9,
+            recl: 8,
+            iostat: &mut iostat,
+            newunit: std::ptr::null_mut(),
+            position: std::ptr::null(),
+            position_len: 0,
+            leading_zero: std::ptr::null(),
+            leading_zero_len: 0,
+            iomsg: std::ptr::null_mut(),
+            iomsg_len: 0,
+        };
+
+        afs_open(&cb);
+        assert_eq!(iostat, 0);
+
+        let fmt = "(I4)";
+        afs_fmt_begin_direct_ex(
+            785,
+            2,
+            fmt.as_ptr(),
+            fmt.len() as i64,
+            &mut iostat,
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_fmt_push_int(42);
+        afs_fmt_end(0);
+        assert_eq!(iostat, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 16);
+
+        let mut value = 0;
+        afs_direct_read_begin(785, 2, 1, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+        afs_fmt_read_int(
+            785,
+            fmt.as_ptr(),
+            fmt.len() as i64,
+            0,
+            &mut value,
+            &mut iostat,
+        );
+        afs_direct_formatted_read_end(785);
+        assert_eq!((iostat, value), (0, 42));
+
+        afs_close_ex(785, "delete".as_ptr(), 6, &mut iostat);
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[test]
@@ -8832,6 +9332,36 @@ mod tests {
     }
 
     #[test]
+    fn deferred_internal_list_tiny_real_uses_bounded_exponential_field() {
+        use crate::descriptor::StringDescriptor;
+
+        let mut desc = StringDescriptor::zeroed();
+        let desc_ptr = &mut desc as *mut StringDescriptor as *mut u8;
+        let mut iostat = 77;
+        let value = 1.0e-200_f64;
+
+        afs_lst_ia_begin(desc_ptr, &mut iostat, std::ptr::null_mut(), 0);
+        afs_lst_ia_real(value);
+        afs_lst_ia_end();
+
+        assert_eq!(iostat, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(desc.data, desc.len as usize) };
+        let text = std::str::from_utf8(bytes).unwrap().trim();
+        assert!(
+            text.contains('E'),
+            "expected exponential field, got {text:?}"
+        );
+        assert_eq!(text.parse::<f64>().unwrap(), value);
+
+        crate::string::afs_dealloc_string(desc_ptr as *mut StringDescriptor);
+    }
+
+    #[test]
+    fn internal_list_ordinary_real_keeps_compact_field() {
+        assert_eq!(list_directed_internal_real64_field(2.5), " 2.5");
+    }
+
+    #[test]
     fn fixed_internal_list_overflow_restores_target() {
         let mut buf = *b"???";
         let mut iostat = 77;
@@ -8860,6 +9390,33 @@ mod tests {
         assert_eq!(iostat, IOSTAT_EOR);
         assert_eq!(&iomsg[..13], b"end of record");
         assert!(iomsg[13..].iter().all(|byte| *byte == b' '));
+    }
+
+    #[test]
+    fn fixed_internal_list_tiny_real_uses_bounded_exponential_field() {
+        let mut buf = [b' '; 128];
+        let mut iostat = 77;
+        let mut pos = 0;
+        let value = 1.0e-200_f64;
+
+        afs_lst_begin_internal_fixed(
+            buf.as_mut_ptr(),
+            buf.len() as i64,
+            1,
+            &mut iostat,
+            std::ptr::null_mut(),
+            0,
+        );
+        afs_write_internal_real64(buf.as_mut_ptr(), buf.len() as i64, value, &mut pos);
+        afs_lst_end_internal_fixed();
+
+        assert_eq!(iostat, 0);
+        let text = std::str::from_utf8(&buf[..pos as usize]).unwrap().trim();
+        assert!(
+            text.contains('E'),
+            "expected exponential field, got {text:?}"
+        );
+        assert_eq!(text.parse::<f64>().unwrap(), value);
     }
 
     #[test]

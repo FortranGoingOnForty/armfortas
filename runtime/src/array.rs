@@ -3139,6 +3139,37 @@ mod tests {
     }
 
     #[test]
+    fn reshape_allocated_zero_size_source_preserves_requested_rank_and_shape() {
+        let source_dim = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+        let mut source = ArrayDescriptor::zeroed();
+        afs_allocate_array(
+            &mut source,
+            8,
+            1,
+            &source_dim as *const DimDescriptor,
+            ptr::null_mut(),
+        );
+        let mut shape_data = [2, 0];
+        let shape = i32_descriptor(&mut shape_data, &[2]);
+        let mut result = ArrayDescriptor::zeroed();
+
+        afs_array_reshape(&source, &shape, ptr::null(), ptr::null(), &mut result);
+
+        assert!(result.is_allocated());
+        assert!(result.base_addr.is_null());
+        assert_eq!(result.elem_size, 8);
+        assert_eq!(result.rank, 2);
+        assert_eq!(result.dims[0].extent(), 2);
+        assert_eq!(result.dims[1].extent(), 0);
+        afs_deallocate_array(&mut source, ptr::null_mut());
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
     fn assign_allocatable() {
         let mut source = ArrayDescriptor::zeroed();
         let mut dest = ArrayDescriptor::zeroed();
@@ -3753,6 +3784,33 @@ mod tests {
     }
 
     #[test]
+    fn logical_reductions_use_identities_for_zero_size_arrays() {
+        let mut desc = ArrayDescriptor::zeroed();
+        let dims = [
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 2,
+                stride: 1,
+            },
+            DimDescriptor {
+                lower_bound: 1,
+                upper_bound: 0,
+                stride: 2,
+            },
+        ];
+        afs_allocate_array(&mut desc, 1, 2, dims.as_ptr(), ptr::null_mut());
+
+        assert!(desc.is_allocated());
+        assert_eq!(desc.total_elements(), 0);
+        assert!(desc.base_addr.is_null());
+        assert_eq!(afs_array_all_logical(&desc), 1);
+        assert_eq!(afs_array_any_logical(&desc), 0);
+        assert_eq!(afs_array_count_logical(&desc), 0);
+
+        afs_deallocate_array(&mut desc, ptr::null_mut());
+    }
+
+    #[test]
     fn array_size_unallocated_descriptor_returns_zero() {
         let mut desc = ArrayDescriptor::zeroed();
         desc.elem_size = 4;
@@ -4243,7 +4301,7 @@ pub extern "C" fn afs_array_all_logical(desc: *const ArrayDescriptor) -> i32 {
         return 0;
     }
     let d = unsafe { &*desc };
-    if d.base_addr.is_null() {
+    if !descriptor_has_payload_or_zero_size_array(d) {
         return 0;
     }
     let mut all_true = true;
@@ -8592,7 +8650,11 @@ pub extern "C" fn afs_array_reshape(
     }
     let src = unsafe { &*source };
     let shp = unsafe { &*shape };
-    if src.base_addr.is_null() || shp.base_addr.is_null() {
+    // A zero-size allocated array has a null payload by construction, but it
+    // is still a valid RESHAPE source and its descriptor still carries the
+    // element kind.  In particular, RESHAPE(empty, [n, 0]) must return an
+    // allocated rank-2 zero-size result rather than leaving `result` zeroed.
+    if !descriptor_has_payload_or_zero_size_array(src) || shp.base_addr.is_null() {
         return;
     }
     let rank = shp.total_elements() as usize;

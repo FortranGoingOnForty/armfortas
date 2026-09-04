@@ -1,4 +1,5 @@
 ! Audit C12 / l05-3: F2023 §12.4 auto-reallocation of a deferred-length
+! FLAGS: --std=f2023
 ! allocatable character on internal WRITE. When the internal file is an
 ! allocatable deferred-length character scalar, the record is assigned by
 ! intrinsic assignment, reallocating the variable to length equal to the

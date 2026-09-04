@@ -9,6 +9,7 @@
 use crate::ast::decl::{ArraySpec, Decl, OnlyItem, SpannedDecl, UseNature};
 use crate::ast::expr::Expr;
 use crate::sema::symtab::*;
+use std::collections::HashSet;
 
 use super::core::{
     backfill_procedure_interfaces, merge_specific_names, resolve_unit, LOADED_EXTERNAL_MODULES,
@@ -52,6 +53,46 @@ fn resolve_module_scope(
             .find_non_intrinsic_module_scope(module)
             .or_else(|| load_external_module(st, module, search_paths, type_layouts)),
     }
+}
+
+fn install_procedure_interface_import(
+    st: &mut SymbolTable,
+    procedure_scope: ScopeId,
+    import: &crate::sema::amod::UseRename,
+    search_paths: &[std::path::PathBuf],
+    type_layouts: &mut crate::sema::type_layout::TypeLayoutRegistry,
+) {
+    let Some(source_scope) = resolve_module_scope(
+        st,
+        &import.source_module,
+        import.source_nature,
+        search_paths,
+        type_layouts,
+    ) else {
+        return;
+    };
+    let already_present = st
+        .scope(procedure_scope)
+        .use_associations
+        .iter()
+        .any(|association| {
+            association.source_scope == source_scope
+                && association.local_name.eq_ignore_ascii_case(&import.local)
+                && association
+                    .original_name
+                    .eq_ignore_ascii_case(&import.original)
+        });
+    if already_present {
+        return;
+    }
+    st.enter_scope(procedure_scope);
+    st.add_use_association(UseAssociation {
+        local_name: import.local.clone(),
+        original_name: import.original.clone(),
+        source_scope,
+        is_submodule_access: false,
+        from_bare_use: false,
+    });
 }
 
 pub(super) fn process_uses(
@@ -602,6 +643,10 @@ fn install_external_interface(
         ScopeKind::Module(iface.module_name.clone())
     };
     let scope_id = st.push_scope(scope_kind);
+    let _ = st.set_default_access(iface.default_access);
+    for (name, access) in &iface.named_access {
+        let _ = st.set_symbol_access(name, *access);
+    }
     if let Some((ancestor, parent_scope)) = &semantic_parent {
         st.set_submodule_ancestor(scope_id, ancestor);
         let policy = match &iface.host_association {
@@ -925,6 +970,21 @@ fn install_external_interface(
                     .unwrap_or_else(|| proc.name.clone()),
             );
         }
+        for import in proc
+            .args
+            .iter()
+            .filter_map(|arg| arg.procedure_iface_import.as_ref())
+            .chain(proc.result_procedure_iface_import.as_ref())
+        {
+            install_procedure_interface_import(st, proc_scope, import, search_paths, type_layouts);
+        }
+        let hidden_char_len_args: HashSet<String> = proc
+            .args
+            .iter()
+            .filter(|arg| arg.hidden)
+            .filter_map(|arg| arg.name.strip_suffix("@len"))
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
         for arg in &proc.args {
             if arg.hidden {
                 continue;
@@ -976,6 +1036,8 @@ fn install_external_interface(
                 asynchronous: arg.asynchronous,
                 contiguous: arg.contiguous,
                 volatile: arg.volatile,
+                assumed_length_character: hidden_char_len_args
+                    .contains(&arg.name.to_ascii_lowercase()),
                 external: arg.external,
                 procedure_iface: arg.procedure_iface.clone(),
                 array_spec,
@@ -1070,6 +1132,7 @@ fn install_external_interface(
                 const_char_value: None,
             });
         }
+        backfill_procedure_interfaces(st, proc_scope);
         st.pop_scope();
     }
     backfill_procedure_interfaces(st, scope_id);

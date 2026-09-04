@@ -1,6 +1,8 @@
 ! CHECK: ok
+! IR_CHECK: direct_maxval_dim_check
+! IR_CHECK: direct_minval_dim_check
 ! IR_CHECK: call @afs_array_maxval_real8_dim
-! IR_CHECK: call @afs_array_minval_real8_dim
+! IR_NOT: call @afs_array_minval_real8_dim
 ! REPRO_CHECK: run
 ! OPT_EQ: O0,O1,O2,O3,Os,Ofast => stdout|stderr|exit
 program maxval_minval_abs_dim_reduction

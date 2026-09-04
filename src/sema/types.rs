@@ -988,6 +988,13 @@ pub fn expr_type(
                         }
                     }
 
+                    if intrinsic_key == "size" {
+                        if let Some(kind) = resolve_intrinsic_kind_call_arg(args, 2, "kind", symtab)
+                        {
+                            return FortranType::Integer { kind };
+                        }
+                    }
+
                     if let Some(kind_position) =
                         character_integer_result_kind_position(&intrinsic_key)
                     {
@@ -3233,6 +3240,24 @@ mod tests {
             assert_eq!(
                 expr_type(&expr, &st),
                 FortranType::Integer { kind },
+                "wrong result type for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn expr_type_size_kind_respects_requested_kind() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        let st = super::super::symtab::SymbolTable::new();
+        for source in ["size([1, 2], kind=8)", "size([1, 2], 1, 8)"] {
+            let tokens = Lexer::tokenize(source, 0).unwrap();
+            let mut parser = Parser::new(&tokens);
+            let expr = parser.parse_expr().unwrap();
+            assert_eq!(
+                expr_type(&expr, &st),
+                FortranType::Integer { kind: 8 },
                 "wrong result type for {source}"
             );
         }

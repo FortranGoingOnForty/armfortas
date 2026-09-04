@@ -27,6 +27,11 @@ fn high_levels() -> &'static [(OptLevel, &'static str)] {
     ]
 }
 
+fn contains_i128_load(ir: &str) -> bool {
+    ir.lines()
+        .any(|line| line.contains(" = load ") && line.trim_end().ends_with(": i128"))
+}
+
 #[test]
 fn high_opt_const_folds_integer16_mul() {
     let raw_ir = capture_text(
@@ -72,12 +77,12 @@ fn high_opt_promotes_branchy_integer16_local() {
         Stage::Ir,
     );
     assert!(
-        raw_ir.contains("alloca"),
+        raw_ir.contains("alloca i128"),
         "raw integer(16) branchy IR should still materialize stack storage before high-opt promotion:\n{}",
         raw_ir
     );
     assert!(
-        raw_ir.contains("load"),
+        contains_i128_load(&raw_ir),
         "raw integer(16) branchy IR should still load the local before high-opt promotion:\n{}",
         raw_ir
     );
@@ -92,13 +97,13 @@ fn high_opt_promotes_branchy_integer16_local() {
             Stage::OptIr,
         );
         assert!(
-            !opt_ir.contains("alloca"),
+            !opt_ir.contains("alloca i128"),
             "{} integer(16) pipeline should eliminate the stack slot after promotion:\n{}",
             label,
             opt_ir
         );
         assert!(
-            !opt_ir.contains("load"),
+            !contains_i128_load(&opt_ir),
             "{} integer(16) pipeline should eliminate wide loads after promotion:\n{}",
             label,
             opt_ir

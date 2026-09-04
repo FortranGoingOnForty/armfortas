@@ -853,9 +853,14 @@ pub(crate) fn alloc_decls(
                     } else {
                         elem_ty.clone()
                     };
+                    // Keep the declared character length on rank-0 fixed-length
+                    // allocatables too. Encoding the length only in `ty` loses
+                    // CHARACTER(1), whose storage type is the same i8 used by
+                    // INTEGER(1), and makes `value(1:1)` look like a function
+                    // call instead of a substring.
                     let char_kind = match char_len {
-                        Some(len) if array_spec.is_some() => CharKind::Fixed(len),
-                        _ => CharKind::None,
+                        Some(len) => CharKind::Fixed(len),
+                        None => CharKind::None,
                     };
                     locals.insert(
                         key,

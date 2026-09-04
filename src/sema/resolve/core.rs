@@ -1281,6 +1281,10 @@ pub(super) fn resolve_unit(
                         if let Some(proc_scope) = find_unit_scope(st, interface_scope, &sub.node) {
                             let bind_c = st.scope(proc_scope).bind_c;
                             let binding_label = st.scope(proc_scope).binding_label.clone();
+                            let resolved_result_type = st
+                                .scope(proc_scope)
+                                .procedure_result_symbol()
+                                .and_then(|result| result.type_info.clone());
                             let (name, kind) = match &sub.node {
                                 ProgramUnit::Function { name, .. } => (name, SymbolKind::Function),
                                 ProgramUnit::Subroutine { name, .. } => {
@@ -1293,6 +1297,17 @@ pub(super) fn resolve_unit(
                             }) {
                                 outer_ref.bind_c = bind_c;
                                 outer_ref.binding_label = binding_label;
+                                // Kind selectors in an interface body's result declaration may
+                                // depend on a USE statement local to that body. The preliminary
+                                // outer reference is collected before those USE statements are
+                                // processed, so refresh it from the resolved result entity. This
+                                // is ABI-relevant state that must survive into the module symbol
+                                // and its .amod record.
+                                if kind == SymbolKind::Function {
+                                    if let Some(type_info) = resolved_result_type {
+                                        outer_ref.type_info = Some(type_info);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1351,6 +1366,7 @@ pub(super) fn resolve_unit(
                     let scope_id = st.current_scope();
                     let is_dummy_arg = st.scope(scope_id).arg_order.iter().any(|arg| arg == &key);
                     let mut merged_dummy = false;
+                    let mut merged_module_body = false;
                     if is_dummy_arg {
                         if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
                             if can_merge_interface_body_with_dummy(existing) {
@@ -1367,7 +1383,7 @@ pub(super) fn resolve_unit(
                                 attrs.array_spec = result_attrs.array_spec;
                                 attrs.is_separate_module_interface =
                                     result_attrs.is_separate_module_interface;
-                                existing.kind = kind;
+                                existing.kind = kind.clone();
                                 existing.type_info = ti;
                                 existing.attrs = attrs;
                                 existing.arg_names = arg_names;
@@ -1375,7 +1391,14 @@ pub(super) fn resolve_unit(
                             }
                         }
                     }
-                    if !merged_dummy {
+                    if result_attrs.is_separate_module_interface {
+                        if let Some(existing) = st.scope_mut(scope_id).symbols.get_mut(&key) {
+                            merged_module_body = existing.kind == kind
+                                && existing.attrs.module_prefix
+                                && !existing.attrs.external;
+                        }
+                    }
+                    if !merged_dummy && !merged_module_body {
                         return Err(err);
                     }
                 }
@@ -2452,15 +2475,29 @@ fn eval_const_int_expr_with_params(
                     let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
                         return None;
                     };
+                    let literal_kind = |kind: &Option<String>, default| match kind.as_deref() {
+                        Some(name) => name
+                            .parse::<i64>()
+                            .ok()
+                            .or_else(|| const_params.get(&name.to_lowercase()).copied()),
+                        None => Some(default),
+                    };
                     match &e.node {
-                        Expr::RealLiteral { text, .. } => {
-                            Some(if text.contains('d') || text.contains('D') {
+                        Expr::RealLiteral { text, kind } => literal_kind(
+                            kind,
+                            if text.contains('d') || text.contains('D') {
                                 8
                             } else {
-                                4
-                            })
+                                i64::from(crate::driver::defaults::default_real_kind())
+                            },
+                        ),
+                        Expr::IntegerLiteral { kind, .. } | Expr::LogicalLiteral { kind, .. } => {
+                            literal_kind(
+                                kind,
+                                i64::from(crate::driver::defaults::default_int_kind()),
+                            )
                         }
-                        Expr::IntegerLiteral { .. } => Some(4),
+                        Expr::StringLiteral { kind, .. } => literal_kind(kind, 1),
                         _ => None,
                     }
                 }
@@ -3195,6 +3232,8 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     // wins; otherwise fall back to the decl-level dimension
                     // attribute).
                     let mut entity_attrs = sym_attrs.clone();
+                    entity_attrs.assumed_length_character =
+                        entity_is_assumed_length_character(type_spec, entity.char_len.as_ref());
                     let entity_array_spec = entity
                         .array_spec
                         .clone()
@@ -3566,12 +3605,28 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
     // Apply deferred access-list overrides after all symbols are declared.
     for (access, names, span) in &pending_access {
         for name in names {
-            if !st.set_symbol_access(name, *access) {
+            if !st.set_symbol_access_at(name, *access, *span) {
                 return Err(repeated_symbol_access_error(name, *span));
             }
         }
     }
     Ok(())
+}
+
+fn entity_is_assumed_length_character(
+    type_spec: &TypeSpec,
+    entity_len: Option<&decl::LenSpec>,
+) -> bool {
+    let TypeSpec::Character(selector) = type_spec else {
+        return false;
+    };
+    match entity_len {
+        Some(decl::LenSpec::Star) => true,
+        Some(_) => false,
+        None => selector
+            .as_ref()
+            .is_some_and(|selector| matches!(selector.len, Some(decl::LenSpec::Star))),
+    }
 }
 
 fn process_namelists(st: &mut SymbolTable, body: &[SpannedStmt]) -> Result<(), SemaError> {
@@ -3639,6 +3694,9 @@ fn process_contains(
                 let attrs = SymbolAttrs {
                     pure,
                     elemental,
+                    module_prefix: prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
                     bind_c: binding.bind_c,
                     binding_label: binding.label,
                     is_separate_module_procedure: is_smp,
@@ -3716,6 +3774,9 @@ fn process_contains(
                     pointer: result_attrs.pointer,
                     pure: fn_pure,
                     elemental: fn_elemental,
+                    module_prefix: prefix
+                        .iter()
+                        .any(|p| matches!(p, crate::ast::unit::Prefix::Module)),
                     bind_c: binding.bind_c,
                     binding_label: binding.label,
                     result_rank: result_attrs.result_rank,
@@ -3895,15 +3956,38 @@ pub(super) fn eval_const_int_expr_in_scope(
                     "kind" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
+                                let literal_kind =
+                                    |kind: &Option<String>, default| match kind.as_deref() {
+                                        Some(name) => name.parse::<i64>().ok().or_else(|| {
+                                            st.lookup_in(scope_id, &name.to_lowercase())
+                                                .filter(|symbol| symbol.attrs.parameter)
+                                                .and_then(|symbol| symbol.const_value)
+                                        }),
+                                        None => Some(default),
+                                    };
                                 match &e.node {
-                                    Expr::RealLiteral { text, .. } => {
-                                        Some(if text.contains('d') || text.contains('D') {
+                                    Expr::RealLiteral { text, kind } => literal_kind(
+                                        kind,
+                                        if text.contains('d') || text.contains('D') {
                                             8
                                         } else {
-                                            4
-                                        })
-                                    }
-                                    Expr::IntegerLiteral { .. } => Some(4),
+                                            i64::from(crate::driver::defaults::default_real_kind())
+                                        },
+                                    ),
+                                    Expr::IntegerLiteral { kind, .. }
+                                    | Expr::LogicalLiteral { kind, .. } => literal_kind(
+                                        kind,
+                                        i64::from(crate::driver::defaults::default_int_kind()),
+                                    ),
+                                    Expr::StringLiteral { kind, .. } => literal_kind(kind, 1),
+                                    Expr::Name { name } => st
+                                        .lookup_in(scope_id, &name.to_lowercase())
+                                        .and_then(|symbol| symbol.type_info.as_ref())
+                                        .and_then(|type_info| {
+                                            crate::sema::types::type_info_to_fortran_type(type_info)
+                                                .kind()
+                                                .map(i64::from)
+                                        }),
                                     _ => None,
                                 }
                             } else {

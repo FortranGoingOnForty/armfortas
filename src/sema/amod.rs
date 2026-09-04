@@ -21,10 +21,11 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 12;
+const AMOD_VERSION: u32 = 14;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
+const AMOD_DEFAULT_ACCESS_VERSION: u32 = 13;
 pub(crate) const SMOD_VERSION: u32 = 2;
 
 /// Stringify a Vec<ArraySpec> as `(dim1; dim2; ...)` where each dim
@@ -293,6 +294,35 @@ fn resolved_module_nature(scope: &Scope) -> UseNature {
     }
 }
 
+fn module_nature_token(nature: UseNature) -> &'static str {
+    match nature {
+        UseNature::Normal => "normal",
+        UseNature::Intrinsic => "intrinsic",
+        UseNature::NonIntrinsic => "non_intrinsic",
+    }
+}
+
+fn procedure_interface_import(
+    st: &SymbolTable,
+    procedure_scope: &Scope,
+    interface_name: &str,
+) -> Option<UseRename> {
+    let association = procedure_scope
+        .use_associations
+        .iter()
+        .find(|association| association.local_name.eq_ignore_ascii_case(interface_name))?;
+    let source_scope = st.scope(association.source_scope);
+    let ScopeKind::Module(source_module) = &source_scope.kind else {
+        return None;
+    };
+    Some(UseRename {
+        local: association.local_name.clone(),
+        original: association.original_name.clone(),
+        source_module: source_module.to_ascii_lowercase(),
+        source_nature: resolved_module_nature(source_scope),
+    })
+}
+
 fn format_module_reference(module_name: &str, nature: UseNature) -> String {
     match nature {
         UseNature::Normal => module_name.to_string(),
@@ -320,6 +350,16 @@ pub fn write_amod(
     // ---- Header ----
     writeln!(out, "#!amod {}", AMOD_VERSION).unwrap();
     writeln!(out, "# module: {}", mod_key).unwrap();
+    writeln!(
+        out,
+        "# default-access: {}",
+        if matches!(scope.default_access, Access::Private) {
+            "private"
+        } else {
+            "public"
+        }
+    )
+    .unwrap();
     if matches!(scope.kind, ScopeKind::Submodule(_)) {
         if let Some(ancestor) = &scope.submodule_ancestor {
             writeln!(out, "# ancestor-module: {}", ancestor.to_lowercase()).unwrap();
@@ -387,6 +427,24 @@ pub fn write_amod(
         .unwrap();
     }
     if !deps.is_empty() {
+        writeln!(out).unwrap();
+    }
+
+    // Named accessibility statements also govern USE-associated names, which
+    // have no local Symbol record on which to carry an access attribute. Keep
+    // these overrides explicit so a private-default facade can deliberately
+    // re-export selected imports (and a public-default facade can hide them).
+    let mut named_access: Vec<_> = scope.pending_access.iter().collect();
+    named_access.sort_by_key(|(name, _)| name.as_str());
+    for (name, access) in named_access {
+        let access = match access {
+            Access::Public => "public",
+            Access::Private => "private",
+            Access::Default => continue,
+        };
+        writeln!(out, "@access {access} :: {name}").unwrap();
+    }
+    if !scope.pending_access.is_empty() {
         writeln!(out).unwrap();
     }
 
@@ -974,11 +1032,23 @@ fn emit_procedure(
         if sym.attrs.pointer {
             write!(out, ", result_pointer").unwrap();
         }
-        if let Some(interface_name) = result_var
+        let result_interface_name = result_var
             .filter(|result| result.kind == SymbolKind::ProcedurePointer)
-            .and_then(|result| result.attrs.procedure_iface.as_deref())
-        {
+            .and_then(|result| result.attrs.procedure_iface.as_deref());
+        if let Some(interface_name) = result_interface_name {
             write!(out, ", result_procedure={interface_name}").unwrap();
+        }
+        if let Some(import) = result_interface_name.and_then(|interface_name| {
+            proc_scope.and_then(|scope| procedure_interface_import(st, scope, interface_name))
+        }) {
+            write!(
+                out,
+                ", result_procedure_original={}, result_procedure_module={}, result_procedure_nature={}",
+                import.original,
+                import.source_module,
+                module_nature_token(import.source_nature)
+            )
+            .unwrap();
         }
         if sym.attrs.result_rank > 0 {
             write!(out, ", result_rank={}", sym.attrs.result_rank).unwrap();
@@ -1068,13 +1138,11 @@ fn emit_procedure(
                     let arg_sym = pscope.symbols.get(&arg_name.to_lowercase())?;
                     let is_assumed_len = declared_char_len_star_params
                         .and_then(|flags| flags.get(arg_idx).copied())
-                        .unwrap_or({
-                            matches!(
-                                arg_sym.type_info,
-                                Some(TypeInfo::Character { len: None, .. })
-                            ) && !arg_sym.attrs.allocatable
-                                && !is_bind_c
-                        });
+                        .unwrap_or(
+                            arg_sym.attrs.assumed_length_character
+                                && !arg_sym.attrs.allocatable
+                                && !is_bind_c,
+                        );
                     is_assumed_len.then(|| arg_name.clone())
                 })
                 .collect()
@@ -1171,6 +1239,26 @@ fn emit_procedure(
                     .map(|n| format!("procedure({})", n));
                 if let Some(s) = proc_iface_attr.as_ref() {
                     arg_attrs.push(s.as_str());
+                }
+                let proc_iface_import_attrs = arg_sym
+                    .attrs
+                    .procedure_iface
+                    .as_deref()
+                    .and_then(|interface_name| {
+                        procedure_interface_import(st, pscope, interface_name)
+                    })
+                    .map(|import| {
+                        vec![
+                            format!("procedure_original={}", import.original),
+                            format!("procedure_module={}", import.source_module),
+                            format!(
+                                "procedure_nature={}",
+                                module_nature_token(import.source_nature)
+                            ),
+                        ]
+                    });
+                if let Some(import_attrs) = proc_iface_import_attrs.as_ref() {
+                    arg_attrs.extend(import_attrs.iter().map(String::as_str));
                 }
                 // Sprint35-SMP Phase 1: emit the dummy's rank so SMP-body
                 // synthesis on the consumer side can rebuild a same-rank
@@ -1529,6 +1617,10 @@ pub struct AmodArg {
     /// the dummy name as an external symbol — see the SGGES3 / selctg
     /// failure in stdlib_lapack_eigv_gen.
     pub procedure_iface: Option<String>,
+    /// Procedure-local USE association that supplies `procedure_iface`.
+    /// Keeping this on the dummy avoids hoisting a signature dependency to
+    /// module scope, where a public-default module could re-export it.
+    pub procedure_iface_import: Option<UseRename>,
     /// True when the source dummy used DIMENSION(..). Rank alone cannot
     /// distinguish assumed-rank from a rank-one assumed-shape dummy.
     pub assumed_rank: bool,
@@ -1556,6 +1648,9 @@ pub struct AmodProc {
     /// `result_pointer` is insufficient because data pointers can also have
     /// a derived declared type.
     pub result_procedure_iface: Option<String>,
+    /// Procedure-local USE association that supplies the declared interface
+    /// for a procedure-pointer function result.
+    pub result_procedure_iface_import: Option<UseRename>,
     pub result_rank: u8,
     /// Sprint35-SMP Phase 2: the result variable's user-declared name
     /// (from `result(X)` clause). None when the result name matches
@@ -1661,6 +1756,8 @@ pub enum AmodHostAssociation {
 #[derive(Debug, Clone)]
 pub struct ModuleInterface {
     pub module_name: String,
+    pub default_access: Access,
+    pub named_access: Vec<(String, Access)>,
     pub submodule_ancestor: Option<String>,
     pub submodule_parent: Option<String>,
     pub host_association: AmodHostAssociation,
@@ -1918,6 +2015,7 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     }
 
     let mut module_name = String::new();
+    let mut default_access = None;
     let mut submodule_ancestor = None;
     let mut submodule_parent = None;
     let mut host_association = AmodHostAssociation::All;
@@ -1929,6 +2027,18 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             if let Some((key, val)) = rest.split_once(": ") {
                 match key {
                     "module" => module_name = val.trim().to_string(),
+                    "default-access" => {
+                        default_access = Some(match val.trim() {
+                            "public" => Access::Public,
+                            "private" => Access::Private,
+                            _ => {
+                                return Err(format!(
+                                    "{}: corrupt .amod file (malformed default-access header); rebuild the provider module",
+                                    path.display()
+                                ));
+                            }
+                        });
+                    }
                     "ancestor-module" => submodule_ancestor = Some(val.trim().to_string()),
                     "parent-submodule" => submodule_parent = Some(val.trim().to_string()),
                     "host-association" => {
@@ -1949,8 +2059,19 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
     if module_name.is_empty() {
         return Err(format!("{}: missing # module: header", path.display()));
     }
+    let default_access = match default_access {
+        Some(access) => access,
+        None if version >= AMOD_DEFAULT_ACCESS_VERSION => {
+            return Err(format!(
+                "{}: corrupt .amod file (missing default-access header); rebuild the provider module",
+                path.display()
+            ));
+        }
+        None => Access::Public,
+    };
 
     let mut dependencies = Vec::new();
+    let mut named_access = Vec::new();
     let mut only_imports: Vec<UseRename> = Vec::new();
     let mut renames: Vec<UseRename> = Vec::new();
     let mut variables = Vec::new();
@@ -1967,6 +2088,31 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
         if let Some(dep) = trimmed.strip_prefix("@uses ") {
             dependencies.push(parse_module_reference(dep.trim(), "@uses", path)?);
+        } else if let Some(rest) = trimmed.strip_prefix("@access ") {
+            let Some((access, name)) = rest.split_once(" :: ") else {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @access record); rebuild the provider module",
+                    path.display()
+                ));
+            };
+            let access = match access.trim() {
+                "public" => Access::Public,
+                "private" => Access::Private,
+                _ => {
+                    return Err(format!(
+                        "{}: corrupt .amod file (malformed @access accessibility); rebuild the provider module",
+                        path.display()
+                    ));
+                }
+            };
+            let name = name.trim();
+            if name.is_empty() || name.split_whitespace().count() != 1 {
+                return Err(format!(
+                    "{}: corrupt .amod file (malformed @access name); rebuild the provider module",
+                    path.display()
+                ));
+            }
+            named_access.push((name.to_ascii_lowercase(), access));
         } else if trimmed == "@use_only" {
             only_imports.push(parse_use_binding("", "@use_only", path)?);
         } else if let Some(rest) = trimmed.strip_prefix("@use_only ") {
@@ -2057,6 +2203,8 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
 
     Ok(ModuleInterface {
         module_name,
+        default_access,
+        named_access,
         submodule_ancestor,
         submodule_parent,
         host_association,
@@ -2241,6 +2389,15 @@ fn split_attrs_top_level(attrs: &str) -> Vec<String> {
     out
 }
 
+fn parse_module_nature_token(token: &str) -> Option<UseNature> {
+    match token.trim() {
+        "normal" => Some(UseNature::Normal),
+        "intrinsic" => Some(UseNature::Intrinsic),
+        "non_intrinsic" => Some(UseNature::NonIntrinsic),
+        _ => None,
+    }
+}
+
 fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) -> AmodProc {
     let is_func = header.starts_with("@function ");
     let rest = if is_func {
@@ -2300,6 +2457,24 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         .iter()
         .find_map(|attr| attr.strip_prefix("result_procedure="))
         .map(str::to_string);
+    let result_procedure_iface_import = result_procedure_iface.as_ref().and_then(|local| {
+        let original = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("result_procedure_original="))?;
+        let source_module = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("result_procedure_module="))?;
+        let source_nature = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("result_procedure_nature="))
+            .and_then(parse_module_nature_token)?;
+        Some(UseRename {
+            local: local.clone(),
+            original: original.to_string(),
+            source_module: source_module.to_string(),
+            source_nature,
+        })
+    });
     let result_rank = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("result_rank="))
@@ -2355,6 +2530,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_allocatable,
         result_pointer,
         result_procedure_iface,
+        result_procedure_iface_import,
         result_rank,
         result_name,
         result_array_bounds,
@@ -2428,6 +2604,24 @@ fn parse_arg(line: &str) -> AmodArg {
         let inner = attr.strip_prefix("procedure(")?;
         inner.strip_suffix(')').map(|s| s.trim().to_string())
     });
+    let procedure_iface_import = procedure_iface.as_ref().and_then(|local| {
+        let original = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("procedure_original="))?;
+        let source_module = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("procedure_module="))?;
+        let source_nature = attr_chunks
+            .iter()
+            .find_map(|attr| attr.strip_prefix("procedure_nature="))
+            .and_then(parse_module_nature_token)?;
+        Some(UseRename {
+            local: local.clone(),
+            original: original.to_string(),
+            source_module: source_module.to_string(),
+            source_nature,
+        })
+    });
     let array_spec = attr_chunks
         .iter()
         .find_map(|attr| attr.strip_prefix("array_spec="))
@@ -2450,6 +2644,7 @@ fn parse_arg(line: &str) -> AmodArg {
         hidden,
         external,
         procedure_iface,
+        procedure_iface_import,
         assumed_rank,
         rank,
         array_spec,
@@ -3335,6 +3530,49 @@ mod tests {
     }
 
     #[test]
+    fn current_default_access_header_is_required_and_preserved() {
+        let private = r#"#!amod 14
+# module: private_facade
+# default-access: private
+
+@uses provider
+@access private :: hidden
+@access public :: selected
+"#;
+        let iface = parse_amod(private, Path::new("private_facade.amod")).unwrap();
+        assert_eq!(iface.default_access, Access::Private);
+        assert_eq!(
+            iface.named_access,
+            vec![
+                ("hidden".into(), Access::Private),
+                ("selected".into(), Access::Public)
+            ]
+        );
+
+        let missing = r#"#!amod 14
+# module: missing_default_access
+
+@uses provider
+"#;
+        let error = parse_amod(missing, Path::new("missing_default_access.amod"))
+            .expect_err("current .amod without module default access was accepted");
+        assert!(
+            error.contains("corrupt .amod file")
+                && error.contains("missing default-access header")
+                && error.contains("rebuild the provider module"),
+            "unexpected missing-default-access diagnostic: {error}"
+        );
+
+        let legacy = r#"#!amod 12
+# module: legacy_default_access
+
+@uses provider
+"#;
+        let iface = parse_amod(legacy, Path::new("legacy_default_access.amod")).unwrap();
+        assert_eq!(iface.default_access, Access::Public);
+    }
+
+    #[test]
     fn current_type_records_require_and_preserve_accessibility() {
         let amod_text = r#"#!amod 12
 # module: type_access
@@ -3697,6 +3935,8 @@ mod tests {
             "@arg values : integer, intent(inout), optional, value, descriptor, \
              allocatable, pointer, target, asynchronous, contiguous, volatile, \
              external, procedure(callback), rank=6, \
+             procedure_original=remote_callback, procedure_module=callback_shapes, \
+             procedure_nature=non_intrinsic, \
              array_spec=\"(count; 0:max(count, 1); :; 1:*; deferred; ..)\"",
         );
         assert_eq!(arg.intent, Some(Intent::InOut));
@@ -3711,6 +3951,11 @@ mod tests {
         assert!(arg.volatile);
         assert!(arg.external);
         assert_eq!(arg.procedure_iface.as_deref(), Some("callback"));
+        let arg_import = arg.procedure_iface_import.as_ref().unwrap();
+        assert_eq!(arg_import.local, "callback");
+        assert_eq!(arg_import.original, "remote_callback");
+        assert_eq!(arg_import.source_module, "callback_shapes");
+        assert_eq!(arg_import.source_nature, UseNature::NonIntrinsic);
         assert_eq!(arg.rank, 6);
         assert!(matches!(
             arg.array_spec.as_deref(),
@@ -3727,7 +3972,9 @@ mod tests {
         let mut lines = "@end function\n".lines().peekable();
         let procedure = parse_proc(
             "@function factory -> type(callback), result_pointer, \
-             result_procedure=callback, result_name=result",
+             result_procedure=callback, result_procedure_original=remote_callback, \
+             result_procedure_module=callback_shapes, \
+             result_procedure_nature=non_intrinsic, result_name=result",
             &mut lines,
         );
         assert!(procedure.result_pointer);
@@ -3736,6 +3983,11 @@ mod tests {
             procedure.result_procedure_iface.as_deref(),
             Some("callback")
         );
+        let result_import = procedure.result_procedure_iface_import.as_ref().unwrap();
+        assert_eq!(result_import.local, "callback");
+        assert_eq!(result_import.original, "remote_callback");
+        assert_eq!(result_import.source_module, "callback_shapes");
+        assert_eq!(result_import.source_nature, UseNature::NonIntrinsic);
         assert_eq!(procedure.result_name.as_deref(), Some("result"));
 
         let mut lines = "@end subroutine\n".lines().peekable();
@@ -3751,8 +4003,9 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 14
 # module: cache_test
+# default-access: public
 # source: cache_test.f90
 
 @param k : integer = 7
@@ -3783,8 +4036,9 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 14
 # module: cached_parent
+# default-access: public
 # source: cached_parent.f90
 
 @param cached : integer = 1
@@ -3796,8 +4050,9 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 14
 # module: supplied_parent
+# default-access: private
 # ancestor-module: supplied_root
 # parent-submodule: supplied_middle
 # host-association: only kept local_value
@@ -3813,6 +4068,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert_eq!(supplied.module_name, "supplied_parent");
+        assert_eq!(supplied.default_access, Access::Private);
         assert_eq!(
             supplied.host_association,
             AmodHostAssociation::Only(vec!["kept".into(), "local_value".into()])
@@ -3828,8 +4084,9 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 12
+            r#"#!amod 14
 # module: child
+# default-access: public
 # ancestor-module: root
 # parent-submodule: middle
 # source: child.f90
@@ -3927,7 +4184,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 12)")
+            err.contains("incompatible .amod version 6 (compiler requires 14)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

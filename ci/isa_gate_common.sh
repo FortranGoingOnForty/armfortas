@@ -3,8 +3,8 @@
 #
 # The counts are deliberate evidence contracts. Update them in the same change
 # as any test_programs/*.f90 addition/removal or ERROR_EXPECTED reclassification.
-isa_gate_expected_sources=873
-isa_gate_expected_diagnostics=124
+isa_gate_expected_sources=883
+isa_gate_expected_diagnostics=125
 
 isa_gate_validate_assembly() {
     if grep -nE '^[[:space:]]*\.arch([[:space:]]|$)' "$1"; then

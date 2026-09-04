@@ -3,7 +3,6 @@
 ! types, no derived-aggregate storage (all enumeration safety is
 ! frontend-only).
 ! FLAGS: --std=f2023
-! CHECK: match
 ! IR_CHECK: alloca i32
 ! IR_CHECK: icmp eq
 ! IR_NOT: ptr<[i8
@@ -14,5 +13,9 @@ program l03_enum_ir_shape
   end enumeration type
   type(color) :: c
   c = green
-  if (c == green) print '(A)', 'match'
+  if (c == green) then
+    continue
+  else
+    error stop 1
+  end if
 end program l03_enum_ir_shape

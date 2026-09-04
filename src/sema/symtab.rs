@@ -258,6 +258,7 @@ impl SymbolTable {
             default_access: Access::Public,
             default_access_specified: false,
             pending_access: HashMap::new(),
+            explicit_access_spans: HashMap::new(),
             arg_order: Vec::new(),
             result_name: None,
         };
@@ -446,6 +447,7 @@ impl SymbolTable {
             default_access: Access::Public,
             default_access_specified: false,
             pending_access: HashMap::new(),
+            explicit_access_spans: HashMap::new(),
             arg_order: Vec::new(),
             result_name,
         };
@@ -527,10 +529,16 @@ impl SymbolTable {
         let Some(host_scope) = self.import_host_scope(scope_id) else {
             return true;
         };
+        let source_precedes_cutoff = |span: Span| {
+            span.file_id != cutoff.file_id
+                || (span.start.line, span.start.col) < (cutoff.start.line, cutoff.start.col)
+        };
         symbol.scope != host_scope
-            || symbol.defined_at.file_id != cutoff.file_id
-            || (symbol.defined_at.start.line, symbol.defined_at.start.col)
-                < (cutoff.start.line, cutoff.start.col)
+            || source_precedes_cutoff(symbol.defined_at)
+            || self.scopes[host_scope]
+                .explicit_access_spans
+                .get(&symbol.name.to_ascii_lowercase())
+                .is_some_and(|span| source_precedes_cutoff(*span))
     }
 
     fn host_association_allows_symbol(
@@ -2085,6 +2093,14 @@ impl SymbolTable {
     /// Returns `false` without mutation when the name's accessibility was
     /// already specified in this scope.
     pub fn set_symbol_access(&mut self, name: &str, access: Access) -> bool {
+        self.set_symbol_access_impl(name, access, None)
+    }
+
+    pub(crate) fn set_symbol_access_at(&mut self, name: &str, access: Access, span: Span) -> bool {
+        self.set_symbol_access_impl(name, access, Some(span))
+    }
+
+    fn set_symbol_access_impl(&mut self, name: &str, access: Access, span: Option<Span>) -> bool {
         let key = name.to_lowercase();
         if self.scopes[self.current].pending_access.contains_key(&key) {
             return false;
@@ -2093,6 +2109,11 @@ impl SymbolTable {
         self.scopes[self.current]
             .pending_access
             .insert(key.clone(), access);
+        if let Some(span) = span {
+            self.scopes[self.current]
+                .explicit_access_spans
+                .insert(key.clone(), span);
+        }
         if let Some(sym) = self.scopes[self.current].symbols.get_mut(&key) {
             sym.attrs.access = access;
         }
@@ -2299,6 +2320,10 @@ pub struct Scope {
     pub default_access: Access,
     pub(crate) default_access_specified: bool,
     pub pending_access: HashMap<String, Access>,
+    /// Source locations of named PUBLIC/PRIVATE specifications. Besides
+    /// accessibility, these are explicit declarations for interface-body
+    /// host association ordering (F2018 C8101).
+    pub(crate) explicit_access_spans: HashMap<String, Span>,
     /// Ordered dummy argument names (for function/subroutine scopes).
     pub arg_order: Vec<String>,
     /// Exact source-level name of this function's result entity. Separate
@@ -2423,6 +2448,11 @@ pub struct SymbolAttrs {
     pub asynchronous: bool,
     pub contiguous: bool,
     pub volatile: bool,
+    /// The entity is a `character(len=*)` dummy and therefore carries a
+    /// trailing hidden length in the non-BIND(C) procedure ABI. This must
+    /// remain distinct from other nonconstant character lengths such as
+    /// `len=len(other)`, which also lower to `TypeInfo::Character { len: None }`.
+    pub assumed_length_character: bool,
     /// Whether the procedure has a `BIND(C)` language-binding
     /// specification, independent of whether it has a binding label.
     pub bind_c: bool,
@@ -2448,6 +2478,11 @@ pub struct SymbolAttrs {
     pub pure: bool,
     /// Procedure declared with the ELEMENTAL prefix.
     pub elemental: bool,
+    /// Procedure body declared with the MODULE prefix. This remains distinct
+    /// from a descendant submodule implementation: a module may provide the
+    /// implementation in the same scoping unit as its explicit MODULE
+    /// interface body.
+    pub module_prefix: bool,
     /// For Function symbols whose result is an array (allocatable,
     /// automatic, or fixed-shape): rank of the result.  0 for scalar
     /// results.  Used by lowering to route array-returning calls
@@ -2482,6 +2517,7 @@ impl Default for SymbolAttrs {
             asynchronous: false,
             contiguous: false,
             volatile: false,
+            assumed_length_character: false,
             bind_c: false,
             binding_label: None,
             procedure_iface: None,
@@ -2496,6 +2532,7 @@ impl Default for SymbolAttrs {
             intrinsic: false,
             pure: false,
             elemental: false,
+            module_prefix: false,
             result_rank: 0,
             array_spec: Vec::new(),
             is_separate_module_procedure: false,
@@ -2754,6 +2791,11 @@ mod tests {
         late_direct.defined_at = span_at(10);
         st.define(late_direct).unwrap();
 
+        let mut forward_declared = make_symbol("forward_declared", SymbolKind::Subroutine);
+        forward_declared.defined_at = span_at(10);
+        st.define(forward_declared).unwrap();
+        assert!(st.set_symbol_access_at("forward_declared", Access::Private, span_at(2)));
+
         let inner = st.push_scope(ScopeKind::Subroutine("inner".into()));
         st.set_host_association_control(
             inner,
@@ -2769,6 +2811,7 @@ mod tests {
         assert!(!st.scope_has_generic_facet(inner, "early_direct", LookupMode::Normal));
         assert!(st.lookup_in(inner, "early_generic").is_none());
         assert!(st.scope_has_generic_facet(inner, "early_generic", LookupMode::Normal));
+        assert!(st.lookup_in(inner, "forward_declared").is_some());
     }
 
     #[test]

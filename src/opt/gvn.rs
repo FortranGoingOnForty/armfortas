@@ -885,6 +885,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             crate::target::TargetLayout::LP64,
+            crate::sema::validate::FortranStandard::F2018,
         )
         .0
     }

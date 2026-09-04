@@ -13,6 +13,7 @@ use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
 use crate::sema::symtab::SymbolTable;
+use crate::sema::validate::FortranStandard;
 
 use super::const_scalar::ConstScalar;
 use super::core::*;
@@ -135,6 +136,7 @@ pub(crate) fn lower_unit(
     st: &SymbolTable,
     globals: &HashMap<(String, String), ModuleGlobalInfo>,
     type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+    standard: FortranStandard,
     // Audit CRITICAL-4: USE imports from the host program unit
     // (and its hosts, transitively). Per F2018 §16.2, names
     // imported into a host are visible in its contained
@@ -196,6 +198,7 @@ pub(crate) fn lower_unit(
                 ambiguous_use_warnings.clone(),
                 fname.clone(),
                 module.layout,
+                standard,
             );
             ctx.proc_scope_id = {
                 let raw_name = name.as_deref();
@@ -314,6 +317,7 @@ pub(crate) fn lower_unit(
                     st,
                     globals,
                     type_layouts,
+                    standard,
                     &combined_uses,
                     &visible_param_consts,
                     &child_host_decls,
@@ -374,6 +378,7 @@ pub(crate) fn lower_unit(
                         st,
                         globals,
                         type_layouts,
+                        standard,
                         host_uses,
                         host_param_consts,
                         host_decls,
@@ -562,6 +567,7 @@ pub(crate) fn lower_unit(
                 ambiguous_use_warnings.clone(),
                 func_name.clone(),
                 module.layout,
+                standard,
             );
             ctx.proc_scope_id = proc_scope_id;
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -873,6 +879,7 @@ pub(crate) fn lower_unit(
                     st,
                     globals,
                     type_layouts,
+                    standard,
                     &combined_uses,
                     &visible_param_consts,
                     &child_host_decls,
@@ -1173,6 +1180,7 @@ pub(crate) fn lower_unit(
                 ambiguous_use_warnings.clone(),
                 func_name.clone(),
                 module.layout,
+                standard,
             );
             ctx.proc_scope_id = proc_scope_id;
             let combined_uses: Vec<crate::ast::decl::SpannedDecl> =
@@ -1829,6 +1837,7 @@ pub(crate) fn lower_unit(
                     st,
                     globals,
                     type_layouts,
+                    standard,
                     &combined_uses,
                     &visible_param_consts,
                     &child_host_decls,
@@ -1889,6 +1898,7 @@ pub(crate) fn lower_unit(
                     st,
                     globals,
                     type_layouts,
+                    standard,
                     &combined_uses,
                     &visible_param_consts,
                     &no_host_decls,
@@ -1990,6 +2000,7 @@ pub(crate) fn lower_unit(
                     st,
                     globals,
                     type_layouts,
+                    standard,
                     &combined_uses,
                     &visible_param_consts,
                     &no_host_decls,

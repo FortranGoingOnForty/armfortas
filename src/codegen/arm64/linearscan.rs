@@ -64,6 +64,84 @@ fn spill_slot_size(class: RegClass) -> u32 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpillColor {
+    size: u32,
+}
+
+/// Pre-color corrected live intervals, but allocate frame storage lazily.
+///
+/// Linear scan intentionally still uses the historical conservative ranges
+/// for register assignment.  Those ranges can make thousands of short-lived
+/// values appear to overlap, so allocating a permanent frame slot at every
+/// spill produces enormous recursive frames.  The corrected spill liveness
+/// is safe for storage sharing and does not perturb any register decision.
+struct SpillSlotPlan {
+    vreg_colors: HashMap<VRegId, usize>,
+    colors: Vec<SpillColor>,
+    offsets: Vec<Option<i32>>,
+}
+
+impl SpillSlotPlan {
+    fn new(intervals: &[super::liveness::LiveInterval]) -> Self {
+        let mut vreg_colors = HashMap::with_capacity(intervals.len());
+        let mut colors: Vec<SpillColor> = Vec::new();
+        let mut active: Vec<(u32, usize)> = Vec::new();
+        let mut free: Vec<usize> = Vec::new();
+
+        for interval in intervals {
+            // Values used and defined by the same instruction overlap at that
+            // position. Only a strictly earlier interval may release a color.
+            let mut index = 0;
+            while index < active.len() {
+                if active[index].0 < interval.start {
+                    let (_, color) = active.swap_remove(index);
+                    free.push(color);
+                } else {
+                    index += 1;
+                }
+            }
+
+            let size = spill_slot_size(interval.class);
+            let reusable = free
+                .iter()
+                .enumerate()
+                .filter(|(_, color)| colors[**color].size >= size)
+                .min_by_key(|(_, color)| (colors[**color].size, **color))
+                .map(|(index, _)| index);
+            let color = if let Some(index) = reusable {
+                free.swap_remove(index)
+            } else {
+                let color = colors.len();
+                colors.push(SpillColor { size });
+                color
+            };
+
+            vreg_colors.insert(interval.vreg, color);
+            active.push((interval.end, color));
+        }
+
+        let offsets = vec![None; colors.len()];
+        Self {
+            vreg_colors,
+            colors,
+            offsets,
+        }
+    }
+
+    fn offset_for(&mut self, mf: &mut MachineFunction, vreg: VRegId, class: RegClass) -> i32 {
+        let Some(&color) = self.vreg_colors.get(&vreg) else {
+            return mf.alloc_local(spill_slot_size(class));
+        };
+        if let Some(offset) = self.offsets[color] {
+            return offset;
+        }
+        let offset = mf.alloc_local(self.colors[color].size);
+        self.offsets[color] = Some(offset);
+        offset
+    }
+}
+
 /// Where a split interval's *post-call* half lives. `Allocated`
 /// is the win — the post-half got a register, so the only memory
 /// traffic is the str/ldr that bridges the call.  `Spilled` is the
@@ -120,6 +198,8 @@ pub struct AllocResult {
 pub fn linear_scan(mf: &mut MachineFunction, liveness: &LivenessResult) -> AllocResult {
     let mut assignments: HashMap<VRegId, PhysReg> = HashMap::new();
     let mut spills: HashMap<VRegId, i32> = HashMap::new();
+    let spill_liveness = super::liveness::compute_spill_liveness(mf);
+    let mut spill_slots = SpillSlotPlan::new(&spill_liveness.intervals);
     // Active intervals: (reg_num, interval_end, current_vreg). The
     // vreg is tracked here so spill victim selection can identify
     // the *current* holder of a physical register without iterating
@@ -475,7 +555,10 @@ pub fn linear_scan(mf: &mut MachineFunction, liveness: &LivenessResult) -> Alloc
                         .find(|v| v.id == victim)
                         .map(|v| v.class)
                         .unwrap_or(RegClass::Gp64);
-                    let offset = mf.alloc_local(spill_slot_size(victim_class));
+                    let offset = splits_in_progress
+                        .get(&victim)
+                        .map(|(_, _, bridge_slot)| *bridge_slot)
+                        .unwrap_or_else(|| spill_slots.offset_for(mf, victim, victim_class));
                     spills.insert(victim, offset);
                     assignments.remove(&victim);
 
@@ -497,12 +580,20 @@ pub fn linear_scan(mf: &mut MachineFunction, liveness: &LivenessResult) -> Alloc
                 } else {
                     // Current interval ends later — spill it. Use the
                     // current interval's class for slot sizing.
-                    let offset = mf.alloc_local(spill_slot_size(interval.class));
+                    let offset = splits_in_progress
+                        .get(&interval.vreg)
+                        .map(|(_, _, bridge_slot)| *bridge_slot)
+                        .unwrap_or_else(|| {
+                            spill_slots.offset_for(mf, interval.vreg, interval.class)
+                        });
                     spills.insert(interval.vreg, offset);
                 }
             } else {
                 // No active intervals — shouldn't happen but spill to be safe.
-                let offset = mf.alloc_local(spill_slot_size(interval.class));
+                let offset = splits_in_progress
+                    .get(&interval.vreg)
+                    .map(|(_, _, bridge_slot)| *bridge_slot)
+                    .unwrap_or_else(|| spill_slots.offset_for(mf, interval.vreg, interval.class));
                 spills.insert(interval.vreg, offset);
             }
         }
@@ -1936,6 +2027,56 @@ mod tests {
     use crate::ir::types::*;
 
     #[test]
+    fn spill_slot_plan_reuses_disjoint_interval_colors() {
+        let intervals: Vec<_> = (0..128)
+            .map(|index| LiveInterval {
+                vreg: VRegId(index),
+                class: RegClass::Gp64,
+                start: index * 2,
+                end: index * 2,
+                hint: None,
+            })
+            .collect();
+        let mut plan = SpillSlotPlan::new(&intervals);
+        let mut mf = MachineFunction::new("spill_colors".into());
+        let offsets: HashSet<_> = intervals
+            .iter()
+            .map(|interval| plan.offset_for(&mut mf, interval.vreg, interval.class))
+            .collect();
+
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(mf.frame.locals.len(), 1);
+    }
+
+    #[test]
+    fn spill_slot_plan_keeps_touching_intervals_distinct() {
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                class: RegClass::Gp64,
+                start: 0,
+                end: 2,
+                hint: None,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                class: RegClass::Gp64,
+                start: 2,
+                end: 4,
+                hint: None,
+            },
+        ];
+        let mut plan = SpillSlotPlan::new(&intervals);
+        let mut mf = MachineFunction::new("touching_spill_colors".into());
+
+        let first = plan.offset_for(&mut mf, VRegId(0), RegClass::Gp64);
+        let second = plan.offset_for(&mut mf, VRegId(1), RegClass::Gp64);
+
+        assert_ne!(first, second);
+        assert_eq!(mf.frame.locals.len(), 2);
+    }
+
+    #[test]
     fn allocation_plan_tracks_split_occupancy_and_stable_temp_order() {
         let pre = VRegId(0);
         let fp = VRegId(1);
@@ -2006,6 +2147,10 @@ mod tests {
         assert!(
             result.spills.is_empty(),
             "should not spill with only 3 vregs"
+        );
+        assert!(
+            mf.frame.locals.is_empty(),
+            "unused spill colors must not allocate frame storage"
         );
     }
 

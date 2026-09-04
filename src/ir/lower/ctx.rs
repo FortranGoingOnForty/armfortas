@@ -11,6 +11,7 @@
 use crate::ir::inst::{BlockId, ValueId};
 use crate::ir::types::IrType;
 use crate::sema::symtab::SymbolTable;
+use crate::sema::validate::FortranStandard;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -271,6 +272,9 @@ pub(super) struct LocalInfo {
 pub(super) struct LowerCtx<'a> {
     /// Target layout of the module under construction (x02).
     pub(super) layout: crate::target::TargetLayout,
+    /// Selected language standard. Some executable semantics, such as
+    /// deferred-length internal files, changed in Fortran 2023.
+    pub(super) standard: FortranStandard,
     pub(super) locals: HashMap<String, LocalInfo>,
     /// Stable bindings owned by the current program unit.
     ///
@@ -384,9 +388,11 @@ impl<'a> LowerCtx<'a> {
         ambiguous_use_warnings: AmbiguousUseWarnings,
         save_owner: String,
         layout: crate::target::TargetLayout,
+        standard: FortranStandard,
     ) -> Self {
         Self {
             layout,
+            standard,
             locals: HashMap::new(),
             procedure_locals: HashMap::new(),
             optional_locals: HashSet::new(),

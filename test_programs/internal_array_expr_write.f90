@@ -1,4 +1,5 @@
 ! CHECK: ok
+! FLAGS: --std=f2023
 ! IR_CHECK: call @afs_deallocate_array(
 program internal_array_expr_write
   implicit none

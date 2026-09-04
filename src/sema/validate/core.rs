@@ -277,7 +277,7 @@ impl<'a> Ctx<'a> {
     /// construct. Associate-names alias their selector and shadow any
     /// USE-imported or host-scope symbol with the same name within the
     /// construct body.
-    fn is_associate_name(&self, name: &str) -> bool {
+    pub(super) fn is_associate_name(&self, name: &str) -> bool {
         let key = name.to_lowercase();
         self.associate_frames
             .iter()
@@ -1730,9 +1730,23 @@ fn validate_const_int_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::Span
                     .filter(|symbol| matches!(symbol.kind, SymbolKind::DerivedType))
                     .map(|symbol| symbol.name.clone());
                 if let Some(type_name) = derived_constructor {
-                    validate_structure_constructor_component_access(
-                        ctx, expr.span, &type_name, args,
-                    );
+                    let interfaces = ctx.lookup_lexical_named_interfaces(name);
+                    let resolves_generic = !interfaces.is_empty()
+                        && matches!(
+                            resolve_generic_procedure_interface(
+                                ctx,
+                                name,
+                                args,
+                                DirectProcedureKind::Function,
+                                &interfaces,
+                            ),
+                            ExplicitInterfaceResolution::Resolved(_)
+                        );
+                    if !resolves_generic {
+                        validate_structure_constructor_component_access(
+                            ctx, expr.span, &type_name, args,
+                        );
+                    }
                 }
                 let enum_ctor = ctx.lookup(name).and_then(|sym| {
                     matches!(sym.kind, crate::sema::symtab::SymbolKind::EnumerationType)
@@ -1857,6 +1871,29 @@ fn validate_const_int_ac_value(ctx: &mut Ctx<'_>, value: &crate::ast::expr::AcVa
             }
         }
     }
+}
+
+fn validate_io_item_expr_tree(ctx: &mut Ctx<'_>, expr: &crate::ast::expr::SpannedExpr) {
+    // The parser represents an I/O implied-do with the array-constructor
+    // expression shape so the lowering machinery can reuse AcValue and
+    // ImpliedDoLoop. Unlike a real array constructor, however, its output
+    // items need not have one common declared type. Walk the contained
+    // expressions without applying array-constructor homogeneity to this
+    // synthetic outer wrapper. Real array constructors nested in an item
+    // still flow through validate_const_int_expr_tree below.
+    if let Expr::ArrayConstructor {
+        type_spec: None,
+        values,
+    } = &expr.node
+    {
+        if matches!(values.as_slice(), [crate::ast::expr::AcValue::ImpliedDo(_)]) {
+            for value in values {
+                validate_const_int_ac_value(ctx, value);
+            }
+            return;
+        }
+    }
+    validate_const_int_expr_tree(ctx, expr);
 }
 
 fn validate_const_int_array_spec(ctx: &mut Ctx<'_>, spec: &crate::ast::decl::ArraySpec) {
@@ -2244,7 +2281,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
                 validate_const_int_expr_tree(ctx, &control.value);
             }
             for item in items {
-                validate_const_int_expr_tree(ctx, item);
+                validate_io_item_expr_tree(ctx, item);
             }
         }
         Stmt::Open { specs }
@@ -2285,7 +2322,7 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
         }
         Stmt::Print { items, .. } => {
             for item in items {
-                validate_const_int_expr_tree(ctx, item);
+                validate_io_item_expr_tree(ctx, item);
             }
         }
         Stmt::Block { .. }
@@ -2441,6 +2478,23 @@ fn find_scope_for_unit(
         .find(|s| s.parent == Some(parent_scope) && kind_matcher(&s.kind));
     if let Some(s) = child {
         return Some(s.id);
+    }
+
+    // Interface bodies are resolved beneath a synthetic Interface scope,
+    // while validation visits the InterfaceBlock without entering that
+    // implementation-only scope. Match the procedure through that one hop
+    // before considering the legacy all-scope fallback. Otherwise a large
+    // source containing repeated interface procedure names (for example,
+    // several unrelated `destroy` interfaces) can validate a body in the
+    // first same-named scope from a different module.
+    let interface_child = st.scopes.iter().find(|scope| {
+        scope.parent.is_some_and(|interface_scope| {
+            matches!(st.scope(interface_scope).kind, ScopeKind::Interface)
+                && st.scope(interface_scope).parent == Some(parent_scope)
+        }) && kind_matcher(&scope.kind)
+    });
+    if let Some(scope) = interface_child {
+        return Some(scope.id);
     }
 
     // Fall back to any matching scope.
@@ -6426,6 +6480,14 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     .and_then(|symbol| symbol.type_info.clone())
             }),
         Expr::ParenExpr { inner } => validation_expr_type_info(ctx, inner),
+        Expr::ComponentAccess { base, component }
+            if component.eq_ignore_ascii_case("re") || component.eq_ignore_ascii_case("im") =>
+        {
+            match validation_expr_type_info(ctx, base) {
+                Some(TypeInfo::Complex { kind }) => Some(TypeInfo::Real { kind }),
+                _ => None,
+            }
+        }
         Expr::ArrayConstructor { type_spec, values } => {
             validation_array_constructor_type_info(ctx, type_spec.as_deref(), values)
         }
@@ -6493,6 +6555,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     )
                     .or(match key.as_str() {
                         "cmplx" => Some(2),
+                        "size" => Some(2),
                         "int" | "nint" | "floor" | "ceiling" | "real" | "logical" | "char"
                         | "achar" => Some(1),
                         _ => None,
@@ -6506,7 +6569,7 @@ fn validation_expr_type_info(ctx: &Ctx<'_>, expr: &SpannedExpr) -> Option<TypeIn
                     if let Some(kind) = requested_kind {
                         let type_info = match key.as_str() {
                             "int" | "nint" | "floor" | "ceiling" | "len" | "len_trim" | "index"
-                            | "scan" | "verify" | "ichar" | "iachar" => {
+                            | "scan" | "verify" | "ichar" | "iachar" | "size" => {
                                 TypeInfo::Integer { kind: Some(kind) }
                             }
                             "real" => TypeInfo::Real { kind: Some(kind) },
@@ -9347,9 +9410,18 @@ fn actual_is_definable(
         Expr::Name { name } => named_actual_is_definable(ctx, name, false, defines_association),
         Expr::ComponentAccess { .. } => {
             let base = extract_base_name(actual)?;
-            let through_pointer = leaf_field_layout(ctx, actual)
-                .is_some_and(|leaf| leaf.field.pointer || leaf.ancestor_is_pointer);
-            named_actual_is_definable(ctx, &base, through_pointer, defines_association)
+            let leaf = leaf_field_layout(ctx, actual)?;
+            let through_pointer = leaf.field.pointer || leaf.ancestor_is_pointer;
+            // An INTENT(IN) pointer's association is protected, but its
+            // target remains definable.  When the association being changed
+            // belongs to a descendant component reached through an ancestor
+            // pointer (for example MOVE_ALLOC(..., node%child%values)), the
+            // root pointer association is not the association being defined.
+            // Keep `defines_association` for a direct pointer component so
+            // object%pointer still cannot be re-associated through an
+            // INTENT(IN) nonpointer object.
+            let defines_base_association = defines_association && !leaf.ancestor_is_pointer;
+            named_actual_is_definable(ctx, &base, through_pointer, defines_base_association)
         }
         Expr::FunctionCall { callee, args } => {
             let has_vector_subscript = args.iter().any(|arg| match &arg.value {
@@ -9381,11 +9453,12 @@ fn actual_is_definable(
                         return Some(false);
                     }
                     let base = extract_base_name(callee)?;
+                    let defines_base_association = defines_association && !leaf.ancestor_is_pointer;
                     named_actual_is_definable(
                         ctx,
                         &base,
                         leaf.field.pointer || leaf.ancestor_is_pointer,
-                        defines_association,
+                        defines_base_association,
                     )
                 }
                 _ => Some(false),
@@ -11063,7 +11136,7 @@ fn intrinsic_real_kind(info: &TypeInfo) -> Option<u8> {
     }
 }
 
-fn validate_character_intrinsic_kind(
+fn validate_intrinsic_result_kind(
     ctx: &mut Ctx<'_>,
     span: Span,
     intrinsic: &str,
@@ -11190,16 +11263,19 @@ fn validate_character_intrinsic_call(
     if let Some(position) = crate::sema::types::character_integer_result_kind_position(intrinsic) {
         require_type(ctx, position, "kind", IntrinsicArgumentType::Integer);
         require_scalar(ctx, position, "kind");
-        validate_character_intrinsic_kind(ctx, span, intrinsic, args, position, false);
+        validate_intrinsic_result_kind(ctx, span, intrinsic, args, position, false);
     } else if matches!(intrinsic, "char" | "achar") {
         require_type(ctx, 1, "kind", IntrinsicArgumentType::Integer);
         require_scalar(ctx, 1, "kind");
-        validate_character_intrinsic_kind(ctx, span, intrinsic, args, 1, true);
+        validate_intrinsic_result_kind(ctx, span, intrinsic, args, 1, true);
     }
 }
 
 pub(super) fn resolved_intrinsic_name(ctx: &Ctx<'_>, name: &str) -> Option<String> {
     let key = name.to_ascii_lowercase();
+    if ctx.is_associate_name(&key) || ctx.is_block_local_name(&key) {
+        return None;
+    }
     if let Some(symbol) = ctx.lookup_lexical(&key) {
         if !symbol.attrs.external
             && (symbol.attrs.intrinsic || matches!(symbol.kind, SymbolKind::IntrinsicProc))
@@ -11257,6 +11333,31 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
                 "i",
                 IntrinsicArgumentType::Integer,
             );
+        }
+        "size" => {
+            const FORMALS: [&str; 3] = ["array", "dim", "kind"];
+            validate_intrinsic_argument_associations(ctx, span, &key, args, &FORMALS, 1);
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                1,
+                "dim",
+                IntrinsicArgumentType::Integer,
+            );
+            require_intrinsic_scalar_argument(ctx, span, &key, args, 1, "dim");
+            require_intrinsic_argument_type(
+                ctx,
+                span,
+                &key,
+                args,
+                2,
+                "kind",
+                IntrinsicArgumentType::Integer,
+            );
+            require_intrinsic_scalar_argument(ctx, span, &key, args, 2, "kind");
+            validate_intrinsic_result_kind(ctx, span, &key, args, 2, false);
         }
         "ieee_fma" => {
             const FORMALS: [&str; 3] = ["a", "b", "c"];
@@ -11324,8 +11425,11 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
 }
 
 fn intrinsic_name_is_shadowed(ctx: &Ctx<'_>, name: &str) -> bool {
-    ctx.lookup_lexical(name)
-        .is_some_and(|symbol| !symbol.attrs.intrinsic)
+    ctx.is_associate_name(name)
+        || ctx.is_block_local_name(name)
+        || ctx
+            .lookup_lexical(name)
+            .is_some_and(|symbol| !symbol.attrs.intrinsic)
         || !ctx.lookup_lexical_named_interfaces(name).is_empty()
 }
 
@@ -11783,6 +11887,41 @@ end module foreign_extension
     }
 
     #[test]
+    fn same_named_generic_bypasses_private_structure_constructor_checks() {
+        let errors = errors_from(
+            "\
+module string_owner
+  implicit none
+  private
+  public :: string_type
+  type :: string_type
+    private
+    character(len=:), allocatable :: raw
+  end type string_type
+  interface string_type
+    module procedure new_string
+  end interface string_type
+contains
+  function new_string(text) result(value)
+    character(len=*), intent(in) :: text
+    type(string_type) :: value
+    value%raw = text
+  end function new_string
+end module string_owner
+
+program consumer
+  use string_owner, only: string_type
+  implicit none
+  type(string_type) :: value
+  value = string_type('ok')
+end program consumer
+",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn component_access_specs_require_a_module_type_definition() {
         let errors = errors_from(
             "\
@@ -11927,6 +12066,146 @@ end module call_contracts
             }),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn direct_call_validation_preserves_complex_part_kind_in_current_scope() {
+        let errs = errors_from(
+            "\
+module call_contracts
+  implicit none
+contains
+  real(8) function earlier(a) result(value)
+    real(8), intent(in) :: a
+    value = a
+  end function earlier
+
+  real(4) function accept_good(value_good) result(value)
+    real(4), intent(in) :: value_good
+    value = value_good
+  end function accept_good
+
+  real(4) function accept_bad(value_bad) result(value)
+    real(4), intent(in) :: value_bad
+    value = value_bad
+  end function accept_bad
+
+  subroutine invoke(a, z)
+    complex(4), intent(in) :: a
+    complex(8), intent(in) :: z
+    real(4) :: value
+    value = accept_good(a%re) + accept_good(a%im)
+    value = accept_bad(z%re) + accept_bad(z%im)
+  end subroutine invoke
+end module call_contracts
+",
+        );
+
+        assert!(
+            !errs.iter().any(|err| err.contains("'value_good'")),
+            "{errs:?}"
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| {
+                    err.contains("argument 'value_bad' type mismatch")
+                        && err.contains("expected REAL(4), got REAL(8)")
+                })
+                .count(),
+            2,
+            "{errs:?}"
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    #[test]
+    fn named_access_declares_late_host_entity_for_module_interface_body() {
+        let conforming = errors_from(
+            "\
+module late_host
+  implicit none
+  private :: callback
+  interface
+    module subroutine invoke(callback_arg)
+      procedure(callback) :: callback_arg
+    end subroutine invoke
+  end interface
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+end module late_host
+",
+        );
+        assert!(conforming.is_empty(), "{conforming:?}");
+
+        let nonconforming = errors_from(
+            "\
+module late_host
+  implicit none
+  interface
+    module subroutine invoke(callback_arg)
+      procedure(callback) :: callback_arg
+    end subroutine invoke
+  end interface
+  abstract interface
+    subroutine callback()
+    end subroutine callback
+  end interface
+end module late_host
+",
+        );
+        assert_eq!(
+            nonconforming,
+            ["host entity 'callback' is not accessible under this IMPORT policy"]
+        );
+    }
+
+    #[test]
+    fn private_module_interface_imports_local_and_use_associated_types() {
+        let errors = errors_from(
+            "\
+module token_owner
+  implicit none
+  type :: token_t
+  end type token_t
+end module token_owner
+
+module other_owner
+  implicit none
+  type :: other_t
+  end type other_t
+  abstract interface
+    subroutine next_i(self)
+      import :: other_t
+      type(other_t), intent(inout) :: self
+    end subroutine next_i
+  end interface
+end module other_owner
+
+module lexer_owner
+  use token_owner, only: token_t
+  implicit none
+  private
+  public :: lexer_t
+
+  type, abstract :: lexer_t
+  contains
+    procedure(next_i), deferred :: next
+  end type lexer_t
+
+  abstract interface
+    subroutine next_i(self, token)
+      import :: lexer_t, token_t
+      class(lexer_t), intent(inout) :: self
+      type(token_t), intent(out) :: token
+    end subroutine next_i
+  end interface
+end module lexer_owner
+",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
@@ -12146,14 +12425,36 @@ contains
   end subroutine accept
 
   subroutine invoke()
+    integer :: values(2)
     call accept(int(1, kind=8), real(1, 8), cmplx(1.0, 2.0, kind=8))
     call accept(1_8, 2.0_8, (1.0_8, 2.0_8))
+    call accept(size(values, kind=8), 2.0_8, (1.0_8, 2.0_8))
   end subroutine invoke
 end module call_contracts
 ",
         );
 
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_unsupported_size_result_kind() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: values(2)
+  print *, size(values, kind=3)
+end program p
+",
+        );
+
+        assert!(
+            errs.iter()
+                .any(|err| err
+                    .contains("intrinsic 'size' requests unsupported INTEGER result kind 3")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -13807,6 +14108,22 @@ end program
     }
 
     #[test]
+    fn associate_array_name_shadows_intrinsic_contract() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: coordinates(2, 2), row
+  associate (index => coordinates)
+    row = index(1, 2)
+  end associate
+end program p
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
     fn selected_char_kind_preserves_leading_whitespace() {
         let errs = errors_from(
             "\
@@ -13839,6 +14156,40 @@ end program
                 |err| err.contains("array constructor element type mismatch")
                     && err.contains("expected INTEGER(4), got LOGICAL(4)")
             ),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_mixed_type_io_implied_do_items() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  integer :: i
+  character(8) :: names(2) = ['first   ', 'second  ']
+  logical :: present(2) = [.true., .false.]
+  write(*, '(i0,1x,a,1x,l1)') (i, names(i), present(i), i=1,2)
+  print *, (i, '[', names(i), ']', i=1,2)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn rejects_mixed_array_constructor_used_as_io_item() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  write(*, *) [1, .true.]
+end program
+",
+        );
+        assert!(
+            errs.iter()
+                .any(|err| err.contains("array constructor element type mismatch")),
             "{errs:?}"
         );
     }
@@ -14257,6 +14608,33 @@ program p
     call move_alloc(local_from, local_to)
   end block
 end program
+",
+        );
+        assert!(
+            !errs.iter().any(|err| err.contains("MOVE_ALLOC")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_move_alloc_component_reached_through_intent_in_pointer() {
+        let errs = errors_from(
+            "\
+module nested_move
+  implicit none
+  type :: leaf_t
+    integer, allocatable :: values(:)
+  end type
+  type :: holder_t
+    type(leaf_t), pointer :: leaf
+  end type
+contains
+  subroutine replace(holder)
+    type(holder_t), pointer, intent(in) :: holder
+    integer, allocatable :: temporary(:)
+    call move_alloc(temporary, holder%leaf%values)
+  end subroutine
+end module
 ",
         );
         assert!(

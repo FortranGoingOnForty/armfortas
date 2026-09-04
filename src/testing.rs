@@ -577,6 +577,7 @@ pub fn capture_from_path_with_module_search_paths(
         external_descriptor_params,
         external_char_len_star,
         crate::target::TargetLayout::of(&crate::target::TargetSpec::host()),
+        crate::sema::validate::FortranStandard::F2018,
     );
     let ir_errors = verify::verify_module(&ir_module);
     if !ir_errors.is_empty() {

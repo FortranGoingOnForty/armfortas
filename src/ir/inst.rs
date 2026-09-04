@@ -240,6 +240,14 @@ pub struct BasicBlock {
     pub params: Vec<BlockParam>,
     pub insts: Vec<Inst>,
     pub terminator: Option<Terminator>,
+    /// True for a loop header produced by loop unswitching. Keeping this
+    /// provenance prevents the pass from recursively unswitching its own
+    /// clones and bypassing its code-size guard.
+    pub(crate) loop_unswitch_generated: bool,
+    /// True for the scalar remainder header produced by runtime partial
+    /// unrolling. The remainder must not itself be runtime-partial-unrolled,
+    /// or every optimizer iteration appends another remainder loop.
+    pub(crate) partial_unroll_remainder: bool,
 }
 
 impl BasicBlock {
@@ -250,6 +258,8 @@ impl BasicBlock {
             params: Vec::new(),
             insts: Vec::new(),
             terminator: None,
+            loop_unswitch_generated: false,
+            partial_unroll_remainder: false,
         }
     }
 }

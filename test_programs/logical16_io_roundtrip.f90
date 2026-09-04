@@ -1,4 +1,5 @@
 ! CHECK: ok
+! FLAGS: --std=f2023
 ! IR_CHECK: call @afs_write_internal_logical(
 ! IR_CHECK: call @afs_lst_ia_logical(
 ! IR_CHECK: call @afs_fmt_push_logical(

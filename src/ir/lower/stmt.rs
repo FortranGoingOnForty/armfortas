@@ -2711,6 +2711,39 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 // Fixed-length character assignment: copy with space padding.
                                 // Get source pointer and length from the expression.
                                 let (src_ptr, src_len) = lower_string_expr_ctx(b, ctx, value);
+                                if local_fixed_char_allocatable_scalar_len(&info).is_some() {
+                                    let desc = array_descriptor_addr(b, &info);
+                                    let allocated = b.call(
+                                        FuncRef::External("afs_array_allocated".into()),
+                                        vec![desc],
+                                        IrType::Int(IntWidth::I32),
+                                    );
+                                    let zero = b.const_i32(0);
+                                    let needs_allocation = b.icmp(CmpOp::Eq, allocated, zero);
+                                    let allocate_bb =
+                                        b.create_block("fixed_char_scalar_assign_allocate");
+                                    let ready_bb = b.create_block("fixed_char_scalar_assign_ready");
+                                    b.cond_branch(
+                                        needs_allocation,
+                                        allocate_bb,
+                                        vec![],
+                                        ready_bb,
+                                        vec![],
+                                    );
+
+                                    b.set_block(allocate_bb);
+                                    let elem_size = b.const_i64(*len);
+                                    let rank = b.const_i32(0);
+                                    let null_dims = b.const_i64(0);
+                                    let null_stat = b.const_i64(0);
+                                    b.call(
+                                        FuncRef::External("afs_allocate_array".into()),
+                                        vec![desc, elem_size, rank, null_dims, null_stat],
+                                        IrType::Void,
+                                    );
+                                    b.branch(ready_bb, vec![]);
+                                    b.set_block(ready_bb);
+                                }
                                 if let Some((dest_ptr, dest_len)) = local_char_ptr_and_len(b, &info)
                                 {
                                     b.call(
@@ -3273,60 +3306,27 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         // (solve_cg/bicgstab/pcg).
                                                         | "merge"
                                                 ) || (
-                                                    // sum(arr, dim) is rank-N-1: route to
-                                                    // lower_array_assign so the sum-dim arm
-                                                    // in lower_array_expr_descriptor fills
-                                                    // the result descriptor. Plain sum(arr)
-                                                    // is scalar; that arm returns None and
-                                                    // assignment falls through to scalar
-                                                    // broadcast.
-                                                    lname == "sum"
-                                                        && call_args.iter().enumerate().any(
-                                                            |(i, a)| {
-                                                                let kw = a
-                                                                    .keyword
-                                                                    .as_deref()
-                                                                    .map(|s| s.to_lowercase());
-                                                                matches!(kw.as_deref(), Some("dim"))
-                                                                    || (i == 1 && kw.is_none())
-                                                            },
-                                                        )
-                                                ) || (
-                                                    // count(mask, dim) is rank-N-1 integer
-                                                    // array: same routing as sum(arr, dim).
-                                                    // Without this, the scalar logical-
-                                                    // reduction path returns a single i32
-                                                    // total and the array-assign treats it
-                                                    // as a source descriptor, dereferencing
-                                                    // a tiny address (e.g. 0x3) and aborting
-                                                    // in afs_assign_allocatable. Surfaced
-                                                    // in stdlib_stats var_mask_2_*.
-                                                    lname == "count"
-                                                        && call_args.iter().enumerate().any(
-                                                            |(i, a)| {
-                                                                let kw = a
-                                                                    .keyword
-                                                                    .as_deref()
-                                                                    .map(|s| s.to_lowercase());
-                                                                matches!(kw.as_deref(), Some("dim"))
-                                                                    || (i == 1 && kw.is_none())
-                                                            },
-                                                        )
-                                                ) || (
-                                                    // maxval/minval(arr, dim) are also rank-N-1
-                                                    // when the source rank is greater than one.
-                                                    // Keep rank-1 reductions on the scalar path
-                                                    // so nested forms such as
-                                                    // maxval(sum(abs(A), dim=1), 1) still return
-                                                    // a scalar.
-                                                    matches!(lname.as_str(), "maxval" | "minval")
-                                                        && actual_expr_rank(
-                                                            array_rhs,
-                                                            &ctx.locals,
-                                                            ctx.st,
-                                                            Some(ctx.type_layouts),
-                                                        )
-                                                        .is_some_and(|rank| rank > 0)
+                                                    // DIM reductions return rank N-1 arrays.
+                                                    // Route every reduction that the shared
+                                                    // rank classifier proves array-valued
+                                                    // through lower_array_expr_descriptor.
+                                                    // Otherwise the scalar intrinsic path can
+                                                    // hand a numeric result to descriptor-copy
+                                                    // code (PRODUCT was the remaining case).
+                                                    resolved_intrinsic_name_for_call(
+                                                        ctx.st,
+                                                        ctx.proc_scope_id,
+                                                        b.func().name.as_str(),
+                                                        &lname,
+                                                    )
+                                                    .is_some_and(|intrinsic_name| {
+                                                        is_array_reducing_intrinsic(&intrinsic_name)
+                                                            && expr_returns_array(
+                                                                array_rhs,
+                                                                &ctx.locals,
+                                                                ctx.st,
+                                                            )
+                                                    })
                                                 )
                                             } else {
                                                 false
@@ -3865,7 +3865,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             }
                             if local_is_array_like(&info)
                                 && !is_scalar_fixed_alloc_char
-                                && lower_1d_section_assign(b, ctx, &info, args, value)
+                                && lower_1d_section_assign(b, ctx, &akey, &info, args, value)
                             {
                                 return;
                             }
@@ -4196,7 +4196,14 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 return;
                             }
                             if local_is_array_like(&info)
-                                && lower_1d_section_assign(b, ctx, &info, args, value)
+                                && lower_1d_section_assign(
+                                    b,
+                                    ctx,
+                                    root_object_name(callee).as_deref().unwrap_or(""),
+                                    &info,
+                                    args,
+                                    value,
+                                )
                             {
                                 return;
                             }
@@ -4706,7 +4713,32 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             // 'area = ', area(r)` printed E-notation in every real program
             // that prints a computed value.
             let is_formatted = is_formatted_format_expr(ctx, format);
+            let (iostat_ptr, iostat_storeback) = lower_runtime_iostat(b, ctx, None, true);
+            let (iomsg_arg, iomsg_ptr, iomsg_len) = scratch_char_buffer_arg(b);
             if is_formatted {
+                let explicit_dtio_edits = explicit_defined_io_edits(ctx, format, items.len());
+                if try_lower_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    Some("DT"),
+                    explicit_dtio_edits.as_deref(),
+                    iostat_ptr,
+                    Some((iomsg_arg, iomsg_len)),
+                ) {
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        None,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        false,
+                    );
+                    return;
+                }
                 let null_i64 = b.const_i64(0);
                 let null_i8_ptr = b.int_to_ptr(null_i64, IrType::Int(IntWidth::I8));
                 let zero_i64 = b.const_i64(0);
@@ -4734,6 +4766,52 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     fmt_ptr,
                 );
             } else {
+                if try_lower_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    Some("LISTDIRECTED"),
+                    None,
+                    iostat_ptr,
+                    Some((iomsg_arg, iomsg_len)),
+                ) {
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        None,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        false,
+                    );
+                    return;
+                }
+                let advance = b.const_i32(1);
+                if try_lower_mixed_defined_io_write_items(
+                    b,
+                    ctx,
+                    items,
+                    unit,
+                    Some("LISTDIRECTED"),
+                    advance,
+                    iostat_ptr,
+                    Some((iomsg_arg, iomsg_len)),
+                    (iomsg_ptr, iomsg_len),
+                ) {
+                    lower_write_status_completion(
+                        b,
+                        ctx,
+                        None,
+                        iostat_ptr,
+                        iomsg_ptr,
+                        iomsg_len,
+                        &iostat_storeback,
+                        false,
+                    );
+                    return;
+                }
                 lower_write_items(b, ctx, items, unit);
             }
         }
@@ -5065,6 +5143,94 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 b.const_i32(6)
             };
 
+            if let Some(rec_ctrl) = io_control_by_keyword(controls, "rec") {
+                if io_control_by_keyword(controls, "pos").is_some() {
+                    lower_stmt_error(rec_ctrl.value.span, "REC= and POS= may not appear together");
+                }
+                if let Some(control) = advance_ctrl {
+                    lower_stmt_error(
+                        control.value.span,
+                        "ADVANCE= is not valid for direct-access I/O",
+                    );
+                }
+                if let Some(control) = fmt_control {
+                    if matches!(&control.value.node, Expr::Name { name } if name == "*") {
+                        lower_stmt_error(
+                            control.value.span,
+                            "list-directed format is not valid with REC=",
+                        );
+                    }
+                }
+
+                let raw_rec = super::expr::lower_expr_ctx(b, ctx, &rec_ctrl.value);
+                let rec = coerce_to_type(b, raw_rec, &IrType::Int(IntWidth::I64));
+                let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+
+                if let Some(format_control) = fmt_control {
+                    let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &format_control.value);
+                    b.call(
+                        FuncRef::External("afs_fmt_begin_direct_ex".into()),
+                        vec![
+                            unit_i32, rec, fmt_ptr, fmt_len, iostat_ptr, iomsg_ptr, iomsg_len,
+                        ],
+                        IrType::Void,
+                    );
+                    lower_fmt_leading_zero_override(b, ctx, leading_zero_ctrl);
+                    for item in items {
+                        lower_fmt_push(b, ctx, item);
+                    }
+                    let no_advance = b.const_i32(0);
+                    b.call(
+                        FuncRef::External("afs_fmt_end".into()),
+                        vec![no_advance],
+                        IrType::Void,
+                    );
+                    deallocate_owned_string_expr_temp(
+                        b,
+                        &ctx.locals,
+                        &format_control.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        fmt_ptr,
+                    );
+                } else {
+                    b.call(
+                        FuncRef::External("afs_direct_write_begin".into()),
+                        vec![unit_i32, rec, iostat_ptr, iomsg_ptr, iomsg_len],
+                        IrType::Void,
+                    );
+                    let status = b.load_typed(iostat_ptr, IrType::Int(IntWidth::I32));
+                    let zero = b.const_i32(0);
+                    let failed = b.icmp(CmpOp::Ne, status, zero);
+                    let transfer_bb = b.create_block("direct_write_ok");
+                    let done_bb = b.create_block("direct_write_done");
+                    b.cond_branch(failed, done_bb, vec![], transfer_bb, vec![]);
+
+                    b.set_block(transfer_bb);
+                    lower_write_items_adv(b, ctx, items, unit_i32, false);
+                    let advance = b.const_i32(1);
+                    b.call(
+                        FuncRef::External("afs_list_write_end".into()),
+                        vec![unit_i32, advance, iostat_ptr, iomsg_ptr, iomsg_len],
+                        IrType::Void,
+                    );
+                    b.branch(done_bb, vec![]);
+                    b.set_block(done_bb);
+                }
+
+                lower_write_status_completion(
+                    b,
+                    ctx,
+                    err_label,
+                    iostat_ptr,
+                    iomsg_ptr,
+                    iomsg_len,
+                    &iostat_storeback,
+                    iostat_ctrl.is_some(),
+                );
+                return;
+            }
+
             let positioning_done = lower_external_write_pos_seek(
                 b, ctx, controls, unit, iostat_ptr, iomsg_ptr, iomsg_len,
             );
@@ -5311,8 +5477,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_bind_c_char_arg_mask(ctx.st, k)
                     });
                     let char_len_star_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
-                            .or_else(|| callee_char_len_star_mask(ctx.st, k))
+                        callee_char_len_star_mask(ctx.st, k).or_else(|| {
+                            cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
+                        })
                     });
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
@@ -5899,8 +6066,9 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_bind_c_char_arg_mask(ctx.st, k)
                     });
                     let char_len_star_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
-                        cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
-                            .or_else(|| callee_char_len_star_mask(ctx.st, k))
+                        callee_char_len_star_mask(ctx.st, k).or_else(|| {
+                            cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
+                        })
                     });
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
@@ -8016,8 +8184,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             let elem_size_bytes =
                                 local_storage_size_bytes(&field_info, ctx.type_layouts, ctx.layout);
                             let size_val = b.const_i64(elem_size_bytes);
+                            let allocate_fn = if field.pointer {
+                                "afs_allocate_pointer"
+                            } else {
+                                "afs_allocate_scalar"
+                            };
                             b.call(
-                                FuncRef::External("afs_allocate_scalar".into()),
+                                FuncRef::External(allocate_fn.into()),
                                 vec![field_ptr, size_val, runtime_stat_arg],
                                 IrType::Void,
                             );
@@ -8489,28 +8662,23 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             } else {
                                 info.addr
                             };
-                            if info.is_pointer {
-                                let size_val = b.const_i64(elem_size_bytes);
-                                b.call(
-                                    FuncRef::External("afs_allocate_scalar".into()),
-                                    vec![slot, size_val, runtime_stat_arg],
-                                    IrType::Void,
-                                );
-                                emit_runtime_errmsg_on_failure(
-                                    b,
-                                    stat_addr,
-                                    errmsg_target.as_ref(),
-                                    "ALLOCATE failed",
-                                );
+                            let allocate_fn = if info.is_pointer {
+                                "afs_allocate_pointer"
                             } else {
-                                let size_val = b.const_i32(elem_size_bytes as i32);
-                                let ptr = b.runtime_call(
-                                    RuntimeFunc::Allocate,
-                                    vec![size_val],
-                                    IrType::Ptr(Box::new(info.ty.clone())),
-                                );
-                                b.store(ptr, slot);
-                            }
+                                "afs_allocate_scalar"
+                            };
+                            let size_val = b.const_i64(elem_size_bytes);
+                            b.call(
+                                FuncRef::External(allocate_fn.into()),
+                                vec![slot, size_val, runtime_stat_arg],
+                                IrType::Void,
+                            );
+                            emit_runtime_errmsg_on_failure(
+                                b,
+                                stat_addr,
+                                errmsg_target.as_ref(),
+                                "ALLOCATE failed",
+                            );
                             emit_raw_scalar_allocate_initialization(
                                 b,
                                 ctx,
@@ -9803,7 +9971,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             let needs_hidden_iostat = end_label.is_some()
                 || err_label.is_some()
                 || iomsg_ctrl.is_some()
-                || io_control_by_keyword(controls, "pos").is_some();
+                || io_control_by_keyword(controls, "pos").is_some()
+                || io_control_by_keyword(controls, "rec").is_some();
             let has_dtio_iostat_addr = user_iostat || needs_hidden_iostat;
             let (iostat_addr, iostat_storeback) =
                 lower_runtime_iostat(b, ctx, iostat_ctrl, needs_hidden_iostat);
@@ -9905,6 +10074,95 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             } else {
                 b.const_i32(5) // default stdin
             };
+
+            if let Some(rec_ctrl) = io_control_by_keyword(controls, "rec") {
+                if io_control_by_keyword(controls, "pos").is_some() {
+                    lower_stmt_error(rec_ctrl.value.span, "REC= and POS= may not appear together");
+                }
+                if let Some(control) = advance_ctrl {
+                    lower_stmt_error(
+                        control.value.span,
+                        "ADVANCE= is not valid for direct-access I/O",
+                    );
+                }
+                if let Some(control) = fmt_control {
+                    if matches!(&control.value.node, Expr::Name { name } if name == "*") {
+                        lower_stmt_error(
+                            control.value.span,
+                            "list-directed format is not valid with REC=",
+                        );
+                    }
+                }
+
+                let raw_rec = super::expr::lower_expr_ctx(b, ctx, &rec_ctrl.value);
+                let rec = coerce_to_type(b, raw_rec, &IrType::Int(IntWidth::I64));
+                let unit_i32 = coerce_to_type(b, unit, &IrType::Int(IntWidth::I32));
+                let formatted = b.const_i32(i32::from(fmt_control.is_some()));
+                b.call(
+                    FuncRef::External("afs_direct_read_begin".into()),
+                    vec![
+                        unit_i32,
+                        rec,
+                        formatted,
+                        iostat_addr,
+                        read_iomsg_ptr,
+                        read_iomsg_len,
+                    ],
+                    IrType::Void,
+                );
+                let status = b.load_typed(iostat_addr, IrType::Int(IntWidth::I32));
+                let zero = b.const_i32(0);
+                let failed = b.icmp(CmpOp::Ne, status, zero);
+                let transfer_bb = b.create_block("direct_read_ok");
+                let done_bb = b.create_block("direct_read_done");
+                b.cond_branch(failed, done_bb, vec![], transfer_bb, vec![]);
+
+                b.set_block(transfer_bb);
+                if let Some(format_control) = fmt_control {
+                    let (fmt_ptr, fmt_len) = lower_format_expr(b, ctx, &format_control.value);
+                    lower_formatted_read_items_with_runtime_advance(
+                        b,
+                        ctx,
+                        items,
+                        unit_i32,
+                        fmt_ptr,
+                        fmt_len,
+                        false,
+                        None,
+                        iostat_addr,
+                        size_addr,
+                    );
+                    b.call(
+                        FuncRef::External("afs_direct_formatted_read_end".into()),
+                        vec![unit_i32],
+                        IrType::Void,
+                    );
+                    deallocate_owned_string_expr_temp(
+                        b,
+                        &ctx.locals,
+                        &format_control.value,
+                        ctx.st,
+                        Some(ctx.type_layouts),
+                        fmt_ptr,
+                    );
+                } else {
+                    lower_list_read_items(b, ctx, items, unit_i32, iostat_addr);
+                    b.call(
+                        FuncRef::External("afs_list_read_end".into()),
+                        vec![unit_i32, iostat_addr, read_iomsg_ptr, read_iomsg_len],
+                        IrType::Void,
+                    );
+                }
+                b.branch(done_bb, vec![]);
+                b.set_block(done_bb);
+
+                lower_read_assign_iomsg(b, iostat_addr, read_iomsg_ptr, read_iomsg_len);
+                lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
+                lower_runtime_iostat_storeback(b, iostat_addr, &iostat_storeback);
+                lower_read_status_branches(b, ctx, end_label, err_label, iostat_addr, user_iostat);
+                return;
+            }
+
             let positioning_done = lower_external_read_pos_seek(
                 b,
                 ctx,

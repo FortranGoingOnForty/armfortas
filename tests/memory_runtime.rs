@@ -1171,10 +1171,10 @@ fn move_alloc_accepts_same_unallocated_variable() {
 }
 
 #[test]
-fn repeated_scalar_pointer_allocation_reports_status_and_preserves_target() {
+fn repeated_scalar_pointer_allocation_reassociates_with_new_target() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_pointer_allocation_reports_status_and_preserves_target count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_pointer_allocation_reassociates_with_new_target count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -1183,7 +1183,7 @@ fn repeated_scalar_pointer_allocation_reports_status_and_preserves_target() {
     let src = write_program_in(
         &dir,
         "main.f90",
-        "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: value\n  end type box_t\n  type(box_t) :: box\n  integer, pointer :: scalar\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  scalar = 17\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 3\n  if (.not. associated(scalar)) error stop 4\n  if (scalar /= 17) error stop 5\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 6\n  ios = 99\n  msg = 'unchanged'\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 7\n  if (trim(msg) /= 'unchanged') error stop 8\n  box%value = 23\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 9\n  if (.not. associated(box%value)) error stop 10\n  if (box%value /= 23) error stop 11\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 12\n  deallocate(scalar)\n  deallocate(box%value)\n  print *, 'ok'\nend program\n",
+        "program p\n  implicit none\n  type :: box_t\n    integer, pointer :: value\n  end type box_t\n  type(box_t) :: box\n  integer, pointer :: scalar, old_scalar, old_box\n  integer :: ios\n  character(len=64) :: msg\n  ios = 99\n  msg = 'unchanged'\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 1\n  if (trim(msg) /= 'unchanged') error stop 2\n  scalar = 17\n  old_scalar => scalar\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 3\n  if (.not. associated(scalar)) error stop 4\n  if (associated(scalar, old_scalar)) error stop 5\n  if (old_scalar /= 17) error stop 6\n  if (trim(msg) /= 'unchanged') error stop 7\n  scalar = 19\n  ios = 99\n  msg = 'unchanged'\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 8\n  if (trim(msg) /= 'unchanged') error stop 9\n  box%value = 23\n  old_box => box%value\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios /= 0) error stop 10\n  if (.not. associated(box%value)) error stop 11\n  if (associated(box%value, old_box)) error stop 12\n  if (old_box /= 23) error stop 13\n  if (trim(msg) /= 'unchanged') error stop 14\n  box%value = 29\n  if (scalar /= 19 .or. box%value /= 29) error stop 15\n  deallocate(old_scalar)\n  deallocate(scalar)\n  deallocate(old_box)\n  deallocate(box%value)\n  print *, 'ok'\nend program p\n",
     );
     let exe = dir.join("scalar_pointer_repeat.bin");
     let compile = compile_program(&src, &exe);
@@ -1200,6 +1200,44 @@ fn repeated_scalar_pointer_allocation_reports_status_and_preserves_target() {
     assert!(
         run.status.success(),
         "scalar pointer status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeated_scalar_allocatable_allocation_reports_status_and_preserves_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_allocatable_allocation_reports_status_and_preserves_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("scalar_allocatable_repeat");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  type :: box_t\n    integer, allocatable :: value\n  end type box_t\n  type(box_t) :: box\n  integer, allocatable :: scalar\n  integer :: ios\n  character(len=64) :: msg\n  allocate(scalar)\n  scalar = 17\n  ios = 0\n  msg = 'unchanged'\n  allocate(scalar, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 1\n  if (.not. allocated(scalar) .or. scalar /= 17) error stop 2\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 3\n  allocate(box%value)\n  box%value = 23\n  ios = 0\n  msg = 'unchanged'\n  allocate(box%value, stat=ios, errmsg=msg)\n  if (ios == 0) error stop 4\n  if (.not. allocated(box%value) .or. box%value /= 23) error stop 5\n  if (index(trim(msg), 'ALLOCATE failed') == 0) error stop 6\n  deallocate(scalar)\n  deallocate(box%value)\n  print *, 'ok'\nend program p\n",
+    );
+    let exe = dir.join("scalar_allocatable_repeat.bin");
+    let compile = compile_program(&src, &exe);
+    assert!(
+        compile.status.success(),
+        "compile failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("scalar allocatable allocation runtime failed");
+    assert!(
+        run.status.success(),
+        "scalar allocatable status handling failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -1247,10 +1285,10 @@ fn zero_storage_derived_pointer_allocation_establishes_association() {
 }
 
 #[test]
-fn repeated_scalar_pointer_allocation_without_stat_terminates() {
+fn repeated_scalar_pointer_allocation_without_stat_succeeds() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_pointer_allocation_without_stat_terminates count=2 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=memory_runtime test=repeated_scalar_pointer_allocation_without_stat_succeeds count=2 reason=\"{}\"",
             reason
         );
         return;
@@ -1267,11 +1305,26 @@ fn repeated_scalar_pointer_allocation_without_stat_terminates() {
     ];
 
     for (name, source) in cases {
-        assert_program_terminates(
-            &format!("scalar_pointer_repeat_loud_{name}"),
-            source,
-            "ALLOCATE",
+        let dir = unique_dir(&format!("scalar_pointer_repeat_{name}"));
+        let src = write_program_in(&dir, "main.f90", source);
+        let exe = dir.join("main.bin");
+        let compile = compile_program(&src, &exe);
+        assert!(
+            compile.status.success(),
+            "{name} compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
         );
+        let run = Command::new(&exe)
+            .output()
+            .unwrap_or_else(|error| panic!("{name} runtime failed to launch: {error}"));
+        assert!(
+            run.status.success(),
+            "{name} repeated pointer allocation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(String::from_utf8_lossy(&run.stdout).contains("survived"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

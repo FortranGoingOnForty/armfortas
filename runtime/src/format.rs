@@ -875,6 +875,26 @@ impl FormatEngine {
         &mut self,
         values: &[IoValue],
     ) -> Result<Vec<u8>, FormatError> {
+        self.format_values_reverting_output_checked(values)
+            .map(FormatOutput::finish)
+    }
+
+    /// Format output as distinct Fortran records. Unlike the byte-oriented
+    /// wrapper, this preserves the difference between a record boundary
+    /// produced by format reversion or `/` and an LF byte supplied as ordinary
+    /// character data through an `A` edit descriptor.
+    pub fn format_values_reverting_records_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<Vec<Vec<u8>>, FormatError> {
+        self.format_values_reverting_output_checked(values)
+            .map(FormatOutput::finish_records)
+    }
+
+    fn format_values_reverting_output_checked(
+        &mut self,
+        values: &[IoValue],
+    ) -> Result<FormatOutput, FormatError> {
         let mut output = FormatOutput::new();
         let mut val_idx = 0;
         let descriptors = Arc::clone(&self.descriptors);
@@ -884,7 +904,7 @@ impl FormatEngine {
         }
         if values.is_empty() {
             self.apply_descriptors(descriptors.as_ref(), values, &mut val_idx, &mut output)?;
-            return Ok(output.finish());
+            return Ok(output);
         }
 
         let mut first_record = true;
@@ -901,7 +921,7 @@ impl FormatEngine {
             active_descriptors = reversion_descriptors;
             first_record = false;
         }
-        Ok(output.finish())
+        Ok(output)
     }
 
     fn apply_descriptors(
@@ -1467,6 +1487,21 @@ impl FormatEngine {
         {
             return self.format_e_style_default(v, decimals, exp_width, exp_char);
         }
+        if matches!(
+            self.round_mode,
+            RoundMode::Compatible | RoundMode::ProcessorDefined
+        ) && self.scale_factor == 1
+        {
+            // 1P,E is ordinary scientific notation. Format the original
+            // binary value directly so an intermediate decimal rescaling
+            // cannot introduce a second rounding before digit selection.
+            let raw = if v.is_sign_positive() && matches!(self.sign_mode, SignMode::Plus) {
+                format!("{:+.*E}", decimals, v)
+            } else {
+                format!("{:.*E}", decimals, v)
+            };
+            return pad_exponent_width(&raw, exp_width, exp_char);
+        }
 
         let fractional_digits = self.e_fractional_digits(decimals);
         if v == 0.0 {
@@ -1615,7 +1650,7 @@ impl FormatEngine {
 }
 
 struct FormatOutput {
-    bytes: Vec<u8>,
+    records: Vec<Vec<u8>>,
     record: Vec<u8>,
     pos: usize,
     high_water: usize,
@@ -1624,7 +1659,7 @@ struct FormatOutput {
 impl FormatOutput {
     fn new() -> Self {
         Self {
-            bytes: Vec::new(),
+            records: Vec::new(),
             record: Vec::new(),
             pos: 0,
             high_water: 0,
@@ -1681,20 +1716,31 @@ impl FormatOutput {
 
     fn new_record(&mut self) {
         self.flush_record();
-        self.bytes.push(b'\n');
     }
 
     fn flush_record(&mut self) {
-        self.bytes
-            .extend_from_slice(&self.record[..self.high_water]);
+        self.records.push(self.record[..self.high_water].to_vec());
         self.record.clear();
         self.pos = 0;
         self.high_water = 0;
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(self) -> Vec<u8> {
+        let records = self.finish_records();
+        let payload_len: usize = records.iter().map(Vec::len).sum();
+        let mut bytes = Vec::with_capacity(payload_len + records.len().saturating_sub(1));
+        for (i, record) in records.iter().enumerate() {
+            if i != 0 {
+                bytes.push(b'\n');
+            }
+            bytes.extend_from_slice(record);
+        }
+        bytes
+    }
+
+    fn finish_records(mut self) -> Vec<Vec<u8>> {
         self.flush_record();
-        self.bytes
+        self.records
     }
 }
 
@@ -2833,6 +2879,24 @@ mod tests {
     }
 
     #[test]
+    fn formatted_records_distinguish_character_lf_from_record_boundaries() {
+        let mut engine = FormatEngine::new(valid_format("(A)"));
+        let records = engine
+            .format_values_reverting_records_checked(&[IoValue::Character(b"abc\ndef".to_vec())])
+            .unwrap();
+        assert_eq!(records, vec![b"abc\ndef".to_vec()]);
+
+        let mut engine = FormatEngine::new(valid_format("(A,/,A)"));
+        let records = engine
+            .format_values_reverting_records_checked(&[
+                IoValue::Character(b"abc".to_vec()),
+                IoValue::Character(b"def".to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(records, vec![b"abc".to_vec(), b"def".to_vec()]);
+    }
+
+    #[test]
     fn format_reversion_reuses_multi_descriptor_format() {
         let descs = valid_format("(I2,1X,I2)");
         let mut engine = FormatEngine::new(descs);
@@ -2928,6 +2992,18 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Real(value)]);
         assert_eq!(out.trim().parse::<f64>().unwrap(), value);
+    }
+
+    #[test]
+    fn format_one_scale_e_dp_precision_roundtrips() {
+        // PRIMA's REAL2STR_SCALAR uses 1PE24.16E3 for binary64. Scaling the
+        // mantissa with floating-point division before decimal formatting
+        // moved this value across its round-trip boundary by one ULP.
+        let value = f64::from_bits(0x3ea2_66ae_e8fb_049a);
+        let descs = valid_format("(1PE24.16E3)");
+        let mut engine = FormatEngine::new(descs);
+        let out = engine.format_values(&[IoValue::Real(value)]);
+        assert_eq!(out.trim().parse::<f64>().unwrap(), value, "{out}");
     }
 
     #[test]

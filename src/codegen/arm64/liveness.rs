@@ -130,6 +130,21 @@ fn machine_vreg_capacity(mf: &MachineFunction) -> usize {
 
 /// Compute live intervals for all vregs in a machine function.
 pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
+    compute_liveness_impl(mf, true)
+}
+
+/// Compute intervals for spill-slot sharing.  Unlike the historical linear
+/// scan analysis, this does not treat a write-only destination operand as a
+/// use.  Keeping the corrected variant separate avoids perturbing optimized
+/// register-allocation decisions that still rely on the conservative ranges.
+pub fn compute_spill_liveness(mf: &MachineFunction) -> LivenessResult {
+    compute_liveness_impl(mf, false)
+}
+
+fn compute_liveness_impl(
+    mf: &MachineFunction,
+    include_write_only_defs_as_uses: bool,
+) -> LivenessResult {
     let num_vregs = machine_vreg_capacity(mf);
     let block_indices: HashMap<MBlockId, usize> = mf
         .blocks
@@ -221,9 +236,15 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
                     scratch_in.remove(def);
                 }
                 // Add uses.
-                for op in &inst.operands {
+                for (operand_index, op) in inst.operands.iter().enumerate() {
                     if let MachineOperand::VReg(vid) = op {
-                        scratch_in.insert(*vid);
+                        if include_write_only_defs_as_uses
+                            || Some(*vid) != inst.def
+                            || operand_index != 0
+                            || inst.opcode.reads_def_operand()
+                        {
+                            scratch_in.insert(*vid);
+                        }
                     }
                 }
             }
@@ -269,11 +290,17 @@ pub fn compute_liveness(mf: &MachineFunction) -> LivenessResult {
                 starts[idx] = Some(starts[idx].map_or(p, |start| start.min(p)));
                 ends[idx] = Some(ends[idx].map_or(p, |end| end.max(p)));
             }
-            for op in &inst.operands {
+            for (operand_index, op) in inst.operands.iter().enumerate() {
                 if let MachineOperand::VReg(vid) = op {
-                    let idx = vid.0 as usize;
-                    ends[idx] = Some(ends[idx].map_or(p, |end| end.max(p)));
-                    starts[idx] = Some(starts[idx].map_or(p, |start| start.min(p)));
+                    if include_write_only_defs_as_uses
+                        || Some(*vid) != inst.def
+                        || operand_index != 0
+                        || inst.opcode.reads_def_operand()
+                    {
+                        let idx = vid.0 as usize;
+                        ends[idx] = Some(ends[idx].map_or(p, |end| end.max(p)));
+                        starts[idx] = Some(starts[idx].map_or(p, |start| start.min(p)));
+                    }
                 }
             }
         }

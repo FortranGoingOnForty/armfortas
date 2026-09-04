@@ -1741,6 +1741,23 @@ end program
 }
 
 #[test]
+fn imported_same_named_generic_constructs_type_with_private_component() {
+    if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
+        eprintln!(
+            "\nHARNESS_SKIP suite=multifile test=imported_same_named_generic_constructs_type_with_private_component count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    multifile_test(
+        "module string_provider\n  implicit none\n  private\n  public :: string_type, string_length\n  type :: string_type\n    private\n    character(len=:), allocatable :: raw\n  end type string_type\n  interface string_type\n    module procedure new_string\n  end interface string_type\ncontains\n  function new_string(text) result(value)\n    character(len=*), intent(in) :: text\n    type(string_type) :: value\n    value%raw = text\n  end function new_string\n  integer function string_length(value) result(n)\n    type(string_type), intent(in) :: value\n    n = len(value%raw)\n  end function string_length\nend module string_provider\n",
+        "program p\n  use string_provider, only: string_type, string_length\n  implicit none\n  type(string_type) :: value\n  value = string_type('ok')\n  if (string_length(value) /= 2) error stop 1\n  print *, 'ok'\nend program p\n",
+        "ok",
+    );
+}
+
+#[test]
 fn module_private_default() {
     if let Err(reason) = armfortas::testing::native_e2e_level_support("-O0") {
         eprintln!(

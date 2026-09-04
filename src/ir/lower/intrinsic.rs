@@ -10,6 +10,10 @@ use crate::ir::types::*;
 use super::core::*;
 use super::helpers::{coerce_to_type, storage_size_bits_for_ir_type};
 
+fn const_int_zero(b: &mut FuncBuilder, width: IntWidth) -> ValueId {
+    b.const_int(0, width)
+}
+
 fn small_int_bits_as_i32(b: &mut FuncBuilder, value: ValueId, width: IntWidth) -> ValueId {
     let widened = b.int_extend(value, IntWidth::I32, true);
     let mask = match width {
@@ -303,10 +307,10 @@ pub(crate) fn lower_intrinsic(
                 } else {
                     // Integer modulo: rem = a % p; if (rem != 0 && (rem ^ p) < 0) rem += p
                     let rem = b.imod(lhs, rhs);
-                    let zero = match &ty {
-                        IrType::Int(IntWidth::I64) => b.const_i64(0),
-                        _ => b.const_i32(0),
+                    let IrType::Int(width) = &ty else {
+                        unreachable!("integer MODULO operands must have an integer IR type")
                     };
+                    let zero = const_int_zero(b, *width);
                     let rem_ne_zero = b.icmp(CmpOp::Ne, rem, zero);
                     let rem_xor_p = b.bit_xor(rem, rhs);
                     let sign_differs = b.icmp(CmpOp::Lt, rem_xor_p, zero);
@@ -326,10 +330,7 @@ pub(crate) fn lower_intrinsic(
                     .unwrap_or(IrType::Int(IntWidth::I32));
                 match &ty {
                     IrType::Int(w) => {
-                        let zero = match w {
-                            IntWidth::I64 => b.const_i64(0),
-                            _ => b.const_i32(0),
-                        };
+                        let zero = const_int_zero(b, *w);
                         let is_pos = b.icmp(CmpOp::Ge, *arg, zero);
                         let neg = b.ineg(*arg);
                         Some(b.select(is_pos, *arg, neg))
@@ -617,10 +618,10 @@ pub(crate) fn lower_intrinsic(
                 let abs_a = if ty.is_float() {
                     b.fabs(args[0])
                 } else {
-                    let zero = match &ty {
-                        IrType::Int(IntWidth::I64) => b.const_i64(0),
-                        _ => b.const_i32(0),
+                    let IrType::Int(width) = &ty else {
+                        unreachable!("integer SIGN operands must have an integer IR type")
                     };
+                    let zero = const_int_zero(b, *width);
                     let is_pos = b.icmp(CmpOp::Ge, args[0], zero);
                     let neg = b.ineg(args[0]);
                     b.select(is_pos, args[0], neg)
@@ -634,10 +635,10 @@ pub(crate) fn lower_intrinsic(
                         ty,
                     ))
                 } else {
-                    let zero = match &ty {
-                        IrType::Int(IntWidth::I64) => b.const_i64(0),
-                        _ => b.const_i32(0),
+                    let IrType::Int(width) = &ty else {
+                        unreachable!("integer SIGN operands must have an integer IR type")
                     };
+                    let zero = const_int_zero(b, *width);
                     let b_neg = b.icmp(CmpOp::Lt, args[1], zero);
                     let neg_abs = b.ineg(abs_a);
                     Some(b.select(b_neg, neg_abs, abs_a))
