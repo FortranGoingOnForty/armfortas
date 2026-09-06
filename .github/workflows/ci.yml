@@ -256,6 +256,12 @@ jobs:
           # for ELF assembly (until afs-as x86 lands in x14).
           prepare: pkg install -y rust binutils bash
           run: |
+            # This ephemeral 6 GiB VM does not reuse incremental state or
+            # consume test debuginfo. Keeping either enabled pushes rustc's
+            # armfortas lib-test build close enough to the memory limit to be
+            # killed nondeterministically.
+            export CARGO_INCREMENTAL=0
+            export CARGO_PROFILE_TEST_DEBUG=0
             export CARGO_TARGET_DIR="$PWD/.cargo-target"
             cargo build --workspace
             cargo test -p armfortas --lib
