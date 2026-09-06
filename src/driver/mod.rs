@@ -3107,7 +3107,8 @@ fn link_inputs_with_afs_ld(
     }
 
     let runtime = find_runtime_lib(bundled_runtime)?;
-    let libsystem_tbd = find_libsystem_tbd()?;
+    let sysroot = find_macos_sdk_root()?;
+    let libsystem_tbd = find_libsystem_tbd(&sysroot)?;
     let mut args: Vec<String> = vec!["-arch".into(), "arm64".into()];
     if opts.shared {
         args.push("-dylib".into());
@@ -3115,6 +3116,7 @@ fn link_inputs_with_afs_ld(
         args.extend(["-e".into(), "_main".into()]);
     }
     args.extend(["-o".into(), output.to_string_lossy().into_owned()]);
+    args.extend(["-syslibroot".into(), sysroot]);
     for dir in &opts.library_search_paths {
         args.push("-L".into());
         args.push(dir.to_string_lossy().into_owned());
@@ -3547,18 +3549,7 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
         .into())
 }
 
-fn find_libsystem_tbd() -> Result<String, String> {
-    if let Some(path) = env_override("AFS_LIBSYSTEM_TBD") {
-        let p = PathBuf::from(&path);
-        if p.exists() {
-            return Ok(path);
-        }
-        return Err(format!(
-            "AFS_LIBSYSTEM_TBD points to missing path '{}'",
-            p.display()
-        ));
-    }
-
+fn find_macos_sdk_root() -> Result<String, String> {
     let sdk = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
@@ -3570,8 +3561,22 @@ fn find_libsystem_tbd() -> Result<String, String> {
         ));
     }
     forward_successful_subprocess_stderr(&sdk.stderr)?;
-    let sysroot = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
-    let tbd = PathBuf::from(&sysroot).join("usr/lib/libSystem.tbd");
+    Ok(String::from_utf8_lossy(&sdk.stdout).trim().to_string())
+}
+
+fn find_libsystem_tbd(sysroot: &str) -> Result<String, String> {
+    if let Some(path) = env_override("AFS_LIBSYSTEM_TBD") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "AFS_LIBSYSTEM_TBD points to missing path '{}'",
+            p.display()
+        ));
+    }
+
+    let tbd = PathBuf::from(sysroot).join("usr/lib/libSystem.tbd");
     if tbd.exists() {
         Ok(tbd.to_string_lossy().into_owned())
     } else {

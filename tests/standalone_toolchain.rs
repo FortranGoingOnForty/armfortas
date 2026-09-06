@@ -317,6 +317,44 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
 }
 
 #[test]
+fn driver_standalone_linker_resolves_sdk_library_names() {
+    if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=standalone_toolchain test=driver_standalone_linker_resolves_sdk_library_names count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let armfortas = binary("armfortas");
+    let afs_as = binary("afs-as");
+    let afs_ld = binary("afs-ld");
+    let runtime = runtime_archive();
+    let libsystem = libsystem_tbd();
+    let source = workspace_root().join("test_programs/hello.f90");
+    let dir = unique_dir("driver_standalone_sdk_library");
+    let binary = dir.join("hello-with-libcxx");
+
+    let compile = compile_with_driver_args(
+        &armfortas,
+        &source,
+        &binary,
+        &[
+            ("AFS_AS_PATH", &afs_as),
+            ("AFS_LD_PATH", &afs_ld),
+            ("AFS_RUNTIME_PATH", &runtime),
+            ("AFS_LIBSYSTEM_TBD", &libsystem),
+        ],
+        &["-lc++"],
+        "standalone armfortas compile with SDK library",
+    );
+    assert_success(&compile, "standalone armfortas compile with SDK library");
+    let run = run_binary(&binary, "standalone armfortas SDK-library output");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), " Hello, World!\n");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
     if let Err(reason) = armfortas::testing::native_macho_toolchain_support() {
         eprintln!(
