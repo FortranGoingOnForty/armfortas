@@ -777,10 +777,21 @@ impl<'a> FormatParser<'a> {
 /// An I/O value to be formatted.
 pub enum IoValue {
     Integer(i128),
+    IntegerKind { value: i128, bit_width: usize },
     Real(f64),
     Real32(f64),
     Logical(bool),
     Character(Vec<u8>),
+}
+
+impl IoValue {
+    fn integer_value(&self) -> Option<(i128, usize)> {
+        match self {
+            Self::Integer(value) => Some((*value, 64)),
+            Self::IntegerKind { value, bit_width } => Some((*value, *bit_width)),
+            _ => None,
+        }
+    }
 }
 
 /// Format engine state for applying descriptors to values.
@@ -1083,35 +1094,50 @@ impl FormatEngine {
     }
 
     fn format_value_text(&self, desc: &FormatDesc, val: &IoValue) -> Result<String, FormatError> {
-        match (desc, val) {
-            // ---- Integer ----
-            (FormatDesc::IntegerI { width, min_digits }, IoValue::Integer(v)) => {
-                let s = if let Some(m) = min_digits {
-                    let abs_s = format!("{}", v.unsigned_abs());
-                    let padded = format!("{:0>width$}", abs_s, width = *m);
-                    if *v < 0 {
-                        format!("-{}", padded)
+        if let Some((value, bit_width)) = val.integer_value() {
+            let formatted = match desc {
+                FormatDesc::IntegerI { width, min_digits } => {
+                    let s = if let Some(m) = min_digits {
+                        let abs_s = format!("{}", value.unsigned_abs());
+                        let padded = format!("{:0>width$}", abs_s, width = *m);
+                        if value < 0 {
+                            format!("-{}", padded)
+                        } else {
+                            self.apply_sign(&padded, true)
+                        }
                     } else {
-                        self.apply_sign(&padded, *v >= 0)
-                    }
-                } else {
-                    self.apply_sign(&format!("{}", v.unsigned_abs()), *v >= 0)
-                };
-                Ok(fit_field(&s, *width))
+                        self.apply_sign(&format!("{}", value.unsigned_abs()), value >= 0)
+                    };
+                    Some(fit_field(&s, *width))
+                }
+                FormatDesc::IntegerB { width, min_digits } => Some(fit_field(
+                    &format_radix_integer(value, *min_digits, 2, bit_width),
+                    *width,
+                )),
+                FormatDesc::IntegerO { width, min_digits } => Some(fit_field(
+                    &format_radix_integer(value, *min_digits, 8, bit_width),
+                    *width,
+                )),
+                FormatDesc::IntegerZ { width, min_digits } => Some(fit_field(
+                    &format_radix_integer(value, *min_digits, 16, bit_width),
+                    *width,
+                )),
+                FormatDesc::RealG { width, .. } => {
+                    let s = if value < 0 {
+                        format!("-{}", value.unsigned_abs())
+                    } else {
+                        self.apply_sign(&value.unsigned_abs().to_string(), true)
+                    };
+                    Some(fit_field(&s, *width))
+                }
+                _ => None,
+            };
+            if let Some(formatted) = formatted {
+                return Ok(formatted);
             }
-            (FormatDesc::IntegerB { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format_radix_integer(*v, *min_digits, 2, *width);
-                Ok(fit_field(&s, *width))
-            }
-            (FormatDesc::IntegerO { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format_radix_integer(*v, *min_digits, 8, *width);
-                Ok(fit_field(&s, *width))
-            }
-            (FormatDesc::IntegerZ { width, min_digits }, IoValue::Integer(v)) => {
-                let s = format_radix_integer(*v, *min_digits, 16, *width);
-                Ok(fit_field(&s, *width))
-            }
+        }
 
+        match (desc, val) {
             // ---- Real ----
             (FormatDesc::RealF { width, decimals }, IoValue::Real(v) | IoValue::Real32(v)) => {
                 if let Some(s) = self.format_nonfinite(*v) {
@@ -1196,14 +1222,6 @@ impl FormatEngine {
                 },
                 IoValue::Real(v),
             ) => self.format_g_text(*v, 17, *width, *decimals, *exp_width),
-            (FormatDesc::RealG { width, .. }, IoValue::Integer(v)) => {
-                let s = if *v < 0 {
-                    format!("-{}", v.unsigned_abs())
-                } else {
-                    self.apply_sign(&v.unsigned_abs().to_string(), true)
-                };
-                Ok(fit_field(&s, *width))
-            }
             (FormatDesc::RealG { width, .. }, IoValue::Logical(v)) => {
                 let s = if *v { "T" } else { "F" };
                 Ok(fit_field(s, *width))
@@ -1748,34 +1766,30 @@ fn format_radix_integer(
     value: i128,
     min_digits: Option<usize>,
     radix: u32,
-    width: usize,
+    bit_width: usize,
 ) -> String {
-    if value < 0 && radix == 16 {
-        let digits = min_digits.unwrap_or(width).max(1);
-        let bit_width = digits.saturating_mul(4).min(128);
+    let bits = if value < 0 {
+        let bit_width = bit_width.clamp(1, 128);
         let mask = if bit_width == 128 {
             u128::MAX
         } else {
             (1u128 << bit_width) - 1
         };
-        return format!("{:0>width$X}", (value as u128) & mask, width = digits);
-    }
+        (value as u128) & mask
+    } else {
+        value.unsigned_abs()
+    };
 
     let digits = match radix {
-        2 => format!("{:b}", value.unsigned_abs()),
-        8 => format!("{:o}", value.unsigned_abs()),
-        16 => format!("{:X}", value.unsigned_abs()),
+        2 => format!("{:b}", bits),
+        8 => format!("{:o}", bits),
+        16 => format!("{:X}", bits),
         _ => unreachable!("unsupported radix"),
     };
-    let padded = if let Some(min_digits) = min_digits {
+    if let Some(min_digits) = min_digits {
         format!("{:0>width$}", digits, width = min_digits)
     } else {
         digits
-    };
-    if value < 0 {
-        format!("-{}", padded)
-    } else {
-        padded
     }
 }
 
@@ -2361,6 +2375,47 @@ mod tests {
         let mut engine = FormatEngine::new(descs);
         let out = engine.format_values(&[IoValue::Integer(-1)]);
         assert_eq!(out, "FFFFFFFFFFFFFFFF");
+    }
+
+    #[test]
+    fn format_negative_radix_values_use_integer_kind_width() {
+        let values = [
+            IoValue::IntegerKind {
+                value: -1,
+                bit_width: 8,
+            },
+            IoValue::IntegerKind {
+                value: -1,
+                bit_width: 16,
+            },
+            IoValue::IntegerKind {
+                value: -1,
+                bit_width: 32,
+            },
+            IoValue::IntegerKind {
+                value: -1,
+                bit_width: 64,
+            },
+        ];
+
+        let mut hex = FormatEngine::new(valid_format("(4(Z0,1X))"));
+        assert_eq!(
+            hex.format_values(&values),
+            "FF FFFF FFFFFFFF FFFFFFFFFFFFFFFF"
+        );
+
+        let mut binary = FormatEngine::new(valid_format("(4(B0,1X))"));
+        assert_eq!(
+            binary.format_values(&values),
+            "11111111 1111111111111111 11111111111111111111111111111111 \
+             1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        let mut octal = FormatEngine::new(valid_format("(4(O0,1X))"));
+        assert_eq!(
+            octal.format_values(&values),
+            "377 177777 37777777777 1777777777777777777777"
+        );
     }
 
     #[test]
