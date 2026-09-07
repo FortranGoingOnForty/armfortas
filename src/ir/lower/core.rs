@@ -37652,31 +37652,7 @@ pub(super) fn lower_fmt_push(
             return;
         }
         match &ty {
-            IrType::Int(IntWidth::I128) => {
-                let slot = b.alloca(IrType::Int(IntWidth::I128));
-                b.store(val, slot);
-                b.call(
-                    FuncRef::External("afs_fmt_push_int128".into()),
-                    vec![slot],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(IntWidth::I64) => {
-                b.call(
-                    FuncRef::External("afs_fmt_push_int".into()),
-                    vec![val],
-                    IrType::Void,
-                );
-            }
-            IrType::Int(_) => {
-                // Widen i32 to i64 for the push API.
-                let widened = b.int_extend(val, IntWidth::I64, true);
-                b.call(
-                    FuncRef::External("afs_fmt_push_int".into()),
-                    vec![widened],
-                    IrType::Void,
-                );
-            }
+            IrType::Int(width) => fmt_push_emit_integer(b, *width, val),
             IrType::Float(FloatWidth::F32) => {
                 // The push API receives f64 at the ABI boundary; keep the
                 // original real(4) kind for G0 precision decisions.
@@ -37826,36 +37802,38 @@ fn fmt_push_emit_scalar(b: &mut FuncBuilder, ty: &IrType, val: ValueId) {
     fmt_push_emit_scalar_semantic(b, ty, val, false);
 }
 
+fn fmt_push_emit_integer(b: &mut FuncBuilder, width: IntWidth, val: ValueId) {
+    if width == IntWidth::I128 {
+        let slot = b.alloca(IrType::Int(IntWidth::I128));
+        b.store(val, slot);
+        b.call(
+            FuncRef::External("afs_fmt_push_int128".into()),
+            vec![slot],
+            IrType::Void,
+        );
+        return;
+    }
+
+    let widened = if width == IntWidth::I64 {
+        val
+    } else {
+        b.int_extend(val, IntWidth::I64, true)
+    };
+    let bit_width = b.const_i32(width.bits() as i32);
+    b.call(
+        FuncRef::External("afs_fmt_push_int_kind".into()),
+        vec![widened, bit_width],
+        IrType::Void,
+    );
+}
+
 fn fmt_push_emit_scalar_semantic(b: &mut FuncBuilder, ty: &IrType, val: ValueId, logical: bool) {
     if logical {
         fmt_push_emit_logical(b, ty, val);
         return;
     }
     match ty {
-        IrType::Int(IntWidth::I128) => {
-            let slot = b.alloca(IrType::Int(IntWidth::I128));
-            b.store(val, slot);
-            b.call(
-                FuncRef::External("afs_fmt_push_int128".into()),
-                vec![slot],
-                IrType::Void,
-            );
-        }
-        IrType::Int(IntWidth::I64) => {
-            b.call(
-                FuncRef::External("afs_fmt_push_int".into()),
-                vec![val],
-                IrType::Void,
-            );
-        }
-        IrType::Int(_) => {
-            let widened = b.int_extend(val, IntWidth::I64, true);
-            b.call(
-                FuncRef::External("afs_fmt_push_int".into()),
-                vec![widened],
-                IrType::Void,
-            );
-        }
+        IrType::Int(width) => fmt_push_emit_integer(b, *width, val),
         IrType::Float(FloatWidth::F64) => {
             b.call(
                 FuncRef::External("afs_fmt_push_real".into()),

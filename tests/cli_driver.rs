@@ -63522,3 +63522,60 @@ end program p
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn negative_boz_output_uses_the_data_items_integer_kind() {
+    let src = write_program(
+        r#"program p
+  use iso_fortran_env, only: int8, int16, int32, int64
+  implicit none
+  character(len=256) :: buffer
+  integer(int8) :: i8
+  integer(int16) :: i16
+  integer(int32) :: i32
+  integer(int64) :: i64
+
+  i8 = -1_int8
+  i16 = -1_int16
+  i32 = -1_int32
+  i64 = -1_int64
+
+  write(buffer, '(4(Z0,1X))') i8, i16, i32, i64
+  if (trim(buffer) /= 'FF FFFF FFFFFFFF FFFFFFFFFFFFFFFF') error stop 1
+
+  write(buffer, '(4(B0,1X))') i8, i16, i32, i64
+  if (trim(buffer) /= '11111111 1111111111111111 ' // &
+      '11111111111111111111111111111111 ' // &
+      '1111111111111111111111111111111111111111111111111111111111111111') error stop 2
+
+  write(buffer, '(4(O0,1X))') i8, i16, i32, i64
+  if (trim(buffer) /= '377 177777 37777777777 1777777777777777777777') error stop 3
+
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("negative_boz_kind_width", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("negative BOZ output compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "negative BOZ output compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("negative BOZ output binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "negative BOZ output binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}

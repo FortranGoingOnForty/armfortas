@@ -5598,7 +5598,27 @@ pub extern "C" fn afs_fmt_set_leading_zero(ptr: *const u8, len: i64) {
 pub extern "C" fn afs_fmt_push_int(val: i64) {
     FMT_CTX.with(|ctx| {
         if let Some(c) = ctx.borrow_mut().last_mut() {
-            c.values.push(IoValue::Integer(val as i128));
+            c.values.push(IoValue::IntegerKind {
+                value: val as i128,
+                bit_width: 64,
+            });
+        }
+    });
+}
+
+/// Push an integer value while preserving its Fortran kind for B/O/Z output.
+#[no_mangle]
+pub extern "C" fn afs_fmt_push_int_kind(val: i64, bit_width: i32) {
+    let bit_width = match bit_width {
+        8 | 16 | 32 | 64 => bit_width as usize,
+        _ => 64,
+    };
+    FMT_CTX.with(|ctx| {
+        if let Some(c) = ctx.borrow_mut().last_mut() {
+            c.values.push(IoValue::IntegerKind {
+                value: val as i128,
+                bit_width,
+            });
         }
     });
 }
@@ -5609,7 +5629,10 @@ pub extern "C" fn afs_fmt_push_int128(val: *const i128) {
     FMT_CTX.with(|ctx| {
         if let Some(c) = ctx.borrow_mut().last_mut() {
             if let Some(wide) = read_i128_ptr(val) {
-                c.values.push(IoValue::Integer(wide));
+                c.values.push(IoValue::IntegerKind {
+                    value: wide,
+                    bit_width: 128,
+                });
             }
         }
     });
