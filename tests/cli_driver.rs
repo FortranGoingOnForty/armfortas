@@ -63450,6 +63450,14 @@ fn std_f2024_rejected_with_unknown_value_diagnostic() {
 
 #[test]
 fn recursive_runtime_bound_fixed_character_array_does_not_corrupt_heap() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=recursive_runtime_bound_fixed_character_array_does_not_corrupt_heap count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
     let src = write_program(
         r#"program p
   implicit none
@@ -63525,6 +63533,14 @@ end program p
 
 #[test]
 fn negative_boz_output_uses_the_data_items_integer_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=negative_boz_output_uses_the_data_items_integer_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
     let src = write_program(
         r#"program p
   use iso_fortran_env, only: int8, int16, int32, int64
