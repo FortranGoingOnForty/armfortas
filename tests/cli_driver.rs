@@ -63447,3 +63447,78 @@ fn std_f2024_rejected_with_unknown_value_diagnostic() {
         stderr
     );
 }
+
+#[test]
+fn recursive_runtime_bound_fixed_character_array_does_not_corrupt_heap() {
+    let src = write_program(
+        r#"program p
+  implicit none
+
+  type :: command_t
+    character(len=:), allocatable :: tokens(:)
+  end type command_t
+
+  type(command_t) :: cmd
+
+  allocate(character(len=4096) :: cmd%tokens(5))
+  cmd%tokens = ''
+  cmd%tokens(1) = '[['
+  cmd%tokens(2) = '!'
+  cmd%tokens(3) = '-e'
+  cmd%tokens(4) = 'missing'
+  cmd%tokens(5) = ']]'
+  if (evaluate(cmd%tokens, 5) /= 0) error stop 1
+  print *, 'ok'
+contains
+  recursive integer function evaluate(items, count) result(status)
+    character(len=*), intent(in) :: items(:)
+    integer, intent(in) :: count
+    integer :: i
+
+    status = 1
+    if (count >= 4 .and. trim(items(2)) == '!') then
+      block
+        character(len=len(items)) :: tail(count - 1)
+        if (size(tail) /= count - 1) error stop 7
+        tail(1) = items(1)
+        do i = 3, count
+          tail(i - 1) = items(i)
+        end do
+        status = evaluate(tail, count - 1)
+        if (status == 1) status = 0
+      end block
+      return
+    end if
+    if (count /= 4) error stop 2
+    if (trim(items(1)) /= '[[') error stop 3
+    if (trim(items(2)) /= '-e') error stop 4
+    if (trim(items(3)) /= 'missing') error stop 5
+    if (trim(items(4)) /= ']]') error stop 6
+  end function evaluate
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("recursive_runtime_char_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("recursive runtime character-array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "recursive runtime character-array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("recursive runtime character-array binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "recursive runtime character-array binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}

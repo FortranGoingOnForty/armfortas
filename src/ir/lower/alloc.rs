@@ -55,6 +55,80 @@ fn declared_derived_info_name(
     }
 }
 
+fn lower_explicit_shape_dim_buffer(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    specs: &[ArraySpec],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+    type_layouts: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> ValueId {
+    if specs.is_empty() {
+        return b.const_i64(0);
+    }
+
+    let dim_buf = b.alloca(IrType::Array(
+        Box::new(IrType::Int(IntWidth::I8)),
+        (specs.len() * 24) as u64,
+    ));
+    let one_i64 = b.const_i64(1);
+    let mut running_stride = one_i64;
+    for (i, spec) in specs.iter().enumerate() {
+        let (lo64, up64) = match spec {
+            ArraySpec::Explicit { lower, upper } => {
+                let lo64 = lower
+                    .as_ref()
+                    .and_then(|expr| eval_const_array_bound(expr, param_consts, Some(st)))
+                    .map(|value| b.const_i64(value))
+                    .unwrap_or_else(|| {
+                        if let Some(expr) = lower.as_ref() {
+                            let raw = super::expr::lower_expr_with_optional_layouts(
+                                b,
+                                locals,
+                                expr,
+                                st,
+                                Some(type_layouts),
+                            );
+                            widen_to_i64(b, raw)
+                        } else {
+                            b.const_i64(1)
+                        }
+                    });
+                let up64 = eval_const_array_bound(upper, param_consts, Some(st))
+                    .map(|value| b.const_i64(value))
+                    .unwrap_or_else(|| {
+                        let raw = super::expr::lower_expr_with_optional_layouts(
+                            b,
+                            locals,
+                            upper,
+                            st,
+                            Some(type_layouts),
+                        );
+                        widen_to_i64(b, raw)
+                    });
+                (lo64, up64)
+            }
+            _ => (b.const_i64(1), b.const_i64(1)),
+        };
+        let base = (i * 24) as i64;
+        let off_lo = b.const_i64(base);
+        let off_up = b.const_i64(base + 8);
+        let off_st = b.const_i64(base + 16);
+        let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
+        let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
+        let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
+        b.store(lo64, p_lo);
+        b.store(up64, p_up);
+        b.store(running_stride, p_st);
+        if i + 1 < specs.len() {
+            let span = b.isub(up64, lo64);
+            let extent = b.iadd(span, one_i64);
+            running_stride = b.imul(running_stride, extent);
+        }
+    }
+    dim_buf
+}
+
 /// Allocate local variables from declarations. Handles both scalars and arrays.
 pub(crate) fn alloc_decls(
     b: &mut FuncBuilder,
@@ -388,89 +462,16 @@ pub(crate) fn alloc_decls(
                         );
 
                         let rank = specs.len();
-                        let one_i64 = b.const_i64(1);
-                        let dim_buf = if rank == 0 {
-                            b.const_i64(0)
-                        } else {
-                            let dim_buf_bytes = (rank * 24) as u64;
-                            let dim_buf = b.alloca(IrType::Array(
-                                Box::new(IrType::Int(IntWidth::I8)),
-                                dim_buf_bytes,
-                            ));
-                            // Column-major stride accumulator: dim[k].stride =
-                            // product(extents[0..k]). Without this, every dim
-                            // got stride=1 — `center(i, :) = ...` walked the
-                            // row axis in element-stride-1 (touching only the
-                            // first column entry per row) instead of the
-                            // column axis in stride=m, so multi-dim section
-                            // assigns to a runtime-shape local silently
-                            // wrote bogus values.
-                            let mut running_stride = one_i64;
-                            for (i, spec) in specs.iter().enumerate() {
-                                let (lo64, up64) = match spec {
-                                    ArraySpec::Explicit { lower, upper } => {
-                                        let lo64 = lower
-                                            .as_ref()
-                                            .and_then(|expr| {
-                                                eval_const_array_bound(
-                                                    expr,
-                                                    &param_consts,
-                                                    Some(st),
-                                                )
-                                            })
-                                            .map(|value| b.const_i64(value))
-                                            .unwrap_or_else(|| {
-                                                if let Some(expr) = lower.as_ref() {
-                                                    let raw = super::expr::lower_expr_with_optional_layouts(
-                                                        b,
-                                                        locals,
-                                                        expr,
-                                                        st,
-                                                        Some(type_layouts),
-                                                    );
-                                                    widen_to_i64(b, raw)
-                                                } else {
-                                                    b.const_i64(1)
-                                                }
-                                            });
-                                        let up64 = eval_const_array_bound(
-                                            upper,
-                                            &param_consts,
-                                            Some(st),
-                                        )
-                                        .map(|value| b.const_i64(value))
-                                        .unwrap_or_else(|| {
-                                            let raw = super::expr::lower_expr_with_optional_layouts(
-                                                b,
-                                                locals,
-                                                upper,
-                                                st,
-                                                Some(type_layouts),
-                                            );
-                                            widen_to_i64(b, raw)
-                                        });
-                                        (lo64, up64)
-                                    }
-                                    _ => (b.const_i64(1), b.const_i64(1)),
-                                };
-                                let base = (i * 24) as i64;
-                                let off_lo = b.const_i64(base);
-                                let off_up = b.const_i64(base + 8);
-                                let off_st = b.const_i64(base + 16);
-                                let p_lo = b.gep(dim_buf, vec![off_lo], IrType::Int(IntWidth::I8));
-                                let p_up = b.gep(dim_buf, vec![off_up], IrType::Int(IntWidth::I8));
-                                let p_st = b.gep(dim_buf, vec![off_st], IrType::Int(IntWidth::I8));
-                                b.store(lo64, p_lo);
-                                b.store(up64, p_up);
-                                b.store(running_stride, p_st);
-                                if i + 1 < rank {
-                                    let span = b.isub(up64, lo64);
-                                    let extent = b.iadd(span, one_i64);
-                                    running_stride = b.imul(running_stride, extent);
-                                }
-                            }
-                            dim_buf
-                        };
+                        // Column-major stride accumulator: dim[k].stride =
+                        // product(extents[0..k]).
+                        let dim_buf = lower_explicit_shape_dim_buffer(
+                            b,
+                            locals,
+                            specs,
+                            &param_consts,
+                            st,
+                            type_layouts,
+                        );
 
                         let elem_size = b.const_i64(ir_scalar_byte_size(&array_elem_ty, b.layout));
                         let rank_val = b.const_i32(rank as i32);
@@ -921,16 +922,35 @@ pub(crate) fn alloc_decls(
                                 IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                             );
 
-                            let n = b.const_i64(total_size.max(0));
+                            // A runtime character length does not imply a
+                            // static array extent.  Build the descriptor from
+                            // every declared bound so `character(len(items))
+                            // :: tail(count - 1)` allocates COUNT-1 elements,
+                            // rather than the `(1, 0)` static-analysis
+                            // sentinel collapsing to one element.
+                            let dim_buf = lower_explicit_shape_dim_buffer(
+                                b,
+                                locals,
+                                specs,
+                                &param_consts,
+                                st,
+                                type_layouts,
+                            );
+                            let rank = b.const_i32(specs.len() as i32);
+                            let stat_slot = b.alloca(IrType::Int(IntWidth::I32));
                             b.call(
-                                FuncRef::External("afs_allocate_1d".into()),
-                                vec![addr, len_val, n],
+                                FuncRef::External("afs_allocate_array".into()),
+                                vec![addr, len_val, rank, dim_buf, stat_slot],
                                 IrType::Void,
                             );
-                            rewrite_heap_promoted_declared_bounds(b, addr, &dims);
 
                             let base = b
                                 .load_typed(addr, IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
+                            let n = b.call(
+                                FuncRef::External("afs_array_size".into()),
+                                vec![addr],
+                                IrType::Int(IntWidth::I64),
+                            );
                             let total_bytes = b.imul(len_val, n);
                             let space = b.const_i32(b' ' as i32);
                             b.call(
