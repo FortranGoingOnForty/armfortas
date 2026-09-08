@@ -63595,3 +63595,202 @@ end program p
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn array_result_assigns_through_every_rank_two_section_stride() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_result_assigns_through_every_rank_two_section_stride count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // A descriptor result is traversed in array element order, but so is the
+    // destination. Using only dim(1)%stride for the latter never advanced to
+    // the next column of a noncontiguous rank-2 section.
+    let src = write_program(
+        r#"module m
+  implicit none
+contains
+  function outer_product(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z(size(x), size(y))
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end function outer_product
+
+  subroutine fill_section(a, x, y)
+    real(8), intent(out) :: a(:, :)
+    real(8), intent(in) :: x(:), y(:)
+    a = outer_product(x, y)
+  end subroutine fill_section
+end module m
+
+program p
+  use m
+  implicit none
+  real(8) :: backing(6, 4), x(3), y(2)
+  backing = -99.0_8
+  x = [1.0_8, 2.0_8, 3.0_8]
+  y = [10.0_8, 20.0_8]
+  call fill_section(backing(1:6:2, 1:4:2), x, y)
+  if (any(backing(1:6:2, 1:4:2) /= &
+      reshape([10.0_8, 20.0_8, 30.0_8, 20.0_8, 40.0_8, 60.0_8], [3, 2]))) error stop 1
+  if (any(backing(2:6:2, :) /= -99.0_8)) error stop 2
+  if (any(backing(:, 2:4:2) /= -99.0_8)) error stop 3
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("rank_two_section_array_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-2 section array-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-2 section array-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-2 section array-result failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-2 section array-result failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn self_update_with_array_result_uses_one_rank_aware_pass() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=self_update_with_array_result_uses_one_rank_aware_pass count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // PRIMA's UOBYQA update has this shape with a 5150x5151 matrix. The
+    // general expression path used to allocate the function result, a full
+    // binary result, and an alias snapshot, then traverse the matrix twice.
+    let src = write_program(
+        r#"module m
+  implicit none
+contains
+  function outer_product(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z(size(x), size(y))
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end function outer_product
+
+  subroutine update(a, x, y)
+    real(8), intent(inout) :: a(:, :)
+    real(8), intent(in) :: x(:), y(:)
+    a = a - outer_product(x, y)
+  end subroutine update
+
+  subroutine update_reversed(a, x, y)
+    real(8), intent(inout) :: a(:, :)
+    real(8), intent(in) :: x(:), y(:)
+    a = outer_product(x, y) - a
+  end subroutine update_reversed
+end module m
+
+program p
+  use m
+  implicit none
+  real(8) :: backing(6, 4), contiguous(3, 2), x(3), y(2)
+  backing = -99.0_8
+  backing(1:6:2, 1:4:2) = reshape([11.0_8, 21.0_8, 31.0_8, &
+                                           21.0_8, 41.0_8, 61.0_8], [3, 2])
+  x = [1.0_8, 2.0_8, 3.0_8]
+  y = [10.0_8, 20.0_8]
+  call update(backing(1:6:2, 1:4:2), x, y)
+  if (any(abs(backing(1:6:2, 1:4:2) - 1.0_8) > 1.0e-12_8)) error stop 1
+  if (any(backing(2:6:2, :) /= -99.0_8)) error stop 2
+  if (any(backing(:, 2:4:2) /= -99.0_8)) error stop 3
+
+  contiguous = reshape([11.0_8, 21.0_8, 31.0_8, &
+                                 21.0_8, 41.0_8, 61.0_8], [3, 2])
+  call update(contiguous, x, y)
+  if (any(abs(contiguous - 1.0_8) > 1.0e-12_8)) error stop 4
+
+  contiguous = 1.0_8
+  call update_reversed(contiguous, x, y)
+  if (any(abs(contiguous - reshape([9.0_8, 19.0_8, 29.0_8, &
+                                    19.0_8, 39.0_8, 59.0_8], [3, 2])) > 1.0e-12_8)) error stop 5
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let ir = unique_path("pointwise_self_array_update", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("pointwise self-update IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "pointwise self-update IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read pointwise self-update IR");
+    assert!(
+        ir_text.contains("pointwise_self_update_body"),
+        "self-update should use the direct rank-aware loop:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("call @afs_array_sub_f64("),
+        "contiguous self-update should dispatch to the bulk arithmetic kernel:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @afs_copy_array_data("),
+        "self-update should not snapshot an already-independent array result:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("pointwise_self_array_update", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("pointwise self-update compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "pointwise self-update compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("pointwise self-update failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "pointwise self-update failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

@@ -40687,6 +40687,7 @@ pub(super) fn actual_is_descriptor_backed(
 }
 
 const DESC_CHAR_SLOT_TABLE: i32 = 1 << 3;
+const DESC_CONTIGUOUS: i32 = armfortas_rt::descriptor::DESC_CONTIGUOUS as i32;
 const DESC_ASSUMED_SIZE: i32 = armfortas_rt::descriptor::DESC_ASSUMED_SIZE as i32;
 
 pub(super) fn array_descriptor_addr(b: &mut FuncBuilder, info: &LocalInfo) -> ValueId {
@@ -53270,6 +53271,213 @@ fn deallocate_dynamic_derived_array_expr_descriptor_if_temp(
     }
 }
 
+fn is_whole_named_array(expr: &crate::ast::expr::SpannedExpr, name: &str) -> bool {
+    match &expr.node {
+        Expr::Name { name: candidate } => candidate.eq_ignore_ascii_case(name),
+        Expr::ParenExpr { inner } => is_whole_named_array(inner, name),
+        _ => false,
+    }
+}
+
+/// Lower `a = a op temporary_array` (and the reversed operand order) without
+/// materializing the complete binary result. The independent operand is
+/// evaluated first, preserving whole-RHS evaluation, then each destination
+/// element is read, combined, and written through its full rank-N descriptor.
+///
+/// This is only valid when the non-destination operand owns fresh storage.
+/// A borrowed array under another name could overlap the destination through
+/// pointer association, in which case an in-place traversal would not preserve
+/// array-assignment semantics.
+fn try_lower_pointwise_self_array_assign(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_name: &str,
+    dest_info: &LocalInfo,
+    value: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    if dest_name.is_empty()
+        || dest_info.derived_type.is_some()
+        || dest_info.char_kind != CharKind::None
+        || local_declared_rank(dest_info) == 0
+    {
+        return false;
+    }
+    if ctx
+        .st
+        .lookup_local_then_any(ctx.proc_scope_id, &dest_name.to_lowercase())
+        .is_some_and(|sym| sym.attrs.allocatable)
+    {
+        return false;
+    }
+
+    let Expr::BinaryOp { op, left, right } = &value.node else {
+        return false;
+    };
+    if !matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+    ) {
+        return false;
+    }
+
+    let (other, dest_is_left) =
+        if is_whole_named_array(left, dest_name) && !expr_mentions_name(right, dest_name) {
+            (right.as_ref(), true)
+        } else if is_whole_named_array(right, dest_name) && !expr_mentions_name(left, dest_name) {
+            (left.as_ref(), false)
+        } else {
+            return false;
+        };
+
+    // Only owning expressions establish the non-overlap required for an
+    // in-place update. In particular, leave `a = a + b` on the conservative
+    // path because b may be a pointer alias of a.
+    if !array_expr_descriptor_may_own_temp(other, &ctx.locals, ctx.st) {
+        return false;
+    }
+    let dest_rank = local_declared_rank(dest_info).max(1);
+    let Some(other_rank) = actual_expr_rank(other, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+    else {
+        return false;
+    };
+    if other_rank == 0 || other_rank != dest_rank {
+        return false;
+    }
+
+    let Some(op_elem_ty) =
+        operator_expr_type_info(value, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+            .map(|ty| type_info_to_ir_type(&ty))
+            .filter(|ty| matches!(ty, IrType::Int(_) | IrType::Float(_)))
+    else {
+        return false;
+    };
+    let Some(other_semantic_ty) =
+        operator_expr_type_info(other, Some(&ctx.locals), ctx.st, Some(ctx.type_layouts))
+            .map(|ty| type_info_to_ir_type(&ty))
+            .filter(|ty| matches!(ty, IrType::Int(_) | IrType::Float(_)))
+    else {
+        return false;
+    };
+
+    let Some((other_desc, other_elem_ty)) = lower_array_expr_descriptor(
+        b,
+        &ctx.locals,
+        other,
+        ctx.st,
+        Some(ctx.type_layouts),
+        Some(ctx.internal_funcs),
+        Some(ctx.contained_host_refs),
+        Some(ctx.descriptor_params),
+    ) else {
+        return false;
+    };
+    // The descriptor element type is authoritative for storage. The semantic
+    // pre-check above makes this branch unreachable for a valid intrinsic
+    // arithmetic expression, but keep malformed input off the direct path.
+    if !matches!(other_elem_ty, IrType::Int(_) | IrType::Float(_))
+        || !matches!(other_semantic_ty, IrType::Int(_) | IrType::Float(_))
+    {
+        deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, other, ctx.st, other_desc);
+        return false;
+    }
+
+    let dest_desc = if local_uses_array_descriptor(dest_info) {
+        array_descriptor_addr(b, dest_info)
+    } else {
+        materialize_array_descriptor_for_info(b, dest_info)
+    };
+    let n = array_total_elems_value(b, dest_info);
+    let contiguous_kernel = if op_elem_ty == dest_info.ty && op_elem_ty == other_elem_ty {
+        bulk_array_binary_runtime_name(op.clone(), &op_elem_ty)
+    } else {
+        None
+    };
+    let bb_strided = b.create_block("pointwise_self_update_strided");
+    let bb_done = b.create_block("pointwise_self_update_done");
+    if let Some(kernel) = contiguous_kernel {
+        let marker = b.const_i32(DESC_CONTIGUOUS);
+        let zero32 = b.const_i32(0);
+        let dest_flags = descriptor_flags(b, dest_desc);
+        let other_flags = descriptor_flags(b, other_desc);
+        let dest_bits = b.bit_and(dest_flags, marker);
+        let other_bits = b.bit_and(other_flags, marker);
+        let dest_contiguous = b.icmp(CmpOp::Ne, dest_bits, zero32);
+        let other_contiguous = b.icmp(CmpOp::Ne, other_bits, zero32);
+        let both_contiguous = b.and(dest_contiguous, other_contiguous);
+        let bb_contiguous = b.create_block("pointwise_self_update_contiguous");
+        b.cond_branch(both_contiguous, bb_contiguous, vec![], bb_strided, vec![]);
+
+        b.set_block(bb_contiguous);
+        let dest_base = b.load_typed(dest_desc, IrType::Ptr(Box::new(op_elem_ty.clone())));
+        let other_base = b.load_typed(other_desc, IrType::Ptr(Box::new(op_elem_ty.clone())));
+        let (lhs_base, rhs_base) = if dest_is_left {
+            (dest_base, other_base)
+        } else {
+            (other_base, dest_base)
+        };
+        b.call(
+            FuncRef::External(kernel.into()),
+            vec![dest_base, lhs_base, rhs_base, n],
+            IrType::Void,
+        );
+        b.branch(bb_done, vec![]);
+    } else {
+        b.branch(bb_strided, vec![]);
+    }
+
+    b.set_block(bb_strided);
+    let i_addr = b.alloca(IrType::Int(IntWidth::I64));
+    let zero = b.const_i64(0);
+    b.store(zero, i_addr);
+
+    let bb_check = b.create_block("pointwise_self_update_check");
+    let bb_body = b.create_block("pointwise_self_update_body");
+    let bb_exit = b.create_block("pointwise_self_update_exit");
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_check);
+    let i = b.load(i_addr);
+    let done = b.icmp(CmpOp::Ge, i, n);
+    b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
+
+    b.set_block(bb_body);
+    let idx = b.load(i_addr);
+    let dest_raw = load_array_desc_elem_rank(b, dest_desc, &dest_info.ty, idx, dest_rank);
+    let other_raw =
+        load_array_desc_elem_rank(b, other_desc, &other_elem_ty, idx, other_rank.max(1));
+    let dest_val = coerce_to_type(b, dest_raw, &op_elem_ty);
+    let other_val = coerce_to_type(b, other_raw, &op_elem_ty);
+    let (lhs, rhs) = if dest_is_left {
+        (dest_val, other_val)
+    } else {
+        (other_val, dest_val)
+    };
+    let result = match (&op_elem_ty, op) {
+        (IrType::Int(_), BinaryOp::Add) => b.iadd(lhs, rhs),
+        (IrType::Int(_), BinaryOp::Sub) => b.isub(lhs, rhs),
+        (IrType::Int(_), BinaryOp::Mul) => b.imul(lhs, rhs),
+        (IrType::Int(_), BinaryOp::Div) => b.idiv(lhs, rhs),
+        (IrType::Float(_), BinaryOp::Add) => b.fadd(lhs, rhs),
+        (IrType::Float(_), BinaryOp::Sub) => b.fsub(lhs, rhs),
+        (IrType::Float(_), BinaryOp::Mul) => b.fmul(lhs, rhs),
+        (IrType::Float(_), BinaryOp::Div) => b.fdiv(lhs, rhs),
+        _ => unreachable!("pointwise self-update type/operator was guarded"),
+    };
+    store_array_desc_elem_rank(b, dest_desc, &dest_info.ty, idx, dest_rank, result);
+
+    let one = b.const_i64(1);
+    let next = b.iadd(idx, one);
+    b.store(next, i_addr);
+    b.branch(bb_check, vec![]);
+
+    b.set_block(bb_exit);
+    b.branch(bb_done, vec![]);
+
+    b.set_block(bb_done);
+    deallocate_array_expr_descriptor_if_temp(b, &ctx.locals, other, ctx.st, other_desc);
+    true
+}
+
 /// Lower whole-array assignment: a = b (element-wise copy) or a = scalar (broadcast).
 pub(super) fn lower_array_assign(
     b: &mut FuncBuilder,
@@ -53892,6 +54100,10 @@ pub(super) fn lower_array_assign(
         return;
     }
 
+    if try_lower_pointwise_self_array_assign(b, ctx, dest_name, dest_info, value) {
+        return;
+    }
+
     // a = [v0, v1, v2, ...] — element-wise store of an array
     // constructor's literal values into the destination.
     if let Expr::ArrayConstructor { values, .. } = &value.node {
@@ -54305,17 +54517,16 @@ pub(super) fn lower_array_assign(
                 } else {
                     None
                 };
-                let dest_base = array_base_addr(b, dest_info);
                 let n = array_total_elems_value(b, dest_info);
-                let dest_elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
-                // For descriptor-backed dests, use the destination's stride;
-                // for fixed-size dests, just use elem_bytes.
-                let dest_stride = if local_uses_array_descriptor(dest_info) {
-                    let dest_desc = array_descriptor_addr(b, dest_info);
-                    load_array_desc_i64_field(b, dest_desc, 24 + 16)
+                let dest_desc = if local_uses_array_descriptor(dest_info) {
+                    array_descriptor_addr(b, dest_info)
                 } else {
-                    b.const_i64(1)
+                    materialize_array_descriptor_for_info(b, dest_info)
                 };
+                let dest_rank = local_declared_rank(dest_info).max(1);
+                let src_rank = actual_expr_rank(value, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                    .unwrap_or(dest_rank)
+                    .max(1);
                 let i_addr = b.alloca(IrType::Int(IntWidth::I64));
                 let zero = b.const_i64(0);
                 b.store(zero, i_addr);
@@ -54329,18 +54540,16 @@ pub(super) fn lower_array_assign(
                 b.cond_branch(done, bb_ext, vec![], bb_bdy, vec![]);
                 b.set_block(bb_bdy);
                 let iv = b.load(i_addr);
-                let logical_idx = b.imul(iv, dest_stride);
-                let doff = b.imul(logical_idx, dest_elem_bytes);
-                let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
+                let dp = array_desc_elem_ptr_rank(b, dest_desc, &dest_info.ty, iv, dest_rank);
                 if is_complex_ty(&dest_info.ty) {
                     let copy_bytes = b.const_i64(complex_byte_size(&dest_info.ty));
                     let src_ptr = if is_complex_ty(&src_elem_ty)
                         && complex_float_width(&src_elem_ty) == complex_float_width(&dest_info.ty)
                     {
-                        rank1_array_desc_elem_ptr(b, copy_src_desc, &src_elem_ty, iv)
+                        array_desc_elem_ptr_rank(b, copy_src_desc, &src_elem_ty, iv, src_rank)
                     } else {
                         let src_val =
-                            load_rank1_array_desc_elem(b, copy_src_desc, &src_elem_ty, iv);
+                            load_array_desc_elem_rank(b, copy_src_desc, &src_elem_ty, iv, src_rank);
                         materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))
                     };
                     b.call(
@@ -54349,7 +54558,8 @@ pub(super) fn lower_array_assign(
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
                 } else {
-                    let elem_val = load_rank1_array_desc_elem(b, copy_src_desc, &src_elem_ty, iv);
+                    let elem_val =
+                        load_array_desc_elem_rank(b, copy_src_desc, &src_elem_ty, iv, src_rank);
                     let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
                     b.store(coerced, dp);
                 }
