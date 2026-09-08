@@ -63794,3 +63794,103 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn rank_one_whole_array_rhs_fuses_into_column_section_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_one_whole_array_rhs_fuses_into_column_section_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // PRIMA's OUTPROD fills a rank-two function result one column at a
+    // time. The section scalarizer handled x(:) but rejected the equivalent
+    // bare rank-one operand x, materializing and freeing a vector temporary
+    // for every column before copying it into z(:, j).
+    let src = write_program(
+        r#"module outprod_fusion_m
+  implicit none
+contains
+  function outer_product(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z(size(x), size(y))
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end function outer_product
+end module outprod_fusion_m
+
+program p
+  use outprod_fusion_m, only : outer_product
+  implicit none
+  real(8) :: got(3, 2)
+  got = outer_product([1.0_8, 2.0_8, 3.0_8], [4.0_8, 5.0_8])
+  if (any(got(:, 1) /= [4.0_8, 8.0_8, 12.0_8])) error stop 1
+  if (any(got(:, 2) /= [5.0_8, 10.0_8, 15.0_8])) error stop 2
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let ir = unique_path("rank_one_column_rhs_fusion", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-one column RHS IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "rank-one column RHS IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read rank-one column RHS IR");
+    let marker = "func @afs_modproc_outprod_fusion_m_outer_product";
+    let function_ir = ir_text
+        .split_once(marker)
+        .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+        .expect("missing outer_product IR");
+    assert!(
+        function_ir.contains("md_section_check"),
+        "column assignment should retain one direct section loop:\n{}",
+        function_ir
+    );
+    assert!(
+        !function_ir.contains("afs_allocate_like_with_elem_size")
+            && !function_ir.contains("afs_deallocate_array")
+            && !function_ir.contains("array_expr_check"),
+        "column assignment should not materialize a per-column RHS descriptor:\n{}",
+        function_ir
+    );
+
+    let out = unique_path("rank_one_column_rhs_fusion", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-one column RHS compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-one column RHS compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-one column RHS binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-one column RHS binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

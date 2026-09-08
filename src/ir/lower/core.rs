@@ -51184,12 +51184,20 @@ fn can_scalarize_multi_d_section_expr(
         | Expr::BozLiteral { .. }
         | Expr::ComplexLiteral { .. }
         | Expr::NilArgument => true,
-        Expr::Name { name } => {
-            // A bare array name is a whole-array operand, not a scalar.
-            !locals
-                .get(&name.to_lowercase())
-                .is_some_and(local_is_array_like)
-        }
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .filter(|info| local_is_array_like(info))
+            .map_or(true, |info| {
+                // A rank-one whole-array operand is conformable with the
+                // rank-one destination section and the scalarizer below can
+                // rewrite it to `name(loop_var)`.  Reject pointer-backed
+                // views and higher-rank arrays: the former may overlap the
+                // destination and the latter cannot be indexed by the one
+                // synthetic section coordinate.
+                !info.is_pointer
+                    && local_declared_rank(info) == 1
+                    && !name.eq_ignore_ascii_case(dest_name)
+            }),
         Expr::ParenExpr { inner } | Expr::UnaryOp { operand: inner, .. } => {
             can_scalarize_multi_d_section_expr(
                 inner,
@@ -51374,7 +51382,8 @@ pub(super) fn lower_multi_d_section_assign(
     // iteration. This avoids materializing every binary subexpression in a
     // heap-backed descriptor while retaining the general snapshot path for
     // potentially overlapping sections.
-    let scalarized_value = if matches!(dest_info.ty, IrType::Int(_) | IrType::Float(_))
+    let scalarized_value = if n_dims == 1
+        && matches!(dest_info.ty, IrType::Int(_) | IrType::Float(_))
         && !dest_info.is_pointer
         && !dest_name.is_empty()
         && can_scalarize_multi_d_section_expr(
@@ -51392,7 +51401,15 @@ pub(super) fn lower_multi_d_section_assign(
             Some(ctx.type_layouts),
         ) {
         let loop_var = fresh_synth_loop_var(&ctx.locals);
-        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, dest_info, &loop_var).and_then(
+        // The expression is conformable with the rank-one LHS section, not
+        // necessarily with the rank of its base array.  Present that section
+        // rank to the shared rewriter so a bare rank-one operand such as `x`
+        // in `z(:, j) = x * y(j)` becomes `x(loop_var)` instead of being
+        // materialized in a heap-backed temporary descriptor.
+        let mut section_info = dest_info.clone();
+        section_info.dims = vec![(1, 0)];
+        section_info.runtime_dim_upper = vec![None];
+        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, &section_info, &loop_var).and_then(
             |(mapped, changed)| {
                 if !changed {
                     return None;
