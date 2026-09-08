@@ -63821,15 +63821,39 @@ contains
       z(:, j) = x * y(j)
     end do
   end function outer_product
+
+  subroutine fill_columns(z, x, y)
+    real(8), intent(out) :: z(:, :)
+    real(8), intent(in) :: x(:), y(:)
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end subroutine fill_columns
 end module outprod_fusion_m
 
 program p
-  use outprod_fusion_m, only : outer_product
+  use outprod_fusion_m, only : outer_product, fill_columns
   implicit none
   real(8) :: got(3, 2)
+  real(8) :: backing(6), canvas(6, 4), x(3), y(2)
   got = outer_product([1.0_8, 2.0_8, 3.0_8], [4.0_8, 5.0_8])
   if (any(got(:, 1) /= [4.0_8, 8.0_8, 12.0_8])) error stop 1
   if (any(got(:, 2) /= [5.0_8, 10.0_8, 15.0_8])) error stop 2
+
+  backing = [1.0_8, -1.0_8, 2.0_8, -1.0_8, 3.0_8, -1.0_8]
+  got = outer_product(backing(1:6:2), [4.0_8, 5.0_8])
+  if (any(got(:, 1) /= [4.0_8, 8.0_8, 12.0_8])) error stop 3
+  if (any(got(:, 2) /= [5.0_8, 10.0_8, 15.0_8])) error stop 4
+
+  canvas = -99.0_8
+  x = [1.0_8, 2.0_8, 3.0_8]
+  y = [4.0_8, 5.0_8]
+  call fill_columns(canvas(1:6:2, 1:4:2), x, y)
+  if (any(canvas(1:6:2, 1:4:2) /= reshape([4.0_8, 8.0_8, 12.0_8, &
+                                             5.0_8, 10.0_8, 15.0_8], [3, 2]))) error stop 5
+  if (any(canvas(2:6:2, :) /= -99.0_8)) error stop 6
+  if (any(canvas(:, 2:4:2) /= -99.0_8)) error stop 7
   print *, 'ok'
 end program p
 "#,
@@ -63859,7 +63883,12 @@ end program p
         .expect("missing outer_product IR");
     assert!(
         function_ir.contains("md_section_check"),
-        "column assignment should retain one direct section loop:\n{}",
+        "column assignment should retain a stride-aware fallback loop:\n{}",
+        function_ir
+    );
+    assert!(
+        function_ir.contains("call @afs_array_mul_scalar_f64("),
+        "contiguous column assignment should dispatch to the bulk kernel:\n{}",
         function_ir
     );
     assert!(
