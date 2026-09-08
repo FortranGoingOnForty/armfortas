@@ -64245,3 +64245,182 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn squared_column_distances_dispatch_to_fused_runtime_kernel() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=squared_column_distances_dispatch_to_fused_runtime_kernel count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // PRIMA repeatedly computes the squared Euclidean distance from every
+    // matrix column to one vector. The general array-expression path builds
+    // and traverses full SPREAD, subtraction, and square temporaries before
+    // SUM(DIM=1). Pin a one-pass descriptor kernel while retaining generic
+    // lowering whenever the arithmetic or VOLATILE contract does not match.
+    let src = write_program(
+        r#"module squared_column_distance_m
+  implicit none
+contains
+  subroutine distances8(matrix, vector, result)
+    real(8), intent(in) :: matrix(:, :), vector(:)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum((matrix - spread(vector, dim=2, ncopies=size(matrix, 2)))**2, dim=1)
+  end subroutine distances8
+
+  subroutine distances8_expr(matrix, delta, result)
+    real(8), intent(in) :: matrix(:, :), delta(:)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum((matrix - spread(matrix(:, 2) + delta, dim=2, &
+      ncopies=size(matrix, 2)))**2, dim=1)
+  end subroutine distances8_expr
+
+  subroutine distances8_section(matrix, vector, result)
+    real(8), intent(in) :: matrix(:, :), vector(:)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum((matrix(:, 3:1:-1) - spread(vector, dim=2, ncopies=3))**2, dim=1)
+  end subroutine distances8_section
+
+  subroutine distances4(matrix, vector, result)
+    real(4), intent(in) :: matrix(:, :), vector(:)
+    real(4), allocatable, intent(out) :: result(:)
+    result = sum((matrix - spread(vector, dim=2, ncopies=size(matrix, 2)))**2, dim=1)
+  end subroutine distances4
+
+  subroutine cubic_fallback(matrix, vector, result)
+    real(8), intent(in) :: matrix(:, :), vector(:)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum((matrix - spread(vector, dim=2, ncopies=size(matrix, 2)))**3, dim=1)
+  end subroutine cubic_fallback
+
+  subroutine volatile_fallback(matrix, vector, result)
+    real(8), intent(in), volatile :: matrix(:, :)
+    real(8), intent(in) :: vector(:)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum((matrix - spread(vector, dim=2, ncopies=size(matrix, 2)))**2, dim=1)
+  end subroutine volatile_fallback
+end module squared_column_distance_m
+
+program p
+  use squared_column_distance_m
+  implicit none
+  real(8) :: matrix8(3, 3), vector8(3), delta8(3)
+  real(4) :: matrix4(3, 3), vector4(3)
+  real(8), allocatable :: result8(:), empty_matrix(:, :), empty_vector(:)
+  real(4), allocatable :: result4(:)
+
+  matrix8 = reshape([1.0_8, 2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8, &
+                     7.0_8, 8.0_8, 9.0_8], [3, 3])
+  matrix4 = real(matrix8, 4)
+  vector8 = [1.0_8, 2.0_8, 3.0_8]
+  vector4 = real(vector8, 4)
+  delta8 = 1.0_8
+
+  call distances8(matrix8, vector8(3:1:-1), result8)
+  if (any(result8 /= [8.0_8, 35.0_8, 116.0_8])) error stop 1
+  call distances8(matrix8(3:1:-1, 3:1:-1), vector8, result8)
+  if (any(result8 /= [116.0_8, 35.0_8, 8.0_8])) error stop 2
+  call distances8_expr(matrix8, delta8, result8)
+  if (any(result8 /= [48.0_8, 3.0_8, 12.0_8])) error stop 3
+  call distances8_section(matrix8, vector8, result8)
+  if (any(result8 /= [108.0_8, 27.0_8, 0.0_8])) error stop 4
+  call distances4(matrix4, vector4(3:1:-1), result4)
+  if (any(result4 /= [8.0_4, 35.0_4, 116.0_4])) error stop 5
+
+  allocate(empty_matrix(0, 3), empty_vector(0))
+  call distances8(empty_matrix, empty_vector, result8)
+  if (size(result8) /= 3 .or. any(result8 /= 0.0_8)) error stop 6
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+
+    let ir = unique_path("squared_column_distances", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("squared-column-distance IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "squared-column-distance IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read squared-column-distance IR");
+    let function_ir = |name: &str| {
+        let marker = format!("func @afs_modproc_squared_column_distance_m_{}", name);
+        ir_text
+            .split_once(&marker)
+            .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("missing {} IR", name))
+    };
+    for name in [
+        "distances8",
+        "distances8_expr",
+        "distances8_section",
+        "distances4",
+    ] {
+        let body = function_ir(name);
+        assert!(
+            body.contains("call @afs_array_squared_column_distances("),
+            "{} should dispatch to the fused squared-distance kernel:\n{}",
+            name,
+            body
+        );
+        assert!(
+            !body.contains("spread_array_check"),
+            "{} should not retain the replicated SPREAD temporary loop:\n{}",
+            name,
+            body
+        );
+        let elemental_loops = body.matches("\n    array_expr_check_").count();
+        let expected_elemental_loops = usize::from(name == "distances8_expr");
+        assert_eq!(
+            elemental_loops, expected_elemental_loops,
+            "{} should retain only an owning rank-one vector-expression temporary:\n{}",
+            name, body
+        );
+    }
+    for name in ["cubic_fallback", "volatile_fallback"] {
+        let body = function_ir(name);
+        assert!(
+            !body.contains("call @afs_array_squared_column_distances("),
+            "{} must retain generic lowering:\n{}",
+            name,
+            body
+        );
+    }
+
+    let out = unique_path("squared_column_distances", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("squared-column-distance compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "squared-column-distance compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("squared-column-distance binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "squared-column-distance failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
