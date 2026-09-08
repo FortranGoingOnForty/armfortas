@@ -4018,6 +4018,69 @@ mod tests {
     }
 
     #[test]
+    fn squared_column_distances_follow_signed_strides_and_real_kinds() {
+        let mut matrix8 = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mut vector8 = [1.0_f64, 2.0, 3.0];
+        let matrix8_desc = strided_descriptor(&mut matrix8, 8, &[3, 3], &[-1, -3]);
+        let vector8_desc = strided_descriptor(&mut vector8, 0, &[3], &[1]);
+        let mut result8 = ArrayDescriptor::zeroed();
+        afs_array_squared_column_distances(&matrix8_desc, &vector8_desc, 3, &mut result8);
+        assert_eq!(result8.rank, 1);
+        assert_eq!(result8.elem_size, 8);
+        assert_eq!(result8.dims[0].extent(), 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(result8.base_addr as *const f64, 3) },
+            [116.0, 35.0, 8.0]
+        );
+        afs_deallocate_array(&mut result8, ptr::null_mut());
+
+        let mut matrix4 = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mut vector4 = [1.0_f32, 2.0, 3.0];
+        let matrix4_desc = strided_descriptor(&mut matrix4, 0, &[3, 3], &[1, 3]);
+        let vector4_desc = strided_descriptor(&mut vector4, 2, &[3], &[-1]);
+        let mut result4 = ArrayDescriptor::zeroed();
+        afs_array_squared_column_distances(&matrix4_desc, &vector4_desc, 3, &mut result4);
+        assert_eq!(result4.rank, 1);
+        assert_eq!(result4.elem_size, 4);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(result4.base_addr as *const f32, 3) },
+            [8.0, 35.0, 116.0]
+        );
+        afs_deallocate_array(&mut result4, ptr::null_mut());
+    }
+
+    #[test]
+    fn squared_column_distances_preserve_empty_reduction_shape() {
+        let mut matrix = ArrayDescriptor::zeroed();
+        matrix.elem_size = 8;
+        matrix.rank = 2;
+        matrix.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+        matrix.dims[1] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 3,
+            stride: 1,
+        };
+        let mut vector = ArrayDescriptor::zeroed();
+        vector.elem_size = 8;
+        vector.rank = 1;
+        vector.dims[0] = matrix.dims[0];
+
+        let mut result = ArrayDescriptor::zeroed();
+        afs_array_squared_column_distances(&matrix, &vector, 3, &mut result);
+        assert_eq!(result.rank, 1);
+        assert_eq!(result.dims[0].extent(), 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(result.base_addr as *const f64, 3) },
+            [0.0, 0.0, 0.0]
+        );
+        afs_deallocate_array(&mut result, ptr::null_mut());
+    }
+
+    #[test]
     fn dot_product_kernels_follow_negative_rank_one_strides() {
         let mut real8_a = [1.0_f64, 2.0, 3.0, 4.0];
         let mut real8_b = [10.0_f64, 20.0, 30.0, 40.0];
@@ -8854,6 +8917,105 @@ pub extern "C" fn afs_array_reshape(
 fn rank_one_byte_offset(desc: &ArrayDescriptor, index: usize, minimum_elem_size: i64) -> isize {
     let elem_size = desc.elem_size.max(minimum_elem_size);
     (index as i64 * desc.dims[0].stride * elem_size) as isize
+}
+
+/// Compute the squared Euclidean distance between every column of a rank-2
+/// real matrix and a rank-1 real vector. This is the one-pass equivalent of
+/// `SUM((matrix - SPREAD(vector, DIM=2, NCOPIES=n))**2, DIM=1)` without the
+/// three full-rank array temporaries.
+#[no_mangle]
+pub extern "C" fn afs_array_squared_column_distances(
+    matrix: *const ArrayDescriptor,
+    vector: *const ArrayDescriptor,
+    ncopies: i64,
+    result: *mut ArrayDescriptor,
+) {
+    if matrix.is_null() || vector.is_null() || result.is_null() {
+        return;
+    }
+    let matrix = unsafe { &*matrix };
+    let vector = unsafe { &*vector };
+    if matrix.rank != 2
+        || vector.rank != 1
+        || !matches!(matrix.elem_size, 4 | 8)
+        || vector.elem_size != matrix.elem_size
+        || !descriptor_has_payload_or_zero_size_array(matrix)
+        || !descriptor_has_payload_or_zero_size_array(vector)
+    {
+        return;
+    }
+
+    let rows = matrix.dims[0].extent();
+    let columns = matrix.dims[1].extent();
+    if vector.dims[0].extent() != rows || ncopies != columns {
+        return;
+    }
+
+    if !unsafe { &*result }.is_allocated() {
+        let dim = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: columns,
+            stride: 1,
+        };
+        let mut stat = 0;
+        afs_allocate_array(result, matrix.elem_size, 1, &dim, &mut stat);
+        if stat != 0 {
+            return;
+        }
+    }
+    let result = unsafe { &mut *result };
+    if result.rank != 1
+        || result.elem_size != matrix.elem_size
+        || result.dims[0].extent() != columns
+        || !descriptor_has_payload_or_zero_size_array(result)
+    {
+        return;
+    }
+
+    let matrix_row_stride = matrix.dims[0].stride;
+    let matrix_column_stride = matrix.dims[1].stride;
+    let vector_stride = vector.dims[0].stride;
+    match matrix.elem_size {
+        4 => {
+            for column in 0..columns {
+                let mut distance = 0.0_f32;
+                for row in 0..rows {
+                    let matrix_offset =
+                        (row * matrix_row_stride + column * matrix_column_stride) * 4;
+                    let vector_offset = row * vector_stride * 4;
+                    let matrix_value =
+                        unsafe { *(matrix.base_addr.offset(matrix_offset as isize) as *const f32) };
+                    let vector_value =
+                        unsafe { *(vector.base_addr.offset(vector_offset as isize) as *const f32) };
+                    let difference = matrix_value - vector_value;
+                    distance += difference * difference;
+                }
+                unsafe {
+                    *(result.base_addr.add(column as usize * 4) as *mut f32) = distance;
+                }
+            }
+        }
+        8 => {
+            for column in 0..columns {
+                let mut distance = 0.0_f64;
+                for row in 0..rows {
+                    let matrix_offset =
+                        (row * matrix_row_stride + column * matrix_column_stride) * 8;
+                    let vector_offset = row * vector_stride * 8;
+                    let matrix_value =
+                        unsafe { *(matrix.base_addr.offset(matrix_offset as isize) as *const f64) };
+                    let vector_value =
+                        unsafe { *(vector.base_addr.offset(vector_offset as isize) as *const f64) };
+                    let difference = matrix_value - vector_value;
+                    distance += difference * difference;
+                }
+                unsafe {
+                    *(result.base_addr.add(column as usize * 8) as *mut f64) = distance;
+                }
+            }
+        }
+        _ => unreachable!("squared-column-distance real kind was validated above"),
+    }
 }
 
 /// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
