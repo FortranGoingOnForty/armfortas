@@ -64025,3 +64025,223 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn dot_product_honors_negative_stride_sections() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dot_product_honors_negative_stride_sections count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"program p
+  implicit none
+  real(8) :: a8(4), b8(4), got8
+  real(4) :: a4(4), b4(4), got4
+  integer :: ai(4), bi(4), goti
+  a8 = [1.0_8, 2.0_8, 3.0_8, 4.0_8]
+  b8 = [10.0_8, 20.0_8, 30.0_8, 40.0_8]
+  a4 = [1.0_4, 2.0_4, 3.0_4, 4.0_4]
+  b4 = [10.0_4, 20.0_4, 30.0_4, 40.0_4]
+  ai = [1, 2, 3, 4]
+  bi = [10, 20, 30, 40]
+  got8 = dot_product(a8(4:1:-1), b8)
+  got4 = dot_product(a4(4:1:-1), b4)
+  goti = dot_product(ai(4:1:-1), bi)
+  if (got8 /= 200.0_8) error stop 1
+  if (got4 /= 200.0_4) error stop 2
+  if (goti /= 200) error stop 3
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("dot_product_negative_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("negative-stride dot_product compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "negative-stride dot_product compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("negative-stride dot_product binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "negative-stride dot_product failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn descriptor_dot_loop_dispatches_to_runtime_kernel() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descriptor_dot_loop_dispatches_to_runtime_kernel count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // PRIMA's MATPROD12 calls an INPROD helper whose runtime-sized loop is
+    // invisible to the static-trip vectorizer. Pin the full-range reduction
+    // fold, signed descriptor strides, and the terminal DO-variable value.
+    let src = write_program(
+        r#"module descriptor_dot_loop_m
+  implicit none
+contains
+  function inprod(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z
+    integer :: i
+    z = 0.0_8
+    do i = 1, int(size(x), kind(i))
+      z = z + x(i) * y(i)
+    end do
+  end function inprod
+
+  subroutine accumulate(x, y, z, last_i)
+    real(8), intent(in) :: x(:), y(:)
+    real(8), intent(inout) :: z
+    integer, intent(out) :: last_i
+    integer :: i
+    do i = 1, size(y)
+      z = x(i) * y(i) + z
+    end do
+    last_i = i
+  end subroutine accumulate
+
+  function partial_inprod(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z
+    integer :: i
+    z = 0.0_8
+    do i = 2, size(x)
+      z = z + x(i) * y(i)
+    end do
+  end function partial_inprod
+
+  function volatile_inprod(x, y) result(z)
+    real(8), intent(in), volatile :: x(:)
+    real(8), intent(in) :: y(:)
+    real(8) :: z
+    integer :: i
+    z = 0.0_8
+    do i = 1, size(x)
+      z = z + x(i) * y(i)
+    end do
+  end function volatile_inprod
+end module descriptor_dot_loop_m
+
+program p
+  use descriptor_dot_loop_m, only : inprod, accumulate, partial_inprod, volatile_inprod
+  implicit none
+  real(8) :: a(4), b(4), got
+  real(8), allocatable :: empty(:)
+  integer :: last_i
+  a = [1.0_8, 2.0_8, 3.0_8, 4.0_8]
+  b = [10.0_8, 20.0_8, 30.0_8, 40.0_8]
+  got = inprod(a(4:1:-1), b)
+  if (got /= 200.0_8) error stop 1
+  got = 5.0_8
+  call accumulate(a(4:1:-1), b, got, last_i)
+  if (got /= 205.0_8) error stop 2
+  if (last_i /= 5) error stop 3
+  got = partial_inprod(a, b)
+  if (got /= 290.0_8) error stop 4
+  got = volatile_inprod(a, b)
+  if (got /= 300.0_8) error stop 5
+  allocate(empty(0))
+  got = 7.0_8
+  call accumulate(empty, empty, got, last_i)
+  if (got /= 7.0_8) error stop 6
+  if (last_i /= 1) error stop 7
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+
+    let ir = unique_path("descriptor_dot_loop", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("descriptor dot-loop IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "descriptor dot-loop IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read descriptor dot-loop IR");
+    let function_ir = |name: &str| {
+        let marker = format!("func @afs_modproc_descriptor_dot_loop_m_{}", name);
+        ir_text
+            .split_once(&marker)
+            .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("missing {} IR", name))
+    };
+    for name in ["inprod", "accumulate"] {
+        let body = function_ir(name);
+        assert!(
+            body.contains("call @afs_dot_product_real8("),
+            "{} should dispatch its full descriptor reduction to the dot kernel:\n{}",
+            name,
+            body
+        );
+        assert!(
+            !body.contains("do_check"),
+            "{} should not retain the scalar descriptor loop:\n{}",
+            name,
+            body
+        );
+    }
+    for name in ["partial_inprod", "volatile_inprod"] {
+        let body = function_ir(name);
+        assert!(
+            body.contains("do_check") && !body.contains("call @afs_dot_product_real8("),
+            "{} must retain ordinary DO lowering:\n{}",
+            name,
+            body
+        );
+    }
+
+    let out = unique_path("descriptor_dot_loop", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("descriptor dot-loop compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "descriptor dot-loop compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("descriptor dot-loop binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "descriptor dot-loop failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

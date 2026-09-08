@@ -6576,8 +6576,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
             end,
             step,
             body,
-            ..
+            shared_terminating_label,
         } => {
+            if !shared_terminating_label
+                && try_lower_descriptor_dot_product_do_loop(b, ctx, var, start, end, step, body)
+            {
+                return;
+            }
             lower_do_loop(
                 b,
                 ctx,

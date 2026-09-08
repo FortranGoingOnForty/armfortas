@@ -30465,6 +30465,179 @@ pub(super) fn try_lower_bulk_do_concurrent(
     true
 }
 
+fn strip_paren_expr(mut expr: &SpannedExpr) -> &SpannedExpr {
+    while let Expr::ParenExpr { inner } = &expr.node {
+        expr = inner;
+    }
+    expr
+}
+
+fn expr_is_named_scalar(expr: &SpannedExpr, name: &str) -> bool {
+    matches!(
+        &strip_paren_expr(expr).node,
+        Expr::Name { name: expr_name } if expr_name.eq_ignore_ascii_case(name)
+    )
+}
+
+fn descriptor_dot_loop_plan(
+    locals: &HashMap<String, LocalInfo>,
+    loop_var: &str,
+    end: &SpannedExpr,
+    body: &[SpannedStmt],
+    st: &SymbolTable,
+) -> Option<(LocalInfo, LocalInfo, LocalInfo, &'static str)> {
+    let [body_stmt] = body else {
+        return None;
+    };
+    let Stmt::Assignment { target, value } = &body_stmt.node else {
+        return None;
+    };
+    let Expr::Name { name: accumulator } = &strip_paren_expr(target).node else {
+        return None;
+    };
+    let accumulator_info = locals.get(&accumulator.to_lowercase())?.clone();
+    if !accumulator_info.dims.is_empty()
+        || accumulator_info.allocatable
+        || accumulator_info.is_pointer
+        || accumulator_info.derived_type.is_some()
+        || accumulator_info.char_kind != CharKind::None
+    {
+        return None;
+    }
+
+    let Expr::BinaryOp {
+        op: BinaryOp::Add,
+        left,
+        right,
+    } = &strip_paren_expr(value).node
+    else {
+        return None;
+    };
+    let product = if expr_is_named_scalar(left, accumulator) {
+        strip_paren_expr(right)
+    } else if expr_is_named_scalar(right, accumulator) {
+        strip_paren_expr(left)
+    } else {
+        return None;
+    };
+    let Expr::BinaryOp {
+        op: BinaryOp::Mul,
+        left,
+        right,
+    } = &product.node
+    else {
+        return None;
+    };
+    let lhs = loop_indexed_array_ref(locals, left, loop_var)?;
+    let rhs = loop_indexed_array_ref(locals, right, loop_var)?;
+    if lhs.info.dims.len() != 1
+        || rhs.info.dims.len() != 1
+        || !local_uses_array_descriptor(&lhs.info)
+        || !local_uses_array_descriptor(&rhs.info)
+        || lhs.info.ty != rhs.info.ty
+        || lhs.info.ty != accumulator_info.ty
+        || (!expr_is_size_of_array(end, &lhs.name) && !expr_is_size_of_array(end, &rhs.name))
+    {
+        return None;
+    }
+    let has_volatile_operand = [accumulator.as_str(), lhs.name.as_str(), rhs.name.as_str()]
+        .into_iter()
+        .any(|name| {
+            current_proc_scope()
+                .and_then(|scope_id| st.lookup_in(scope_id, name))
+                .or_else(|| st.lookup(name))
+                .is_some_and(|symbol| symbol.attrs.volatile)
+        });
+    if has_volatile_operand {
+        return None;
+    }
+    let kernel = match accumulator_info.ty {
+        IrType::Float(FloatWidth::F32) => "afs_dot_product_real4",
+        IrType::Float(FloatWidth::F64) => "afs_dot_product_real8",
+        _ => return None,
+    };
+    Some((accumulator_info, lhs.info, rhs.info, kernel))
+}
+
+pub(super) fn try_lower_descriptor_dot_product_do_loop(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    var: &Option<String>,
+    start: &Option<SpannedExpr>,
+    end: &Option<SpannedExpr>,
+    step: &Option<SpannedExpr>,
+    body: &[SpannedStmt],
+) -> bool {
+    let (Some(var_name), Some(start_expr), Some(end_expr)) = (var, start, end) else {
+        return false;
+    };
+    if eval_const_int(start_expr) != Some(1)
+        || step
+            .as_ref()
+            .is_some_and(|step_expr| eval_const_int(step_expr) != Some(1))
+    {
+        return false;
+    }
+    let Some(var_info) = ctx.locals.get(&var_name.to_lowercase()).cloned() else {
+        return false;
+    };
+    if !var_info.dims.is_empty()
+        || var_info.allocatable
+        || var_info.is_pointer
+        || !matches!(var_info.ty, IrType::Int(_))
+    {
+        return false;
+    }
+    let Some((accumulator, lhs, rhs, kernel)) =
+        descriptor_dot_loop_plan(&ctx.locals, var_name, end_expr, body, ctx.st)
+    else {
+        return false;
+    };
+
+    // Preserve the ordinary counted-DO evaluation order: initialize the
+    // variable, capture the terminal expression, then capture the step.
+    let var_addr = if var_info.by_ref {
+        b.load(var_info.addr)
+    } else {
+        var_info.addr
+    };
+    let init_raw = super::expr::lower_expr_ctx(b, ctx, start_expr);
+    let init_val = coerce_to_type(b, init_raw, &var_info.ty);
+    b.store(init_val, var_addr);
+    let end_raw = super::expr::lower_expr_ctx(b, ctx, end_expr);
+    let end_val = coerce_to_type(b, end_raw, &var_info.ty);
+    let step_val = if let Some(step_expr) = step {
+        let step_raw = super::expr::lower_expr_ctx(b, ctx, step_expr);
+        coerce_to_type(b, step_raw, &var_info.ty)
+    } else {
+        let one = b.const_i32(1);
+        coerce_to_type(b, one, &var_info.ty)
+    };
+
+    let lhs_desc = array_descriptor_addr(b, &lhs);
+    let rhs_desc = array_descriptor_addr(b, &rhs);
+    let dot = b.call(
+        FuncRef::External(kernel.into()),
+        vec![lhs_desc, rhs_desc],
+        accumulator.ty.clone(),
+    );
+    let accumulator_addr = if accumulator.by_ref {
+        b.load(accumulator.addr)
+    } else {
+        accumulator.addr
+    };
+    let current = b.load_typed(accumulator_addr, accumulator.ty.clone());
+    let sum = b.fadd(current, dot);
+    b.store(sum, accumulator_addr);
+
+    // A normally terminated unit-step DO leaves its variable one past the
+    // terminal value. SIZE is nonnegative, so this is also 1 for an empty
+    // vector and matches the generic loop's zero-trip value.
+    let final_var = b.iadd(end_val, step_val);
+    b.store(final_var, var_addr);
+    true
+}
+
 pub(super) fn lower_do_concurrent(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -42153,6 +42326,15 @@ pub(super) fn expr_is_size_of_array(
                             &arg.node,
                             Expr::Name { name } if name.eq_ignore_ascii_case(array_name)
                         );
+                    }
+                }
+                if name.eq_ignore_ascii_case("int") {
+                    if let Some(crate::ast::expr::Argument {
+                        value: crate::ast::expr::SectionSubscript::Element(value),
+                        ..
+                    }) = args.first()
+                    {
+                        return expr_is_size_of_array(value, array_name);
                     }
                 }
             }

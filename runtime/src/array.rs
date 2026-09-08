@@ -4018,6 +4018,51 @@ mod tests {
     }
 
     #[test]
+    fn dot_product_kernels_follow_negative_rank_one_strides() {
+        let mut real8_a = [1.0_f64, 2.0, 3.0, 4.0];
+        let mut real8_b = [10.0_f64, 20.0, 30.0, 40.0];
+        let real8_a_desc = strided_descriptor(&mut real8_a, 3, &[4], &[-1]);
+        let real8_b_desc = strided_descriptor(&mut real8_b, 0, &[4], &[1]);
+        assert_eq!(afs_dot_product_real8(&real8_a_desc, &real8_b_desc), 200.0);
+
+        let mut real4_a = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut real4_b = [10.0_f32, 20.0, 30.0, 40.0];
+        let real4_a_desc = strided_descriptor(&mut real4_a, 3, &[4], &[-1]);
+        let real4_b_desc = strided_descriptor(&mut real4_b, 0, &[4], &[1]);
+        assert_eq!(afs_dot_product_real4(&real4_a_desc, &real4_b_desc), 200.0);
+
+        let mut int_a = [1_i32, 2, 3, 4];
+        let mut int_b = [10_i32, 20, 30, 40];
+        let int_a_desc = strided_descriptor(&mut int_a, 3, &[4], &[-1]);
+        let int_b_desc = strided_descriptor(&mut int_b, 0, &[4], &[1]);
+        assert_eq!(afs_dot_product_int(&int_a_desc, &int_b_desc), 200);
+
+        let mut complex4_a = [[1.0_f32, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]];
+        let mut complex4_b = [[10.0_f32, 0.0], [20.0, 0.0], [30.0, 0.0], [40.0, 0.0]];
+        let complex4_a_desc = strided_descriptor(&mut complex4_a, 3, &[4], &[-1]);
+        let complex4_b_desc = strided_descriptor(&mut complex4_b, 0, &[4], &[1]);
+        let mut complex4_out = [0.0_f32; 2];
+        afs_dot_product_complex4(
+            &complex4_a_desc,
+            &complex4_b_desc,
+            complex4_out.as_mut_ptr(),
+        );
+        assert_eq!(complex4_out, [200.0, 0.0]);
+
+        let mut complex8_a = [[1.0_f64, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]];
+        let mut complex8_b = [[10.0_f64, 0.0], [20.0, 0.0], [30.0, 0.0], [40.0, 0.0]];
+        let complex8_a_desc = strided_descriptor(&mut complex8_a, 3, &[4], &[-1]);
+        let complex8_b_desc = strided_descriptor(&mut complex8_b, 0, &[4], &[1]);
+        let mut complex8_out = [0.0_f64; 2];
+        afs_dot_product_complex8(
+            &complex8_a_desc,
+            &complex8_b_desc,
+            complex8_out.as_mut_ptr(),
+        );
+        assert_eq!(complex8_out, [200.0, 0.0]);
+    }
+
+    #[test]
     fn iolength_accumulation_is_checked() {
         assert_eq!(checked_iolength_accumulate(3, 4, 8), Some(35));
         assert_eq!(checked_iolength_accumulate(7, 0, i64::MAX), Some(7));
@@ -8806,6 +8851,11 @@ pub extern "C" fn afs_array_reshape(
     }
 }
 
+fn rank_one_byte_offset(desc: &ArrayDescriptor, index: usize, minimum_elem_size: i64) -> isize {
+    let elem_size = desc.elem_size.max(minimum_elem_size);
+    (index as i64 * desc.dims[0].stride * elem_size) as isize
+}
+
 /// DOT_PRODUCT(a, b) — vector dot product (real(8) version).
 /// Respects strides for non-contiguous array sections.
 #[no_mangle]
@@ -8822,13 +8872,11 @@ pub extern "C" fn afs_dot_product_real8(
         return 0.0;
     }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
-    let stride_a = da.dims[0].stride.max(1) as usize;
-    let stride_b = db.dims[0].stride.max(1) as usize;
-    let pa = da.base_addr as *const f64;
-    let pb = db.base_addr as *const f64;
     let mut dot = 0.0;
     for i in 0..n {
-        dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
+        let pa = unsafe { da.base_addr.offset(rank_one_byte_offset(da, i, 8)) as *const f64 };
+        let pb = unsafe { db.base_addr.offset(rank_one_byte_offset(db, i, 8)) as *const f64 };
+        dot += unsafe { *pa * *pb };
     }
     dot
 }
@@ -8848,13 +8896,11 @@ pub extern "C" fn afs_dot_product_real4(
         return 0.0;
     }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
-    let stride_a = da.dims[0].stride.max(1) as usize;
-    let stride_b = db.dims[0].stride.max(1) as usize;
-    let pa = da.base_addr as *const f32;
-    let pb = db.base_addr as *const f32;
     let mut dot = 0.0;
     for i in 0..n {
-        dot += unsafe { *pa.add(i * stride_a) * *pb.add(i * stride_b) };
+        let pa = unsafe { da.base_addr.offset(rank_one_byte_offset(da, i, 4)) as *const f32 };
+        let pb = unsafe { db.base_addr.offset(rank_one_byte_offset(db, i, 4)) as *const f32 };
+        dot += unsafe { *pa * *pb };
     }
     dot
 }
@@ -8883,15 +8929,11 @@ pub extern "C" fn afs_dot_product_complex4(
         return;
     }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
-    let stride_a = da.dims[0].stride.max(1) as usize;
-    let stride_b = db.dims[0].stride.max(1) as usize;
-    let elem_a = da.elem_size.max(8) as usize;
-    let elem_b = db.elem_size.max(8) as usize;
     let mut re = 0.0f32;
     let mut im = 0.0f32;
     for i in 0..n {
-        let pa = unsafe { da.base_addr.add(i * stride_a * elem_a) as *const f32 };
-        let pb = unsafe { db.base_addr.add(i * stride_b * elem_b) as *const f32 };
+        let pa = unsafe { da.base_addr.offset(rank_one_byte_offset(da, i, 8)) as *const f32 };
+        let pb = unsafe { db.base_addr.offset(rank_one_byte_offset(db, i, 8)) as *const f32 };
         let ar = unsafe { *pa };
         let ai = unsafe { *pa.add(1) };
         let br = unsafe { *pb };
@@ -8929,15 +8971,11 @@ pub extern "C" fn afs_dot_product_complex8(
         return;
     }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
-    let stride_a = da.dims[0].stride.max(1) as usize;
-    let stride_b = db.dims[0].stride.max(1) as usize;
-    let elem_a = da.elem_size.max(16) as usize;
-    let elem_b = db.elem_size.max(16) as usize;
     let mut re = 0.0f64;
     let mut im = 0.0f64;
     for i in 0..n {
-        let pa = unsafe { da.base_addr.add(i * stride_a * elem_a) as *const f64 };
-        let pb = unsafe { db.base_addr.add(i * stride_b * elem_b) as *const f64 };
+        let pa = unsafe { da.base_addr.offset(rank_one_byte_offset(da, i, 16)) as *const f64 };
+        let pb = unsafe { db.base_addr.offset(rank_one_byte_offset(db, i, 16)) as *const f64 };
         let ar = unsafe { *pa };
         let ai = unsafe { *pa.add(1) };
         let br = unsafe { *pb };
@@ -8963,13 +9001,11 @@ pub extern "C" fn afs_dot_product_int(a: *const ArrayDescriptor, b: *const Array
         return 0;
     }
     let n = da.dims[0].extent().min(db.dims[0].extent()) as usize;
-    let stride_a = da.dims[0].stride.max(1) as usize;
-    let stride_b = db.dims[0].stride.max(1) as usize;
-    let pa = da.base_addr as *const i32;
-    let pb = db.base_addr as *const i32;
     let mut dot: i64 = 0;
     for i in 0..n {
-        dot += unsafe { (*pa.add(i * stride_a) as i64) * (*pb.add(i * stride_b) as i64) };
+        let pa = unsafe { da.base_addr.offset(rank_one_byte_offset(da, i, 4)) as *const i32 };
+        let pb = unsafe { db.base_addr.offset(rank_one_byte_offset(db, i, 4)) as *const i32 };
+        dot += unsafe { (*pa as i64) * (*pb as i64) };
     }
     dot
 }
