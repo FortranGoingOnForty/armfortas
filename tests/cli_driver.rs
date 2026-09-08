@@ -64025,3 +64025,60 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn dot_product_honors_negative_stride_sections() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=dot_product_honors_negative_stride_sections count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"program p
+  implicit none
+  real(8) :: a8(4), b8(4), got8
+  real(4) :: a4(4), b4(4), got4
+  integer :: ai(4), bi(4), goti
+  a8 = [1.0_8, 2.0_8, 3.0_8, 4.0_8]
+  b8 = [10.0_8, 20.0_8, 30.0_8, 40.0_8]
+  a4 = [1.0_4, 2.0_4, 3.0_4, 4.0_4]
+  b4 = [10.0_4, 20.0_4, 30.0_4, 40.0_4]
+  ai = [1, 2, 3, 4]
+  bi = [10, 20, 30, 40]
+  got8 = dot_product(a8(4:1:-1), b8)
+  got4 = dot_product(a4(4:1:-1), b4)
+  goti = dot_product(ai(4:1:-1), bi)
+  if (got8 /= 200.0_8) error stop 1
+  if (got4 /= 200.0_4) error stop 2
+  if (goti /= 200) error stop 3
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("dot_product_negative_stride", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("negative-stride dot_product compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "negative-stride dot_product compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("negative-stride dot_product binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "negative-stride dot_product failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
