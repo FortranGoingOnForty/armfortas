@@ -63595,3 +63595,77 @@ end program p
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn array_result_assigns_through_every_rank_two_section_stride() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_result_assigns_through_every_rank_two_section_stride count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // A descriptor result is traversed in array element order, but so is the
+    // destination. Using only dim(1)%stride for the latter never advanced to
+    // the next column of a noncontiguous rank-2 section.
+    let src = write_program(
+        r#"module m
+  implicit none
+contains
+  function outer_product(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z(size(x), size(y))
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end function outer_product
+
+  subroutine fill_section(a, x, y)
+    real(8), intent(out) :: a(:, :)
+    real(8), intent(in) :: x(:), y(:)
+    a = outer_product(x, y)
+  end subroutine fill_section
+end module m
+
+program p
+  use m
+  implicit none
+  real(8) :: backing(6, 4), x(3), y(2)
+  backing = -99.0_8
+  x = [1.0_8, 2.0_8, 3.0_8]
+  y = [10.0_8, 20.0_8]
+  call fill_section(backing(1:6:2, 1:4:2), x, y)
+  if (any(backing(1:6:2, 1:4:2) /= &
+      reshape([10.0_8, 20.0_8, 30.0_8, 20.0_8, 40.0_8, 60.0_8], [3, 2]))) error stop 1
+  if (any(backing(2:6:2, :) /= -99.0_8)) error stop 2
+  if (any(backing(:, 2:4:2) /= -99.0_8)) error stop 3
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let out = unique_path("rank_two_section_array_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-2 section array-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-2 section array-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-2 section array-result failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-2 section array-result failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}

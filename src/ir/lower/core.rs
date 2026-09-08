@@ -54305,17 +54305,16 @@ pub(super) fn lower_array_assign(
                 } else {
                     None
                 };
-                let dest_base = array_base_addr(b, dest_info);
                 let n = array_total_elems_value(b, dest_info);
-                let dest_elem_bytes = b.const_i64(ir_scalar_byte_size(&dest_info.ty, ctx.layout));
-                // For descriptor-backed dests, use the destination's stride;
-                // for fixed-size dests, just use elem_bytes.
-                let dest_stride = if local_uses_array_descriptor(dest_info) {
-                    let dest_desc = array_descriptor_addr(b, dest_info);
-                    load_array_desc_i64_field(b, dest_desc, 24 + 16)
+                let dest_desc = if local_uses_array_descriptor(dest_info) {
+                    array_descriptor_addr(b, dest_info)
                 } else {
-                    b.const_i64(1)
+                    materialize_array_descriptor_for_info(b, dest_info)
                 };
+                let dest_rank = local_declared_rank(dest_info).max(1);
+                let src_rank = actual_expr_rank(value, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+                    .unwrap_or(dest_rank)
+                    .max(1);
                 let i_addr = b.alloca(IrType::Int(IntWidth::I64));
                 let zero = b.const_i64(0);
                 b.store(zero, i_addr);
@@ -54329,18 +54328,16 @@ pub(super) fn lower_array_assign(
                 b.cond_branch(done, bb_ext, vec![], bb_bdy, vec![]);
                 b.set_block(bb_bdy);
                 let iv = b.load(i_addr);
-                let logical_idx = b.imul(iv, dest_stride);
-                let doff = b.imul(logical_idx, dest_elem_bytes);
-                let dp = b.gep(dest_base, vec![doff], IrType::Int(IntWidth::I8));
+                let dp = array_desc_elem_ptr_rank(b, dest_desc, &dest_info.ty, iv, dest_rank);
                 if is_complex_ty(&dest_info.ty) {
                     let copy_bytes = b.const_i64(complex_byte_size(&dest_info.ty));
                     let src_ptr = if is_complex_ty(&src_elem_ty)
                         && complex_float_width(&src_elem_ty) == complex_float_width(&dest_info.ty)
                     {
-                        rank1_array_desc_elem_ptr(b, copy_src_desc, &src_elem_ty, iv)
+                        array_desc_elem_ptr_rank(b, copy_src_desc, &src_elem_ty, iv, src_rank)
                     } else {
                         let src_val =
-                            load_rank1_array_desc_elem(b, copy_src_desc, &src_elem_ty, iv);
+                            load_array_desc_elem_rank(b, copy_src_desc, &src_elem_ty, iv, src_rank);
                         materialize_complex_operand(b, src_val, complex_float_width(&dest_info.ty))
                     };
                     b.call(
@@ -54349,7 +54346,8 @@ pub(super) fn lower_array_assign(
                         IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
                     );
                 } else {
-                    let elem_val = load_rank1_array_desc_elem(b, copy_src_desc, &src_elem_ty, iv);
+                    let elem_val =
+                        load_array_desc_elem_rank(b, copy_src_desc, &src_elem_ty, iv, src_rank);
                     let coerced = coerce_to_type(b, elem_val, &dest_info.ty);
                     b.store(coerced, dp);
                 }
