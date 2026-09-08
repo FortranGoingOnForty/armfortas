@@ -63894,3 +63894,105 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn descriptor_element_access_loads_bounds_inline() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descriptor_element_access_loads_bounds_inline count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // Descriptor element access used to call both afs_array_lbound and
+    // afs_array_ubound for every subscript. Exercise a non-unit-stride actual
+    // and an explicit assumed-shape lower bound while retaining bounds checks.
+    let src = write_program(
+        r#"module descriptor_inline_m
+  implicit none
+contains
+  subroutine probe(x, got)
+    real(8), intent(in) :: x(-1:)
+    real(8), intent(out) :: got
+    got = x(0) + x(1)
+  end subroutine probe
+end module descriptor_inline_m
+
+program p
+  use descriptor_inline_m, only : probe
+  implicit none
+  real(8) :: backing(6), got
+  backing = [1.0_8, 2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8]
+  call probe(backing(1:6:2), got)
+  if (got /= 8.0_8) error stop 1
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let ir = unique_path("descriptor_inline_bounds", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "-fcheck=bounds",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inline descriptor bounds IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "inline descriptor bounds IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read inline descriptor bounds IR");
+    let marker = "func @afs_modproc_descriptor_inline_m_probe";
+    let function_ir = ir_text
+        .split_once(marker)
+        .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+        .expect("missing descriptor probe IR");
+    assert!(
+        function_ir.contains("rt_call @__afs_check_bounds"),
+        "descriptor element access should retain requested bounds checks:\n{}",
+        function_ir
+    );
+    assert!(
+        !function_ir.contains("call @afs_array_lbound")
+            && !function_ir.contains("call @afs_array_ubound"),
+        "descriptor element access should load bounds without opaque runtime calls:\n{}",
+        function_ir
+    );
+
+    let out = unique_path("descriptor_inline_bounds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "-fcheck=bounds",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inline descriptor bounds compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "inline descriptor bounds compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("inline descriptor bounds binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "inline descriptor bounds binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

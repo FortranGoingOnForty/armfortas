@@ -31090,17 +31090,15 @@ pub(super) fn compute_flat_elem_offset(
             };
             let sub = widen_idx_to_i64(b, sub_raw);
 
-            let dim = b.const_i32((dim_idx + 1) as i32);
-            let lo = b.call(
-                FuncRef::External("afs_array_lbound".into()),
-                vec![desc, dim],
-                IrType::Int(IntWidth::I64),
-            );
-            let up = b.call(
-                FuncRef::External("afs_array_ubound".into()),
-                vec![desc, dim],
-                IrType::Int(IntWidth::I64),
-            );
+            // The descriptor is already in hand and every indexed dimension
+            // is statically valid here. Read its bounds directly instead of
+            // making two opaque runtime calls per element access. Besides
+            // avoiding call overhead, this exposes invariant descriptor loads
+            // to LICM and lets DCE discard the upper bound when bounds checks
+            // are disabled.
+            let dim_off = 24 + (dim_idx as i64) * 24;
+            let lo = load_array_desc_i64_field(b, desc, dim_off);
+            let up = load_array_desc_i64_field(b, desc, dim_off + 8);
             // F2018 §8.5.8.5: skip bounds check on the assumed-size
             // last dim of an explicit-shape dummy; the descriptor's
             // dim metadata for that slot reflects the caller's shape,
