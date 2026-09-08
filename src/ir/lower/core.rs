@@ -31090,17 +31090,15 @@ pub(super) fn compute_flat_elem_offset(
             };
             let sub = widen_idx_to_i64(b, sub_raw);
 
-            let dim = b.const_i32((dim_idx + 1) as i32);
-            let lo = b.call(
-                FuncRef::External("afs_array_lbound".into()),
-                vec![desc, dim],
-                IrType::Int(IntWidth::I64),
-            );
-            let up = b.call(
-                FuncRef::External("afs_array_ubound".into()),
-                vec![desc, dim],
-                IrType::Int(IntWidth::I64),
-            );
+            // The descriptor is already in hand and every indexed dimension
+            // is statically valid here. Read its bounds directly instead of
+            // making two opaque runtime calls per element access. Besides
+            // avoiding call overhead, this exposes invariant descriptor loads
+            // to LICM and lets DCE discard the upper bound when bounds checks
+            // are disabled.
+            let dim_off = 24 + (dim_idx as i64) * 24;
+            let lo = load_array_desc_i64_field(b, desc, dim_off);
+            let up = load_array_desc_i64_field(b, desc, dim_off + 8);
             // F2018 §8.5.8.5: skip bounds check on the assumed-size
             // last dim of an explicit-shape dummy; the descriptor's
             // dim metadata for that slot reflects the caller's shape,
@@ -43448,10 +43446,21 @@ pub(super) fn emit_bulk_array_plan(
     plan: BulkArrayPlan,
 ) {
     let dest_base = array_base_addr(b, dest_info);
+    emit_bulk_array_plan_to_base(b, ctx, dest_base, &dest_info.ty, n, plan);
+}
+
+fn emit_bulk_array_plan_to_base(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    dest_base: ValueId,
+    dest_ty: &IrType,
+    n: ValueId,
+    plan: BulkArrayPlan,
+) {
     match plan {
         BulkArrayPlan::Fill { kernel, scalar } => {
             let scalar = super::expr::lower_expr_ctx_tl(b, ctx, &scalar);
-            let scalar = coerce_to_type(b, scalar, &dest_info.ty);
+            let scalar = coerce_to_type(b, scalar, dest_ty);
             b.call(
                 FuncRef::External(kernel.into()),
                 vec![dest_base, n, scalar],
@@ -43474,7 +43483,7 @@ pub(super) fn emit_bulk_array_plan(
         } => {
             let array_base = array_base_addr(b, &array);
             let scalar = super::expr::lower_expr_ctx_tl(b, ctx, &scalar);
-            let scalar = coerce_to_type(b, scalar, &dest_info.ty);
+            let scalar = coerce_to_type(b, scalar, dest_ty);
             b.call(
                 FuncRef::External(kernel.into()),
                 vec![dest_base, array_base, scalar, n],
@@ -43487,7 +43496,7 @@ pub(super) fn emit_bulk_array_plan(
             array,
         } => {
             let scalar = super::expr::lower_expr_ctx_tl(b, ctx, &scalar);
-            let scalar = coerce_to_type(b, scalar, &dest_info.ty);
+            let scalar = coerce_to_type(b, scalar, dest_ty);
             let array_base = array_base_addr(b, &array);
             b.call(
                 FuncRef::External(kernel.into()),
@@ -51184,12 +51193,20 @@ fn can_scalarize_multi_d_section_expr(
         | Expr::BozLiteral { .. }
         | Expr::ComplexLiteral { .. }
         | Expr::NilArgument => true,
-        Expr::Name { name } => {
-            // A bare array name is a whole-array operand, not a scalar.
-            !locals
-                .get(&name.to_lowercase())
-                .is_some_and(local_is_array_like)
-        }
+        Expr::Name { name } => locals
+            .get(&name.to_lowercase())
+            .filter(|info| local_is_array_like(info))
+            .is_none_or(|info| {
+                // A rank-one whole-array operand is conformable with the
+                // rank-one destination section and the scalarizer below can
+                // rewrite it to `name(loop_var)`.  Reject pointer-backed
+                // views and higher-rank arrays: the former may overlap the
+                // destination and the latter cannot be indexed by the one
+                // synthetic section coordinate.
+                !info.is_pointer
+                    && local_declared_rank(info) == 1
+                    && !name.eq_ignore_ascii_case(dest_name)
+            }),
         Expr::ParenExpr { inner } | Expr::UnaryOp { operand: inner, .. } => {
             can_scalarize_multi_d_section_expr(
                 inner,
@@ -51374,7 +51391,11 @@ pub(super) fn lower_multi_d_section_assign(
     // iteration. This avoids materializing every binary subexpression in a
     // heap-backed descriptor while retaining the general snapshot path for
     // potentially overlapping sections.
-    let scalarized_value = if matches!(dest_info.ty, IrType::Int(_) | IrType::Float(_))
+    let mut section_info = dest_info.clone();
+    section_info.dims = vec![(1, 0)];
+    section_info.runtime_dim_upper = vec![None];
+    let scalarized_value = if n_dims == 1
+        && matches!(dest_info.ty, IrType::Int(_) | IrType::Float(_))
         && !dest_info.is_pointer
         && !dest_name.is_empty()
         && can_scalarize_multi_d_section_expr(
@@ -51392,14 +51413,19 @@ pub(super) fn lower_multi_d_section_assign(
             Some(ctx.type_layouts),
         ) {
         let loop_var = fresh_synth_loop_var(&ctx.locals);
-        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, dest_info, &loop_var).and_then(
+        // The expression is conformable with the rank-one LHS section, not
+        // necessarily with the rank of its base array.  Present that section
+        // rank to the shared rewriter so a bare rank-one operand such as `x`
+        // in `z(:, j) = x * y(j)` becomes `x(loop_var)` instead of being
+        // materialized in a heap-backed temporary descriptor.
+        rewrite_scalarized_rank1_array_refs(value, &ctx.locals, &section_info, &loop_var).and_then(
             |(mapped, changed)| {
                 if !changed {
                     return None;
                 }
                 let index_addr = b.alloca(IrType::Int(IntWidth::I32));
                 ctx.locals.insert(
-                    loop_var,
+                    loop_var.clone(),
                     LocalInfo {
                         addr: index_addr,
                         ty: IrType::Int(IntWidth::I32),
@@ -51417,7 +51443,7 @@ pub(super) fn lower_multi_d_section_assign(
                         last_dim_assumed_size: false,
                     },
                 );
-                Some((index_addr, mapped))
+                Some((loop_var, index_addr, mapped))
             },
         )
     } else {
@@ -51466,6 +51492,22 @@ pub(super) fn lower_multi_d_section_assign(
         total = b.imul(total, ext);
     }
 
+    // A scalarized rank-one section expression such as `z(:, j) = x * y(j)`
+    // can use the existing raw-pointer bulk kernels when every array view is
+    // contiguous. Keep the descriptor-stride loop below as the runtime
+    // fallback: assumed-shape actuals may be strided even though their ranks
+    // and element types are compatible.
+    let bulk_plan = scalarized_value.as_ref().and_then(|(loop_var, _, mapped)| {
+        build_loop_bulk_plan(
+            &ctx.locals,
+            &section_info,
+            loop_var,
+            mapped,
+            ctx.st,
+            Some(ctx.type_layouts),
+        )
+    });
+
     let (scalar_value, scalar_complex_src) = if src_desc.is_none() && scalarized_value.is_none() {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, value);
         if is_complex_ty(&elem_ty) {
@@ -51488,7 +51530,38 @@ pub(super) fn lower_multi_d_section_assign(
     let bb_check = b.create_block("md_section_check");
     let bb_body = b.create_block("md_section_body");
     let bb_exit = b.create_block("md_section_exit");
-    b.branch(bb_check, vec![]);
+    if let Some(plan) = bulk_plan {
+        let marker = b.const_i32(DESC_CONTIGUOUS);
+        let zero32 = b.const_i32(0);
+        let dest_flags = descriptor_flags(b, dest_desc);
+        let dest_bits = b.bit_and(dest_flags, marker);
+        let mut all_contiguous = b.icmp(CmpOp::Ne, dest_bits, zero32);
+        let source_infos: Vec<&LocalInfo> = match &plan {
+            BulkArrayPlan::Fill { .. } => vec![],
+            BulkArrayPlan::ArrayBinary { lhs, rhs, .. } => vec![lhs, rhs],
+            BulkArrayPlan::ArrayScalar { array, .. } | BulkArrayPlan::ScalarArray { array, .. } => {
+                vec![array]
+            }
+        };
+        for source_info in source_infos {
+            let source_contiguous = if local_uses_array_descriptor(source_info) {
+                let source_desc = array_descriptor_addr(b, source_info);
+                let source_flags = descriptor_flags(b, source_desc);
+                let source_bits = b.bit_and(source_flags, marker);
+                b.icmp(CmpOp::Ne, source_bits, zero32)
+            } else {
+                b.const_bool(true)
+            };
+            all_contiguous = b.and(all_contiguous, source_contiguous);
+        }
+        let bb_bulk = b.create_block("md_section_bulk_contiguous");
+        b.cond_branch(all_contiguous, bb_bulk, vec![], bb_check, vec![]);
+        b.set_block(bb_bulk);
+        emit_bulk_array_plan_to_base(b, ctx, dest_base, &elem_ty, total, plan);
+        b.branch(bb_exit, vec![]);
+    } else {
+        b.branch(bb_check, vec![]);
+    }
 
     b.set_block(bb_check);
     let i = b.load(i_addr);
@@ -51496,7 +51569,7 @@ pub(super) fn lower_multi_d_section_assign(
     b.cond_branch(done, bb_exit, vec![], bb_body, vec![]);
 
     b.set_block(bb_body);
-    if let Some((index_addr, _)) = scalarized_value.as_ref() {
+    if let Some((_, index_addr, _)) = scalarized_value.as_ref() {
         let one = b.const_i64(1);
         let one_based = b.iadd(i, one);
         let one_based_i32 = coerce_to_type(b, one_based, &IrType::Int(IntWidth::I32));
@@ -51521,7 +51594,7 @@ pub(super) fn lower_multi_d_section_assign(
     }
     let dest_ptr = b.gep(dest_base, vec![dest_off], IrType::Int(IntWidth::I8));
 
-    let (stored, complex_src_ptr) = if let Some((_, mapped)) = scalarized_value.as_ref() {
+    let (stored, complex_src_ptr) = if let Some((_, _, mapped)) = scalarized_value.as_ref() {
         let raw = super::expr::lower_expr_ctx_tl(b, ctx, mapped);
         (Some(coerce_to_type(b, raw, &elem_ty)), None)
     } else if let Some((sd, src_ty)) = src_desc.as_ref() {
@@ -52134,12 +52207,8 @@ pub(super) fn build_loop_bulk_plan(
 
         let lhs = loop_indexed_array_ref(locals, left, loop_var);
         let rhs = loop_indexed_array_ref(locals, right, loop_var);
-        let lhs_scalar = !expr_contains_array_refs(left, locals)
-            && !expr_mentions_name(left, loop_var)
-            && actual_expr_rank(left, locals, st, type_layouts) == Some(0);
-        let rhs_scalar = !expr_contains_array_refs(right, locals)
-            && !expr_mentions_name(right, loop_var)
-            && actual_expr_rank(right, locals, st, type_layouts) == Some(0);
+        let lhs_scalar = bulk_loop_invariant_scalar(left, locals, loop_var, st, type_layouts);
+        let rhs_scalar = bulk_loop_invariant_scalar(right, locals, loop_var, st, type_layouts);
 
         if let Some(lhs) = lhs {
             if rhs_scalar && bulk_arrays_compatible(dest_info, &lhs.info) {
@@ -52197,6 +52266,54 @@ pub(super) fn build_loop_bulk_plan(
     }
 
     None
+}
+
+fn bulk_loop_invariant_scalar(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    loop_var: &str,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    if expr_mentions_name(expr, loop_var)
+        || actual_expr_rank(expr, locals, st, type_layouts) != Some(0)
+    {
+        return false;
+    }
+    // Preserve the existing bulk-loop contract for ordinary scalar
+    // expressions. The cases below add only scalar array-element designators,
+    // which `expr_contains_array_refs` necessarily classifies as array uses.
+    if !expr_contains_array_refs(expr, locals) {
+        return true;
+    }
+
+    match &expr.node {
+        node if is_pure_expr(node) => true,
+        Expr::ParenExpr { inner } | Expr::UnaryOp { operand: inner, .. } => {
+            bulk_loop_invariant_scalar(inner, locals, loop_var, st, type_layouts)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            bulk_loop_invariant_scalar(left, locals, loop_var, st, type_layouts)
+                && bulk_loop_invariant_scalar(right, locals, loop_var, st, type_layouts)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return false;
+            };
+            let Some(info) = locals
+                .get(&name.to_lowercase())
+                .filter(|info| local_is_array_like(info))
+            else {
+                return false;
+            };
+            args.len() == local_declared_rank(info)
+                && args.iter().all(|arg| match &arg.value {
+                    crate::ast::expr::SectionSubscript::Element(index) => is_pure_expr(&index.node),
+                    crate::ast::expr::SectionSubscript::Range { .. } => false,
+                })
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn try_lower_bulk_array_assign(

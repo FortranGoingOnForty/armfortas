@@ -63794,3 +63794,234 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn rank_one_whole_array_rhs_fuses_into_column_section_assignment() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank_one_whole_array_rhs_fuses_into_column_section_assignment count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // PRIMA's OUTPROD fills a rank-two function result one column at a
+    // time. The section scalarizer handled x(:) but rejected the equivalent
+    // bare rank-one operand x, materializing and freeing a vector temporary
+    // for every column before copying it into z(:, j).
+    let src = write_program(
+        r#"module outprod_fusion_m
+  implicit none
+contains
+  function outer_product(x, y) result(z)
+    real(8), intent(in) :: x(:), y(:)
+    real(8) :: z(size(x), size(y))
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end function outer_product
+
+  subroutine fill_columns(z, x, y)
+    real(8), intent(out) :: z(:, :)
+    real(8), intent(in) :: x(:), y(:)
+    integer :: j
+    do j = 1, size(y)
+      z(:, j) = x * y(j)
+    end do
+  end subroutine fill_columns
+end module outprod_fusion_m
+
+program p
+  use outprod_fusion_m, only : outer_product, fill_columns
+  implicit none
+  real(8) :: got(3, 2)
+  real(8) :: backing(6), canvas(6, 4), x(3), y(2)
+  got = outer_product([1.0_8, 2.0_8, 3.0_8], [4.0_8, 5.0_8])
+  if (any(got(:, 1) /= [4.0_8, 8.0_8, 12.0_8])) error stop 1
+  if (any(got(:, 2) /= [5.0_8, 10.0_8, 15.0_8])) error stop 2
+
+  backing = [1.0_8, -1.0_8, 2.0_8, -1.0_8, 3.0_8, -1.0_8]
+  got = outer_product(backing(1:6:2), [4.0_8, 5.0_8])
+  if (any(got(:, 1) /= [4.0_8, 8.0_8, 12.0_8])) error stop 3
+  if (any(got(:, 2) /= [5.0_8, 10.0_8, 15.0_8])) error stop 4
+
+  canvas = -99.0_8
+  x = [1.0_8, 2.0_8, 3.0_8]
+  y = [4.0_8, 5.0_8]
+  call fill_columns(canvas(1:6:2, 1:4:2), x, y)
+  if (any(canvas(1:6:2, 1:4:2) /= reshape([4.0_8, 8.0_8, 12.0_8, &
+                                             5.0_8, 10.0_8, 15.0_8], [3, 2]))) error stop 5
+  if (any(canvas(2:6:2, :) /= -99.0_8)) error stop 6
+  if (any(canvas(:, 2:4:2) /= -99.0_8)) error stop 7
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let ir = unique_path("rank_one_column_rhs_fusion", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-one column RHS IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "rank-one column RHS IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read rank-one column RHS IR");
+    let marker = "func @afs_modproc_outprod_fusion_m_outer_product";
+    let function_ir = ir_text
+        .split_once(marker)
+        .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+        .expect("missing outer_product IR");
+    assert!(
+        function_ir.contains("md_section_check"),
+        "column assignment should retain a stride-aware fallback loop:\n{}",
+        function_ir
+    );
+    assert!(
+        function_ir.contains("call @afs_array_mul_scalar_f64("),
+        "contiguous column assignment should dispatch to the bulk kernel:\n{}",
+        function_ir
+    );
+    assert!(
+        !function_ir.contains("afs_allocate_like_with_elem_size")
+            && !function_ir.contains("afs_deallocate_array")
+            && !function_ir.contains("array_expr_check"),
+        "column assignment should not materialize a per-column RHS descriptor:\n{}",
+        function_ir
+    );
+
+    let out = unique_path("rank_one_column_rhs_fusion", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-one column RHS compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-one column RHS compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-one column RHS binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-one column RHS binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn descriptor_element_access_loads_bounds_inline() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=descriptor_element_access_loads_bounds_inline count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // Descriptor element access used to call both afs_array_lbound and
+    // afs_array_ubound for every subscript. Exercise a non-unit-stride actual
+    // and an explicit assumed-shape lower bound while retaining bounds checks.
+    let src = write_program(
+        r#"module descriptor_inline_m
+  implicit none
+contains
+  subroutine probe(x, got)
+    real(8), intent(in) :: x(-1:)
+    real(8), intent(out) :: got
+    got = x(0) + x(1)
+  end subroutine probe
+end module descriptor_inline_m
+
+program p
+  use descriptor_inline_m, only : probe
+  implicit none
+  real(8) :: backing(6), got
+  backing = [1.0_8, 2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8]
+  call probe(backing(1:6:2), got)
+  if (got /= 8.0_8) error stop 1
+  print *, 'ok'
+end program p
+"#,
+        "f90",
+    );
+    let ir = unique_path("descriptor_inline_bounds", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "-fcheck=bounds",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inline descriptor bounds IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "inline descriptor bounds IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read inline descriptor bounds IR");
+    let marker = "func @afs_modproc_descriptor_inline_m_probe";
+    let function_ir = ir_text
+        .split_once(marker)
+        .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+        .expect("missing descriptor probe IR");
+    assert!(
+        function_ir.contains("rt_call @__afs_check_bounds"),
+        "descriptor element access should retain requested bounds checks:\n{}",
+        function_ir
+    );
+    assert!(
+        !function_ir.contains("call @afs_array_lbound")
+            && !function_ir.contains("call @afs_array_ubound"),
+        "descriptor element access should load bounds without opaque runtime calls:\n{}",
+        function_ir
+    );
+
+    let out = unique_path("descriptor_inline_bounds", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "-fcheck=bounds",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inline descriptor bounds compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "inline descriptor bounds compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("inline descriptor bounds binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "inline descriptor bounds binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
