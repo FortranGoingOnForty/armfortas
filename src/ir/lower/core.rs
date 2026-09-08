@@ -51196,7 +51196,7 @@ fn can_scalarize_multi_d_section_expr(
         Expr::Name { name } => locals
             .get(&name.to_lowercase())
             .filter(|info| local_is_array_like(info))
-            .map_or(true, |info| {
+            .is_none_or(|info| {
                 // A rank-one whole-array operand is conformable with the
                 // rank-one destination section and the scalarizer below can
                 // rewrite it to `name(loop_var)`.  Reject pointer-backed
