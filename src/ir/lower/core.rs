@@ -44779,6 +44779,27 @@ pub(super) fn lower_array_sum_dim_descriptor(
     }
     let dim_expr = dim_expr?;
 
+    // PRIMA's derivative-free solvers repeatedly form the squared distance
+    // from every matrix column to one vector. Recognize that exact intrinsic
+    // expression before the generic descriptor path materializes SPREAD,
+    // subtraction, and square temporaries. The matcher deliberately excludes
+    // callable and VOLATILE operands; unmatched forms retain normal lowering.
+    if args.len() == 2 && mask_expr.is_none() {
+        if let Some(result) = lower_squared_column_distances_descriptor(
+            b,
+            locals,
+            array_expr,
+            dim_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            return Some(result);
+        }
+    }
+
     // A common numerical-kernel shape is SUM(ABS(x), DIM=k). When k is
     // compile-time known and the elemental expression has one safe array
     // control, reduce it directly into the rank-N-1 result. Keep every other
@@ -44886,6 +44907,205 @@ pub(super) fn lower_array_sum_dim_descriptor(
         deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask_desc);
     }
     Some((result_desc, elem_ty))
+}
+
+fn squared_column_distance_descriptor_expr_is_safe(
+    expr: &crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    use crate::ast::expr::SectionSubscript;
+
+    match &strip_paren_expr(expr).node {
+        Expr::Name { .. } => true,
+        Expr::UnaryOp {
+            op: UnaryOp::Plus | UnaryOp::Minus,
+            operand,
+        } => squared_column_distance_descriptor_expr_is_safe(operand, locals, st, type_layouts),
+        Expr::BinaryOp {
+            op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow,
+            left,
+            right,
+        } => {
+            squared_column_distance_descriptor_expr_is_safe(left, locals, st, type_layouts)
+                && squared_column_distance_descriptor_expr_is_safe(right, locals, st, type_layouts)
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return false;
+            };
+            if !locals
+                .get(&name.to_ascii_lowercase())
+                .is_some_and(local_is_array_like)
+            {
+                return false;
+            }
+            args.iter().all(|arg| match &arg.value {
+                SectionSubscript::Element(expr) => {
+                    actual_expr_rank(expr, locals, st, type_layouts) == Some(0)
+                        && is_pure_expr(&expr.node)
+                }
+                SectionSubscript::Range { start, end, stride } => [start, end, stride]
+                    .into_iter()
+                    .flatten()
+                    .all(|expr| is_pure_expr(&expr.node)),
+            })
+        }
+        _ => false,
+    }
+}
+
+fn squared_column_distance_expr_references_volatile(
+    expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+) -> bool {
+    let mut names = Vec::new();
+    collect_name_refs_expr(expr, &mut names);
+    names.into_iter().any(|name| {
+        let key = name.to_ascii_lowercase();
+        current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, &key))
+            .or_else(|| st.lookup(&key))
+            .is_some_and(|symbol| symbol.attrs.volatile)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_squared_column_distances_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    dim_expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    use crate::ast::expr::SectionSubscript;
+
+    if eval_const_int(dim_expr) != Some(1)
+        || user_callable_shadows_intrinsic(
+            st,
+            current_proc_scope(),
+            b.func().name.as_str(),
+            "spread",
+        )
+    {
+        return None;
+    }
+    let Expr::BinaryOp {
+        op: BinaryOp::Pow,
+        left: difference,
+        right: exponent,
+    } = &strip_paren_expr(expr).node
+    else {
+        return None;
+    };
+    if eval_const_int(exponent) != Some(2) {
+        return None;
+    }
+    let Expr::BinaryOp {
+        op: BinaryOp::Sub,
+        left,
+        right,
+    } = &strip_paren_expr(difference).node
+    else {
+        return None;
+    };
+
+    let spread_parts = |candidate: &crate::ast::expr::SpannedExpr| {
+        let Expr::FunctionCall { callee, args } = &strip_paren_expr(candidate).node else {
+            return None;
+        };
+        let Expr::Name { name } = &callee.node else {
+            return None;
+        };
+        if !name.eq_ignore_ascii_case("spread") {
+            return None;
+        }
+        let slots = reorder_args_by_keyword_slots(args, "spread", st);
+        let source_arg = slots.first().and_then(|arg| arg.as_ref())?;
+        let dim_arg = slots.get(1).and_then(|arg| arg.as_ref())?;
+        let ncopies_arg = slots.get(2).and_then(|arg| arg.as_ref())?;
+        let SectionSubscript::Element(source) = &source_arg.value else {
+            return None;
+        };
+        let SectionSubscript::Element(spread_dim) = &dim_arg.value else {
+            return None;
+        };
+        let SectionSubscript::Element(ncopies) = &ncopies_arg.value else {
+            return None;
+        };
+        if eval_const_int(spread_dim) != Some(2) {
+            return None;
+        }
+        Some((source.clone(), ncopies.clone()))
+    };
+
+    let (matrix_expr, vector_expr, ncopies_expr) =
+        if let Some((vector, ncopies)) = spread_parts(right) {
+            (left.as_ref(), vector, ncopies)
+        } else if let Some((vector, ncopies)) = spread_parts(left) {
+            (right.as_ref(), vector, ncopies)
+        } else {
+            return None;
+        };
+    if actual_expr_rank(matrix_expr, locals, st, type_layouts) != Some(2)
+        || actual_expr_rank(&vector_expr, locals, st, type_layouts) != Some(1)
+        || !squared_column_distance_descriptor_expr_is_safe(matrix_expr, locals, st, type_layouts)
+        || !squared_column_distance_descriptor_expr_is_safe(&vector_expr, locals, st, type_layouts)
+        || squared_column_distance_expr_references_volatile(matrix_expr, st)
+        || squared_column_distance_expr_references_volatile(&vector_expr, st)
+    {
+        return None;
+    }
+
+    let matrix_ty = generic_actual_expr_type_info(matrix_expr, locals, st, type_layouts)
+        .map(|type_info| type_info_to_ir_type(&type_info))?;
+    let vector_ty = generic_actual_expr_type_info(&vector_expr, locals, st, type_layouts)
+        .map(|type_info| type_info_to_ir_type(&type_info))?;
+    if !matches!(matrix_ty, IrType::Float(FloatWidth::F32 | FloatWidth::F64))
+        || vector_ty != matrix_ty
+    {
+        return None;
+    }
+
+    // SPREAD lowers NCOPIES before its SOURCE descriptor today. Keep that
+    // evaluation point even though the fused kernel needs no replicated data.
+    let ncopies_raw =
+        super::expr::lower_expr_with_optional_layouts(b, locals, &ncopies_expr, st, type_layouts);
+    let ncopies = widen_idx_to_i64(b, ncopies_raw);
+    let (matrix_desc, _) = lower_array_expr_descriptor(
+        b,
+        locals,
+        matrix_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let (vector_desc, _) = lower_array_expr_descriptor(
+        b,
+        locals,
+        &vector_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let result_desc = zeroed_array_temp_descriptor(b);
+    b.call(
+        FuncRef::External("afs_array_squared_column_distances".into()),
+        vec![matrix_desc, vector_desc, ncopies, result_desc],
+        IrType::Void,
+    );
+    deallocate_array_expr_descriptor_if_temp(b, locals, matrix_expr, st, matrix_desc);
+    deallocate_array_expr_descriptor_if_temp(b, locals, &vector_expr, st, vector_desc);
+    Some((result_desc, matrix_ty))
 }
 
 pub(super) fn lower_array_product_dim_descriptor(
