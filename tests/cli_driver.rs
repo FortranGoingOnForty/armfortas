@@ -64948,3 +64948,40 @@ fn fixed_form_complex_star_16_uses_double_components() {
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn fixed_form_if_keyword_can_name_assignment_targets() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_if_keyword_can_name_assignment_targets count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER I, IF, IF_ARRAY(2)\n      I = 4\n      IF = I - 1\n      IF_ARRAY(1) = IF + 2\n      IF (IF.NE.3 .OR. IF_ARRAY(1).NE.5) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_if_designator", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form IF-designator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form IF-designator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form IF-designator binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form IF-designator run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}

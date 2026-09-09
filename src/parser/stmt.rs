@@ -63,7 +63,12 @@ impl<'a> Parser<'a> {
         }
 
         match text.as_str() {
-            "if" => self.parse_if(start),
+            "if" if self.peek_kind_at(1) == Some(&TokenKind::LParen)
+                && !self.leading_designator_is_assignment() =>
+            {
+                self.parse_if(start)
+            }
+            "if" => self.parse_assignment_or_call(start),
             "do" => self.parse_do(start),
             // SELECT is not a reserved word — F2008 §3.2.5. LAPACK
             // routines use `select` as a logical-array dummy
@@ -774,6 +779,47 @@ impl<'a> Parser<'a> {
     fn looks_like_optional_name_stmt(&self) -> bool {
         self.at_stmt_end_after(1)
             || (self.peek_kind_at(1) == Some(&TokenKind::Identifier) && self.at_stmt_end_after(2))
+    }
+
+    /// Fortran keywords are not reserved. Distinguish `IF (condition) ...`
+    /// from assignments to scalar, array, or component designators named IF.
+    fn leading_designator_is_assignment(&self) -> bool {
+        let mut index = self.pos + 1;
+        loop {
+            if self.tokens.get(index).map(|token| &token.kind) == Some(&TokenKind::LParen) {
+                let mut depth = 0usize;
+                while let Some(token) = self.tokens.get(index) {
+                    match token.kind {
+                        TokenKind::LParen => depth += 1,
+                        TokenKind::RParen => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                index += 1;
+                                break;
+                            }
+                        }
+                        TokenKind::Newline
+                        | TokenKind::Semicolon
+                        | TokenKind::Comment
+                        | TokenKind::Eof => return false,
+                        _ => {}
+                    }
+                    index += 1;
+                }
+            }
+            if self.tokens.get(index).map(|token| &token.kind) == Some(&TokenKind::Percent)
+                && self.tokens.get(index + 1).map(|token| &token.kind)
+                    == Some(&TokenKind::Identifier)
+            {
+                index += 2;
+                continue;
+            }
+            break;
+        }
+        matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Assign | TokenKind::Arrow)
+        )
     }
 
     fn parse_stop(
@@ -2049,6 +2095,22 @@ mod tests {
         } else {
             panic!("not IfConstruct");
         }
+    }
+
+    #[test]
+    fn if_keyword_can_be_an_assignment_designator() {
+        assert!(matches!(
+            parse_one("if = 3\n").node,
+            Stmt::Assignment { .. }
+        ));
+        assert!(matches!(
+            parse_one("if(i) = 4\n").node,
+            Stmt::Assignment { .. }
+        ));
+        assert!(matches!(
+            parse_one("if(i)%value = 5\n").node,
+            Stmt::Assignment { .. }
+        ));
     }
 
     // ---- DO ----
