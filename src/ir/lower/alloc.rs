@@ -209,7 +209,10 @@ pub(crate) fn alloc_decls(
                 // merged symbol instead of looking only at this TypeDecl.
                 if current_proc_scope()
                     .and_then(|scope_id| st.lookup_in(scope_id, &key))
-                    .is_some_and(|symbol| symbol.attrs.external)
+                    .is_some_and(|symbol| {
+                        symbol.attrs.external
+                            && symbol.kind != crate::sema::symtab::SymbolKind::ProcedurePointer
+                    })
                 {
                     continue;
                 }
