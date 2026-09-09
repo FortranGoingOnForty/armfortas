@@ -152,6 +152,24 @@ fn write_f32_ptr(dst: *mut f32, value: f32) {
     }
 }
 
+#[inline]
+fn write_complex32_ptr(dst: *mut f32, real: f32, imag: f32) {
+    if dst.is_null() {
+        return;
+    }
+    write_f32_ptr(dst, real);
+    write_f32_ptr(dst.wrapping_add(1), imag);
+}
+
+#[inline]
+fn write_complex64_ptr(dst: *mut f64, real: f64, imag: f64) {
+    if dst.is_null() {
+        return;
+    }
+    write_f64_ptr(dst, real);
+    write_f64_ptr(dst.wrapping_add(1), imag);
+}
+
 // ---- Unit status types ----
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,6 +310,24 @@ fn scan_list_directed_token(input: &[u8], start: usize) -> Option<(ListReadToken
         // Keep any non-separator suffix in the same raw token. The
         // character decoder will reject it instead of silently treating
         // the suffix as a second list item.
+        while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
+        {
+            cursor += 1;
+        }
+    } else if input[cursor] == b'(' {
+        // A list-directed complex value is one input item even though its
+        // `(real, imaginary)` spelling contains whitespace and a comma.
+        // Preserve the complete parenthesized value for the type-aware
+        // complex reader instead of handing the real reader a bare `(`.
+        cursor += 1;
+        while cursor < input.len() && input[cursor] != b')' {
+            cursor += 1;
+        }
+        if cursor < input.len() {
+            cursor += 1;
+        }
+        // Keep an invalid suffix attached so the complex decoder rejects
+        // malformed input rather than silently treating it as another item.
         while cursor < input.len() && !input[cursor].is_ascii_whitespace() && input[cursor] != b','
         {
             cursor += 1;
@@ -644,6 +680,39 @@ fn mantissa_allows_implicit_exponent(prefix: &[u8]) -> bool {
         }
     }
     saw_digit
+}
+
+fn list_directed_complex_parts(token: &str) -> Option<(&str, &str)> {
+    let body = token.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let (real, imag) = body.split_once(',')?;
+    if imag.contains(',') || real.trim().is_empty() || imag.trim().is_empty() {
+        return None;
+    }
+    Some((real.trim(), imag.trim()))
+}
+
+fn parse_list_directed_complex32(token: &str) -> Option<(f32, f32)> {
+    let (real, imag) = list_directed_complex_parts(token)?;
+    Some((
+        normalize_fortran_real_input(real, false)
+            .parse::<f32>()
+            .ok()?,
+        normalize_fortran_real_input(imag, false)
+            .parse::<f32>()
+            .ok()?,
+    ))
+}
+
+fn parse_list_directed_complex64(token: &str) -> Option<(f64, f64)> {
+    let (real, imag) = list_directed_complex_parts(token)?;
+    Some((
+        normalize_fortran_real_input(real, false)
+            .parse::<f64>()
+            .ok()?,
+        normalize_fortran_real_input(imag, false)
+            .parse::<f64>()
+            .ok()?,
+    ))
 }
 
 // ---- I/O State ----
@@ -2374,6 +2443,106 @@ pub extern "C" fn afs_read_real64(unit: i32, val: *mut f64, iostat: *mut i32) {
                     }
                 }
             }
+        }
+    });
+}
+
+/// Read a complex(4) value. Formatted list input uses the standard
+/// `(real, imaginary)` syntax; unformatted input consumes two adjacent f32
+/// lanes from the current record or stream.
+#[no_mangle]
+pub extern "C" fn afs_read_complex(unit: i32, val: *mut f32, iostat: *mut i32) {
+    with_unit(unit, |u| {
+        if let Some(bytes) = u.read_buffer_take(8) {
+            let mut real = [0u8; 4];
+            let mut imag = [0u8; 4];
+            real.copy_from_slice(&bytes[..4]);
+            imag.copy_from_slice(&bytes[4..]);
+            write_complex32_ptr(val, f32::from_ne_bytes(real), f32::from_ne_bytes(imag));
+            set_read_success(iostat);
+            return;
+        }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut bytes = [0u8; 8];
+            if read_stream_unformatted_exact(u, &mut bytes, iostat) == Some(true) {
+                let mut real = [0u8; 4];
+                let mut imag = [0u8; 4];
+                real.copy_from_slice(&bytes[..4]);
+                imag.copy_from_slice(&bytes[4..]);
+                write_complex32_ptr(val, f32::from_ne_bytes(real), f32::from_ne_bytes(imag));
+            }
+            return;
+        }
+
+        match u.next_read_token() {
+            Ok(Some(ListReadToken::Value(token))) => {
+                if let Some((real, imag)) = parse_list_directed_complex32(&token) {
+                    write_complex32_ptr(val, real, imag);
+                    set_read_success(iostat);
+                } else {
+                    set_read_iostat_or_exit(
+                        iostat,
+                        1,
+                        &format!("cannot parse complex from '{}'", token),
+                    );
+                }
+            }
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(None) => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file"),
+            Err(error) => set_read_iostat_or_exit(iostat, 1, &error.to_string()),
+        }
+    });
+}
+
+/// Read a complex(8) value. Formatted list input uses the standard
+/// `(real, imaginary)` syntax; unformatted input consumes two adjacent f64
+/// lanes from the current record or stream.
+#[no_mangle]
+pub extern "C" fn afs_read_complex64(unit: i32, val: *mut f64, iostat: *mut i32) {
+    with_unit(unit, |u| {
+        if let Some(bytes) = u.read_buffer_take(16) {
+            let mut real = [0u8; 8];
+            let mut imag = [0u8; 8];
+            real.copy_from_slice(&bytes[..8]);
+            imag.copy_from_slice(&bytes[8..]);
+            write_complex64_ptr(val, f64::from_ne_bytes(real), f64::from_ne_bytes(imag));
+            set_read_success(iostat);
+            return;
+        }
+        if report_short_pending_read_record(u, iostat) {
+            return;
+        }
+        if u.form == Form::Unformatted && u.access == Access::Stream {
+            let mut bytes = [0u8; 16];
+            if read_stream_unformatted_exact(u, &mut bytes, iostat) == Some(true) {
+                let mut real = [0u8; 8];
+                let mut imag = [0u8; 8];
+                real.copy_from_slice(&bytes[..8]);
+                imag.copy_from_slice(&bytes[8..]);
+                write_complex64_ptr(val, f64::from_ne_bytes(real), f64::from_ne_bytes(imag));
+            }
+            return;
+        }
+
+        match u.next_read_token() {
+            Ok(Some(ListReadToken::Value(token))) => {
+                if let Some((real, imag)) = parse_list_directed_complex64(&token) {
+                    write_complex64_ptr(val, real, imag);
+                    set_read_success(iostat);
+                } else {
+                    set_read_iostat_or_exit(
+                        iostat,
+                        1,
+                        &format!("cannot parse complex from '{}'", token),
+                    );
+                }
+            }
+            Ok(Some(ListReadToken::Null)) => set_read_success(iostat),
+            Ok(None) => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of file"),
+            Err(error) => set_read_iostat_or_exit(iostat, 1, &error.to_string()),
         }
     });
 }
@@ -4314,6 +4483,60 @@ pub extern "C" fn afs_read_internal_real(
                 }
             }
         }
+    }
+}
+
+/// Read a list-directed complex(4) value from a character buffer.
+#[no_mangle]
+pub extern "C" fn afs_read_internal_complex(
+    buf: *const u8,
+    buf_len: i64,
+    pos: *mut i64,
+    val: *mut f32,
+    iostat: *mut i32,
+) {
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => {
+            if let Some((real, imag)) = parse_list_directed_complex32(&token) {
+                write_complex32_ptr(val, real, imag);
+                set_read_success(iostat);
+            } else {
+                set_read_iostat_or_exit(
+                    iostat,
+                    1,
+                    &format!("cannot parse complex from '{}'", token),
+                );
+            }
+        }
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record"),
+    }
+}
+
+/// Read a list-directed complex(8) value from a character buffer.
+#[no_mangle]
+pub extern "C" fn afs_read_internal_complex64(
+    buf: *const u8,
+    buf_len: i64,
+    pos: *mut i64,
+    val: *mut f64,
+    iostat: *mut i32,
+) {
+    match next_internal_token(buf, buf_len, pos) {
+        Some(ListReadToken::Value(token)) => {
+            if let Some((real, imag)) = parse_list_directed_complex64(&token) {
+                write_complex64_ptr(val, real, imag);
+                set_read_success(iostat);
+            } else {
+                set_read_iostat_or_exit(
+                    iostat,
+                    1,
+                    &format!("cannot parse complex from '{}'", token),
+                );
+            }
+        }
+        Some(ListReadToken::Null) => set_read_success(iostat),
+        None => set_read_iostat_or_exit(iostat, IOSTAT_END, "end of record"),
     }
 }
 
@@ -7677,6 +7900,67 @@ mod tests {
                 ListReadToken::Value("plain".into()),
             ]
         );
+    }
+
+    #[test]
+    fn list_directed_tokenizer_preserves_parenthesized_complex_values() {
+        let tokens: Vec<_> =
+            tokenize_list_directed_record(" ( 1.25, -2.5),(-3.0D+00, 4.5D-01), 17\n")
+                .into_iter()
+                .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ListReadToken::Value("( 1.25, -2.5)".into()),
+                ListReadToken::Value("(-3.0D+00, 4.5D-01)".into()),
+                ListReadToken::Value("17".into()),
+            ]
+        );
+        assert_eq!(
+            parse_list_directed_complex32("( 1.25, -2.5)"),
+            Some((1.25, -2.5))
+        );
+        assert_eq!(
+            parse_list_directed_complex64("(-3.0D+00, 4.5D-01)"),
+            Some((-3.0, 0.45))
+        );
+    }
+
+    #[test]
+    fn internal_list_directed_complex_read_consumes_one_value_per_destination() {
+        let input = b"( 1.25, -2.5), (-3.0D+00, 4.5D-01), 17";
+        let mut position = 0;
+        let mut iostat = -99;
+        let mut single = [-9.0f32; 2];
+        let mut double = [-9.0f64; 2];
+        let mut trailing = -1;
+
+        afs_read_internal_complex(
+            input.as_ptr(),
+            input.len() as i64,
+            &mut position,
+            single.as_mut_ptr(),
+            &mut iostat,
+        );
+        assert_eq!((iostat, single), (0, [1.25, -2.5]));
+
+        afs_read_internal_complex64(
+            input.as_ptr(),
+            input.len() as i64,
+            &mut position,
+            double.as_mut_ptr(),
+            &mut iostat,
+        );
+        assert_eq!((iostat, double), (0, [-3.0, 0.45]));
+
+        afs_read_internal_int(
+            input.as_ptr(),
+            input.len() as i64,
+            &mut position,
+            &mut trailing,
+            &mut iostat,
+        );
+        assert_eq!((iostat, trailing), (0, 17));
     }
 
     #[test]

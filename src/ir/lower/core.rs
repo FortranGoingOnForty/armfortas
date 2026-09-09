@@ -37246,6 +37246,45 @@ pub(super) fn lower_read_into_addr(
         }
         IrType::Array(inner, 2) if matches!(inner.as_ref(), IrType::Float(_)) => {
             let lane_ty = inner.as_ref().clone();
+            match mode {
+                ReadMode::Unit { unit, iostat, .. } => {
+                    let func = match &lane_ty {
+                        IrType::Float(FloatWidth::F64) => "afs_read_complex64",
+                        _ => "afs_read_complex",
+                    };
+                    b.call(
+                        FuncRef::External(func.into()),
+                        vec![unit, addr, iostat],
+                        IrType::Void,
+                    );
+                    finish_read_item(b, mode);
+                    return true;
+                }
+                ReadMode::Internal {
+                    buf_ptr,
+                    buf_len,
+                    pos,
+                    iostat,
+                    ..
+                } => {
+                    let func = match &lane_ty {
+                        IrType::Float(FloatWidth::F64) => "afs_read_internal_complex64",
+                        _ => "afs_read_internal_complex",
+                    };
+                    b.call(
+                        FuncRef::External(func.into()),
+                        vec![buf_ptr, buf_len, pos, addr, iostat],
+                        IrType::Void,
+                    );
+                    finish_read_item(b, mode);
+                    return true;
+                }
+                ReadMode::FormattedUnit { .. } | ReadMode::FormattedInternal { .. } => {}
+            }
+
+            // Explicit formatted complex input consumes two consecutive real
+            // data edits. List-directed input above instead consumes one
+            // parenthesized `(real, imaginary)` value.
             let lane_bytes = match lane_ty {
                 IrType::Float(FloatWidth::F64) => 8,
                 _ => 4,
