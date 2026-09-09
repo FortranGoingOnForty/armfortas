@@ -64424,3 +64424,196 @@ end program p
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn sum_squares_dim_dispatches_to_runtime_kernel() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sum_squares_dim_dispatches_to_runtime_kernel count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"module sum_squares_dim_m
+  implicit none
+contains
+  subroutine squares8(x, result)
+    real(8), intent(in) :: x(:, :)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum(x**2, dim=1)
+  end subroutine
+
+  subroutine squares4(x, result)
+    real(4), intent(in) :: x(:, :)
+    real(4), allocatable, intent(out) :: result(:)
+    result = sum(x**2, dim=1)
+  end subroutine
+
+  subroutine section8(x, result)
+    real(8), intent(in) :: x(:, :)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum(x(3:1:-1, 3:1:-1)**2, dim=1)
+  end subroutine
+
+  subroutine rank3(x, result)
+    real(8), intent(in) :: x(:, :, :)
+    real(8), allocatable, intent(out) :: result(:, :)
+    result = sum(x**2, dim=2)
+  end subroutine
+
+  subroutine parameter_exponent(x, result)
+    integer, parameter :: square = 2
+    real(8), intent(in) :: x(:, :)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum(x**square, dim=1)
+  end subroutine
+
+  subroutine dynamic_dim(x, dim, result)
+    real(8), intent(in) :: x(:, :)
+    integer, value :: dim
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum(x**2, dim=dim)
+  end subroutine
+
+  subroutine cubic_fallback(x, result)
+    real(8), intent(in) :: x(:, :)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum(x**3, dim=1)
+  end subroutine
+
+  subroutine expression_fallback(x, result)
+    real(8), intent(in) :: x(:, :)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum((x + 1.0_8)**2, dim=1)
+  end subroutine
+
+  subroutine volatile_fallback(x, result)
+    real(8), intent(in), volatile :: x(:, :)
+    real(8), allocatable, intent(out) :: result(:)
+    result = sum(x**2, dim=1)
+  end subroutine
+end module
+
+program p
+  use sum_squares_dim_m
+  implicit none
+  real(8) :: matrix8(3, 3), cube(2, 2, 2)
+  real(4) :: matrix4(3, 3)
+  real(8), allocatable :: result8(:), result3(:, :), empty(:, :)
+  real(4), allocatable :: result4(:)
+
+  matrix8 = reshape([1.0_8, 2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8, &
+                     7.0_8, 8.0_8, 9.0_8], [3, 3])
+  matrix4 = real(matrix8, 4)
+  cube = reshape([1.0_8, 2.0_8, 3.0_8, 4.0_8, 5.0_8, 6.0_8, 7.0_8, 8.0_8], [2, 2, 2])
+
+  call squares8(matrix8, result8)
+  if (any(result8 /= [14.0_8, 77.0_8, 194.0_8])) error stop 1
+  call squares4(matrix4, result4)
+  if (any(result4 /= [14.0_4, 77.0_4, 194.0_4])) error stop 2
+  call section8(matrix8, result8)
+  if (any(result8 /= [194.0_8, 77.0_8, 14.0_8])) error stop 3
+  call rank3(cube, result3)
+  if (any(result3 /= reshape([10.0_8, 20.0_8, 74.0_8, 100.0_8], [2, 2]))) error stop 4
+  call parameter_exponent(matrix8, result8)
+  if (any(result8 /= [14.0_8, 77.0_8, 194.0_8])) error stop 5
+  call dynamic_dim(matrix8, 2, result8)
+  if (any(result8 /= [66.0_8, 93.0_8, 126.0_8])) error stop 6
+  call cubic_fallback(matrix8, result8)
+  if (any(result8 /= [36.0_8, 405.0_8, 1584.0_8])) error stop 7
+  call expression_fallback(matrix8, result8)
+  if (any(result8 /= [29.0_8, 110.0_8, 245.0_8])) error stop 8
+  call volatile_fallback(matrix8, result8)
+  if (any(result8 /= [14.0_8, 77.0_8, 194.0_8])) error stop 9
+
+  allocate(empty(0, 3))
+  call squares8(empty, result8)
+  if (size(result8) /= 3 .or. any(result8 /= 0.0_8)) error stop 10
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+
+    let ir = unique_path("sum_squares_dim", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("sum-squares DIM IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "sum-squares DIM IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read sum-squares DIM IR");
+    let function_ir = |name: &str| {
+        let marker = format!("func @afs_modproc_sum_squares_dim_m_{}", name);
+        ir_text
+            .split_once(&marker)
+            .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("missing {} IR", name))
+    };
+    for name in [
+        "squares8",
+        "squares4",
+        "section8",
+        "rank3",
+        "parameter_exponent",
+        "dynamic_dim",
+    ] {
+        let body = function_ir(name);
+        assert!(
+            body.contains("call @afs_array_sum_squares_real_dim("),
+            "{} should dispatch to the sum-squares DIM kernel:\n{}",
+            name,
+            body
+        );
+        assert!(
+            !body.contains("direct_sum_dim_check"),
+            "{} should not retain the generalized reduction loop:\n{}",
+            name,
+            body
+        );
+    }
+    for name in ["cubic_fallback", "expression_fallback", "volatile_fallback"] {
+        let body = function_ir(name);
+        assert!(
+            !body.contains("call @afs_array_sum_squares_real_dim("),
+            "{} must retain ordinary lowering:\n{}",
+            name,
+            body
+        );
+    }
+
+    let out = unique_path("sum_squares_dim", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sum-squares DIM compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sum-squares DIM compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("sum-squares DIM binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "sum-squares DIM failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

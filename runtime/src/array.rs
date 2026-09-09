@@ -4018,6 +4018,80 @@ mod tests {
     }
 
     #[test]
+    fn sum_squares_dim_follows_signed_strides_and_real_kinds() {
+        let mut matrix8 = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let matrix8_desc = strided_descriptor(&mut matrix8, 8, &[3, 3], &[-1, -3]);
+        let mut columns = ArrayDescriptor::zeroed();
+        afs_array_sum_squares_real_dim(&matrix8_desc, 1, &mut columns);
+        assert_eq!(columns.rank, 1);
+        assert_eq!(columns.elem_size, 8);
+        assert_eq!(columns.dims[0].extent(), 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(columns.base_addr as *const f64, 3) },
+            [194.0, 77.0, 14.0]
+        );
+        afs_deallocate_array(&mut columns, ptr::null_mut());
+
+        let mut rows = ArrayDescriptor::zeroed();
+        afs_array_sum_squares_real_dim(&matrix8_desc, 2, &mut rows);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(rows.base_addr as *const f64, 3) },
+            [126.0, 93.0, 66.0]
+        );
+        afs_deallocate_array(&mut rows, ptr::null_mut());
+
+        let mut matrix4 = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let matrix4_desc = strided_descriptor(&mut matrix4, 0, &[2, 3], &[1, 2]);
+        let mut result4 = ArrayDescriptor::zeroed();
+        afs_array_sum_squares_real_dim(&matrix4_desc, 1, &mut result4);
+        assert_eq!(result4.elem_size, 4);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(result4.base_addr as *const f32, 3) },
+            [5.0, 25.0, 61.0]
+        );
+        afs_deallocate_array(&mut result4, ptr::null_mut());
+    }
+
+    #[test]
+    fn sum_squares_dim_handles_rank_three_and_empty_reduction_extents() {
+        let mut cube = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let cube_desc = strided_descriptor(&mut cube, 0, &[2, 2, 2], &[1, 2, 4]);
+        let mut cube_result = ArrayDescriptor::zeroed();
+        afs_array_sum_squares_real_dim(&cube_desc, 2, &mut cube_result);
+        assert_eq!(cube_result.rank, 2);
+        assert_eq!(cube_result.dims[0].extent(), 2);
+        assert_eq!(cube_result.dims[1].extent(), 2);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(cube_result.base_addr as *const f64, 4) },
+            [10.0, 20.0, 74.0, 100.0]
+        );
+        afs_deallocate_array(&mut cube_result, ptr::null_mut());
+
+        let mut empty = ArrayDescriptor::zeroed();
+        empty.elem_size = 8;
+        empty.rank = 2;
+        empty.dims[0] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 0,
+            stride: 1,
+        };
+        empty.dims[1] = DimDescriptor {
+            lower_bound: 1,
+            upper_bound: 3,
+            stride: 1,
+        };
+        let mut empty_result = ArrayDescriptor::zeroed();
+        afs_array_sum_squares_real_dim(&empty, 1, &mut empty_result);
+        assert_eq!(empty_result.rank, 1);
+        assert_eq!(empty_result.dims[0].extent(), 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(empty_result.base_addr as *const f64, 3) },
+            [0.0, 0.0, 0.0]
+        );
+        afs_deallocate_array(&mut empty_result, ptr::null_mut());
+    }
+
+    #[test]
     fn squared_column_distances_follow_signed_strides_and_real_kinds() {
         let mut matrix8 = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let mut vector8 = [1.0_f64, 2.0, 3.0];
@@ -8917,6 +8991,191 @@ pub extern "C" fn afs_array_reshape(
 fn rank_one_byte_offset(desc: &ArrayDescriptor, index: usize, minimum_elem_size: i64) -> isize {
     let elem_size = desc.elem_size.max(minimum_elem_size);
     (index as i64 * desc.dims[0].stride * elem_size) as isize
+}
+
+/// Compute `SUM(source**2, DIM=dim)` for a real array without materializing
+/// the full-rank square temporary. The result is a freshly allocated
+/// rank-(N-1) descriptor. Source strides are signed so reversed sections keep
+/// their logical element order.
+#[no_mangle]
+pub extern "C" fn afs_array_sum_squares_real_dim(
+    source: *const ArrayDescriptor,
+    dim: i32,
+    result: *mut ArrayDescriptor,
+) {
+    if source.is_null() || result.is_null() {
+        return;
+    }
+    let source = unsafe { &*source };
+    if !(1..=MAX_RANK as i32).contains(&source.rank) {
+        return;
+    }
+    let rank = source.rank as usize;
+    let Some(reduced_dim) = usize::try_from(dim)
+        .ok()
+        .and_then(|value| value.checked_sub(1))
+    else {
+        return;
+    };
+    if reduced_dim >= rank
+        || !matches!(source.elem_size, 4 | 8)
+        || !descriptor_has_payload_or_zero_size_array(source)
+    {
+        return;
+    }
+
+    let new_rank = rank - 1;
+    if !unsafe { &*result }.is_allocated() {
+        let mut result_dims = [DimDescriptor {
+            lower_bound: 0,
+            upper_bound: 0,
+            stride: 0,
+        }; 15];
+        let mut result_dim = 0;
+        let mut result_stride = 1;
+        for source_dim in 0..rank {
+            if source_dim == reduced_dim {
+                continue;
+            }
+            let extent = source.dims[source_dim].extent();
+            result_dims[result_dim] = DimDescriptor {
+                lower_bound: 1,
+                upper_bound: extent,
+                stride: result_stride,
+            };
+            result_stride *= extent;
+            result_dim += 1;
+        }
+        let mut stat = 0;
+        afs_allocate_array(
+            result,
+            source.elem_size,
+            new_rank as i32,
+            result_dims.as_ptr(),
+            &mut stat,
+        );
+        if stat != 0 {
+            return;
+        }
+    }
+    let result = unsafe { &mut *result };
+    if result.rank as usize != new_rank
+        || result.elem_size != source.elem_size
+        || !descriptor_has_payload_or_zero_size_array(result)
+    {
+        return;
+    }
+
+    let result_total = result.total_elements().max(0) as usize;
+    match source.elem_size {
+        4 => {
+            let result_ptr = result.base_addr as *mut f32;
+            for result_index in 0..result_total {
+                unsafe {
+                    *result_ptr.add(result_index) = 0.0;
+                }
+            }
+            let source_ptr = source.base_addr as *const f32;
+            if rank == 2 && reduced_dim == 0 {
+                let rows = source.dims[0].extent();
+                let columns = source.dims[1].extent();
+                for column in 0..columns {
+                    let mut sum = 0.0_f32;
+                    for row in 0..rows {
+                        let offset = row * source.dims[0].stride + column * source.dims[1].stride;
+                        let value = unsafe { *source_ptr.offset(offset as isize) };
+                        sum += value * value;
+                    }
+                    unsafe {
+                        *result_ptr.add(column as usize) = sum;
+                    }
+                }
+                return;
+            }
+            sum_squares_dim_generic(source, reduced_dim, |source_offset, result_index| {
+                let value = unsafe { *source_ptr.offset(source_offset) };
+                unsafe {
+                    *result_ptr.add(result_index) += value * value;
+                }
+            });
+        }
+        8 => {
+            let result_ptr = result.base_addr as *mut f64;
+            for result_index in 0..result_total {
+                unsafe {
+                    *result_ptr.add(result_index) = 0.0;
+                }
+            }
+            let source_ptr = source.base_addr as *const f64;
+            if rank == 2 && reduced_dim == 0 {
+                let rows = source.dims[0].extent();
+                let columns = source.dims[1].extent();
+                for column in 0..columns {
+                    let mut sum = 0.0_f64;
+                    for row in 0..rows {
+                        let offset = row * source.dims[0].stride + column * source.dims[1].stride;
+                        let value = unsafe { *source_ptr.offset(offset as isize) };
+                        sum += value * value;
+                    }
+                    unsafe {
+                        *result_ptr.add(column as usize) = sum;
+                    }
+                }
+                return;
+            }
+            sum_squares_dim_generic(source, reduced_dim, |source_offset, result_index| {
+                let value = unsafe { *source_ptr.offset(source_offset) };
+                unsafe {
+                    *result_ptr.add(result_index) += value * value;
+                }
+            });
+        }
+        _ => unreachable!("sum-squares real kind was validated above"),
+    }
+}
+
+fn sum_squares_dim_generic<F: FnMut(isize, usize)>(
+    source: &ArrayDescriptor,
+    reduced_dim: usize,
+    mut accumulate: F,
+) {
+    let rank = source.rank as usize;
+    let mut extents = [0_i64; 15];
+    let mut result_strides = [0_i64; 15];
+    let mut result_dim = 0;
+    let mut result_stride = 1;
+    let mut total = 1_i64;
+    for (dim, extent_slot) in extents.iter_mut().enumerate().take(rank) {
+        let extent = source.dims[dim].extent();
+        *extent_slot = extent;
+        total *= extent;
+        if dim != reduced_dim {
+            result_strides[dim] = result_stride;
+            result_stride *= extent;
+            result_dim += 1;
+        }
+    }
+    if total <= 0 || result_dim + 1 != rank {
+        return;
+    }
+
+    let mut indices = [0_i64; 15];
+    for _ in 0..total {
+        let mut source_offset = 0_i64;
+        let mut result_index = 0_i64;
+        for dim in 0..rank {
+            source_offset += indices[dim] * source.dims[dim].stride;
+            result_index += indices[dim] * result_strides[dim];
+        }
+        accumulate(source_offset as isize, result_index as usize);
+        for dim in 0..rank {
+            indices[dim] += 1;
+            if indices[dim] < extents[dim] {
+                break;
+            }
+            indices[dim] = 0;
+        }
+    }
 }
 
 /// Compute the squared Euclidean distance between every column of a rank-2
