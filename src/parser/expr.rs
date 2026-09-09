@@ -41,11 +41,11 @@ const BP_ADD: Bp = Bp {
     left: 16,
     right: 17,
 }; // +, - (binary)
-const BP_UNARY_ADD: u8 = 18; // +, - (unary)
 pub(crate) const BP_MUL: Bp = Bp {
     left: 20,
     right: 21,
 }; // *, /
+const BP_UNARY_ADD: u8 = 22; // +, - (unary)
 const BP_POW: Bp = Bp {
     left: 23,
     right: 22,
@@ -991,6 +991,12 @@ mod tests {
     fn unary_minus_below_power() {
         // -a ** b → (- (a ** b))
         assert_eq!(sexpr("-a ** b"), "(- (a ** b))");
+    }
+
+    #[test]
+    fn unary_minus_above_multiplication() {
+        // -a * b → ((- a) * b)
+        assert_eq!(sexpr("-a * b"), "((- a) * b)");
     }
 
     #[test]

@@ -65133,3 +65133,40 @@ fn fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms() {
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn fixed_form_data_accepts_negative_final_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_data_accepts_negative_final_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER INCXS(4)\n      DATA INCXS/1, 2, -2, -1/\n      IF (INCXS(1).NE.1 .OR. INCXS(3).NE.-2 .OR.\n     $    INCXS(4).NE.-1) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_data_negative_final", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DATA compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DATA compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DATA binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DATA run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}

@@ -2366,6 +2366,26 @@ end type item",
     }
 
     #[test]
+    fn data_stmt_negative_final_value_does_not_consume_delimiter() {
+        let d = parse_decl("data incxs /1, 2, -2, -1/");
+        let Decl::DataStmt { sets } = &d.node else {
+            panic!("not DataStmt");
+        };
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].values.len(), 4);
+        let DataValue::Expr(last) = &sets[0].values[3] else {
+            panic!("expected scalar DATA value");
+        };
+        assert!(matches!(
+            last.node,
+            crate::ast::expr::Expr::UnaryOp {
+                op: crate::ast::expr::UnaryOp::Minus,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn equivalence_stmt() {
         let d = parse_decl("equivalence (a, b), (c, d)");
         if let Decl::EquivalenceStmt { groups } = &d.node {
