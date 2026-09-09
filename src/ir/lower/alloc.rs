@@ -203,6 +203,16 @@ pub(crate) fn alloc_decls(
                 if locals.contains_key(&key) {
                     continue;
                 }
+                // A typed EXTERNAL declaration describes a procedure result,
+                // not a data object. Standalone legacy spelling commonly puts
+                // EXTERNAL in a later attribute statement, so consult sema's
+                // merged symbol instead of looking only at this TypeDecl.
+                if current_proc_scope()
+                    .and_then(|scope_id| st.lookup_in(scope_id, &key))
+                    .is_some_and(|symbol| symbol.attrs.external)
+                {
+                    continue;
+                }
                 let init_expr: Option<&crate::ast::expr::SpannedExpr> = entity
                     .init
                     .as_ref()

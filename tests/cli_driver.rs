@@ -49845,6 +49845,50 @@ fn derived_scalar_structure_constructor_initializer_sets_char_components() {
 }
 
 #[test]
+fn legacy_typed_external_dummy_calls_actual_procedure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=legacy_typed_external_dummy_calls_actual_procedure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      LOGICAL A, B, ISPOS, ISNEG\n      INTEGER S\n      EXTERNAL ISPOS, ISNEG\n      CALL APPLY(ISPOS, 2, A)\n      CALL APPLY(ISNEG, -2, B)\n      S = 0\n      IF (A) S = S + 1\n      IF (B) S = S + 2\n      PRINT *, S\n      END\n      SUBROUTINE APPLY(PRED, X, ANSWER)\n      LOGICAL PRED, ANSWER\n      INTEGER X\n      EXTERNAL PRED\n      ANSWER = PRED(X)\n      END\n      LOGICAL FUNCTION ISPOS(X)\n      INTEGER X\n      ISPOS = X .GT. 0\n      END\n      LOGICAL FUNCTION ISNEG(X)\n      INTEGER X\n      ISNEG = X .LT. 0\n      END\n",
+        "f",
+    );
+    let out = unique_path("legacy_external_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("legacy EXTERNAL dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "legacy EXTERNAL dummy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("legacy EXTERNAL dummy run failed");
+    assert!(
+        run.status.success(),
+        "legacy EXTERNAL dummy run failed: {:?}: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('3'),
+        "legacy EXTERNAL dummy did not dispatch both actual procedures: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_dummy_with_explicit_interface_indirect_call_links_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -22579,7 +22579,12 @@ fn procedure_dummy_symbol_in_scope<'a>(
     scope
         .symbols
         .get(&key.to_lowercase())
-        .filter(|sym| symbol_is_procedure_dummy(sym))
+        // A legacy implicit-interface procedure dummy is commonly declared
+        // by a type statement followed by EXTERNAL (`LOGICAL SELECT;
+        // EXTERNAL SELECT`). Sema correctly retains that as a Variable with
+        // the EXTERNAL attribute, rather than an explicit-interface
+        // Function/ProcedurePointer symbol.
+        .filter(|sym| symbol_is_procedure_dummy(sym) || sym.attrs.external)
 }
 
 pub(super) fn procedure_dummy_arg_ir_type(
@@ -22671,7 +22676,10 @@ pub(super) fn procedure_dummy_closure_param_slots_for_scope(
         return false;
     };
     let key = dummy_name.to_lowercase();
-    procedure_dummy_symbol_in_scope(st, scope_id, &key).is_some()
+    st.scope(scope_id)
+        .symbols
+        .get(&key)
+        .is_some_and(symbol_is_procedure_dummy)
 }
 
 pub(super) fn append_procedure_dummy_closure_args_for_call(
@@ -65020,12 +65028,7 @@ pub(super) fn lower_arg_by_ref_full(
             return info.addr;
         }
         if let Some(sym) = find_linkable_symbol_any_scope(st, &key) {
-            if matches!(
-                sym.kind,
-                crate::sema::symtab::SymbolKind::Function
-                    | crate::sema::symtab::SymbolKind::Subroutine
-                    | crate::sema::symtab::SymbolKind::ExternalProc
-            ) {
+            if is_linkable_callable_symbol(sym) {
                 let (link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
                 if let Some(internal_funcs) = internal_funcs {
                     if internal_funcs.contains_key(&resolved_key)
