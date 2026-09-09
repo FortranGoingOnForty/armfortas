@@ -20126,6 +20126,14 @@ pub(super) fn lowered_scope_symbol_name(
                         internal_funcs,
                     ))
                 }
+                crate::sema::symtab::ScopeKind::Global => Some(lowered_procedure_symbol_name(
+                    name,
+                    scope.binding_label.as_deref(),
+                    None,
+                    None,
+                    false,
+                    internal_funcs,
+                )),
                 crate::sema::symtab::ScopeKind::Module(module_name) => {
                     Some(module_procedure_symbol_name(module_name, name))
                 }

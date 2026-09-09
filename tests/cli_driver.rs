@@ -65170,3 +65170,68 @@ fn fixed_form_data_accepts_negative_final_value() {
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn top_level_subroutine_contained_function_uses_internal_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=top_level_subroutine_contained_function_uses_internal_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real :: value\n  call host(value)\n  if (abs(value - 9.0) > 1.0e-5) error stop 1\n  print *, 'ok'\nend program\n\nsubroutine host(value)\n  implicit none\n  real, intent(out) :: value\n  value = square(3.0)\ncontains\n  real function square(x)\n    real, intent(in) :: x\n    square = x * x\n  end function square\nend subroutine host\n",
+        "f90",
+    );
+    let ir = unique_path("top_level_host_internal_function", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("top-level-host contained-function IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "top-level-host contained-function IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read contained-function IR");
+    assert!(
+        ir_text.contains("call @afs_internal_host_"),
+        "contained function call should use the host-qualified internal target:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @square("),
+        "contained function must not escape as a raw external target:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("top_level_host_internal_function", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("top-level-host contained-function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "top-level-host contained-function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("top-level-host contained-function binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "top-level-host contained-function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
