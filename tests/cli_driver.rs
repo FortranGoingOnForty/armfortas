@@ -41902,6 +41902,64 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
 }
 
 #[test]
+fn list_directed_implied_do_read_observes_record_boundaries() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_implied_do_read_observes_record_boundaries count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // LAPACK data files annotate each record after the requested values and
+    // read arrays through input implied-DO lists.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: n, i, values(6)\n  read(*, *) n\n  read(*, *) (values(i), i = 1, n)\n  print *, n, values\nend program\n",
+        "f90",
+    );
+    let out = unique_path("list_read_implied_do_records", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("list-directed implied-DO read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "list-directed implied-DO read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut child = Command::new(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("list-directed implied-DO read run failed to spawn");
+    child
+        .stdin
+        .take()
+        .expect("child stdin must be piped")
+        .write_all(b"6 Number of values\n0 1 2 3 5 20 Values of N\n")
+        .expect("cannot write annotated list-directed records");
+    let run = child
+        .wait_with_output()
+        .expect("cannot collect list-directed implied-DO output");
+    assert!(
+        run.status.success(),
+        "list-directed implied-DO read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let fields: Vec<_> = String::from_utf8_lossy(&run.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(fields, ["6", "0", "1", "2", "3", "5", "20"]);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn internal_list_read_mixed_integer_and_character_token_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -36311,6 +36311,15 @@ fn lower_list_read_item(
     item: &crate::ast::expr::SpannedExpr,
     mode: ReadMode,
 ) {
+    if let Expr::ArrayConstructor { values, .. } = &item.node {
+        if values
+            .iter()
+            .any(|value| matches!(value, AcValue::ImpliedDo(_)))
+        {
+            lower_list_read_ac_values(b, ctx, values, mode);
+            return;
+        }
+    }
     if lower_array_read_item(b, ctx, item, mode) {
         return;
     }
@@ -36324,6 +36333,111 @@ fn lower_list_read_item(
         return;
     };
     let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
+}
+
+fn lower_list_read_ac_values(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    values: &[AcValue],
+    mode: ReadMode,
+) {
+    for value in values {
+        match value {
+            AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: nested, .. } = &expr.node {
+                    lower_list_read_ac_values(b, ctx, nested, mode);
+                } else {
+                    lower_list_read_item(b, ctx, expr, mode);
+                }
+            }
+            AcValue::ImpliedDo(implied_do) => {
+                lower_list_read_ac_implied_do(b, ctx, implied_do, mode)
+            }
+        }
+    }
+}
+
+fn lower_list_read_ac_implied_do(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    implied_do: &crate::ast::expr::ImpliedDoLoop,
+    mode: ReadMode,
+) {
+    let var_ty = IrType::Int(IntWidth::I32);
+    let var_addr = b.alloca(var_ty.clone());
+    let start_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.start);
+    let start = coerce_to_type(b, start_raw, &var_ty);
+    b.store(start, var_addr);
+    let end_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.end);
+    let end = coerce_to_type(b, end_raw, &var_ty);
+    let step_raw = match &implied_do.step {
+        Some(step) => super::expr::lower_expr_ctx(b, ctx, step),
+        None => b.const_i32(1),
+    };
+    let step = coerce_to_type(b, step_raw, &var_ty);
+
+    let var_key = implied_do.var.to_lowercase();
+    let old_local = ctx.locals.insert(
+        var_key.clone(),
+        LocalInfo {
+            addr: var_addr,
+            ty: var_ty,
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let check = b.create_block("read_ac_impdo_check");
+    let body = b.create_block("read_ac_impdo_body");
+    let exit = b.create_block("read_ac_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let current = b.load(var_addr);
+    let const_step = implied_do.step.as_ref().and_then(eval_const_int);
+    if let Some(value) = const_step {
+        let comparison = if value < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let keep_going = b.icmp(comparison, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    } else {
+        let zero = b.const_i32(0);
+        let negative = b.icmp(CmpOp::Lt, step, zero);
+        let negative_check = b.create_block("read_ac_impdo_neg_check");
+        let positive_check = b.create_block("read_ac_impdo_pos_check");
+        b.cond_branch(negative, negative_check, vec![], positive_check, vec![]);
+
+        b.set_block(negative_check);
+        let keep_going = b.icmp(CmpOp::Ge, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+
+        b.set_block(positive_check);
+        let keep_going = b.icmp(CmpOp::Le, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    }
+
+    b.set_block(body);
+    lower_list_read_ac_values(b, ctx, &implied_do.values, mode);
+    let current = b.load(var_addr);
+    let next = b.iadd(current, step);
+    b.store(next, var_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
+    if let Some(previous) = old_local {
+        ctx.locals.insert(var_key, previous);
+    } else {
+        ctx.locals.remove(&var_key);
+    }
 }
 
 pub(super) fn lower_list_read_items(
