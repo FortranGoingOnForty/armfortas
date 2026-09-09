@@ -20349,7 +20349,7 @@ fn is_linkable_callable_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
             | SymbolKind::ExternalProc
             | SymbolKind::IntrinsicProc
             | SymbolKind::ProcedurePointer
-    )
+    ) || sym.attrs.external
 }
 
 fn find_linkable_symbol_for_callee<'a>(
@@ -70977,5 +70977,29 @@ end program
 ",
         );
         assert!(ir.contains("iadd"));
+    }
+
+    #[test]
+    fn typed_external_return_flows_into_nested_intrinsic() {
+        let (_, ir) = lower_and_verify(
+            "\
+program typed_external_nested
+  implicit none
+  real, external :: external_value
+  real :: value
+  value = sqrt(external_value(9.0))
+end program typed_external_nested
+",
+        );
+
+        assert!(
+            ir.contains("call @external_value") && ir.contains(": f32"),
+            "a typed EXTERNAL function call must retain its declared return type:\n{ir}",
+        );
+        assert!(
+            ir.lines()
+                .any(|line| line.contains("fsqrt") && line.contains(": f32")),
+            "SQRT must receive the typed EXTERNAL function's real result:\n{ir}",
+        );
     }
 }

@@ -1136,6 +1136,25 @@ fn check_type_consistency(func: &Function, inst: &Inst, errors: &mut Vec<VerifyE
                 }
             }
         }
+        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => {
+            if let Some(operand_ty) = func.value_type(*a) {
+                if !operand_ty.is_float() {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "float unary op %{} has non-float operand %{} : {}",
+                            inst.id.0, a.0, operand_ty,
+                        ),
+                    });
+                } else if operand_ty != inst.ty {
+                    errors.push(VerifyError {
+                        msg: format!(
+                            "float unary op %{} result type {} does not match operand type {}",
+                            inst.id.0, inst.ty, operand_ty,
+                        ),
+                    });
+                }
+            }
+        }
         InstKind::Store(val, addr) | InstKind::VolatileStore(val, addr) => {
             let addr_ty = func.value_type(*addr);
             if let Some(ty) = &addr_ty {
@@ -2285,6 +2304,27 @@ mod tests {
                     && error.msg.contains("operand type f32")
             }),
             "expected the float result-type mismatch to be rejected, got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn scalar_float_unary_rejects_integer_operand() {
+        let mut func = Function::new("test".into(), vec![], IrType::Void);
+        let sqrt;
+        {
+            let mut b = FuncBuilder::new(&mut func, crate::target::TargetLayout::LP64);
+            let integer = b.const_i32(9);
+            sqrt = b.fsqrt(integer);
+            b.ret_void();
+        }
+
+        let errs = verify_function(&func);
+        assert!(
+            errs.iter().any(|error| {
+                error.msg.contains(&format!("float unary op %{}", sqrt.0))
+                    && error.msg.contains("non-float operand")
+            }),
+            "expected integer FSqrt to be rejected before codegen, got: {errs:?}",
         );
     }
 
