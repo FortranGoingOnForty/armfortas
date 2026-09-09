@@ -64636,13 +64636,13 @@ contains
     real(8), intent(in) :: x(:), xbase(:), xpt(:, :)
     integer, value :: k
     real(8) :: value
-    value = sum((x - (xbase + xpt(:, k)))**2)
+    value = sum((x - (xbase + xpt(:, k)))**2, dim=1)
   end function
 
   function distinct_bounds(a, b) result(value)
     real(8), intent(in) :: a(-1:2), b(4:7)
     real(8) :: value
-    value = sum((a - b)**2)
+    value = sum((a - b)**2, 1)
   end function
 
   function reversed_column(a, matrix, k) result(value)

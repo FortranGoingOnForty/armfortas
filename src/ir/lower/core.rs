@@ -58301,6 +58301,41 @@ fn size_intrinsic_result_type(
         .unwrap_or(IrType::Int(IntWidth::I32))
 }
 
+/// A rank-one reduction with DIM=1 still has a scalar result. Recognize only
+/// the compile-time-known, unmasked form here so it can share the whole-array
+/// direct-reduction loop; dynamic DIM and MASK retain ordinary lowering.
+fn rank1_scalar_reduction_has_dim_one(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> bool {
+    if args.len() != 2 {
+        return false;
+    }
+    let Some(first_expr) = args.first().and_then(|arg| match &arg.value {
+        crate::ast::expr::SectionSubscript::Element(expr) => Some(expr),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if actual_expr_rank(first_expr, locals, st, type_layouts) != Some(1) {
+        return false;
+    }
+    let dim_arg = &args[1];
+    if dim_arg
+        .keyword
+        .as_deref()
+        .is_some_and(|keyword| !keyword.eq_ignore_ascii_case("dim"))
+    {
+        return false;
+    }
+    let crate::ast::expr::SectionSubscript::Element(dim_expr) = &dim_arg.value else {
+        return false;
+    };
+    eval_const_int_in_scope_or_any_scope(dim_expr, &HashMap::new(), st) == Some(1)
+}
+
 pub(super) fn lower_array_intrinsic(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -58361,7 +58396,9 @@ pub(super) fn lower_array_intrinsic(
     })?;
     let size_result_type =
         (name == "size").then(|| size_intrinsic_result_type(args, locals, st, type_layouts));
-    if matches!(name, "sum" | "maxval" | "minval") && args.len() == 1 {
+    if matches!(name, "sum" | "maxval" | "minval")
+        && (args.len() == 1 || rank1_scalar_reduction_has_dim_one(args, locals, st, type_layouts))
+    {
         if let Some(result) = lower_direct_real_reduction_expr(
             b,
             locals,
@@ -67723,8 +67760,8 @@ subroutine kernel(x, xbase, xpt, k, r)
   real(8), intent(in) :: x(:), xbase(:), xpt(:, :)
   integer, intent(in) :: k
   real(8), intent(out) :: r(3)
-  r(1) = sum((x - (xbase + xpt(:, k)))**2)
-  r(2) = maxval(abs(x - xbase))
+  r(1) = sum((x - (xbase + xpt(:, k)))**2, dim=1)
+  r(2) = maxval(abs(x - xbase), 1)
   r(3) = minval(abs(x - xbase))
 end subroutine
 ",
@@ -67749,6 +67786,34 @@ end subroutine
         assert!(
             !ir.contains("call @afs_allocate_like"),
             "direct rank-one reductions must not materialize array temporaries:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_rank1_dimension_reductions_preserve_dynamic_dim_and_masks() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y, dim, mask, r)
+  implicit none
+  real(8), intent(in) :: x(:), y(:)
+  integer, intent(in) :: dim
+  logical, intent(in) :: mask(:)
+  real(8), intent(out) :: r(3)
+  r(1) = sum((x - y)**2, dim=dim)
+  r(2) = maxval(abs(x - y), mask=mask)
+  r(3) = minval(abs(x - y), mask)
+end subroutine
+",
+        );
+        assert!(
+            !ir.contains("direct_sum_check")
+                && !ir.contains("direct_maxval_check")
+                && !ir.contains("direct_minval_check"),
+            "dynamic DIM and masked reductions must retain ordinary lowering:\n{ir}"
+        );
+        assert!(
+            ir.contains("call @afs_allocate_like_with_elem_size("),
+            "fallback reductions should retain materialized array temporaries:\n{ir}"
         );
     }
 
