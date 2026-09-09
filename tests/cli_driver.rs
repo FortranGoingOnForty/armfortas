@@ -65172,6 +65172,43 @@ fn fixed_form_data_accepts_negative_final_value() {
 }
 
 #[test]
+fn fixed_form_legacy_star_width_preserves_exponent_named_entities() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_legacy_star_width_preserves_exponent_named_entities count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      COMPLEX*16 D1(2), D2(2)\n      DATA D1 /(-1.0D0,0.0D0), (0.0D0,1.0D0)/\n      DATA D2 /(2.5D0,-3.0D0), (4.0D0,5.0D0)/\n      IF (ABS(DBLE(D1(1))+1.0D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(D1(2))-1.0D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(D2(1))-2.5D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(D2(1))+3.0D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_star_width_exponent_name", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form legacy star-width compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form legacy star-width compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form legacy star-width binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form legacy star-width run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn top_level_subroutine_contained_function_uses_internal_target() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
