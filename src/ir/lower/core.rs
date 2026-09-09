@@ -20375,6 +20375,34 @@ fn is_linkable_callable_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
     ) || sym.attrs.external
 }
 
+/// A scalar type declaration also supplies the result type of an external
+/// function referenced with an implicit interface; a separate EXTERNAL
+/// statement is not required merely to call it.  The parser keeps the
+/// deliberately ambiguous `F(X)` syntax as a FunctionCall and sema records
+/// `REAL F` as a scalar Variable, so accept that symbol specifically while
+/// resolving a callee.  Arrays remain data objects and statement functions
+/// have already been promoted to SymbolKind::Function before lowering.
+fn is_typed_implicit_external_function_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
+    use crate::sema::symtab::{SymbolKind, TypeInfo};
+
+    sym.kind == SymbolKind::Variable
+        && !sym.attrs.parameter
+        && !sym.attrs.allocatable
+        && !sym.attrs.pointer
+        && sym.attrs.array_spec.is_empty()
+        && matches!(
+            sym.type_info,
+            Some(
+                TypeInfo::Integer { .. }
+                    | TypeInfo::Real { .. }
+                    | TypeInfo::DoublePrecision
+                    | TypeInfo::Complex { .. }
+                    | TypeInfo::Logical { .. }
+                    | TypeInfo::Character { .. }
+            )
+        )
+}
+
 fn find_linkable_symbol_for_callee<'a>(
     st: &'a SymbolTable,
     callee_name: &str,
@@ -20387,7 +20415,10 @@ fn find_linkable_symbol_for_callee<'a>(
     // `recast`, so the caller omits the complex hidden-result buffer).
     if let Some(symbol) = current_proc_scope()
         .and_then(|scope_id| st.lookup_in(scope_id, &key))
-        .filter(|symbol| is_linkable_callable_symbol(symbol))
+        .filter(|symbol| {
+            is_linkable_callable_symbol(symbol)
+                || is_typed_implicit_external_function_symbol(symbol)
+        })
     {
         return Some(symbol);
     }
@@ -71242,6 +71273,29 @@ end program typed_external_nested
             ir.lines()
                 .any(|line| line.contains("fsqrt") && line.contains(": f32")),
             "SQRT must receive the typed EXTERNAL function's real result:\n{ir}",
+        );
+    }
+
+    #[test]
+    fn typed_implicit_external_return_flows_into_nested_intrinsic() {
+        let (_, ir) = lower_and_verify(
+            "\
+program typed_implicit_external_nested
+  real :: external_value
+  real :: value
+  value = sqrt(external_value(9.0))
+end program typed_implicit_external_nested
+",
+        );
+
+        assert!(
+            ir.contains("call @external_value") && ir.contains(": f32"),
+            "a scalar type declaration must supply an implicit-interface function's return type:\n{ir}",
+        );
+        assert!(
+            ir.lines()
+                .any(|line| line.contains("fsqrt") && line.contains(": f32")),
+            "SQRT must receive the implicitly external function's declared real result:\n{ir}",
         );
     }
 

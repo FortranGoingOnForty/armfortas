@@ -65298,6 +65298,54 @@ fn fixed_form_typed_external_return_feeds_nested_sqrt() {
 }
 
 #[test]
+fn fixed_form_typed_implicit_external_return_feeds_nested_sqrt() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_typed_implicit_external_return_feeds_nested_sqrt count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("fixed_typed_implicit_external_sqrt");
+    let provider = write_program_in(
+        &dir,
+        "external_value.f",
+        "      REAL FUNCTION EXTERNAL_VALUE(X)\n      REAL X\n      EXTERNAL_VALUE = X\n      END\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f",
+        "      PROGRAM P\n      REAL EXTERNAL_VALUE, Y\n      Y = SQRT(EXTERNAL_VALUE(9.0))\n      IF (ABS(Y-3.0).GT.1.0E-5) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+    );
+    let out = dir.join("typed-implicit-external-sqrt");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            provider.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("typed implicit-interface nested-SQRT compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed implicit-interface nested-SQRT compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("typed implicit-interface nested-SQRT binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "typed implicit-interface nested-SQRT run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fixed_form_complex_star_16_uses_double_components() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
