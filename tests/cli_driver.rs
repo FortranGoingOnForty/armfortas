@@ -65292,6 +65292,43 @@ fn fixed_form_logical_if_accepts_bare_rewind() {
 }
 
 #[test]
+fn array_conversion_expression_materializes_for_function_sequence_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_conversion_expression_materializes_for_function_sequence_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      DOUBLE PRECISION SX(3), RESULT, SUM_SP\n      EXTERNAL SUM_SP\n      DATA SX /1.25D0, 2.5D0, 3.75D0/\n      RESULT = SUM_SP(3, REAL(SX))\n      IF (ABS(RESULT-7.5D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n      DOUBLE PRECISION FUNCTION SUM_SP(N,X)\n      INTEGER N, I\n      REAL X(*)\n      SUM_SP = 0.0D0\n      DO 10 I = 1, N\n         SUM_SP = SUM_SP + DBLE(X(I))\n   10 CONTINUE\n      END\n",
+        "f",
+    );
+    let out = unique_path("function_sequence_array_conversion", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array-conversion function actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array-conversion function actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("array-conversion function actual binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "array-conversion function actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn top_level_subroutine_contained_function_uses_internal_target() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
