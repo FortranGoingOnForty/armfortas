@@ -1721,7 +1721,9 @@ pub(crate) fn lower_expr_full(
                     }
                 }
 
-                // abs(z) for complex: sqrt(re² + im²).
+                // ABS(z) for complex is the Euclidean magnitude. Use the
+                // platform hypot implementation so representable results do
+                // not overflow or underflow merely because re² or im² does.
                 // Must be handled before generic intrinsic lowering because
                 // complex values may be pointer-backed or aggregate pairs.
                 if (key == "abs" || key == "cabs" || key == "cdabs" || key == "zabs")
@@ -1753,11 +1755,13 @@ pub(crate) fn lower_expr_full(
                                 let re_ptr = b.gep(src, vec![zero], IrType::Int(IntWidth::I8));
                                 let im_ptr = b.gep(src, vec![esz], IrType::Int(IntWidth::I8));
                                 let re = b.load_typed(re_ptr, elem.clone());
-                                let im = b.load_typed(im_ptr, elem);
-                                let re2 = b.fmul(re, re);
-                                let im2 = b.fmul(im, im);
-                                let sum = b.fadd(re2, im2);
-                                return b.fsqrt(sum);
+                                let im = b.load_typed(im_ptr, elem.clone());
+                                let hypot = if fw == FloatWidth::F64 {
+                                    "hypot"
+                                } else {
+                                    "hypotf"
+                                };
+                                return b.call(FuncRef::External(hypot.into()), vec![re, im], elem);
                             }
                         }
                     }

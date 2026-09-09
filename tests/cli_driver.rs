@@ -40861,6 +40861,81 @@ end program
 }
 
 #[test]
+fn complex_abs_avoids_intermediate_overflow_and_underflow() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_abs_avoids_intermediate_overflow_and_underflow count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+program main
+  use, intrinsic :: iso_fortran_env, only: real32, real64
+  implicit none
+  complex(real32) :: sp(2)
+  complex(real64) :: dp(2)
+  real(real32) :: sp_mag(2)
+  real(real64) :: dp_mag(2)
+
+  sp = [cmplx(2.0e30_real32, 2.0e30_real32, kind=real32), &
+        cmplx(2.0e-30_real32, 2.0e-30_real32, kind=real32)]
+  dp = [cmplx(2.0e300_real64, 2.0e300_real64, kind=real64), &
+        cmplx(2.0e-300_real64, 2.0e-300_real64, kind=real64)]
+
+  if (.not. abs(sp(1)) < huge(0.0_real32)) error stop 11
+  if (.not. abs(sp(1)) > 2.0e30_real32) error stop 12
+  if (.not. abs(sp(2)) > 2.0e-30_real32) error stop 13
+  if (.not. abs(dp(1)) < huge(0.0_real64)) error stop 21
+  if (.not. abs(dp(1)) > 2.0e300_real64) error stop 22
+  if (.not. abs(dp(2)) > 2.0e-300_real64) error stop 23
+
+  sp_mag = abs(sp)
+  dp_mag = abs(dp)
+  if (.not. sp_mag(1) < huge(0.0_real32)) error stop 31
+  if (.not. sp_mag(1) > 2.0e30_real32) error stop 32
+  if (.not. sp_mag(2) > 2.0e-30_real32) error stop 33
+  if (.not. dp_mag(1) < huge(0.0_real64)) error stop 41
+  if (.not. dp_mag(1) > 2.0e300_real64) error stop 42
+  if (.not. dp_mag(2) > 2.0e-300_real64) error stop 43
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_abs_range", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O0", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex ABS range compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "complex ABS range program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex ABS range run failed");
+    assert!(
+        run.status.success(),
+        "complex ABS range runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex ABS range output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_sin_cos_intrinsics_use_complex_lanes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

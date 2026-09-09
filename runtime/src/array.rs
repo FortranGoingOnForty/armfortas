@@ -8433,8 +8433,9 @@ pub extern "C" fn afs_array_aimag(source: *const ArrayDescriptor, result: *mut A
 }
 
 /// ABS over a complex array: produce a real array of the same shape
-/// whose elements are |z| = sqrt(re*re + im*im). Result has HALF the
-/// source elem_size; mirror the allocation strategy from `afs_array_aimag`.
+/// whose elements are the robust Euclidean magnitude of each complex value.
+/// Result has HALF the source elem_size; mirror the allocation strategy from
+/// `afs_array_aimag`.
 #[no_mangle]
 pub extern "C" fn afs_array_abs_complex(
     source: *const ArrayDescriptor,
@@ -8473,7 +8474,7 @@ pub extern "C" fn afs_array_abs_complex(
             unsafe {
                 let re = *(sp_buf.add(i * 8) as *const f32);
                 let im = *(sp_buf.add(i * 8 + 4) as *const f32);
-                *(rp_buf.add(i * 4) as *mut f32) = (re * re + im * im).sqrt();
+                *(rp_buf.add(i * 4) as *mut f32) = re.hypot(im);
             }
         }
     } else if elem_size == 16 {
@@ -8481,7 +8482,7 @@ pub extern "C" fn afs_array_abs_complex(
             unsafe {
                 let re = *(sp_buf.add(i * 16) as *const f64);
                 let im = *(sp_buf.add(i * 16 + 8) as *const f64);
-                *(rp_buf.add(i * 8) as *mut f64) = (re * re + im * im).sqrt();
+                *(rp_buf.add(i * 8) as *mut f64) = re.hypot(im);
             }
         }
     }
