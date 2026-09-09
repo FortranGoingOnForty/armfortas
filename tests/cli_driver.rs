@@ -40752,6 +40752,52 @@ end program
 }
 
 #[test]
+fn real_intrinsic_without_kind_converts_real_input_to_default_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real_intrinsic_without_kind_converts_real_input_to_default_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+program main
+  implicit none
+  double precision :: wide, rounded
+  wide = 16777217.0d0
+  rounded = dble(real(wide))
+  if (rounded /= 16777216.0d0) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("real_real8_default_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O0", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("REAL(real8) default-kind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "REAL(real8) default-kind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("REAL(real8) default-kind binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "REAL(real8) default-kind run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn mixed_scalar_complex_division_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

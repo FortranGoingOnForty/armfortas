@@ -434,8 +434,12 @@ pub(crate) fn lower_intrinsic(
                             FloatWidth::F32
                         }
                     });
-                let default_fw = if matches!(ty, IrType::Float(FloatWidth::F64))
-                    || (is_complex_ty(&ty) && complex_float_width(&ty) == FloatWidth::F64)
+                // REAL(real) without KIND converts to default real. REAL(complex)
+                // is the exception and retains the complex component kind.
+                // SNGL always returns default real.
+                let default_fw = if name == "real"
+                    && is_complex_ty(&ty)
+                    && complex_float_width(&ty) == FloatWidth::F64
                 {
                     FloatWidth::F64
                 } else {

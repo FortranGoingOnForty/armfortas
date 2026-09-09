@@ -1493,14 +1493,17 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Real-valued conversions.
         "real" | "float" => match args.first()? {
-            FortranType::Real { kind } | FortranType::Complex { kind } => {
-                Some(FortranType::Real { kind: *kind })
-            }
-            FortranType::Integer { .. } | FortranType::Logical { .. } => {
-                Some(FortranType::default_real())
-            }
+            // Without KIND, REAL converts integer, logical, and real
+            // arguments to default real. A complex argument is the exception:
+            // its real component retains the complex kind.
+            FortranType::Complex { kind } => Some(FortranType::Real { kind: *kind }),
+            FortranType::Integer { .. }
+            | FortranType::Logical { .. }
+            | FortranType::Real { .. } => Some(FortranType::default_real()),
             _ => None,
         },
+        "sngl" => matches!(args.first()?, FortranType::Real { .. })
+            .then(FortranType::default_real),
         "dble" | "dfloat" => Some(FortranType::double_precision()),
         "aimag" => {
             // aimag(complex(k)) → real(k)
@@ -3134,6 +3137,18 @@ mod tests {
     fn dble_returns_real8() {
         let result = intrinsic_result_type("dble", &[FortranType::Integer { kind: 4 }]).unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn real_without_kind_defaults_real_inputs_but_preserves_complex_kind() {
+        assert_eq!(
+            intrinsic_result_type("real", &[FortranType::Real { kind: 8 }]),
+            Some(FortranType::Real { kind: 4 })
+        );
+        assert_eq!(
+            intrinsic_result_type("real", &[FortranType::Complex { kind: 8 }]),
+            Some(FortranType::Real { kind: 8 })
+        );
     }
 
     #[test]
