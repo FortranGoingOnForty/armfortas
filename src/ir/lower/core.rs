@@ -8810,7 +8810,13 @@ pub(super) fn extract_array_dims(
                 }
                 ArraySpec::AssumedShape { .. } => (1, 0), // size unknown at compile time
                 ArraySpec::Deferred => (1, 0),
-                ArraySpec::AssumedSize { .. } => (1, 0),
+                ArraySpec::AssumedSize { lower } => {
+                    let lo = lower
+                        .as_ref()
+                        .and_then(|e| eval_const_array_bound(e, param_consts, st))
+                        .unwrap_or(1);
+                    (lo, 0)
+                }
                 ArraySpec::AssumedRank => (1, 0),
             }
         })
