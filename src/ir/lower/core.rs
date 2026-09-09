@@ -57580,31 +57580,116 @@ fn collect_direct_real_reduction_sections<'a>(
     }
 }
 
-/// Replace the single whole-array operand, or one exact rank-preserving array
-/// section, of a side-effect-free elemental expression with a scalar loop
-/// value. This is intentionally narrower than the general array-expression
-/// scalarizer: scalar procedure references are rejected because moving one
-/// into the reduction loop could change its evaluation count, and a second
-/// array would require position-based mapping across potentially different
-/// lower bounds.
+/// Find a single rank-one section operand that can join whole arrays in a
+/// direct scalar reduction. This includes rank-reducing matrix columns such
+/// as `xpt(:, k)`, while excluding vector subscripts and array-valued section
+/// bounds whose evaluation cannot be moved safely.
+fn collect_direct_real_rank1_sections<'a>(
+    expr: &'a crate::ast::expr::SpannedExpr,
+    locals: &HashMap<String, LocalInfo>,
+    out: &mut Vec<(&'a crate::ast::expr::SpannedExpr, String)>,
+) {
+    match &expr.node {
+        Expr::BinaryOp { left, right, .. } => {
+            collect_direct_real_rank1_sections(left, locals, out);
+            collect_direct_real_rank1_sections(right, locals, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_direct_real_rank1_sections(operand, locals, out),
+        Expr::ParenExpr { inner } => collect_direct_real_rank1_sections(inner, locals, out),
+        Expr::ComponentAccess { base, .. } => collect_direct_real_rank1_sections(base, locals, out),
+        Expr::FunctionCall { callee, args } => {
+            if let Expr::Name { name } = &callee.node {
+                let key = name.to_lowercase();
+                if let Some(info) = locals.get(&key) {
+                    let declared_rank = local_declared_rank(info);
+                    if declared_rank > 0 && args.len() == declared_rank {
+                        let range_count = args
+                            .iter()
+                            .filter(|arg| {
+                                matches!(
+                                    arg.value,
+                                    crate::ast::expr::SectionSubscript::Range { .. }
+                                )
+                            })
+                            .count();
+                        let subscript_has_array = args.iter().any(|arg| match &arg.value {
+                            crate::ast::expr::SectionSubscript::Element(value) => {
+                                expr_contains_array_refs(value, locals)
+                            }
+                            crate::ast::expr::SectionSubscript::Range { start, end, stride } => {
+                                start
+                                    .as_ref()
+                                    .is_some_and(|value| expr_contains_array_refs(value, locals))
+                                    || end.as_ref().is_some_and(|value| {
+                                        expr_contains_array_refs(value, locals)
+                                    })
+                                    || stride.as_ref().is_some_and(|value| {
+                                        expr_contains_array_refs(value, locals)
+                                    })
+                            }
+                        });
+                        if range_count == 1
+                            && !is_full_rank1_whole_slice(args)
+                            && !subscript_has_array
+                        {
+                            out.push((expr, key));
+                        }
+                        // A local-array reference is one designator. Its
+                        // scalar subscripts and section bounds are not array
+                        // operands of the elemental expression.
+                        return;
+                    }
+                }
+            }
+            collect_direct_real_rank1_sections(callee, locals, out);
+            for arg in args {
+                if let crate::ast::expr::SectionSubscript::Element(argument) = &arg.value {
+                    collect_direct_real_rank1_sections(argument, locals, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+struct DirectRealReductionControl<'a> {
+    array_name: &'a str,
+    section: Option<&'a crate::ast::expr::SpannedExpr>,
+    element_name: &'a str,
+}
+
+struct DirectRealReductionSource<'a> {
+    array_name: String,
+    section: Option<&'a crate::ast::expr::SpannedExpr>,
+    info: LocalInfo,
+}
+
+/// Replace selected whole-array and section operands of a side-effect-free
+/// elemental expression with scalar loop values. Scalar procedure references
+/// remain rejected because moving one into the reduction loop could change
+/// its evaluation count.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_direct_real_reduction_expr(
     expr: &crate::ast::expr::SpannedExpr,
-    control_name: &str,
-    control_section: Option<&crate::ast::expr::SpannedExpr>,
-    element_name: &str,
+    controls: &[DirectRealReductionControl<'_>],
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
     caller_name: &str,
 ) -> Option<(crate::ast::expr::SpannedExpr, bool)> {
-    if control_section.is_some_and(|section| expr == section) {
-        return Some((synth_name_expr(element_name, expr.span), true));
+    if let Some(control) = controls
+        .iter()
+        .find(|control| control.section.is_some_and(|section| expr == section))
+    {
+        return Some((synth_name_expr(control.element_name, expr.span), true));
     }
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            if control_section.is_none() && key == control_name {
-                return Some((synth_name_expr(element_name, expr.span), true));
+            if let Some(control) = controls
+                .iter()
+                .find(|control| control.section.is_none() && key == control.array_name)
+            {
+                return Some((synth_name_expr(control.element_name, expr.span), true));
             }
             if locals.get(&key).is_some_and(local_is_array_like) {
                 return None;
@@ -57613,15 +57698,8 @@ fn rewrite_direct_real_reduction_expr(
         }
         Expr::IntegerLiteral { .. } | Expr::RealLiteral { .. } => Some((expr.clone(), false)),
         Expr::ParenExpr { inner } => {
-            let (inner, changed) = rewrite_direct_real_reduction_expr(
-                inner,
-                control_name,
-                control_section,
-                element_name,
-                locals,
-                st,
-                caller_name,
-            )?;
+            let (inner, changed) =
+                rewrite_direct_real_reduction_expr(inner, controls, locals, st, caller_name)?;
             Some((
                 crate::ast::Spanned::new(
                     Expr::ParenExpr {
@@ -57633,15 +57711,8 @@ fn rewrite_direct_real_reduction_expr(
             ))
         }
         Expr::UnaryOp { op, operand } if matches!(op, UnaryOp::Plus | UnaryOp::Minus) => {
-            let (operand, changed) = rewrite_direct_real_reduction_expr(
-                operand,
-                control_name,
-                control_section,
-                element_name,
-                locals,
-                st,
-                caller_name,
-            )?;
+            let (operand, changed) =
+                rewrite_direct_real_reduction_expr(operand, controls, locals, st, caller_name)?;
             Some((
                 crate::ast::Spanned::new(
                     Expr::UnaryOp {
@@ -57659,24 +57730,10 @@ fn rewrite_direct_real_reduction_expr(
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
             ) =>
         {
-            let (left, left_changed) = rewrite_direct_real_reduction_expr(
-                left,
-                control_name,
-                control_section,
-                element_name,
-                locals,
-                st,
-                caller_name,
-            )?;
-            let (right, right_changed) = rewrite_direct_real_reduction_expr(
-                right,
-                control_name,
-                control_section,
-                element_name,
-                locals,
-                st,
-                caller_name,
-            )?;
+            let (left, left_changed) =
+                rewrite_direct_real_reduction_expr(left, controls, locals, st, caller_name)?;
+            let (right, right_changed) =
+                rewrite_direct_real_reduction_expr(right, controls, locals, st, caller_name)?;
             Some((
                 crate::ast::Spanned::new(
                     Expr::BinaryOp {
@@ -57702,15 +57759,8 @@ fn rewrite_direct_real_reduction_expr(
             let crate::ast::expr::SectionSubscript::Element(argument) = &args[0].value else {
                 return None;
             };
-            let (argument, changed) = rewrite_direct_real_reduction_expr(
-                argument,
-                control_name,
-                control_section,
-                element_name,
-                locals,
-                st,
-                caller_name,
-            )?;
+            let (argument, changed) =
+                rewrite_direct_real_reduction_expr(argument, controls, locals, st, caller_name)?;
             let mut mapped_args = args.clone();
             mapped_args[0].value = crate::ast::expr::SectionSubscript::Element(argument);
             Some((
@@ -57761,59 +57811,144 @@ fn lower_direct_real_reduction_expr(
 
     let mut arrays = Vec::new();
     collect_scalarized_control_array_names(expr, locals, &mut arrays);
-    let [control_name] = arrays.as_slice() else {
-        return None;
-    };
-    let control = locals.get(control_name)?;
-    if !matches!(control.ty, IrType::Float(_))
-        || current_proc_scope()
-            .and_then(|scope_id| st.lookup_in(scope_id, control_name))
-            .or_else(|| st.lookup(control_name))
-            .is_some_and(|symbol| symbol.attrs.volatile)
-    {
+    let mut sections = Vec::new();
+    if rank == 1 {
+        collect_direct_real_rank1_sections(expr, locals, &mut sections);
+    }
+    if sections.len() > 1 || (rank > 1 && (arrays.len() != 1 || !sections.is_empty())) {
         return None;
     }
 
-    let element_name = fresh_direct_reduction_element_name(locals);
-    let (scalar_expr, changed) = rewrite_direct_real_reduction_expr(
-        expr,
-        control_name,
-        None,
-        &element_name,
-        locals,
-        st,
-        b.func().name.as_str(),
-    )?;
+    let mut sources = Vec::with_capacity(arrays.len() + sections.len());
+    for array_name in &arrays {
+        sources.push(DirectRealReductionSource {
+            array_name: array_name.clone(),
+            section: None,
+            info: locals.get(array_name)?.clone(),
+        });
+    }
+    for (section, array_name) in &sections {
+        sources.push(DirectRealReductionSource {
+            array_name: array_name.clone(),
+            section: Some(*section),
+            info: locals.get(array_name)?.clone(),
+        });
+    }
+    if sources.is_empty() {
+        return None;
+    }
+
+    let uses_rank1_multi_source_path = sources.len() > 1 || sources[0].section.is_some();
+    for source in &sources {
+        let source_rank = source
+            .section
+            .and_then(|section| actual_expr_rank(section, locals, st, type_layouts))
+            .unwrap_or_else(|| local_declared_rank(&source.info));
+        if source_rank != rank
+            || (uses_rank1_multi_source_path && source.info.last_dim_assumed_size)
+            || !matches!(source.info.ty, IrType::Float(_))
+            || current_proc_scope()
+                .and_then(|scope_id| st.lookup_in(scope_id, &source.array_name))
+                .or_else(|| st.lookup(&source.array_name))
+                .is_some_and(|symbol| symbol.attrs.volatile)
+        {
+            return None;
+        }
+    }
+
+    let mut element_names = Vec::with_capacity(sources.len());
+    let mut candidate_index = 0usize;
+    while element_names.len() < sources.len() {
+        let candidate = if candidate_index == 0 {
+            "afs_reduction_element".to_string()
+        } else {
+            format!("afs_reduction_element{candidate_index}")
+        };
+        candidate_index += 1;
+        if !locals.contains_key(&candidate) && !element_names.contains(&candidate) {
+            element_names.push(candidate);
+        }
+    }
+    let controls = sources
+        .iter()
+        .zip(&element_names)
+        .map(|(source, element_name)| DirectRealReductionControl {
+            array_name: &source.array_name,
+            section: source.section,
+            element_name,
+        })
+        .collect::<Vec<_>>();
+    let (scalar_expr, changed) =
+        rewrite_direct_real_reduction_expr(expr, &controls, locals, st, b.func().name.as_str())?;
     if !changed {
         return None;
     }
 
-    let element_addr = b.alloca(control.ty.clone());
     let mut scalar_locals = locals.clone();
-    scalar_locals.insert(
-        element_name,
-        LocalInfo {
-            addr: element_addr,
-            ty: control.ty.clone(),
-            dims: vec![],
-            allocatable: false,
-            descriptor_arg: false,
-            by_ref: false,
-            char_kind: CharKind::None,
-            derived_type: None,
-            inline_const: None,
-            is_pointer: false,
-            runtime_dim_upper: vec![],
-            is_class: false,
-            logical_kind: None,
-            last_dim_assumed_size: false,
-        },
-    );
+    let mut element_addrs = Vec::with_capacity(sources.len());
+    for (source, element_name) in sources.iter().zip(&element_names) {
+        let element_addr = b.alloca(source.info.ty.clone());
+        element_addrs.push(element_addr);
+        scalar_locals.insert(
+            element_name.clone(),
+            LocalInfo {
+                addr: element_addr,
+                ty: source.info.ty.clone(),
+                dims: vec![],
+                allocatable: false,
+                descriptor_arg: false,
+                by_ref: false,
+                char_kind: CharKind::None,
+                derived_type: None,
+                inline_const: None,
+                is_pointer: false,
+                runtime_dim_upper: vec![],
+                is_class: false,
+                logical_kind: None,
+                last_dim_assumed_size: false,
+            },
+        );
+    }
 
-    let descriptor =
-        local_uses_array_descriptor(control).then(|| array_descriptor_addr(b, control));
-    let base = descriptor.is_none().then(|| array_base_addr(b, control));
-    let element_count = array_total_elems_value(b, control);
+    let simple_control = (!uses_rank1_multi_source_path).then_some(&sources[0].info);
+    let descriptor = simple_control
+        .filter(|control| local_uses_array_descriptor(control))
+        .map(|control| array_descriptor_addr(b, control));
+    let base = simple_control
+        .filter(|_| descriptor.is_none())
+        .map(|control| array_base_addr(b, control));
+    let mut source_descriptors = Vec::new();
+    if uses_rank1_multi_source_path {
+        for source in &sources {
+            let source_desc = if let Some(section) = source.section {
+                lower_array_expr_descriptor(
+                    b,
+                    locals,
+                    section,
+                    st,
+                    type_layouts,
+                    internal_funcs,
+                    contained_host_refs,
+                    descriptor_params,
+                )?
+                .0
+            } else if local_uses_array_descriptor(&source.info) {
+                array_descriptor_addr(b, &source.info)
+            } else {
+                materialize_array_descriptor_for_info(b, &source.info)
+            };
+            source_descriptors.push(source_desc);
+        }
+    }
+    let element_count = if let Some(control) = simple_control {
+        array_total_elems_value(b, control)
+    } else {
+        b.call(
+            FuncRef::External("afs_array_size".into()),
+            vec![source_descriptors[0]],
+            IrType::Int(IntWidth::I64),
+        )
+    };
     let index_addr = b.alloca(IrType::Int(IntWidth::I64));
     let accumulator_addr = b.alloca(IrType::Float(FloatWidth::F64));
     let zero_index = b.const_i64(0);
@@ -57841,17 +57976,26 @@ fn lower_direct_real_reduction_expr(
 
     b.set_block(body);
     let index = b.load(index_addr);
-    let element = if let Some(descriptor) = descriptor {
-        load_array_desc_elem_rank(b, descriptor, &control.ty, index, rank)
+    if let Some(control) = simple_control {
+        let element = if let Some(descriptor) = descriptor {
+            load_array_desc_elem_rank(b, descriptor, &control.ty, index, rank)
+        } else {
+            let element_ptr = b.gep(
+                base.expect("non-descriptor array base"),
+                vec![index],
+                control.ty.clone(),
+            );
+            b.load_typed(element_ptr, control.ty.clone())
+        };
+        b.store(element, element_addrs[0]);
     } else {
-        let element_ptr = b.gep(
-            base.expect("non-descriptor array base"),
-            vec![index],
-            control.ty.clone(),
-        );
-        b.load_typed(element_ptr, control.ty.clone())
-    };
-    b.store(element, element_addr);
+        for ((source, element_addr), source_desc) in
+            sources.iter().zip(&element_addrs).zip(&source_descriptors)
+        {
+            let element = load_array_desc_elem_rank(b, *source_desc, &source.info.ty, index, rank);
+            b.store(element, *element_addr);
+        }
+    }
     let value = super::expr::lower_expr_full(
         b,
         &scalar_locals,
@@ -57952,15 +58096,13 @@ fn lower_direct_real_dim_reduction_expr(
     }
 
     let element_name = fresh_direct_reduction_element_name(locals);
-    let (scalar_expr, changed) = rewrite_direct_real_reduction_expr(
-        expr,
-        control_name,
-        control_section,
-        &element_name,
-        locals,
-        st,
-        b.func().name.as_str(),
-    )?;
+    let controls = [DirectRealReductionControl {
+        array_name: control_name,
+        section: control_section,
+        element_name: &element_name,
+    }];
+    let (scalar_expr, changed) =
+        rewrite_direct_real_reduction_expr(expr, &controls, locals, st, b.func().name.as_str())?;
     if !changed {
         return None;
     }
@@ -67569,6 +67711,68 @@ end subroutine
             ir.matches("call @afs_array_minval_real8(").count(),
             1,
             "plain MINVAL(Z) should retain the runtime path:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_rank1_real_reductions_fuse_multiple_arrays_and_one_section() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, xbase, xpt, k, r)
+  implicit none
+  real(8), intent(in) :: x(:), xbase(:), xpt(:, :)
+  integer, intent(in) :: k
+  real(8), intent(out) :: r(3)
+  r(1) = sum((x - (xbase + xpt(:, k)))**2)
+  r(2) = maxval(abs(x - xbase))
+  r(3) = minval(abs(x - xbase))
+end subroutine
+",
+        );
+        assert!(
+            ir.contains("direct_sum_check"),
+            "multi-array SUM should use a direct reduction loop:\n{ir}"
+        );
+        assert!(
+            ir.contains("direct_maxval_check"),
+            "multi-array MAXVAL should use a direct reduction loop:\n{ir}"
+        );
+        assert!(
+            ir.contains("direct_minval_check"),
+            "multi-array MINVAL should use a direct reduction loop:\n{ir}"
+        );
+        assert_eq!(
+            ir.matches("call @afs_create_section(").count(),
+            1,
+            "the matrix-column section should be evaluated once:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like"),
+            "direct rank-one reductions must not materialize array temporaries:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_rank1_multi_array_reductions_preserve_unsafe_fallbacks() {
+        let (_, ir) = lower_and_verify(
+            "\
+subroutine kernel(x, y, r)
+  implicit none
+  real(8), intent(in), volatile :: x(:)
+  real(8), intent(in) :: y(:)
+  real(8), intent(out) :: r(2)
+  r(1) = sum((x - y)**2)
+  r(2) = sum((x(1:3) - y(1:3))**2)
+end subroutine
+",
+        );
+        assert!(
+            !ir.contains("direct_sum_check"),
+            "volatile and multi-section reductions must retain ordinary lowering:\n{ir}"
+        );
+        assert!(
+            ir.contains("call @afs_allocate_like_with_elem_size("),
+            "unsafe reductions should retain materialized array temporaries:\n{ir}"
         );
     }
 
