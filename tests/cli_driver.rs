@@ -65209,6 +65209,43 @@ fn fixed_form_legacy_star_width_preserves_exponent_named_entities() {
 }
 
 #[test]
+fn fixed_form_logical_if_accepts_bare_rewind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_logical_if_accepts_bare_rewind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER NTRA, VALUE\n      LOGICAL REWI\n      OPEN(NEWUNIT=NTRA, STATUS='SCRATCH', ACTION='READWRITE')\n      WRITE(NTRA,*) 42\n      REWI = .TRUE.\n      IF (REWI)\n     $   REWIND NTRA\n      READ(NTRA,*) VALUE\n      CLOSE(NTRA)\n      IF (VALUE.NE.42) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_logical_if_bare_rewind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form bare REWIND compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form bare REWIND compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form bare REWIND binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form bare REWIND run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn top_level_subroutine_contained_function_uses_internal_target() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

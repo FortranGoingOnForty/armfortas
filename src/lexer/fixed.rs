@@ -2176,6 +2176,14 @@ C     Hello World
     }
 
     #[test]
+    fn logical_if_splits_bare_rewind_action() {
+        assert_eq!(
+            fixed_texts("      IF (REWI)\n     $   REWIND NTRA\n"),
+            ["IF", "(", "REWI", ")", "REWIND", "NTRA"]
+        );
+    }
+
+    #[test]
     fn numeric_print_prefix_stays_in_procedure_names() {
         let declaration = fixed_texts("      SUBROUTINE PRINT100()\n");
         assert_eq!(

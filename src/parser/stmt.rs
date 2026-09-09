@@ -161,10 +161,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_read(start)
             }
-            // I/O and memory keywords double as legal identifiers. The
-            // statement form always opens with `(`; anything else (`=`,
-            // `==`, end of line, etc.) means the lexeme is being used as
-            // a variable name and we redirect to assignment/call.
+            // I/O and memory keywords double as legal identifiers. Most
+            // statement forms open with `(`; file-positioning statements also
+            // accept a bare unit expression and use the designator lookahead
+            // below to preserve assignments to same-named variables.
             "open" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "open")
@@ -177,21 +177,21 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_inquire(start)
             }
-            "rewind" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "rewind" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "rewind")
+                self.parse_io_position_stmt(start, "rewind")
             }
-            "backspace" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "backspace" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "backspace")
+                self.parse_io_position_stmt(start, "backspace")
             }
-            "endfile" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "endfile" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "endfile")
+                self.parse_io_position_stmt(start, "endfile")
             }
-            "flush" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "flush" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "flush")
+                self.parse_io_position_stmt(start, "flush")
             }
             "wait" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
@@ -1611,6 +1611,35 @@ impl<'a> Parser<'a> {
         Ok(Spanned::new(Stmt::Inquire { specs, items }, span))
     }
 
+    /// Parse the parenthesized or legacy bare-unit form of a file-positioning
+    /// statement: `REWIND(unit, ...)` and `REWIND unit` are both standard.
+    fn parse_io_position_stmt(
+        &mut self,
+        start: crate::lexer::Span,
+        kind: &str,
+    ) -> Result<SpannedStmt, ParseError> {
+        if self.peek() == &TokenKind::LParen {
+            return self.parse_io_paren_stmt(start, kind);
+        }
+
+        let unit = self.parse_expr()?;
+        let specs = vec![IoControl {
+            keyword: None,
+            value: unit,
+        }];
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(
+            match kind {
+                "rewind" => Stmt::Rewind { specs },
+                "backspace" => Stmt::Backspace { specs },
+                "endfile" => Stmt::Endfile { specs },
+                "flush" => Stmt::Flush { specs },
+                _ => unreachable!(),
+            },
+            span,
+        ))
+    }
+
     /// Parse a generic I/O statement with parenthesized specifiers:
     /// OPEN/CLOSE/REWIND/BACKSPACE/ENDFILE/FLUSH
     fn parse_io_paren_stmt(
@@ -2787,6 +2816,44 @@ end if
     fn rewind_stmt() {
         let s = parse_one("rewind(10)\n");
         assert!(matches!(s.node, Stmt::Rewind { .. }));
+    }
+
+    #[test]
+    fn file_positioning_accepts_bare_units() {
+        assert!(matches!(
+            parse_one("rewind unit\n").node,
+            Stmt::Rewind { .. }
+        ));
+        assert!(matches!(
+            parse_one("backspace 10\n").node,
+            Stmt::Backspace { .. }
+        ));
+        assert!(matches!(
+            parse_one("endfile unit\n").node,
+            Stmt::Endfile { .. }
+        ));
+        assert!(matches!(parse_one("flush unit\n").node, Stmt::Flush { .. }));
+    }
+
+    #[test]
+    fn logical_if_accepts_bare_rewind() {
+        let stmt = parse_one("if (rewi) rewind ntra\n");
+        let Stmt::IfStmt { action, .. } = stmt.node else {
+            panic!("not logical IF");
+        };
+        assert!(matches!(action.node, Stmt::Rewind { .. }));
+    }
+
+    #[test]
+    fn file_positioning_names_remain_assignment_designators() {
+        assert!(matches!(
+            parse_one("rewind = 3\n").node,
+            Stmt::Assignment { .. }
+        ));
+        assert!(matches!(
+            parse_one("rewind(i) = 4\n").node,
+            Stmt::Assignment { .. }
+        ));
     }
 
     #[test]
