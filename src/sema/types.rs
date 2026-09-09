@@ -1342,6 +1342,7 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "int"
             | "real"
             | "dble"
+            | "dreal"
             | "cmplx"
             | "dcmplx"
             | "logical"
@@ -1493,15 +1494,22 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Real-valued conversions.
         "real" | "float" => match args.first()? {
-            FortranType::Real { kind } | FortranType::Complex { kind } => {
-                Some(FortranType::Real { kind: *kind })
-            }
-            FortranType::Integer { .. } | FortranType::Logical { .. } => {
-                Some(FortranType::default_real())
-            }
+            // Without KIND, REAL converts integer, logical, and real
+            // arguments to default real. A complex argument is the exception:
+            // its real component retains the complex kind.
+            FortranType::Complex { kind } => Some(FortranType::Real { kind: *kind }),
+            FortranType::Integer { .. }
+            | FortranType::Logical { .. }
+            | FortranType::Real { .. } => Some(FortranType::default_real()),
             _ => None,
         },
+        "sngl" => matches!(args.first()?, FortranType::Real { .. })
+            .then(FortranType::default_real),
         "dble" | "dfloat" => Some(FortranType::double_precision()),
+        "dreal" => match args.first()? {
+            FortranType::Complex { kind: 8 } => Some(FortranType::double_precision()),
+            _ => None,
+        },
         "aimag" => {
             // aimag(complex(k)) → real(k)
             match args.first()? {
@@ -3137,9 +3145,33 @@ mod tests {
     }
 
     #[test]
+    fn real_without_kind_defaults_real_inputs_but_preserves_complex_kind() {
+        assert_eq!(
+            intrinsic_result_type("real", &[FortranType::Real { kind: 8 }]),
+            Some(FortranType::Real { kind: 4 })
+        );
+        assert_eq!(
+            intrinsic_result_type("real", &[FortranType::Complex { kind: 8 }]),
+            Some(FortranType::Real { kind: 8 })
+        );
+    }
+
+    #[test]
     fn dcmplx_returns_complex8() {
         let result = intrinsic_result_type("dcmplx", &[FortranType::Integer { kind: 4 }]).unwrap();
         assert_eq!(result, FortranType::Complex { kind: 8 });
+    }
+
+    #[test]
+    fn dreal_requires_double_complex_and_returns_double_precision() {
+        assert_eq!(
+            intrinsic_result_type("dreal", &[FortranType::Complex { kind: 8 }]),
+            Some(FortranType::double_precision())
+        );
+        assert_eq!(
+            intrinsic_result_type("dreal", &[FortranType::Complex { kind: 4 }]),
+            None
+        );
     }
 
     #[test]

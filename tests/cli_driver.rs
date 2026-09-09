@@ -4011,6 +4011,50 @@ fn fixed_form_program_compiles_and_runs() {
 }
 
 #[test]
+fn fixed_form_labeled_end_do_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_labeled_end_do_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER I, J, S\n      S = 0\n      DO 20 J = 1, 2\n         DO 10 I = 1, 3\n            IF (I .EQ. 2) GO TO 10\n            S = S + I\n   10    END DO\n   20 END DO\n      PRINT *, S\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_labeled_end_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form labeled END DO compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form labeled END DO compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form labeled END DO run failed");
+    assert!(
+        run.status.success(),
+        "fixed-form labeled END DO run failed: {:?}: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('8'),
+        "unexpected fixed-form labeled END DO output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_unlabeled_do_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -6689,6 +6733,147 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn implicit_interface_character_actuals_keep_hidden_lengths_across_objects() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_interface_character_actuals_keep_hidden_lengths_across_objects count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Netlib callers commonly have only `LOGICAL F; EXTERNAL F`, while the
+    // separately compiled definition declares CHARACTER*(*) dummies.  With
+    // no explicit interface the caller must still pass trailing character
+    // lengths according to the Fortran calling convention.
+    let dir = unique_dir("implicit_interface_character_lengths");
+    let callee = write_program_in(
+        &dir,
+        "callee.f",
+        "      LOGICAL FUNCTION SAME3(N,A,B)\n      INTEGER N,I\n      CHARACTER*(*) A,B\n      SAME3 = .FALSE.\n      IF (LEN(A).NE.N .OR. LEN(B).NE.N) RETURN\n      DO 10 I=1,N\n        IF (A(I:I).NE.B(I:I)) RETURN\n   10 CONTINUE\n      SAME3 = .TRUE.\n      RETURN\n      END\n      SUBROUTINE NAMELEN(NAME,N)\n      CHARACTER*(*) NAME\n      INTEGER N\n      N = LEN(NAME)\n      RETURN\n      END\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f",
+        "      PROGRAM P\n      LOGICAL SAME3\n      EXTERNAL SAME3\n      CHARACTER*3 PATH\n      INTEGER N,SCORE\n      PATH = 'SEP'\n      SCORE = 0\n      IF (SAME3(3,PATH,'SEP')) THEN\n        SCORE = SCORE + 1\n      END IF\n      CALL NAMELEN('DTRSYL',N)\n      IF (N.EQ.6) THEN\n        SCORE = SCORE + 2\n      END IF\n      PRINT *, SCORE\n      END\n",
+    );
+    let callee_obj = dir.join("callee.o");
+    let caller_obj = dir.join("caller.o");
+    let out = dir.join("p");
+
+    for (src, obj) in [(&callee, &callee_obj), (&caller, &caller_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .output()
+            .expect("implicit-interface character compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "implicit-interface character compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            caller_obj.to_str().unwrap(),
+            callee_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("implicit-interface character link failed to spawn");
+    assert!(
+        link.status.success(),
+        "implicit-interface character link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("implicit-interface character run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("3"),
+        "implicit-interface character run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn implicit_interface_heap_backed_array_actual_passes_data_across_objects() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_interface_heap_backed_array_actual_passes_data_across_objects count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // ARMFORTAS heap-backs sufficiently large explicit-shape locals with an
+    // internal ArrayDescriptor. An unresolved external still has an implicit
+    // interface, so the actual associates with an assumed-size dummy through
+    // its first element. Passing that implementation descriptor lets ordinary
+    // callee stores destroy it and makes the caller's automatic cleanup abort.
+    let dir = unique_dir("implicit_interface_heap_array");
+    let callee = write_program_in(
+        &dir,
+        "callee.f",
+        "      SUBROUTINE FILL_VALUES(N,VALUES)\n      INTEGER N,I,VALUES(*)\n      DO 10 I=1,N\n         VALUES(I)=I\n   10 CONTINUE\n      RETURN\n      END\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f",
+        "      PROGRAM P\n      IMPLICIT NONE\n      INTEGER I, VALUES(90000)\n      EXTERNAL FILL_VALUES\n      VALUES = -1\n      CALL FILL_VALUES(SIZE(VALUES),VALUES)\n      DO 10 I=1,SIZE(VALUES)\n         IF (VALUES(I).NE.I) STOP\n   10 CONTINUE\n      PRINT *, 'ok'\n      END\n",
+    );
+    let callee_obj = dir.join("callee.o");
+    let caller_obj = dir.join("caller.o");
+    let out = dir.join("p");
+
+    for (src, obj) in [(&callee, &callee_obj), (&caller, &caller_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .output()
+            .expect("implicit-interface heap-backed-array compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "implicit-interface heap-backed-array compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            caller_obj.to_str().unwrap(),
+            callee_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("implicit-interface heap-backed-array link failed to spawn");
+    assert!(
+        link.status.success(),
+        "implicit-interface heap-backed-array link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("implicit-interface heap-backed-array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "implicit-interface heap-backed-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -40752,6 +40937,52 @@ end program
 }
 
 #[test]
+fn real_intrinsic_without_kind_converts_real_input_to_default_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=real_intrinsic_without_kind_converts_real_input_to_default_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+program main
+  implicit none
+  double precision :: wide, rounded
+  wide = 16777217.0d0
+  rounded = dble(real(wide))
+  if (rounded /= 16777216.0d0) error stop 1
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("real_real8_default_kind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O0", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("REAL(real8) default-kind compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "REAL(real8) default-kind compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("REAL(real8) default-kind binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "REAL(real8) default-kind run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn mixed_scalar_complex_division_compiles_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -41739,6 +41970,64 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file("/tmp/afs_real_read.txt");
+}
+
+#[test]
+fn list_directed_implied_do_read_observes_record_boundaries() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_implied_do_read_observes_record_boundaries count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // LAPACK data files annotate each record after the requested values and
+    // read arrays through input implied-DO lists.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: n, i, values(6)\n  read(*, *) n\n  read(*, *) (values(i), i = 1, n)\n  print *, n, values\nend program\n",
+        "f90",
+    );
+    let out = unique_path("list_read_implied_do_records", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("list-directed implied-DO read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "list-directed implied-DO read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut child = Command::new(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("list-directed implied-DO read run failed to spawn");
+    child
+        .stdin
+        .take()
+        .expect("child stdin must be piped")
+        .write_all(b"6 Number of values\n0 1 2 3 5 20 Values of N\n")
+        .expect("cannot write annotated list-directed records");
+    let run = child
+        .wait_with_output()
+        .expect("cannot collect list-directed implied-DO output");
+    assert!(
+        run.status.success(),
+        "list-directed implied-DO read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let fields: Vec<_> = String::from_utf8_lossy(&run.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(fields, ["6", "0", "1", "2", "3", "5", "20"]);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
@@ -49748,6 +50037,50 @@ fn derived_scalar_structure_constructor_initializer_sets_char_components() {
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected derived scalar ctor initializer output: {}",
         String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn legacy_typed_external_dummy_calls_actual_procedure() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=legacy_typed_external_dummy_calls_actual_procedure count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      LOGICAL A, B, ISPOS, ISNEG\n      INTEGER S\n      EXTERNAL ISPOS, ISNEG\n      CALL APPLY(ISPOS, 2, A)\n      CALL APPLY(ISNEG, -2, B)\n      S = 0\n      IF (A) S = S + 1\n      IF (B) S = S + 2\n      PRINT *, S\n      END\n      SUBROUTINE APPLY(PRED, X, ANSWER)\n      LOGICAL PRED, ANSWER\n      INTEGER X\n      EXTERNAL PRED\n      ANSWER = PRED(X)\n      END\n      LOGICAL FUNCTION ISPOS(X)\n      INTEGER X\n      ISPOS = X .GT. 0\n      END\n      LOGICAL FUNCTION ISNEG(X)\n      INTEGER X\n      ISNEG = X .LT. 0\n      END\n",
+        "f",
+    );
+    let out = unique_path("legacy_external_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("legacy EXTERNAL dummy compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "legacy EXTERNAL dummy compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("legacy EXTERNAL dummy run failed");
+    assert!(
+        run.status.success(),
+        "legacy EXTERNAL dummy run failed: {:?}: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('3'),
+        "legacy EXTERNAL dummy did not dispatch both actual procedures: {}",
+        stdout
     );
 
     let _ = std::fs::remove_file(&out);
@@ -65131,5 +65464,255 @@ fn fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms() {
         String::from_utf8_lossy(&run.stderr),
     );
     let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_dreal_extracts_double_complex_real_parts() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_dreal_extracts_double_complex_real_parts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      IMPLICIT NONE\n      COMPLEX*16 ONE, VALUES(2)\n      DOUBLE PRECISION PARTS(2)\n      PARAMETER (ONE=(1.0D0,0.0D0))\n      VALUES(1) = (3.5D0,-4.5D0)\n      VALUES(2) = (-2.25D0,7.0D0)\n      PARTS = DREAL(VALUES)\n      IF (ABS(PARTS(1)-3.5D0).GT.1.0D-12) STOP\n      IF (ABS(PARTS(2)+2.25D0).GT.1.0D-12) STOP\n      IF (ABS(DREAL(-ONE)+1.0D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_dreal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DREAL compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DREAL compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DREAL binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DREAL run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_data_accepts_negative_final_value() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_data_accepts_negative_final_value count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER INCXS(4)\n      DATA INCXS/1, 2, -2, -1/\n      IF (INCXS(1).NE.1 .OR. INCXS(3).NE.-2 .OR.\n     $    INCXS(4).NE.-1) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_data_negative_final", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DATA compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DATA compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DATA binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DATA run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_legacy_star_width_preserves_exponent_named_entities() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_legacy_star_width_preserves_exponent_named_entities count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      COMPLEX*16 D1(2), D2(2)\n      DATA D1 /(-1.0D0,0.0D0), (0.0D0,1.0D0)/\n      DATA D2 /(2.5D0,-3.0D0), (4.0D0,5.0D0)/\n      IF (ABS(DBLE(D1(1))+1.0D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(D1(2))-1.0D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(D2(1))-2.5D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(D2(1))+3.0D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_star_width_exponent_name", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form legacy star-width compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form legacy star-width compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form legacy star-width binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form legacy star-width run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_logical_if_accepts_bare_rewind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_logical_if_accepts_bare_rewind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER NTRA, VALUE\n      LOGICAL REWI\n      OPEN(NEWUNIT=NTRA, STATUS='SCRATCH', ACTION='READWRITE')\n      WRITE(NTRA,*) 42\n      REWI = .TRUE.\n      IF (REWI)\n     $   REWIND NTRA\n      READ(NTRA,*) VALUE\n      CLOSE(NTRA)\n      IF (VALUE.NE.42) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_logical_if_bare_rewind", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form bare REWIND compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form bare REWIND compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form bare REWIND binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form bare REWIND run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn array_conversion_expression_materializes_for_function_sequence_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=array_conversion_expression_materializes_for_function_sequence_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      DOUBLE PRECISION SX(3), RESULT, SUM_SP\n      EXTERNAL SUM_SP\n      DATA SX /1.25D0, 2.5D0, 3.75D0/\n      RESULT = SUM_SP(3, REAL(SX))\n      IF (ABS(RESULT-7.5D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n      DOUBLE PRECISION FUNCTION SUM_SP(N,X)\n      INTEGER N, I\n      REAL X(*)\n      SUM_SP = 0.0D0\n      DO 10 I = 1, N\n         SUM_SP = SUM_SP + DBLE(X(I))\n   10 CONTINUE\n      END\n",
+        "f",
+    );
+    let out = unique_path("function_sequence_array_conversion", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("array-conversion function actual compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "array-conversion function actual compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("array-conversion function actual binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "array-conversion function actual run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn top_level_subroutine_contained_function_uses_internal_target() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=top_level_subroutine_contained_function_uses_internal_target count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real :: value\n  call host(value)\n  if (abs(value - 9.0) > 1.0e-5) error stop 1\n  print *, 'ok'\nend program\n\nsubroutine host(value)\n  implicit none\n  real, intent(out) :: value\n  value = square(3.0)\ncontains\n  real function square(x)\n    real, intent(in) :: x\n    square = x * x\n  end function square\nend subroutine host\n",
+        "f90",
+    );
+    let ir = unique_path("top_level_host_internal_function", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("top-level-host contained-function IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "top-level-host contained-function IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read contained-function IR");
+    assert!(
+        ir_text.contains("call @afs_internal_host_"),
+        "contained function call should use the host-qualified internal target:\n{}",
+        ir_text
+    );
+    assert!(
+        !ir_text.contains("call @square("),
+        "contained function must not escape as a raw external target:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("top_level_host_internal_function", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("top-level-host contained-function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "top-level-host contained-function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("top-level-host contained-function binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "top-level-host contained-function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }

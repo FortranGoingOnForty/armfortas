@@ -14717,7 +14717,7 @@ pub(super) fn actual_expr_rank(
                 }
                 if matches!(
                     key.as_str(),
-                    "abs" | "aimag" | "dimag" | "conjg" | "dconjg" | "real"
+                    "abs" | "aimag" | "dimag" | "dreal" | "conjg" | "dconjg" | "real"
                 ) {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
@@ -17450,6 +17450,7 @@ pub(super) fn generic_dispatch_probe_value(
                 "dconjg",
                 "aimag",
                 "dimag",
+                "dreal",
                 "abs",
                 "cmplx",
                 "dcmplx",
@@ -17680,7 +17681,7 @@ pub(super) fn array_expr_elem_type_only(
                             }
                         }
                     }
-                    "aimag" | "dimag" => {
+                    "aimag" | "dimag" | "dreal" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 if let Some(IrType::Array(inner, 2)) =
@@ -20126,6 +20127,14 @@ pub(super) fn lowered_scope_symbol_name(
                         internal_funcs,
                     ))
                 }
+                crate::sema::symtab::ScopeKind::Global => Some(lowered_procedure_symbol_name(
+                    name,
+                    scope.binding_label.as_deref(),
+                    None,
+                    None,
+                    false,
+                    internal_funcs,
+                )),
                 crate::sema::symtab::ScopeKind::Module(module_name) => {
                     Some(module_procedure_symbol_name(module_name, name))
                 }
@@ -22570,7 +22579,12 @@ fn procedure_dummy_symbol_in_scope<'a>(
     scope
         .symbols
         .get(&key.to_lowercase())
-        .filter(|sym| symbol_is_procedure_dummy(sym))
+        // A legacy implicit-interface procedure dummy is commonly declared
+        // by a type statement followed by EXTERNAL (`LOGICAL SELECT;
+        // EXTERNAL SELECT`). Sema correctly retains that as a Variable with
+        // the EXTERNAL attribute, rather than an explicit-interface
+        // Function/ProcedurePointer symbol.
+        .filter(|sym| symbol_is_procedure_dummy(sym) || sym.attrs.external)
 }
 
 pub(super) fn procedure_dummy_arg_ir_type(
@@ -22662,7 +22676,10 @@ pub(super) fn procedure_dummy_closure_param_slots_for_scope(
         return false;
     };
     let key = dummy_name.to_lowercase();
-    procedure_dummy_symbol_in_scope(st, scope_id, &key).is_some()
+    st.scope(scope_id)
+        .symbols
+        .get(&key)
+        .is_some_and(symbol_is_procedure_dummy)
 }
 
 pub(super) fn append_procedure_dummy_closure_args_for_call(
@@ -25484,6 +25501,36 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
     // selected specific instead of falling through to a same-named imported
     // character procedure and appending one of its hidden length arguments.
     Some(mask)
+}
+
+/// Infer the trailing CHARACTER-length ABI for a call whose procedure
+/// interface is unavailable in this compilation.  Legacy external calls do
+/// not carry dummy metadata, but the caller still knows which actual
+/// arguments are CHARACTER and must pass their lengths for a separately
+/// compiled `character*(*)` dummy.  Callers must use this only after concrete
+/// procedure lookup returned `None`; a resolved all-false mask is meaningful.
+pub(super) fn implicit_interface_character_arg_mask(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    arg_slots: &[Option<crate::ast::expr::Argument>],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<Vec<bool>> {
+    let mut has_character_actual = false;
+    let mask = arg_slots
+        .iter()
+        .map(|slot| {
+            let is_character = slot.as_ref().is_some_and(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(expr) => {
+                    expr_is_character_expr(b, locals, expr, st, type_layouts)
+                }
+                crate::ast::expr::SectionSubscript::Range { .. } => false,
+            });
+            has_character_actual |= is_character;
+            is_character
+        })
+        .collect::<Vec<_>>();
+    has_character_actual.then_some(mask)
 }
 
 /// Check if a callee has deferred-length allocatable/pointer character dummies
@@ -32144,6 +32191,7 @@ fn constructor_intrinsic_materializes_array(name: &str) -> bool {
             | "dconjg"
             | "aimag"
             | "dimag"
+            | "dreal"
             | "abs"
             | "real"
     )
@@ -36115,6 +36163,7 @@ pub(super) fn try_lower_defined_io_read_items(
     explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: Option<ValueId>,
     iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -36145,6 +36194,15 @@ pub(super) fn try_lower_defined_io_read_items(
         b.store(zero, tmp);
         tmp
     });
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    // The enclosing transfer owns the input record. Defined-I/O procedures
+    // may issue child READs on the same unit; keeping this outer scope open
+    // lets those children share the record until every item has been handled.
+    b.call(
+        FuncRef::External("afs_list_read_begin".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
     let done = b.create_block("defined_read_done");
     lower_io_status_continue_or_exit(b, statement_iostat, done);
     for (index, (item, candidate)) in items.iter().zip(candidates.iter()).enumerate() {
@@ -36171,6 +36229,11 @@ pub(super) fn try_lower_defined_io_read_items(
     }
     b.branch(done, vec![]);
     b.set_block(done);
+    b.call(
+        FuncRef::External("afs_list_read_end".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
     if owns_iostat {
         lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
     }
@@ -36263,6 +36326,15 @@ fn lower_list_read_item(
     item: &crate::ast::expr::SpannedExpr,
     mode: ReadMode,
 ) {
+    if let Expr::ArrayConstructor { values, .. } = &item.node {
+        if values
+            .iter()
+            .any(|value| matches!(value, AcValue::ImpliedDo(_)))
+        {
+            lower_list_read_ac_values(b, ctx, values, mode);
+            return;
+        }
+    }
     if lower_array_read_item(b, ctx, item, mode) {
         return;
     }
@@ -36276,6 +36348,111 @@ fn lower_list_read_item(
         return;
     };
     let _ = lower_read_into_addr(b, mode, &ty, addr, logical);
+}
+
+fn lower_list_read_ac_values(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    values: &[AcValue],
+    mode: ReadMode,
+) {
+    for value in values {
+        match value {
+            AcValue::Expr(expr) => {
+                if let Expr::ArrayConstructor { values: nested, .. } = &expr.node {
+                    lower_list_read_ac_values(b, ctx, nested, mode);
+                } else {
+                    lower_list_read_item(b, ctx, expr, mode);
+                }
+            }
+            AcValue::ImpliedDo(implied_do) => {
+                lower_list_read_ac_implied_do(b, ctx, implied_do, mode)
+            }
+        }
+    }
+}
+
+fn lower_list_read_ac_implied_do(
+    b: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    implied_do: &crate::ast::expr::ImpliedDoLoop,
+    mode: ReadMode,
+) {
+    let var_ty = IrType::Int(IntWidth::I32);
+    let var_addr = b.alloca(var_ty.clone());
+    let start_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.start);
+    let start = coerce_to_type(b, start_raw, &var_ty);
+    b.store(start, var_addr);
+    let end_raw = super::expr::lower_expr_ctx(b, ctx, &implied_do.end);
+    let end = coerce_to_type(b, end_raw, &var_ty);
+    let step_raw = match &implied_do.step {
+        Some(step) => super::expr::lower_expr_ctx(b, ctx, step),
+        None => b.const_i32(1),
+    };
+    let step = coerce_to_type(b, step_raw, &var_ty);
+
+    let var_key = implied_do.var.to_lowercase();
+    let old_local = ctx.locals.insert(
+        var_key.clone(),
+        LocalInfo {
+            addr: var_addr,
+            ty: var_ty,
+            dims: vec![],
+            allocatable: false,
+            descriptor_arg: false,
+            by_ref: false,
+            char_kind: CharKind::None,
+            derived_type: None,
+            inline_const: None,
+            is_pointer: false,
+            runtime_dim_upper: vec![],
+            is_class: false,
+            logical_kind: None,
+            last_dim_assumed_size: false,
+        },
+    );
+
+    let check = b.create_block("read_ac_impdo_check");
+    let body = b.create_block("read_ac_impdo_body");
+    let exit = b.create_block("read_ac_impdo_exit");
+    b.branch(check, vec![]);
+
+    b.set_block(check);
+    let current = b.load(var_addr);
+    let const_step = implied_do.step.as_ref().and_then(eval_const_int);
+    if let Some(value) = const_step {
+        let comparison = if value < 0 { CmpOp::Ge } else { CmpOp::Le };
+        let keep_going = b.icmp(comparison, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    } else {
+        let zero = b.const_i32(0);
+        let negative = b.icmp(CmpOp::Lt, step, zero);
+        let negative_check = b.create_block("read_ac_impdo_neg_check");
+        let positive_check = b.create_block("read_ac_impdo_pos_check");
+        b.cond_branch(negative, negative_check, vec![], positive_check, vec![]);
+
+        b.set_block(negative_check);
+        let keep_going = b.icmp(CmpOp::Ge, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+
+        b.set_block(positive_check);
+        let keep_going = b.icmp(CmpOp::Le, current, end);
+        b.cond_branch(keep_going, body, vec![], exit, vec![]);
+    }
+
+    b.set_block(body);
+    lower_list_read_ac_values(b, ctx, &implied_do.values, mode);
+    let current = b.load(var_addr);
+    let next = b.iadd(current, step);
+    b.store(next, var_addr);
+    b.branch(check, vec![]);
+
+    b.set_block(exit);
+    if let Some(previous) = old_local {
+        ctx.locals.insert(var_key, previous);
+    } else {
+        ctx.locals.remove(&var_key);
+    }
 }
 
 pub(super) fn lower_list_read_items(
@@ -65010,12 +65187,7 @@ pub(super) fn lower_arg_by_ref_full(
             return info.addr;
         }
         if let Some(sym) = find_linkable_symbol_any_scope(st, &key) {
-            if matches!(
-                sym.kind,
-                crate::sema::symtab::SymbolKind::Function
-                    | crate::sema::symtab::SymbolKind::Subroutine
-                    | crate::sema::symtab::SymbolKind::ExternalProc
-            ) {
+            if is_linkable_callable_symbol(sym) {
                 let (link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
                 if let Some(internal_funcs) = internal_funcs {
                     if internal_funcs.contains_key(&resolved_key)

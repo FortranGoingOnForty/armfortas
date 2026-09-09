@@ -65,6 +65,7 @@ pub(crate) fn specific_intrinsic(name: &str) -> Option<SpecificIntrinsic> {
         "clog" => (COMPLEX_1, Complex, "afs_specific_log_c4"),
         "conjg" => (COMPLEX_1, Complex, "afs_specific_conjg_c4"),
         "dconjg" => (DOUBLE_COMPLEX_1, DoubleComplex, "afs_specific_conjg_c8"),
+        "dreal" => (DOUBLE_COMPLEX_1, DoublePrecision, "afs_specific_dreal_c8"),
         "csin" => (COMPLEX_1, Complex, "afs_specific_sin_c4"),
         "csqrt" => (COMPLEX_1, Complex, "afs_specific_sqrt_c4"),
         "dabs" => (DOUBLE_1, DoublePrecision, "afs_specific_abs_r8"),
@@ -121,7 +122,7 @@ mod tests {
             "ccos", "cexp", "clog", "conjg", "csin", "csqrt", "dabs", "dacos", "dasin", "datan",
             "dcos", "dcosh", "dexp", "dint", "dlog", "dlog10", "dnint", "dsin", "dsinh", "dsqrt",
             "dtan", "dtanh", "datan2", "ddim", "dmod", "dsign", "dprod", "iabs", "idim", "isign",
-            "mod", "idnint", "nint", "index", "len", "dconjg",
+            "mod", "idnint", "nint", "index", "len", "dconjg", "dreal",
         ] {
             let definition = specific_intrinsic(name)
                 .unwrap_or_else(|| panic!("missing specific intrinsic definition for {name}"));

@@ -271,7 +271,8 @@ fn tokenize_body(body: &MappedFixedText, file_id: u32) -> Result<Vec<Token>, Lex
         // Dot-operator or real starting with dot.
         if ch == b'.' {
             if pos + 1 < bytes.len() && bytes[pos + 1].is_ascii_digit() {
-                let (mut tok, consumed) = lex_fixed_number(&stripped.text, pos, file_id, line);
+                let (mut tok, consumed) =
+                    lex_fixed_number(&stripped.text, pos, file_id, line, &tokens);
                 remap_fixed_token(&mut tok, &stripped, pos, consumed);
                 tokens.push(tok);
                 pos += consumed;
@@ -287,7 +288,7 @@ fn tokenize_body(body: &MappedFixedText, file_id: u32) -> Result<Vec<Token>, Lex
 
         // Number (integer or real).
         if ch.is_ascii_digit() {
-            let (mut tok, consumed) = lex_fixed_number(&stripped.text, pos, file_id, line);
+            let (mut tok, consumed) = lex_fixed_number(&stripped.text, pos, file_id, line, &tokens);
             remap_fixed_token(&mut tok, &stripped, pos, consumed);
             tokens.push(tok);
             pos += consumed;
@@ -664,7 +665,13 @@ fn lex_fixed_dot_op(
 }
 
 /// Lex a number (integer or real) in whitespace-stripped body.
-fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, usize) {
+fn lex_fixed_number(
+    text: &str,
+    pos: usize,
+    file_id: u32,
+    line: u32,
+    prior_tokens: &[Token],
+) -> (Token, usize) {
     let bytes = text.as_bytes();
     let mut end = pos;
     let mut is_real = false;
@@ -674,6 +681,19 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
     while end < bytes.len() && bytes[end].is_ascii_digit() {
         tok_text.push(bytes[end] as char);
         end += 1;
+    }
+
+    // Blanks are insignificant in fixed form, so a declaration such as
+    // `COMPLEX*16 D1(8)` reaches this scanner as `COMPLEX*16D1(8)`. The
+    // `16D1` prefix is also a valid double-precision literal, but a legacy
+    // star selector requires an integer width followed by an entity name.
+    // Preserve that grammar boundary here; ordinary expression literals such
+    // as `X=16D1` still take the exponent path below.
+    if in_fixed_legacy_star_selector(prior_tokens)
+        && end < bytes.len()
+        && matches!(bytes[end], b'e' | b'E' | b'd' | b'D')
+    {
+        return make_fixed_number_token(tok_text, false, pos, end, file_id, line);
     }
 
     // Decimal point — but not if followed by letter (dot-op like .EQ.).
@@ -744,16 +764,38 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
         }
     }
 
-    let col = (pos as u32) + 7;
-    let kind = if is_real {
-        TokenKind::RealLiteral
-    } else {
-        TokenKind::IntegerLiteral
+    make_fixed_number_token(tok_text, is_real, pos, end, file_id, line)
+}
+
+fn in_fixed_legacy_star_selector(prior_tokens: &[Token]) -> bool {
+    let Some([type_token, star]) = prior_tokens.get(prior_tokens.len().saturating_sub(2)..) else {
+        return false;
     };
+    star.kind == TokenKind::Star
+        && type_token.kind == TokenKind::Identifier
+        && matches!(
+            type_token.text.to_ascii_lowercase().as_str(),
+            "integer" | "real" | "complex" | "logical" | "character"
+        )
+}
+
+fn make_fixed_number_token(
+    text: String,
+    is_real: bool,
+    pos: usize,
+    end: usize,
+    file_id: u32,
+    line: u32,
+) -> (Token, usize) {
+    let col = (pos as u32) + 7;
     (
         Token {
-            kind,
-            text: tok_text,
+            kind: if is_real {
+                TokenKind::RealLiteral
+            } else {
+                TokenKind::IntegerLiteral
+            },
+            text,
             span: Span {
                 file_id,
                 start: Position { line, col },
@@ -2134,6 +2176,14 @@ C     Hello World
     }
 
     #[test]
+    fn logical_if_splits_bare_rewind_action() {
+        assert_eq!(
+            fixed_texts("      IF (REWI)\n     $   REWIND NTRA\n"),
+            ["IF", "(", "REWI", ")", "REWIND", "NTRA"]
+        );
+    }
+
+    #[test]
     fn numeric_print_prefix_stays_in_procedure_names() {
         let declaration = fixed_texts("      SUBROUTINE PRINT100()\n");
         assert_eq!(
@@ -2273,6 +2323,29 @@ C     Hello World
                 TokenKind::RealLiteral,
             ]
         );
+    }
+
+    #[test]
+    fn legacy_star_width_preserves_exponent_named_entities() {
+        assert_eq!(
+            fixed_texts("      COMPLEX*16 D1(8), D2(8)\n"),
+            ["COMPLEX", "*", "16", "D1", "(", "8", ")", ",", "D2", "(", "8", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      REAL*8 E2(3)\n"),
+            ["REAL", "*", "8", "E2", "(", "3", ")"]
+        );
+    }
+
+    #[test]
+    fn exponent_literal_outside_legacy_star_width_stays_real() {
+        let tokens = fixed_toks("      X=16D1\n");
+        let literal = tokens
+            .iter()
+            .find(|token| token.text == "16D1")
+            .expect("missing D-exponent literal");
+
+        assert_eq!(literal.kind, TokenKind::RealLiteral);
     }
 
     #[test]

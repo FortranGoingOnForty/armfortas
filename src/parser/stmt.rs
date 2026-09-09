@@ -161,10 +161,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_read(start)
             }
-            // I/O and memory keywords double as legal identifiers. The
-            // statement form always opens with `(`; anything else (`=`,
-            // `==`, end of line, etc.) means the lexeme is being used as
-            // a variable name and we redirect to assignment/call.
+            // I/O and memory keywords double as legal identifiers. Most
+            // statement forms open with `(`; file-positioning statements also
+            // accept a bare unit expression and use the designator lookahead
+            // below to preserve assignments to same-named variables.
             "open" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
                 self.parse_io_paren_stmt(start, "open")
@@ -177,21 +177,21 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.parse_inquire(start)
             }
-            "rewind" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "rewind" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "rewind")
+                self.parse_io_position_stmt(start, "rewind")
             }
-            "backspace" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "backspace" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "backspace")
+                self.parse_io_position_stmt(start, "backspace")
             }
-            "endfile" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "endfile" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "endfile")
+                self.parse_io_position_stmt(start, "endfile")
             }
-            "flush" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
+            "flush" if !self.leading_designator_is_assignment() => {
                 self.advance();
-                self.parse_io_paren_stmt(start, "flush")
+                self.parse_io_position_stmt(start, "flush")
             }
             "wait" if self.peek_kind_at(1) == Some(&TokenKind::LParen) => {
                 self.advance();
@@ -1505,6 +1505,26 @@ impl<'a> Parser<'a> {
             let nested_do_shares_terminator =
                 !is_terminator && self.current_stmt_is_do_with_terminating_label(label);
 
+            if is_terminator && self.current_labeled_do_terminator_is_end_do(label) {
+                let start = self.current_span();
+                self.advance(); // terminating label
+                let inner_start = self.current_span();
+                self.consume_end("do")?;
+                let inner_span = span_from_to(inner_start, self.prev_span());
+                let span = span_from_to(start, self.prev_span());
+                body.push(Spanned::new(
+                    Stmt::Labeled {
+                        label,
+                        // A labeled END DO is the loop-tail branch target. Represent it
+                        // as a labeled no-op so normal fall-through and GO TO both reach
+                        // the increment edge supplied by DO lowering.
+                        stmt: Box::new(Spanned::new(Stmt::Continue { label: None }, inner_span)),
+                    },
+                    span,
+                ));
+                break;
+            }
+
             let mut stmt = self.parse_stmt()?;
             if nested_do_shares_terminator {
                 Self::mark_shared_labeled_do(&mut stmt);
@@ -1515,6 +1535,30 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(body)
+    }
+
+    fn current_labeled_do_terminator_is_end_do(&self, label: u64) -> bool {
+        let Some(label_token) = self.tokens.get(self.pos) else {
+            return false;
+        };
+        if label_token.kind != TokenKind::IntegerLiteral
+            || label_token.text.parse::<u64>().ok() != Some(label)
+        {
+            return false;
+        }
+
+        let Some(end_token) = self.tokens.get(self.pos + 1) else {
+            return false;
+        };
+        if end_token.text.eq_ignore_ascii_case("enddo") {
+            return self.at_stmt_end_after(2);
+        }
+        end_token.text.eq_ignore_ascii_case("end")
+            && self
+                .tokens
+                .get(self.pos + 2)
+                .is_some_and(|token| token.text.eq_ignore_ascii_case("do"))
+            && self.at_stmt_end_after(3)
     }
 
     fn current_stmt_is_do_with_terminating_label(&self, label: u64) -> bool {
@@ -1609,6 +1653,35 @@ impl<'a> Parser<'a> {
         let items = self.parse_io_item_list()?;
         let span = span_from_to(start, self.prev_span());
         Ok(Spanned::new(Stmt::Inquire { specs, items }, span))
+    }
+
+    /// Parse the parenthesized or legacy bare-unit form of a file-positioning
+    /// statement: `REWIND(unit, ...)` and `REWIND unit` are both standard.
+    fn parse_io_position_stmt(
+        &mut self,
+        start: crate::lexer::Span,
+        kind: &str,
+    ) -> Result<SpannedStmt, ParseError> {
+        if self.peek() == &TokenKind::LParen {
+            return self.parse_io_paren_stmt(start, kind);
+        }
+
+        let unit = self.parse_expr()?;
+        let specs = vec![IoControl {
+            keyword: None,
+            value: unit,
+        }];
+        let span = span_from_to(start, self.prev_span());
+        Ok(Spanned::new(
+            match kind {
+                "rewind" => Stmt::Rewind { specs },
+                "backspace" => Stmt::Backspace { specs },
+                "endfile" => Stmt::Endfile { specs },
+                "flush" => Stmt::Flush { specs },
+                _ => unreachable!(),
+            },
+            span,
+        ))
     }
 
     /// Parse a generic I/O statement with parenthesized specifiers:
@@ -2157,6 +2230,33 @@ mod tests {
         } else {
             panic!("not DoLoop");
         }
+    }
+
+    #[test]
+    fn do_with_terminating_label_on_end_do() {
+        let s = parse_one("do 20 j = 1, 2\n  do 10 i = 1, 3\n    x = x + 1\n10 end do\n20 enddo\n");
+        let Stmt::DoLoop {
+            body: outer_body, ..
+        } = &s.node
+        else {
+            panic!("not outer DoLoop");
+        };
+        let Stmt::DoLoop {
+            body: inner_body, ..
+        } = &outer_body[0].node
+        else {
+            panic!("not inner DoLoop");
+        };
+        assert!(matches!(
+            inner_body.last().map(|stmt| &stmt.node),
+            Some(Stmt::Labeled { label: 10, stmt })
+                if matches!(stmt.node, Stmt::Continue { label: None })
+        ));
+        assert!(matches!(
+            outer_body.last().map(|stmt| &stmt.node),
+            Some(Stmt::Labeled { label: 20, stmt })
+                if matches!(stmt.node, Stmt::Continue { label: None })
+        ));
     }
 
     #[test]
@@ -2787,6 +2887,44 @@ end if
     fn rewind_stmt() {
         let s = parse_one("rewind(10)\n");
         assert!(matches!(s.node, Stmt::Rewind { .. }));
+    }
+
+    #[test]
+    fn file_positioning_accepts_bare_units() {
+        assert!(matches!(
+            parse_one("rewind unit\n").node,
+            Stmt::Rewind { .. }
+        ));
+        assert!(matches!(
+            parse_one("backspace 10\n").node,
+            Stmt::Backspace { .. }
+        ));
+        assert!(matches!(
+            parse_one("endfile unit\n").node,
+            Stmt::Endfile { .. }
+        ));
+        assert!(matches!(parse_one("flush unit\n").node, Stmt::Flush { .. }));
+    }
+
+    #[test]
+    fn logical_if_accepts_bare_rewind() {
+        let stmt = parse_one("if (rewi) rewind ntra\n");
+        let Stmt::IfStmt { action, .. } = stmt.node else {
+            panic!("not logical IF");
+        };
+        assert!(matches!(action.node, Stmt::Rewind { .. }));
+    }
+
+    #[test]
+    fn file_positioning_names_remain_assignment_designators() {
+        assert!(matches!(
+            parse_one("rewind = 3\n").node,
+            Stmt::Assignment { .. }
+        ));
+        assert!(matches!(
+            parse_one("rewind(i) = 4\n").node,
+            Stmt::Assignment { .. }
+        ));
     }
 
     #[test]

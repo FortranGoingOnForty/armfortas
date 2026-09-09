@@ -254,8 +254,9 @@ struct Unit {
     /// cleared by `afs_list_read_end`. The cursor tracks how many
     /// bytes the per-item helpers have consumed so far.
     pending_read: Option<(Vec<u8>, usize)>,
-    /// Nesting depth for sequential-unformatted child reads sharing
-    /// `pending_read` with their parent transfer statement.
+    /// Nesting depth for child list-directed reads. Sequential-unformatted
+    /// children share `pending_read`; formatted children share the current
+    /// record's token queue until the outer statement finishes.
     list_read_depth: usize,
 }
 
@@ -2403,8 +2404,9 @@ fn read_raw_exact(u: &mut Unit, buf: &mut [u8]) -> io::Result<ExactRawRead> {
 /// sequential-unformatted (which needs the leading record marker
 /// consumed and the data slurped into a buffer for typed take-bytes).
 ///
-/// For formatted units this only resets iostat. For sequential
-/// unformatted units it reads `[u32 len][len bytes][u32 trailer]`,
+/// For formatted units this tracks nesting so the outermost statement can
+/// discard unused fields at the record boundary. For sequential unformatted
+/// units it reads `[u32 len][len bytes][u32 trailer]`,
 /// stashes the data in `pending_read`, and the per-item helpers will
 /// consume from there. A nested child transfer on the same unit shares
 /// the parent's buffer and cursor. Stream-unformatted reads continue
@@ -2433,6 +2435,14 @@ pub extern "C" fn afs_list_read_begin(unit: i32, iostat: *mut i32, iomsg: *mut u
             u.pending_read = Some((Vec::new(), 0));
             u.list_read_depth = 1;
             set_read_iostat_or_exit(iostat, 1, "direct-access READ requires REC=");
+            return;
+        }
+        if u.form == Form::Formatted && matches!(u.access, Access::Sequential | Access::Stream) {
+            let Some(depth) = u.list_read_depth.checked_add(1) else {
+                set_read_status_or_exit(iostat, 1);
+                return;
+            };
+            u.list_read_depth = depth;
             return;
         }
         if !(u.form == Form::Unformatted && u.access == Access::Sequential) {
@@ -2571,10 +2581,10 @@ pub extern "C" fn afs_direct_read_begin(
     }
 }
 
-/// End a list-directed READ statement. The outermost sequential
-/// unformatted transfer drops any unread bytes left in the in-flight
-/// record buffer (the standard does not require the program to consume
-/// the entire record). Nested child transfers only release their depth.
+/// End a list-directed READ statement. The outermost formatted transfer
+/// discards unused fields in its current record, while the outermost
+/// sequential-unformatted transfer drops unread bytes from its in-flight
+/// record buffer. Nested child transfers only release their depth.
 #[no_mangle]
 pub extern "C" fn afs_list_read_end(
     unit: i32,
@@ -2583,6 +2593,15 @@ pub extern "C" fn afs_list_read_end(
     _iomsg_len: i64,
 ) {
     with_unit(unit, |u| {
+        if u.form == Form::Formatted && matches!(u.access, Access::Sequential | Access::Stream) {
+            if u.list_read_depth > 1 {
+                u.list_read_depth -= 1;
+                return;
+            }
+            u.list_read_depth = 0;
+            u.read_tokens.clear();
+            return;
+        }
         if !(u.form == Form::Unformatted && matches!(u.access, Access::Sequential | Access::Direct))
         {
             return;
@@ -7597,6 +7616,50 @@ mod tests {
                 ListReadToken::Value("8".into()),
             ]
         );
+    }
+
+    #[test]
+    fn formatted_list_read_end_discards_unused_record_fields() {
+        let path = format!(
+            "/tmp/afs_list_read_record_end_{}_{}.dat",
+            std::process::id(),
+            line!()
+        );
+        std::fs::write(
+            &path,
+            b"6 Number of values of N\n0 1 2 3 5 20 Values of N\n",
+        )
+        .expect("create annotated list-directed input");
+        let unit = 1795;
+        afs_open_simple(
+            unit,
+            path.as_ptr(),
+            path.len() as i64,
+            "old".as_ptr(),
+            3,
+            "read".as_ptr(),
+            4,
+        );
+
+        let mut iostat = -99;
+        let mut count = -1;
+        afs_list_read_begin(unit, &mut iostat, std::ptr::null_mut(), 0);
+        afs_read_int(unit, &mut count, &mut iostat);
+        afs_list_read_end(unit, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!((iostat, count), (0, 6));
+
+        let mut values = [-1; 6];
+        afs_list_read_begin(unit, &mut iostat, std::ptr::null_mut(), 0);
+        for value in &mut values {
+            afs_read_int(unit, value, &mut iostat);
+        }
+        afs_list_read_end(unit, &mut iostat, std::ptr::null_mut(), 0);
+        assert_eq!(iostat, 0);
+        assert_eq!(values, [0, 1, 2, 3, 5, 20]);
+
+        afs_close_ex(unit, "delete".as_ptr(), 6, &mut iostat);
+        assert_eq!(iostat, 0);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -2819,6 +2819,15 @@ pub(crate) fn lower_expr_full(
                 let callee_char_len_star_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_char_len_star_mask(st, k)
+                    })
+                    .or_else(|| {
+                        implicit_interface_character_arg_mask(
+                            b,
+                            locals,
+                            &arg_slots,
+                            st,
+                            type_layouts,
+                        )
                     });
                 let callee_pointer_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
@@ -2827,6 +2836,14 @@ pub(crate) fn lower_expr_full(
                 let callee_allocatable_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_allocatable_arg_mask(st, k)
+                    });
+                let callee_sequence_array_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_sequence_array_arg_mask(st, k)
+                    });
+                let callee_sequence_array_copy_back_args =
+                    first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
+                        callee_sequence_array_copy_back_mask(st, k)
                     });
                 let callee_class_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
@@ -2839,6 +2856,7 @@ pub(crate) fn lower_expr_full(
                     Vec::with_capacity(arg_slots.len() + indirect_hidden_result.is_some() as usize);
                 let mut arg_presence: Vec<ValueId> = Vec::with_capacity(arg_slots.len());
                 let mut call_arg_array_temps = Vec::new();
+                let mut call_arg_sequence_temps = Vec::new();
                 let mut call_arg_character_lens = vec![None; arg_slots.len()];
                 let mut call_arg_character_temps = Vec::new();
                 if let Some(desc) = indirect_hidden_result {
@@ -2880,6 +2898,14 @@ pub(crate) fn lower_expr_full(
                         .as_ref()
                         .map(|mask| mask.get(i).copied().unwrap_or(false))
                         .unwrap_or(false);
+                    let wants_sequence_array = callee_sequence_array_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
+                    let sequence_array_copy_back = callee_sequence_array_copy_back_args
+                        .as_ref()
+                        .map(|mask| mask.get(i).copied().unwrap_or(false))
+                        .unwrap_or(false);
                     let wants_polymorphic_descriptor = wants_descriptor
                         && dummy_is_class
                         && !dummy_is_allocatable
@@ -2891,6 +2917,34 @@ pub(crate) fn lower_expr_full(
                     let lowered = match slot {
                         Some(arg) => match &arg.value {
                             crate::ast::expr::SectionSubscript::Element(arg_expr) => {
+                                let actual_is_array_section = actual_is_array_section_designator(
+                                    locals,
+                                    arg_expr,
+                                    st,
+                                    type_layouts,
+                                );
+                                let actual_is_array =
+                                    actual_expr_rank(arg_expr, locals, st, type_layouts)
+                                        .is_some_and(|rank| rank > 0)
+                                        || actual_is_array_section;
+                                let actual_is_char_sequence =
+                                    actual_is_character_array_section_designator(
+                                        locals,
+                                        arg_expr,
+                                        st,
+                                        type_layouts,
+                                    );
+                                let sequence_array_for_arg = (wants_sequence_array
+                                    || actual_is_array)
+                                    && !matches!(
+                                        arg_expr.node,
+                                        Expr::ConditionalExpr { .. } | Expr::NilArgument
+                                    );
+                                let sequence_array_copy_back_for_arg = if wants_sequence_array {
+                                    sequence_array_copy_back
+                                } else {
+                                    true
+                                };
                                 // F2023 conditional actual argument: select the
                                 // association per arm (never a value temp), so
                                 // INTENT(OUT)/INOUT writes land in the chosen
@@ -2971,6 +3025,47 @@ pub(crate) fn lower_expr_full(
                                                 )
                                             },
                                         )
+                                    } else if sequence_array_for_arg {
+                                        let sequence_actual = if actual_is_char_sequence {
+                                            lower_sequence_char_array_actual(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                internal_funcs,
+                                                contained_host_refs,
+                                                descriptor_params,
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        } else {
+                                            lower_sequence_array_actual(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                internal_funcs,
+                                                contained_host_refs,
+                                                descriptor_params,
+                                                sequence_array_copy_back_for_arg,
+                                                &mut call_arg_sequence_temps,
+                                            )
+                                        };
+                                        sequence_actual.unwrap_or_else(|| {
+                                            lower_arg_by_ref_for_dummy_full(
+                                                b,
+                                                locals,
+                                                e,
+                                                st,
+                                                type_layouts,
+                                                internal_funcs,
+                                                contained_host_refs,
+                                                descriptor_params,
+                                                dummy_is_class,
+                                            )
+                                        })
                                     } else if let Some(actual) =
                                         lower_materialized_character_actual(
                                             b,
@@ -3215,6 +3310,7 @@ pub(crate) fn lower_expr_full(
                     )
                 };
                 let call_result = b.call(func_ref, ref_arg_vals, ret_ty);
+                finish_sequence_association_temps(b, &call_arg_sequence_temps);
                 deallocate_call_arg_array_temp_descriptors(b, &call_arg_array_temps);
                 deallocate_owned_string_bases(b, &call_arg_character_temps);
                 if let Some(desc) = indirect_hidden_result {
@@ -3400,6 +3496,16 @@ pub(crate) fn lower_expr_full(
                                         st,
                                         formal_skip,
                                     );
+                                    let callee_char_len_star_args = callee_char_len_star_args
+                                        .or_else(|| {
+                                            implicit_interface_character_arg_mask(
+                                                b,
+                                                locals,
+                                                &arg_slots,
+                                                st,
+                                                type_layouts,
+                                            )
+                                        });
                                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(
                                         arg_slots.len() + hidden_result.is_some() as usize,
                                     );

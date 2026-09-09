@@ -5481,6 +5481,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_char_len_star_mask(ctx.st, k).or_else(|| {
                             cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
                         })
+                    })
+                    .or_else(|| {
+                        implicit_interface_character_arg_mask(
+                            b,
+                            &ctx.locals,
+                            &arg_slots,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                        )
                     });
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
@@ -6070,6 +6079,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                         callee_char_len_star_mask(ctx.st, k).or_else(|| {
                             cached_param_mask_for_lookup(ctx.st, ctx.char_len_star_params, k)
                         })
+                    })
+                    .or_else(|| {
+                        implicit_interface_character_arg_mask(
+                            b,
+                            &ctx.locals,
+                            &arg_slots,
+                            ctx.st,
+                            Some(ctx.type_layouts),
+                        )
                     });
                     let pointer_mask = first_procedure_lookup(&abi_lookup_keys, |k| {
                         callee_pointer_arg_mask(ctx.st, k)
@@ -6196,8 +6214,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                          -> MaterializedCallArg {
                                     let mut character_len = None;
                                     let mut owned_character_bases = Vec::new();
+                                    // A plain unresolved external has an
+                                    // implicit interface and receives array
+                                    // storage, even when ARMFORTAS internally
+                                    // heap-backs that storage with a descriptor.
+                                    // Retain the descriptor inference only for
+                                    // indirect procedure-pointer calls.
                                     let wants_descriptor = (mask_wants_descriptor
-                                        || (desc_mask.is_none()
+                                        || (procptr_target.is_some()
+                                            && desc_mask.is_none()
                                             && actual_is_descriptor_backed(
                                                 &ctx.locals,
                                                 e,
@@ -6407,7 +6432,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         call_arg_character_temps
                                             .extend(lowered.owned_character_bases.iter().copied());
                                         let wants_descriptor = (mask_wants_descriptor
-                                            || (desc_mask.is_none()
+                                            || (procptr_target.is_some()
+                                                && desc_mask.is_none()
                                                 && actual_is_descriptor_backed(
                                                     &ctx.locals,
                                                     arg_expr,
@@ -10200,6 +10226,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 explicit_dtio_edits.as_deref(),
                 dtio_iostat_addr,
                 dtio_iomsg,
+                (read_iomsg_ptr, read_iomsg_len),
             ) {
                 finish_external_read_positioning(b, positioning_done);
                 lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
