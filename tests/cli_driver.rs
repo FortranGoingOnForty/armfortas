@@ -64617,3 +64617,163 @@ end program
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn rank1_multi_array_reductions_avoid_temporaries() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank1_multi_array_reductions_avoid_temporaries count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let src = write_program(
+        r#"module multi_array_reduction_m
+  implicit none
+contains
+  function distance(x, xbase, xpt, k) result(value)
+    real(8), intent(in) :: x(:), xbase(:), xpt(:, :)
+    integer, value :: k
+    real(8) :: value
+    value = sum((x - (xbase + xpt(:, k)))**2)
+  end function
+
+  function distinct_bounds(a, b) result(value)
+    real(8), intent(in) :: a(-1:2), b(4:7)
+    real(8) :: value
+    value = sum((a - b)**2)
+  end function
+
+  function reversed_column(a, matrix, k) result(value)
+    real(8), intent(in) :: a(:), matrix(:, :)
+    integer, value :: k
+    real(8) :: value
+    value = sum((a - matrix(4:1:-1, k))**2)
+  end function
+
+  function volatile_fallback(a, b) result(value)
+    real(8), intent(in), volatile :: a(:)
+    real(8), intent(in) :: b(:)
+    real(8) :: value
+    value = sum((a - b)**2)
+  end function
+
+  function two_section_fallback(matrix) result(value)
+    real(8), intent(in) :: matrix(:, :)
+    real(8) :: value
+    value = sum((matrix(1:3, 1) - matrix(1:3, 2))**2)
+  end function
+end module
+
+program p
+  use multi_array_reduction_m
+  implicit none
+  real(8) :: x(3), xbase(3), xpt(3, 2)
+  real(8) :: a(-1:2), b(4:7), reverse_matrix(4, 1)
+
+  x = [5.0_8, 7.0_8, 11.0_8]
+  xbase = [1.0_8, 2.0_8, 3.0_8]
+  xpt = reshape([9.0_8, 9.0_8, 9.0_8, 2.0_8, 1.0_8, 4.0_8], [3, 2])
+  if (distance(x, xbase, xpt, 2) /= 36.0_8) error stop 1
+
+  a = [1.0_8, 2.0_8, 3.0_8, 4.0_8]
+  b = [4.0_8, 3.0_8, 2.0_8, 1.0_8]
+  if (distinct_bounds(a, b) /= 20.0_8) error stop 2
+
+  reverse_matrix(:, 1) = [4.0_8, 3.0_8, 2.0_8, 1.0_8]
+  if (reversed_column(a, reverse_matrix, 1) /= 0.0_8) error stop 3
+  if (volatile_fallback(a, b) /= 20.0_8) error stop 4
+  if (two_section_fallback(xpt) /= 138.0_8) error stop 5
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+
+    let ir = unique_path("rank1_multi_array_reductions", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "-O3",
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("rank-one multi-array reduction IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "rank-one multi-array reduction IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read multi-array reduction IR");
+    let function_ir = |name: &str| {
+        let marker = format!("func @afs_modproc_multi_array_reduction_m_{}", name);
+        ir_text
+            .split_once(&marker)
+            .map(|(_, rest)| rest.split("\n  func @").next().unwrap_or(rest))
+            .unwrap_or_else(|| panic!("missing {} IR", name))
+    };
+    for name in ["distance", "distinct_bounds", "reversed_column"] {
+        let body = function_ir(name);
+        assert!(
+            body.contains("direct_sum_check"),
+            "{} should use a direct rank-one reduction:\n{}",
+            name,
+            body
+        );
+        assert!(
+            !body.contains("call @afs_allocate_like"),
+            "{} should not allocate array-expression temporaries:\n{}",
+            name,
+            body
+        );
+    }
+    assert_eq!(
+        function_ir("distance")
+            .matches("call @afs_create_section(")
+            .count(),
+        1,
+        "the PRIMA-shaped column section should be evaluated exactly once"
+    );
+    for name in ["volatile_fallback", "two_section_fallback"] {
+        let body = function_ir(name);
+        assert!(
+            !body.contains("direct_sum_check"),
+            "{} must retain ordinary lowering:\n{}",
+            name,
+            body
+        );
+        assert!(
+            body.contains("call @afs_allocate_like_with_elem_size("),
+            "{} should retain materialized array temporaries:\n{}",
+            name,
+            body
+        );
+    }
+
+    let out = unique_path("rank1_multi_array_reductions", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O3", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-one multi-array reduction compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-one multi-array reduction compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-one multi-array reduction binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "rank-one multi-array reduction failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
