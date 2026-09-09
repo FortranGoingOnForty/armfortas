@@ -1505,6 +1505,26 @@ impl<'a> Parser<'a> {
             let nested_do_shares_terminator =
                 !is_terminator && self.current_stmt_is_do_with_terminating_label(label);
 
+            if is_terminator && self.current_labeled_do_terminator_is_end_do(label) {
+                let start = self.current_span();
+                self.advance(); // terminating label
+                let inner_start = self.current_span();
+                self.consume_end("do")?;
+                let inner_span = span_from_to(inner_start, self.prev_span());
+                let span = span_from_to(start, self.prev_span());
+                body.push(Spanned::new(
+                    Stmt::Labeled {
+                        label,
+                        // A labeled END DO is the loop-tail branch target. Represent it
+                        // as a labeled no-op so normal fall-through and GO TO both reach
+                        // the increment edge supplied by DO lowering.
+                        stmt: Box::new(Spanned::new(Stmt::Continue { label: None }, inner_span)),
+                    },
+                    span,
+                ));
+                break;
+            }
+
             let mut stmt = self.parse_stmt()?;
             if nested_do_shares_terminator {
                 Self::mark_shared_labeled_do(&mut stmt);
@@ -1515,6 +1535,30 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(body)
+    }
+
+    fn current_labeled_do_terminator_is_end_do(&self, label: u64) -> bool {
+        let Some(label_token) = self.tokens.get(self.pos) else {
+            return false;
+        };
+        if label_token.kind != TokenKind::IntegerLiteral
+            || label_token.text.parse::<u64>().ok() != Some(label)
+        {
+            return false;
+        }
+
+        let Some(end_token) = self.tokens.get(self.pos + 1) else {
+            return false;
+        };
+        if end_token.text.eq_ignore_ascii_case("enddo") {
+            return self.at_stmt_end_after(2);
+        }
+        end_token.text.eq_ignore_ascii_case("end")
+            && self
+                .tokens
+                .get(self.pos + 2)
+                .is_some_and(|token| token.text.eq_ignore_ascii_case("do"))
+            && self.at_stmt_end_after(3)
     }
 
     fn current_stmt_is_do_with_terminating_label(&self, label: u64) -> bool {
@@ -2186,6 +2230,33 @@ mod tests {
         } else {
             panic!("not DoLoop");
         }
+    }
+
+    #[test]
+    fn do_with_terminating_label_on_end_do() {
+        let s = parse_one("do 20 j = 1, 2\n  do 10 i = 1, 3\n    x = x + 1\n10 end do\n20 enddo\n");
+        let Stmt::DoLoop {
+            body: outer_body, ..
+        } = &s.node
+        else {
+            panic!("not outer DoLoop");
+        };
+        let Stmt::DoLoop {
+            body: inner_body, ..
+        } = &outer_body[0].node
+        else {
+            panic!("not inner DoLoop");
+        };
+        assert!(matches!(
+            inner_body.last().map(|stmt| &stmt.node),
+            Some(Stmt::Labeled { label: 10, stmt })
+                if matches!(stmt.node, Stmt::Continue { label: None })
+        ));
+        assert!(matches!(
+            outer_body.last().map(|stmt| &stmt.node),
+            Some(Stmt::Labeled { label: 20, stmt })
+                if matches!(stmt.node, Stmt::Continue { label: None })
+        ));
     }
 
     #[test]
