@@ -797,6 +797,16 @@ fn lex_fixed_ident_or_keyword(
     let run = &text[pos..run_end];
     let run_lower = run.to_lowercase();
 
+    // Fixed-form whitespace removal joins parenthesized DO keywords. Keep an
+    // array or statement-function assignment such as `DOWHILE(I)=...` intact.
+    if matches!(run_lower.as_str(), "dowhile" | "doconcurrent")
+        && text.as_bytes().get(run_end) == Some(&b'(')
+        && at_fixed_action_statement_start(prior_tokens)
+        && !identifier_precedes_assignment(text, run_end)
+    {
+        return make_ident_token(&run[..2], pos, file_id, line);
+    }
+
     // DO/assignment ambiguity: the optional termination label may be absent, so
     // both `DO10I=1,10` and `DOI=1,10` must expose `DO` as a separate token.
     // A top-level comma after `=` distinguishes them from assignments such as
@@ -2406,6 +2416,26 @@ C     Hello World
         assert_eq!(
             fixed_texts("      DO I = 2,N\n"),
             ["DO", "I", "=", "2", ",", "N"]
+        );
+    }
+
+    #[test]
+    fn parenthesized_do_keywords_split_after_whitespace_removal() {
+        assert_eq!(
+            fixed_texts("      DO WHILE (MORE)\n"),
+            ["DO", "WHILE", "(", "MORE", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      DO CONCURRENT (I=1:N)\n"),
+            ["DO", "CONCURRENT", "(", "I", "=", "1", ":", "N", ")"]
+        );
+    }
+
+    #[test]
+    fn parenthesized_do_prefixed_assignment_stays_an_identifier() {
+        assert_eq!(
+            fixed_texts("      DOWHILE(I) = 1\n"),
+            ["DOWHILE", "(", "I", ")", "=", "1"]
         );
     }
 

@@ -4054,6 +4054,49 @@ fn fixed_form_unlabeled_do_compiles_and_runs() {
 }
 
 #[test]
+fn fixed_form_do_while_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_do_while_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER I, S\n      I = 0\n      S = 0\n      DO WHILE (I .LT. 3)\n         I = I + 1\n         S = S + I\n      END DO\n      PRINT *, S\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_do_while", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DO WHILE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DO WHILE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DO WHILE run failed");
+    assert!(
+        run.status.success(),
+        "fixed-form DO WHILE run failed: {:?}",
+        run.status
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('6'),
+        "unexpected fixed-form DO WHILE output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_inline_comments_preserve_later_continuations() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
