@@ -1137,19 +1137,7 @@ pub(crate) fn lower_expr_full(
                         let bc = b.fmul(im_l, re_r);
                         (b.fsub(ac, bd), b.fadd(ad, bc))
                     }
-                    BinaryOp::Div => {
-                        // (a+bi)/(c+di) = ((ac+bd)/(c^2+d^2), (bc-ad)/(c^2+d^2))
-                        let rr = b.fmul(re_r, re_r);
-                        let ii = b.fmul(im_r, im_r);
-                        let denom = b.fadd(rr, ii);
-                        let ac = b.fmul(re_l, re_r);
-                        let bd = b.fmul(im_l, im_r);
-                        let bc = b.fmul(im_l, re_r);
-                        let ad = b.fmul(re_l, im_r);
-                        let real_num = b.fadd(ac, bd);
-                        let imag_num = b.fsub(bc, ad);
-                        (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
-                    }
+                    BinaryOp::Div => lower_complex_div_lanes(b, fw, re_l, im_l, re_r, im_r),
                     BinaryOp::Pow if matches!(rty, IrType::Int(_)) => {
                         lower_complex_integer_pow_lanes(b, fw, re_l, im_l, rhs)
                     }

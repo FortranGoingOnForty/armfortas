@@ -27795,6 +27795,36 @@ pub(super) fn materialize_complex_operand(
     buf
 }
 
+pub(super) fn lower_complex_div_lanes(
+    b: &mut FuncBuilder,
+    fw: FloatWidth,
+    lhs_re: ValueId,
+    lhs_im: ValueId,
+    rhs_re: ValueId,
+    rhs_im: ValueId,
+) -> (ValueId, ValueId) {
+    let lane_ty = IrType::Float(fw);
+    let lane_bytes = b.const_i64(if fw == FloatWidth::F64 { 8 } else { 4 });
+    let zero = b.const_i64(0);
+    let result = b.alloca(IrType::Array(Box::new(lane_ty.clone()), 2));
+    let helper = if fw == FloatWidth::F64 {
+        "afs_complex_div_c8"
+    } else {
+        "afs_complex_div_c4"
+    };
+    b.call(
+        FuncRef::External(helper.into()),
+        vec![result, lhs_re, lhs_im, rhs_re, rhs_im],
+        IrType::Void,
+    );
+    let real_ptr = b.gep(result, vec![zero], IrType::Int(IntWidth::I8));
+    let imaginary_ptr = b.gep(result, vec![lane_bytes], IrType::Int(IntWidth::I8));
+    (
+        b.load_typed(real_ptr, lane_ty.clone()),
+        b.load_typed(imaginary_ptr, lane_ty),
+    )
+}
+
 pub(super) fn lower_complex_pow_lanes(
     b: &mut FuncBuilder,
     fw: FloatWidth,
@@ -27953,12 +27983,7 @@ pub(super) fn lower_complex_integer_pow_lanes(
 
     b.set_block(bb_negative);
     let neg_order = b.isub(zero_i32, order_i32);
-    let re_sq = b.fmul(base_re, base_re);
-    let im_sq = b.fmul(base_im, base_im);
-    let denom = b.fadd(re_sq, im_sq);
-    let inv_re = b.fdiv(base_re, denom);
-    let neg_im = b.fsub(zero_f, base_im);
-    let inv_im = b.fdiv(neg_im, denom);
+    let (inv_re, inv_im) = lower_complex_div_lanes(b, fw, one_f, zero_f, base_re, base_im);
     b.store(inv_re, base_re_addr);
     b.store(inv_im, base_im_addr);
     b.store(neg_order, counter_addr);
@@ -50159,66 +50184,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                     contained_host_refs,
                     descriptor_params,
                 );
-                let order_i32 = match b.func().value_type(order_raw) {
-                    Some(IrType::Int(IntWidth::I64)) => b.int_trunc(order_raw, IntWidth::I32),
-                    _ => coerce_to_type(b, order_raw, &IrType::Int(IntWidth::I32)),
-                };
-                let zero_i32 = b.const_i32(0);
-                let one_f = match fw {
-                    FloatWidth::F64 => b.const_f64(1.0),
-                    FloatWidth::F32 => b.const_f32(1.0),
-                };
-                let zero_f = match fw {
-                    FloatWidth::F64 => b.const_f64(0.0),
-                    FloatWidth::F32 => b.const_f32(0.0),
-                };
-                let neg = b.icmp(CmpOp::Lt, order_i32, zero_i32);
-                let neg_order = b.isub(zero_i32, order_i32);
-                let abs_order = b.select(neg, neg_order, order_i32);
-                let re_sq = b.fmul(re_l, re_l);
-                let im_sq = b.fmul(im_l, im_l);
-                let denom = b.fadd(re_sq, im_sq);
-                let inv_re = b.fdiv(re_l, denom);
-                let neg_im = b.fsub(zero_f, im_l);
-                let inv_im = b.fdiv(neg_im, denom);
-                let base_re = b.select(neg, inv_re, re_l);
-                let base_im = b.select(neg, inv_im, im_l);
-
-                let res_re_addr = b.alloca(lane_ty.clone());
-                let res_im_addr = b.alloca(lane_ty.clone());
-                b.store(one_f, res_re_addr);
-                b.store(zero_f, res_im_addr);
-                let counter_addr = b.alloca(IrType::Int(IntWidth::I32));
-                b.store(abs_order, counter_addr);
-
-                let bb_pow_check = b.create_block("complex_pow_check");
-                let bb_pow_body = b.create_block("complex_pow_body");
-                let bb_pow_exit = b.create_block("complex_pow_exit");
-                b.branch(bb_pow_check, vec![]);
-
-                b.set_block(bb_pow_check);
-                let counter = b.load(counter_addr);
-                let still_pos = b.icmp(CmpOp::Gt, counter, zero_i32);
-                b.cond_branch(still_pos, bb_pow_body, vec![], bb_pow_exit, vec![]);
-
-                b.set_block(bb_pow_body);
-                let cur_re = b.load(res_re_addr);
-                let cur_im = b.load(res_im_addr);
-                let ac = b.fmul(cur_re, base_re);
-                let bd = b.fmul(cur_im, base_im);
-                let ad = b.fmul(cur_re, base_im);
-                let bc = b.fmul(cur_im, base_re);
-                let new_re = b.fsub(ac, bd);
-                let new_im = b.fadd(ad, bc);
-                b.store(new_re, res_re_addr);
-                b.store(new_im, res_im_addr);
-                let one_i32 = b.const_i32(1);
-                let dec = b.isub(counter, one_i32);
-                b.store(dec, counter_addr);
-                b.branch(bb_pow_check, vec![]);
-
-                b.set_block(bb_pow_exit);
-                (b.load(res_re_addr), b.load(res_im_addr))
+                lower_complex_integer_pow_lanes(b, fw, re_l, im_l, order_raw)
             } else {
                 let (re_r, im_r) = load_lanes(b, rhs.as_ref(), rhs_elem_rank, right);
                 lower_complex_pow_lanes(b, fw, re_l, im_l, re_r, im_r)
@@ -50235,18 +50201,7 @@ pub(super) fn lower_rank1_numeric_array_binary_descriptor(
                     let bc = b.fmul(im_l, re_r);
                     (b.fsub(ac, bd), b.fadd(ad, bc))
                 }
-                BinaryOp::Div => {
-                    let rr = b.fmul(re_r, re_r);
-                    let ii = b.fmul(im_r, im_r);
-                    let denom = b.fadd(rr, ii);
-                    let ac = b.fmul(re_l, re_r);
-                    let bd = b.fmul(im_l, im_r);
-                    let bc = b.fmul(im_l, re_r);
-                    let ad = b.fmul(re_l, im_r);
-                    let real_num = b.fadd(ac, bd);
-                    let imag_num = b.fsub(bc, ad);
-                    (b.fdiv(real_num, denom), b.fdiv(imag_num, denom))
-                }
+                BinaryOp::Div => lower_complex_div_lanes(b, fw, re_l, im_l, re_r, im_r),
                 _ => unreachable!("unsupported complex array op"),
             }
         };
