@@ -2819,6 +2819,15 @@ pub(crate) fn lower_expr_full(
                 let callee_char_len_star_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
                         callee_char_len_star_mask(st, k)
+                    })
+                    .or_else(|| {
+                        implicit_interface_character_arg_mask(
+                            b,
+                            locals,
+                            &arg_slots,
+                            st,
+                            type_layouts,
+                        )
                     });
                 let callee_pointer_args =
                     first_resolved_procedure_lookup(st, &abi_lookup_keys, |k| {
@@ -3487,6 +3496,16 @@ pub(crate) fn lower_expr_full(
                                         st,
                                         formal_skip,
                                     );
+                                    let callee_char_len_star_args = callee_char_len_star_args
+                                        .or_else(|| {
+                                            implicit_interface_character_arg_mask(
+                                                b,
+                                                locals,
+                                                &arg_slots,
+                                                st,
+                                                type_layouts,
+                                            )
+                                        });
                                     let mut arg_vals: Vec<ValueId> = Vec::with_capacity(
                                         arg_slots.len() + hidden_result.is_some() as usize,
                                     );

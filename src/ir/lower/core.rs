@@ -25503,6 +25503,36 @@ pub(super) fn callee_char_len_star_mask(st: &SymbolTable, callee_name: &str) -> 
     Some(mask)
 }
 
+/// Infer the trailing CHARACTER-length ABI for a call whose procedure
+/// interface is unavailable in this compilation.  Legacy external calls do
+/// not carry dummy metadata, but the caller still knows which actual
+/// arguments are CHARACTER and must pass their lengths for a separately
+/// compiled `character*(*)` dummy.  Callers must use this only after concrete
+/// procedure lookup returned `None`; a resolved all-false mask is meaningful.
+pub(super) fn implicit_interface_character_arg_mask(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    arg_slots: &[Option<crate::ast::expr::Argument>],
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> Option<Vec<bool>> {
+    let mut has_character_actual = false;
+    let mask = arg_slots
+        .iter()
+        .map(|slot| {
+            let is_character = slot.as_ref().is_some_and(|arg| match &arg.value {
+                crate::ast::expr::SectionSubscript::Element(expr) => {
+                    expr_is_character_expr(b, locals, expr, st, type_layouts)
+                }
+                crate::ast::expr::SectionSubscript::Range { .. } => false,
+            });
+            has_character_actual |= is_character;
+            is_character
+        })
+        .collect::<Vec<_>>();
+    has_character_actual.then_some(mask)
+}
+
 /// Check if a callee has deferred-length allocatable/pointer character dummies
 /// that are passed via StringDescriptor pointers.
 pub(super) fn callee_string_descriptor_arg_mask(

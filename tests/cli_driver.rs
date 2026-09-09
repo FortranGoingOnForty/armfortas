@@ -6736,6 +6736,76 @@ fn assumed_length_character_dummy_keeps_hidden_length_abi() {
 }
 
 #[test]
+fn implicit_interface_character_actuals_keep_hidden_lengths_across_objects() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_interface_character_actuals_keep_hidden_lengths_across_objects count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Netlib callers commonly have only `LOGICAL F; EXTERNAL F`, while the
+    // separately compiled definition declares CHARACTER*(*) dummies.  With
+    // no explicit interface the caller must still pass trailing character
+    // lengths according to the Fortran calling convention.
+    let dir = unique_dir("implicit_interface_character_lengths");
+    let callee = write_program_in(
+        &dir,
+        "callee.f",
+        "      LOGICAL FUNCTION SAME3(N,A,B)\n      INTEGER N,I\n      CHARACTER*(*) A,B\n      SAME3 = .FALSE.\n      IF (LEN(A).NE.N .OR. LEN(B).NE.N) RETURN\n      DO 10 I=1,N\n        IF (A(I:I).NE.B(I:I)) RETURN\n   10 CONTINUE\n      SAME3 = .TRUE.\n      RETURN\n      END\n      SUBROUTINE NAMELEN(NAME,N)\n      CHARACTER*(*) NAME\n      INTEGER N\n      N = LEN(NAME)\n      RETURN\n      END\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f",
+        "      PROGRAM P\n      LOGICAL SAME3\n      EXTERNAL SAME3\n      CHARACTER*3 PATH\n      INTEGER N,SCORE\n      PATH = 'SEP'\n      SCORE = 0\n      IF (SAME3(3,PATH,'SEP')) THEN\n        SCORE = SCORE + 1\n      END IF\n      CALL NAMELEN('DTRSYL',N)\n      IF (N.EQ.6) THEN\n        SCORE = SCORE + 2\n      END IF\n      PRINT *, SCORE\n      END\n",
+    );
+    let callee_obj = dir.join("callee.o");
+    let caller_obj = dir.join("caller.o");
+    let out = dir.join("p");
+
+    for (src, obj) in [(&callee, &callee_obj), (&caller, &caller_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .output()
+            .expect("implicit-interface character compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "implicit-interface character compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            caller_obj.to_str().unwrap(),
+            callee_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("implicit-interface character link failed to spawn");
+    assert!(
+        link.status.success(),
+        "implicit-interface character link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("implicit-interface character run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("3"),
+        "implicit-interface character run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn entity_star_assumed_length_uses_hidden_length_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
