@@ -2524,6 +2524,70 @@ mod tests {
         desc
     }
 
+    #[test]
+    fn complex4_elementals_walk_positive_stride_sections() {
+        let mut data = [[99.0_f32, 99.0_f32]; 7];
+        data[0] = [1.0, 1.0];
+        data[3] = [2.0, -1.0];
+        data[6] = [-1.0, 2.0];
+        let source = strided_descriptor(&mut data, 0, &[3], &[3]);
+        let mut conjugate = ArrayDescriptor::zeroed();
+        let mut imaginary = ArrayDescriptor::zeroed();
+        let mut magnitude = ArrayDescriptor::zeroed();
+
+        afs_array_conjg(&source, &mut conjugate);
+        afs_array_aimag(&source, &mut imaginary);
+        afs_array_abs_complex(&source, &mut magnitude);
+
+        unsafe {
+            let conjugate_values =
+                std::slice::from_raw_parts(conjugate.base_addr as *const [f32; 2], 3);
+            let imaginary_values = std::slice::from_raw_parts(imaginary.base_addr as *const f32, 3);
+            let magnitude_values = std::slice::from_raw_parts(magnitude.base_addr as *const f32, 3);
+            assert_eq!(conjugate_values, &[[1.0, -1.0], [2.0, 1.0], [-1.0, -2.0]]);
+            assert_eq!(imaginary_values, &[1.0, -1.0, 2.0]);
+            assert!((magnitude_values[0] - 2.0_f32.sqrt()).abs() < 1.0e-6);
+            assert!((magnitude_values[1] - 5.0_f32.sqrt()).abs() < 1.0e-6);
+            assert!((magnitude_values[2] - 5.0_f32.sqrt()).abs() < 1.0e-6);
+        }
+
+        afs_deallocate_array(&mut conjugate, ptr::null_mut());
+        afs_deallocate_array(&mut imaginary, ptr::null_mut());
+        afs_deallocate_array(&mut magnitude, ptr::null_mut());
+    }
+
+    #[test]
+    fn complex8_elementals_walk_negative_stride_sections() {
+        let mut data = [[99.0_f64, 99.0_f64]; 7];
+        data[0] = [1.0, 1.0];
+        data[3] = [2.0, -1.0];
+        data[6] = [-1.0, 2.0];
+        let source = strided_descriptor(&mut data, 6, &[3], &[-3]);
+        let mut conjugate = ArrayDescriptor::zeroed();
+        let mut imaginary = ArrayDescriptor::zeroed();
+        let mut magnitude = ArrayDescriptor::zeroed();
+
+        afs_array_conjg(&source, &mut conjugate);
+        afs_array_aimag(&source, &mut imaginary);
+        afs_array_abs_complex(&source, &mut magnitude);
+
+        unsafe {
+            let conjugate_values =
+                std::slice::from_raw_parts(conjugate.base_addr as *const [f64; 2], 3);
+            let imaginary_values = std::slice::from_raw_parts(imaginary.base_addr as *const f64, 3);
+            let magnitude_values = std::slice::from_raw_parts(magnitude.base_addr as *const f64, 3);
+            assert_eq!(conjugate_values, &[[-1.0, -2.0], [2.0, 1.0], [1.0, -1.0]]);
+            assert_eq!(imaginary_values, &[2.0, -1.0, 1.0]);
+            assert!((magnitude_values[0] - 5.0_f64.sqrt()).abs() < 1.0e-12);
+            assert!((magnitude_values[1] - 5.0_f64.sqrt()).abs() < 1.0e-12);
+            assert!((magnitude_values[2] - 2.0_f64.sqrt()).abs() < 1.0e-12);
+        }
+
+        afs_deallocate_array(&mut conjugate, ptr::null_mut());
+        afs_deallocate_array(&mut imaginary, ptr::null_mut());
+        afs_deallocate_array(&mut magnitude, ptr::null_mut());
+    }
+
     fn assert_rank_two_scalar_reductions(
         real8: &ArrayDescriptor,
         real4: &ArrayDescriptor,
@@ -8344,39 +8408,44 @@ pub extern "C" fn afs_array_conjg(source: *const ArrayDescriptor, result: *mut A
     let res = unsafe { &mut *result };
     let elem_size = src.elem_size.max(1) as usize;
     let lane = elem_size / 2;
-    let total = src.total_elements() as usize;
     let sp = src.base_addr as *const u8;
     let rp = res.base_addr;
+    let mut dst_index = 0usize;
     if elem_size == 8 {
         // complex(sp): two f32 lanes per element
-        for i in 0..total {
-            let off = i * 8;
+        for_each_element_byte_offset(src, |src_off| {
+            let dst_off = dst_index * 8;
             unsafe {
-                let re = *(sp.add(off) as *const f32);
-                let im = *(sp.add(off + lane) as *const f32);
-                *(rp.add(off) as *mut f32) = re;
-                *(rp.add(off + lane) as *mut f32) = -im;
+                let src_elem = sp.offset(src_off);
+                let re = *(src_elem as *const f32);
+                let im = *(src_elem.add(lane) as *const f32);
+                *(rp.add(dst_off) as *mut f32) = re;
+                *(rp.add(dst_off + lane) as *mut f32) = -im;
             }
-        }
+            dst_index += 1;
+        });
     } else if elem_size == 16 {
         // complex(dp): two f64 lanes per element
-        for i in 0..total {
-            let off = i * 16;
+        for_each_element_byte_offset(src, |src_off| {
+            let dst_off = dst_index * 16;
             unsafe {
-                let re = *(sp.add(off) as *const f64);
-                let im = *(sp.add(off + lane) as *const f64);
-                *(rp.add(off) as *mut f64) = re;
-                *(rp.add(off + lane) as *mut f64) = -im;
+                let src_elem = sp.offset(src_off);
+                let re = *(src_elem as *const f64);
+                let im = *(src_elem.add(lane) as *const f64);
+                *(rp.add(dst_off) as *mut f64) = re;
+                *(rp.add(dst_off + lane) as *mut f64) = -im;
             }
-        }
+            dst_index += 1;
+        });
     } else {
         // Non-complex element width: byte-copy (degenerates to identity).
-        for i in 0..total {
-            let off = i * elem_size;
+        for_each_element_byte_offset(src, |src_off| {
+            let dst_off = dst_index * elem_size;
             unsafe {
-                core::ptr::copy_nonoverlapping(sp.add(off), rp.add(off), elem_size);
+                core::ptr::copy_nonoverlapping(sp.offset(src_off), rp.add(dst_off), elem_size);
             }
-        }
+            dst_index += 1;
+        });
     }
 }
 
@@ -8412,23 +8481,25 @@ pub extern "C" fn afs_array_aimag(source: *const ArrayDescriptor, result: *mut A
     afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
 
     let res = unsafe { &mut *result };
-    let total = src.total_elements() as usize;
     let sp_buf = src.base_addr as *const u8;
     let rp_buf = res.base_addr;
+    let mut dst_index = 0usize;
     if elem_size == 8 {
-        for i in 0..total {
+        for_each_element_byte_offset(src, |src_off| {
             unsafe {
-                let im = *(sp_buf.add(i * 8 + 4) as *const f32);
-                *(rp_buf.add(i * 4) as *mut f32) = im;
+                let im = *(sp_buf.offset(src_off).add(4) as *const f32);
+                *(rp_buf.add(dst_index * 4) as *mut f32) = im;
             }
-        }
+            dst_index += 1;
+        });
     } else if elem_size == 16 {
-        for i in 0..total {
+        for_each_element_byte_offset(src, |src_off| {
             unsafe {
-                let im = *(sp_buf.add(i * 16 + 8) as *const f64);
-                *(rp_buf.add(i * 8) as *mut f64) = im;
+                let im = *(sp_buf.offset(src_off).add(8) as *const f64);
+                *(rp_buf.add(dst_index * 8) as *mut f64) = im;
             }
-        }
+            dst_index += 1;
+        });
     }
 }
 
@@ -8466,25 +8537,29 @@ pub extern "C" fn afs_array_abs_complex(
     afs_allocate_array(result, lane as i64, src.rank, dims_ptr, ptr::null_mut());
 
     let res = unsafe { &mut *result };
-    let total = src.total_elements() as usize;
     let sp_buf = src.base_addr as *const u8;
     let rp_buf = res.base_addr;
+    let mut dst_index = 0usize;
     if elem_size == 8 {
-        for i in 0..total {
+        for_each_element_byte_offset(src, |src_off| {
             unsafe {
-                let re = *(sp_buf.add(i * 8) as *const f32);
-                let im = *(sp_buf.add(i * 8 + 4) as *const f32);
-                *(rp_buf.add(i * 4) as *mut f32) = re.hypot(im);
+                let src_elem = sp_buf.offset(src_off);
+                let re = *(src_elem as *const f32);
+                let im = *(src_elem.add(4) as *const f32);
+                *(rp_buf.add(dst_index * 4) as *mut f32) = re.hypot(im);
             }
-        }
+            dst_index += 1;
+        });
     } else if elem_size == 16 {
-        for i in 0..total {
+        for_each_element_byte_offset(src, |src_off| {
             unsafe {
-                let re = *(sp_buf.add(i * 16) as *const f64);
-                let im = *(sp_buf.add(i * 16 + 8) as *const f64);
-                *(rp_buf.add(i * 8) as *mut f64) = re.hypot(im);
+                let src_elem = sp_buf.offset(src_off);
+                let re = *(src_elem as *const f64);
+                let im = *(src_elem.add(8) as *const f64);
+                *(rp_buf.add(dst_index * 8) as *mut f64) = re.hypot(im);
             }
-        }
+            dst_index += 1;
+        });
     }
 }
 

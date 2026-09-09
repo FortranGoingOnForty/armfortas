@@ -40936,6 +40936,90 @@ end program
 }
 
 #[test]
+fn complex_array_elementals_follow_strided_sections() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_array_elementals_follow_strided_sections count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+program main
+  use, intrinsic :: iso_fortran_env, only: real32, real64
+  implicit none
+  complex(real32) :: q4(3, 3), c4(3), a4(5, 2)
+  complex(real64) :: q8(3, 3), c8(3)
+  real(real32) :: i4(3), m4(3)
+  real(real64) :: i8(3), m8(3)
+
+  q4 = cmplx(99.0_real32, 99.0_real32, kind=real32)
+  q4(1, 1) = cmplx(1.0_real32, 1.0_real32, kind=real32)
+  q4(1, 2) = cmplx(2.0_real32, -1.0_real32, kind=real32)
+  q4(1, 3) = cmplx(-1.0_real32, 2.0_real32, kind=real32)
+  c4 = conjg(q4(1, 1:3))
+  i4 = aimag(q4(1, 1:3))
+  m4 = abs(q4(1, 1:3))
+  if (abs(c4(2) - cmplx(2.0_real32, 1.0_real32, kind=real32)) > 1.0e-6_real32) error stop 11
+  if (abs(c4(3) - cmplx(-1.0_real32, -2.0_real32, kind=real32)) > 1.0e-6_real32) error stop 12
+  if (abs(i4(2) + 1.0_real32) > 1.0e-6_real32) error stop 13
+  if (abs(m4(3) - sqrt(5.0_real32)) > 1.0e-6_real32) error stop 14
+
+  a4 = cmplx(0.0_real32, 0.0_real32, kind=real32)
+  a4(3, 2) = cmplx(2.0_real32, 3.0_real32, kind=real32)
+  a4(3:5, 2) = a4(3, 2)*conjg(q4(1, 1:3))
+  if (abs(a4(4, 2) - cmplx(1.0_real32, 8.0_real32, kind=real32)) > 1.0e-5_real32) error stop 15
+  if (abs(a4(5, 2) - cmplx(4.0_real32, -7.0_real32, kind=real32)) > 1.0e-5_real32) error stop 16
+
+  q8 = cmplx(99.0_real64, 99.0_real64, kind=real64)
+  q8(1, 1) = cmplx(1.0_real64, 1.0_real64, kind=real64)
+  q8(1, 2) = cmplx(2.0_real64, -1.0_real64, kind=real64)
+  q8(1, 3) = cmplx(-1.0_real64, 2.0_real64, kind=real64)
+  c8 = conjg(q8(1, 3:1:-1))
+  i8 = aimag(q8(1, 3:1:-1))
+  m8 = abs(q8(1, 3:1:-1))
+  if (abs(c8(1) - cmplx(-1.0_real64, -2.0_real64, kind=real64)) > 1.0e-12_real64) error stop 21
+  if (abs(c8(3) - cmplx(1.0_real64, -1.0_real64, kind=real64)) > 1.0e-12_real64) error stop 22
+  if (abs(i8(2) + 1.0_real64) > 1.0e-12_real64) error stop 23
+  if (abs(m8(3) - sqrt(2.0_real64)) > 1.0e-12_real64) error stop 24
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_array_elementals_strided", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O0", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("strided complex elemental compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "strided complex elemental program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("strided complex elemental run failed");
+    assert!(
+        run.status.success(),
+        "strided complex elemental runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected strided complex elemental output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_division_avoids_intermediate_overflow_and_underflow() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
