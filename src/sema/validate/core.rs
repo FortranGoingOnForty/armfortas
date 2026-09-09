@@ -11014,7 +11014,10 @@ impl IntrinsicArgumentType {
             (Self::Character, TypeInfo::Character { .. })
                 | (Self::Integer, TypeInfo::Integer { .. })
                 | (Self::Logical, TypeInfo::Logical { .. })
-                | (Self::Real, TypeInfo::Real { .. })
+                | (
+                    Self::Real,
+                    TypeInfo::Real { .. } | TypeInfo::DoublePrecision
+                )
         )
     }
 }
@@ -13828,6 +13831,24 @@ end program
                 "missing {intrinsic} diagnostic: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_double_precision_intrinsic_real_arguments() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  double precision :: x, y
+  integer :: e
+  intrinsic fraction, exponent, scale
+  y = fraction(x)
+  e = exponent(x)
+  y = scale(x, e)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]

@@ -64985,3 +64985,40 @@ fn fixed_form_if_keyword_can_name_assignment_targets() {
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn fixed_form_exponent_accepts_double_precision_argument() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_exponent_accepts_double_precision_argument count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      DOUBLE PRECISION SCALOC, BUF\n      INTRINSIC EXPONENT\n      SCALOC = 0.125D0\n      BUF = 2.D0**EXPONENT(SCALOC)\n      IF (ABS(BUF-0.25D0).GT.1.0D-12) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_double_exponent", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form double EXPONENT compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form double EXPONENT compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form double EXPONENT binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form double EXPONENT run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
