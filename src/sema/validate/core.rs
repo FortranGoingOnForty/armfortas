@@ -10925,7 +10925,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         "atan" | "atand" | "atanpi" | "aint" | "anint" | "nint" | "int" | "real" | "logical"
         | "char" | "ichar" | "achar" | "iachar" | "len" | "len_trim" | "floor" | "ceiling"
         | "maskl" | "maskr" | "shape" | "storage_size" | "associated" | "any" | "all" | "norm2"
-        | "f_c_string" | "iall" | "iany" | "iparity" | "parity" => (1, Some(2)),
+        | "f_c_string" | "iall" | "iany" | "iparity" | "parity" | "dcmplx" => (1, Some(2)),
         "cmplx"
         | "size"
         | "lbound"
@@ -11558,7 +11558,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "selected_logical_kind" |
         "exp" | "log" | "log10" | "sqrt" | "dsqrt" |
         "mod" | "modulo" | "max" | "min" | "sign" | "dim" |
-        "int" | "nint" | "real" | "dble" | "logical" | "cmplx" | "conjg" |
+        "int" | "nint" | "real" | "dble" | "logical" | "cmplx" | "dcmplx" | "conjg" |
         "aimag" | "dimag" | "char" | "ichar" | "achar" | "iachar" |
         "len" | "len_trim" | "trim" | "adjustl" | "adjustr" |
         "index" | "scan" | "verify" | "repeat" | "lge" | "lgt" | "lle" | "llt" |
@@ -13849,6 +13849,38 @@ end program
 ",
         );
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn recognizes_legacy_dcmplx_under_implicit_none() {
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  complex(8) :: z
+  z = dcmplx(1)
+end program
+",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+
+        let errs = errors_from(
+            "\
+program p
+  implicit none
+  complex(8) :: z
+  z = dcmplx()
+  z = dcmplx(1, 2, 3)
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|err| err.contains("intrinsic 'dcmplx' takes"))
+                .count(),
+            2,
+            "{errs:?}"
+        );
     }
 
     #[test]

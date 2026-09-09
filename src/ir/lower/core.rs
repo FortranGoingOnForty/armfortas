@@ -5840,7 +5840,7 @@ pub(super) fn collect_const_array_scalars(
         // the result extent.
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
-                if name.eq_ignore_ascii_case("cmplx") {
+                if matches!(name.to_ascii_lowercase().as_str(), "cmplx" | "dcmplx") {
                     if let Some(values) = collect_const_cmplx_intrinsic(args, elem_ty, param_consts)
                     {
                         return Some(values);
@@ -6325,7 +6325,7 @@ pub(super) fn eval_const_complex_global_init(
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
-            if !name.eq_ignore_ascii_case("cmplx") {
+            if !matches!(name.to_ascii_lowercase().as_str(), "cmplx" | "dcmplx") {
                 return None;
             }
             const_cmplx_arg_exprs(args)?
@@ -8874,7 +8874,15 @@ fn const_array_initializer_len_in_scope(
             };
             if !matches!(
                 name.to_ascii_lowercase().as_str(),
-                "real" | "dble" | "dfloat" | "float" | "int" | "cmplx" | "complex" | "logical"
+                "real"
+                    | "dble"
+                    | "dfloat"
+                    | "float"
+                    | "int"
+                    | "cmplx"
+                    | "dcmplx"
+                    | "complex"
+                    | "logical"
             ) {
                 return None;
             }
@@ -17440,6 +17448,7 @@ pub(super) fn generic_dispatch_probe_value(
                 "dimag",
                 "abs",
                 "cmplx",
+                "dcmplx",
                 "shape",
                 "spread",
                 "unpack",
@@ -19508,6 +19517,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
         "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
         "cmplx" => Some(&["x", "y", "kind"]),
+        "dcmplx" => Some(&["x", "y"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
         "pack" => Some(&["array", "mask", "vector"]),
         "findloc" => Some(&["array", "value", "dim", "mask", "kind", "back"]),
@@ -32125,6 +32135,7 @@ fn constructor_intrinsic_materializes_array(name: &str) -> bool {
             | "minloc"
             | "merge"
             | "cmplx"
+            | "dcmplx"
             | "conjg"
             | "aimag"
             | "dimag"
@@ -47901,6 +47912,7 @@ fn lower_cmplx_array_expr_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     args: &[crate::ast::expr::Argument],
+    forced_lane_bytes: Option<i64>,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     internal_funcs: Option<&HashMap<String, u32>>,
@@ -48018,7 +48030,9 @@ fn lower_cmplx_array_expr_descriptor(
         );
         extract_const_int_from_value(b, kind_val)
     });
-    let out_lane_bytes = kind_lane_bytes.unwrap_or(source_lane_bytes);
+    let out_lane_bytes = forced_lane_bytes
+        .or(kind_lane_bytes)
+        .unwrap_or(source_lane_bytes);
     let out_fw = if out_lane_bytes == 8 {
         FloatWidth::F64
     } else {
@@ -50620,11 +50634,12 @@ pub(super) fn lower_array_expr_descriptor(
                 // / schur_complex examples with an "unhandled coercion
                 // Ptr(Array(F32),2) → Array(F64,2)" warning at the
                 // assignment.
-                if name.eq_ignore_ascii_case("cmplx") {
+                if matches!(name.to_ascii_lowercase().as_str(), "cmplx" | "dcmplx") {
                     if let Some(result) = lower_cmplx_array_expr_descriptor(
                         b,
                         locals,
                         args,
+                        name.eq_ignore_ascii_case("dcmplx").then_some(8),
                         st,
                         type_layouts,
                         internal_funcs,

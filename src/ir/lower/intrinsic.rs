@@ -142,24 +142,28 @@ pub(crate) fn lower_intrinsic(
     args: &[ValueId],
 ) -> Option<ValueId> {
     match name {
-        "cmplx" => {
+        "cmplx" | "dcmplx" => {
             if let Some(real_arg) = args.first() {
-                let kind = args
-                    .get(2)
-                    .and_then(|arg| extract_const_int_from_value(b, *arg))
-                    .unwrap_or_else(|| {
-                        if args.iter().any(|arg| {
-                            let ty = b.func().value_type(*arg);
-                            matches!(ty, Some(IrType::Float(FloatWidth::F64)))
-                                || ty.as_ref().is_some_and(|ty| {
-                                    is_complex_ty(ty) && complex_float_width(ty) == FloatWidth::F64
-                                })
-                        }) {
-                            8
-                        } else {
-                            4
-                        }
-                    });
+                let kind = if name == "dcmplx" {
+                    8
+                } else {
+                    args.get(2)
+                        .and_then(|arg| extract_const_int_from_value(b, *arg))
+                        .unwrap_or_else(|| {
+                            if args.iter().any(|arg| {
+                                let ty = b.func().value_type(*arg);
+                                matches!(ty, Some(IrType::Float(FloatWidth::F64)))
+                                    || ty.as_ref().is_some_and(|ty| {
+                                        is_complex_ty(ty)
+                                            && complex_float_width(ty) == FloatWidth::F64
+                                    })
+                            }) {
+                                8
+                            } else {
+                                4
+                            }
+                        })
+                };
                 let fw = if kind == 8 {
                     FloatWidth::F64
                 } else {

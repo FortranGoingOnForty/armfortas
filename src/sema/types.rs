@@ -1343,6 +1343,7 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "real"
             | "dble"
             | "cmplx"
+            | "dcmplx"
             | "logical"
             | "conjg"
             | "aimag"
@@ -1542,6 +1543,7 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
 
         // Complex-valued.
         "cmplx" => Some(FortranType::default_complex()),
+        "dcmplx" => Some(FortranType::Complex { kind: 8 }),
 
         // Reduction / array intrinsics — return type matches first arg.
         "sum" | "product" => args.first().cloned(),
@@ -3127,6 +3129,12 @@ mod tests {
     fn dble_returns_real8() {
         let result = intrinsic_result_type("dble", &[FortranType::Integer { kind: 4 }]).unwrap();
         assert_eq!(result, FortranType::Real { kind: 8 });
+    }
+
+    #[test]
+    fn dcmplx_returns_complex8() {
+        let result = intrinsic_result_type("dcmplx", &[FortranType::Integer { kind: 4 }]).unwrap();
+        assert_eq!(result, FortranType::Complex { kind: 8 });
     }
 
     #[test]

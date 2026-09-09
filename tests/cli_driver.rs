@@ -65022,3 +65022,40 @@ fn fixed_form_exponent_accepts_double_precision_argument() {
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn fixed_form_dcmplx_produces_double_complex_scalars_and_arrays() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_dcmplx_produces_double_complex_scalars_and_arrays count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      IMPLICIT NONE\n      INTEGER LWKOPT, VALUES(2)\n      COMPLEX*16 WORK(2), ARRAY_VALUES(2)\n      LWKOPT = 17\n      WORK(1) = DCMPLX(LWKOPT)\n      WORK(2) = DCMPLX(1.25,-2.5)\n      VALUES(1) = 3\n      VALUES(2) = -4\n      ARRAY_VALUES = DCMPLX(VALUES)\n      IF (ABS(DBLE(WORK(1))-17.0D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(WORK(1))).GT.1.0D-12) STOP\n      IF (ABS(DBLE(WORK(2))-1.25D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(WORK(2))+2.5D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(ARRAY_VALUES(1))-3.0D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(ARRAY_VALUES(2))+4.0D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_dcmplx", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DCMPLX compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DCMPLX compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DCMPLX binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DCMPLX run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
