@@ -6806,6 +6806,77 @@ fn implicit_interface_character_actuals_keep_hidden_lengths_across_objects() {
 }
 
 #[test]
+fn implicit_interface_heap_backed_array_actual_passes_data_across_objects() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=implicit_interface_heap_backed_array_actual_passes_data_across_objects count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // ARMFORTAS heap-backs sufficiently large explicit-shape locals with an
+    // internal ArrayDescriptor. An unresolved external still has an implicit
+    // interface, so the actual associates with an assumed-size dummy through
+    // its first element. Passing that implementation descriptor lets ordinary
+    // callee stores destroy it and makes the caller's automatic cleanup abort.
+    let dir = unique_dir("implicit_interface_heap_array");
+    let callee = write_program_in(
+        &dir,
+        "callee.f",
+        "      SUBROUTINE FILL_VALUES(N,VALUES)\n      INTEGER N,I,VALUES(*)\n      DO 10 I=1,N\n         VALUES(I)=I\n   10 CONTINUE\n      RETURN\n      END\n",
+    );
+    let caller = write_program_in(
+        &dir,
+        "caller.f",
+        "      PROGRAM P\n      IMPLICIT NONE\n      INTEGER I, VALUES(90000)\n      EXTERNAL FILL_VALUES\n      VALUES = -1\n      CALL FILL_VALUES(SIZE(VALUES),VALUES)\n      DO 10 I=1,SIZE(VALUES)\n         IF (VALUES(I).NE.I) STOP\n   10 CONTINUE\n      PRINT *, 'ok'\n      END\n",
+    );
+    let callee_obj = dir.join("callee.o");
+    let caller_obj = dir.join("caller.o");
+    let out = dir.join("p");
+
+    for (src, obj) in [(&callee, &callee_obj), (&caller, &caller_obj)] {
+        let compile = Command::new(compiler("armfortas"))
+            .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+            .output()
+            .expect("implicit-interface heap-backed-array compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "implicit-interface heap-backed-array compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            caller_obj.to_str().unwrap(),
+            callee_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("implicit-interface heap-backed-array link failed to spawn");
+    assert!(
+        link.status.success(),
+        "implicit-interface heap-backed-array link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("implicit-interface heap-backed-array run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "implicit-interface heap-backed-array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn entity_star_assumed_length_uses_hidden_length_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

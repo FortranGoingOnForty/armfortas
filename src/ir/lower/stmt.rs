@@ -6214,8 +6214,15 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                          -> MaterializedCallArg {
                                     let mut character_len = None;
                                     let mut owned_character_bases = Vec::new();
+                                    // A plain unresolved external has an
+                                    // implicit interface and receives array
+                                    // storage, even when ARMFORTAS internally
+                                    // heap-backs that storage with a descriptor.
+                                    // Retain the descriptor inference only for
+                                    // indirect procedure-pointer calls.
                                     let wants_descriptor = (mask_wants_descriptor
-                                        || (desc_mask.is_none()
+                                        || (procptr_target.is_some()
+                                            && desc_mask.is_none()
                                             && actual_is_descriptor_backed(
                                                 &ctx.locals,
                                                 e,
@@ -6425,7 +6432,8 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         call_arg_character_temps
                                             .extend(lowered.owned_character_bases.iter().copied());
                                         let wants_descriptor = (mask_wants_descriptor
-                                            || (desc_mask.is_none()
+                                            || (procptr_target.is_some()
+                                                && desc_mask.is_none()
                                                 && actual_is_descriptor_backed(
                                                     &ctx.locals,
                                                     arg_expr,
