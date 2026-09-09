@@ -589,14 +589,16 @@ fn is_c_interop_pointer_typespec(ts: &crate::ast::decl::TypeSpec) -> bool {
 /// Returns None when the kind can't be determined statically — the
 /// caller must not reject on an unknown kind. `real*16` (the old-style
 /// `Star` selector) is evaluated the same way.
-fn eval_real_complex_kind(
-    ctx: &Ctx<'_>,
-    sel: &Option<crate::ast::decl::KindSelector>,
-) -> Option<u8> {
+fn eval_real_complex_kind(ctx: &Ctx<'_>, type_spec: &TypeSpec) -> Option<u8> {
     use crate::ast::decl::KindSelector;
     use crate::ast::expr::Expr;
+    let (sel, is_complex) = match type_spec {
+        TypeSpec::Real(sel) => (sel, false),
+        TypeSpec::Complex(sel) => (sel, true),
+        _ => return None,
+    };
     let (KindSelector::Expr(e) | KindSelector::Star(e)) = sel.as_ref()?;
-    match &e.node {
+    let value = match &e.node {
         Expr::IntegerLiteral { text, .. } => text.parse::<u8>().ok(),
         Expr::Name { name } => {
             let key = name.to_lowercase();
@@ -607,7 +609,12 @@ fn eval_real_complex_kind(
                 .and_then(|v| u8::try_from(v).ok())
         }
         _ => None,
-    }
+    }?;
+    Some(if is_complex {
+        crate::sema::resolve::type_resolution::normalize_complex_kind_selector_value(sel, value)
+    } else {
+        value
+    })
 }
 
 fn validate_supported_character_type_spec(ctx: &mut Ctx<'_>, span: Span, type_spec: &TypeSpec) {
@@ -4563,8 +4570,8 @@ fn validate_unit(ctx: &mut Ctx, unit: &SpannedUnit) {
             // bits). The `result(r)` body-declaration spelling is caught by
             // validate_decls; the prefix `real(16) function f()` spelling is
             // checked here. Audit finding C7.
-            if let Some(TypeSpec::Real(sel) | TypeSpec::Complex(sel)) = &return_type {
-                if let Some(k) = eval_real_complex_kind(ctx, sel) {
+            if let Some(type_spec @ (TypeSpec::Real(_) | TypeSpec::Complex(_))) = &return_type {
+                if let Some(k) = eval_real_complex_kind(ctx, type_spec) {
                     if k != 4 && k != 8 {
                         let what = if matches!(return_type, Some(TypeSpec::Complex(_))) {
                             "COMPLEX"
@@ -4955,8 +4962,8 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             // unsupported kind loudly instead of miscompiling. Audit finding
             // C7. Only reject when the kind evaluates to a definite value —
             // an unresolved kind selector is left alone.
-            if let TypeSpec::Real(sel) | TypeSpec::Complex(sel) = type_spec {
-                if let Some(k) = eval_real_complex_kind(ctx, sel) {
+            if let TypeSpec::Real(_) | TypeSpec::Complex(_) = type_spec {
+                if let Some(k) = eval_real_complex_kind(ctx, type_spec) {
                     if k != 4 && k != 8 {
                         let what = if matches!(type_spec, TypeSpec::Complex(_)) {
                             "COMPLEX"

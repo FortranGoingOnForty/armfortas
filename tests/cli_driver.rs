@@ -64911,3 +64911,40 @@ fn fixed_form_typed_external_return_feeds_nested_sqrt() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn fixed_form_complex_star_16_uses_double_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_complex_star_16_uses_double_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      DOUBLE PRECISION FUNCTION LEGACY_ABS(Z)\n      COMPLEX*16 Z\n      LEGACY_ABS = ABS(DBLE(Z)) + ABS(DIMAG(Z))\n      END\n      PROGRAM P\n      COMPLEX*16 Z\n      DOUBLE PRECISION LEGACY_ABS, VALUE\n      EXTERNAL LEGACY_ABS\n      Z = (1.0D0,-2.0D0)\n      VALUE = LEGACY_ABS(Z)\n      IF (ABS(VALUE-3.0D0).GT.1.0D-12) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_complex_star_16", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form COMPLEX*16 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form COMPLEX*16 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form COMPLEX*16 binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form COMPLEX*16 run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
