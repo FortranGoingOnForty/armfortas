@@ -44800,6 +44800,25 @@ pub(super) fn lower_array_sum_dim_descriptor(
         }
     }
 
+    // SUM(source**2, DIM=k) is common in numerical kernels. A local array
+    // designator can be reduced directly by the runtime without either the
+    // square temporary or the generalized IR loop's per-element division.
+    if args.len() == 2 && mask_expr.is_none() {
+        if let Some(result) = lower_sum_squares_dim_descriptor(
+            b,
+            locals,
+            array_expr,
+            dim_expr,
+            st,
+            type_layouts,
+            internal_funcs,
+            contained_host_refs,
+            descriptor_params,
+        ) {
+            return Some(result);
+        }
+    }
+
     // A common numerical-kernel shape is SUM(ABS(x), DIM=k). When k is
     // compile-time known and the elemental expression has one safe array
     // control, reduce it directly into the rank-N-1 result. Keep every other
@@ -44907,6 +44926,69 @@ pub(super) fn lower_array_sum_dim_descriptor(
         deallocate_array_expr_descriptor_if_temp(b, locals, mask_expr, st, mask_desc);
     }
     Some((result_desc, elem_ty))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_sum_squares_dim_descriptor(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    expr: &crate::ast::expr::SpannedExpr,
+    dim_expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+    internal_funcs: Option<&HashMap<String, u32>>,
+    contained_host_refs: Option<&HashMap<String, Vec<String>>>,
+    descriptor_params: Option<&HashMap<String, Vec<bool>>>,
+) -> Option<(ValueId, IrType)> {
+    let Expr::BinaryOp {
+        op: BinaryOp::Pow,
+        left: source_expr,
+        right: exponent,
+    } = &strip_paren_expr(expr).node
+    else {
+        return None;
+    };
+    if eval_const_int_in_scope_or_any_scope(exponent, &HashMap::new(), st) != Some(2)
+        || actual_expr_rank(source_expr, locals, st, type_layouts).is_none_or(|rank| rank <= 1)
+        || array_expr_descriptor_may_own_temp(source_expr, locals, st)
+        || !squared_column_distance_descriptor_expr_is_safe(source_expr, locals, st, type_layouts)
+        || squared_column_distance_expr_references_volatile(source_expr, st)
+    {
+        return None;
+    }
+    let source_ty = generic_actual_expr_type_info(source_expr, locals, st, type_layouts)
+        .map(|type_info| type_info_to_ir_type(&type_info))?;
+    if !matches!(source_ty, IrType::Float(FloatWidth::F32 | FloatWidth::F64)) {
+        return None;
+    }
+    if !matches!(
+        generic_actual_expr_type_info(dim_expr, locals, st, type_layouts),
+        Some(crate::sema::symtab::TypeInfo::Integer { .. })
+    ) {
+        return None;
+    }
+
+    let (source_desc, _) = lower_array_expr_descriptor(
+        b,
+        locals,
+        source_expr,
+        st,
+        type_layouts,
+        internal_funcs,
+        contained_host_refs,
+        descriptor_params,
+    )?;
+    let dim_raw =
+        super::expr::lower_expr_with_optional_layouts(b, locals, dim_expr, st, type_layouts);
+    let dim = coerce_to_type(b, dim_raw, &IrType::Int(IntWidth::I32));
+    let result_desc = zeroed_array_temp_descriptor(b);
+    b.call(
+        FuncRef::External("afs_array_sum_squares_real_dim".into()),
+        vec![source_desc, dim, result_desc],
+        IrType::Void,
+    );
+    deallocate_array_expr_descriptor_if_temp(b, locals, source_expr, st, source_desc);
+    Some((result_desc, source_ty))
 }
 
 fn squared_column_distance_descriptor_expr_is_safe(
@@ -67545,7 +67627,8 @@ subroutine kernel(z, first, last, sums, maxima, minima)
 end subroutine
 ",
         );
-        assert!(ir.contains("direct_sum_dim_check"));
+        assert!(ir.contains("call @afs_array_sum_squares_real_dim("));
+        assert!(!ir.contains("direct_sum_dim_check"));
         assert!(ir.contains("direct_maxval_dim_check"));
         assert!(ir.contains("direct_minval_dim_check"));
         assert_eq!(
@@ -67557,7 +67640,7 @@ end subroutine
             !ir.contains("call @afs_allocate_like"),
             "direct section reductions must not materialize their elemental inputs:\n{ir}"
         );
-        for intrinsic in ["sum", "maxval", "minval"] {
+        for intrinsic in ["maxval", "minval"] {
             assert!(
                 !ir.contains(&format!("call @afs_array_{intrinsic}_real8_dim(")),
                 "direct section {intrinsic}(DIM=) must not call the runtime reducer:\n{ir}"
@@ -67565,8 +67648,8 @@ end subroutine
         }
         assert_eq!(
             ir.matches("call @afs_allocate_array(").count(),
-            3,
-            "each direct reduction should allocate only its rank-reduced result:\n{ir}"
+            2,
+            "only the remaining direct reductions should allocate results in IR:\n{ir}"
         );
         assert_eq!(
             ir.matches("call @afs_deallocate_array(").count(),
