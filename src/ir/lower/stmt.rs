@@ -3292,6 +3292,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                                         // a single complex(4) const-zero
                                                         // buffer — wrong shape and wrong kind.
                                                         | "cmplx"
+                                                        | "dcmplx"
                                                         // merge(t, f, mask) over arrays:
                                                         // lower_array_merge_descriptor
                                                         // materializes a temp via per-element

@@ -46,6 +46,20 @@ fn extract_kind_in_scope(
     }
 }
 
+/// Legacy `COMPLEX*n` spells the total storage size, while `COMPLEX(kind=n)`
+/// spells the component kind. Thus `COMPLEX*8` is two REAL(4) components and
+/// `COMPLEX*16` is two REAL(8) components.
+pub(crate) fn normalize_complex_kind_selector_value(
+    sel: &Option<decl::KindSelector>,
+    value: u8,
+) -> u8 {
+    if matches!(sel, Some(decl::KindSelector::Star(_))) {
+        value / 2
+    } else {
+        value
+    }
+}
+
 /// Compute the byte length of a string-valued PARAMETER initializer
 /// for `character(*)` length inference (F2008 §5.3.2). Handles string
 /// literals, lexically visible character parameters whose length is already
@@ -193,7 +207,8 @@ pub(crate) fn type_spec_to_info_in_scope(
         },
         TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
         TypeSpec::Complex(sel) => TypeInfo::Complex {
-            kind: extract_kind_in_scope(sel, st, scope_id),
+            kind: extract_kind_in_scope(sel, st, scope_id)
+                .map(|kind| normalize_complex_kind_selector_value(sel, kind)),
         },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },
         TypeSpec::Logical(sel) => TypeInfo::Logical {

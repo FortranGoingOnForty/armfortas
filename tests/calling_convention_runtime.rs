@@ -1923,6 +1923,9 @@ fn specific_intrinsic_procedure_targets_keep_fortran_abi_at_every_opt_level() {
     complex function complex_callback(value)
       complex, intent(in) :: value
     end function complex_callback
+    complex(8) function double_complex_callback(value)
+      complex(8), intent(in) :: value
+    end function double_complex_callback
   end interface
   intrinsic :: sin
   type :: callback_holder
@@ -1934,21 +1937,24 @@ end module callback_types
 program p
   use callback_types
   implicit none
-  intrinsic :: sin, dsin, iabs, len, conjg
+  intrinsic :: sin, dsin, iabs, len, conjg, dconjg
   procedure(real_callback), pointer :: initialized => sin
   procedure(real_callback), pointer :: assigned
   procedure(double_callback), pointer :: double_target
   procedure(integer_callback), pointer :: integer_target
   procedure(character_callback), pointer :: character_target
   procedure(complex_callback), pointer :: complex_target
+  procedure(double_complex_callback), pointer :: double_complex_target
   type(callback_holder) :: holder
   complex :: result
+  complex(8) :: double_result
 
   assigned => sin
   double_target => dsin
   integer_target => iabs
   character_target => len
   complex_target => conjg
+  double_complex_target => dconjg
   holder%rebound => sin
 
   if (abs(initialized(0.5) - sin(0.5)) > 1.0e-6) error stop 1
@@ -1961,6 +1967,9 @@ program p
   result = complex_target((1.5, -2.0))
   if (abs(real(result) - 1.5) > 1.0e-6) error stop 8
   if (abs(aimag(result) - 2.0) > 1.0e-6) error stop 9
+  double_result = double_complex_target((1.5d0, -2.0d0))
+  if (abs(real(double_result) - 1.5d0) > 1.0d-12) error stop 10
+  if (abs(aimag(double_result) - 2.0d0) > 1.0d-12) error stop 11
   print *, 'ok'
 end program p
 "#,

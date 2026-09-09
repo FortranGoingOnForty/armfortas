@@ -12,6 +12,7 @@ pub(crate) enum SpecificIntrinsicType {
     Real,
     DoublePrecision,
     Complex,
+    DoubleComplex,
     Character,
 }
 
@@ -22,13 +23,14 @@ pub(crate) struct SpecificIntrinsic {
     pub(crate) wrapper_symbol: &'static str,
 }
 
-use SpecificIntrinsicType::{Character, Complex, DoublePrecision, Integer, Real};
+use SpecificIntrinsicType::{Character, Complex, DoubleComplex, DoublePrecision, Integer, Real};
 
 const REAL_1: &[SpecificIntrinsicType] = &[Real];
 const REAL_2: &[SpecificIntrinsicType] = &[Real, Real];
 const DOUBLE_1: &[SpecificIntrinsicType] = &[DoublePrecision];
 const DOUBLE_2: &[SpecificIntrinsicType] = &[DoublePrecision, DoublePrecision];
 const COMPLEX_1: &[SpecificIntrinsicType] = &[Complex];
+const DOUBLE_COMPLEX_1: &[SpecificIntrinsicType] = &[DoubleComplex];
 const INTEGER_1: &[SpecificIntrinsicType] = &[Integer];
 const INTEGER_2: &[SpecificIntrinsicType] = &[Integer, Integer];
 const CHARACTER_1: &[SpecificIntrinsicType] = &[Character];
@@ -62,6 +64,7 @@ pub(crate) fn specific_intrinsic(name: &str) -> Option<SpecificIntrinsic> {
         "cexp" => (COMPLEX_1, Complex, "afs_specific_exp_c4"),
         "clog" => (COMPLEX_1, Complex, "afs_specific_log_c4"),
         "conjg" => (COMPLEX_1, Complex, "afs_specific_conjg_c4"),
+        "dconjg" => (DOUBLE_COMPLEX_1, DoubleComplex, "afs_specific_conjg_c8"),
         "csin" => (COMPLEX_1, Complex, "afs_specific_sin_c4"),
         "csqrt" => (COMPLEX_1, Complex, "afs_specific_sqrt_c4"),
         "dabs" => (DOUBLE_1, DoublePrecision, "afs_specific_abs_r8"),
@@ -118,7 +121,7 @@ mod tests {
             "ccos", "cexp", "clog", "conjg", "csin", "csqrt", "dabs", "dacos", "dasin", "datan",
             "dcos", "dcosh", "dexp", "dint", "dlog", "dlog10", "dnint", "dsin", "dsinh", "dsqrt",
             "dtan", "dtanh", "datan2", "ddim", "dmod", "dsign", "dprod", "iabs", "idim", "isign",
-            "mod", "idnint", "nint", "index", "len",
+            "mod", "idnint", "nint", "index", "len", "dconjg",
         ] {
             let definition = specific_intrinsic(name)
                 .unwrap_or_else(|| panic!("missing specific intrinsic definition for {name}"));

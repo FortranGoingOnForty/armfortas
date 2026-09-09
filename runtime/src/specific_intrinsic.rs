@@ -149,6 +149,14 @@ pub extern "C" fn afs_specific_conjg_c4(result: *mut [f32; 2], value: *const [f3
 }
 
 #[no_mangle]
+pub extern "C" fn afs_specific_conjg_c8(result: *mut [f64; 2], value: *const [f64; 2]) {
+    let [real, imaginary] = unsafe { *value };
+    unsafe {
+        *result = [real, -imaginary];
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn afs_specific_exp_c4(result: *mut [f32; 2], value: *const [f32; 2]) {
     let (real, imaginary) = load_complex(value);
     let magnitude = real.exp();
@@ -245,6 +253,11 @@ mod tests {
         let input = [1.5, -2.0];
         let mut output = [0.0, 0.0];
         afs_specific_conjg_c4(&mut output, &input);
+        assert_eq!(output, [1.5, 2.0]);
+
+        let input = [1.5_f64, -2.0];
+        let mut output = [0.0_f64, 0.0];
+        afs_specific_conjg_c8(&mut output, &input);
         assert_eq!(output, [1.5, 2.0]);
     }
 

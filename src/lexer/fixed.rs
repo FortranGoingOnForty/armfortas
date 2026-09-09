@@ -778,8 +778,8 @@ fn lex_fixed_number(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
 /// parser resolves the remaining program-unit ambiguity with grammar context.
 ///
 /// The DO/assignment ambiguity still needs special handling before the generic
-/// prefix splitter because `DO10I=1,10` is a loop while `DO10I=1.10` is an
-/// assignment.
+/// prefix splitter because `DO10I=1,10` and `DOI=1,10` are loops while
+/// `DO10I=1.10` and `DOI=1.10` are assignments.
 fn lex_fixed_ident_or_keyword(
     text: &str,
     pos: usize,
@@ -797,11 +797,23 @@ fn lex_fixed_ident_or_keyword(
     let run = &text[pos..run_end];
     let run_lower = run.to_lowercase();
 
-    // DO/assignment ambiguity: if the run starts with "do" followed by digits,
-    // check if this is a DO loop (has comma after =) or an assignment.
+    // Fixed-form whitespace removal joins parenthesized DO keywords. Keep an
+    // array or statement-function assignment such as `DOWHILE(I)=...` intact.
+    if matches!(run_lower.as_str(), "dowhile" | "doconcurrent")
+        && text.as_bytes().get(run_end) == Some(&b'(')
+        && at_fixed_action_statement_start(prior_tokens)
+        && !identifier_precedes_assignment(text, run_end)
+    {
+        return make_ident_token(&run[..2], pos, file_id, line);
+    }
+
+    // DO/assignment ambiguity: the optional termination label may be absent, so
+    // both `DO10I=1,10` and `DOI=1,10` must expose `DO` as a separate token.
+    // A top-level comma after `=` distinguishes them from assignments such as
+    // `DO10I=1.10` and `DOI=1.10`.
     if run_lower.starts_with("do")
         && run.len() > 2
-        && run.as_bytes()[2].is_ascii_digit()
+        && run.as_bytes()[2].is_ascii_alphanumeric()
         && is_do_loop_context(text, pos + 2)
     {
         // IS a DO loop — emit just "DO" (2 chars). Subsequent calls
@@ -1046,7 +1058,7 @@ fn make_ident_token(text: &str, pos: usize, file_id: u32, line: u32) -> (Token, 
     )
 }
 
-/// Check if the rest of the statement after DO+digits looks like a DO loop.
+/// Check if the rest of the statement after DO looks like a DO loop.
 /// A DO loop has: DO [label] variable = start , end [, step]
 /// An assignment has: DO[label][var] = expr (no top-level comma after =).
 fn is_do_loop_context(text: &str, after_do: usize) -> bool {
@@ -2398,6 +2410,36 @@ C     Hello World
     }
 
     #[test]
+    fn unlabeled_do_loop_with_comma() {
+        // Blanks are insignificant in fixed form: `DO I=2,N` reaches the
+        // scanner as `DOI=2,N` and must still split the keyword from `I`.
+        assert_eq!(
+            fixed_texts("      DO I = 2,N\n"),
+            ["DO", "I", "=", "2", ",", "N"]
+        );
+    }
+
+    #[test]
+    fn parenthesized_do_keywords_split_after_whitespace_removal() {
+        assert_eq!(
+            fixed_texts("      DO WHILE (MORE)\n"),
+            ["DO", "WHILE", "(", "MORE", ")"]
+        );
+        assert_eq!(
+            fixed_texts("      DO CONCURRENT (I=1:N)\n"),
+            ["DO", "CONCURRENT", "(", "I", "=", "1", ":", "N", ")"]
+        );
+    }
+
+    #[test]
+    fn parenthesized_do_prefixed_assignment_stays_an_identifier() {
+        assert_eq!(
+            fixed_texts("      DOWHILE(I) = 1\n"),
+            ["DOWHILE", "(", "I", ")", "=", "1"]
+        );
+    }
+
+    #[test]
     fn do_assignment_no_comma() {
         // DO10I=1.10 → assignment: DO10I + = + 1.10 (no comma → not a loop)
         let kinds = fixed_kinds("      DO10I=1.10\n");
@@ -2421,6 +2463,11 @@ C     Hello World
         assert!(!kinds.contains(&TokenKind::Comma));
         let texts = fixed_texts("      DO10I=1\n");
         assert_eq!(texts[0], "DO10I");
+    }
+
+    #[test]
+    fn unlabeled_do_assignment_without_comma() {
+        assert_eq!(fixed_texts("      DOI = 1.10\n"), ["DOI", "=", "1.10"]);
     }
 
     // ---- BOZ in fixed-form ----

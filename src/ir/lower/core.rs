@@ -1409,14 +1409,14 @@ pub(super) fn complex_result_kind(
         }
         match type_spec {
             TypeSpec::Complex(sel) => {
-                return extract_kind_with_context(sel, 4, None, Some(st));
+                return extract_complex_kind_with_context(sel, 4, None, Some(st));
             }
             TypeSpec::DoubleComplex => return 8,
             _ => {}
         }
     }
     match return_type {
-        Some(TypeSpec::Complex(sel)) => extract_kind_with_context(sel, 4, None, Some(st)),
+        Some(TypeSpec::Complex(sel)) => extract_complex_kind_with_context(sel, 4, None, Some(st)),
         Some(TypeSpec::DoubleComplex) => 8,
         _ => 4,
     }
@@ -5840,7 +5840,7 @@ pub(super) fn collect_const_array_scalars(
         // the result extent.
         Expr::FunctionCall { callee, args } => {
             if let Expr::Name { name } = &callee.node {
-                if name.eq_ignore_ascii_case("cmplx") {
+                if matches!(name.to_ascii_lowercase().as_str(), "cmplx" | "dcmplx") {
                     if let Some(values) = collect_const_cmplx_intrinsic(args, elem_ty, param_consts)
                     {
                         return Some(values);
@@ -6325,7 +6325,7 @@ pub(super) fn eval_const_complex_global_init(
             let Expr::Name { name } = &callee.node else {
                 return None;
             };
-            if !name.eq_ignore_ascii_case("cmplx") {
+            if !matches!(name.to_ascii_lowercase().as_str(), "cmplx" | "dcmplx") {
                 return None;
             }
             const_cmplx_arg_exprs(args)?
@@ -8874,7 +8874,15 @@ fn const_array_initializer_len_in_scope(
             };
             if !matches!(
                 name.to_ascii_lowercase().as_str(),
-                "real" | "dble" | "dfloat" | "float" | "int" | "cmplx" | "complex" | "logical"
+                "real"
+                    | "dble"
+                    | "dfloat"
+                    | "float"
+                    | "int"
+                    | "cmplx"
+                    | "dcmplx"
+                    | "complex"
+                    | "logical"
             ) {
                 return None;
             }
@@ -14707,7 +14715,10 @@ pub(super) fn actual_expr_rank(
                         return Some(0);
                     }
                 }
-                if matches!(key.as_str(), "abs" | "aimag" | "dimag" | "conjg" | "real") {
+                if matches!(
+                    key.as_str(),
+                    "abs" | "aimag" | "dimag" | "conjg" | "dconjg" | "real"
+                ) {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
@@ -17436,10 +17447,12 @@ pub(super) fn generic_dispatch_probe_value(
                 "matmul",
                 "transpose",
                 "conjg",
+                "dconjg",
                 "aimag",
                 "dimag",
                 "abs",
                 "cmplx",
+                "dcmplx",
                 "shape",
                 "spread",
                 "unpack",
@@ -17644,7 +17657,7 @@ pub(super) fn array_expr_elem_type_only(
                     "shape" => {
                         return Some(IrType::Int(IntWidth::I32));
                     }
-                    "conjg" => {
+                    "conjg" | "dconjg" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 return array_expr_elem_type_only(locals, e, st, type_layouts);
@@ -19508,6 +19521,7 @@ pub(super) fn intrinsic_subroutine_arg_order(callee_key: &str) -> Option<&'stati
         "c_f_pointer" => Some(&["cptr", "fptr", "shape", "lower"]),
         "c_f_strpointer" => Some(&["cstrarray", "fstrptr", "nchars"]),
         "cmplx" => Some(&["x", "y", "kind"]),
+        "dcmplx" => Some(&["x", "y"]),
         "reshape" => Some(&["source", "shape", "pad", "order"]),
         "pack" => Some(&["array", "mask", "vector"]),
         "findloc" => Some(&["array", "value", "dim", "mask", "kind", "back"]),
@@ -20349,7 +20363,7 @@ fn is_linkable_callable_symbol(sym: &crate::sema::symtab::Symbol) -> bool {
             | SymbolKind::ExternalProc
             | SymbolKind::IntrinsicProc
             | SymbolKind::ProcedurePointer
-    )
+    ) || sym.attrs.external
 }
 
 fn find_linkable_symbol_for_callee<'a>(
@@ -28973,6 +28987,16 @@ pub(super) fn extract_kind_with_context(
     }
 }
 
+pub(super) fn extract_complex_kind_with_context(
+    sel: &Option<crate::ast::decl::KindSelector>,
+    default: u8,
+    param_consts: Option<&HashMap<String, ConstScalar>>,
+    st: Option<&SymbolTable>,
+) -> u8 {
+    let value = extract_kind_with_context(sel, default, param_consts, st);
+    crate::sema::resolve::type_resolution::normalize_complex_kind_selector_value(sel, value)
+}
+
 /// Lower a Fortran type specifier to an IR type.
 pub(super) fn lower_type_spec(ts: &TypeSpec) -> IrType {
     lower_type_spec_st(ts, None)
@@ -29028,7 +29052,7 @@ pub(super) fn lower_type_spec_with_param_consts(
         )),
         TypeSpec::DoublePrecision => IrType::Float(FloatWidth::F64),
         TypeSpec::Complex(sel) => {
-            let fw = match extract_kind_with_context(sel, 4, param_consts, st) {
+            let fw = match extract_complex_kind_with_context(sel, 4, param_consts, st) {
                 8 => FloatWidth::F64,
                 _ => FloatWidth::F32,
             };
@@ -32115,7 +32139,9 @@ fn constructor_intrinsic_materializes_array(name: &str) -> bool {
             | "minloc"
             | "merge"
             | "cmplx"
+            | "dcmplx"
             | "conjg"
+            | "dconjg"
             | "aimag"
             | "dimag"
             | "abs"
@@ -47891,6 +47917,7 @@ fn lower_cmplx_array_expr_descriptor(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     args: &[crate::ast::expr::Argument],
+    forced_lane_bytes: Option<i64>,
     st: &SymbolTable,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     internal_funcs: Option<&HashMap<String, u32>>,
@@ -48008,7 +48035,9 @@ fn lower_cmplx_array_expr_descriptor(
         );
         extract_const_int_from_value(b, kind_val)
     });
-    let out_lane_bytes = kind_lane_bytes.unwrap_or(source_lane_bytes);
+    let out_lane_bytes = forced_lane_bytes
+        .or(kind_lane_bytes)
+        .unwrap_or(source_lane_bytes);
     let out_fw = if out_lane_bytes == 8 {
         FloatWidth::F64
     } else {
@@ -50472,7 +50501,7 @@ pub(super) fn lower_array_expr_descriptor(
                 // an explicit array path the elemental fallback emits
                 // an external `_conjg` for the whole-array call, which
                 // the linker can't resolve.
-                if name.eq_ignore_ascii_case("conjg") {
+                if matches!(name.to_ascii_lowercase().as_str(), "conjg" | "dconjg") {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
@@ -50610,11 +50639,12 @@ pub(super) fn lower_array_expr_descriptor(
                 // / schur_complex examples with an "unhandled coercion
                 // Ptr(Array(F32),2) → Array(F64,2)" warning at the
                 // assignment.
-                if name.eq_ignore_ascii_case("cmplx") {
+                if matches!(name.to_ascii_lowercase().as_str(), "cmplx" | "dcmplx") {
                     if let Some(result) = lower_cmplx_array_expr_descriptor(
                         b,
                         locals,
                         args,
+                        name.eq_ignore_ascii_case("dcmplx").then_some(8),
                         st,
                         type_layouts,
                         internal_funcs,
@@ -55592,6 +55622,7 @@ fn array_arg_elem_ty<'a>(
                         | "eoshift"
                         | "merge"
                         | "conjg"
+                        | "dconjg"
                         | "matmul"
                         | "sum"
                         | "product"
@@ -70977,5 +71008,52 @@ end program
 ",
         );
         assert!(ir.contains("iadd"));
+    }
+
+    #[test]
+    fn typed_external_return_flows_into_nested_intrinsic() {
+        let (_, ir) = lower_and_verify(
+            "\
+program typed_external_nested
+  implicit none
+  real, external :: external_value
+  real :: value
+  value = sqrt(external_value(9.0))
+end program typed_external_nested
+",
+        );
+
+        assert!(
+            ir.contains("call @external_value") && ir.contains(": f32"),
+            "a typed EXTERNAL function call must retain its declared return type:\n{ir}",
+        );
+        assert!(
+            ir.lines()
+                .any(|line| line.contains("fsqrt") && line.contains(": f32")),
+            "SQRT must receive the typed EXTERNAL function's real result:\n{ir}",
+        );
+    }
+
+    #[test]
+    fn legacy_complex_star_uses_total_byte_size() {
+        let (_, ir) = lower_and_verify(
+            "\
+program legacy_complex_bytes
+  complex*8 :: narrow
+  complex*16 :: wide
+  narrow = (1.0, 2.0)
+  wide = (3.0d0, 4.0d0)
+end program legacy_complex_bytes
+",
+        );
+
+        assert!(
+            ir.contains("alloca [f32 x 2]"),
+            "COMPLEX*8 must lower as two four-byte components:\n{ir}",
+        );
+        assert!(
+            ir.contains("alloca [f64 x 2]"),
+            "COMPLEX*16 must lower as two eight-byte components:\n{ir}",
+        );
     }
 }

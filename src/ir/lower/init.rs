@@ -283,6 +283,27 @@ fn collect_static_initializer_global_addr_values(b: &FuncBuilder) -> HashSet<Val
     set
 }
 
+fn store_complex_scalar_initializer(
+    b: &mut FuncBuilder,
+    locals: &HashMap<String, LocalInfo>,
+    info: &LocalInfo,
+    init_expr: &SpannedExpr,
+    st: &SymbolTable,
+) {
+    let raw = super::expr::lower_expr(b, locals, init_expr, st);
+    let target_fw = complex_float_width(&info.ty);
+    let source = match b.func().value_type(raw) {
+        Some(ref ty) if is_complex_ptr_ty(ty) && complex_float_width(ty) == target_fw => raw,
+        _ => materialize_complex_operand(b, raw, target_fw),
+    };
+    let size = b.const_i64(complex_byte_size(&info.ty));
+    b.call(
+        FuncRef::External("memcpy".into()),
+        vec![info.addr, source, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+}
+
 /// Lower initializer expressions for declared variables.
 ///
 /// Handles two AST shapes:
@@ -727,14 +748,7 @@ pub(crate) fn init_decls(
                     // 2-element array) would fail IR verification — do
                     // a byte memcpy of the inline buffer instead.
                     if is_complex_ty(&info.ty) && !info.is_pointer {
-                        let src = super::expr::lower_expr(b, locals, init_expr, st);
-                        let bytes = complex_byte_size(&info.ty);
-                        let sz = b.const_i64(bytes);
-                        b.call(
-                            FuncRef::External("memcpy".into()),
-                            vec![info.addr, src, sz],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
-                        );
+                        store_complex_scalar_initializer(b, locals, info, init_expr, st);
                         continue;
                     }
                     let val = super::expr::lower_expr(b, locals, init_expr, st);
@@ -790,6 +804,10 @@ pub(crate) fn init_decls(
                     // locals when alloc_decls successfully folds
                     // the value.
                     if info.inline_const.is_some() {
+                        continue;
+                    }
+                    if is_complex_ty(&info.ty) && !info.is_pointer {
+                        store_complex_scalar_initializer(b, locals, info, expr, st);
                         continue;
                     }
                     let val = super::expr::lower_expr(b, locals, expr, st);

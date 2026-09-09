@@ -1312,9 +1312,16 @@ fn type_spec_to_type_info(
         TypeSpec::DoublePrecision => TypeInfo::DoublePrecision,
         TypeSpec::Complex(kind) => TypeInfo::Complex {
             kind: kind.as_ref().and_then(|k| match k {
-                KindSelector::Expr(e) | KindSelector::Star(e) => {
-                    eval_const_int_expr(e, const_params).and_then(|v| u8::try_from(v).ok())
-                }
+                KindSelector::Expr(e) | KindSelector::Star(e) => eval_const_int_expr(
+                    e,
+                    const_params,
+                )
+                .and_then(|v| u8::try_from(v).ok())
+                .map(|value| {
+                    crate::sema::resolve::type_resolution::normalize_complex_kind_selector_value(
+                        kind, value,
+                    )
+                }),
             }),
         },
         TypeSpec::DoubleComplex => TypeInfo::Complex { kind: Some(8) },

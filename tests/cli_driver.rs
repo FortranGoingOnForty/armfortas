@@ -4011,6 +4011,92 @@ fn fixed_form_program_compiles_and_runs() {
 }
 
 #[test]
+fn fixed_form_unlabeled_do_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_unlabeled_do_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER I, S\n      S = 0\n      DO I = 2, 4\n         S = S + I\n      END DO\n      PRINT *, S\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_unlabeled_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form unlabeled DO compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form unlabeled DO compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form unlabeled DO run failed");
+    assert!(
+        run.status.success(),
+        "fixed-form unlabeled DO run failed: {:?}",
+        run.status
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('9'),
+        "unexpected fixed-form unlabeled DO output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_do_while_compiles_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_do_while_compiles_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER I, S\n      I = 0\n      S = 0\n      DO WHILE (I .LT. 3)\n         I = I + 1\n         S = S + I\n      END DO\n      PRINT *, S\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_do_while", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DO WHILE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DO WHILE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DO WHILE run failed");
+    assert!(
+        run.status.success(),
+        "fixed-form DO WHILE run failed: {:?}",
+        run.status
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim().ends_with('6'),
+        "unexpected fixed-form DO WHILE output: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_inline_comments_preserve_later_continuations() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -64775,5 +64861,275 @@ end program
     );
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_typed_external_return_feeds_nested_sqrt() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_typed_external_return_feeds_nested_sqrt count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("fixed_typed_external_sqrt");
+    let provider = write_program_in(
+        &dir,
+        "external_value.f",
+        "      REAL FUNCTION EXTERNAL_VALUE(X)\n      REAL X\n      EXTERNAL_VALUE = X\n      END\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f",
+        "      PROGRAM P\n      REAL EXTERNAL_VALUE, Y\n      EXTERNAL EXTERNAL_VALUE\n      Y = SQRT(EXTERNAL_VALUE(9.0))\n      IF (ABS(Y-3.0).GT.1.0E-5) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+    );
+    let out = dir.join("typed-external-sqrt");
+    let compile = Command::new(compiler("armfortas"))
+        .args([
+            provider.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("typed EXTERNAL nested-SQRT compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed EXTERNAL nested-SQRT compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("typed EXTERNAL nested-SQRT binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "typed EXTERNAL nested-SQRT run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fixed_form_complex_star_16_uses_double_components() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_complex_star_16_uses_double_components count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      DOUBLE PRECISION FUNCTION LEGACY_ABS(Z)\n      COMPLEX*16 Z\n      LEGACY_ABS = ABS(DBLE(Z)) + ABS(DIMAG(Z))\n      END\n      PROGRAM P\n      COMPLEX*16 Z\n      DOUBLE PRECISION LEGACY_ABS, VALUE\n      EXTERNAL LEGACY_ABS\n      Z = (1.0D0,-2.0D0)\n      VALUE = LEGACY_ABS(Z)\n      IF (ABS(VALUE-3.0D0).GT.1.0D-12) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_complex_star_16", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form COMPLEX*16 compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form COMPLEX*16 compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form COMPLEX*16 binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form COMPLEX*16 run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_if_keyword_can_name_assignment_targets() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_if_keyword_can_name_assignment_targets count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      INTEGER I, IF, IF_ARRAY(2)\n      I = 4\n      IF = I - 1\n      IF_ARRAY(1) = IF + 2\n      IF (IF.NE.3 .OR. IF_ARRAY(1).NE.5) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_if_designator", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form IF-designator compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form IF-designator compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form IF-designator binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form IF-designator run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_exponent_accepts_double_precision_argument() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_exponent_accepts_double_precision_argument count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      DOUBLE PRECISION SCALOC, BUF\n      INTRINSIC EXPONENT\n      SCALOC = 0.125D0\n      BUF = 2.D0**EXPONENT(SCALOC)\n      IF (ABS(BUF-0.25D0).GT.1.0D-12) THEN\n         STOP\n      END IF\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_double_exponent", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form double EXPONENT compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form double EXPONENT compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form double EXPONENT binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form double EXPONENT run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_dcmplx_produces_double_complex_scalars_and_arrays() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_dcmplx_produces_double_complex_scalars_and_arrays count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      IMPLICIT NONE\n      INTEGER LWKOPT, VALUES(2)\n      COMPLEX*16 WORK(2), ARRAY_VALUES(2)\n      LWKOPT = 17\n      WORK(1) = DCMPLX(LWKOPT)\n      WORK(2) = DCMPLX(1.25,-2.5)\n      VALUES(1) = 3\n      VALUES(2) = -4\n      ARRAY_VALUES = DCMPLX(VALUES)\n      IF (ABS(DBLE(WORK(1))-17.0D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(WORK(1))).GT.1.0D-12) STOP\n      IF (ABS(DBLE(WORK(2))-1.25D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(WORK(2))+2.5D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(ARRAY_VALUES(1))-3.0D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(ARRAY_VALUES(2))+4.0D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_dcmplx", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DCMPLX compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DCMPLX compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DCMPLX binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DCMPLX run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn complex_parameter_initializers_widen_single_precision_literals() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_parameter_initializers_widen_single_precision_literals count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      IMPLICIT NONE\n      COMPLEX*16 ZERO, ONE\n      PARAMETER (ZERO=(0.0E0,0.0E0))\n      COMPLEX*16, PARAMETER :: INLINE=(1.25E0,-2.5E0)\n      PARAMETER (ONE=(1.0E0,0.0E0))\n      IF (ABS(DBLE(ZERO)).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(ZERO)).GT.1.0D-12) STOP\n      IF (ABS(DBLE(ONE)-1.0D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(INLINE)-1.25D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(INLINE)+2.5D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("complex_parameter_widen", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex parameter initializer compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex parameter initializer compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("complex parameter initializer binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "complex parameter initializer run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      SUBROUTINE IMPLICIT_FORM(Z,W)\n      IMPLICIT NONE\n      COMPLEX*16 Z,W\n      W = DCONJG(Z)\n      END\n      SUBROUTINE DECLARED_FORM(Z,W)\n      IMPLICIT NONE\n      COMPLEX*16 Z,W\n      INTRINSIC DCONJG\n      W = DCONJG(Z)\n      END\n      PROGRAM P\n      IMPLICIT NONE\n      COMPLEX*16 Z, W1, W2, INPUTS(2), OUTPUTS(2)\n      Z = (1.5D0,-2.25D0)\n      CALL IMPLICIT_FORM(Z,W1)\n      CALL DECLARED_FORM(Z,W2)\n      INPUTS(1) = Z\n      INPUTS(2) = (-3.0D0,4.5D0)\n      OUTPUTS = DCONJG(INPUTS)\n      IF (ABS(DBLE(W1)-1.5D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(W1)-2.25D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(W2)-1.5D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(W2)-2.25D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(OUTPUTS(2))+3.0D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(OUTPUTS(2))+4.5D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_dconjg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DCONJG compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DCONJG compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DCONJG binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DCONJG run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }

@@ -2325,7 +2325,7 @@ pub(crate) fn lower_expr_full(
                         }
                     }
                 }
-                if !has_named_interface && key == "cmplx" {
+                if !has_named_interface && matches!(key.as_str(), "cmplx" | "dcmplx") {
                     if let Some(result) = lower_cmplx_intrinsic_expr(
                         b,
                         locals,
