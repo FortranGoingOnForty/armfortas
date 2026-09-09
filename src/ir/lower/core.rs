@@ -36163,6 +36163,7 @@ pub(super) fn try_lower_defined_io_read_items(
     explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: Option<ValueId>,
     iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -36193,6 +36194,15 @@ pub(super) fn try_lower_defined_io_read_items(
         b.store(zero, tmp);
         tmp
     });
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    // The enclosing transfer owns the input record. Defined-I/O procedures
+    // may issue child READs on the same unit; keeping this outer scope open
+    // lets those children share the record until every item has been handled.
+    b.call(
+        FuncRef::External("afs_list_read_begin".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
     let done = b.create_block("defined_read_done");
     lower_io_status_continue_or_exit(b, statement_iostat, done);
     for (index, (item, candidate)) in items.iter().zip(candidates.iter()).enumerate() {
@@ -36219,6 +36229,11 @@ pub(super) fn try_lower_defined_io_read_items(
     }
     b.branch(done, vec![]);
     b.set_block(done);
+    b.call(
+        FuncRef::External("afs_list_read_end".into()),
+        vec![unit, statement_iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
     if owns_iostat {
         lower_read_status_branches(b, ctx, None, None, statement_iostat, false);
     }

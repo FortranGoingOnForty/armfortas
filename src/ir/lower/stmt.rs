@@ -10226,6 +10226,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 explicit_dtio_edits.as_deref(),
                 dtio_iostat_addr,
                 dtio_iomsg,
+                (read_iomsg_ptr, read_iomsg_len),
             ) {
                 finish_external_read_positioning(b, positioning_done);
                 lower_runtime_iostat_storeback(b, size_addr, &size_storeback);
