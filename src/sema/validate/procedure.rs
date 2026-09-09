@@ -686,7 +686,7 @@ fn intrinsic_data_characteristics(
     dummy: bool,
 ) -> DataCharacteristics {
     use crate::sema::specific_intrinsic::SpecificIntrinsicType::{
-        Character, Complex, DoublePrecision, Integer, Real,
+        Character, Complex, DoubleComplex, DoublePrecision, Integer, Real,
     };
 
     let type_info = match intrinsic_type {
@@ -694,6 +694,7 @@ fn intrinsic_data_characteristics(
         Real => TypeInfo::Real { kind: None },
         DoublePrecision => TypeInfo::DoublePrecision,
         Complex => TypeInfo::Complex { kind: None },
+        DoubleComplex => TypeInfo::Complex { kind: Some(8) },
         Character => TypeInfo::Character {
             len: None,
             kind: None,

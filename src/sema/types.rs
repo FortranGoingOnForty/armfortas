@@ -1346,6 +1346,7 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "dcmplx"
             | "logical"
             | "conjg"
+            | "dconjg"
             | "aimag"
             | "dimag"
             | "mod"
@@ -1515,6 +1516,10 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
                 _ => None,
             }
         }
+        "dconjg" => match args.first()? {
+            FortranType::Complex { kind: 8 } => Some(FortranType::Complex { kind: 8 }),
+            _ => None,
+        },
 
         // Logical-valued.
         "allocated" | "associated" | "present" | "same_type_as" | "btest" => {
@@ -3157,6 +3162,13 @@ mod tests {
     #[test]
     fn conjg_non_complex_returns_none() {
         assert!(intrinsic_result_type("conjg", &[FortranType::Real { kind: 4 }]).is_none());
+    }
+
+    #[test]
+    fn dconjg_complex8_returns_complex8() {
+        let result = intrinsic_result_type("dconjg", &[FortranType::Complex { kind: 8 }]).unwrap();
+        assert_eq!(result, FortranType::Complex { kind: 8 });
+        assert!(intrinsic_result_type("dconjg", &[FortranType::Complex { kind: 4 }]).is_none());
     }
 
     #[test]

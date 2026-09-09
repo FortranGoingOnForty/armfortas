@@ -14715,7 +14715,10 @@ pub(super) fn actual_expr_rank(
                         return Some(0);
                     }
                 }
-                if matches!(key.as_str(), "abs" | "aimag" | "dimag" | "conjg" | "real") {
+                if matches!(
+                    key.as_str(),
+                    "abs" | "aimag" | "dimag" | "conjg" | "dconjg" | "real"
+                ) {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
@@ -17444,6 +17447,7 @@ pub(super) fn generic_dispatch_probe_value(
                 "matmul",
                 "transpose",
                 "conjg",
+                "dconjg",
                 "aimag",
                 "dimag",
                 "abs",
@@ -17653,7 +17657,7 @@ pub(super) fn array_expr_elem_type_only(
                     "shape" => {
                         return Some(IrType::Int(IntWidth::I32));
                     }
-                    "conjg" => {
+                    "conjg" | "dconjg" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 return array_expr_elem_type_only(locals, e, st, type_layouts);
@@ -32137,6 +32141,7 @@ fn constructor_intrinsic_materializes_array(name: &str) -> bool {
             | "cmplx"
             | "dcmplx"
             | "conjg"
+            | "dconjg"
             | "aimag"
             | "dimag"
             | "abs"
@@ -50496,7 +50501,7 @@ pub(super) fn lower_array_expr_descriptor(
                 // an explicit array path the elemental fallback emits
                 // an external `_conjg` for the whole-array call, which
                 // the linker can't resolve.
-                if name.eq_ignore_ascii_case("conjg") {
+                if matches!(name.to_ascii_lowercase().as_str(), "conjg" | "dconjg") {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
                             &first_arg.value
@@ -55617,6 +55622,7 @@ fn array_arg_elem_ty<'a>(
                         | "eoshift"
                         | "merge"
                         | "conjg"
+                        | "dconjg"
                         | "matmul"
                         | "sum"
                         | "product"

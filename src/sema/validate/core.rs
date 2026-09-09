@@ -10833,6 +10833,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         | "dabs"
         | "cabs"
         | "conjg"
+        | "dconjg"
         | "aimag"
         | "dimag"
         | "acos"

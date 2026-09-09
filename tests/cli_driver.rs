@@ -65096,3 +65096,40 @@ fn complex_parameter_initializers_widen_single_precision_literals() {
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      SUBROUTINE IMPLICIT_FORM(Z,W)\n      IMPLICIT NONE\n      COMPLEX*16 Z,W\n      W = DCONJG(Z)\n      END\n      SUBROUTINE DECLARED_FORM(Z,W)\n      IMPLICIT NONE\n      COMPLEX*16 Z,W\n      INTRINSIC DCONJG\n      W = DCONJG(Z)\n      END\n      PROGRAM P\n      IMPLICIT NONE\n      COMPLEX*16 Z, W1, W2, INPUTS(2), OUTPUTS(2)\n      Z = (1.5D0,-2.25D0)\n      CALL IMPLICIT_FORM(Z,W1)\n      CALL DECLARED_FORM(Z,W2)\n      INPUTS(1) = Z\n      INPUTS(2) = (-3.0D0,4.5D0)\n      OUTPUTS = DCONJG(INPUTS)\n      IF (ABS(DBLE(W1)-1.5D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(W1)-2.25D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(W2)-1.5D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(W2)-2.25D0).GT.1.0D-12) STOP\n      IF (ABS(DBLE(OUTPUTS(2))+3.0D0).GT.1.0D-12) STOP\n      IF (ABS(DIMAG(OUTPUTS(2))+4.5D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_dconjg", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DCONJG compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DCONJG compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DCONJG binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DCONJG run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
