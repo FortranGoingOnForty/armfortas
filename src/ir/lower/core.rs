@@ -14717,7 +14717,7 @@ pub(super) fn actual_expr_rank(
                 }
                 if matches!(
                     key.as_str(),
-                    "abs" | "aimag" | "dimag" | "conjg" | "dconjg" | "real"
+                    "abs" | "aimag" | "dimag" | "dreal" | "conjg" | "dconjg" | "real"
                 ) {
                     if let Some(first_arg) = args.first() {
                         if let crate::ast::expr::SectionSubscript::Element(first_expr) =
@@ -17450,6 +17450,7 @@ pub(super) fn generic_dispatch_probe_value(
                 "dconjg",
                 "aimag",
                 "dimag",
+                "dreal",
                 "abs",
                 "cmplx",
                 "dcmplx",
@@ -17680,7 +17681,7 @@ pub(super) fn array_expr_elem_type_only(
                             }
                         }
                     }
-                    "aimag" | "dimag" => {
+                    "aimag" | "dimag" | "dreal" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
                                 if let Some(IrType::Array(inner, 2)) =
@@ -32152,6 +32153,7 @@ fn constructor_intrinsic_materializes_array(name: &str) -> bool {
             | "dconjg"
             | "aimag"
             | "dimag"
+            | "dreal"
             | "abs"
             | "real"
     )

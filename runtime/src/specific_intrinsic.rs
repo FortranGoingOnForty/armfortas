@@ -137,6 +137,11 @@ pub extern "C" fn afs_specific_aimag_c4(value: *const [f32; 2]) -> f32 {
 }
 
 #[no_mangle]
+pub extern "C" fn afs_specific_dreal_c8(value: *const [f64; 2]) -> f64 {
+    (unsafe { *value })[0]
+}
+
+#[no_mangle]
 pub extern "C" fn afs_specific_abs_c4(value: *const [f32; 2]) -> f32 {
     let (real, imaginary) = load_complex(value);
     real.hypot(imaginary)
@@ -259,6 +264,7 @@ mod tests {
         let mut output = [0.0_f64, 0.0];
         afs_specific_conjg_c8(&mut output, &input);
         assert_eq!(output, [1.5, 2.0]);
+        assert_eq!(afs_specific_dreal_c8(&input), 1.5);
     }
 
     #[test]

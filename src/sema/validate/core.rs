@@ -10836,6 +10836,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         | "dconjg"
         | "aimag"
         | "dimag"
+        | "dreal"
         | "acos"
         | "asin"
         | "acosh"

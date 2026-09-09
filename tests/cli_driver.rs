@@ -65181,6 +65181,43 @@ fn fixed_form_dconjg_resolves_declared_and_implicit_intrinsic_forms() {
 }
 
 #[test]
+fn fixed_form_dreal_extracts_double_complex_real_parts() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_dreal_extracts_double_complex_real_parts count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM P\n      IMPLICIT NONE\n      COMPLEX*16 ONE, VALUES(2)\n      DOUBLE PRECISION PARTS(2)\n      PARAMETER (ONE=(1.0D0,0.0D0))\n      VALUES(1) = (3.5D0,-4.5D0)\n      VALUES(2) = (-2.25D0,7.0D0)\n      PARTS = DREAL(VALUES)\n      IF (ABS(PARTS(1)-3.5D0).GT.1.0D-12) STOP\n      IF (ABS(PARTS(2)+2.25D0).GT.1.0D-12) STOP\n      IF (ABS(DREAL(-ONE)+1.0D0).GT.1.0D-12) STOP\n      PRINT *, 'ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_dreal", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form DREAL compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form DREAL compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form DREAL binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "fixed-form DREAL run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_data_accepts_negative_final_value() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

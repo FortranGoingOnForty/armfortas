@@ -1342,6 +1342,7 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "int"
             | "real"
             | "dble"
+            | "dreal"
             | "cmplx"
             | "dcmplx"
             | "logical"
@@ -1505,6 +1506,10 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         "sngl" => matches!(args.first()?, FortranType::Real { .. })
             .then(FortranType::default_real),
         "dble" | "dfloat" => Some(FortranType::double_precision()),
+        "dreal" => match args.first()? {
+            FortranType::Complex { kind: 8 } => Some(FortranType::double_precision()),
+            _ => None,
+        },
         "aimag" => {
             // aimag(complex(k)) → real(k)
             match args.first()? {
@@ -3155,6 +3160,18 @@ mod tests {
     fn dcmplx_returns_complex8() {
         let result = intrinsic_result_type("dcmplx", &[FortranType::Integer { kind: 4 }]).unwrap();
         assert_eq!(result, FortranType::Complex { kind: 8 });
+    }
+
+    #[test]
+    fn dreal_requires_double_complex_and_returns_double_precision() {
+        assert_eq!(
+            intrinsic_result_type("dreal", &[FortranType::Complex { kind: 8 }]),
+            Some(FortranType::double_precision())
+        );
+        assert_eq!(
+            intrinsic_result_type("dreal", &[FortranType::Complex { kind: 4 }]),
+            None
+        );
     }
 
     #[test]

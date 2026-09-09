@@ -506,7 +506,7 @@ pub(crate) fn lower_intrinsic(
                 None
             }
         }
-        "dble" | "dfloat" => {
+        "dble" | "dfloat" | "dreal" => {
             if let Some(arg) = args.first() {
                 let ty = b
                     .func()
