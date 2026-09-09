@@ -29050,6 +29050,52 @@ fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
 }
 
 #[test]
+fn assumed_size_dummy_honors_constant_nondefault_lower_bound() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=assumed_size_dummy_honors_constant_nondefault_lower_bound count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 8.5.8.5: the optional lower bound in an assumed-size spec is
+    // the dummy's lower bound.  LAPACK's RFP routines use both `arf(0:*)`
+    // and `a(0:lda-1,0:*)`.  Pre-fix dimension extraction replaced the
+    // final dimension's declared zero with one, so `arf(0)` wrote one
+    // element before the actual and `a(0,0)` stepped back a full column.
+    let src = write_program(
+        "program p\n  implicit none\n  real :: rank1_values(3), rank2_values(2, 2)\n  rank1_values = -1.0\n  rank2_values = -2.0\n  call write_rank1(rank1_values)\n  call write_rank2(2, rank2_values)\n  if (rank1_values(1) /= 11.0) error stop 1\n  if (rank2_values(1, 1) /= 21.0) error stop 2\n  if (rank2_values(2, 1) /= 22.0) error stop 3\n  print *, 'ok'\nend program\nsubroutine write_rank1(values)\n  implicit none\n  real :: values(0:*)\n  values(0) = 11.0\nend subroutine\nsubroutine write_rank2(lda, values)\n  implicit none\n  integer :: lda\n  real :: values(0:lda-1, 0:*)\n  values(0, 0) = 21.0\n  values(1, 0) = 22.0\nend subroutine\n",
+        "f90",
+    );
+    let out = unique_path("assumed_size_nondefault_lower", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile failed");
+    assert!(
+        compile.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn array_element_actual_to_explicit_shape_dummy_rebases_dummy_descriptor() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
