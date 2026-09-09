@@ -1,6 +1,6 @@
 ! CHECK: ok
 ! IR_CHECK: call @afs_array_abs_complex
-! IR_CHECK: fsqrt
+! IR_CHECK: call @hypotf
 ! IR_CHECK: fcmp le
 ! REPRO_CHECK: run
 ! PHASE_TRIANGULATE: ir|asm|obj|repro
