@@ -40936,6 +40936,86 @@ end program
 }
 
 #[test]
+fn complex_division_avoids_intermediate_overflow_and_underflow() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=complex_division_avoids_intermediate_overflow_and_underflow count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"
+program main
+  use, intrinsic :: iso_fortran_env, only: real32, real64
+  implicit none
+  complex(real32) :: sp_hi, sp_lo, sp(2), sp_q(2), sp_inv
+  complex(real64) :: dp_hi, dp_lo, dp(2), dp_q(2), dp_inv
+
+  sp_hi = cmplx(2.0e30_real32, 2.0e30_real32, kind=real32)
+  sp_lo = cmplx(2.0e-30_real32, 2.0e-30_real32, kind=real32)
+  dp_hi = cmplx(2.0e300_real64, 2.0e300_real64, kind=real64)
+  dp_lo = cmplx(2.0e-300_real64, 2.0e-300_real64, kind=real64)
+
+  if (abs(real(sp_hi / sp_hi) - 1.0_real32) > 1.0e-5_real32) error stop 11
+  if (abs(aimag(sp_hi / sp_hi)) > 1.0e-5_real32) error stop 12
+  if (abs(real(sp_lo / sp_lo) - 1.0_real32) > 1.0e-5_real32) error stop 13
+  if (abs(aimag(sp_lo / sp_lo)) > 1.0e-5_real32) error stop 14
+  if (abs(real(dp_hi / dp_hi) - 1.0_real64) > 1.0e-12_real64) error stop 21
+  if (abs(aimag(dp_hi / dp_hi)) > 1.0e-12_real64) error stop 22
+  if (abs(real(dp_lo / dp_lo) - 1.0_real64) > 1.0e-12_real64) error stop 23
+  if (abs(aimag(dp_lo / dp_lo)) > 1.0e-12_real64) error stop 24
+
+  sp = [sp_hi, sp_lo]
+  dp = [dp_hi, dp_lo]
+  sp_q = sp / sp
+  dp_q = dp / dp
+  if (any(abs(real(sp_q) - 1.0_real32) > 1.0e-5_real32)) error stop 31
+  if (any(abs(aimag(sp_q)) > 1.0e-5_real32)) error stop 32
+  if (any(abs(real(dp_q) - 1.0_real64) > 1.0e-12_real64)) error stop 33
+  if (any(abs(aimag(dp_q)) > 1.0e-12_real64)) error stop 34
+
+  sp_inv = sp_hi**(-1)
+  dp_inv = dp_hi**(-1)
+  if (.not. abs(sp_inv) > 0.0_real32 .or. .not. abs(sp_inv) < 1.0e-29_real32) error stop 41
+  if (.not. abs(dp_inv) > 0.0_real64 .or. .not. abs(dp_inv) < 1.0e-299_real64) error stop 42
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("complex_div_range", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-O0", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("complex division range compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "complex division range program should compile cleanly: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("complex division range run failed");
+    assert!(
+        run.status.success(),
+        "complex division range runtime failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected complex division range output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn complex_sin_cos_intrinsics_use_complex_lanes() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
