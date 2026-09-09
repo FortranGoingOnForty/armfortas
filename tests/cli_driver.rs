@@ -41973,6 +41973,58 @@ fn list_directed_read_unit_real_returns_correct_f32_value() {
 }
 
 #[test]
+fn list_directed_complex_input_consumes_parenthesized_values() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=list_directed_complex_input_consumes_parenthesized_values count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // LAPACK's expert eigenvalue-driver inputs spell each complex list item
+    // as `(real, imaginary)`, often with spaces and D exponents. Complex
+    // destinations used to lower as two independent real reads, so the first
+    // helper received a bare `(` and set iostat=1. Exercise both internal and
+    // external list input, both supported kinds, and a following scalar to
+    // prove each parenthesized pair advances the token cursor exactly once.
+    // Also preserve the distinct explicit-format and unformatted paths that
+    // legitimately consume the two complex lanes separately or as raw bytes.
+    let src = write_program(
+        "program p\n  implicit none\n  complex :: z\n  complex(kind=8) :: zd\n  character(len=96) :: buffer\n  integer :: ios, marker, unit\n\n  buffer = '( 1.25, -2.5), (-3.0D+00, 4.5D-01), 17'\n  z = (-9.0, -9.0)\n  zd = (-9.0_8, -9.0_8)\n  marker = -1\n  read(buffer, *, iostat=ios) z, zd, marker\n  if (ios /= 0) error stop 1\n  if (abs(real(z) - 1.25) > 1.0e-6 .or. abs(aimag(z) + 2.5) > 1.0e-6) error stop 2\n  if (abs(real(zd) + 3.0_8) > 1.0e-12_8 .or. abs(aimag(zd) - 0.45_8) > 1.0e-12_8) error stop 3\n  if (marker /= 17) error stop 4\n\n  open(newunit=unit, status='scratch', action='readwrite')\n  write(unit, '(a)') '( 6.25, 7.5), (8.5D+00, -9.25D+00), 23'\n  rewind(unit)\n  read(unit, *, iostat=ios) z, zd, marker\n  close(unit)\n  if (ios /= 0) error stop 5\n  if (abs(real(z) - 6.25) > 1.0e-6 .or. abs(aimag(z) - 7.5) > 1.0e-6) error stop 6\n  if (abs(real(zd) - 8.5_8) > 1.0e-12_8 .or. abs(aimag(zd) + 9.25_8) > 1.0e-12_8) error stop 7\n  if (marker /= 23) error stop 8\n\n  buffer = '       11.50      -12.75       13.25       14.50'\n  read(buffer, '(4f12.2)', iostat=ios) z, zd\n  if (ios /= 0) error stop 9\n  if (abs(real(z) - 11.5) > 1.0e-6 .or. abs(aimag(z) + 12.75) > 1.0e-6) error stop 10\n  if (abs(real(zd) - 13.25_8) > 1.0e-12_8 .or. abs(aimag(zd) - 14.5_8) > 1.0e-12_8) error stop 11\n\n  z = (15.5, -16.75)\n  zd = (-17.25_8, 18.5_8)\n  marker = 29\n  open(newunit=unit, status='scratch', form='unformatted', action='readwrite')\n  write(unit) z, zd, marker\n  rewind(unit)\n  z = (-9.0, -9.0)\n  zd = (-9.0_8, -9.0_8)\n  marker = -1\n  read(unit, iostat=ios) z, zd, marker\n  close(unit)\n  if (ios /= 0) error stop 12\n  if (abs(real(z) - 15.5) > 1.0e-6 .or. abs(aimag(z) + 16.75) > 1.0e-6) error stop 13\n  if (abs(real(zd) + 17.25_8) > 1.0e-12_8 .or. abs(aimag(zd) - 18.5_8) > 1.0e-12_8) error stop 14\n  if (marker /= 29) error stop 15\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("list_read_complex", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("list-directed complex read compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "list-directed complex read should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("list-directed complex read failed to run");
+    assert!(
+        run.status.success(),
+        "list-directed complex read failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok in output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn list_directed_implied_do_read_observes_record_boundaries() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
