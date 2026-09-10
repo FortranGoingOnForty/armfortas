@@ -29517,6 +29517,100 @@ fn named_inquiry_parameter_constants_survive_cross_tu_import() {
 }
 
 #[test]
+fn sibling_module_inquiries_use_lexical_parameter_type() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sibling_module_inquiries_use_lexical_parameter_type count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // stdlib_blas_constants.f90 defines its SP and DP constant modules in
+    // one source file, with the same local names in each. The module-global
+    // initializer folder must resolve `zero` in the current module instead
+    // of finding the first sibling module's symbol and folding every later
+    // inquiry with that symbol's kind.
+    let dir = unique_dir("sibling_module_inquiry_scope");
+    let kinds_src = write_program_in(
+        &dir,
+        "kinds.f90",
+        "module precision_kinds\n  implicit none\n  integer, parameter :: dp = kind(0.0d0)\nend module precision_kinds\n",
+    );
+    let reexport_src = write_program_in(
+        &dir,
+        "reexport.f90",
+        "module precision_reexport\n  use precision_kinds, only: dp\n  implicit none\nend module precision_reexport\n",
+    );
+    let constants_src = write_program_in(
+        &dir,
+        "constants.f90",
+        "module constants_sp\n  use precision_reexport\n  implicit none\n  real(4), parameter :: zero = 0.0_4\n  integer, parameter :: maxexp = maxexponent(zero)\n  integer, parameter :: minexp = minexponent(zero)\n  real(4), parameter :: ulp = epsilon(zero)\nend module constants_sp\n\nmodule constants_dp\n  use precision_reexport\n  implicit none\n  real(dp), parameter :: zero = 0.0_dp\n  integer, parameter :: maxexp = maxexponent(zero)\n  integer, parameter :: minexp = minexponent(zero)\n  real(dp), parameter :: ulp = epsilon(zero)\nend module constants_dp\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use constants_sp, only: sp_zero => zero, sp_maxexp => maxexp, sp_minexp => minexp, sp_ulp => ulp\n  use constants_dp, only: dp_zero => zero, dp_maxexp => maxexp, dp_minexp => minexp, dp_ulp => ulp\n  implicit none\n  if (kind(sp_zero) /= 4 .or. sp_maxexp /= 128 .or. sp_minexp /= -125) error stop 1\n  if (kind(dp_zero) /= 8 .or. dp_maxexp /= 1024 .or. dp_minexp /= -1021) error stop 2\n  if (sp_ulp /= epsilon(0.0_4)) error stop 3\n  if (dp_ulp /= epsilon(0.0_8)) error stop 4\n  print *, 'ok'\nend program p\n",
+    );
+
+    let compiler = compiler("armfortas");
+    let compile_unit = |source: &std::path::Path, object: &std::path::Path| {
+        let output = Command::new(&compiler)
+            .current_dir(&dir)
+            .arg("-c")
+            .arg("-I")
+            .arg(&dir)
+            .arg("-J")
+            .arg(&dir)
+            .arg(source)
+            .arg("-o")
+            .arg(object)
+            .output()
+            .expect("module-scope inquiry compile failed to spawn");
+        assert!(
+            output.status.success(),
+            "{} should compile: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let kinds_obj = dir.join("kinds.o");
+    let reexport_obj = dir.join("reexport.o");
+    let constants_obj = dir.join("constants.o");
+    let main_obj = dir.join("main.o");
+    compile_unit(&kinds_src, &kinds_obj);
+    compile_unit(&reexport_src, &reexport_obj);
+    compile_unit(&constants_src, &constants_obj);
+    compile_unit(&main_src, &main_obj);
+
+    let exe = dir.join("sibling_module_inquiry_scope.bin");
+    let link = Command::new(&compiler)
+        .args([&kinds_obj, &reexport_obj, &constants_obj, &main_obj])
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("module-scope inquiry link failed to spawn");
+    assert!(
+        link.status.success(),
+        "module-scope inquiry objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("module-scope inquiry binary failed to spawn");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "module-scope inquiry binary failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cross_unit_char_array_result_uses_array_descriptor_abi() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

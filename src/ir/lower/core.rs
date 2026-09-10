@@ -5316,15 +5316,22 @@ pub(super) fn collect_module_globals(
                                 ConstScalar::Float(value) => GlobalInit::Float(value),
                             })
                             .or_else(|| {
-                                eval_const_global_init_with_any_scope(
+                                eval_const_global_init_with_decl_scope(
                                     e,
+                                    decls,
                                     &param_consts,
                                     Some(&ir_ty),
                                     st,
                                 )
                             })
                         } else {
-                            eval_const_global_init(e, &param_consts, Some(&ir_ty))
+                            eval_const_global_init_with_decl_scope(
+                                e,
+                                decls,
+                                &param_consts,
+                                Some(&ir_ty),
+                                st,
+                            )
                         }
                     });
                     let const_value = if is_parameter {
@@ -6430,6 +6437,25 @@ pub(super) fn eval_const_global_init_with_any_scope(
     st: &SymbolTable,
 ) -> Option<GlobalInit> {
     eval_const_scalar_with_any_scope(e, param_consts, st).map(|raw| {
+        let clamped = match target {
+            Some(t) => clamp_const_to_type(raw, t),
+            None => raw,
+        };
+        match clamped {
+            ConstScalar::Int(i) => GlobalInit::Int(i),
+            ConstScalar::Float(f) => GlobalInit::Float(f),
+        }
+    })
+}
+
+fn eval_const_global_init_with_decl_scope(
+    e: &crate::ast::expr::SpannedExpr,
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+    target: Option<&IrType>,
+    st: &SymbolTable,
+) -> Option<GlobalInit> {
+    eval_const_scalar_with_decl_scope(e, decls, param_consts, st).map(|raw| {
         let clamped = match target {
             Some(t) => clamp_const_to_type(raw, t),
             None => raw,
