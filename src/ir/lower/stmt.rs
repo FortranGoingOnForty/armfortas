@@ -4743,6 +4743,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     explicit_dtio_edits.as_deref(),
                     iostat_ptr,
                     Some((iomsg_arg, iomsg_len)),
+                    (iomsg_ptr, iomsg_len),
                 ) {
                     lower_write_status_completion(
                         b,
@@ -4792,6 +4793,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     None,
                     iostat_ptr,
                     Some((iomsg_arg, iomsg_len)),
+                    (iomsg_ptr, iomsg_len),
                 ) {
                     lower_write_status_completion(
                         b,
@@ -5274,6 +5276,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                 explicit_dtio_edits.as_deref(),
                 iostat_ptr,
                 dtio_iomsg,
+                (iomsg_ptr, iomsg_len),
             ) {
                 finish_external_write_positioning(b, positioning_done);
                 lower_write_status_completion(

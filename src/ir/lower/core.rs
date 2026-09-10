@@ -36149,6 +36149,7 @@ pub(super) fn try_lower_defined_io_write_items(
     explicit_edits: Option<&[DefinedIoEdit]>,
     iostat: ValueId,
     iomsg: Option<(ValueId, ValueId)>,
+    runtime_iomsg: (ValueId, ValueId),
 ) -> bool {
     if items.is_empty() {
         return false;
@@ -36171,6 +36172,16 @@ pub(super) fn try_lower_defined_io_write_items(
         None
     };
     let (iomsg_arg, iomsg_len) = iomsg.unwrap_or_else(|| scratch_char_slot_arg(b));
+    let (runtime_iomsg_arg, runtime_iomsg_len) = runtime_iomsg;
+    // The enclosing transfer owns the output record. Defined-I/O procedures
+    // may issue multiple child WRITEs on the same unit; keeping this outer
+    // scope open lets every child append before the runtime emits framing.
+    b.call(
+        FuncRef::External("afs_list_write_begin".into()),
+        vec![unit, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
+
     let done = b.create_block("defined_write_done");
     lower_io_status_continue_or_exit(b, iostat, done);
 
@@ -36198,6 +36209,12 @@ pub(super) fn try_lower_defined_io_write_items(
     }
     b.branch(done, vec![]);
     b.set_block(done);
+    let advance = b.const_i32(1);
+    b.call(
+        FuncRef::External("afs_list_write_end".into()),
+        vec![unit, advance, iostat, runtime_iomsg_arg, runtime_iomsg_len],
+        IrType::Void,
+    );
     true
 }
 
