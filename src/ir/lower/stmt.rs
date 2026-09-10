@@ -10743,20 +10743,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                             ) {
                                 let (link_name, resolved_key) =
                                     resolved_symbol_call_target(ctx.st, &src_key, src_name);
-                                let lowered_name = if ctx.internal_funcs.contains_key(&resolved_key)
-                                    || ctx.internal_funcs.contains_key(&src_key)
-                                {
-                                    lowered_procedure_symbol_name(
-                                        resolved_key.as_str(),
-                                        None,
-                                        Some(b.func().name.as_str()),
-                                        None,
-                                        true,
-                                        ctx.internal_funcs,
-                                    )
-                                } else {
-                                    link_name
-                                };
+                                let lowered_name = lowered_internal_procedure_symbol_for_caller(
+                                    ctx.st,
+                                    ctx.internal_funcs,
+                                    &[&resolved_key, &src_key],
+                                )
+                                .unwrap_or(link_name);
                                 let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
                                 let mut closure_args = procedure_dummy_closure_args_from_locals(
                                     b,
@@ -11254,20 +11246,12 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                     ) {
                         let (link_name, resolved_key) =
                             resolved_symbol_call_target(ctx.st, &src_key, src_name);
-                        let lowered_name = if ctx.internal_funcs.contains_key(&resolved_key)
-                            || ctx.internal_funcs.contains_key(&src_key)
-                        {
-                            lowered_procedure_symbol_name(
-                                resolved_key.as_str(),
-                                None,
-                                Some(b.func().name.as_str()),
-                                None,
-                                true,
-                                ctx.internal_funcs,
-                            )
-                        } else {
-                            link_name
-                        };
+                        let lowered_name = lowered_internal_procedure_symbol_for_caller(
+                            ctx.st,
+                            ctx.internal_funcs,
+                            &[&resolved_key, &src_key],
+                        )
+                        .unwrap_or(link_name);
                         let addr = b.global_addr(
                             &lowered_name,
                             procedure_pointer_symbol_addr_elem_type(&tgt_info),

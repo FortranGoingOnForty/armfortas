@@ -53743,6 +53743,45 @@ fn same_named_contained_callbacks_keep_distinct_host_closures() {
 }
 
 #[test]
+fn sibling_contained_callback_actual_uses_owner_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sibling_contained_callback_actual_uses_owner_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module callbacks_m\n  implicit none\n  abstract interface\n    function unary(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n    end function\n  end interface\ncontains\n  subroutine apply(fun, got)\n    procedure(unary) :: fun\n    real(8), intent(out) :: got\n    got = fun(3.0d0)\n  end subroutine\nend module\n\nprogram p\n  use callbacks_m\n  implicit none\n  call test()\ncontains\n  subroutine test()\n    real(8) :: got\n    call apply(square, got)\n    if (got /= 9.0d0) error stop 1\n  end subroutine\n\n  function square(x) result(y)\n    real(8), intent(in) :: x\n    real(8) :: y\n    y = x * x\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sibling_contained_callback_owner", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sibling contained callback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sibling contained callback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("sibling contained callback run failed");
+    assert!(
+        run.status.success(),
+        "sibling contained callback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_dummy_assigned_to_procptr_component_preserves_host_closure() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

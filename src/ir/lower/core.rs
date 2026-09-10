@@ -20289,6 +20289,17 @@ pub(super) fn lowered_scope_symbol_name(
     }
 }
 
+pub(super) fn lowered_internal_procedure_symbol_for_caller(
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    candidate_names: &[&str],
+) -> Option<String> {
+    candidate_names.iter().find_map(|name| {
+        find_procedure_scope_id_for_caller_strict(st, name, current_proc_scope())
+            .and_then(|scope_id| lowered_scope_symbol_name(st, internal_funcs, scope_id))
+    })
+}
+
 pub(super) fn same_unit_func_ref(
     st: &SymbolTable,
     _current_func_name: &str,
@@ -62617,15 +62628,11 @@ pub(super) fn store_derived_field_expr(
                         let (link_name, resolved_key) =
                             resolved_symbol_call_target(st, &src_key, src_name);
                         let lowered_name = internal_funcs
-                            .filter(|m| m.contains_key(&resolved_key) || m.contains_key(&src_key))
-                            .map(|m| {
-                                lowered_procedure_symbol_name(
-                                    resolved_key.as_str(),
-                                    None,
-                                    Some(b.func().name.as_str()),
-                                    None,
-                                    true,
+                            .and_then(|m| {
+                                lowered_internal_procedure_symbol_for_caller(
+                                    st,
                                     m,
+                                    &[&resolved_key, &src_key],
                                 )
                             })
                             .unwrap_or(link_name);
@@ -62685,15 +62692,11 @@ pub(super) fn store_derived_field_expr(
                         let (link_name, resolved_key) =
                             resolved_symbol_call_target(st, &src_key, src_name);
                         let lowered_name = internal_funcs
-                            .filter(|m| m.contains_key(&resolved_key) || m.contains_key(&src_key))
-                            .map(|m| {
-                                lowered_procedure_symbol_name(
-                                    resolved_key.as_str(),
-                                    None,
-                                    Some(b.func().name.as_str()),
-                                    None,
-                                    true,
+                            .and_then(|m| {
+                                lowered_internal_procedure_symbol_for_caller(
+                                    st,
                                     m,
+                                    &[&resolved_key, &src_key],
                                 )
                             })
                             .unwrap_or(link_name);
@@ -65402,17 +65405,11 @@ pub(super) fn lower_arg_by_ref_full(
             if is_linkable_callable_symbol(sym) {
                 let (link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
                 if let Some(internal_funcs) = internal_funcs {
-                    if internal_funcs.contains_key(&resolved_key)
-                        || internal_funcs.contains_key(&key)
-                    {
-                        let lowered = lowered_procedure_symbol_name(
-                            resolved_key.as_str(),
-                            None,
-                            Some(b.func().name.as_str()),
-                            None,
-                            true,
-                            internal_funcs,
-                        );
+                    if let Some(lowered) = lowered_internal_procedure_symbol_for_caller(
+                        st,
+                        internal_funcs,
+                        &[&resolved_key, &key],
+                    ) {
                         return b.global_addr(&lowered, IrType::Int(IntWidth::I8));
                     }
                 }
