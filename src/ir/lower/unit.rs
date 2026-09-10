@@ -410,6 +410,11 @@ pub(crate) fn lower_unit(
             };
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
+            // Signature construction resolves named kinds in dummy declarations.
+            // Install the lexical scope before building the ABI, not only later
+            // while lowering the body: sibling procedures may each rename a
+            // different imported kind to the same local name.
+            let _unit_proc_scope_guard = ProcScopeGuard::enter(proc_scope_id);
             let func_name = lowered_procedure_symbol_name(
                 name,
                 proc_scope_id.and_then(|scope_id| st.scope(scope_id).binding_label.as_deref()),
@@ -913,6 +918,11 @@ pub(crate) fn lower_unit(
         } => {
             let proc_scope_id =
                 procedure_scope_for_dummy_args_with_host(st, name, args, host_scope_id);
+            // Keep kind-selector lookup lexical throughout signature/result ABI
+            // construction.  The narrower body guards below remain useful at
+            // the mutation-heavy lowering sites, while this guard covers the
+            // declarations evaluated before those sites are entered.
+            let _unit_proc_scope_guard = ProcScopeGuard::enter(proc_scope_id);
             let is_bind_c = proc_scope_id
                 .map(|scope_id| st.scope(scope_id).bind_c)
                 .unwrap_or_else(|| bind.is_some());

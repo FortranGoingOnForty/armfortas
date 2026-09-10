@@ -26836,6 +26836,144 @@ fn module_parameter_bit_size_with_imported_renamed_kind_folds_to_correct_value()
 }
 
 #[test]
+fn sibling_contained_functions_resolve_their_own_renamed_kind() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sibling_contained_functions_resolve_their_own_renamed_kind count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // LAPACK's LA_XISNAN has single- and double-precision module functions,
+    // each with a contained helper, and each renames its imported kind to
+    // `wp`. Signature lowering used to search every scope for `wp` before it
+    // installed the current procedure scope, so the first sibling's SP alias
+    // silently controlled the DP sibling and its nested helper.
+    let dir = unique_dir("sibling_contained_renamed_kind");
+    let kinds_src = write_program_in(
+        &dir,
+        "kinds.f90",
+        "module kinds\n  implicit none\n  integer, parameter :: sp = kind(0.0e0)\n  integer, parameter :: dp = kind(0.0d0)\nend module kinds\n",
+    );
+    let predicates_src = write_program_in(
+        &dir,
+        "predicates.f90",
+        r#"module predicates
+  interface is_nan
+    module procedure sisnan
+    module procedure disnan
+  end interface
+contains
+  logical function sisnan(x)
+    use kinds, only : wp => sp
+    real(wp) :: x
+    sisnan = slocal(x, x)
+  contains
+    logical function slocal(x, y)
+      use kinds, only : wp => sp
+      real(wp) :: x, y
+      slocal = (x /= y)
+    end function slocal
+  end function sisnan
+
+  logical function disnan(x)
+    use kinds, only : wp => dp
+    real(wp) :: x
+    disnan = dlocal(x, x)
+  contains
+    logical function dlocal(x, y)
+      use kinds, only : wp => dp
+      real(wp) :: x, y
+      dlocal = (x /= y)
+    end function dlocal
+  end function disnan
+end module predicates
+"#,
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        r#"program p
+  use predicates, only : is_nan
+  implicit none
+  real(8) :: x
+  ! This finite f64 has a NaN bit pattern in its low 32 bits. A mistaken
+  ! f32 load therefore makes x /= x spuriously true.
+  x = 24.999999999999996d0
+  if (is_nan(x)) error stop 1
+  print *, 'ok'
+end program p
+"#,
+    );
+
+    let kinds_obj = dir.join("kinds.o");
+    let kinds_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-J"])
+        .arg(&dir)
+        .arg(&kinds_src)
+        .args(["-o"])
+        .arg(&kinds_obj)
+        .output()
+        .expect("kind module compile failed to spawn");
+    assert!(
+        kinds_compile.status.success(),
+        "kind module should compile: {}",
+        String::from_utf8_lossy(&kinds_compile.stderr)
+    );
+
+    let predicates_obj = dir.join("predicates.o");
+    let predicates_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-I"])
+        .arg(&dir)
+        .args(["-J"])
+        .arg(&dir)
+        .arg(&predicates_src)
+        .args(["-o"])
+        .arg(&predicates_obj)
+        .output()
+        .expect("predicate module compile failed to spawn");
+    assert!(
+        predicates_compile.status.success(),
+        "predicate module should compile: {}",
+        String::from_utf8_lossy(&predicates_compile.stderr)
+    );
+
+    let exe = dir.join("sibling_contained_renamed_kind.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-I"])
+        .arg(&dir)
+        .arg(&main_src)
+        .arg(&predicates_obj)
+        .arg(&kinds_obj)
+        .args(["-o"])
+        .arg(&exe)
+        .output()
+        .expect("renamed-kind reproducer compile failed to spawn");
+    assert!(
+        link.status.success(),
+        "renamed-kind reproducer should compile and link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("renamed-kind reproducer failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "renamed-kind reproducer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn logical_int8_array_scalar_broadcast_init_fills_every_element() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

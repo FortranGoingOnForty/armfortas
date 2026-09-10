@@ -23063,7 +23063,7 @@ pub(super) fn named_kind_value(
             .or_else(|| kind_from_param_consts(kind_name, param_consts))
             .or_else(|| {
                 st.and_then(|st| {
-                    st.find_symbol_any_scope(&kind_name.to_ascii_lowercase())
+                    st.lookup_local_then_any(current_proc_scope(), &kind_name.to_ascii_lowercase())
                         .and_then(|sym| sym.const_value)
                         .and_then(|v| u8::try_from(v).ok())
                 })
