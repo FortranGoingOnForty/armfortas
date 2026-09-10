@@ -50606,6 +50606,50 @@ fn procedure_dummy_with_explicit_interface_indirect_call_links_and_runs() {
 }
 
 #[test]
+fn procedure_dummy_array_result_participates_in_binary_expression() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_array_result_participates_in_binary_expression count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    function array_callback(x) result(y)\n      real(8), intent(in) :: x(:)\n      real(8) :: y(size(x))\n    end function array_callback\n  end interface\ncontains\n  subroutine evaluate(callback, x, output)\n    procedure(array_callback) :: callback\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: output(size(x))\n    output = x - callback(x)\n  end subroutine evaluate\n\n  function twice(x) result(y)\n    real(8), intent(in) :: x(:)\n    real(8) :: y(size(x))\n    y = 2.0_8 * x\n  end function twice\nend module m\nprogram p\n  use m\n  implicit none\n  real(8) :: x(3), output(3)\n  x = [1.0_8, 2.0_8, 3.0_8]\n  call evaluate(twice, x, output)\n  if (any(abs(output - [-1.0_8, -2.0_8, -3.0_8]) > 1.0e-12_8)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("procedure_dummy_array_result_binary", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure-dummy array-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure-dummy array-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure-dummy array-result run failed");
+    assert!(
+        run.status.success(),
+        "procedure-dummy array-result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected procedure-dummy array-result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn new_line_intrinsic_links_and_runs_in_runtime_char_context() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

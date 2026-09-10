@@ -47078,8 +47078,19 @@ pub(super) fn array_function_result_elem_type(
             {
                 return None;
             }
-            if procedure_pointer_call_target(b, locals, st, &key).is_some() {
-                return None;
+            // Procedure dummies/pointers inherit their declared result shape
+            // and element type from the explicit interface during semantic
+            // resolution.  Use that metadata to classify array-valued
+            // indirect calls without loading the runtime code pointer as a
+            // speculative side effect.  The old early return here forced an
+            // array result through scalar expression lowering whenever it
+            // appeared in a binary expression (for example `x - callback(x)`).
+            if procedure_pointer_signature_key(st, &key).is_some() {
+                let symbol = st.lookup_local_then_any(current_proc_scope(), &key)?;
+                if symbol.attrs.result_rank == 0 {
+                    return None;
+                }
+                return callee_symbol_ir_type(symbol);
             }
 
             let arg_slots = reorder_args_by_keyword_slots(args, &key, st);
