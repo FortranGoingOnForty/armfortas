@@ -25657,6 +25657,108 @@ fn imported_nested_derived_defaults_round_trip_through_amod_and_run() {
 }
 
 #[test]
+fn imported_derived_huge_default_round_trips_through_amod_and_runs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_derived_huge_default_round_trips_through_amod_and_runs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // rklib defaults rk_class%max_number_of_steps to HUGE(1). The derived
+    // layout folder used to omit that inquiry expression from the .amod,
+    // leaving separately compiled consumers with uninitialized storage and
+    // causing the canonical integrator example to stop after two steps.
+    let dir = unique_dir("derived_huge_default_amod");
+    let mod_src = write_program_in(
+        &dir,
+        "limits_mod.f90",
+        "module limits_mod\n  implicit none\n  type, public :: limits_t\n    integer :: max_steps = huge(1)\n  end type limits_t\nend module limits_mod\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use limits_mod, only: limits_t\n  implicit none\n  type(limits_t) :: limits\n  if (limits%max_steps /= huge(1)) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+
+    let mod_obj = dir.join("limits_mod.o");
+    let compile_mod = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            mod_src.to_str().unwrap(),
+            "-o",
+            mod_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("limits module compile spawn failed");
+    assert!(
+        compile_mod.status.success(),
+        "limits module should compile: {}",
+        String::from_utf8_lossy(&compile_mod.stderr)
+    );
+
+    let amod_text =
+        std::fs::read_to_string(dir.join("limits_mod.amod")).expect("missing limits_mod.amod");
+    assert!(
+        amod_text.contains("@init=int:2147483647"),
+        "HUGE component default should be exported to .amod: {}",
+        amod_text
+    );
+
+    let main_obj = dir.join("main.o");
+    let compile_main = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-o",
+            main_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("main compile spawn failed");
+    assert!(
+        compile_main.status.success(),
+        "imported limits type should compile: {}",
+        String::from_utf8_lossy(&compile_main.stderr)
+    );
+
+    let exe = dir.join("derived_huge_default.bin");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            mod_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("link spawn failed");
+    assert!(
+        link.status.success(),
+        "derived HUGE default objects should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "imported derived HUGE default should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn any_on_vector_subscripted_char_array_compare_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
