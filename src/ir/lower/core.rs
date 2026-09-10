@@ -65304,6 +65304,29 @@ pub(super) fn lower_sequence_array_actual(
     copy_back: bool,
     temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
+    // A fixed inline array component of a scalar derived object is already a
+    // contiguous storage sequence.  Keep its real address so an explicit-
+    // shape dummy can apply sequence association beyond the component's
+    // apparent rank/extent.  Materializing a descriptor-sized copy here is
+    // not equivalent: `arr(1)%mpr` in MPFUN is one 146-word component, while
+    // the rank-2 dummy intentionally continues through ten adjacent SEQUENCE
+    // records.  A four/146-element temporary leaves the callee walking past
+    // its allocation.  Projected, pointer, and descriptor-backed components
+    // remain on the conservative copy path below.
+    if matches!(expr.node, Expr::ComponentAccess { .. }) {
+        if let Some(info) = type_layouts
+            .and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
+        {
+            if !info.dims.is_empty()
+                && !local_uses_array_descriptor(&info)
+                && !info.is_pointer
+                && sequence_supported_elem_ty(&info.ty)
+            {
+                return Some(array_data_ptr_for_call(b, &info));
+            }
+        }
+    }
+
     if proven_contiguous_sequence_section_actual(locals, expr) {
         let (source_desc, elem_ty) = lower_array_expr_descriptor(
             b,

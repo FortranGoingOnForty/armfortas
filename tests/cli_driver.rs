@@ -60003,6 +60003,50 @@ fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
 }
 
 #[test]
+fn sequence_association_keeps_fixed_component_array_storage_direct() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sequence_association_keeps_fixed_component_array_storage_direct count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 15.5.2.11 sequence association: the storage sequence beginning
+    // at blocks(1)%words continues into the next SEQUENCE record because the
+    // component is the record's sole inline field.  A rank-remapping
+    // explicit-shape dummy may therefore read the second record.  Copying
+    // only the four-element component into a temporary leaves the rank-2
+    // dummy walking beyond that temporary, as MPFUN's mppolylogini did for
+    // arr(1)%mpr.
+    let src = write_program(
+        "module blocks_m\n  implicit none\n  type :: block_t\n    sequence\n    integer(8) :: words(0:3)\n  end type\ncontains\n  subroutine read_second(data, value)\n    integer(8), intent(in) :: data(0:3, 2)\n    integer(8), intent(out) :: value\n    value = data(0, 2)\n  end subroutine\n  subroutine inspect(blocks, value)\n    type(block_t), intent(in) :: blocks(2)\n    integer(8), intent(out) :: value\n    call read_second(blocks(1)%words, value)\n  end subroutine\nend module\nprogram p\n  use blocks_m\n  implicit none\n  type(block_t) :: blocks(2)\n  integer(8) :: value\n  blocks(1)%words = [11_8, 12_8, 13_8, 14_8]\n  blocks(2)%words = [21_8, 22_8, 23_8, 24_8]\n  call inspect(blocks, value)\n  if (value /= 21_8) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sequence_fixed_component_direct", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("component sequence compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "component sequence compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("component sequence run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "component sequence run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn defined_assignment_derived_dummy_lhs_loads_caller_storage_through_slot() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
