@@ -31330,6 +31330,45 @@ fn where_array_function_result_reads_materialize_before_scalarization() {
 }
 
 #[test]
+fn spaced_else_where_executes_unmasked_branch() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=spaced_else_where_executes_unmasked_branch count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // rklib uses the spaced ELSE WHERE spelling while computing element-wise
+    // relative errors.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: input(3), output(3)\n  input = [2, 0, -4]\n  where (input /= 0)\n    output = 8 / input\n  else where\n    output = 99\n  end where\n  if (any(output /= [4, 99, -2])) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("spaced_else_where", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spaced ELSE WHERE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "spaced ELSE WHERE should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("spaced ELSE WHERE failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "spaced ELSE WHERE failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
