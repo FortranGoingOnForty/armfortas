@@ -828,7 +828,7 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::LParen)?;
                 let op = self.advance().clone().text;
                 self.expect(&TokenKind::RParen)?;
-                name = format!("{}({})", name, op);
+                name = crate::ast::canonical_generic_spec_name(&format!("{}({})", name, op));
                 is_generic_spec = true;
             } else if (name.eq_ignore_ascii_case("read") || name.eq_ignore_ascii_case("write"))
                 && self.peek() == &TokenKind::LParen
@@ -1361,7 +1361,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::LParen)?;
             let op = self.advance().clone().text;
             self.expect(&TokenKind::RParen)?;
-            name = format!("{}({})", name, op);
+            name = crate::ast::canonical_generic_spec_name(&format!("{}({})", name, op));
         }
         let mut bindings = Vec::new();
         if self.eat(&TokenKind::Arrow) {
@@ -2264,13 +2264,16 @@ end type item",
 
     #[test]
     fn use_only_generic_specs() {
-        let d = parse_decl("use my_module, only: operator(+), operator(//), assignment(=)");
+        let d = parse_decl(
+            "use my_module, only: operator(+), operator(//), operator(.ne.), assignment(=)",
+        );
         if let Decl::UseStmt { only, .. } = &d.node {
             let items = only.as_ref().unwrap();
-            assert_eq!(items.len(), 3);
+            assert_eq!(items.len(), 4);
             assert!(matches!(&items[0], OnlyItem::Generic(name) if name == "operator(+)"));
             assert!(matches!(&items[1], OnlyItem::Generic(name) if name == "operator(//)"));
-            assert!(matches!(&items[2], OnlyItem::Generic(name) if name == "assignment(=)"));
+            assert!(matches!(&items[2], OnlyItem::Generic(name) if name == "operator(/=)"));
+            assert!(matches!(&items[3], OnlyItem::Generic(name) if name == "assignment(=)"));
         } else {
             panic!("not UseStmt");
         }

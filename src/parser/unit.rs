@@ -704,7 +704,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            Some(format!("{}({})", op_kw, op))
+            Some(crate::ast::canonical_generic_spec_name(&format!(
+                "{}({})",
+                op_kw, op
+            )))
         } else if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
         } else {
@@ -1377,7 +1380,10 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(Some(format!("{}({})", generic_kw, op)))
+        Ok(Some(crate::ast::canonical_generic_spec_name(&format!(
+            "{}({})",
+            generic_kw, op
+        ))))
     }
 
     fn parse_contains_section(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {
@@ -2740,6 +2746,18 @@ end module malformed_m
         if let ProgramUnit::InterfaceBlock { name, bodies, .. } = &u.node {
             assert_eq!(name.as_deref(), Some("operator(+)"));
             assert_eq!(bodies.len(), 1);
+        } else {
+            panic!("not InterfaceBlock");
+        }
+    }
+
+    #[test]
+    fn interface_dotted_relational_operator_uses_canonical_name() {
+        let u = parse_unit(
+            "interface operator(.eq.)\n  module procedure eq_mixed\nend interface operator(.eq.)\n",
+        );
+        if let ProgramUnit::InterfaceBlock { name, .. } = &u.node {
+            assert_eq!(name.as_deref(), Some("operator(==)"));
         } else {
             panic!("not InterfaceBlock");
         }

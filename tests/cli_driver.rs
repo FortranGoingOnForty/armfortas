@@ -23802,6 +23802,105 @@ fn merged_generic_keeps_same_named_specifics_scoped_to_owner_module() {
 }
 
 #[test]
+fn merged_operator_keeps_private_same_named_specifics_scoped_to_owner_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_operator_keeps_private_same_named_specifics_scoped_to_owner_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("merged_operator_private_owner_scope");
+    let standard_src = write_program_in(
+        &dir,
+        "standard_ops.f90",
+        "module standard_ops\n  implicit none\n  private :: eq_mixed\n  public :: full_t, rk, operator(.eq.)\n  integer, parameter :: rk = 8\n  type :: full_t\n    integer :: tag = 1\n  end type\n  interface operator(.eq.)\n    module procedure :: eq_mixed\n  end interface\ncontains\n  logical function eq_mixed(lhs, rhs) result(ok)\n    complex(8), intent(in) :: lhs\n    type(full_t), intent(in) :: rhs\n    ok = real(lhs, 8) == rhs%tag\n  end function\nend module\n",
+    );
+    let medium_src = write_program_in(
+        &dir,
+        "medium_ops.f90",
+        "module medium_ops\n  use standard_ops\n  implicit none\n  private :: eq_mixed\n  public :: medium_t, operator(.eq.)\n  type :: medium_t\n    integer :: tag = 2\n  end type\n  interface operator(.eq.)\n    module procedure :: eq_mixed\n  end interface\ncontains\n  logical function eq_mixed(lhs, rhs) result(ok)\n    complex(8), intent(in) :: lhs\n    type(medium_t), intent(in) :: rhs\n    ok = real(lhs, 8) == rhs%tag\n  end function\nend module\n",
+    );
+    let facade_src = write_program_in(
+        &dir,
+        "facade.f90",
+        "module facade\n  use standard_ops\n  use medium_ops\n  implicit none\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use facade\n  implicit none\n  complex(rk) :: value\n  type(full_t) :: full\n  type(medium_t) :: medium\n  value = cmplx(1.0_8, 0.0_8, rk)\n  if (.not. (value == full)) error stop 1\n  value = cmplx(2.0_8, 0.0_8, rk)\n  if (.not. (value == medium)) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let standard_obj = dir.join("standard_ops.o");
+    let medium_obj = dir.join("medium_ops.o");
+    let facade_obj = dir.join("facade.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_operator_private_owner_scope.bin");
+
+    for (src, obj, needs_i) in [
+        (&standard_src, &standard_obj, false),
+        (&medium_src, &medium_obj, true),
+        (&facade_src, &facade_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged operator owner-scope compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            standard_obj.to_str().unwrap(),
+            medium_obj.to_str().unwrap(),
+            facade_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("merged operator owner-scope link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged operator owner-scope should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "merged operator owner-scope run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected merged operator owner-scope output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn intrinsic_len_falls_back_when_visible_generic_len_does_not_match() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -37000,7 +37099,9 @@ fn standalone_optional_statement_preserves_absent_dummy() {
         "standalone OPTIONAL compile failed: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let run = Command::new(&out).output().expect("standalone OPTIONAL run failed");
+    let run = Command::new(&out)
+        .output()
+        .expect("standalone OPTIONAL run failed");
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "standalone OPTIONAL run failed: status={:?} stdout={} stderr={}",
