@@ -5111,6 +5111,18 @@ fn validate_decls(ctx: &mut Ctx, decls: &[crate::ast::decl::SpannedDecl]) {
             let _ = entities; // entities checked individually if needed
         }
 
+        if ctx.in_pure
+            && matches!(
+                decl.node,
+                Decl::AttributeStmt {
+                    attr: Attribute::Save,
+                    ..
+                }
+            )
+        {
+            ctx.error(decl.span, "SAVE statement not allowed in pure procedure");
+        }
+
         if matches!(decl.node, Decl::ImplicitNone { .. }) {
             ctx.require_std(decl.span, FortranStandard::F90, "IMPLICIT NONE");
         }
@@ -17565,6 +17577,22 @@ end function
 pure subroutine foo(x)
   real, intent(in) :: x
   real, save :: counter
+end subroutine
+",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("SAVE") && e.contains("pure")));
+    }
+
+    #[test]
+    fn bare_save_in_pure_errors() {
+        let errs = errors_from(
+            "\
+pure subroutine foo(x)
+  real, intent(in) :: x
+  real :: counter
+  save
 end subroutine
 ",
         );

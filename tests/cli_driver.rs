@@ -66446,3 +66446,80 @@ fn contained_save_explicit_shape_array_uses_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_scalar_save_forms_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_scalar_save_forms_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Recursion makes the storage-duration distinction deterministic: a
+    // stack local in the inner activation must not alias the value assigned
+    // by the outer activation. Cover the declaration attribute, standalone
+    // entity statement, scope-wide bare statement, and the existing fixed
+    // CHARACTER path together.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: got\n  character(len=8) :: text\n  call direct_save(0, got)\n  if (got /= 73) error stop 1\n  call named_save(0, got)\n  if (got /= 91) error stop 2\n  call bare_save(0, got)\n  if (got /= 117) error stop 3\n  call character_save(0, text)\n  if (text /= 'persist!') error stop 4\n  print *, 'ok'\ncontains\n  recursive subroutine direct_save(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer, save :: value\n    if (stage == 0) then\n      value = 73\n      call direct_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine direct_save\n\n  recursive subroutine named_save(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer :: value\n    save :: value\n    if (stage == 0) then\n      value = 91\n      call named_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine named_save\n\n  recursive subroutine bare_save(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer :: value\n    save\n    if (stage == 0) then\n      value = 117\n      call bare_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine bare_save\n\n  recursive subroutine character_save(stage, out)\n    integer, intent(in) :: stage\n    character(len=8), intent(out) :: out\n    character(len=8), save :: value\n    if (stage == 0) then\n      value = 'persist!'\n      call character_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine character_save\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_scalar_save_forms", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalar SAVE forms IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "scalar SAVE forms IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read scalar SAVE forms IR");
+    let saved_integer_globals = ir_text
+        .lines()
+        .filter(|line| line.contains("global @afs_save_") && line.contains(": i32 = zeroinit"))
+        .count();
+    assert_eq!(
+        saved_integer_globals, 3,
+        "all three integer SAVE forms must use zero-initialized static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains(": [i8 x 9]")),
+        "fixed CHARACTER SAVE storage regressed:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_scalar_save_forms", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar SAVE forms compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar SAVE forms compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar SAVE forms binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scalar SAVE forms run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

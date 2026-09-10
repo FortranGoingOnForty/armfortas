@@ -173,6 +173,15 @@ pub(crate) fn alloc_decls(
         st,
         current_proc_scope(),
     );
+    let save_all = decls.iter().any(|decl| {
+        matches!(
+            &decl.node,
+            Decl::AttributeStmt {
+                attr: Attribute::Save,
+                entities,
+            } if entities.is_empty()
+        )
+    });
 
     for decl in decls {
         if let Decl::TypeDecl {
@@ -222,6 +231,7 @@ pub(crate) fn alloc_decls(
                     .or_else(|| parameter_inits.get(&key).copied());
                 let is_parameter = attrs.iter().any(|a| matches!(a, Attribute::Parameter))
                     || parameter_inits.contains_key(&key);
+                let is_saved = save_all || attrs.iter().any(|a| matches!(a, Attribute::Save));
 
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
@@ -681,10 +691,9 @@ pub(crate) fn alloc_decls(
                         // value still occupies the first N bytes.
                         let buf_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (len + 1) as u64);
-                        let is_save_attr = attrs.iter().any(|a| matches!(a, Attribute::Save));
                         if !is_parameter
                             && array_spec.is_none()
-                            && (is_save_attr || init_expr.is_some())
+                            && (is_saved || init_expr.is_some())
                         {
                             let mut bytes = vec![b' '; len.max(0) as usize + 1];
                             let mut const_init = init_expr.is_none();
@@ -1026,11 +1035,10 @@ pub(crate) fn alloc_decls(
                     // and the large-array descriptor/heap path: recreating either
                     // form on every procedure entry loses values between calls.
                     // An initializer implies SAVE too (F2018 8.5.16.4).
-                    let is_save_attr = attrs.iter().any(|a| matches!(a, Attribute::Save));
                     let static_init = if !is_parameter
                         && total_size > 0
                         && array_derived_type.is_none()
-                        && (is_save_attr || init_expr.is_some())
+                        && (is_saved || init_expr.is_some())
                     {
                         match init_expr {
                             Some(expr) => eval_const_array_init(
@@ -1399,9 +1407,13 @@ pub(crate) fn alloc_decls(
                         // semantics are preserved.
                     }
 
-                    if let Some(init) = init_expr
+                    let static_init = init_expr
                         .and_then(|e| eval_const_global_init(e, &param_consts, Some(&elem_ty)))
-                    {
+                        .or_else(|| {
+                            (!is_parameter && is_saved && init_expr.is_none())
+                                .then_some(GlobalInit::Zero)
+                        });
+                    if let Some(init) = static_init {
                         let global_name = save_global_name(func_name, &key);
                         pending_globals.push(PendingGlobal {
                             global: Global {

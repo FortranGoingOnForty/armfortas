@@ -1171,7 +1171,13 @@ impl<'a> Parser<'a> {
                             // /common-block-name/ — consume bracketing slashes.
                             self.advance();
                             if self.peek() == &TokenKind::Identifier {
-                                entities.push(self.advance().clone().text);
+                                let name = self.advance().clone().text;
+                                // Keep common-block names distinguishable from
+                                // ordinary saved entities after parsing. A bare
+                                // string loses the slashes and could otherwise
+                                // be folded onto an unrelated variable with the
+                                // same name by `fold_attribute_statements`.
+                                entities.push(format!("/{name}/"));
                             }
                             self.expect(&TokenKind::Slash)?;
                         } else if self.peek() == &TokenKind::Identifier {
@@ -1517,9 +1523,10 @@ impl<'a> Parser<'a> {
 /// `integer :: z` and `integer, allocatable :: y`. An entity with no type
 /// declaration in this scope — e.g. a function result typed by its function
 /// statement — has no fold target, so its statement remains available for
-/// semantic resolution. Lowering normalizes semantically typed standalone
-/// VOLATILE entities later; other result-attribute ABIs remain separate
-/// concerns.
+/// semantic resolution. A bare SAVE is scope-wide rather than entity-specific,
+/// so it remains as an AttributeStmt. Lowering normalizes semantically typed
+/// standalone VOLATILE entities later; other result-attribute ABIs remain
+/// separate concerns.
 fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
     use crate::ast::decl::{Attribute, Decl};
     let mut i = 0;
@@ -1534,7 +1541,8 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
                         | Attribute::Volatile
                         | Attribute::External
                         | Attribute::Intrinsic
-                ) =>
+                        | Attribute::Save
+                ) && (!matches!(attr, Attribute::Save) || !entities.is_empty()) =>
             {
                 (attr.clone(), entities.clone())
             }
@@ -1545,7 +1553,12 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
         };
         let unfolded: Vec<String> = entities
             .into_iter()
-            .filter(|name| !crate::ast::decl::fold_attribute_into_type_decl(decls, name, &attr))
+            .filter(|name| {
+                let is_common_block =
+                    matches!(attr, Attribute::Save) && name.starts_with('/') && name.ends_with('/');
+                is_common_block
+                    || !crate::ast::decl::fold_attribute_into_type_decl(decls, name, &attr)
+            })
             .collect();
         if unfolded.is_empty() {
             decls.remove(i); // fully folded — drop the now-redundant statement
@@ -2154,6 +2167,35 @@ end module malformed_m
     }
 
     #[test]
+    fn named_save_folds_but_bare_save_remains_scope_wide() {
+        use crate::ast::decl::{Attribute, Decl};
+
+        let unit = parse_unit(
+            "program p\n  integer :: named, all_saved\n  save :: named\n  save\nend program p\n",
+        );
+        let ProgramUnit::Program { decls, .. } = &unit.node else {
+            panic!("not Program");
+        };
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::TypeDecl { attrs, entities, .. }
+                    if entities.iter().any(|entity| entity.name == "named")
+                        && attrs.iter().any(|attr| matches!(attr, Attribute::Save))
+            )
+        }));
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::AttributeStmt {
+                    attr: Attribute::Save,
+                    entities,
+                } if entities.is_empty()
+            )
+        }));
+    }
+
+    #[test]
     fn standalone_external_and_intrinsic_statements_are_preserved() {
         use crate::ast::decl::{Attribute, Decl};
 
@@ -2268,9 +2310,10 @@ end module malformed_m
         use crate::ast::decl::{Attribute, Decl};
 
         let units = [
-            parse_unit("program p\n  save /state/, value\nend program p\n"),
+            parse_unit("program p\n  integer :: value\n  save /state/, value\nend program p\n"),
             parse_fixed_unit(concat!(
                 "      PROGRAM P\n",
+                "      INTEGER VALUE\n",
                 "      SAVE /STATE/, VALUE\n",
                 "      END\n",
             )),
@@ -2286,9 +2329,16 @@ end module malformed_m
                     Decl::AttributeStmt {
                         attr: Attribute::Save,
                         entities,
-                    } if entities.len() == 2
-                        && entities[0].eq_ignore_ascii_case("state")
-                        && entities[1].eq_ignore_ascii_case("value")
+                    } if entities.len() == 1
+                        && entities[0].eq_ignore_ascii_case("/state/")
+                )
+            }));
+            assert!(decls.iter().any(|decl| {
+                matches!(
+                    &decl.node,
+                    Decl::TypeDecl { attrs, entities, .. }
+                        if entities.iter().any(|entity| entity.name.eq_ignore_ascii_case("value"))
+                            && attrs.iter().any(|attr| matches!(attr, Attribute::Save))
                 )
             }));
         }
