@@ -35390,6 +35390,51 @@ fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
 }
 
 #[test]
+fn explicit_shape_dummy_runtime_lower_bound_preserves_sequence_mapping() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_shape_dummy_runtime_lower_bound_preserves_sequence_mapping count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MPFUN's doublep kernel sequence-associates a one-based actual with an
+    // explicit-shape dummy declared `poly(-n/2:n/2)`. Both bounds depend on
+    // another dummy. The upper bound was already lowered at runtime, but the
+    // lower bound silently fell back to one, shifting writes before the actual
+    // array and leaving its latter half uninitialized.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box_t\n    integer :: value\n  end type\ncontains\n  subroutine fill(n, values)\n    integer, intent(in) :: n\n    type(box_t), intent(inout) :: values(-n/2:n/2)\n    integer :: k\n    if (lbound(values, 1) /= -n/2) error stop 1\n    if (ubound(values, 1) /= n/2) error stop 2\n    if (size(values) /= n) error stop 3\n    do k = -n/2, n/2\n      values(k)%value = 100 + k\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: i\n  type(box_t) :: actual(5)\n  actual%value = -1\n  call fill(5, actual)\n  do i = 1, 5\n    if (actual(i)%value /= 97 + i) error stop 4\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("explicit_shape_dummy_runtime_lower", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("explicit-shape runtime lower-bound compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "explicit-shape runtime lower-bound should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("explicit-shape runtime lower-bound run failed");
+    assert!(
+        run.status.success(),
+        "explicit-shape runtime lower-bound should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn same_name_contained_function_return_type_is_caller_relative() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -23710,12 +23710,17 @@ pub(super) fn arg_dims_from_decls(
 
 /// Post-pass run after normal dummy-arg locals are registered. For
 /// every by_ref dummy whose declared array_spec is `ArraySpec::Explicit`
-/// with a non-const upper bound (typically another dummy, e.g. `xs(n)`),
-/// lower the bound expression and store the i64 result into the dummy's
-/// `runtime_dim_upper`. Subsequent bounds checks and stride computation
-/// consult this value instead of the (1, 1) fallback that
-/// `arg_dims_from_decls` emits when a bound is not compile-time
-/// resolvable.
+/// with a non-const bound (typically another dummy, e.g. `xs(-n:n)`),
+/// lower the bound expressions on procedure entry.
+///
+/// Runtime upper bounds are stored in `runtime_dim_upper`. If any lower
+/// bound is dynamic, promote the dummy's local view to a descriptor: the
+/// following `install_explicit_shape_dummy_rebase` pass fills that descriptor
+/// with both declared bounds and truthful column-major strides. This preserves
+/// the external raw-pointer ABI of explicit-shape dummies while giving every
+/// internal consumer (subscripts, inquiries, whole-array operations, and
+/// forwarding) the same runtime lower bound. `arg_dims_from_decls` otherwise
+/// substitutes one for a non-constant lower bound and shifts every access.
 pub(super) fn install_runtime_dim_bounds(
     b: &mut FuncBuilder,
     locals: &mut HashMap<String, LocalInfo>,
@@ -23753,6 +23758,13 @@ pub(super) fn install_runtime_dim_bounds(
             let Some(specs) = entity.array_spec.as_ref().or(attr_dims) else {
                 continue;
             };
+
+            let has_runtime_lower = specs.iter().any(|spec| match spec {
+                ArraySpec::Explicit {
+                    lower: Some(lower), ..
+                } => eval_const_array_bound(lower, visible_param_consts, Some(st)).is_none(),
+                _ => false,
+            });
 
             let mut runtime = Vec::with_capacity(specs.len());
             let mut any_runtime = false;
@@ -23808,6 +23820,22 @@ pub(super) fn install_runtime_dim_bounds(
             if any_runtime {
                 if let Some(slot) = locals.get_mut(&key) {
                     slot.runtime_dim_upper = runtime;
+                }
+            }
+            if has_runtime_lower {
+                // Materialize while this is still the raw-pointer view: the
+                // descriptor's base field must capture the incoming actual's
+                // data pointer. Keep `by_ref` true and replace the value in its
+                // existing pointer slot, so the normal explicit-shape rebase
+                // pass can consume it exactly like a descriptor supplied by a
+                // caller and patch every declared bound in one place.
+                let Some(raw_info) = locals.get(&key).cloned() else {
+                    continue;
+                };
+                let desc = materialize_array_descriptor_for_info(b, &raw_info);
+                b.store(desc, raw_info.addr);
+                if let Some(slot) = locals.get_mut(&key) {
+                    slot.descriptor_arg = true;
                 }
             }
         }
