@@ -60134,6 +60134,51 @@ fn defined_assignment_derived_dummy_lhs_loads_caller_storage_through_slot() {
 }
 
 #[test]
+fn intrinsic_array_element_uses_defined_assignment_for_derived_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intrinsic_array_element_uses_defined_assignment_for_derived_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 10.2.1.4: defined assignment may have an intrinsic LHS when
+    // the RHS is derived.  The array-element path used to attempt overload
+    // resolution only for a derived LHS, so `values(2) = make_box(42)`
+    // fell through to an intrinsic REAL store and tried to coerce the
+    // derived-result pointer to f64.  MPFUN's mp_eqdr assignment exposes
+    // this shape while initializing its double-precision work arrays.
+    let src = write_program(
+        "module boxes\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type box_t\n  interface assignment(=)\n    module procedure assign_real_from_box\n  end interface\ncontains\n  subroutine assign_real_from_box(lhs, rhs)\n    real(8), intent(out) :: lhs\n    type(box_t), intent(in) :: rhs\n    lhs = real(rhs%value, 8) + 0.5_8\n  end subroutine assign_real_from_box\n\n  function make_box(value) result(box)\n    integer, intent(in) :: value\n    type(box_t) :: box\n    box%value = value\n  end function make_box\nend module boxes\n\nprogram p\n  use boxes\n  implicit none\n  real(8) :: values(2)\n  values = 0.0_8\n  values(2) = make_box(42)\n  if (values(1) /= 0.0_8) error stop 1\n  if (values(2) /= 42.5_8) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("intrinsic_array_element_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("intrinsic array element defined assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "intrinsic array element defined assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("intrinsic array element defined assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "intrinsic array element defined assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
