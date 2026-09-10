@@ -29377,6 +29377,49 @@ fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
 }
 
 #[test]
+fn renamed_kind_inquiry_parameter_array_preserves_precision() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=renamed_kind_inquiry_parameter_array_preserves_precision count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MINPACK imports `real64` as `wp`, uses that suffix in inquiry
+    // intrinsics inside a parameter array constructor, then initializes its
+    // private scalar epsilon from `dpmpar(1)`. Pre-fix the inquiry folder
+    // treated every unfamiliar suffix as kind 4 and the scalar array-element
+    // initializer fell back to zero-filled storage.
+    let src = write_program(
+        "module machine_constants_m\n  use iso_fortran_env, only: wp => real64\n  implicit none\n  real(wp), parameter :: scalar_eps = epsilon(1.0_wp)\n  real(wp), dimension(0:2), parameter :: limits = [epsilon(1.0_wp), tiny(1.0_wp), huge(1.0_wp)]\n  real(wp), parameter :: array_eps = limits(0)\nend module machine_constants_m\nprogram p\n  use machine_constants_m\n  implicit none\n  if (scalar_eps <= 0.0_wp .or. scalar_eps > 1.0e-15_wp) error stop 1\n  if (limits(0) /= scalar_eps) error stop 2\n  if (limits(1) <= 0.0_wp .or. limits(1) > 1.0e-300_wp) error stop 3\n  if (limits(2) < 1.0e300_wp) error stop 4\n  if (array_eps /= scalar_eps) error stop 5\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("renamed_kind_inquiry_parameter_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("renamed-kind inquiry parameter compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "renamed-kind inquiry parameter compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("renamed-kind inquiry parameter run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "renamed-kind inquiry parameter run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn named_inquiry_parameter_constants_survive_cross_tu_import() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
