@@ -25505,6 +25505,50 @@ fn typed_header_derived_function_result_uses_hidden_result_abi() {
 }
 
 #[test]
+fn typed_derived_external_function_result_uses_implicit_interface_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_derived_external_function_result_uses_implicit_interface_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module box_types\n  implicit none\n  type :: box_t\n    integer :: value\n  end type box_t\nend module box_types\n\nprogram p\n  use box_types\n  implicit none\n  type(box_t) :: got, make_box\n  external :: make_box\n  got = make_box(41)\n  if (got%value /= 42) error stop 1\n  print *, 'ok'\nend program p\n\nfunction make_box(value) result(out)\n  use box_types\n  implicit none\n  integer, intent(in) :: value\n  type(box_t) :: out\n  out%value = value + 1\nend function make_box\n",
+        "f90",
+    );
+    let out = unique_path("typed_derived_external_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("typed derived external result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed derived external result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("typed derived external result run failed");
+    assert!(
+        run.status.success(),
+        "typed derived external result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected typed derived external result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn imported_type_finalizer_round_trips_through_amod_and_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
