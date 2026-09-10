@@ -23901,6 +23901,110 @@ fn merged_operator_keeps_private_same_named_specifics_scoped_to_owner_module() {
 }
 
 #[test]
+fn merged_defined_assignment_keeps_private_same_named_specifics_scoped_to_owner_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_defined_assignment_keeps_private_same_named_specifics_scoped_to_owner_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MPFUN's facade module re-exports full- and medium-precision
+    // ASSIGNMENT(=) interfaces whose private specifics intentionally share
+    // names.  The owner scope is part of a specific's identity: retaining
+    // only the first `assign_real` makes REAL-array-element = medium_t fall
+    // through to an impossible intrinsic pointer-to-f64 store.
+    let dir = unique_dir("merged_defined_assignment_private_owner_scope");
+    let standard_src = write_program_in(
+        &dir,
+        "standard_assign.f90",
+        "module standard_assign\n  implicit none\n  private :: assign_real\n  type :: full_t\n    integer :: tag = 11\n  end type\n  interface assignment(=)\n    module procedure :: assign_real\n  end interface\ncontains\n  subroutine assign_real(lhs, rhs)\n    real(8), intent(out) :: lhs\n    type(full_t), intent(in) :: rhs\n    lhs = real(rhs%tag, 8) + 0.25_8\n  end subroutine\nend module\n",
+    );
+    let medium_src = write_program_in(
+        &dir,
+        "medium_assign.f90",
+        "module medium_assign\n  use standard_assign\n  implicit none\n  private :: assign_real\n  type :: medium_t\n    integer :: tag = 22\n  end type\n  interface assignment(=)\n    module procedure :: assign_real\n  end interface\ncontains\n  subroutine assign_real(lhs, rhs)\n    real(8), intent(out) :: lhs\n    type(medium_t), intent(in) :: rhs\n    lhs = real(rhs%tag, 8) + 0.5_8\n  end subroutine\nend module\n",
+    );
+    let facade_src = write_program_in(
+        &dir,
+        "assign_facade.f90",
+        "module assign_facade\n  use standard_assign\n  use medium_assign\n  implicit none\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use assign_facade\n  implicit none\n  real(8) :: values(2)\n  type(full_t) :: full\n  type(medium_t) :: medium\n  values = 0.0_8\n  values(1) = full\n  values(2) = medium\n  if (values(1) /= 11.25_8) error stop 1\n  if (values(2) /= 22.5_8) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let standard_obj = dir.join("standard_assign.o");
+    let medium_obj = dir.join("medium_assign.o");
+    let facade_obj = dir.join("assign_facade.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_defined_assignment_private_owner_scope.bin");
+
+    for (src, obj, needs_i) in [
+        (&standard_src, &standard_obj, false),
+        (&medium_src, &medium_obj, true),
+        (&facade_src, &facade_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged defined-assignment owner-scope compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            standard_obj.to_str().unwrap(),
+            medium_obj.to_str().unwrap(),
+            facade_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("merged defined-assignment owner-scope link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged defined-assignment owner-scope should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "merged defined-assignment owner-scope run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected merged defined-assignment owner-scope output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn intrinsic_len_falls_back_when_visible_generic_len_does_not_match() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

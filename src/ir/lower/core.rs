@@ -18301,8 +18301,14 @@ fn defined_assignment_semantic_candidates(
     lhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
     rhs_semantic_ti: Option<&crate::sema::symtab::TypeInfo>,
 ) -> Vec<SpecificProcCandidate> {
+    // ASSIGNMENT(=) is a defined-operator interface and can be assembled from
+    // several USE-associated modules.  Collect the complete lexical merge,
+    // retaining (specific name, owner scope) identity, just as expression
+    // operators do.  A plain named-interface lookup can stop at the first
+    // re-export and lose a same-named specific owned by another module (MPFUN
+    // has distinct private `mp_eqdr` procedures for mp_real and mp_realm).
     let mut candidates =
-        named_interface_specific_candidates(st, "assignment(=)").unwrap_or_default();
+        operator_interface_specific_candidates(st, "assignment(=)").unwrap_or_default();
     let mut seen: HashSet<(String, crate::sema::symtab::ScopeId)> = candidates
         .iter()
         .map(|candidate| (candidate.name.to_ascii_lowercase(), candidate.owner_scope))
