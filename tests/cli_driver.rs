@@ -36869,6 +36869,44 @@ fn symbolic_integer_kind_suffix_uses_imported_width() {
 }
 
 #[test]
+fn standalone_parameter_integer_kind_suffix_uses_declared_width() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=standalone_parameter_integer_kind_suffix_uses_declared_width count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, parameter :: wide_kind = selected_int_kind(18)\n  integer :: literal_kind\n  parameter (literal_kind = wide_kind)\n  integer(literal_kind) :: value\n  value = 799144290325165978_literal_kind\n  if (value /= 799144290325165978_literal_kind) error stop 1\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("standalone_parameter_int_kind_ok", "bin");
+    let result = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn failed");
+    assert!(
+        result.status.success(),
+        "standalone PARAMETER kind suffix should honor declared width: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "standalone PARAMETER kind program should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn integer_division_by_zero_is_diagnosed() {
     let src = write_program(
         "program p\n  integer, parameter :: x = 1 / 0\n  print *, x\nend program\n",

@@ -3602,6 +3602,7 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
             _ => {}
         }
     }
+    finalize_standalone_parameters(st, decls)?;
     // Apply deferred access-list overrides after all symbols are declared.
     for (access, names, span) in &pending_access {
         for name in names {
@@ -3610,6 +3611,104 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
             }
         }
     }
+    Ok(())
+}
+
+fn finalize_standalone_parameters(
+    st: &mut SymbolTable,
+    decls: &[SpannedDecl],
+) -> Result<(), SemaError> {
+    let current_scope = st.current_scope();
+
+    // A PARAMETER statement may precede or follow the entity's type
+    // declaration. All type declarations have been processed by this point,
+    // so upgrade explicitly declared variables first and only use implicit
+    // typing for names that truly have no declaration.
+    for decl in decls {
+        let Decl::ParameterStmt { pairs } = &decl.node else {
+            continue;
+        };
+        for (name, _) in pairs {
+            let key = name.to_lowercase();
+            let implicit_type = st.implicit_type(name).map(implicit_type_to_type_info);
+            if let Some(symbol) = st.scope_mut(current_scope).symbols.get_mut(&key) {
+                if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+                    return Err(SemaError {
+                        span: decl.span,
+                        msg: format!("'{}' in a PARAMETER statement is not a variable", name),
+                    });
+                }
+                if symbol.type_info.is_none() {
+                    symbol.type_info = Some(implicit_type.ok_or_else(|| SemaError {
+                        span: decl.span,
+                        msg: format!("PARAMETER entity '{}' has no implicit type", name),
+                    })?);
+                }
+                symbol.kind = SymbolKind::Parameter;
+                symbol.attrs.parameter = true;
+            } else {
+                let type_info = implicit_type.ok_or_else(|| SemaError {
+                    span: decl.span,
+                    msg: format!("PARAMETER entity '{}' has no implicit type", name),
+                })?;
+                st.define(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Parameter,
+                    type_info: Some(type_info),
+                    attrs: SymbolAttrs {
+                        access: st.default_access(current_scope),
+                        parameter: true,
+                        ..Default::default()
+                    },
+                    defined_at: decl.span,
+                    scope: current_scope,
+                    arg_names: vec![],
+                    const_value: None,
+                    const_char_value: None,
+                })?;
+            }
+        }
+    }
+
+    // Resolve dependencies among standalone named constants. Marking every
+    // symbol above before folding lets forward references and declaration
+    // order behave the same way as typed PARAMETER declarations.
+    let pair_count = decls
+        .iter()
+        .filter_map(|decl| match &decl.node {
+            Decl::ParameterStmt { pairs } => Some(pairs.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    for _ in 0..=pair_count {
+        let mut changed = false;
+        for decl in decls {
+            let Decl::ParameterStmt { pairs } = &decl.node else {
+                continue;
+            };
+            for (name, expr) in pairs {
+                let const_value = eval_const_int_expr(expr, st);
+                let const_char_value = eval_const_char_expr(expr, st);
+                let symbol = st
+                    .scope_mut(current_scope)
+                    .symbols
+                    .get_mut(&name.to_lowercase())
+                    .expect("standalone PARAMETER symbol must exist");
+                if symbol.const_value != const_value {
+                    symbol.const_value = const_value;
+                    changed = true;
+                }
+                if symbol.const_char_value != const_char_value {
+                    symbol.const_char_value = const_char_value;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     Ok(())
 }
 
