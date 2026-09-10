@@ -10767,7 +10767,13 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                     append_host_closure_args(
                                         b,
                                         ctx,
-                                        if ctx.contained_host_refs.contains_key(&resolved_key) {
+                                        if contained_host_refs_for_callee(
+                                            ctx.st,
+                                            ctx.contained_host_refs,
+                                            &resolved_key,
+                                        )
+                                        .is_some()
+                                        {
                                             &resolved_key
                                         } else {
                                             &src_key

@@ -152,10 +152,12 @@ pub fn lower_file(
     // sites inside the host (or sibling contained procs) append the
     // address of the matching variable from their own locals. This is
     // the standard closure-passing ABI for Fortran contained
-    // subprograms (F2018 §19.5). Keyed by lowercase callee name.
+    // subprograms (F2018 §19.5). Keyed by semantic procedure scope so
+    // same-named contained procedures under different hosts cannot overwrite
+    // one another's closure shape.
     let mut contained_host_refs: HashMap<String, Vec<String>> = HashMap::new();
     for unit in units {
-        walk_contained_host_refs(&unit.node, &mut contained_host_refs);
+        walk_contained_host_refs(&unit.node, st, &mut contained_host_refs);
     }
 
     // Pass 2: lower each unit. Modules already had their globals
@@ -787,23 +789,36 @@ const VTABLE_TYPE_TAG_MASK: i64 = i64::MAX;
 /// Slot `i` lives at `VTABLE_HEADER_BYTES + i * 8`.
 pub(super) const VTABLE_HEADER_BYTES: i64 = 48;
 
+fn contained_host_ref_scope_key(scope_id: crate::sema::symtab::ScopeId) -> String {
+    format!("__afs_host_scope_{scope_id}")
+}
+
 /// Recursively walk `unit` and, for every contained subprogram, record
 /// the ordered list of immediate-host-local variable names it reads or
 /// writes. Subprograms with no host-local references get an empty
 /// entry (still inserted, so call sites can cheaply check membership).
-pub(super) fn walk_contained_host_refs(unit: &ProgramUnit, out: &mut HashMap<String, Vec<String>>) {
+pub(super) fn walk_contained_host_refs(
+    unit: &ProgramUnit,
+    st: &SymbolTable,
+    out: &mut HashMap<String, Vec<String>>,
+) {
     // Nested CONTAINS: a contained proc may reference not just its
     // immediate host's locals but also its host's host's locals and
     // so on. Thread an accumulated ancestor-decls chain so every
     // nested contained subprogram can find every name it depends on.
-    walk_contained_host_refs_inner(unit, &[], out);
+    walk_contained_host_refs_inner(unit, &[], st, 0, out);
 }
 
 pub(super) fn walk_contained_host_refs_inner<'a>(
     unit: &'a ProgramUnit,
     ancestor_decls: &[&'a [crate::ast::decl::SpannedDecl]],
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
     out: &mut HashMap<String, Vec<String>>,
 ) {
+    let Some(unit_scope) = resolved_scope_for_unit(st, parent_scope, unit) else {
+        return;
+    };
     let (my_decls, contains): (&[crate::ast::decl::SpannedDecl], &[SpannedUnit]) = match unit {
         ProgramUnit::Program {
             decls, contains, ..
@@ -820,7 +835,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             // into each so any nested contains still gets analyzed
             // against its own host.
             for sub in contains {
-                walk_contained_host_refs_inner(&sub.node, ancestor_decls, out);
+                walk_contained_host_refs_inner(&sub.node, ancestor_decls, st, unit_scope, out);
             }
             return;
         }
@@ -837,20 +852,22 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
     // intermediate level to carry the outer-scope vars as hidden
     // params even when it doesn't reference them directly.
     for sub in contains {
-        walk_contained_host_refs_inner(&sub.node, &next_ancestors, out);
+        walk_contained_host_refs_inner(&sub.node, &next_ancestors, st, unit_scope, out);
     }
     for sub in contains {
         if let ProgramUnit::Subroutine {
-            name,
             contains: sub_contains,
             ..
         }
         | ProgramUnit::Function {
-            name,
             contains: sub_contains,
             ..
         } = &sub.node
         {
+            let Some(sub_scope) = resolved_scope_for_unit(st, unit_scope, &sub.node) else {
+                continue;
+            };
+            let sub_key = contained_host_ref_scope_key(sub_scope);
             let mut refs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Direct references in this sub's body, against each
             // layer of the ancestor chain (so host-of-host names
@@ -876,14 +893,14 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                 }
             }
             for nested in sub_contains {
-                if let ProgramUnit::Subroutine {
-                    name: nested_name, ..
-                }
-                | ProgramUnit::Function {
-                    name: nested_name, ..
-                } = &nested.node
+                if let ProgramUnit::Subroutine { .. } | ProgramUnit::Function { .. } = &nested.node
                 {
-                    if let Some(nested_refs) = out.get(&nested_name.to_lowercase()) {
+                    let Some(nested_scope) = resolved_scope_for_unit(st, sub_scope, &nested.node)
+                    else {
+                        continue;
+                    };
+                    if let Some(nested_refs) = out.get(&contained_host_ref_scope_key(nested_scope))
+                    {
                         for r in nested_refs {
                             if ancestor_names.contains(r)
                                 && host_name_allowed_by_imports(&sub.node, r)
@@ -896,7 +913,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             }
             let mut refs: Vec<String> = refs_set.into_iter().collect();
             refs.sort();
-            out.insert(name.to_lowercase(), refs);
+            out.insert(sub_key, refs);
         }
     }
 
@@ -914,7 +931,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
     // carry and forward the hidden host-closure arg required by `leaf`.
     // Propagate required refs across the sibling call graph to a fixed
     // point after all direct/nested refs in this host scope are known.
-    let mut sibling_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sibling_keys: HashMap<String, String> = HashMap::new();
     let mut ancestor_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for anc in &next_ancestors {
         for decl in *anc {
@@ -928,7 +945,9 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
     for sub in contains {
         if let ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } = &sub.node
         {
-            sibling_names.insert(name.to_lowercase());
+            if let Some(scope_id) = resolved_scope_for_unit(st, unit_scope, &sub.node) {
+                sibling_keys.insert(name.to_lowercase(), contained_host_ref_scope_key(scope_id));
+            }
         }
     }
 
@@ -942,19 +961,22 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                 }
                 _ => continue,
             };
+            let Some(scope_key) = sibling_keys.get(&name).cloned() else {
+                continue;
+            };
             let mut called = std::collections::HashSet::new();
             collect_called_contained_names(&sub.node, &mut called);
             let mut refs: std::collections::HashSet<String> = out
-                .get(&name)
+                .get(&scope_key)
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
             for callee in called {
-                if !sibling_names.contains(&callee) {
+                let Some(callee_key) = sibling_keys.get(&callee) else {
                     continue;
-                }
-                let Some(callee_refs) = out.get(&callee).cloned() else {
+                };
+                let Some(callee_refs) = out.get(callee_key).cloned() else {
                     continue;
                 };
                 for r in callee_refs {
@@ -969,7 +991,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             if changed {
                 let mut sorted: Vec<String> = refs.into_iter().collect();
                 sorted.sort();
-                out.insert(name, sorted);
+                out.insert(scope_key, sorted);
             }
         }
     }
@@ -21298,7 +21320,7 @@ pub(super) fn emit_named_function_call(
     );
 
     let closure_key = if contained_host_refs
-        .map(|m| m.contains_key(&callee_key))
+        .map(|m| contained_host_refs_for_callee(st, m, &callee_key).is_some())
         .unwrap_or(false)
     {
         &callee_key
@@ -22866,7 +22888,7 @@ fn procedure_actual_closure_args(
     }
     let (_link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
     let closure_key = if contained_host_refs
-        .map(|m| m.contains_key(&resolved_key))
+        .map(|m| contained_host_refs_for_callee(st, m, &resolved_key).is_some())
         .unwrap_or(false)
     {
         resolved_key.as_str()
@@ -24956,7 +24978,7 @@ fn decl_is_procedure_dummy_ref(name: &str, decls: &[crate::ast::decl::SpannedDec
 /// callee agree on positional assignment. `starting_id` is the next
 /// free SSA value id after any other params (normal + hidden-length).
 pub(super) fn build_host_ref_params(
-    callee_name: &str,
+    callee_scope_id: Option<crate::sema::symtab::ScopeId>,
     layout: crate::target::TargetLayout,
     host_decls: &[crate::ast::decl::SpannedDecl],
     host_param_consts: &HashMap<String, ConstScalar>,
@@ -24965,7 +24987,10 @@ pub(super) fn build_host_ref_params(
     st: &SymbolTable,
     out_params: &mut Vec<Param>,
 ) -> Vec<HostRefParamInfo> {
-    let refs = match contained_host_refs.get(&callee_name.to_lowercase()) {
+    let refs = match callee_scope_id
+        .map(contained_host_ref_scope_key)
+        .and_then(|key| contained_host_refs.get(&key))
+    {
         Some(r) if !r.is_empty() => r,
         _ => return Vec::new(),
     };
@@ -25108,7 +25133,9 @@ pub(super) fn append_host_closure_args_raw(
     callee_key: &str,
     arg_vals: &mut Vec<ValueId>,
 ) {
-    let refs = match contained_host_refs.and_then(|m| m.get(callee_key)) {
+    let refs = match contained_host_refs
+        .and_then(|refs| contained_host_refs_for_callee(st, refs, callee_key))
+    {
         Some(r) if !r.is_empty() => r,
         _ => return,
     };
@@ -25194,6 +25221,28 @@ pub(super) fn append_host_closure_args_raw(
             arg_vals.extend(proc_closure_args);
         }
     }
+}
+
+pub(super) fn contained_host_refs_for_callee<'a>(
+    st: &SymbolTable,
+    contained_host_refs: &'a HashMap<String, Vec<String>>,
+    callee_key: &str,
+) -> Option<&'a Vec<String>> {
+    if let Some(refs) = contained_host_refs.get(callee_key) {
+        return Some(refs);
+    }
+
+    let scope_id = find_procedure_scope_id_for_caller_strict(st, callee_key, current_proc_scope())
+        .or_else(|| {
+            st.procedure_scopes_for_link_name(callee_key)
+                .last()
+                .copied()
+        })
+        .or_else(|| {
+            let scopes = st.procedure_scopes_named(callee_key);
+            (scopes.len() == 1).then(|| scopes[0])
+        })?;
+    contained_host_refs.get(&contained_host_ref_scope_key(scope_id))
 }
 
 /// After a contained proc's normal params are installed, set up a
@@ -62582,10 +62631,9 @@ pub(super) fn store_derived_field_expr(
                             .unwrap_or(link_name);
                         let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
                         let mut closure_args = Vec::new();
-                        let closure_key = if contained_host_refs
-                            .and_then(|m| m.get(&resolved_key))
-                            .is_some()
-                        {
+                        let closure_key = if contained_host_refs.is_some_and(|m| {
+                            contained_host_refs_for_callee(st, m, &resolved_key).is_some()
+                        }) {
                             resolved_key.as_str()
                         } else {
                             src_key.as_str()

@@ -3245,7 +3245,7 @@ pub(crate) fn lower_expr_full(
                 // to the unresolved key so calls that don't go through
                 // generic dispatch still thread host vars.
                 let closure_key = if contained_host_refs
-                    .map(|m| m.contains_key(&callee_key))
+                    .map(|m| contained_host_refs_for_callee(st, m, &callee_key).is_some())
                     .unwrap_or(false)
                 {
                     &callee_key

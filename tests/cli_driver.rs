@@ -53699,6 +53699,50 @@ fn procedure_pointer_component_call_updates_integer_argument() {
 }
 
 #[test]
+fn same_named_contained_callbacks_keep_distinct_host_closures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_named_contained_callbacks_keep_distinct_host_closures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module callbacks_m\n  implicit none\n  abstract interface\n    function unary(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n    end function\n  end interface\ncontains\n  subroutine apply(fun, got)\n    procedure(unary) :: fun\n    real(8), intent(out) :: got\n    got = func_wrapper(3.0d0)\n  contains\n    function func_wrapper(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n      y = fun(x)\n    end function\n  end subroutine\n\n  subroutine unrelated(got)\n    integer, intent(out) :: got\n    integer :: bias\n    bias = 40\n    got = func_wrapper(2)\n  contains\n    function func_wrapper(x) result(y)\n      integer, intent(in) :: x\n      integer :: y\n      y = bias + x\n    end function\n  end subroutine\nend module\n\nprogram p\n  use callbacks_m\n  implicit none\n  real(8) :: got\n  call apply(square, got)\n  if (got /= 9.0d0) error stop 1\n  print *, 'ok'\ncontains\n  function square(x) result(y)\n    real(8), intent(in) :: x\n    real(8) :: y\n    y = x * x\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("same_named_contained_callback_closures", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-named contained callback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-named contained callback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("same-named contained callback run failed");
+    assert!(
+        run.status.success(),
+        "same-named contained callback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected same-named contained callback output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn procedure_dummy_assigned_to_procptr_component_preserves_host_closure() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
