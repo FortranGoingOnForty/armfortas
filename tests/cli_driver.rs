@@ -36978,6 +36978,41 @@ fn standalone_parameter_kind_is_concrete_across_module_boundary() {
 }
 
 #[test]
+fn standalone_optional_statement_preserves_absent_dummy() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=standalone_optional_statement_preserves_absent_dummy count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\ncontains\n  subroutine probe(required, extra)\n    integer, intent(in) :: required, extra\n    optional :: extra\n    if (required /= 7) error stop 1\n    if (present(extra)) error stop 2\n  end subroutine probe\nend module m\n\nprogram p\n  use m, only: probe\n  implicit none\n  call probe(7)\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("standalone_optional", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("standalone OPTIONAL compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "standalone OPTIONAL compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("standalone OPTIONAL run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "standalone OPTIONAL run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn integer_division_by_zero_is_diagnosed() {
     let src = write_program(
         "program p\n  integer, parameter :: x = 1 / 0\n  print *, x\nend program\n",
