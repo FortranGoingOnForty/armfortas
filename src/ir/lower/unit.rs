@@ -542,7 +542,7 @@ pub(crate) fn lower_unit(
             // one per host-local variable this contained proc reads or
             // writes. Order matches contained_host_refs[name].
             let host_ref_infos = build_host_ref_params(
-                name,
+                proc_scope_id,
                 module.layout,
                 host_decls,
                 host_param_consts,
@@ -1159,7 +1159,7 @@ pub(crate) fn lower_unit(
                 procedure_dummy_closure_params.push((n.to_lowercase(), ids));
             }
             let host_ref_infos = build_host_ref_params(
-                name,
+                proc_scope_id,
                 module.layout,
                 host_decls,
                 host_param_consts,

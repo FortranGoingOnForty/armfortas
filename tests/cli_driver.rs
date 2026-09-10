@@ -53029,6 +53029,48 @@ fn generic_dispatch_accepts_class_dummy_forwarding_to_char_specific_compile_only
 }
 
 #[test]
+fn generic_dispatch_forwards_procedure_dummy_to_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_dispatch_forwards_procedure_dummy_to_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // roots-fortran's character-name wrapper forwards its procedure dummy
+    // through the root_scalar generic to the derived-type specific. Procedure
+    // dummies have local IR slots, but remain procedure entities for generic
+    // resolution; treating every local name as data rejected this valid call.
+    let src = write_program(
+        "module roots_generic_repro\n  implicit none\n  type :: method_t\n    integer :: id\n  end type\n  abstract interface\n    function scalar_func(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n    end function\n  end interface\n  interface solve\n    module procedure solve_by_name, solve_by_type\n  end interface\ncontains\n  subroutine solve_by_name(name, fun, result)\n    character(len=*), intent(in) :: name\n    procedure(scalar_func) :: fun\n    real(8), intent(out) :: result\n    type(method_t) :: method\n    method%id = len(name)\n    call solve(method, fun, result)\n  end subroutine\n  subroutine solve_by_type(method, fun, result)\n    type(method_t), intent(in) :: method\n    procedure(scalar_func) :: fun\n    real(8), intent(out) :: result\n    result = fun(real(method%id, 8))\n  end subroutine\nend module\nprogram p\n  use roots_generic_repro\n  implicit none\n  real(8) :: result\n  call solve('abc', square, result)\n  if (result /= 9.0_8) error stop 1\n  print *, 'ok'\ncontains\n  function square(x) result(y)\n    real(8), intent(in) :: x\n    real(8) :: y\n    y = x*x\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_forward_proc_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure-dummy generic forwarding compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure-dummy generic forwarding should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure-dummy generic forwarding binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure-dummy generic forwarding should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn bound_generic_procedure_actual_selects_procedure_dummy_specific() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -53650,6 +53692,89 @@ fn procedure_pointer_component_call_updates_integer_argument() {
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected procptr component call output: {}",
         String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn same_named_contained_callbacks_keep_distinct_host_closures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=same_named_contained_callbacks_keep_distinct_host_closures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module callbacks_m\n  implicit none\n  abstract interface\n    function unary(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n    end function\n  end interface\ncontains\n  subroutine apply(fun, got)\n    procedure(unary) :: fun\n    real(8), intent(out) :: got\n    got = func_wrapper(3.0d0)\n  contains\n    function func_wrapper(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n      y = fun(x)\n    end function\n  end subroutine\n\n  subroutine unrelated(got)\n    integer, intent(out) :: got\n    integer :: bias\n    bias = 40\n    got = func_wrapper(2)\n  contains\n    function func_wrapper(x) result(y)\n      integer, intent(in) :: x\n      integer :: y\n      y = bias + x\n    end function\n  end subroutine\nend module\n\nprogram p\n  use callbacks_m\n  implicit none\n  real(8) :: got\n  call apply(square, got)\n  if (got /= 9.0d0) error stop 1\n  print *, 'ok'\ncontains\n  function square(x) result(y)\n    real(8), intent(in) :: x\n    real(8) :: y\n    y = x * x\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("same_named_contained_callback_closures", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("same-named contained callback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "same-named contained callback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("same-named contained callback run failed");
+    assert!(
+        run.status.success(),
+        "same-named contained callback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected same-named contained callback output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn sibling_contained_callback_actual_uses_owner_symbol() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=sibling_contained_callback_actual_uses_owner_symbol count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module callbacks_m\n  implicit none\n  abstract interface\n    function unary(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n    end function\n  end interface\ncontains\n  subroutine apply(fun, got)\n    procedure(unary) :: fun\n    real(8), intent(out) :: got\n    got = fun(3.0d0)\n  end subroutine\nend module\n\nprogram p\n  use callbacks_m\n  implicit none\n  call test()\ncontains\n  subroutine test()\n    real(8) :: got\n    call apply(square, got)\n    if (got /= 9.0d0) error stop 1\n  end subroutine\n\n  function square(x) result(y)\n    real(8), intent(in) :: x\n    real(8) :: y\n    y = x * x\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("sibling_contained_callback_owner", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("sibling contained callback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "sibling contained callback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("sibling contained callback run failed");
+    assert!(
+        run.status.success(),
+        "sibling contained callback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -56613,6 +56738,94 @@ fn allocate_mold_scalar_class_preserves_dynamic_vtable() {
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("ok"),
         "unexpected allocate mold scalar class output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn module_derived_parameter_array_from_named_constants_initializes_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_derived_parameter_array_from_named_constants_initializes_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module methods_m\n  implicit none\n  type :: method_t\n    integer :: id = 0\n    character(len=8) :: name = ''\n  end type\n  type(method_t), parameter :: one = method_t(1, 'one')\n  type(method_t), parameter :: two = method_t(2, 'two')\n  type(method_t), parameter, dimension(*) :: methods = [one, two]\nend module\nprogram p\n  use methods_m\n  implicit none\n  if (size(methods) /= 2) error stop 1\n  if (methods(1)%id /= 1) error stop 2\n  if (methods(2)%id /= 2) error stop 3\n  if (trim(methods(1)%name) /= 'one') error stop 4\n  if (trim(methods(2)%name) /= 'two') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_named_derived_parameter_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module named derived parameter array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module named derived parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module named derived parameter array run failed");
+    assert!(
+        run.status.success(),
+        "module named derived parameter array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module named derived parameter array output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn select_case_uses_derived_parameter_constructor_overrides() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_case_uses_derived_parameter_constructor_overrides count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module methods_m\n  implicit none\n  type :: method_t\n    integer :: id = 0\n  end type\n  type(method_t), parameter :: one = method_t(1)\n  type(method_t), parameter :: two = method_t(2)\ncontains\n  integer function dispatch(id) result(value)\n    integer, intent(in) :: id\n    select case (id)\n    case (one%id)\n      value = 11\n    case (two%id)\n      value = 22\n    case default\n      value = -1\n    end select\n  end function\nend module\nprogram p\n  use methods_m\n  implicit none\n  if (dispatch(1) /= 11) error stop 1\n  if (dispatch(2) /= 22) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("select_case_derived_parameter_overrides", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived parameter SELECT CASE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived parameter SELECT CASE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived parameter SELECT CASE run failed");
+    assert!(
+        run.status.success(),
+        "derived parameter SELECT CASE run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived parameter SELECT CASE output: {}",
         String::from_utf8_lossy(&run.stdout)
     );
 

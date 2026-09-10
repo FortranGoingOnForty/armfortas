@@ -152,10 +152,12 @@ pub fn lower_file(
     // sites inside the host (or sibling contained procs) append the
     // address of the matching variable from their own locals. This is
     // the standard closure-passing ABI for Fortran contained
-    // subprograms (F2018 §19.5). Keyed by lowercase callee name.
+    // subprograms (F2018 §19.5). Keyed by semantic procedure scope so
+    // same-named contained procedures under different hosts cannot overwrite
+    // one another's closure shape.
     let mut contained_host_refs: HashMap<String, Vec<String>> = HashMap::new();
     for unit in units {
-        walk_contained_host_refs(&unit.node, &mut contained_host_refs);
+        walk_contained_host_refs(&unit.node, st, &mut contained_host_refs);
     }
 
     // Pass 2: lower each unit. Modules already had their globals
@@ -787,23 +789,36 @@ const VTABLE_TYPE_TAG_MASK: i64 = i64::MAX;
 /// Slot `i` lives at `VTABLE_HEADER_BYTES + i * 8`.
 pub(super) const VTABLE_HEADER_BYTES: i64 = 48;
 
+fn contained_host_ref_scope_key(scope_id: crate::sema::symtab::ScopeId) -> String {
+    format!("__afs_host_scope_{scope_id}")
+}
+
 /// Recursively walk `unit` and, for every contained subprogram, record
 /// the ordered list of immediate-host-local variable names it reads or
 /// writes. Subprograms with no host-local references get an empty
 /// entry (still inserted, so call sites can cheaply check membership).
-pub(super) fn walk_contained_host_refs(unit: &ProgramUnit, out: &mut HashMap<String, Vec<String>>) {
+pub(super) fn walk_contained_host_refs(
+    unit: &ProgramUnit,
+    st: &SymbolTable,
+    out: &mut HashMap<String, Vec<String>>,
+) {
     // Nested CONTAINS: a contained proc may reference not just its
     // immediate host's locals but also its host's host's locals and
     // so on. Thread an accumulated ancestor-decls chain so every
     // nested contained subprogram can find every name it depends on.
-    walk_contained_host_refs_inner(unit, &[], out);
+    walk_contained_host_refs_inner(unit, &[], st, 0, out);
 }
 
 pub(super) fn walk_contained_host_refs_inner<'a>(
     unit: &'a ProgramUnit,
     ancestor_decls: &[&'a [crate::ast::decl::SpannedDecl]],
+    st: &SymbolTable,
+    parent_scope: crate::sema::symtab::ScopeId,
     out: &mut HashMap<String, Vec<String>>,
 ) {
+    let Some(unit_scope) = resolved_scope_for_unit(st, parent_scope, unit) else {
+        return;
+    };
     let (my_decls, contains): (&[crate::ast::decl::SpannedDecl], &[SpannedUnit]) = match unit {
         ProgramUnit::Program {
             decls, contains, ..
@@ -820,7 +835,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             // into each so any nested contains still gets analyzed
             // against its own host.
             for sub in contains {
-                walk_contained_host_refs_inner(&sub.node, ancestor_decls, out);
+                walk_contained_host_refs_inner(&sub.node, ancestor_decls, st, unit_scope, out);
             }
             return;
         }
@@ -837,20 +852,22 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
     // intermediate level to carry the outer-scope vars as hidden
     // params even when it doesn't reference them directly.
     for sub in contains {
-        walk_contained_host_refs_inner(&sub.node, &next_ancestors, out);
+        walk_contained_host_refs_inner(&sub.node, &next_ancestors, st, unit_scope, out);
     }
     for sub in contains {
         if let ProgramUnit::Subroutine {
-            name,
             contains: sub_contains,
             ..
         }
         | ProgramUnit::Function {
-            name,
             contains: sub_contains,
             ..
         } = &sub.node
         {
+            let Some(sub_scope) = resolved_scope_for_unit(st, unit_scope, &sub.node) else {
+                continue;
+            };
+            let sub_key = contained_host_ref_scope_key(sub_scope);
             let mut refs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Direct references in this sub's body, against each
             // layer of the ancestor chain (so host-of-host names
@@ -876,14 +893,14 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                 }
             }
             for nested in sub_contains {
-                if let ProgramUnit::Subroutine {
-                    name: nested_name, ..
-                }
-                | ProgramUnit::Function {
-                    name: nested_name, ..
-                } = &nested.node
+                if let ProgramUnit::Subroutine { .. } | ProgramUnit::Function { .. } = &nested.node
                 {
-                    if let Some(nested_refs) = out.get(&nested_name.to_lowercase()) {
+                    let Some(nested_scope) = resolved_scope_for_unit(st, sub_scope, &nested.node)
+                    else {
+                        continue;
+                    };
+                    if let Some(nested_refs) = out.get(&contained_host_ref_scope_key(nested_scope))
+                    {
                         for r in nested_refs {
                             if ancestor_names.contains(r)
                                 && host_name_allowed_by_imports(&sub.node, r)
@@ -896,7 +913,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             }
             let mut refs: Vec<String> = refs_set.into_iter().collect();
             refs.sort();
-            out.insert(name.to_lowercase(), refs);
+            out.insert(sub_key, refs);
         }
     }
 
@@ -914,7 +931,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
     // carry and forward the hidden host-closure arg required by `leaf`.
     // Propagate required refs across the sibling call graph to a fixed
     // point after all direct/nested refs in this host scope are known.
-    let mut sibling_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sibling_keys: HashMap<String, String> = HashMap::new();
     let mut ancestor_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for anc in &next_ancestors {
         for decl in *anc {
@@ -928,7 +945,9 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
     for sub in contains {
         if let ProgramUnit::Subroutine { name, .. } | ProgramUnit::Function { name, .. } = &sub.node
         {
-            sibling_names.insert(name.to_lowercase());
+            if let Some(scope_id) = resolved_scope_for_unit(st, unit_scope, &sub.node) {
+                sibling_keys.insert(name.to_lowercase(), contained_host_ref_scope_key(scope_id));
+            }
         }
     }
 
@@ -942,19 +961,22 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
                 }
                 _ => continue,
             };
+            let Some(scope_key) = sibling_keys.get(&name).cloned() else {
+                continue;
+            };
             let mut called = std::collections::HashSet::new();
             collect_called_contained_names(&sub.node, &mut called);
             let mut refs: std::collections::HashSet<String> = out
-                .get(&name)
+                .get(&scope_key)
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
             for callee in called {
-                if !sibling_names.contains(&callee) {
+                let Some(callee_key) = sibling_keys.get(&callee) else {
                     continue;
-                }
-                let Some(callee_refs) = out.get(&callee).cloned() else {
+                };
+                let Some(callee_refs) = out.get(callee_key).cloned() else {
                     continue;
                 };
                 for r in callee_refs {
@@ -969,7 +991,7 @@ pub(super) fn walk_contained_host_refs_inner<'a>(
             if changed {
                 let mut sorted: Vec<String> = refs.into_iter().collect();
                 sorted.sort();
-                out.insert(name, sorted);
+                out.insert(scope_key, sorted);
             }
         }
     }
@@ -4841,6 +4863,7 @@ pub(super) fn collect_module_globals(
         collect_decl_param_char_consts(decls, &param_consts, type_layouts, st, module_scope_id);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
+    let mut param_derived_consts: HashMap<String, Vec<u8>> = HashMap::new();
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for decl in decls {
         if let Decl::ParameterStmt { pairs } = &decl.node {
@@ -5071,7 +5094,18 @@ pub(super) fn collect_module_globals(
                                 eval_const_derived_global_init(layout, total as usize, type_layouts)
                             })
                         } else {
-                            None
+                            init_expr.and_then(|expr| {
+                                eval_const_derived_array_global_init(
+                                    type_name,
+                                    expr,
+                                    total as usize,
+                                    type_layouts,
+                                    &param_consts,
+                                    &param_char_consts,
+                                    &param_derived_consts,
+                                    st,
+                                )
+                            })
                         }
                     } else {
                         init_expr.and_then(|e| {
@@ -5137,6 +5171,11 @@ pub(super) fn collect_module_globals(
                                     param_array_elem_tys.insert(key.clone(), ir_ty.clone());
                                 }
                             }
+                        }
+                    }
+                    if is_parameter {
+                        if let Some(GlobalInit::String(bytes)) = &init {
+                            param_derived_consts.insert(key.clone(), bytes.clone());
                         }
                     }
                     module.add_global(Global {
@@ -5253,6 +5292,16 @@ pub(super) fn collect_module_globals(
                                         &param_char_consts,
                                         st,
                                     )
+                                    .or_else(|| {
+                                        let Expr::Name { name } = &e.node else {
+                                            return None;
+                                        };
+                                        param_derived_consts
+                                            .get(&name.to_lowercase())
+                                            .filter(|bytes| bytes.len() == layout.size)
+                                            .cloned()
+                                            .map(GlobalInit::String)
+                                    })
                                 })
                                 .or_else(|| {
                                     if init_expr.is_none() {
@@ -5261,6 +5310,11 @@ pub(super) fn collect_module_globals(
                                         None
                                     }
                                 });
+                            if is_parameter {
+                                if let Some(GlobalInit::String(bytes)) = &init {
+                                    param_derived_consts.insert(key.clone(), bytes.clone());
+                                }
+                            }
                             module.add_global(Global {
                                 name: symbol.clone(),
                                 ty: scalar_ty.clone(),
@@ -7491,6 +7545,107 @@ pub(super) fn eval_const_derived_global_init(
         Some(GlobalInit::String(bytes))
     } else {
         None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn eval_const_derived_array_global_init(
+    type_name: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    total: usize,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    param_derived_consts: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+) -> Option<GlobalInit> {
+    let layout = registry.get(type_name)?;
+    let mut bytes = Vec::with_capacity(layout.size.saturating_mul(total));
+    collect_const_derived_array_bytes(
+        type_name,
+        expr,
+        registry,
+        param_consts,
+        param_char_consts,
+        param_derived_consts,
+        st,
+        &mut bytes,
+    )?;
+    let expected_bytes = layout.size.checked_mul(total)?;
+    if bytes.len() > expected_bytes || bytes.len() % layout.size != 0 {
+        return None;
+    }
+    let default_element = match eval_const_derived_global_init(layout, 1, registry) {
+        Some(GlobalInit::String(defaults)) => defaults,
+        _ => vec![0; layout.size],
+    };
+    while bytes.len() < expected_bytes {
+        bytes.extend_from_slice(&default_element);
+    }
+    Some(GlobalInit::String(bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_const_derived_array_bytes(
+    type_name: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    param_derived_consts: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                let crate::ast::expr::AcValue::Expr(value) = value else {
+                    return None;
+                };
+                collect_const_derived_array_bytes(
+                    type_name,
+                    value,
+                    registry,
+                    param_consts,
+                    param_char_consts,
+                    param_derived_consts,
+                    st,
+                    out,
+                )?;
+            }
+            Some(())
+        }
+        Expr::ParenExpr { inner } => collect_const_derived_array_bytes(
+            type_name,
+            inner,
+            registry,
+            param_consts,
+            param_char_consts,
+            param_derived_consts,
+            st,
+            out,
+        ),
+        Expr::Name { name } => {
+            let bytes = param_derived_consts.get(&name.to_lowercase())?;
+            out.extend_from_slice(bytes);
+            Some(())
+        }
+        Expr::FunctionCall { .. } => {
+            let GlobalInit::String(bytes) = eval_const_derived_ctor_global_init(
+                type_name,
+                expr,
+                registry,
+                param_consts,
+                param_char_consts,
+                st,
+            )?
+            else {
+                return None;
+            };
+            out.extend_from_slice(&bytes);
+            Some(())
+        }
+        _ => None,
     }
 }
 
@@ -14003,6 +14158,16 @@ fn declared_arg_accepts_procedure_actual(sym: &crate::sema::symtab::Symbol) -> b
     ) || sym.attrs.external
 }
 
+fn symbol_is_procedure_reference(sym: &crate::sema::symtab::Symbol) -> bool {
+    matches!(
+        sym.kind,
+        crate::sema::symtab::SymbolKind::Function
+            | crate::sema::symtab::SymbolKind::Subroutine
+            | crate::sema::symtab::SymbolKind::ExternalProc
+            | crate::sema::symtab::SymbolKind::ProcedurePointer
+    ) || sym.attrs.external
+}
+
 fn actual_arg_is_procedure_reference(
     arg: &crate::ast::expr::Argument,
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -14016,18 +14181,17 @@ fn actual_arg_is_procedure_reference(
     };
     let key = name.to_lowercase();
     if locals.is_some_and(|l| l.contains_key(&key)) {
-        return false;
+        // A local-map entry normally means that a data object shadows any
+        // same-named callable in an outer scope. Procedure dummies and local
+        // procedure pointers also occupy local slots, though, so consult the
+        // caller's lexical symbol before applying that shadowing rule.
+        return current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, &key))
+            .is_some_and(symbol_is_procedure_reference);
     }
     st.lookup(&key)
         .or_else(|| st.find_symbol_any_scope(&key))
-        .map(|sym| {
-            matches!(
-                sym.kind,
-                crate::sema::symtab::SymbolKind::Function
-                    | crate::sema::symtab::SymbolKind::Subroutine
-                    | crate::sema::symtab::SymbolKind::ProcedurePointer
-            ) || sym.attrs.external
-        })
+        .map(symbol_is_procedure_reference)
         .unwrap_or(false)
 }
 
@@ -14437,30 +14601,7 @@ fn resolve_generic_call_actuals_from_specifics(
         // that share a procedure's name.
         let actual_is_procedure: Vec<bool> = args
             .iter()
-            .map(|arg| match &arg.value {
-                crate::ast::expr::SectionSubscript::Element(expr) => {
-                    if let Expr::Name { name } = &expr.node {
-                        let key = name.to_lowercase();
-                        if locals.is_some_and(|l| l.contains_key(&key)) {
-                            return false;
-                        }
-                        st.lookup(&key)
-                            .or_else(|| st.find_symbol_any_scope(&key))
-                            .map(|sym| {
-                                matches!(
-                                    sym.kind,
-                                    crate::sema::symtab::SymbolKind::Function
-                                        | crate::sema::symtab::SymbolKind::Subroutine
-                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
-                                ) || sym.attrs.external
-                            })
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            })
+            .map(|arg| actual_arg_is_procedure_reference(arg, locals, st))
             .collect();
         let actual_is_procedure_slots = reorder_actual_bool_slots_by_formal_skip(
             args,
@@ -20206,6 +20347,14 @@ pub(super) fn lowered_scope_symbol_name(
         crate::sema::symtab::ScopeKind::Program(name) => Some(format!("__prog_{}", name)),
         crate::sema::symtab::ScopeKind::Function(name)
         | crate::sema::symtab::ScopeKind::Subroutine(name) => {
+            // BIND(C, NAME=...) owns the linker identity regardless of
+            // whether the procedure is external, module-contained, or
+            // internally contained. Definition lowering already gives the
+            // binding label precedence; address-taking must make the same
+            // choice or it invents an undefined `afs_modproc_*` symbol.
+            if let Some(binding_label) = scope.binding_label.as_deref() {
+                return Some(binding_label.to_string());
+            }
             let parent_id = scope.parent?;
             let parent_scope = st.scope(parent_id);
             match &parent_scope.kind {
@@ -20279,6 +20428,17 @@ pub(super) fn lowered_scope_symbol_name(
         }
         _ => None,
     }
+}
+
+pub(super) fn lowered_internal_procedure_symbol_for_caller(
+    st: &SymbolTable,
+    internal_funcs: &HashMap<String, u32>,
+    candidate_names: &[&str],
+) -> Option<String> {
+    candidate_names.iter().find_map(|name| {
+        find_procedure_scope_id_for_caller_strict(st, name, current_proc_scope())
+            .and_then(|scope_id| lowered_scope_symbol_name(st, internal_funcs, scope_id))
+    })
 }
 
 pub(super) fn same_unit_func_ref(
@@ -21312,7 +21472,7 @@ pub(super) fn emit_named_function_call(
     );
 
     let closure_key = if contained_host_refs
-        .map(|m| m.contains_key(&callee_key))
+        .map(|m| contained_host_refs_for_callee(st, m, &callee_key).is_some())
         .unwrap_or(false)
     {
         &callee_key
@@ -22880,7 +23040,7 @@ fn procedure_actual_closure_args(
     }
     let (_link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
     let closure_key = if contained_host_refs
-        .map(|m| m.contains_key(&resolved_key))
+        .map(|m| contained_host_refs_for_callee(st, m, &resolved_key).is_some())
         .unwrap_or(false)
     {
         resolved_key.as_str()
@@ -24970,7 +25130,7 @@ fn decl_is_procedure_dummy_ref(name: &str, decls: &[crate::ast::decl::SpannedDec
 /// callee agree on positional assignment. `starting_id` is the next
 /// free SSA value id after any other params (normal + hidden-length).
 pub(super) fn build_host_ref_params(
-    callee_name: &str,
+    callee_scope_id: Option<crate::sema::symtab::ScopeId>,
     layout: crate::target::TargetLayout,
     host_decls: &[crate::ast::decl::SpannedDecl],
     host_param_consts: &HashMap<String, ConstScalar>,
@@ -24979,7 +25139,10 @@ pub(super) fn build_host_ref_params(
     st: &SymbolTable,
     out_params: &mut Vec<Param>,
 ) -> Vec<HostRefParamInfo> {
-    let refs = match contained_host_refs.get(&callee_name.to_lowercase()) {
+    let refs = match callee_scope_id
+        .map(contained_host_ref_scope_key)
+        .and_then(|key| contained_host_refs.get(&key))
+    {
         Some(r) if !r.is_empty() => r,
         _ => return Vec::new(),
     };
@@ -25122,7 +25285,9 @@ pub(super) fn append_host_closure_args_raw(
     callee_key: &str,
     arg_vals: &mut Vec<ValueId>,
 ) {
-    let refs = match contained_host_refs.and_then(|m| m.get(callee_key)) {
+    let refs = match contained_host_refs
+        .and_then(|refs| contained_host_refs_for_callee(st, refs, callee_key))
+    {
         Some(r) if !r.is_empty() => r,
         _ => return,
     };
@@ -25208,6 +25373,28 @@ pub(super) fn append_host_closure_args_raw(
             arg_vals.extend(proc_closure_args);
         }
     }
+}
+
+pub(super) fn contained_host_refs_for_callee<'a>(
+    st: &SymbolTable,
+    contained_host_refs: &'a HashMap<String, Vec<String>>,
+    callee_key: &str,
+) -> Option<&'a Vec<String>> {
+    if let Some(refs) = contained_host_refs.get(callee_key) {
+        return Some(refs);
+    }
+
+    let scope_id = find_procedure_scope_id_for_caller_strict(st, callee_key, current_proc_scope())
+        .or_else(|| {
+            st.procedure_scopes_for_link_name(callee_key)
+                .last()
+                .copied()
+        })
+        .or_else(|| {
+            let scopes = st.procedure_scopes_named(callee_key);
+            (scopes.len() == 1).then(|| scopes[0])
+        })?;
+    contained_host_refs.get(&contained_host_ref_scope_key(scope_id))
 }
 
 /// After a contained proc's normal params are installed, set up a
@@ -62582,24 +62769,19 @@ pub(super) fn store_derived_field_expr(
                         let (link_name, resolved_key) =
                             resolved_symbol_call_target(st, &src_key, src_name);
                         let lowered_name = internal_funcs
-                            .filter(|m| m.contains_key(&resolved_key) || m.contains_key(&src_key))
-                            .map(|m| {
-                                lowered_procedure_symbol_name(
-                                    resolved_key.as_str(),
-                                    None,
-                                    Some(b.func().name.as_str()),
-                                    None,
-                                    true,
+                            .and_then(|m| {
+                                lowered_internal_procedure_symbol_for_caller(
+                                    st,
                                     m,
+                                    &[&resolved_key, &src_key],
                                 )
                             })
                             .unwrap_or(link_name);
                         let addr = b.global_addr(&lowered_name, IrType::Int(IntWidth::I8));
                         let mut closure_args = Vec::new();
-                        let closure_key = if contained_host_refs
-                            .and_then(|m| m.get(&resolved_key))
-                            .is_some()
-                        {
+                        let closure_key = if contained_host_refs.is_some_and(|m| {
+                            contained_host_refs_for_callee(st, m, &resolved_key).is_some()
+                        }) {
                             resolved_key.as_str()
                         } else {
                             src_key.as_str()
@@ -62651,15 +62833,11 @@ pub(super) fn store_derived_field_expr(
                         let (link_name, resolved_key) =
                             resolved_symbol_call_target(st, &src_key, src_name);
                         let lowered_name = internal_funcs
-                            .filter(|m| m.contains_key(&resolved_key) || m.contains_key(&src_key))
-                            .map(|m| {
-                                lowered_procedure_symbol_name(
-                                    resolved_key.as_str(),
-                                    None,
-                                    Some(b.func().name.as_str()),
-                                    None,
-                                    true,
+                            .and_then(|m| {
+                                lowered_internal_procedure_symbol_for_caller(
+                                    st,
                                     m,
+                                    &[&resolved_key, &src_key],
                                 )
                             })
                             .unwrap_or(link_name);
@@ -65368,17 +65546,11 @@ pub(super) fn lower_arg_by_ref_full(
             if is_linkable_callable_symbol(sym) {
                 let (link_name, resolved_key) = resolved_symbol_call_target(st, &key, name);
                 if let Some(internal_funcs) = internal_funcs {
-                    if internal_funcs.contains_key(&resolved_key)
-                        || internal_funcs.contains_key(&key)
-                    {
-                        let lowered = lowered_procedure_symbol_name(
-                            resolved_key.as_str(),
-                            None,
-                            Some(b.func().name.as_str()),
-                            None,
-                            true,
-                            internal_funcs,
-                        );
+                    if let Some(lowered) = lowered_internal_procedure_symbol_for_caller(
+                        st,
+                        internal_funcs,
+                        &[&resolved_key, &key],
+                    ) {
                         return b.global_addr(&lowered, IrType::Int(IntWidth::I8));
                     }
                 }
