@@ -270,7 +270,9 @@ impl<'a> Parser<'a> {
             if matches!(
                 text.as_str(),
                 "else" | "elseif" | "elsewhere" | "case" | "contains" | "default"
-            ) {
+            ) && !(matches!(text.as_str(), "case" | "default")
+                && self.leading_designator_is_assignment())
+            {
                 break;
             }
             stmts.push(self.parse_stmt()?);
@@ -1042,8 +1044,21 @@ impl<'a> Parser<'a> {
 
         let body = self.parse_stmt_block(&["where"])?;
         let mut elsewhere = Vec::new();
-        while self.peek_text().eq_ignore_ascii_case("elsewhere") {
-            self.advance();
+        loop {
+            self.skip_newlines();
+            let joined = self.peek_text().eq_ignore_ascii_case("elsewhere");
+            let spaced = self.peek_text().eq_ignore_ascii_case("else")
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|tok| tok.text.eq_ignore_ascii_case("where"));
+            if !joined && !spaced {
+                break;
+            }
+            self.advance(); // ELSEWHERE or ELSE
+            if spaced {
+                self.advance(); // WHERE
+            }
             let ew_mask = if self.peek() == &TokenKind::LParen {
                 self.advance();
                 let m = self.parse_expr()?;
@@ -1052,6 +1067,10 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // Optional construct name on the ELSEWHERE statement.
+            if self.peek() == &TokenKind::Identifier && !self.at_stmt_end() {
+                self.advance();
+            }
             let ew_body = self.parse_stmt_block(&["where"])?;
             elsewhere.push((ew_mask, ew_body));
         }
@@ -2579,6 +2598,29 @@ end if
         } else {
             panic!("not WhereConstruct");
         }
+    }
+
+    #[test]
+    fn where_construct_accepts_spaced_else_where() {
+        let s = parse_one(
+            "where (a > 0)\n  b = 1\nelse where (a < 0)\n  b = -1\nelse where\n  b = 0\nend where\n",
+        );
+        if let Stmt::WhereConstruct { elsewhere, .. } = &s.node {
+            assert_eq!(elsewhere.len(), 2);
+            assert!(elsewhere[0].0.is_some());
+            assert!(elsewhere[1].0.is_none());
+        } else {
+            panic!("not WhereConstruct");
+        }
+    }
+
+    #[test]
+    fn case_keyword_can_name_assignment_inside_if() {
+        let s = parse_one("if (enabled) then\n  case = 'active'\nend if\n");
+        let Stmt::IfConstruct { then_body, .. } = &s.node else {
+            panic!("not IfConstruct");
+        };
+        assert!(matches!(then_body[0].node, Stmt::Assignment { .. }));
     }
 
     #[test]

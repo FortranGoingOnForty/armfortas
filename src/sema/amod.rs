@@ -2150,10 +2150,14 @@ fn parse_amod(content: &str, path: &Path) -> Result<ModuleInterface, String> {
             // body lists `@specific <proc>` until `@end interface`.
             let header = name.trim();
             let (iface_name, access) = match header.split_once(", ") {
-                Some((n, attr)) if attr.split(", ").any(|a| a == "private") => {
-                    (n.trim().to_string(), Access::Private)
-                }
-                _ => (header.to_string(), Access::Public),
+                Some((n, attr)) if attr.split(", ").any(|a| a == "private") => (
+                    crate::ast::canonical_generic_spec_name(n.trim()),
+                    Access::Private,
+                ),
+                _ => (
+                    crate::ast::canonical_generic_spec_name(header),
+                    Access::Public,
+                ),
             };
             let mut specifics = Vec::new();
             for iline in lines.by_ref() {
@@ -3570,6 +3574,21 @@ mod tests {
 "#;
         let iface = parse_amod(legacy, Path::new("legacy_default_access.amod")).unwrap();
         assert_eq!(iface.default_access, Access::Public);
+    }
+
+    #[test]
+    fn dotted_relational_operator_interface_loads_with_canonical_name() {
+        let text = r#"#!amod 14
+# module: operators
+# default-access: public
+
+@interface operator(.eq.)
+  @specific eq_mixed
+@end interface
+"#;
+        let iface = parse_amod(text, Path::new("operators.amod")).unwrap();
+        assert_eq!(iface.interfaces.len(), 1);
+        assert_eq!(iface.interfaces[0].name, "operator(==)");
     }
 
     #[test]

@@ -4861,6 +4861,7 @@ pub(super) fn collect_module_globals(
     }
     let param_char_consts =
         collect_decl_param_char_consts(decls, &param_consts, type_layouts, st, module_scope_id);
+    let data_init_plans = super::alloc::collect_static_data_init_plans(decls, &param_consts, st);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
     let mut param_derived_consts: HashMap<String, Vec<u8>> = HashMap::new();
@@ -4906,6 +4907,7 @@ pub(super) fn collect_module_globals(
                     .init
                     .as_ref()
                     .or_else(|| parameter_inits.get(&key).copied());
+                let data_init_plan = data_init_plans.get(&key);
                 let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
                 let char_len = declared_char_len(
                     type_spec,
@@ -5107,31 +5109,51 @@ pub(super) fn collect_module_globals(
                                 )
                             })
                         }
-                    } else {
-                        init_expr.and_then(|e| {
-                            if matches!(type_spec, TypeSpec::Character(_)) {
-                                char_len.and_then(|len| {
-                                    eval_const_char_array_init(
-                                        e,
-                                        total,
-                                        len,
-                                        &param_consts,
-                                        &param_char_consts,
-                                        Some(st),
-                                        module_scope_id,
-                                        Some(type_layouts),
-                                    )
-                                })
-                            } else {
-                                eval_const_array_init(
-                                    e,
-                                    &ir_ty,
+                    } else if let Some(init_expr) = init_expr {
+                        if matches!(type_spec, TypeSpec::Character(_)) {
+                            char_len.and_then(|len| {
+                                eval_const_char_array_init(
+                                    init_expr,
                                     total,
+                                    len,
                                     &param_consts,
-                                    &param_array_consts,
-                                    &param_array_elem_tys,
+                                    &param_char_consts,
+                                    Some(st),
+                                    module_scope_id,
+                                    Some(type_layouts),
                                 )
-                            }
+                            })
+                        } else {
+                            eval_const_array_init(
+                                init_expr,
+                                &ir_ty,
+                                total,
+                                &param_consts,
+                                &param_array_consts,
+                                &param_array_elem_tys,
+                            )
+                        }
+                    } else if matches!(type_spec, TypeSpec::Character(_)) {
+                        data_init_plan.and_then(|plan| {
+                            char_len.and_then(|len| {
+                                super::alloc::eval_character_data_array_init(
+                                    plan,
+                                    total,
+                                    len,
+                                    &param_consts,
+                                    &param_char_consts,
+                                )
+                            })
+                        })
+                    } else {
+                        data_init_plan.and_then(|plan| {
+                            super::alloc::eval_numeric_data_array_init(
+                                plan,
+                                &ir_ty,
+                                total,
+                                &param_consts,
+                                st,
+                            )
                         })
                     };
                     if is_parameter
@@ -5918,9 +5940,15 @@ pub(super) fn collect_const_array_scalars(
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            let values = param_array_consts.get(&key)?;
-            let source_elem_ty = param_array_elem_tys.get(&key);
-            coerce_param_array_values(values, source_elem_ty, elem_ty)
+            if let Some(values) = param_array_consts.get(&key) {
+                let source_elem_ty = param_array_elem_tys.get(&key);
+                coerce_param_array_values(values, source_elem_ty, elem_ty)
+            } else {
+                param_consts
+                    .get(&key)
+                    .copied()
+                    .map(|value| coerce_scalar_to_array_lanes(value, elem_ty))
+            }
         }
         Expr::ParenExpr { inner } => collect_const_array_scalars(
             inner,
@@ -18610,12 +18638,12 @@ pub(super) fn try_defined_assignment(
     // instead take a default path, the IR instructions are still
     // emitted — that's harmless (dead-code elim removes them).
     let rhs_val = super::expr::lower_expr_ctx_tl(b, ctx, rhs);
-    // For a class()/descriptor-backed LHS dummy, `info.addr` is the
-    // alloca slot holding the descriptor pointer (one extra
-    // indirection). The assignment specific expects a descriptor
-    // pointer directly. Load through the slot when needed; otherwise
-    // pass `addr` as-is (the scalar/derived-aggregate cases that
-    // already worked).
+    // For every non-VALUE LHS dummy, `info.addr` is the alloca slot
+    // holding the caller's pointer (one extra indirection). The
+    // assignment specific expects that pointer directly, whether it
+    // designates a scalar, fixed derived aggregate, or descriptor.
+    // Load through the slot for all by-reference dummies; locals own
+    // their storage directly and continue to pass `addr` as-is.
     //
     // Surfaced in stdlib_error's `error_handling`: `ierr_out = ierr`
     // (both class(state_type)) generated a state_assign_state call
@@ -18628,12 +18656,11 @@ pub(super) fn try_defined_assignment(
     // where_at (`set_cwd ` padded to 32, low bytes spaces, hex
     // 0x2020...20$). Crashed every fs example via set_cwd's
     // error_handling path.
-    let lhs_val =
-        if lhs_info.by_ref && (lhs_info.is_class || local_uses_array_descriptor(&lhs_info)) {
-            b.load(lhs_info.addr)
-        } else {
-            lhs_info.addr
-        };
+    let lhs_val = if lhs_info.by_ref {
+        b.load(lhs_info.addr)
+    } else {
+        lhs_info.addr
+    };
 
     // Only attempt overload resolution when the LHS and RHS types
     // differ in a way the intrinsic assignment can't handle — e.g.
@@ -65277,6 +65304,29 @@ pub(super) fn lower_sequence_array_actual(
     copy_back: bool,
     temps: &mut Vec<SequenceAssociationTemp>,
 ) -> Option<ValueId> {
+    // A fixed inline array component of a scalar derived object is already a
+    // contiguous storage sequence.  Keep its real address so an explicit-
+    // shape dummy can apply sequence association beyond the component's
+    // apparent rank/extent.  Materializing a descriptor-sized copy here is
+    // not equivalent: `arr(1)%mpr` in MPFUN is one 146-word component, while
+    // the rank-2 dummy intentionally continues through ten adjacent SEQUENCE
+    // records.  A four/146-element temporary leaves the callee walking past
+    // its allocation.  Projected, pointer, and descriptor-backed components
+    // remain on the conservative copy path below.
+    if matches!(expr.node, Expr::ComponentAccess { .. }) {
+        if let Some(info) =
+            type_layouts.and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
+        {
+            if !info.dims.is_empty()
+                && !local_uses_array_descriptor(&info)
+                && !info.is_pointer
+                && sequence_supported_elem_ty(&info.ty)
+            {
+                return Some(array_data_ptr_for_call(b, &info));
+            }
+        }
+    }
+
     if proven_contiguous_sequence_section_actual(locals, expr) {
         let (source_desc, elem_ty) = lower_array_expr_descriptor(
             b,

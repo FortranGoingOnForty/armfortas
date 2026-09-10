@@ -704,7 +704,10 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            Some(format!("{}({})", op_kw, op))
+            Some(crate::ast::canonical_generic_spec_name(&format!(
+                "{}({})",
+                op_kw, op
+            )))
         } else if self.peek() == &TokenKind::Identifier {
             Some(self.advance().clone().text)
         } else {
@@ -1202,16 +1205,17 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // ALLOCATABLE / POINTER / TARGET / VOLATILE attribute statements
-            // (F2018 R526/R535/R859): `allocatable :: a, b`, `pointer p`,
-            // `target :: t`. Parsed to AttributeStmt; fold_attribute_statements
+            // ALLOCATABLE / OPTIONAL / POINTER / TARGET / VOLATILE attribute
+            // statements (F2018 R526/R535/R849/R859): `allocatable :: a, b`,
+            // `optional x`, `pointer p`, `target :: t`. Parsed to AttributeStmt;
+            // fold_attribute_statements
             // (run at end of the unit body) merges each into the entity's
             // type declaration. Disambiguate from a same-named variable by
             // requiring `::` or an entity identifier next — `pointer = x`
             // (`=`) and `pointer(i) = x` (`(`) fall through to assignment.
             if matches!(
                 text.as_str(),
-                "allocatable" | "pointer" | "target" | "volatile"
+                "allocatable" | "optional" | "pointer" | "target" | "volatile"
             ) {
                 let next_kind = self.tokens.get(self.pos + 1).map(|t| t.kind.clone());
                 let is_attr_stmt = matches!(
@@ -1222,6 +1226,7 @@ impl<'a> Parser<'a> {
                     let start = self.current_span();
                     let attr = match text.as_str() {
                         "allocatable" => crate::ast::decl::Attribute::Allocatable,
+                        "optional" => crate::ast::decl::Attribute::Optional,
                         "pointer" => crate::ast::decl::Attribute::Pointer,
                         "target" => crate::ast::decl::Attribute::Target,
                         _ => crate::ast::decl::Attribute::Volatile,
@@ -1237,7 +1242,7 @@ impl<'a> Parser<'a> {
                         // dropping the shape.
                         if self.peek() == &TokenKind::LParen {
                             return Err(self.error(
-                                "array-spec in a standalone ALLOCATABLE/POINTER/TARGET/VOLATILE \
+                                "array-spec in a standalone ALLOCATABLE/OPTIONAL/POINTER/TARGET/VOLATILE \
                                  statement is not supported yet; declare the shape on \
                                  the type declaration instead"
                                     .to_string(),
@@ -1375,7 +1380,10 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(Some(format!("{}({})", generic_kw, op)))
+        Ok(Some(crate::ast::canonical_generic_spec_name(&format!(
+            "{}({})",
+            generic_kw, op
+        ))))
     }
 
     fn parse_contains_section(&mut self) -> Result<Vec<SpannedUnit>, ParseError> {
@@ -1536,6 +1544,7 @@ fn fold_attribute_statements(decls: &mut Vec<SpannedDecl>) {
                 if matches!(
                     attr,
                     Attribute::Allocatable
+                        | Attribute::Optional
                         | Attribute::Pointer
                         | Attribute::Target
                         | Attribute::Volatile
@@ -2149,6 +2158,25 @@ end module malformed_m
     }
 
     #[test]
+    fn standalone_optional_statement_folds_into_type_decl() {
+        use crate::ast::decl::{Attribute, Decl};
+        let unit = parse_unit(
+            "subroutine probe(required, extra)\n  integer :: required, extra\n  optional :: extra\nend subroutine probe\n",
+        );
+        let ProgramUnit::Subroutine { decls, .. } = &unit.node else {
+            panic!("not Subroutine");
+        };
+        assert!(decls.iter().any(|decl| {
+            matches!(
+                &decl.node,
+                Decl::TypeDecl { attrs, entities, .. }
+                    if entities.iter().any(|entity| entity.name == "extra")
+                        && attrs.iter().any(|attr| matches!(attr, Attribute::Optional))
+            )
+        }));
+    }
+
+    #[test]
     fn standalone_volatile_statement_folds_into_type_decl() {
         use crate::ast::decl::{Attribute, Decl};
         let unit =
@@ -2718,6 +2746,18 @@ end module malformed_m
         if let ProgramUnit::InterfaceBlock { name, bodies, .. } = &u.node {
             assert_eq!(name.as_deref(), Some("operator(+)"));
             assert_eq!(bodies.len(), 1);
+        } else {
+            panic!("not InterfaceBlock");
+        }
+    }
+
+    #[test]
+    fn interface_dotted_relational_operator_uses_canonical_name() {
+        let u = parse_unit(
+            "interface operator(.eq.)\n  module procedure eq_mixed\nend interface operator(.eq.)\n",
+        );
+        if let ProgramUnit::InterfaceBlock { name, .. } = &u.node {
+            assert_eq!(name.as_deref(), Some("operator(==)"));
         } else {
             panic!("not InterfaceBlock");
         }

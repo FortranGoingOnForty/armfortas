@@ -923,6 +923,29 @@ fn eval_const_int_expr(
                         _ => None,
                     }
                 }
+                "huge" => {
+                    let arg = args.first()?;
+                    let crate::ast::expr::SectionSubscript::Element(e) = &arg.value else {
+                        return None;
+                    };
+                    let Expr::IntegerLiteral { kind, .. } = &e.node else {
+                        return None;
+                    };
+                    let bytes = match kind.as_deref() {
+                        Some(selector) => selector
+                            .parse::<i64>()
+                            .ok()
+                            .or_else(|| const_params.get(&selector.to_lowercase()).copied())?,
+                        None => crate::driver::defaults::default_int_kind().into(),
+                    };
+                    match bytes {
+                        1 => Some(i8::MAX as i64),
+                        2 => Some(i16::MAX as i64),
+                        4 => Some(i32::MAX as i64),
+                        8 => Some(i64::MAX),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
