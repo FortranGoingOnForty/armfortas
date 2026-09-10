@@ -66375,3 +66375,74 @@ fn top_level_subroutine_contained_function_uses_internal_target() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_save_explicit_shape_array_uses_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_save_explicit_shape_array_uses_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MINPACK's lmstr callback fills a SAVE'd 65x40 Jacobian workspace on
+    // one invocation and reads a selected row on later invocations. This
+    // used to be an alloca whose stale stack contents survived by accident;
+    // an unrelated same-sized frame could overwrite individual values. The
+    // small initialized array also checks the implicit-SAVE form.
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: got\n  integer :: count\n  call callback(.true., got, count)\n  if (count /= 1) error stop 2\n  call clobber()\n  call callback(.false., got, count)\n  if (abs(got + 1.57959540603238699e-8_8) > 1.0e-20_8) error stop 1\n  if (count /= 2) error stop 3\n  print *, 'ok'\ncontains\n  subroutine callback(fill, value, count)\n    logical, intent(in) :: fill\n    real(8), intent(out) :: value\n    integer, intent(out) :: count\n    real(8), save :: temp(65, 40)\n    integer :: state(2) = [0, 10]\n    state(1) = state(1) + 1\n    count = state(1)\n    if (fill) then\n      temp = 0.0_8\n      temp(47, 9) = -1.57959540603238699e-8_8\n      value = 0.0_8\n    else\n      value = temp(47, 9)\n    end if\n  end subroutine callback\n\n  subroutine clobber()\n    real(8) :: scratch(65, 40)\n    scratch = -99.0_8\n    call observe(scratch(47, 9))\n  end subroutine clobber\n\n  subroutine observe(value)\n    real(8), intent(in) :: value\n    if (value > 0.0_8) print *, value\n  end subroutine observe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_save_explicit_shape_array", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("contained SAVE array IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "contained SAVE array IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read contained SAVE array IR");
+    assert!(
+        ir_text.contains("_temp: [f64 x 2600] = zeroinit"),
+        "SAVE'd explicit-shape array must have static IR storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("_state: [i32 x 2] = [0, 10]"),
+        "initialized local array must carry its implicit-SAVE initializer in static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_save_explicit_shape_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained SAVE array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained SAVE array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained SAVE array binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained SAVE array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

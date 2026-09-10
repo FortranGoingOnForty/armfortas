@@ -7844,7 +7844,7 @@ pub(super) fn install_host_param_consts(
 }
 
 /// A pending global variable produced by the lowerer for a SAVE'd
-/// scalar local. Flushed into the IR Module after the containing
+/// local. Flushed into the IR Module after the containing
 /// function finishes lowering.
 pub(super) struct PendingGlobal {
     pub(super) global: Global,
