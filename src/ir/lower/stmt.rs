@@ -1121,11 +1121,8 @@ fn lower_where_array_read_temp(
     } else {
         false
     };
-    let Some(rank) = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
-        .or_else(|| local_array_section.then_some(1))
-    else {
-        return None;
-    };
+    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .or_else(|| local_array_section.then_some(1))?;
     if rank == 0 {
         return None;
     }
