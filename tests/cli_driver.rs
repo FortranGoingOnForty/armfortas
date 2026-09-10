@@ -66872,6 +66872,74 @@ fn contained_integer_array_data_initialization_uses_static_storage() {
 }
 
 #[test]
+fn contained_real_and_logical_array_data_initialization_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_real_and_logical_array_data_initialization_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Real-valued lookup tables and logical control masks are both common in
+    // LAPACK DATA statements. Their initialized values and later mutations
+    // must live in the same static storage across recursive activations.
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: observed_real\n  logical :: observed_flag\n  call probe(0, observed_real, observed_flag)\n  if (abs(observed_real - 9.5d0) > 1.0d-12) error stop 1\n  if (.not. observed_flag) error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine probe(stage, real_out, flag_out)\n    integer, intent(in) :: stage\n    real(8), intent(out) :: real_out\n    logical, intent(out) :: flag_out\n    real(8) :: reals(3)\n    logical :: flags(3)\n    data reals /1.5d0, 2*2.5d0/\n    data flags /.true., .false., .true./\n    if (stage == 0) then\n      if (abs(reals(1) - 1.5d0) > 1.0d-12) error stop 3\n      if (abs(reals(3) - 2.5d0) > 1.0d-12) error stop 4\n      if (.not. flags(1) .or. flags(2) .or. .not. flags(3)) error stop 5\n      reals(2) = 9.5d0\n      flags(2) = .true.\n      call probe(1, real_out, flag_out)\n    else\n      real_out = reals(2)\n      flag_out = flags(2)\n    end if\n  end subroutine probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_real_logical_array_data_save", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("real/logical array DATA IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "real/logical array DATA IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read real/logical array DATA IR");
+    for expected in [
+        "_reals: [f64 x 3] = [1.5, 2.5, 2.5]",
+        "_flags: [bool x 3] = [1, 0, 1]",
+    ] {
+        assert!(
+            ir_text.lines().any(|line| line.contains(expected)),
+            "missing static DATA initializer {expected}:\n{ir_text}"
+        );
+    }
+
+    let out = unique_path("contained_real_logical_array_data_save", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("real/logical array DATA compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "real/logical array DATA compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("real/logical array DATA binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "real/logical array DATA run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn contained_character_and_complex_data_initialization_use_static_storage() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
