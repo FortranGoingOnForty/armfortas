@@ -31369,6 +31369,45 @@ fn spaced_else_where_executes_unmasked_branch() {
 }
 
 #[test]
+fn case_keyword_can_name_assignment_inside_if() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=case_keyword_can_name_assignment_inside_if count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // rklib's performance driver uses CASE as a character variable and
+    // assigns it inside an IF construct.
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=16) :: case\n  case = ''\n  if (.true.) then\n    case = ' [REAL64]'\n  end if\n  if (trim(case) /= ' [REAL64]') error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("case_assignment_inside_if", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("CASE-named assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "CASE-named assignment should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("CASE-named assignment failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "CASE-named assignment failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

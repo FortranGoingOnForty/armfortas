@@ -270,7 +270,9 @@ impl<'a> Parser<'a> {
             if matches!(
                 text.as_str(),
                 "else" | "elseif" | "elsewhere" | "case" | "contains" | "default"
-            ) {
+            ) && !(matches!(text.as_str(), "case" | "default")
+                && self.leading_designator_is_assignment())
+            {
                 break;
             }
             stmts.push(self.parse_stmt()?);
@@ -2610,6 +2612,15 @@ end if
         } else {
             panic!("not WhereConstruct");
         }
+    }
+
+    #[test]
+    fn case_keyword_can_name_assignment_inside_if() {
+        let s = parse_one("if (enabled) then\n  case = 'active'\nend if\n");
+        let Stmt::IfConstruct { then_body, .. } = &s.node else {
+            panic!("not IfConstruct");
+        };
+        assert!(matches!(then_body[0].node, Stmt::Assignment { .. }));
     }
 
     #[test]
