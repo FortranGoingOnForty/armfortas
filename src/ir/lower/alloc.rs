@@ -608,6 +608,57 @@ pub(crate) fn alloc_decls(
                         let elem_ty = fixed_char_storage_ir_type(len);
                         let elem_bytes = ir_scalar_byte_size(&elem_ty, b.layout);
                         let total_bytes = total_size * elem_bytes;
+                        let static_init = if !is_parameter && total_size > 0 {
+                            match init_expr {
+                                Some(expr) => eval_const_char_array_init(
+                                    expr,
+                                    total_size,
+                                    len,
+                                    &param_consts,
+                                    &param_char_consts,
+                                    Some(st),
+                                    current_proc_scope(),
+                                    Some(type_layouts),
+                                ),
+                                None if is_saved => Some(GlobalInit::Zero),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(initializer) = static_init {
+                            let arr_ty =
+                                IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                            let global_name = save_global_name(func_name, &key);
+                            pending_globals.push(PendingGlobal {
+                                global: Global {
+                                    name: global_name.clone(),
+                                    ty: arr_ty.clone(),
+                                    initializer: Some(initializer),
+                                },
+                            });
+                            let addr = b.global_addr(&global_name, arr_ty);
+                            locals.insert(
+                                key,
+                                LocalInfo {
+                                    addr,
+                                    ty: elem_ty,
+                                    dims,
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::Fixed(len),
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                    runtime_dim_upper: vec![],
+                                    is_class: false,
+                                    logical_kind: None,
+                                    last_dim_assumed_size: false,
+                                },
+                            );
+                            continue;
+                        }
                         let space = b.const_i32(b' ' as i32);
                         let total_bytes_val = b.const_i64(total_bytes);
                         const STACK_THRESHOLD: i64 = 64 * 1024;

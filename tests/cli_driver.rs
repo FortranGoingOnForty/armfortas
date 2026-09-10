@@ -66593,3 +66593,68 @@ fn contained_saved_pointer_and_allocatable_descriptors_persist() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_saved_character_arrays_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_saved_character_arrays_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=4) :: got\n  call explicit_save(0, got)\n  if (got /= 'kept') error stop 1\n  call implicit_save(0, got)\n  if (got /= 'kept') error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine explicit_save(stage, out)\n    integer, intent(in) :: stage\n    character(len=4), intent(out) :: out\n    character(len=4), save :: words(2)\n    if (stage == 0) then\n      words(2) = 'kept'\n      call explicit_save(1, out)\n    else\n      out = words(2)\n    end if\n  end subroutine explicit_save\n\n  recursive subroutine implicit_save(stage, out)\n    integer, intent(in) :: stage\n    character(len=4), intent(out) :: out\n    character(len=4) :: words(2) = ['left', 'rght']\n    if (stage == 0) then\n      if (words(1) /= 'left') error stop 3\n      words(2) = 'kept'\n      call implicit_save(1, out)\n    else\n      out = words(2)\n    end if\n  end subroutine implicit_save\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_saved_character_arrays", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("saved character arrays IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "saved character arrays IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read saved character arrays IR");
+    let saved_arrays = ir_text
+        .lines()
+        .filter(|line| line.contains("global @afs_save_") && line.contains("_words:"))
+        .count();
+    assert_eq!(
+        saved_arrays, 2,
+        "explicit and implicit character-array SAVE forms must be global:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_saved_character_arrays", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved character arrays compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "saved character arrays compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("saved character arrays binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "saved character arrays run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

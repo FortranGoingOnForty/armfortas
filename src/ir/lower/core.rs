@@ -7065,7 +7065,7 @@ pub(super) fn eval_const_char_array_init(
     scope_id: Option<crate::sema::symtab::ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<GlobalInit> {
-    let elems = collect_const_char_array_elems_with_context(
+    let mut elems = collect_const_char_array_elems_with_context(
         expr,
         param_consts,
         param_char_consts,
@@ -7077,8 +7077,14 @@ pub(super) fn eval_const_char_array_init(
         return None;
     }
 
+    let total = usize::try_from(total).ok()?;
+    if elems.len() == 1 && total > 1 {
+        elems.resize(total, elems[0].clone());
+    } else {
+        elems.resize_with(total, Vec::new);
+    }
     let elem_len = usize::try_from(elem_len).ok()?;
-    let mut bytes = Vec::with_capacity(elems.len().saturating_mul(elem_len));
+    let mut bytes = Vec::with_capacity(total.saturating_mul(elem_len));
     for mut elem in elems {
         if elem.len() > elem_len {
             elem.truncate(elem_len);
