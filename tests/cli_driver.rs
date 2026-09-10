@@ -36907,6 +36907,77 @@ fn standalone_parameter_integer_kind_suffix_uses_declared_width() {
 }
 
 #[test]
+fn standalone_parameter_kind_is_concrete_across_module_boundary() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=standalone_parameter_kind_is_concrete_across_module_boundary count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("standalone_parameter_kind_amod");
+    let module_src = write_program_in(
+        &dir,
+        "standalone_kind_module.f90",
+        "module standalone_kind_module\n  implicit none\n  integer, parameter :: wide_kind = selected_int_kind(18)\n  integer :: literal_kind\n  parameter (literal_kind = wide_kind)\n  integer(literal_kind), public :: value = 799144290325165978_literal_kind\nend module standalone_kind_module\n",
+    );
+    let module_obj = dir.join("standalone_kind_module.o");
+    let module_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-c", "-J"])
+        .arg(&dir)
+        .arg(&module_src)
+        .args(["-o"])
+        .arg(&module_obj)
+        .output()
+        .expect("standalone-kind module compile failed to spawn");
+    assert!(
+        module_compile.status.success(),
+        "standalone-kind module compile failed: {}",
+        String::from_utf8_lossy(&module_compile.stderr)
+    );
+
+    let amod = fs::read_to_string(dir.join("standalone_kind_module.amod"))
+        .expect("standalone-kind module interface was not written");
+    assert!(
+        amod.contains("@var value : integer(8)"),
+        "standalone PARAMETER must give later declarations a concrete exported kind:\n{amod}"
+    );
+
+    let consumer_src = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  use standalone_kind_module, only: value\n  implicit none\n  if (value /= 799144290325165978_8) error stop 1\n  print *, 'ok'\nend program p\n",
+    );
+    let exe = dir.join("standalone_parameter_kind_amod.bin");
+    let consumer_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["-I"])
+        .arg(&dir)
+        .arg(&consumer_src)
+        .arg(&module_obj)
+        .args(["-o"])
+        .arg(&exe)
+        .output()
+        .expect("standalone-kind consumer compile failed to spawn");
+    assert!(
+        consumer_compile.status.success(),
+        "standalone-kind consumer compile failed: {}",
+        String::from_utf8_lossy(&consumer_compile.stderr)
+    );
+    let run = Command::new(&exe).output().expect("consumer run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "standalone-kind consumer failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn integer_division_by_zero_is_diagnosed() {
     let src = write_program(
         "program p\n  integer, parameter :: x = 1 / 0\n  print *, x\nend program\n",

@@ -3289,6 +3289,18 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                     }
                 }
             }
+            Decl::ParameterStmt { pairs } => {
+                // Finalize already-declared named constants immediately so
+                // later declarations in this specification part can use
+                // their values in kind and length selectors. A PARAMETER
+                // statement may legally precede its type declaration, so
+                // missing names are deferred to the post-pass below.
+                for (name, expr) in pairs {
+                    if prepare_standalone_parameter(st, name, decl.span, false)? {
+                        fold_standalone_parameter(st, name, expr);
+                    }
+                }
+            }
             Decl::AttributeStmt {
                 attr: Attribute::Volatile,
                 entities,
@@ -3618,8 +3630,6 @@ fn finalize_standalone_parameters(
     st: &mut SymbolTable,
     decls: &[SpannedDecl],
 ) -> Result<(), SemaError> {
-    let current_scope = st.current_scope();
-
     // A PARAMETER statement may precede or follow the entity's type
     // declaration. All type declarations have been processed by this point,
     // so upgrade explicitly declared variables first and only use implicit
@@ -3629,44 +3639,7 @@ fn finalize_standalone_parameters(
             continue;
         };
         for (name, _) in pairs {
-            let key = name.to_lowercase();
-            let implicit_type = st.implicit_type(name).map(implicit_type_to_type_info);
-            if let Some(symbol) = st.scope_mut(current_scope).symbols.get_mut(&key) {
-                if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-                    return Err(SemaError {
-                        span: decl.span,
-                        msg: format!("'{}' in a PARAMETER statement is not a variable", name),
-                    });
-                }
-                if symbol.type_info.is_none() {
-                    symbol.type_info = Some(implicit_type.ok_or_else(|| SemaError {
-                        span: decl.span,
-                        msg: format!("PARAMETER entity '{}' has no implicit type", name),
-                    })?);
-                }
-                symbol.kind = SymbolKind::Parameter;
-                symbol.attrs.parameter = true;
-            } else {
-                let type_info = implicit_type.ok_or_else(|| SemaError {
-                    span: decl.span,
-                    msg: format!("PARAMETER entity '{}' has no implicit type", name),
-                })?;
-                st.define(Symbol {
-                    name: name.clone(),
-                    kind: SymbolKind::Parameter,
-                    type_info: Some(type_info),
-                    attrs: SymbolAttrs {
-                        access: st.default_access(current_scope),
-                        parameter: true,
-                        ..Default::default()
-                    },
-                    defined_at: decl.span,
-                    scope: current_scope,
-                    arg_names: vec![],
-                    const_value: None,
-                    const_char_value: None,
-                })?;
-            }
+            prepare_standalone_parameter(st, name, decl.span, true)?;
         }
     }
 
@@ -3687,21 +3660,7 @@ fn finalize_standalone_parameters(
                 continue;
             };
             for (name, expr) in pairs {
-                let const_value = eval_const_int_expr(expr, st);
-                let const_char_value = eval_const_char_expr(expr, st);
-                let symbol = st
-                    .scope_mut(current_scope)
-                    .symbols
-                    .get_mut(&name.to_lowercase())
-                    .expect("standalone PARAMETER symbol must exist");
-                if symbol.const_value != const_value {
-                    symbol.const_value = const_value;
-                    changed = true;
-                }
-                if symbol.const_char_value != const_char_value {
-                    symbol.const_char_value = const_char_value;
-                    changed = true;
-                }
+                changed |= fold_standalone_parameter(st, name, expr);
             }
         }
         if !changed {
@@ -3710,6 +3669,78 @@ fn finalize_standalone_parameters(
     }
 
     Ok(())
+}
+
+fn prepare_standalone_parameter(
+    st: &mut SymbolTable,
+    name: &str,
+    span: crate::lexer::Span,
+    define_missing: bool,
+) -> Result<bool, SemaError> {
+    let current_scope = st.current_scope();
+    let key = name.to_lowercase();
+    let implicit_type = st.implicit_type(name).map(implicit_type_to_type_info);
+    if let Some(symbol) = st.scope_mut(current_scope).symbols.get_mut(&key) {
+        if !matches!(symbol.kind, SymbolKind::Variable | SymbolKind::Parameter) {
+            return Err(SemaError {
+                span,
+                msg: format!("'{}' in a PARAMETER statement is not a variable", name),
+            });
+        }
+        if symbol.type_info.is_none() {
+            symbol.type_info = Some(implicit_type.ok_or_else(|| SemaError {
+                span,
+                msg: format!("PARAMETER entity '{}' has no implicit type", name),
+            })?);
+        }
+        symbol.kind = SymbolKind::Parameter;
+        symbol.attrs.parameter = true;
+        return Ok(true);
+    }
+    if !define_missing {
+        return Ok(false);
+    }
+
+    let type_info = implicit_type.ok_or_else(|| SemaError {
+        span,
+        msg: format!("PARAMETER entity '{}' has no implicit type", name),
+    })?;
+    st.define(Symbol {
+        name: name.into(),
+        kind: SymbolKind::Parameter,
+        type_info: Some(type_info),
+        attrs: SymbolAttrs {
+            access: st.default_access(current_scope),
+            parameter: true,
+            ..Default::default()
+        },
+        defined_at: span,
+        scope: current_scope,
+        arg_names: vec![],
+        const_value: None,
+        const_char_value: None,
+    })?;
+    Ok(true)
+}
+
+fn fold_standalone_parameter(
+    st: &mut SymbolTable,
+    name: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+) -> bool {
+    let const_value = eval_const_int_expr(expr, st);
+    let const_char_value = eval_const_char_expr(expr, st);
+    let current_scope = st.current_scope();
+    let symbol = st
+        .scope_mut(current_scope)
+        .symbols
+        .get_mut(&name.to_lowercase())
+        .expect("standalone PARAMETER symbol must exist");
+    let changed = symbol.const_value != const_value
+        || symbol.const_char_value.as_ref() != const_char_value.as_ref();
+    symbol.const_value = const_value;
+    symbol.const_char_value = const_char_value;
+    changed
 }
 
 fn entity_is_assumed_length_character(
