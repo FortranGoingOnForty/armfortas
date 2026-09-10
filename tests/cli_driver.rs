@@ -42146,6 +42146,44 @@ fn print_routes_derived_function_results_through_defined_io() {
 }
 
 #[test]
+fn defined_unformatted_io_shares_parent_sequential_record() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_unformatted_io_shares_parent_sequential_record count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module unformatted_dtio_m\n  implicit none\n  type :: payload_t\n    integer :: number = 0\n    character(len=3) :: text = '   '\n  end type\n  interface write(unformatted)\n    module procedure :: write_payload\n  end interface\n  interface read(unformatted)\n    module procedure :: read_payload\n  end interface\ncontains\n  subroutine write_payload(value, unit, iostat, iomsg)\n    type(payload_t), intent(in) :: value\n    integer, intent(in) :: unit\n    integer, intent(out) :: iostat\n    character(len=*), intent(inout) :: iomsg\n    write(unit, iostat=iostat, iomsg=iomsg) value%number\n    if (iostat == 0) write(unit, iostat=iostat, iomsg=iomsg) value%text\n  end subroutine\n  subroutine read_payload(value, unit, iostat, iomsg)\n    type(payload_t), intent(inout) :: value\n    integer, intent(in) :: unit\n    integer, intent(out) :: iostat\n    character(len=*), intent(inout) :: iomsg\n    read(unit, iostat=iostat, iomsg=iomsg) value%number\n    if (iostat == 0) read(unit, iostat=iostat, iomsg=iomsg) value%text\n  end subroutine\nend module\nprogram p\n  use unformatted_dtio_m, only: payload_t, write(unformatted), read(unformatted)\n  implicit none\n  type(payload_t) :: sent, received\n  integer :: unit, ios\n  character(len=128) :: msg\n  sent%number = 42\n  sent%text = 'abc'\n  open(newunit=unit, form='unformatted', status='scratch', action='readwrite', iostat=ios)\n  if (ios /= 0) error stop 1\n  write(unit, iostat=ios, iomsg=msg) sent\n  if (ios /= 0) error stop 2\n  rewind(unit)\n  read(unit, iostat=ios, iomsg=msg) received\n  if (ios /= 0) error stop 3\n  close(unit)\n  if (received%number /= 42) error stop 4\n  if (received%text /= 'abc') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_unformatted_parent_record", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("defined unformatted I/O compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "defined unformatted I/O compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("defined unformatted I/O run failed to spawn");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success() && stdout.contains("ok"),
+        "defined unformatted I/O did not share its parent record: status={:?} stdout={} stderr={}",
+        run.status,
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn formatted_write_of_concat_with_internal_char_function_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
