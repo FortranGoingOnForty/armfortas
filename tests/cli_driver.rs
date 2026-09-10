@@ -66523,3 +66523,73 @@ fn contained_scalar_save_forms_use_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_saved_pointer_and_allocatable_descriptors_persist() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_saved_pointer_and_allocatable_descriptors_persist count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, target :: backing\n  integer :: got\n  backing = 149\n  call pointer_probe(.true., backing, got)\n  call pointer_probe(.false., backing, got)\n  if (got /= 149) error stop 1\n  call allocatable_probe(0, got)\n  if (got /= 163) error stop 2\n  print *, 'ok'\ncontains\n  subroutine pointer_probe(bind, target_value, out)\n    logical, intent(in) :: bind\n    integer, target, intent(in) :: target_value\n    integer, intent(out) :: out\n    integer, pointer, save :: slot\n    if (bind) then\n      slot => target_value\n      out = 0\n    else if (associated(slot)) then\n      out = slot\n    else\n      out = -1\n    end if\n  end subroutine pointer_probe\n\n  recursive subroutine allocatable_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer, allocatable, save :: values(:)\n    if (stage == 0) then\n      allocate(values(1))\n      values(1) = 163\n      call allocatable_probe(1, out)\n    else if (allocated(values)) then\n      out = values(1)\n    else\n      out = -1\n    end if\n  end subroutine allocatable_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_saved_descriptors", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("saved descriptors IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "saved descriptors IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read saved descriptors IR");
+    assert!(
+        ir_text.lines().any(|line| {
+            line.contains("global @afs_save_") && line.contains(": ptr<i32> = zeroinit")
+        }),
+        "saved pointer slot must have static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.lines().any(|line| {
+            line.contains("global @afs_save_") && line.contains(": [i8 x 392] = zeroinit")
+        }),
+        "saved allocatable descriptor must have static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_saved_descriptors", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved descriptors compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "saved descriptors compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("saved descriptors binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "saved descriptors run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

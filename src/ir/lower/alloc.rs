@@ -129,6 +129,38 @@ fn lower_explicit_shape_dim_buffer(
     dim_buf
 }
 
+fn alloc_zeroed_or_saved_storage(
+    b: &mut FuncBuilder,
+    pending_globals: &mut Vec<PendingGlobal>,
+    func_name: &str,
+    local_name: &str,
+    storage_ty: IrType,
+    byte_size: i64,
+    is_saved: bool,
+) -> ValueId {
+    if is_saved {
+        let global_name = save_global_name(func_name, local_name);
+        pending_globals.push(PendingGlobal {
+            global: Global {
+                name: global_name.clone(),
+                ty: storage_ty.clone(),
+                initializer: Some(GlobalInit::Zero),
+            },
+        });
+        return b.global_addr(&global_name, storage_ty);
+    }
+
+    let addr = b.alloca(storage_ty);
+    let zero = b.const_i32(0);
+    let size = b.const_i64(byte_size);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![addr, zero, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    addr
+}
+
 /// Allocate local variables from declarations. Handles both scalars and arrays.
 pub(crate) fn alloc_decls(
     b: &mut FuncBuilder,
@@ -282,13 +314,14 @@ pub(crate) fn alloc_decls(
                     // afs_deallocate_array call — a pointer does
                     // not own its target.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
-                    let addr = b.alloca(desc_ty);
-                    let zero_byte = b.const_i32(0);
-                    let descriptor_bytes = b.const_i64(392);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero_byte, descriptor_bytes],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        392,
+                        is_saved,
                     );
                     // dims is left empty for a deferred-shape pointer;
                     // the descriptor carries the runtime rank and
@@ -344,13 +377,15 @@ pub(crate) fn alloc_decls(
                     // struct base.  derived_type is stored so that
                     // component lookup can find the type layout.
                     if let TypeSpec::Type(_) = type_spec {
-                        let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        let zero_byte = b.const_i32(0);
-                        let eight = b.const_i64(8);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![addr, zero_byte, eight],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        let slot_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+                        let addr = alloc_zeroed_or_saved_storage(
+                            b,
+                            pending_globals,
+                            func_name,
+                            &key,
+                            slot_ty,
+                            8,
+                            is_saved,
                         );
                         locals.insert(
                             key,
@@ -379,13 +414,14 @@ pub(crate) fn alloc_decls(
                     && array_spec.is_none()
                 {
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
-                    let addr = b.alloca(desc_ty);
-                    let zero = b.const_i32(0);
-                    let descriptor_bytes = b.const_i64(392);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero, descriptor_bytes],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        392,
+                        is_saved,
                     );
                     locals.insert(
                         key,
@@ -413,13 +449,14 @@ pub(crate) fn alloc_decls(
                     // 32-byte StringDescriptor. Deferred-length arrays fall
                     // through to the general descriptor path below.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
-                    let addr = b.alloca(desc_ty);
-                    let zero = b.const_i32(0);
-                    let size32 = b.const_i64(32);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero, size32],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        32,
+                        is_saved,
                     );
                     locals.insert(
                         key,
@@ -656,13 +693,15 @@ pub(crate) fn alloc_decls(
                         // c_f_pointer populate this slot with the associated
                         // byte buffer address, and later substring/character
                         // reads must dereference it.
-                        let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        let zero = b.const_i32(0);
-                        let eight = b.const_i64(8);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![addr, zero, eight],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        let slot_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+                        let addr = alloc_zeroed_or_saved_storage(
+                            b,
+                            pending_globals,
+                            func_name,
+                            &key,
+                            slot_ty,
+                            8,
+                            is_saved,
                         );
                         locals.insert(
                             key,
@@ -854,16 +893,18 @@ pub(crate) fn alloc_decls(
                 }
 
                 if is_allocatable {
-                    // Allocatable variable: alloca a descriptor (392 bytes), zero-initialized.
+                    // Allocatable variable: a zero-initialized 392-byte
+                    // descriptor. SAVE'd descriptors live in static storage;
+                    // ordinary descriptors remain per-activation allocas.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
-                    let addr = b.alloca(desc_ty);
-                    // Zero-initialize the descriptor so flags=0 (not allocated).
-                    let zero = b.const_i32(0);
-                    let size = b.const_i64(392);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero, size],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        392,
+                        is_saved,
                     );
                     let alloc_elem_ty = if matches!(type_spec, TypeSpec::Character(_)) {
                         match char_len {
@@ -1328,16 +1369,15 @@ pub(crate) fn alloc_decls(
                     // dereferences it; reads load twice.  The slot
                     // starts null so that ASSOCIATED() returns
                     // false before the first `=>`.
-                    let addr = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
-                    // Memset the slot to zero so unassociated pointers
-                    // compare null.  Eight bytes matches the ARM64
-                    // pointer width.
-                    let zero_byte = b.const_i32(0);
-                    let eight = b.const_i64(8);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero_byte, eight],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let slot_ty = IrType::Ptr(Box::new(elem_ty.clone()));
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        slot_ty,
+                        8,
+                        is_saved,
                     );
                     locals.insert(
                         key,
