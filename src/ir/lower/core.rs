@@ -18638,12 +18638,12 @@ pub(super) fn try_defined_assignment(
     // instead take a default path, the IR instructions are still
     // emitted — that's harmless (dead-code elim removes them).
     let rhs_val = super::expr::lower_expr_ctx_tl(b, ctx, rhs);
-    // For a class()/descriptor-backed LHS dummy, `info.addr` is the
-    // alloca slot holding the descriptor pointer (one extra
-    // indirection). The assignment specific expects a descriptor
-    // pointer directly. Load through the slot when needed; otherwise
-    // pass `addr` as-is (the scalar/derived-aggregate cases that
-    // already worked).
+    // For every non-VALUE LHS dummy, `info.addr` is the alloca slot
+    // holding the caller's pointer (one extra indirection). The
+    // assignment specific expects that pointer directly, whether it
+    // designates a scalar, fixed derived aggregate, or descriptor.
+    // Load through the slot for all by-reference dummies; locals own
+    // their storage directly and continue to pass `addr` as-is.
     //
     // Surfaced in stdlib_error's `error_handling`: `ierr_out = ierr`
     // (both class(state_type)) generated a state_assign_state call
@@ -18656,12 +18656,11 @@ pub(super) fn try_defined_assignment(
     // where_at (`set_cwd ` padded to 32, low bytes spaces, hex
     // 0x2020...20$). Crashed every fs example via set_cwd's
     // error_handling path.
-    let lhs_val =
-        if lhs_info.by_ref && (lhs_info.is_class || local_uses_array_descriptor(&lhs_info)) {
-            b.load(lhs_info.addr)
-        } else {
-            lhs_info.addr
-        };
+    let lhs_val = if lhs_info.by_ref {
+        b.load(lhs_info.addr)
+    } else {
+        lhs_info.addr
+    };
 
     // Only attempt overload resolution when the LHS and RHS types
     // differ in a way the intrinsic assignment can't handle — e.g.

@@ -60003,6 +60003,49 @@ fn use_only_does_not_leak_unrelated_generic_specifics_into_user_scope() {
 }
 
 #[test]
+fn defined_assignment_derived_dummy_lhs_loads_caller_storage_through_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=defined_assignment_derived_dummy_lhs_loads_caller_storage_through_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // A non-VALUE dummy's LocalInfo.addr is a spill slot containing the
+    // caller's address.  Defined assignment must load that address before
+    // passing the LHS to its specific.  Passing the spill slot itself lets
+    // the assignment overwrite the saved pointer; the next reference to the
+    // dummy then dereferences derived-component bytes as an address.  MPFUN's
+    // `err = abs(t1-t2)` in checkmp exposed this with type(mp_real) dummies.
+    let src = write_program(
+        "module boxes\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type\n  interface assignment(=)\n    module procedure assign_box\n  end interface\ncontains\n  subroutine assign_box(lhs, rhs)\n    type(box_t), intent(out) :: lhs\n    type(box_t), intent(in) :: rhs\n    lhs%value = rhs%value\n  end subroutine\n  function make_box(value) result(box)\n    integer, intent(in) :: value\n    type(box_t) :: box\n    box%value = value\n  end function\n  subroutine fill_box(out)\n    type(box_t), intent(out) :: out\n    out = make_box(42)\n    if (out%value /= 42) error stop 1\n  end subroutine\nend module\nprogram p\n  use boxes\n  implicit none\n  type(box_t) :: box\n  call fill_box(box)\n  if (box%value /= 42) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("defined_assignment_derived_dummy_lhs", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived dummy assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived dummy assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("derived dummy assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "derived dummy assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn defined_assignment_class_lhs_loads_descriptor_pointer_through_slot() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
