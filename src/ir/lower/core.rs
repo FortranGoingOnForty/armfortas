@@ -7065,7 +7065,7 @@ pub(super) fn eval_const_char_array_init(
     scope_id: Option<crate::sema::symtab::ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
 ) -> Option<GlobalInit> {
-    let elems = collect_const_char_array_elems_with_context(
+    let mut elems = collect_const_char_array_elems_with_context(
         expr,
         param_consts,
         param_char_consts,
@@ -7077,8 +7077,14 @@ pub(super) fn eval_const_char_array_init(
         return None;
     }
 
+    let total = usize::try_from(total).ok()?;
+    if elems.len() == 1 && total > 1 {
+        elems.resize(total, elems[0].clone());
+    } else {
+        elems.resize_with(total, Vec::new);
+    }
     let elem_len = usize::try_from(elem_len).ok()?;
-    let mut bytes = Vec::with_capacity(elems.len().saturating_mul(elem_len));
+    let mut bytes = Vec::with_capacity(total.saturating_mul(elem_len));
     for mut elem in elems {
         if elem.len() > elem_len {
             elem.truncate(elem_len);
@@ -59997,6 +60003,26 @@ pub(super) fn derived_layout_has_runtime_field_defaults(
                             .get_related(layout, type_name)
                             .is_some_and(|nested| derived_layout_has_runtime_field_defaults(nested, registry))
                 ))
+    })
+}
+
+pub(super) fn derived_layout_has_procedure_pointer_defaults(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    layout.fields.iter().any(|field| {
+        matches!(
+            &field.default_init,
+            Some(crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(_))
+        ) || (!field.pointer
+            && !field.allocatable
+            && field_derived_type_name(field).is_some_and(|type_name| {
+                registry
+                    .get_related(layout, &type_name)
+                    .is_some_and(|nested| {
+                        derived_layout_has_procedure_pointer_defaults(nested, registry)
+                    })
+            }))
     })
 }
 

@@ -66446,3 +66446,358 @@ fn contained_save_explicit_shape_array_uses_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_scalar_save_forms_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_scalar_save_forms_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // Recursion makes the storage-duration distinction deterministic: a
+    // stack local in the inner activation must not alias the value assigned
+    // by the outer activation. Cover the declaration attribute, standalone
+    // entity statement, scope-wide bare statement, and the existing fixed
+    // CHARACTER path together.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: got\n  character(len=8) :: text\n  call direct_save(0, got)\n  if (got /= 73) error stop 1\n  call named_save(0, got)\n  if (got /= 91) error stop 2\n  call bare_save(0, got)\n  if (got /= 117) error stop 3\n  call character_save(0, text)\n  if (text /= 'persist!') error stop 4\n  print *, 'ok'\ncontains\n  recursive subroutine direct_save(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer, save :: value\n    if (stage == 0) then\n      value = 73\n      call direct_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine direct_save\n\n  recursive subroutine named_save(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer :: value\n    save :: value\n    if (stage == 0) then\n      value = 91\n      call named_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine named_save\n\n  recursive subroutine bare_save(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer :: value\n    save\n    if (stage == 0) then\n      value = 117\n      call bare_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine bare_save\n\n  recursive subroutine character_save(stage, out)\n    integer, intent(in) :: stage\n    character(len=8), intent(out) :: out\n    character(len=8), save :: value\n    if (stage == 0) then\n      value = 'persist!'\n      call character_save(1, out)\n    else\n      out = value\n    end if\n  end subroutine character_save\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_scalar_save_forms", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalar SAVE forms IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "scalar SAVE forms IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read scalar SAVE forms IR");
+    let saved_integer_globals = ir_text
+        .lines()
+        .filter(|line| line.contains("global @afs_save_") && line.contains(": i32 = zeroinit"))
+        .count();
+    assert_eq!(
+        saved_integer_globals, 3,
+        "all three integer SAVE forms must use zero-initialized static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains(": [i8 x 9]")),
+        "fixed CHARACTER SAVE storage regressed:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_scalar_save_forms", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar SAVE forms compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar SAVE forms compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar SAVE forms binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scalar SAVE forms run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn contained_saved_pointer_and_allocatable_descriptors_persist() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_saved_pointer_and_allocatable_descriptors_persist count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer, target :: backing\n  integer :: got\n  backing = 149\n  call pointer_probe(.true., backing, got)\n  call pointer_probe(.false., backing, got)\n  if (got /= 149) error stop 1\n  call allocatable_probe(0, got)\n  if (got /= 163) error stop 2\n  print *, 'ok'\ncontains\n  subroutine pointer_probe(bind, target_value, out)\n    logical, intent(in) :: bind\n    integer, target, intent(in) :: target_value\n    integer, intent(out) :: out\n    integer, pointer, save :: slot\n    if (bind) then\n      slot => target_value\n      out = 0\n    else if (associated(slot)) then\n      out = slot\n    else\n      out = -1\n    end if\n  end subroutine pointer_probe\n\n  recursive subroutine allocatable_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer, allocatable, save :: values(:)\n    if (stage == 0) then\n      allocate(values(1))\n      values(1) = 163\n      call allocatable_probe(1, out)\n    else if (allocated(values)) then\n      out = values(1)\n    else\n      out = -1\n    end if\n  end subroutine allocatable_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_saved_descriptors", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("saved descriptors IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "saved descriptors IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read saved descriptors IR");
+    assert!(
+        ir_text.lines().any(|line| {
+            line.contains("global @afs_save_") && line.contains(": ptr<i32> = zeroinit")
+        }),
+        "saved pointer slot must have static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.lines().any(|line| {
+            line.contains("global @afs_save_") && line.contains(": [i8 x 392] = zeroinit")
+        }),
+        "saved allocatable descriptor must have static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_saved_descriptors", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved descriptors compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "saved descriptors compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("saved descriptors binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "saved descriptors run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn contained_saved_character_arrays_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_saved_character_arrays_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=4) :: got\n  call explicit_save(0, got)\n  if (got /= 'kept') error stop 1\n  call implicit_save(0, got)\n  if (got /= 'kept') error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine explicit_save(stage, out)\n    integer, intent(in) :: stage\n    character(len=4), intent(out) :: out\n    character(len=4), save :: words(2)\n    if (stage == 0) then\n      words(2) = 'kept'\n      call explicit_save(1, out)\n    else\n      out = words(2)\n    end if\n  end subroutine explicit_save\n\n  recursive subroutine implicit_save(stage, out)\n    integer, intent(in) :: stage\n    character(len=4), intent(out) :: out\n    character(len=4) :: words(2) = ['left', 'rght']\n    if (stage == 0) then\n      if (words(1) /= 'left') error stop 3\n      words(2) = 'kept'\n      call implicit_save(1, out)\n    else\n      out = words(2)\n    end if\n  end subroutine implicit_save\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_saved_character_arrays", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("saved character arrays IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "saved character arrays IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read saved character arrays IR");
+    let saved_arrays = ir_text
+        .lines()
+        .filter(|line| line.contains("global @afs_save_") && line.contains("_words:"))
+        .count();
+    assert_eq!(
+        saved_arrays, 2,
+        "explicit and implicit character-array SAVE forms must be global:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_saved_character_arrays", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved character arrays compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "saved character arrays compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("saved character arrays binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "saved character arrays run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn contained_saved_derived_objects_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_saved_derived_objects_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: slot_t\n    integer :: value = 7\n  end type slot_t\n  integer :: got\n  call scalar_probe(0, got)\n  if (got /= 131) error stop 1\n  call array_probe(0, got)\n  if (got /= 181) error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine scalar_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    type(slot_t), save :: slot\n    if (stage == 0) then\n      if (slot%value /= 7) error stop 3\n      slot%value = 131\n      call scalar_probe(1, out)\n    else\n      out = slot%value\n    end if\n  end subroutine scalar_probe\n\n  recursive subroutine array_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    type(slot_t), save :: slots(2)\n    if (stage == 0) then\n      if (slots(1)%value /= 7 .or. slots(2)%value /= 7) error stop 4\n      slots(2)%value = 181\n      call array_probe(1, out)\n    else\n      out = slots(2)%value\n    end if\n  end subroutine array_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_saved_derived_objects", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("saved derived objects IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "saved derived objects IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read saved derived objects IR");
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_slot:")),
+        "saved derived scalar must have static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_slots:")),
+        "saved derived array must have static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_saved_derived_objects", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved derived objects compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "saved derived objects compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("saved derived objects binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "saved derived objects run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn contained_scalar_data_initialization_implies_save() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_scalar_data_initialization_implies_save count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // LAPACK's machine-constant routines use this exact logical FIRST idiom.
+    // A DATA initializer is applied once before execution and gives the object
+    // implicit SAVE; it must not be replayed for each recursive activation.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: got\n  logical :: first\n  call integer_probe(0, got)\n  if (got /= 193) error stop 1\n  call logical_probe(0, first)\n  if (first) error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine integer_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer :: value\n    data value /191/\n    if (stage == 0) then\n      value = 193\n      call integer_probe(1, out)\n    else\n      out = value\n    end if\n  end subroutine integer_probe\n\n  recursive subroutine logical_probe(stage, observed)\n    integer, intent(in) :: stage\n    logical, intent(out) :: observed\n    logical :: first\n    data first /.true./\n    if (stage == 0) then\n      if (.not. first) error stop 3\n      first = .false.\n      call logical_probe(1, observed)\n    else\n      observed = first\n    end if\n  end subroutine logical_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_scalar_data_save", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalar DATA SAVE IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "scalar DATA SAVE IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read scalar DATA SAVE IR");
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_value: i32 = 191")),
+        "integer DATA initializer must be baked into static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_first: bool = 1")),
+        "logical DATA initializer must be baked into static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_scalar_data_save", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar DATA SAVE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar DATA SAVE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar DATA SAVE binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scalar DATA SAVE run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

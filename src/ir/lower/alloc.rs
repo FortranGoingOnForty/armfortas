@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::decl::{ArraySpec, Decl, TypeSpec};
+use crate::ast::decl::{ArraySpec, DataValue, Decl, TypeSpec};
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
@@ -129,6 +129,48 @@ fn lower_explicit_shape_dim_buffer(
     dim_buf
 }
 
+fn saved_zero_storage(
+    b: &mut FuncBuilder,
+    pending_globals: &mut Vec<PendingGlobal>,
+    func_name: &str,
+    local_name: &str,
+    storage_ty: IrType,
+) -> ValueId {
+    let global_name = save_global_name(func_name, local_name);
+    pending_globals.push(PendingGlobal {
+        global: Global {
+            name: global_name.clone(),
+            ty: storage_ty.clone(),
+            initializer: Some(GlobalInit::Zero),
+        },
+    });
+    b.global_addr(&global_name, storage_ty)
+}
+
+fn alloc_zeroed_or_saved_storage(
+    b: &mut FuncBuilder,
+    pending_globals: &mut Vec<PendingGlobal>,
+    func_name: &str,
+    local_name: &str,
+    storage_ty: IrType,
+    byte_size: i64,
+    is_saved: bool,
+) -> ValueId {
+    if is_saved {
+        return saved_zero_storage(b, pending_globals, func_name, local_name, storage_ty);
+    }
+
+    let addr = b.alloca(storage_ty);
+    let zero = b.const_i32(0);
+    let size = b.const_i64(byte_size);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![addr, zero, size],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    addr
+}
+
 /// Allocate local variables from declarations. Handles both scalars and arrays.
 pub(crate) fn alloc_decls(
     b: &mut FuncBuilder,
@@ -148,10 +190,28 @@ pub(crate) fn alloc_decls(
     // this pre-scan, the standalone form would silently fall back to
     // the alloca + per-call store path.
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    let mut scalar_data_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for d in decls {
         if let Decl::ParameterStmt { pairs } = &d.node {
             for (name, expr) in pairs {
                 parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+        if let Decl::DataStmt { sets } = &d.node {
+            for set in sets {
+                if set.objects.len() != set.values.len() {
+                    continue;
+                }
+                for (object, value) in set.objects.iter().zip(&set.values) {
+                    let (crate::ast::expr::Expr::Name { name }, DataValue::Expr(value)) =
+                        (&object.node, value)
+                    else {
+                        continue;
+                    };
+                    scalar_data_inits
+                        .entry(name.to_lowercase())
+                        .or_insert(value);
+                }
             }
         }
     }
@@ -173,6 +233,15 @@ pub(crate) fn alloc_decls(
         st,
         current_proc_scope(),
     );
+    let save_all = decls.iter().any(|decl| {
+        matches!(
+            &decl.node,
+            Decl::AttributeStmt {
+                attr: Attribute::Save,
+                entities,
+            } if entities.is_empty()
+        )
+    });
 
     for decl in decls {
         if let Decl::TypeDecl {
@@ -225,6 +294,18 @@ pub(crate) fn alloc_decls(
 
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
+                let data_init_expr = if array_spec.is_none()
+                    && !is_allocatable
+                    && !is_pointer_attr
+                    && !matches!(type_spec, TypeSpec::Type(_) | TypeSpec::Class(_))
+                {
+                    scalar_data_inits.get(&key).copied()
+                } else {
+                    None
+                };
+                let is_saved = save_all
+                    || attrs.iter().any(|a| matches!(a, Attribute::Save))
+                    || data_init_expr.is_some();
 
                 // Check for character type.
                 let char_len = declared_char_len(
@@ -272,13 +353,14 @@ pub(crate) fn alloc_decls(
                     // afs_deallocate_array call — a pointer does
                     // not own its target.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
-                    let addr = b.alloca(desc_ty);
-                    let zero_byte = b.const_i32(0);
-                    let descriptor_bytes = b.const_i64(392);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero_byte, descriptor_bytes],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        392,
+                        is_saved,
                     );
                     // dims is left empty for a deferred-shape pointer;
                     // the descriptor carries the runtime rank and
@@ -334,13 +416,15 @@ pub(crate) fn alloc_decls(
                     // struct base.  derived_type is stored so that
                     // component lookup can find the type layout.
                     if let TypeSpec::Type(_) = type_spec {
-                        let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        let zero_byte = b.const_i32(0);
-                        let eight = b.const_i64(8);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![addr, zero_byte, eight],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        let slot_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+                        let addr = alloc_zeroed_or_saved_storage(
+                            b,
+                            pending_globals,
+                            func_name,
+                            &key,
+                            slot_ty,
+                            8,
+                            is_saved,
                         );
                         locals.insert(
                             key,
@@ -369,13 +453,14 @@ pub(crate) fn alloc_decls(
                     && array_spec.is_none()
                 {
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
-                    let addr = b.alloca(desc_ty);
-                    let zero = b.const_i32(0);
-                    let descriptor_bytes = b.const_i64(392);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero, descriptor_bytes],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        392,
+                        is_saved,
                     );
                     locals.insert(
                         key,
@@ -403,13 +488,14 @@ pub(crate) fn alloc_decls(
                     // 32-byte StringDescriptor. Deferred-length arrays fall
                     // through to the general descriptor path below.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 32);
-                    let addr = b.alloca(desc_ty);
-                    let zero = b.const_i32(0);
-                    let size32 = b.const_i64(32);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero, size32],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        32,
+                        is_saved,
                     );
                     locals.insert(
                         key,
@@ -561,6 +647,57 @@ pub(crate) fn alloc_decls(
                         let elem_ty = fixed_char_storage_ir_type(len);
                         let elem_bytes = ir_scalar_byte_size(&elem_ty, b.layout);
                         let total_bytes = total_size * elem_bytes;
+                        let static_init = if !is_parameter && total_size > 0 {
+                            match init_expr {
+                                Some(expr) => eval_const_char_array_init(
+                                    expr,
+                                    total_size,
+                                    len,
+                                    &param_consts,
+                                    &param_char_consts,
+                                    Some(st),
+                                    current_proc_scope(),
+                                    Some(type_layouts),
+                                ),
+                                None if is_saved => Some(GlobalInit::Zero),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(initializer) = static_init {
+                            let arr_ty =
+                                IrType::Array(Box::new(elem_ty.clone()), total_size as u64);
+                            let global_name = save_global_name(func_name, &key);
+                            pending_globals.push(PendingGlobal {
+                                global: Global {
+                                    name: global_name.clone(),
+                                    ty: arr_ty.clone(),
+                                    initializer: Some(initializer),
+                                },
+                            });
+                            let addr = b.global_addr(&global_name, arr_ty);
+                            locals.insert(
+                                key,
+                                LocalInfo {
+                                    addr,
+                                    ty: elem_ty,
+                                    dims,
+                                    allocatable: false,
+                                    descriptor_arg: false,
+                                    by_ref: false,
+                                    char_kind: CharKind::Fixed(len),
+                                    derived_type: None,
+                                    inline_const: None,
+                                    is_pointer: false,
+                                    runtime_dim_upper: vec![],
+                                    is_class: false,
+                                    logical_kind: None,
+                                    last_dim_assumed_size: false,
+                                },
+                            );
+                            continue;
+                        }
                         let space = b.const_i32(b' ' as i32);
                         let total_bytes_val = b.const_i64(total_bytes);
                         const STACK_THRESHOLD: i64 = 64 * 1024;
@@ -646,13 +783,15 @@ pub(crate) fn alloc_decls(
                         // c_f_pointer populate this slot with the associated
                         // byte buffer address, and later substring/character
                         // reads must dereference it.
-                        let addr = b.alloca(IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))));
-                        let zero = b.const_i32(0);
-                        let eight = b.const_i64(8);
-                        b.call(
-                            FuncRef::External("memset".into()),
-                            vec![addr, zero, eight],
-                            IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                        let slot_ty = IrType::Ptr(Box::new(IrType::Int(IntWidth::I8)));
+                        let addr = alloc_zeroed_or_saved_storage(
+                            b,
+                            pending_globals,
+                            func_name,
+                            &key,
+                            slot_ty,
+                            8,
+                            is_saved,
                         );
                         locals.insert(
                             key,
@@ -681,14 +820,14 @@ pub(crate) fn alloc_decls(
                         // value still occupies the first N bytes.
                         let buf_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (len + 1) as u64);
-                        let is_save_attr = attrs.iter().any(|a| matches!(a, Attribute::Save));
+                        let static_init_expr = init_expr.or(data_init_expr);
                         if !is_parameter
                             && array_spec.is_none()
-                            && (is_save_attr || init_expr.is_some())
+                            && (is_saved || static_init_expr.is_some())
                         {
                             let mut bytes = vec![b' '; len.max(0) as usize + 1];
-                            let mut const_init = init_expr.is_none();
-                            if let Some(expr) = init_expr {
+                            let mut const_init = static_init_expr.is_none();
+                            if let Some(expr) = static_init_expr {
                                 if let Some(raw) =
                                     eval_const_char_bytes(expr, &param_consts, &param_char_consts)
                                 {
@@ -845,16 +984,18 @@ pub(crate) fn alloc_decls(
                 }
 
                 if is_allocatable {
-                    // Allocatable variable: alloca a descriptor (392 bytes), zero-initialized.
+                    // Allocatable variable: a zero-initialized 392-byte
+                    // descriptor. SAVE'd descriptors live in static storage;
+                    // ordinary descriptors remain per-activation allocas.
                     let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);
-                    let addr = b.alloca(desc_ty);
-                    // Zero-initialize the descriptor so flags=0 (not allocated).
-                    let zero = b.const_i32(0);
-                    let size = b.const_i64(392);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero, size],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        desc_ty,
+                        392,
+                        is_saved,
                     );
                     let alloc_elem_ty = if matches!(type_spec, TypeSpec::Character(_)) {
                         match char_len {
@@ -1026,26 +1167,45 @@ pub(crate) fn alloc_decls(
                     // and the large-array descriptor/heap path: recreating either
                     // form on every procedure entry loses values between calls.
                     // An initializer implies SAVE too (F2018 8.5.16.4).
-                    let is_save_attr = attrs.iter().any(|a| matches!(a, Attribute::Save));
-                    let static_init = if !is_parameter
-                        && total_size > 0
-                        && array_derived_type.is_none()
-                        && (is_save_attr || init_expr.is_some())
-                    {
-                        match init_expr {
-                            Some(expr) => eval_const_array_init(
-                                expr,
-                                &array_elem_ty,
-                                total_size,
-                                &param_consts,
-                                &HashMap::new(),
-                                &HashMap::new(),
-                            ),
-                            None => Some(GlobalInit::Zero),
-                        }
-                    } else {
-                        None
-                    };
+                    let static_init =
+                        if !is_parameter && total_size > 0 && (is_saved || init_expr.is_some()) {
+                            if let Some(type_name) = array_derived_type.as_deref() {
+                                if is_saved
+                                    && init_expr.is_none()
+                                    && !type_layouts.get(type_name).is_some_and(|layout| {
+                                        derived_layout_has_procedure_pointer_defaults(
+                                            layout,
+                                            type_layouts,
+                                        )
+                                    })
+                                {
+                                    type_layouts.get(type_name).map(|layout| {
+                                        eval_const_derived_global_init(
+                                            layout,
+                                            total_size as usize,
+                                            type_layouts,
+                                        )
+                                        .unwrap_or(GlobalInit::Zero)
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                match init_expr {
+                                    Some(expr) => eval_const_array_init(
+                                        expr,
+                                        &array_elem_ty,
+                                        total_size,
+                                        &param_consts,
+                                        &HashMap::new(),
+                                        &HashMap::new(),
+                                    ),
+                                    None => Some(GlobalInit::Zero),
+                                }
+                            }
+                        } else {
+                            None
+                        };
                     if let Some(initializer) = static_init {
                         let arr_ty =
                             IrType::Array(Box::new(array_elem_ty.clone()), total_size as u64);
@@ -1068,7 +1228,7 @@ pub(crate) fn alloc_decls(
                                 descriptor_arg: false,
                                 by_ref: false,
                                 char_kind: array_char_kind,
-                                derived_type: None,
+                                derived_type: array_derived_type,
                                 inline_const: None,
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
@@ -1205,7 +1365,17 @@ pub(crate) fn alloc_decls(
                                 .as_ref()
                                 .map(crate::ir::lower::core::type_info_to_ir_type)
                                 .unwrap_or(IrType::Int(IntWidth::I32));
-                            let addr = b.alloca(scalar_ty.clone());
+                            let addr = if is_saved {
+                                saved_zero_storage(
+                                    b,
+                                    pending_globals,
+                                    func_name,
+                                    &key,
+                                    scalar_ty.clone(),
+                                )
+                            } else {
+                                b.alloca(scalar_ty.clone())
+                            };
                             locals.insert(
                                 key,
                                 LocalInfo {
@@ -1235,7 +1405,17 @@ pub(crate) fn alloc_decls(
                         crate::sema::resolve::type_resolution::ieee_opaque_int_kind(type_name)
                     {
                         let scalar_ty = IrType::int_from_kind(kind);
-                        let addr = b.alloca(scalar_ty.clone());
+                        let addr = if is_saved {
+                            saved_zero_storage(
+                                b,
+                                pending_globals,
+                                func_name,
+                                &key,
+                                scalar_ty.clone(),
+                            )
+                        } else {
+                            b.alloca(scalar_ty.clone())
+                        };
                         locals.insert(
                             key,
                             LocalInfo {
@@ -1264,10 +1444,47 @@ pub(crate) fn alloc_decls(
                             .expect("canonical derived layout should be registered");
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
-                        let addr = b.alloca(struct_ty);
-                        if derived_layout_needs_runtime_initialization(layout, type_layouts) {
-                            initialize_derived_storage(b, addr, layout, type_layouts);
-                        }
+                        let static_init = if !is_parameter
+                            && (is_saved || init_expr.is_some())
+                            && !derived_layout_has_procedure_pointer_defaults(layout, type_layouts)
+                        {
+                            init_expr
+                                .and_then(|expr| {
+                                    eval_const_derived_ctor_global_init(
+                                        type_name,
+                                        expr,
+                                        type_layouts,
+                                        &param_consts,
+                                        &param_char_consts,
+                                        st,
+                                    )
+                                })
+                                .or_else(|| {
+                                    (is_saved && init_expr.is_none()).then(|| {
+                                        eval_const_derived_global_init(layout, 1, type_layouts)
+                                            .unwrap_or(GlobalInit::Zero)
+                                    })
+                                })
+                        } else {
+                            None
+                        };
+                        let addr = if let Some(initializer) = static_init {
+                            let global_name = save_global_name(func_name, &key);
+                            pending_globals.push(PendingGlobal {
+                                global: Global {
+                                    name: global_name.clone(),
+                                    ty: struct_ty.clone(),
+                                    initializer: Some(initializer),
+                                },
+                            });
+                            b.global_addr(&global_name, struct_ty)
+                        } else {
+                            let addr = b.alloca(struct_ty);
+                            if derived_layout_needs_runtime_initialization(layout, type_layouts) {
+                                initialize_derived_storage(b, addr, layout, type_layouts);
+                            }
+                            addr
+                        };
                         // Store the derived type name in the ty field for component access lookup.
                         // Use Ptr<i8> as a marker — the type_layouts registry is used for field resolution.
                         locals.insert(
@@ -1320,16 +1537,15 @@ pub(crate) fn alloc_decls(
                     // dereferences it; reads load twice.  The slot
                     // starts null so that ASSOCIATED() returns
                     // false before the first `=>`.
-                    let addr = b.alloca(IrType::Ptr(Box::new(elem_ty.clone())));
-                    // Memset the slot to zero so unassociated pointers
-                    // compare null.  Eight bytes matches the ARM64
-                    // pointer width.
-                    let zero_byte = b.const_i32(0);
-                    let eight = b.const_i64(8);
-                    b.call(
-                        FuncRef::External("memset".into()),
-                        vec![addr, zero_byte, eight],
-                        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+                    let slot_ty = IrType::Ptr(Box::new(elem_ty.clone()));
+                    let addr = alloc_zeroed_or_saved_storage(
+                        b,
+                        pending_globals,
+                        func_name,
+                        &key,
+                        slot_ty,
+                        8,
+                        is_saved,
                     );
                     locals.insert(
                         key,
@@ -1399,9 +1615,14 @@ pub(crate) fn alloc_decls(
                         // semantics are preserved.
                     }
 
-                    if let Some(init) = init_expr
+                    let static_init_expr = init_expr.or(data_init_expr);
+                    let static_init = static_init_expr
                         .and_then(|e| eval_const_global_init(e, &param_consts, Some(&elem_ty)))
-                    {
+                        .or_else(|| {
+                            (!is_parameter && is_saved && static_init_expr.is_none())
+                                .then_some(GlobalInit::Zero)
+                        });
+                    if let Some(init) = static_init {
                         let global_name = save_global_name(func_name, &key);
                         pending_globals.push(PendingGlobal {
                             global: Global {
