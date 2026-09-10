@@ -66870,3 +66870,69 @@ fn contained_integer_array_data_initialization_uses_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_character_and_complex_data_initialization_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_character_and_complex_data_initialization_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  character(len=4) :: word\n  complex(8) :: scalar, item\n  call character_probe(0, word)\n  if (word /= 'kept') error stop 1\n  call complex_probe(0, scalar, item)\n  if (abs(real(scalar) - 5.0d0) > 1.0d-12) error stop 2\n  if (abs(aimag(scalar) - 6.0d0) > 1.0d-12) error stop 3\n  if (abs(real(item) - 7.0d0) > 1.0d-12) error stop 4\n  if (abs(aimag(item) - 8.0d0) > 1.0d-12) error stop 5\n  print *, 'ok'\ncontains\n  recursive subroutine character_probe(stage, out)\n    integer, intent(in) :: stage\n    character(len=4), intent(out) :: out\n    character(len=4) :: words(3)\n    data words /'ab', 2*'x'/\n    if (stage == 0) then\n      if (words(1) /= 'ab' .or. words(2) /= 'x' .or. words(3) /= 'x') error stop 6\n      words(2) = 'kept'\n      call character_probe(1, out)\n    else\n      out = words(2)\n    end if\n  end subroutine character_probe\n\n  recursive subroutine complex_probe(stage, scalar_out, item_out)\n    integer, intent(in) :: stage\n    complex(8), intent(out) :: scalar_out, item_out\n    complex(8) :: scalar\n    complex(8) :: values(2)\n    data scalar /(1.0d0, 2.0d0)/\n    data values /2*(3.0d0, 4.0d0)/\n    if (stage == 0) then\n      if (abs(real(scalar) - 1.0d0) > 1.0d-12) error stop 7\n      if (abs(aimag(values(2)) - 4.0d0) > 1.0d-12) error stop 8\n      scalar = (5.0d0, 6.0d0)\n      values(2) = (7.0d0, 8.0d0)\n      call complex_probe(1, scalar_out, item_out)\n    else\n      scalar_out = scalar\n      item_out = values(2)\n    end if\n  end subroutine complex_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_character_complex_data_save", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("character/complex DATA IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "character/complex DATA IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read character/complex DATA IR");
+    for expected in [
+        "_words: [[i8 x 4] x 3] =",
+        "_scalar: [f64 x 2] = [1, 2]",
+        "_values: [[f64 x 2] x 2] = [3, 4, 3, 4]",
+    ] {
+        assert!(
+            ir_text.lines().any(|line| line.contains(expected)),
+            "missing static DATA initializer {expected}:\n{ir_text}"
+        );
+    }
+
+    let out = unique_path("contained_character_complex_data_save", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("character/complex DATA compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "character/complex DATA compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("character/complex DATA binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "character/complex DATA run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
