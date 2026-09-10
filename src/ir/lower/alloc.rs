@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::decl::{ArraySpec, Decl, TypeSpec};
+use crate::ast::decl::{ArraySpec, DataValue, Decl, TypeSpec};
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
@@ -190,10 +190,28 @@ pub(crate) fn alloc_decls(
     // this pre-scan, the standalone form would silently fall back to
     // the alloca + per-call store path.
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
+    let mut scalar_data_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for d in decls {
         if let Decl::ParameterStmt { pairs } = &d.node {
             for (name, expr) in pairs {
                 parameter_inits.insert(name.to_lowercase(), expr);
+            }
+        }
+        if let Decl::DataStmt { sets } = &d.node {
+            for set in sets {
+                if set.objects.len() != set.values.len() {
+                    continue;
+                }
+                for (object, value) in set.objects.iter().zip(&set.values) {
+                    let (crate::ast::expr::Expr::Name { name }, DataValue::Expr(value)) =
+                        (&object.node, value)
+                    else {
+                        continue;
+                    };
+                    scalar_data_inits
+                        .entry(name.to_lowercase())
+                        .or_insert(value);
+                }
             }
         }
     }
@@ -273,10 +291,21 @@ pub(crate) fn alloc_decls(
                     .or_else(|| parameter_inits.get(&key).copied());
                 let is_parameter = attrs.iter().any(|a| matches!(a, Attribute::Parameter))
                     || parameter_inits.contains_key(&key);
-                let is_saved = save_all || attrs.iter().any(|a| matches!(a, Attribute::Save));
 
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
+                let data_init_expr = if array_spec.is_none()
+                    && !is_allocatable
+                    && !is_pointer_attr
+                    && !matches!(type_spec, TypeSpec::Type(_) | TypeSpec::Class(_))
+                {
+                    scalar_data_inits.get(&key).copied()
+                } else {
+                    None
+                };
+                let is_saved = save_all
+                    || attrs.iter().any(|a| matches!(a, Attribute::Save))
+                    || data_init_expr.is_some();
 
                 // Check for character type.
                 let char_len = declared_char_len(
@@ -791,13 +820,14 @@ pub(crate) fn alloc_decls(
                         // value still occupies the first N bytes.
                         let buf_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), (len + 1) as u64);
+                        let static_init_expr = init_expr.or(data_init_expr);
                         if !is_parameter
                             && array_spec.is_none()
-                            && (is_saved || init_expr.is_some())
+                            && (is_saved || static_init_expr.is_some())
                         {
                             let mut bytes = vec![b' '; len.max(0) as usize + 1];
-                            let mut const_init = init_expr.is_none();
-                            if let Some(expr) = init_expr {
+                            let mut const_init = static_init_expr.is_none();
+                            if let Some(expr) = static_init_expr {
                                 if let Some(raw) =
                                     eval_const_char_bytes(expr, &param_consts, &param_char_consts)
                                 {
@@ -1585,10 +1615,11 @@ pub(crate) fn alloc_decls(
                         // semantics are preserved.
                     }
 
-                    let static_init = init_expr
+                    let static_init_expr = init_expr.or(data_init_expr);
+                    let static_init = static_init_expr
                         .and_then(|e| eval_const_global_init(e, &param_consts, Some(&elem_ty)))
                         .or_else(|| {
-                            (!is_parameter && is_saved && init_expr.is_none())
+                            (!is_parameter && is_saved && static_init_expr.is_none())
                                 .then_some(GlobalInit::Zero)
                         });
                     if let Some(init) = static_init {

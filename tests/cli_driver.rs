@@ -66728,3 +66728,76 @@ fn contained_saved_derived_objects_use_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_scalar_data_initialization_implies_save() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_scalar_data_initialization_implies_save count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // LAPACK's machine-constant routines use this exact logical FIRST idiom.
+    // A DATA initializer is applied once before execution and gives the object
+    // implicit SAVE; it must not be replayed for each recursive activation.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: got\n  logical :: first\n  call integer_probe(0, got)\n  if (got /= 193) error stop 1\n  call logical_probe(0, first)\n  if (first) error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine integer_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    integer :: value\n    data value /191/\n    if (stage == 0) then\n      value = 193\n      call integer_probe(1, out)\n    else\n      out = value\n    end if\n  end subroutine integer_probe\n\n  recursive subroutine logical_probe(stage, observed)\n    integer, intent(in) :: stage\n    logical, intent(out) :: observed\n    logical :: first\n    data first /.true./\n    if (stage == 0) then\n      if (.not. first) error stop 3\n      first = .false.\n      call logical_probe(1, observed)\n    else\n      observed = first\n    end if\n  end subroutine logical_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_scalar_data_save", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalar DATA SAVE IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "scalar DATA SAVE IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read scalar DATA SAVE IR");
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_value: i32 = 191")),
+        "integer DATA initializer must be baked into static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_first: bool = 1")),
+        "logical DATA initializer must be baked into static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_scalar_data_save", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("scalar DATA SAVE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "scalar DATA SAVE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("scalar DATA SAVE binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "scalar DATA SAVE run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
