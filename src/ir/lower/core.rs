@@ -60006,6 +60006,26 @@ pub(super) fn derived_layout_has_runtime_field_defaults(
     })
 }
 
+pub(super) fn derived_layout_has_procedure_pointer_defaults(
+    layout: &crate::sema::type_layout::TypeLayout,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+) -> bool {
+    layout.fields.iter().any(|field| {
+        matches!(
+            &field.default_init,
+            Some(crate::sema::type_layout::FieldDefaultInit::ProcedurePointer(_))
+        ) || (!field.pointer
+            && !field.allocatable
+            && field_derived_type_name(field).is_some_and(|type_name| {
+                registry
+                    .get_related(layout, &type_name)
+                    .is_some_and(|nested| {
+                        derived_layout_has_procedure_pointer_defaults(nested, registry)
+                    })
+            }))
+    })
+}
+
 pub(super) fn zero_fill_bytes(b: &mut FuncBuilder, addr: ValueId, bytes: i64) {
     if bytes <= 0 {
         return;

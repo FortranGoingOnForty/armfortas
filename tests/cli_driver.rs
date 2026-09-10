@@ -66658,3 +66658,73 @@ fn contained_saved_character_arrays_use_static_storage() {
     let _ = fs::remove_file(&ir);
     let _ = fs::remove_file(&src);
 }
+
+#[test]
+fn contained_saved_derived_objects_use_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_saved_derived_objects_use_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  type :: slot_t\n    integer :: value = 7\n  end type slot_t\n  integer :: got\n  call scalar_probe(0, got)\n  if (got /= 131) error stop 1\n  call array_probe(0, got)\n  if (got /= 181) error stop 2\n  print *, 'ok'\ncontains\n  recursive subroutine scalar_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    type(slot_t), save :: slot\n    if (stage == 0) then\n      if (slot%value /= 7) error stop 3\n      slot%value = 131\n      call scalar_probe(1, out)\n    else\n      out = slot%value\n    end if\n  end subroutine scalar_probe\n\n  recursive subroutine array_probe(stage, out)\n    integer, intent(in) :: stage\n    integer, intent(out) :: out\n    type(slot_t), save :: slots(2)\n    if (stage == 0) then\n      if (slots(1)%value /= 7 .or. slots(2)%value /= 7) error stop 4\n      slots(2)%value = 181\n      call array_probe(1, out)\n    else\n      out = slots(2)%value\n    end if\n  end subroutine array_probe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_saved_derived_objects", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("saved derived objects IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "saved derived objects IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read saved derived objects IR");
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_slot:")),
+        "saved derived scalar must have static storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text
+            .lines()
+            .any(|line| line.contains("global @afs_save_") && line.contains("_slots:")),
+        "saved derived array must have static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_saved_derived_objects", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("saved derived objects compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "saved derived objects compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("saved derived objects binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "saved derived objects run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}

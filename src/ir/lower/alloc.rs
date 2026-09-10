@@ -129,6 +129,24 @@ fn lower_explicit_shape_dim_buffer(
     dim_buf
 }
 
+fn saved_zero_storage(
+    b: &mut FuncBuilder,
+    pending_globals: &mut Vec<PendingGlobal>,
+    func_name: &str,
+    local_name: &str,
+    storage_ty: IrType,
+) -> ValueId {
+    let global_name = save_global_name(func_name, local_name);
+    pending_globals.push(PendingGlobal {
+        global: Global {
+            name: global_name.clone(),
+            ty: storage_ty.clone(),
+            initializer: Some(GlobalInit::Zero),
+        },
+    });
+    b.global_addr(&global_name, storage_ty)
+}
+
 fn alloc_zeroed_or_saved_storage(
     b: &mut FuncBuilder,
     pending_globals: &mut Vec<PendingGlobal>,
@@ -139,15 +157,7 @@ fn alloc_zeroed_or_saved_storage(
     is_saved: bool,
 ) -> ValueId {
     if is_saved {
-        let global_name = save_global_name(func_name, local_name);
-        pending_globals.push(PendingGlobal {
-            global: Global {
-                name: global_name.clone(),
-                ty: storage_ty.clone(),
-                initializer: Some(GlobalInit::Zero),
-            },
-        });
-        return b.global_addr(&global_name, storage_ty);
+        return saved_zero_storage(b, pending_globals, func_name, local_name, storage_ty);
     }
 
     let addr = b.alloca(storage_ty);
@@ -1127,25 +1137,45 @@ pub(crate) fn alloc_decls(
                     // and the large-array descriptor/heap path: recreating either
                     // form on every procedure entry loses values between calls.
                     // An initializer implies SAVE too (F2018 8.5.16.4).
-                    let static_init = if !is_parameter
-                        && total_size > 0
-                        && array_derived_type.is_none()
-                        && (is_saved || init_expr.is_some())
-                    {
-                        match init_expr {
-                            Some(expr) => eval_const_array_init(
-                                expr,
-                                &array_elem_ty,
-                                total_size,
-                                &param_consts,
-                                &HashMap::new(),
-                                &HashMap::new(),
-                            ),
-                            None => Some(GlobalInit::Zero),
-                        }
-                    } else {
-                        None
-                    };
+                    let static_init =
+                        if !is_parameter && total_size > 0 && (is_saved || init_expr.is_some()) {
+                            if let Some(type_name) = array_derived_type.as_deref() {
+                                if is_saved
+                                    && init_expr.is_none()
+                                    && !type_layouts.get(type_name).is_some_and(|layout| {
+                                        derived_layout_has_procedure_pointer_defaults(
+                                            layout,
+                                            type_layouts,
+                                        )
+                                    })
+                                {
+                                    type_layouts.get(type_name).map(|layout| {
+                                        eval_const_derived_global_init(
+                                            layout,
+                                            total_size as usize,
+                                            type_layouts,
+                                        )
+                                        .unwrap_or(GlobalInit::Zero)
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                match init_expr {
+                                    Some(expr) => eval_const_array_init(
+                                        expr,
+                                        &array_elem_ty,
+                                        total_size,
+                                        &param_consts,
+                                        &HashMap::new(),
+                                        &HashMap::new(),
+                                    ),
+                                    None => Some(GlobalInit::Zero),
+                                }
+                            }
+                        } else {
+                            None
+                        };
                     if let Some(initializer) = static_init {
                         let arr_ty =
                             IrType::Array(Box::new(array_elem_ty.clone()), total_size as u64);
@@ -1168,7 +1198,7 @@ pub(crate) fn alloc_decls(
                                 descriptor_arg: false,
                                 by_ref: false,
                                 char_kind: array_char_kind,
-                                derived_type: None,
+                                derived_type: array_derived_type,
                                 inline_const: None,
                                 is_pointer: false,
                                 runtime_dim_upper: vec![],
@@ -1305,7 +1335,17 @@ pub(crate) fn alloc_decls(
                                 .as_ref()
                                 .map(crate::ir::lower::core::type_info_to_ir_type)
                                 .unwrap_or(IrType::Int(IntWidth::I32));
-                            let addr = b.alloca(scalar_ty.clone());
+                            let addr = if is_saved {
+                                saved_zero_storage(
+                                    b,
+                                    pending_globals,
+                                    func_name,
+                                    &key,
+                                    scalar_ty.clone(),
+                                )
+                            } else {
+                                b.alloca(scalar_ty.clone())
+                            };
                             locals.insert(
                                 key,
                                 LocalInfo {
@@ -1335,7 +1375,17 @@ pub(crate) fn alloc_decls(
                         crate::sema::resolve::type_resolution::ieee_opaque_int_kind(type_name)
                     {
                         let scalar_ty = IrType::int_from_kind(kind);
-                        let addr = b.alloca(scalar_ty.clone());
+                        let addr = if is_saved {
+                            saved_zero_storage(
+                                b,
+                                pending_globals,
+                                func_name,
+                                &key,
+                                scalar_ty.clone(),
+                            )
+                        } else {
+                            b.alloca(scalar_ty.clone())
+                        };
                         locals.insert(
                             key,
                             LocalInfo {
@@ -1364,10 +1414,47 @@ pub(crate) fn alloc_decls(
                             .expect("canonical derived layout should be registered");
                         let struct_ty =
                             IrType::Array(Box::new(IrType::Int(IntWidth::I8)), layout.size as u64);
-                        let addr = b.alloca(struct_ty);
-                        if derived_layout_needs_runtime_initialization(layout, type_layouts) {
-                            initialize_derived_storage(b, addr, layout, type_layouts);
-                        }
+                        let static_init = if !is_parameter
+                            && (is_saved || init_expr.is_some())
+                            && !derived_layout_has_procedure_pointer_defaults(layout, type_layouts)
+                        {
+                            init_expr
+                                .and_then(|expr| {
+                                    eval_const_derived_ctor_global_init(
+                                        type_name,
+                                        expr,
+                                        type_layouts,
+                                        &param_consts,
+                                        &param_char_consts,
+                                        st,
+                                    )
+                                })
+                                .or_else(|| {
+                                    (is_saved && init_expr.is_none()).then(|| {
+                                        eval_const_derived_global_init(layout, 1, type_layouts)
+                                            .unwrap_or(GlobalInit::Zero)
+                                    })
+                                })
+                        } else {
+                            None
+                        };
+                        let addr = if let Some(initializer) = static_init {
+                            let global_name = save_global_name(func_name, &key);
+                            pending_globals.push(PendingGlobal {
+                                global: Global {
+                                    name: global_name.clone(),
+                                    ty: struct_ty.clone(),
+                                    initializer: Some(initializer),
+                                },
+                            });
+                            b.global_addr(&global_name, struct_ty)
+                        } else {
+                            let addr = b.alloca(struct_ty);
+                            if derived_layout_needs_runtime_initialization(layout, type_layouts) {
+                                initialize_derived_storage(b, addr, layout, type_layouts);
+                            }
+                            addr
+                        };
                         // Store the derived type name in the ty field for component access lookup.
                         // Use Ptr<i8> as a marker — the type_layouts registry is used for field resolution.
                         locals.insert(
