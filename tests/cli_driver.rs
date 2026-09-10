@@ -53029,6 +53029,48 @@ fn generic_dispatch_accepts_class_dummy_forwarding_to_char_specific_compile_only
 }
 
 #[test]
+fn generic_dispatch_forwards_procedure_dummy_to_specific() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=generic_dispatch_forwards_procedure_dummy_to_specific count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // roots-fortran's character-name wrapper forwards its procedure dummy
+    // through the root_scalar generic to the derived-type specific. Procedure
+    // dummies have local IR slots, but remain procedure entities for generic
+    // resolution; treating every local name as data rejected this valid call.
+    let src = write_program(
+        "module roots_generic_repro\n  implicit none\n  type :: method_t\n    integer :: id\n  end type\n  abstract interface\n    function scalar_func(x) result(y)\n      real(8), intent(in) :: x\n      real(8) :: y\n    end function\n  end interface\n  interface solve\n    module procedure solve_by_name, solve_by_type\n  end interface\ncontains\n  subroutine solve_by_name(name, fun, result)\n    character(len=*), intent(in) :: name\n    procedure(scalar_func) :: fun\n    real(8), intent(out) :: result\n    type(method_t) :: method\n    method%id = len(name)\n    call solve(method, fun, result)\n  end subroutine\n  subroutine solve_by_type(method, fun, result)\n    type(method_t), intent(in) :: method\n    procedure(scalar_func) :: fun\n    real(8), intent(out) :: result\n    result = fun(real(method%id, 8))\n  end subroutine\nend module\nprogram p\n  use roots_generic_repro\n  implicit none\n  real(8) :: result\n  call solve('abc', square, result)\n  if (result /= 9.0_8) error stop 1\n  print *, 'ok'\ncontains\n  function square(x) result(y)\n    real(8), intent(in) :: x\n    real(8) :: y\n    y = x*x\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_forward_proc_dummy", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure-dummy generic forwarding compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure-dummy generic forwarding should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure-dummy generic forwarding binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "procedure-dummy generic forwarding should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn bound_generic_procedure_actual_selects_procedure_dummy_specific() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

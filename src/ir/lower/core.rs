@@ -14003,6 +14003,16 @@ fn declared_arg_accepts_procedure_actual(sym: &crate::sema::symtab::Symbol) -> b
     ) || sym.attrs.external
 }
 
+fn symbol_is_procedure_reference(sym: &crate::sema::symtab::Symbol) -> bool {
+    matches!(
+        sym.kind,
+        crate::sema::symtab::SymbolKind::Function
+            | crate::sema::symtab::SymbolKind::Subroutine
+            | crate::sema::symtab::SymbolKind::ExternalProc
+            | crate::sema::symtab::SymbolKind::ProcedurePointer
+    ) || sym.attrs.external
+}
+
 fn actual_arg_is_procedure_reference(
     arg: &crate::ast::expr::Argument,
     locals: Option<&HashMap<String, LocalInfo>>,
@@ -14016,18 +14026,17 @@ fn actual_arg_is_procedure_reference(
     };
     let key = name.to_lowercase();
     if locals.is_some_and(|l| l.contains_key(&key)) {
-        return false;
+        // A local-map entry normally means that a data object shadows any
+        // same-named callable in an outer scope. Procedure dummies and local
+        // procedure pointers also occupy local slots, though, so consult the
+        // caller's lexical symbol before applying that shadowing rule.
+        return current_proc_scope()
+            .and_then(|scope_id| st.lookup_in(scope_id, &key))
+            .is_some_and(symbol_is_procedure_reference);
     }
     st.lookup(&key)
         .or_else(|| st.find_symbol_any_scope(&key))
-        .map(|sym| {
-            matches!(
-                sym.kind,
-                crate::sema::symtab::SymbolKind::Function
-                    | crate::sema::symtab::SymbolKind::Subroutine
-                    | crate::sema::symtab::SymbolKind::ProcedurePointer
-            ) || sym.attrs.external
-        })
+        .map(symbol_is_procedure_reference)
         .unwrap_or(false)
 }
 
@@ -14437,30 +14446,7 @@ fn resolve_generic_call_actuals_from_specifics(
         // that share a procedure's name.
         let actual_is_procedure: Vec<bool> = args
             .iter()
-            .map(|arg| match &arg.value {
-                crate::ast::expr::SectionSubscript::Element(expr) => {
-                    if let Expr::Name { name } = &expr.node {
-                        let key = name.to_lowercase();
-                        if locals.is_some_and(|l| l.contains_key(&key)) {
-                            return false;
-                        }
-                        st.lookup(&key)
-                            .or_else(|| st.find_symbol_any_scope(&key))
-                            .map(|sym| {
-                                matches!(
-                                    sym.kind,
-                                    crate::sema::symtab::SymbolKind::Function
-                                        | crate::sema::symtab::SymbolKind::Subroutine
-                                        | crate::sema::symtab::SymbolKind::ProcedurePointer
-                                ) || sym.attrs.external
-                            })
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            })
+            .map(|arg| actual_arg_is_procedure_reference(arg, locals, st))
             .collect();
         let actual_is_procedure_slots = reorder_actual_bool_slots_by_formal_skip(
             args,
