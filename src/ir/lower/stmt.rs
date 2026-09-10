@@ -1111,6 +1111,19 @@ fn lower_where_array_read_temp(
     let Expr::FunctionCall { callee, args } = &expr.node else {
         return None;
     };
+    if let Expr::Name { name } = &callee.node {
+        // WHERE's element loop already gives an elemental intrinsic one
+        // scalar actual at a time. Keep that representation intact so the
+        // vectorizer can lift operations such as ABS directly into VAbs.
+        // Pre-materializing the whole intrinsic result is only redundant and
+        // hides the operation behind a descriptor loop. A user procedure that
+        // shadows an intrinsic name still follows the array-result path below.
+        if resolved_intrinsic_name_for_call(ctx.st, ctx.proc_scope_id, b.func().name.as_str(), name)
+            .is_some_and(|intrinsic| is_elemental_math_intrinsic(&intrinsic))
+        {
+            return None;
+        }
+    }
     let local_array_section = if let Expr::Name { name } = &callee.node {
         args.iter()
             .any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
