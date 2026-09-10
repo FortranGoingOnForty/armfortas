@@ -44412,6 +44412,46 @@ fn contained_subroutine_uses_host_parameter_array_storage() {
 }
 
 #[test]
+fn contained_parameter_array_initializes_from_host_parameter() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_parameter_array_initializes_from_host_parameter count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // rklib declares a local real PARAMETER array inside a contained test
+    // routine and broadcasts a host-associated scalar PARAMETER into it.
+    // Declaration initialization must retain that host constant environment.
+    let src = write_program(
+        "program p\n  use iso_fortran_env, only: wp => real64\n  implicit none\n  real(wp), parameter :: one = 1.0_wp\n  call check()\n  print *, 'ok'\ncontains\n  subroutine check()\n    integer, parameter :: n = 1\n    real(wp), parameter :: values(n) = one\n    if (values(1) /= one) error stop 1\n  end subroutine check\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("contained_parameter_array_host_parameter", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained parameter array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained parameter array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained parameter array failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained parameter array failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_materializes_host_character_parameter() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

@@ -5918,9 +5918,15 @@ pub(super) fn collect_const_array_scalars(
     match &expr.node {
         Expr::Name { name } => {
             let key = name.to_lowercase();
-            let values = param_array_consts.get(&key)?;
-            let source_elem_ty = param_array_elem_tys.get(&key);
-            coerce_param_array_values(values, source_elem_ty, elem_ty)
+            if let Some(values) = param_array_consts.get(&key) {
+                let source_elem_ty = param_array_elem_tys.get(&key);
+                coerce_param_array_values(values, source_elem_ty, elem_ty)
+            } else {
+                param_consts
+                    .get(&key)
+                    .copied()
+                    .map(|value| coerce_scalar_to_array_lanes(value, elem_ty))
+            }
         }
         Expr::ParenExpr { inner } => collect_const_array_scalars(
             inner,

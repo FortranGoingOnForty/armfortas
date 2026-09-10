@@ -354,6 +354,7 @@ pub(crate) fn init_decls(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
     decls: &[crate::ast::decl::SpannedDecl],
+    visible_param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
     proc_scope_id: Option<ScopeId>,
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
@@ -362,7 +363,7 @@ pub(crate) fn init_decls(
     // in .data. COMMON globals are emitted as .comm until explicitly
     // initialized, so DATA still needs to store into those slots.
     let global_addr_ids = collect_static_initializer_global_addr_values(b);
-    let param_consts = collect_decl_param_consts_with_scope(decls, &HashMap::new(), st);
+    let param_consts = collect_decl_param_consts_with_scope(decls, visible_param_consts, st);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
