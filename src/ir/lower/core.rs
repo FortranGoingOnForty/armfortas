@@ -65314,8 +65314,8 @@ pub(super) fn lower_sequence_array_actual(
     // its allocation.  Projected, pointer, and descriptor-backed components
     // remain on the conservative copy path below.
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
-        if let Some(info) = type_layouts
-            .and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
+        if let Some(info) =
+            type_layouts.and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
         {
             if !info.dims.is_empty()
                 && !local_uses_array_descriptor(&info)
