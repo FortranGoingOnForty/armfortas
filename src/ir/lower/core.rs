@@ -20347,6 +20347,14 @@ pub(super) fn lowered_scope_symbol_name(
         crate::sema::symtab::ScopeKind::Program(name) => Some(format!("__prog_{}", name)),
         crate::sema::symtab::ScopeKind::Function(name)
         | crate::sema::symtab::ScopeKind::Subroutine(name) => {
+            // BIND(C, NAME=...) owns the linker identity regardless of
+            // whether the procedure is external, module-contained, or
+            // internally contained. Definition lowering already gives the
+            // binding label precedence; address-taking must make the same
+            // choice or it invents an undefined `afs_modproc_*` symbol.
+            if let Some(binding_label) = scope.binding_label.as_deref() {
+                return Some(binding_label.to_string());
+            }
             let parent_id = scope.parent?;
             let parent_scope = st.scope(parent_id);
             match &parent_scope.kind {
