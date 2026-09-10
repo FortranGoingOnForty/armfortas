@@ -241,6 +241,31 @@ fn store_data_scalar(
     type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
     global_addr_ids: &std::collections::HashSet<ValueId>,
 ) {
+    // DATA-backed arrays are promoted as a single initialized global. Test the
+    // base object before lowering an element designator to a GEP: the GEP gets
+    // a fresh ValueId and therefore cannot itself appear in global_addr_ids.
+    let base_name = match &target.node {
+        Expr::Name { name } => Some(name.as_str()),
+        Expr::FunctionCall { callee, .. } => match &callee.node {
+            Expr::Name { name } => Some(name.as_str()),
+            _ => None,
+        },
+        Expr::ParenExpr { inner } => match &inner.node {
+            Expr::Name { name } => Some(name.as_str()),
+            Expr::FunctionCall { callee, .. } => match &callee.node {
+                Expr::Name { name } => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    if base_name
+        .and_then(|name| locals.get(&name.to_lowercase()))
+        .is_some_and(|info| global_addr_ids.contains(&info.addr))
+    {
+        return;
+    }
     let Some(info) = lower_data_target(b, locals, target, st, type_layouts) else {
         return;
     };

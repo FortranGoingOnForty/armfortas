@@ -3,9 +3,10 @@
 //! Extracted from `core.rs` in Sprint 11 Stage E. Pure mechanical
 //! move — behavior unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::decl::{ArraySpec, DataValue, Decl, TypeSpec};
+use crate::ast::expr::{AcValue, Expr, SectionSubscript, SpannedExpr};
 use crate::ir::builder::FuncBuilder;
 use crate::ir::inst::*;
 use crate::ir::types::*;
@@ -15,6 +16,444 @@ use super::const_scalar::{clamp_const_to_type, ConstScalar};
 use super::core::*;
 use super::ctx::{current_proc_scope, CharKind, LocalInfo};
 use super::helpers::{clamp_nonnegative_i64, widen_to_i64};
+
+#[derive(Debug, Clone)]
+struct StaticDataInitPlan {
+    slots: Vec<Option<SpannedExpr>>,
+    valid: bool,
+}
+
+fn static_data_object_count(dims: &[(i64, i64)]) -> Option<usize> {
+    if dims.is_empty() {
+        return Some(1);
+    }
+    dims.iter().try_fold(1usize, |total, (_, extent)| {
+        let extent = usize::try_from(*extent).ok()?;
+        (extent > 0).then_some(())?;
+        total.checked_mul(extent)
+    })
+}
+
+fn static_data_int_expr(value: i64, span: crate::lexer::Span) -> SpannedExpr {
+    crate::ast::Spanned::new(
+        Expr::IntegerLiteral {
+            text: value.to_string(),
+            kind: None,
+        },
+        span,
+    )
+}
+
+fn eval_static_data_int(
+    expr: &SpannedExpr,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<i64> {
+    eval_const_int_in_scope_or_any_scope(expr, param_consts, st)
+        .or_else(|| eval_const_int_in_scope(expr, param_consts))
+        .or_else(|| eval_const_int(expr))
+}
+
+fn collect_static_data_object_names(expr: &SpannedExpr, names: &mut HashSet<String>) {
+    match &expr.node {
+        Expr::Name { name } => {
+            names.insert(name.to_lowercase());
+        }
+        Expr::FunctionCall { callee, .. } => {
+            if let Expr::Name { name } = &callee.node {
+                names.insert(name.to_lowercase());
+            }
+        }
+        Expr::ArrayConstructor { values, .. } => {
+            fn collect_ac_value(value: &AcValue, names: &mut HashSet<String>) {
+                match value {
+                    AcValue::Expr(expr) => collect_static_data_object_names(expr, names),
+                    AcValue::ImpliedDo(ido) => {
+                        for value in &ido.values {
+                            collect_ac_value(value, names);
+                        }
+                    }
+                }
+            }
+            for value in values {
+                collect_ac_value(value, names);
+            }
+        }
+        Expr::ParenExpr { inner } => collect_static_data_object_names(inner, names),
+        _ => {}
+    }
+}
+
+fn static_data_target(
+    expr: &SpannedExpr,
+    shapes: &HashMap<String, Vec<(i64, i64)>>,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<Vec<(String, usize)>> {
+    match &expr.node {
+        Expr::ParenExpr { inner } => static_data_target(inner, shapes, param_consts, st),
+        Expr::Name { name } => {
+            let key = name.to_lowercase();
+            let dims = shapes.get(&key)?;
+            let count = static_data_object_count(dims)?;
+            Some((0..count).map(|index| (key.clone(), index)).collect())
+        }
+        Expr::FunctionCall { callee, args } => {
+            let Expr::Name { name } = &callee.node else {
+                return None;
+            };
+            let key = name.to_lowercase();
+            let dims = shapes.get(&key)?;
+            if dims.is_empty() || args.len() != dims.len() {
+                return None;
+            }
+            let mut linear = 0usize;
+            let mut stride = 1usize;
+            for (arg, (lower, extent)) in args.iter().zip(dims) {
+                let SectionSubscript::Element(index_expr) = &arg.value else {
+                    return None;
+                };
+                let index = eval_static_data_int(index_expr, param_consts, st)?;
+                if index < *lower || index >= lower.checked_add(*extent)? {
+                    return None;
+                }
+                let offset = usize::try_from(index - lower).ok()?;
+                linear = linear.checked_add(offset.checked_mul(stride)?)?;
+                stride = stride.checked_mul(usize::try_from(*extent).ok()?)?;
+            }
+            Some(vec![(key, linear)])
+        }
+        _ => None,
+    }
+}
+
+fn expand_static_data_ac_value(
+    value: &AcValue,
+    substitutions: &HashMap<String, &SpannedExpr>,
+    shapes: &HashMap<String, Vec<(i64, i64)>>,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+    targets: &mut Vec<(String, usize)>,
+) -> bool {
+    match value {
+        AcValue::Expr(expr) => {
+            let expr = super::expr::substitute_names_in_expr(expr, substitutions);
+            let Some(mut expanded) = static_data_target(&expr, shapes, param_consts, st) else {
+                return false;
+            };
+            targets.append(&mut expanded);
+            true
+        }
+        AcValue::ImpliedDo(ido) => {
+            let start_expr = super::expr::substitute_names_in_expr(&ido.start, substitutions);
+            let end_expr = super::expr::substitute_names_in_expr(&ido.end, substitutions);
+            let Some(start) = eval_static_data_int(&start_expr, param_consts, st) else {
+                return false;
+            };
+            let Some(end) = eval_static_data_int(&end_expr, param_consts, st) else {
+                return false;
+            };
+            let step = match &ido.step {
+                Some(step) => {
+                    let step = super::expr::substitute_names_in_expr(step, substitutions);
+                    let Some(step) = eval_static_data_int(&step, param_consts, st) else {
+                        return false;
+                    };
+                    step
+                }
+                None => 1,
+            };
+            if step == 0 {
+                return false;
+            }
+            let mut index = start;
+            while if step > 0 { index <= end } else { index >= end } {
+                let replacement = static_data_int_expr(index, ido.start.span);
+                let mut nested = substitutions.clone();
+                nested.insert(ido.var.to_lowercase(), &replacement);
+                for value in &ido.values {
+                    if !expand_static_data_ac_value(
+                        value,
+                        &nested,
+                        shapes,
+                        param_consts,
+                        st,
+                        targets,
+                    ) {
+                        return false;
+                    }
+                }
+                let Some(next) = index.checked_add(step) else {
+                    return false;
+                };
+                index = next;
+            }
+            true
+        }
+    }
+}
+
+fn expand_static_data_objects(
+    objects: &[SpannedExpr],
+    shapes: &HashMap<String, Vec<(i64, i64)>>,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<Vec<(String, usize)>> {
+    let mut targets = Vec::new();
+    let substitutions = HashMap::new();
+    for object in objects {
+        if let Expr::ArrayConstructor { values, .. } = &object.node {
+            for value in values {
+                if !expand_static_data_ac_value(
+                    value,
+                    &substitutions,
+                    shapes,
+                    param_consts,
+                    st,
+                    &mut targets,
+                ) {
+                    return None;
+                }
+            }
+        } else {
+            let mut expanded = static_data_target(object, shapes, param_consts, st)?;
+            targets.append(&mut expanded);
+        }
+    }
+    Some(targets)
+}
+
+fn expand_static_data_values(
+    values: &[DataValue],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<Vec<SpannedExpr>> {
+    let mut expanded = Vec::new();
+    for value in values {
+        match value {
+            DataValue::Expr(expr) => expanded.push(expr.clone()),
+            DataValue::Repeat { count, value } => {
+                let repeat = eval_static_data_int(count, param_consts, st)?;
+                let repeat = usize::try_from(repeat).ok()?;
+                expanded.try_reserve(repeat).ok()?;
+                expanded.extend((0..repeat).map(|_| value.clone()));
+            }
+        }
+    }
+    Some(expanded)
+}
+
+fn collect_static_data_init_plans(
+    decls: &[crate::ast::decl::SpannedDecl],
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> HashMap<String, StaticDataInitPlan> {
+    let mut shapes = HashMap::new();
+    for decl in decls {
+        let Decl::TypeDecl {
+            attrs, entities, ..
+        } = &decl.node
+        else {
+            continue;
+        };
+        if attrs.iter().any(|attr| {
+            matches!(
+                attr,
+                crate::ast::decl::Attribute::Allocatable | crate::ast::decl::Attribute::Pointer
+            )
+        }) {
+            continue;
+        }
+        let attr_dims = attrs.iter().find_map(|attr| match attr {
+            crate::ast::decl::Attribute::Dimension(specs) => Some(specs),
+            _ => None,
+        });
+        for entity in entities {
+            let dims = match entity.array_spec.as_ref().or(attr_dims) {
+                Some(specs) => {
+                    if array_spec_has_runtime_bounds(specs, param_consts, Some(st)) {
+                        continue;
+                    }
+                    let dims = extract_array_dims_with_init(
+                        specs,
+                        entity.init.as_ref(),
+                        param_consts,
+                        Some(st),
+                    );
+                    if static_data_object_count(&dims).is_none() {
+                        continue;
+                    }
+                    dims
+                }
+                None => Vec::new(),
+            };
+            shapes.entry(entity.name.to_lowercase()).or_insert(dims);
+        }
+    }
+
+    let mut plans: HashMap<String, StaticDataInitPlan> = HashMap::new();
+    for decl in decls {
+        let Decl::DataStmt { sets } = &decl.node else {
+            continue;
+        };
+        for set in sets {
+            let mut raw_names = HashSet::new();
+            for object in &set.objects {
+                collect_static_data_object_names(object, &mut raw_names);
+            }
+            let targets = expand_static_data_objects(&set.objects, &shapes, param_consts, st);
+            let values = expand_static_data_values(&set.values, param_consts, st);
+            let Some((targets, values)) = targets.zip(values) else {
+                for key in raw_names {
+                    if let Some(dims) = shapes.get(&key) {
+                        let count = static_data_object_count(dims).unwrap_or(1);
+                        plans
+                            .entry(key)
+                            .or_insert_with(|| StaticDataInitPlan {
+                                slots: vec![None; count],
+                                valid: false,
+                            })
+                            .valid = false;
+                    }
+                }
+                continue;
+            };
+            if targets.len() != values.len() {
+                for key in raw_names {
+                    if let Some(dims) = shapes.get(&key) {
+                        let count = static_data_object_count(dims).unwrap_or(1);
+                        plans
+                            .entry(key)
+                            .or_insert_with(|| StaticDataInitPlan {
+                                slots: vec![None; count],
+                                valid: false,
+                            })
+                            .valid = false;
+                    }
+                }
+                continue;
+            }
+            for ((key, index), value) in targets.into_iter().zip(values) {
+                let Some(dims) = shapes.get(&key) else {
+                    continue;
+                };
+                let count = static_data_object_count(dims).unwrap_or(1);
+                let plan = plans.entry(key).or_insert_with(|| StaticDataInitPlan {
+                    slots: vec![None; count],
+                    valid: true,
+                });
+                if index >= plan.slots.len() || plan.slots[index].is_some() {
+                    plan.valid = false;
+                    continue;
+                }
+                plan.slots[index] = Some(value);
+            }
+        }
+    }
+    plans
+}
+
+fn eval_numeric_data_array_init(
+    plan: &StaticDataInitPlan,
+    elem_ty: &IrType,
+    total: i64,
+    param_consts: &HashMap<String, ConstScalar>,
+    st: &SymbolTable,
+) -> Option<GlobalInit> {
+    let total = usize::try_from(total).ok()?;
+    if !plan.valid || plan.slots.len() != total {
+        return None;
+    }
+    if is_complex_ty(elem_ty) {
+        let mut lanes = vec![0.0; total.checked_mul(2)?];
+        for (index, expr) in plan.slots.iter().enumerate() {
+            let Some(expr) = expr else { continue };
+            let values = match eval_const_complex_global_init(expr, param_consts, elem_ty, st) {
+                Some(GlobalInit::FloatArray(values)) if values.len() == 2 => values,
+                _ => {
+                    let scalar = eval_const_global_init_with_any_scope(
+                        expr,
+                        param_consts,
+                        complex_component_type(elem_ty),
+                        st,
+                    )?;
+                    let real = match scalar {
+                        GlobalInit::Float(value) => value,
+                        GlobalInit::Int(value) => value as f64,
+                        _ => return None,
+                    };
+                    vec![real, 0.0]
+                }
+            };
+            lanes[index * 2] = values[0];
+            lanes[index * 2 + 1] = values[1];
+        }
+        return Some(GlobalInit::FloatArray(lanes));
+    }
+    if matches!(elem_ty, IrType::Float(_)) {
+        let mut values = vec![0.0; total];
+        for (index, expr) in plan.slots.iter().enumerate() {
+            let Some(expr) = expr else { continue };
+            values[index] =
+                match eval_const_global_init_with_any_scope(expr, param_consts, Some(elem_ty), st)?
+                {
+                    GlobalInit::Float(value) => value,
+                    GlobalInit::Int(value) => value as f64,
+                    _ => return None,
+                };
+        }
+        return Some(GlobalInit::FloatArray(values));
+    }
+    if matches!(elem_ty, IrType::Bool | IrType::Int(_)) {
+        let mut values = vec![0; total];
+        for (index, expr) in plan.slots.iter().enumerate() {
+            let Some(expr) = expr else { continue };
+            values[index] =
+                match eval_const_global_init_with_any_scope(expr, param_consts, Some(elem_ty), st)?
+                {
+                    GlobalInit::Int(value) => value,
+                    GlobalInit::Float(value) => value as i128,
+                    _ => return None,
+                };
+        }
+        return Some(GlobalInit::IntArray(values));
+    }
+    None
+}
+
+fn complex_component_type(ty: &IrType) -> Option<&IrType> {
+    match ty {
+        IrType::Array(component, 2) if matches!(component.as_ref(), IrType::Float(_)) => {
+            Some(component)
+        }
+        _ => None,
+    }
+}
+
+fn eval_character_data_array_init(
+    plan: &StaticDataInitPlan,
+    total: i64,
+    len: i64,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+) -> Option<GlobalInit> {
+    let total = usize::try_from(total).ok()?;
+    let len = usize::try_from(len).ok()?;
+    if !plan.valid || plan.slots.len() != total {
+        return None;
+    }
+    let mut bytes = vec![b' '; total.checked_mul(len)?];
+    for (index, expr) in plan.slots.iter().enumerate() {
+        let Some(expr) = expr else { continue };
+        let value = eval_const_char_bytes(expr, param_consts, param_char_consts)?;
+        let start = index.checked_mul(len)?;
+        let end = start.checked_add(len)?;
+        for (dst, src) in bytes[start..end].iter_mut().zip(value) {
+            *dst = src;
+        }
+    }
+    Some(GlobalInit::String(bytes))
+}
 
 fn canonical_declared_derived_layout_name(
     type_spec: &TypeSpec,
@@ -190,28 +629,10 @@ pub(crate) fn alloc_decls(
     // this pre-scan, the standalone form would silently fall back to
     // the alloca + per-call store path.
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
-    let mut scalar_data_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for d in decls {
         if let Decl::ParameterStmt { pairs } = &d.node {
             for (name, expr) in pairs {
                 parameter_inits.insert(name.to_lowercase(), expr);
-            }
-        }
-        if let Decl::DataStmt { sets } = &d.node {
-            for set in sets {
-                if set.objects.len() != set.values.len() {
-                    continue;
-                }
-                for (object, value) in set.objects.iter().zip(&set.values) {
-                    let (crate::ast::expr::Expr::Name { name }, DataValue::Expr(value)) =
-                        (&object.node, value)
-                    else {
-                        continue;
-                    };
-                    scalar_data_inits
-                        .entry(name.to_lowercase())
-                        .or_insert(value);
-                }
             }
         }
     }
@@ -233,6 +654,7 @@ pub(crate) fn alloc_decls(
         st,
         current_proc_scope(),
     );
+    let data_init_plans = collect_static_data_init_plans(decls, &param_consts, st);
     let save_all = decls.iter().any(|decl| {
         matches!(
             &decl.node,
@@ -294,18 +716,22 @@ pub(crate) fn alloc_decls(
 
                 // Use entity-level array spec, or fall back to attribute-level DIMENSION.
                 let array_spec = entity.array_spec.as_ref().or(attr_dims);
+                let data_init_plan = data_init_plans.get(&key);
                 let data_init_expr = if array_spec.is_none()
                     && !is_allocatable
                     && !is_pointer_attr
                     && !matches!(type_spec, TypeSpec::Type(_) | TypeSpec::Class(_))
                 {
-                    scalar_data_inits.get(&key).copied()
+                    data_init_plan
+                        .filter(|plan| plan.valid)
+                        .and_then(|plan| plan.slots.first())
+                        .and_then(Option::as_ref)
                 } else {
                     None
                 };
-                let is_saved = save_all
-                    || attrs.iter().any(|a| matches!(a, Attribute::Save))
-                    || data_init_expr.is_some();
+                let has_data_init = data_init_plan.is_some();
+                let is_saved =
+                    save_all || attrs.iter().any(|a| matches!(a, Attribute::Save)) || has_data_init;
 
                 // Check for character type.
                 let char_len = declared_char_len(
@@ -648,8 +1074,8 @@ pub(crate) fn alloc_decls(
                         let elem_bytes = ir_scalar_byte_size(&elem_ty, b.layout);
                         let total_bytes = total_size * elem_bytes;
                         let static_init = if !is_parameter && total_size > 0 {
-                            match init_expr {
-                                Some(expr) => eval_const_char_array_init(
+                            match (init_expr, data_init_plan) {
+                                (Some(expr), _) => eval_const_char_array_init(
                                     expr,
                                     total_size,
                                     len,
@@ -659,8 +1085,15 @@ pub(crate) fn alloc_decls(
                                     current_proc_scope(),
                                     Some(type_layouts),
                                 ),
-                                None if is_saved => Some(GlobalInit::Zero),
-                                None => None,
+                                (None, Some(plan)) => eval_character_data_array_init(
+                                    plan,
+                                    total_size,
+                                    len,
+                                    &param_consts,
+                                    &param_char_consts,
+                                ),
+                                (None, None) if is_saved => Some(GlobalInit::Zero),
+                                (None, None) => None,
                             }
                         } else {
                             None
@@ -1191,8 +1624,8 @@ pub(crate) fn alloc_decls(
                                     None
                                 }
                             } else {
-                                match init_expr {
-                                    Some(expr) => eval_const_array_init(
+                                match (init_expr, data_init_plan) {
+                                    (Some(expr), _) => eval_const_array_init(
                                         expr,
                                         &array_elem_ty,
                                         total_size,
@@ -1200,7 +1633,14 @@ pub(crate) fn alloc_decls(
                                         &HashMap::new(),
                                         &HashMap::new(),
                                     ),
-                                    None => Some(GlobalInit::Zero),
+                                    (None, Some(plan)) => eval_numeric_data_array_init(
+                                        plan,
+                                        &array_elem_ty,
+                                        total_size,
+                                        &param_consts,
+                                        st,
+                                    ),
+                                    (None, None) => Some(GlobalInit::Zero),
                                 }
                             }
                         } else {
@@ -1617,9 +2057,18 @@ pub(crate) fn alloc_decls(
 
                     let static_init_expr = init_expr.or(data_init_expr);
                     let static_init = static_init_expr
-                        .and_then(|e| eval_const_global_init(e, &param_consts, Some(&elem_ty)))
+                        .and_then(|e| {
+                            if is_complex_ty(&elem_ty) {
+                                eval_const_complex_global_init(e, &param_consts, &elem_ty, st)
+                            } else {
+                                eval_const_global_init(e, &param_consts, Some(&elem_ty))
+                            }
+                        })
                         .or_else(|| {
-                            (!is_parameter && is_saved && static_init_expr.is_none())
+                            (!is_parameter
+                                && is_saved
+                                && static_init_expr.is_none()
+                                && !has_data_init)
                                 .then_some(GlobalInit::Zero)
                         });
                     if let Some(init) = static_init {
