@@ -4861,6 +4861,7 @@ pub(super) fn collect_module_globals(
     }
     let param_char_consts =
         collect_decl_param_char_consts(decls, &param_consts, type_layouts, st, module_scope_id);
+    let data_init_plans = super::alloc::collect_static_data_init_plans(decls, &param_consts, st);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
     let mut param_derived_consts: HashMap<String, Vec<u8>> = HashMap::new();
@@ -4906,6 +4907,7 @@ pub(super) fn collect_module_globals(
                     .init
                     .as_ref()
                     .or_else(|| parameter_inits.get(&key).copied());
+                let data_init_plan = data_init_plans.get(&key);
                 let is_parameter = is_parameter_decl || parameter_inits.contains_key(&key);
                 let char_len = declared_char_len(
                     type_spec,
@@ -5107,31 +5109,51 @@ pub(super) fn collect_module_globals(
                                 )
                             })
                         }
-                    } else {
-                        init_expr.and_then(|e| {
-                            if matches!(type_spec, TypeSpec::Character(_)) {
-                                char_len.and_then(|len| {
-                                    eval_const_char_array_init(
-                                        e,
-                                        total,
-                                        len,
-                                        &param_consts,
-                                        &param_char_consts,
-                                        Some(st),
-                                        module_scope_id,
-                                        Some(type_layouts),
-                                    )
-                                })
-                            } else {
-                                eval_const_array_init(
-                                    e,
-                                    &ir_ty,
+                    } else if let Some(init_expr) = init_expr {
+                        if matches!(type_spec, TypeSpec::Character(_)) {
+                            char_len.and_then(|len| {
+                                eval_const_char_array_init(
+                                    init_expr,
                                     total,
+                                    len,
                                     &param_consts,
-                                    &param_array_consts,
-                                    &param_array_elem_tys,
+                                    &param_char_consts,
+                                    Some(st),
+                                    module_scope_id,
+                                    Some(type_layouts),
                                 )
-                            }
+                            })
+                        } else {
+                            eval_const_array_init(
+                                init_expr,
+                                &ir_ty,
+                                total,
+                                &param_consts,
+                                &param_array_consts,
+                                &param_array_elem_tys,
+                            )
+                        }
+                    } else if matches!(type_spec, TypeSpec::Character(_)) {
+                        data_init_plan.and_then(|plan| {
+                            char_len.and_then(|len| {
+                                super::alloc::eval_character_data_array_init(
+                                    plan,
+                                    total,
+                                    len,
+                                    &param_consts,
+                                    &param_char_consts,
+                                )
+                            })
+                        })
+                    } else {
+                        data_init_plan.and_then(|plan| {
+                            super::alloc::eval_numeric_data_array_init(
+                                plan,
+                                &ir_ty,
+                                total,
+                                &param_consts,
+                                st,
+                            )
                         })
                     };
                     if is_parameter

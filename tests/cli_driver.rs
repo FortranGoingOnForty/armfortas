@@ -67333,6 +67333,46 @@ fn contained_saved_derived_objects_use_static_storage() {
 }
 
 #[test]
+fn module_integer_array_data_implied_do_initializes_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_integer_array_data_implied_do_initializes_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MPFUN2020 initializes its large integer lookup tables with this exact
+    // combination: a module array, an implied-do object list, and values whose
+    // symbolic kind suffix comes from a standalone PARAMETER statement.
+    let src = write_program(
+        "module data_module\n  implicit none\n  integer, parameter :: wide_kind = selected_int_kind(18)\n  integer :: literal_kind\n  parameter (literal_kind = wide_kind)\n  integer(wide_kind) :: values(0:3)\n  integer :: i\n  data (values(i), i = 0, 3) / &\n    799144290325165978_literal_kind, 2_literal_kind, &\n    3_literal_kind, 4_literal_kind /\nend module data_module\n\nprogram p\n  use data_module, only: values\n  implicit none\n  if (values(0) /= 799144290325165978_8) error stop 1\n  if (any(values(1:3) /= [2_8, 3_8, 4_8])) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("module_data_implied_do", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module DATA implied-do compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module DATA implied-do compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("module DATA implied-do binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "module DATA implied-do run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn contained_scalar_data_initialization_implies_save() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

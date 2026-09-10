@@ -18,7 +18,7 @@ use super::ctx::{current_proc_scope, CharKind, LocalInfo};
 use super::helpers::{clamp_nonnegative_i64, widen_to_i64};
 
 #[derive(Debug, Clone)]
-struct StaticDataInitPlan {
+pub(super) struct StaticDataInitPlan {
     slots: Vec<Option<SpannedExpr>>,
     valid: bool,
 }
@@ -243,7 +243,7 @@ fn expand_static_data_values(
     Some(expanded)
 }
 
-fn collect_static_data_init_plans(
+pub(super) fn collect_static_data_init_plans(
     decls: &[crate::ast::decl::SpannedDecl],
     param_consts: &HashMap<String, ConstScalar>,
     st: &SymbolTable,
@@ -353,7 +353,7 @@ fn collect_static_data_init_plans(
     plans
 }
 
-fn eval_numeric_data_array_init(
+pub(super) fn eval_numeric_data_array_init(
     plan: &StaticDataInitPlan,
     elem_ty: &IrType,
     total: i64,
@@ -430,7 +430,7 @@ fn complex_component_type(ty: &IrType) -> Option<&IrType> {
     }
 }
 
-fn eval_character_data_array_init(
+pub(super) fn eval_character_data_array_init(
     plan: &StaticDataInitPlan,
     total: i64,
     len: i64,
