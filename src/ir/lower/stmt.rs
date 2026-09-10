@@ -1101,7 +1101,7 @@ fn try_lower_forall_assignment_with_temp(
     true
 }
 
-fn lower_where_section_temp(
+fn lower_where_array_read_temp(
     b: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     expr: &SpannedExpr,
@@ -1111,23 +1111,29 @@ fn lower_where_section_temp(
     let Expr::FunctionCall { callee, args } = &expr.node else {
         return None;
     };
-    let Expr::Name { name } = &callee.node else {
+    let local_array_section = if let Expr::Name { name } = &callee.node {
+        args.iter()
+            .any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
+            && ctx
+                .locals
+                .get(&name.to_lowercase())
+                .is_some_and(local_is_array_like)
+    } else {
+        false
+    };
+    let Some(rank) = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
+        .or_else(|| local_array_section.then_some(1))
+    else {
         return None;
     };
-    if !args
-        .iter()
-        .any(|a| matches!(a.value, crate::ast::expr::SectionSubscript::Range { .. }))
-    {
-        return None;
-    }
-    let key = name.to_lowercase();
-    if !ctx.locals.get(&key).is_some_and(local_is_array_like) {
+    if rank == 0 {
         return None;
     }
 
-    let rank = actual_expr_rank(expr, &ctx.locals, ctx.st, Some(ctx.type_layouts))
-        .unwrap_or(1)
-        .max(1);
+    // WHERE scalarizes local arrays one element at a time. Materialize every
+    // read-side array expression first, not only local array sections: an
+    // array-valued function call is otherwise lowered inside that scalar loop
+    // as though its descriptor were a scalar element.
     let (source_desc, elem_ty) = lower_array_expr_descriptor(
         b,
         &ctx.locals,
@@ -1186,7 +1192,7 @@ fn rewrite_where_read_sections_to_temps(
 ) -> SpannedExpr {
     use crate::ast::Spanned;
 
-    if let Some(temp) = lower_where_section_temp(b, ctx, expr, next_temp, temps) {
+    if let Some(temp) = lower_where_array_read_temp(b, ctx, expr, next_temp, temps) {
         return temp;
     }
 

@@ -31042,6 +31042,55 @@ fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
 }
 
 #[test]
+fn where_array_function_result_reads_materialize_before_scalarization() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=where_array_function_result_reads_materialize_before_scalarization count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // WHERE scalarization must snapshot array-valued function references in
+    // both the mask and assignment RHS. Pre-fix, the whole hidden-result
+    // descriptor reached scalar comparison/arithmetic lowering, producing an
+    // illegal ARM64 `fcmp xN, dN`. MINPACK's test_chkder uses this exact form
+    // with an allocatable result in `solution(ic)`.
+    let src = write_program(
+        "module where_array_function_m\n  implicit none\ncontains\n  pure function values(n) result(x)\n    integer, intent(in) :: n\n    real(8), allocatable :: x(:)\n    allocate(x(n))\n    x = [1.0_8, 0.0_8, 2.0_8]\n  end function values\n\n  subroutine apply_where(output)\n    real(8), intent(out) :: output(3)\n    output = 10.0_8\n    where (values(3) /= 0.0_8) output = output / abs(values(3))\n  end subroutine apply_where\nend module where_array_function_m\n\nprogram p\n  use where_array_function_m\n  implicit none\n  real(8) :: output(3)\n  call apply_where(output)\n  if (any(abs(output - [10.0_8, 10.0_8, 5.0_8]) > 1.0e-12_8)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("where_array_function_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("WHERE array-function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "WHERE array-function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("WHERE array-function run failed");
+    assert!(
+        run.status.success(),
+        "WHERE array-function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected WHERE array-function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn where_with_section_ref_to_allocatable_does_not_emit_external_bl() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
