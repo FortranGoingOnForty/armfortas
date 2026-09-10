@@ -3929,10 +3929,19 @@ pub(crate) fn lower_expr_full(
             }
             if let Some(tl) = type_layouts {
                 if let Expr::Name { name } = &base.node {
-                    if let Some(value) =
-                        lower_parameter_derived_component_const(b, st, tl, name, component)
-                    {
-                        return value;
+                    // Prefer the parameter object's materialized storage when
+                    // it is visible in this procedure. Folding from the type
+                    // layout alone only knows component defaults; it cannot
+                    // represent constructor overrides such as
+                    // `type(tag), parameter :: two = tag(2)`. Treating
+                    // `two%id` as the type default silently collapsed distinct
+                    // SELECT CASE labels to the same value.
+                    if !locals.contains_key(&name.to_ascii_lowercase()) {
+                        if let Some(value) =
+                            lower_parameter_derived_component_const(b, st, tl, name, component)
+                        {
+                            return value;
+                        }
                     }
                 }
                 // Common case: base is a Name or chained ComponentAccess.

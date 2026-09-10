@@ -56790,6 +56790,50 @@ fn module_derived_parameter_array_from_named_constants_initializes_bytes() {
 }
 
 #[test]
+fn select_case_uses_derived_parameter_constructor_overrides() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=select_case_uses_derived_parameter_constructor_overrides count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module methods_m\n  implicit none\n  type :: method_t\n    integer :: id = 0\n  end type\n  type(method_t), parameter :: one = method_t(1)\n  type(method_t), parameter :: two = method_t(2)\ncontains\n  integer function dispatch(id) result(value)\n    integer, intent(in) :: id\n    select case (id)\n    case (one%id)\n      value = 11\n    case (two%id)\n      value = 22\n    case default\n      value = -1\n    end select\n  end function\nend module\nprogram p\n  use methods_m\n  implicit none\n  if (dispatch(1) /= 11) error stop 1\n  if (dispatch(2) /= 22) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("select_case_derived_parameter_overrides", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("derived parameter SELECT CASE compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "derived parameter SELECT CASE compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("derived parameter SELECT CASE run failed");
+    assert!(
+        run.status.success(),
+        "derived parameter SELECT CASE run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected derived parameter SELECT CASE output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_parameter_array_constructor_initializes_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
