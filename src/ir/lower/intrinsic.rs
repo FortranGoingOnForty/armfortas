@@ -401,6 +401,48 @@ pub(crate) fn lower_intrinsic(
                 None
             }
         }
+        "aint" | "dint" => {
+            // AINT truncates toward zero and returns a real value. DINT is
+            // the double-precision specific name. Use libm trunc rather than
+            // a float-to-int round trip so large finite values remain in the
+            // real domain and preserve the input precision.
+            if let Some(arg) = args.first() {
+                let source_ty = b
+                    .func()
+                    .value_type(*arg)
+                    .unwrap_or(IrType::Float(FloatWidth::F64));
+                let IrType::Float(source_fw) = source_ty else {
+                    return None;
+                };
+                let func = if source_fw == FloatWidth::F32 {
+                    "truncf"
+                } else {
+                    "trunc"
+                };
+                let truncated = b.call(
+                    FuncRef::External(func.into()),
+                    vec![*arg],
+                    IrType::Float(source_fw),
+                );
+                let result_fw = if name == "dint" {
+                    FloatWidth::F64
+                } else {
+                    args.get(1)
+                        .and_then(|kind| extract_const_int_from_value(b, *kind))
+                        .map(|kind| {
+                            if kind == 8 {
+                                FloatWidth::F64
+                            } else {
+                                FloatWidth::F32
+                            }
+                        })
+                        .unwrap_or(source_fw)
+                };
+                Some(coerce_to_type(b, truncated, &IrType::Float(result_fw)))
+            } else {
+                None
+            }
+        }
         "anint" | "dnint" => {
             // ANINT: round to nearest whole number, return as real.
             if let Some(arg) = args.first() {

@@ -61985,6 +61985,43 @@ fn local_generic_gamma_falls_back_to_intrinsic_for_real_actual() {
 }
 
 #[test]
+fn local_generic_aint_falls_back_to_intrinsic_for_real_actual() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=local_generic_aint_falls_back_to_intrinsic_for_real_actual count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module aint_like\n  implicit none\n  type :: box_t\n    real :: value\n  end type\n  interface aint\n    module procedure aint_box\n  end interface\ncontains\n  real function aint_box(box) result(value)\n    type(box_t), intent(in) :: box\n    value = box%value\n  end function\nend module\nprogram p\n  use aint_like, only: aint\n  implicit none\n  real :: single\n  real(8) :: double\n  single = aint(-2.75)\n  double = aint(3.75_8)\n  if (single /= -2.0) error stop 1\n  if (double /= 3.0_8) error stop 2\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("generic_aint_intrinsic_fallback", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("AINT intrinsic fallback compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "AINT intrinsic fallback compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("AINT intrinsic fallback run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "AINT intrinsic fallback run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn generic_callee_type_ignores_unrelated_same_name_data_symbol() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
