@@ -56746,6 +56746,50 @@ fn allocate_mold_scalar_class_preserves_dynamic_vtable() {
 }
 
 #[test]
+fn module_derived_parameter_array_from_named_constants_initializes_bytes() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=module_derived_parameter_array_from_named_constants_initializes_bytes count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module methods_m\n  implicit none\n  type :: method_t\n    integer :: id = 0\n    character(len=8) :: name = ''\n  end type\n  type(method_t), parameter :: one = method_t(1, 'one')\n  type(method_t), parameter :: two = method_t(2, 'two')\n  type(method_t), parameter, dimension(*) :: methods = [one, two]\nend module\nprogram p\n  use methods_m\n  implicit none\n  if (size(methods) /= 2) error stop 1\n  if (methods(1)%id /= 1) error stop 2\n  if (methods(2)%id /= 2) error stop 3\n  if (trim(methods(1)%name) /= 'one') error stop 4\n  if (trim(methods(2)%name) /= 'two') error stop 5\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("module_named_derived_parameter_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("module named derived parameter array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "module named derived parameter array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("module named derived parameter array run failed");
+    assert!(
+        run.status.success(),
+        "module named derived parameter array run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected module named derived parameter array output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn derived_parameter_array_constructor_initializes_elements() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

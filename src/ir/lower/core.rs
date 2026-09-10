@@ -4863,6 +4863,7 @@ pub(super) fn collect_module_globals(
         collect_decl_param_char_consts(decls, &param_consts, type_layouts, st, module_scope_id);
     let mut param_array_consts: HashMap<String, Vec<ConstScalar>> = HashMap::new();
     let mut param_array_elem_tys: HashMap<String, IrType> = HashMap::new();
+    let mut param_derived_consts: HashMap<String, Vec<u8>> = HashMap::new();
     let mut parameter_inits: HashMap<String, &crate::ast::expr::SpannedExpr> = HashMap::new();
     for decl in decls {
         if let Decl::ParameterStmt { pairs } = &decl.node {
@@ -5093,7 +5094,18 @@ pub(super) fn collect_module_globals(
                                 eval_const_derived_global_init(layout, total as usize, type_layouts)
                             })
                         } else {
-                            None
+                            init_expr.and_then(|expr| {
+                                eval_const_derived_array_global_init(
+                                    type_name,
+                                    expr,
+                                    total as usize,
+                                    type_layouts,
+                                    &param_consts,
+                                    &param_char_consts,
+                                    &param_derived_consts,
+                                    st,
+                                )
+                            })
                         }
                     } else {
                         init_expr.and_then(|e| {
@@ -5159,6 +5171,11 @@ pub(super) fn collect_module_globals(
                                     param_array_elem_tys.insert(key.clone(), ir_ty.clone());
                                 }
                             }
+                        }
+                    }
+                    if is_parameter {
+                        if let Some(GlobalInit::String(bytes)) = &init {
+                            param_derived_consts.insert(key.clone(), bytes.clone());
                         }
                     }
                     module.add_global(Global {
@@ -5275,6 +5292,16 @@ pub(super) fn collect_module_globals(
                                         &param_char_consts,
                                         st,
                                     )
+                                    .or_else(|| {
+                                        let Expr::Name { name } = &e.node else {
+                                            return None;
+                                        };
+                                        param_derived_consts
+                                            .get(&name.to_lowercase())
+                                            .filter(|bytes| bytes.len() == layout.size)
+                                            .cloned()
+                                            .map(GlobalInit::String)
+                                    })
                                 })
                                 .or_else(|| {
                                     if init_expr.is_none() {
@@ -5283,6 +5310,11 @@ pub(super) fn collect_module_globals(
                                         None
                                     }
                                 });
+                            if is_parameter {
+                                if let Some(GlobalInit::String(bytes)) = &init {
+                                    param_derived_consts.insert(key.clone(), bytes.clone());
+                                }
+                            }
                             module.add_global(Global {
                                 name: symbol.clone(),
                                 ty: scalar_ty.clone(),
@@ -7513,6 +7545,107 @@ pub(super) fn eval_const_derived_global_init(
         Some(GlobalInit::String(bytes))
     } else {
         None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn eval_const_derived_array_global_init(
+    type_name: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    total: usize,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    param_derived_consts: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+) -> Option<GlobalInit> {
+    let layout = registry.get(type_name)?;
+    let mut bytes = Vec::with_capacity(layout.size.saturating_mul(total));
+    collect_const_derived_array_bytes(
+        type_name,
+        expr,
+        registry,
+        param_consts,
+        param_char_consts,
+        param_derived_consts,
+        st,
+        &mut bytes,
+    )?;
+    let expected_bytes = layout.size.checked_mul(total)?;
+    if bytes.len() > expected_bytes || bytes.len() % layout.size != 0 {
+        return None;
+    }
+    let default_element = match eval_const_derived_global_init(layout, 1, registry) {
+        Some(GlobalInit::String(defaults)) => defaults,
+        _ => vec![0; layout.size],
+    };
+    while bytes.len() < expected_bytes {
+        bytes.extend_from_slice(&default_element);
+    }
+    Some(GlobalInit::String(bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_const_derived_array_bytes(
+    type_name: &str,
+    expr: &crate::ast::expr::SpannedExpr,
+    registry: &crate::sema::type_layout::TypeLayoutRegistry,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_char_consts: &HashMap<String, Vec<u8>>,
+    param_derived_consts: &HashMap<String, Vec<u8>>,
+    st: &SymbolTable,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    match &expr.node {
+        Expr::ArrayConstructor { values, .. } => {
+            for value in values {
+                let crate::ast::expr::AcValue::Expr(value) = value else {
+                    return None;
+                };
+                collect_const_derived_array_bytes(
+                    type_name,
+                    value,
+                    registry,
+                    param_consts,
+                    param_char_consts,
+                    param_derived_consts,
+                    st,
+                    out,
+                )?;
+            }
+            Some(())
+        }
+        Expr::ParenExpr { inner } => collect_const_derived_array_bytes(
+            type_name,
+            inner,
+            registry,
+            param_consts,
+            param_char_consts,
+            param_derived_consts,
+            st,
+            out,
+        ),
+        Expr::Name { name } => {
+            let bytes = param_derived_consts.get(&name.to_lowercase())?;
+            out.extend_from_slice(bytes);
+            Some(())
+        }
+        Expr::FunctionCall { .. } => {
+            let GlobalInit::String(bytes) = eval_const_derived_ctor_global_init(
+                type_name,
+                expr,
+                registry,
+                param_consts,
+                param_char_consts,
+                st,
+            )?
+            else {
+                return None;
+            };
+            out.extend_from_slice(&bytes);
+            Some(())
+        }
+        _ => None,
     }
 }
 
