@@ -29377,6 +29377,49 @@ fn epsilon_tiny_huge_fold_at_compile_time_for_module_parameters() {
 }
 
 #[test]
+fn renamed_kind_inquiry_parameter_array_preserves_precision() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=renamed_kind_inquiry_parameter_array_preserves_precision count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MINPACK imports `real64` as `wp`, uses that suffix in inquiry
+    // intrinsics inside a parameter array constructor, then initializes its
+    // private scalar epsilon from `dpmpar(1)`. Pre-fix the inquiry folder
+    // treated every unfamiliar suffix as kind 4 and the scalar array-element
+    // initializer fell back to zero-filled storage.
+    let src = write_program(
+        "module machine_constants_m\n  use iso_fortran_env, only: wp => real64\n  implicit none\n  real(wp), parameter :: scalar_eps = epsilon(1.0_wp)\n  real(wp), dimension(0:2), parameter :: limits = [epsilon(1.0_wp), tiny(1.0_wp), huge(1.0_wp)]\n  real(wp), parameter :: array_eps = limits(0)\nend module machine_constants_m\nprogram p\n  use machine_constants_m\n  implicit none\n  if (scalar_eps <= 0.0_wp .or. scalar_eps > 1.0e-15_wp) error stop 1\n  if (limits(0) /= scalar_eps) error stop 2\n  if (limits(1) <= 0.0_wp .or. limits(1) > 1.0e-300_wp) error stop 3\n  if (limits(2) < 1.0e300_wp) error stop 4\n  if (array_eps /= scalar_eps) error stop 5\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("renamed_kind_inquiry_parameter_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("renamed-kind inquiry parameter compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "renamed-kind inquiry parameter compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("renamed-kind inquiry parameter run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "renamed-kind inquiry parameter run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn named_inquiry_parameter_constants_survive_cross_tu_import() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -31036,6 +31079,55 @@ fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn where_array_function_result_reads_materialize_before_scalarization() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=where_array_function_result_reads_materialize_before_scalarization count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // WHERE scalarization must snapshot array-valued function references in
+    // both the mask and assignment RHS. Pre-fix, the whole hidden-result
+    // descriptor reached scalar comparison/arithmetic lowering, producing an
+    // illegal ARM64 `fcmp xN, dN`. MINPACK's test_chkder uses this exact form
+    // with an allocatable result in `solution(ic)`.
+    let src = write_program(
+        "module where_array_function_m\n  implicit none\ncontains\n  pure function values(n) result(x)\n    integer, intent(in) :: n\n    real(8), allocatable :: x(:)\n    allocate(x(n))\n    x = [1.0_8, 0.0_8, 2.0_8]\n  end function values\n\n  subroutine apply_where(output)\n    real(8), intent(out) :: output(3)\n    output = 10.0_8\n    where (values(3) /= 0.0_8) output = output / abs(values(3))\n  end subroutine apply_where\nend module where_array_function_m\n\nprogram p\n  use where_array_function_m\n  implicit none\n  real(8) :: output(3)\n  call apply_where(output)\n  if (any(abs(output - [10.0_8, 10.0_8, 5.0_8]) > 1.0e-12_8)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("where_array_function_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("WHERE array-function compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "WHERE array-function compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("WHERE array-function run failed");
+    assert!(
+        run.status.success(),
+        "WHERE array-function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected WHERE array-function output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
@@ -50606,6 +50698,50 @@ fn procedure_dummy_with_explicit_interface_indirect_call_links_and_runs() {
 }
 
 #[test]
+fn procedure_dummy_array_result_participates_in_binary_expression() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=procedure_dummy_array_result_participates_in_binary_expression count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  abstract interface\n    function array_callback(x) result(y)\n      real(8), intent(in) :: x(:)\n      real(8) :: y(size(x))\n    end function array_callback\n  end interface\ncontains\n  subroutine evaluate(callback, x, output)\n    procedure(array_callback) :: callback\n    real(8), intent(in) :: x(:)\n    real(8), intent(out) :: output(size(x))\n    output = x - callback(x)\n  end subroutine evaluate\n\n  function twice(x) result(y)\n    real(8), intent(in) :: x(:)\n    real(8) :: y(size(x))\n    y = 2.0_8 * x\n  end function twice\nend module m\nprogram p\n  use m\n  implicit none\n  real(8) :: x(3), output(3)\n  x = [1.0_8, 2.0_8, 3.0_8]\n  call evaluate(twice, x, output)\n  if (any(abs(output - [-1.0_8, -2.0_8, -3.0_8]) > 1.0e-12_8)) error stop 1\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("procedure_dummy_array_result_binary", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("procedure-dummy array-result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "procedure-dummy array-result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("procedure-dummy array-result run failed");
+    assert!(
+        run.status.success(),
+        "procedure-dummy array-result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected procedure-dummy array-result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn new_line_intrinsic_links_and_runs_in_runtime_char_context() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -66231,6 +66367,77 @@ fn top_level_subroutine_contained_function_uses_internal_target() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "top-level-host contained-function run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&ir);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn contained_save_explicit_shape_array_uses_static_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contained_save_explicit_shape_array_uses_static_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MINPACK's lmstr callback fills a SAVE'd 65x40 Jacobian workspace on
+    // one invocation and reads a selected row on later invocations. This
+    // used to be an alloca whose stale stack contents survived by accident;
+    // an unrelated same-sized frame could overwrite individual values. The
+    // small initialized array also checks the implicit-SAVE form.
+    let src = write_program(
+        "program p\n  implicit none\n  real(8) :: got\n  integer :: count\n  call callback(.true., got, count)\n  if (count /= 1) error stop 2\n  call clobber()\n  call callback(.false., got, count)\n  if (abs(got + 1.57959540603238699e-8_8) > 1.0e-20_8) error stop 1\n  if (count /= 2) error stop 3\n  print *, 'ok'\ncontains\n  subroutine callback(fill, value, count)\n    logical, intent(in) :: fill\n    real(8), intent(out) :: value\n    integer, intent(out) :: count\n    real(8), save :: temp(65, 40)\n    integer :: state(2) = [0, 10]\n    state(1) = state(1) + 1\n    count = state(1)\n    if (fill) then\n      temp = 0.0_8\n      temp(47, 9) = -1.57959540603238699e-8_8\n      value = 0.0_8\n    else\n      value = temp(47, 9)\n    end if\n  end subroutine callback\n\n  subroutine clobber()\n    real(8) :: scratch(65, 40)\n    scratch = -99.0_8\n    call observe(scratch(47, 9))\n  end subroutine clobber\n\n  subroutine observe(value)\n    real(8), intent(in) :: value\n    if (value > 0.0_8) print *, value\n  end subroutine observe\nend program p\n",
+        "f90",
+    );
+    let ir = unique_path("contained_save_explicit_shape_array", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            "--emit-ir",
+            src.to_str().unwrap(),
+            "-O0",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("contained SAVE array IR compile failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "contained SAVE array IR compile failed: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("cannot read contained SAVE array IR");
+    assert!(
+        ir_text.contains("_temp: [f64 x 2600] = zeroinit"),
+        "SAVE'd explicit-shape array must have static IR storage:\n{}",
+        ir_text
+    );
+    assert!(
+        ir_text.contains("_state: [i32 x 2] = [0, 10]"),
+        "initialized local array must carry its implicit-SAVE initializer in static storage:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contained_save_explicit_shape_array", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("contained SAVE array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "contained SAVE array compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("contained SAVE array binary failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "contained SAVE array run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr),

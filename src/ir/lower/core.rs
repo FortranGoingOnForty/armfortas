@@ -4723,6 +4723,54 @@ pub(super) fn collect_decl_spec_import_names(
         .collect()
 }
 
+fn eval_module_parameter_array_element(
+    expr: &crate::ast::expr::SpannedExpr,
+    module_name: &str,
+    globals: &HashMap<(String, String), ModuleGlobalInfo>,
+    param_consts: &HashMap<String, ConstScalar>,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<ConstScalar> {
+    let Expr::FunctionCall { callee, args } = &expr.node else {
+        return None;
+    };
+    let Expr::Name { name } = &callee.node else {
+        return None;
+    };
+    let key = name.to_lowercase();
+    let values = param_array_consts.get(&key)?;
+    let elem_ty = param_array_elem_tys.get(&key)?;
+    let info = globals.get(&(module_name.to_lowercase(), key))?;
+    if args.len() != info.dims.len() {
+        return None;
+    }
+
+    let mut linear_index = 0_i64;
+    let mut stride = 1_i64;
+    for (arg, (lower, extent)) in args.iter().zip(&info.dims) {
+        let crate::ast::expr::SectionSubscript::Element(index_expr) = &arg.value else {
+            return None;
+        };
+        let ConstScalar::Int(index) = eval_const_scalar(index_expr, param_consts)? else {
+            return None;
+        };
+        let index = i64::try_from(index).ok()?;
+        if index < *lower || index >= lower.checked_add(*extent)? {
+            return None;
+        }
+        linear_index = linear_index.checked_add((index - lower).checked_mul(stride)?)?;
+        stride = stride.checked_mul(*extent)?;
+    }
+
+    // ConstScalar represents one numeric lane. A complex array element has
+    // two lanes and needs the complex-global path rather than this scalar one.
+    let lanes = usize::try_from(const_array_storage_scalar_count(elem_ty, 1)?).ok()?;
+    if lanes != 1 {
+        return None;
+    }
+    values.get(usize::try_from(linear_index).ok()?).copied()
+}
+
 pub(super) fn collect_module_globals(
     module: &mut Module,
     globals: &mut HashMap<(String, String), ModuleGlobalInfo>,
@@ -5255,12 +5303,26 @@ pub(super) fn collect_module_globals(
                             return Some(complex_init);
                         }
                         if is_parameter {
-                            eval_const_global_init_with_any_scope(
+                            eval_module_parameter_array_element(
                                 e,
+                                mod_name,
+                                globals,
                                 &param_consts,
-                                Some(&ir_ty),
-                                st,
+                                &param_array_consts,
+                                &param_array_elem_tys,
                             )
+                            .map(|raw| match clamp_const_to_type(raw, &ir_ty) {
+                                ConstScalar::Int(value) => GlobalInit::Int(value),
+                                ConstScalar::Float(value) => GlobalInit::Float(value),
+                            })
+                            .or_else(|| {
+                                eval_const_global_init_with_any_scope(
+                                    e,
+                                    &param_consts,
+                                    Some(&ir_ty),
+                                    st,
+                                )
+                            })
                         } else {
                             eval_const_global_init(e, &param_consts, Some(&ir_ty))
                         }
@@ -5281,6 +5343,11 @@ pub(super) fn collect_module_globals(
                     } else {
                         None
                     };
+                    if let Some(value) = const_value {
+                        param_consts.insert(key.clone(), ConstScalar::Int(value));
+                    } else if let Some(value) = const_real_value {
+                        param_consts.insert(key.clone(), ConstScalar::Float(value));
+                    }
                     module.add_global(Global {
                         name: symbol.clone(),
                         ty: ir_ty.clone(),
@@ -7777,7 +7844,7 @@ pub(super) fn install_host_param_consts(
 }
 
 /// A pending global variable produced by the lowerer for a SAVE'd
-/// scalar local. Flushed into the IR Module after the containing
+/// local. Flushed into the IR Module after the containing
 /// function finishes lowering.
 pub(super) struct PendingGlobal {
     pub(super) global: Global,
@@ -47078,8 +47145,19 @@ pub(super) fn array_function_result_elem_type(
             {
                 return None;
             }
-            if procedure_pointer_call_target(b, locals, st, &key).is_some() {
-                return None;
+            // Procedure dummies/pointers inherit their declared result shape
+            // and element type from the explicit interface during semantic
+            // resolution.  Use that metadata to classify array-valued
+            // indirect calls without loading the runtime code pointer as a
+            // speculative side effect.  The old early return here forced an
+            // array result through scalar expression lowering whenever it
+            // appeared in a binary expression (for example `x - callback(x)`).
+            if procedure_pointer_signature_key(st, &key).is_some() {
+                let symbol = st.lookup_local_then_any(current_proc_scope(), &key)?;
+                if symbol.attrs.result_rank == 0 {
+                    return None;
+                }
+                return callee_symbol_ir_type(symbol);
             }
 
             let arg_slots = reorder_args_by_keyword_slots(args, &key, st);

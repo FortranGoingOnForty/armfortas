@@ -1021,6 +1021,69 @@ pub(crate) fn alloc_decls(
                     let total_bytes = total_size * elem_bytes;
                     const STACK_THRESHOLD: i64 = 64 * 1024; // 64KB
 
+                    // A compile-time-shaped local with SAVE has static storage
+                    // duration. Keep it out of both the small-array alloca path
+                    // and the large-array descriptor/heap path: recreating either
+                    // form on every procedure entry loses values between calls.
+                    // An initializer implies SAVE too (F2018 8.5.16.4).
+                    let is_save_attr = attrs.iter().any(|a| matches!(a, Attribute::Save));
+                    let static_init = if !is_parameter
+                        && total_size > 0
+                        && array_derived_type.is_none()
+                        && (is_save_attr || init_expr.is_some())
+                    {
+                        match init_expr {
+                            Some(expr) => eval_const_array_init(
+                                expr,
+                                &array_elem_ty,
+                                total_size,
+                                &param_consts,
+                                &HashMap::new(),
+                                &HashMap::new(),
+                            ),
+                            None => Some(GlobalInit::Zero),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(initializer) = static_init {
+                        let arr_ty =
+                            IrType::Array(Box::new(array_elem_ty.clone()), total_size as u64);
+                        let global_name = save_global_name(func_name, &key);
+                        pending_globals.push(PendingGlobal {
+                            global: Global {
+                                name: global_name.clone(),
+                                ty: arr_ty.clone(),
+                                initializer: Some(initializer),
+                            },
+                        });
+                        let addr = b.global_addr(&global_name, arr_ty);
+                        locals.insert(
+                            key,
+                            LocalInfo {
+                                addr,
+                                ty: array_elem_ty,
+                                dims,
+                                allocatable: false,
+                                descriptor_arg: false,
+                                by_ref: false,
+                                char_kind: array_char_kind,
+                                derived_type: None,
+                                inline_const: None,
+                                is_pointer: false,
+                                runtime_dim_upper: vec![],
+                                is_class: false,
+                                logical_kind: type_spec_logical_kind(
+                                    type_spec,
+                                    Some(&param_consts),
+                                    Some(st),
+                                ),
+                                last_dim_assumed_size: false,
+                            },
+                        );
+                        continue;
+                    }
+
                     if total_bytes >= STACK_THRESHOLD {
                         // Large array: use descriptor + heap allocation (prevents stack overflow).
                         let desc_ty = IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392);

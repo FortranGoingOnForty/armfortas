@@ -407,31 +407,40 @@ pub(super) fn eval_const_scalar(
                         enum Kind {
                             F32,
                             F64,
+                            I8,
+                            I16,
                             I32,
                             I64,
+                            I128,
                         }
                         let kind = match &e.node {
                             Expr::RealLiteral { text, kind, .. } => {
                                 let lower = text.to_ascii_lowercase();
-                                if let Some(k) = kind.as_deref() {
-                                    match k.parse::<i64>().ok() {
-                                        Some(8) => Kind::F64,
-                                        Some(4) => Kind::F32,
-                                        _ => match k.to_ascii_lowercase().as_str() {
-                                            "dp" | "real64" => Kind::F64,
-                                            _ => Kind::F32,
-                                        },
-                                    }
+                                let bytes = if let Some(k) = kind.as_deref() {
+                                    kind_bytes(k, param_consts)?
                                 } else if lower.contains('d') {
-                                    Kind::F64
+                                    8
                                 } else {
-                                    Kind::F32
+                                    4
+                                };
+                                match bytes {
+                                    4 => Kind::F32,
+                                    8 => Kind::F64,
+                                    _ => return None,
                                 }
                             }
                             Expr::IntegerLiteral { kind, .. } => {
-                                match kind.as_deref().and_then(|s| s.parse::<i64>().ok()) {
-                                    Some(8) => Kind::I64,
-                                    _ => Kind::I32,
+                                let bytes = match kind.as_deref() {
+                                    Some(k) => kind_bytes(k, param_consts)?,
+                                    None => 4,
+                                };
+                                match bytes {
+                                    1 => Kind::I8,
+                                    2 => Kind::I16,
+                                    4 => Kind::I32,
+                                    8 => Kind::I64,
+                                    16 => Kind::I128,
+                                    _ => return None,
                                 }
                             }
                             _ => return None,
@@ -445,8 +454,11 @@ pub(super) fn eval_const_scalar(
                             ("tiny", Kind::F64) => Some(ConstScalar::Float(f64::MIN_POSITIVE)),
                             ("huge", Kind::F32) => Some(ConstScalar::Float(f32::MAX as f64)),
                             ("huge", Kind::F64) => Some(ConstScalar::Float(f64::MAX)),
+                            ("huge", Kind::I8) => Some(ConstScalar::Int(i8::MAX as i128)),
+                            ("huge", Kind::I16) => Some(ConstScalar::Int(i16::MAX as i128)),
                             ("huge", Kind::I32) => Some(ConstScalar::Int(i32::MAX as i128)),
                             ("huge", Kind::I64) => Some(ConstScalar::Int(i64::MAX as i128)),
+                            ("huge", Kind::I128) => Some(ConstScalar::Int(i128::MAX)),
                             _ => None,
                         }
                     }
