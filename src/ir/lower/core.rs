@@ -22306,6 +22306,14 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
     let is_subroutine_call = matches!(explicit_ret_ty, Some(IrType::Void));
     let hidden_abi = if is_subroutine_call {
         None
+    } else if let Some(symbol) = find_linkable_symbol_by_link_name(st, &declared_bp.target_name) {
+        // The declared binding defines the call ABI. In particular, a
+        // scalar result legitimately has no hidden argument; do not keep
+        // scanning progressively shorter module-symbol suffixes and graft
+        // an unrelated local's hidden-result ABI onto it. fpm's logical
+        // `match_key` binding ended in `_key`, which collided with its
+        // character dummy named `key` and fabricated a string descriptor.
+        hidden_result_abi_for_symbol(symbol)
     } else {
         first_procedure_lookup(&abi_lookup_keys, |k| callee_hidden_result_abi(st, k))
     };
@@ -26321,9 +26329,13 @@ pub(super) fn callee_hidden_result_abi(
     st: &SymbolTable,
     callee_name: &str,
 ) -> Option<HiddenResultAbi> {
+    let sym = find_linkable_symbol_for_callee(st, callee_name)?;
+    hidden_result_abi_for_symbol(sym)
+}
+
+fn hidden_result_abi_for_symbol(sym: &crate::sema::symtab::Symbol) -> Option<HiddenResultAbi> {
     use crate::sema::symtab::TypeInfo;
 
-    let sym = find_linkable_symbol_for_callee(st, callee_name)?;
     // Rank check must come BEFORE the Character match arm: a function
     // returning `character :: cstr(N)` is rank-1, and the caller has to
     // allocate a 392-byte ArrayDescriptor (NOT a 32-byte StringDescriptor)
