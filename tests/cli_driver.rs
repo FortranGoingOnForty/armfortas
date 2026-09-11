@@ -36787,6 +36787,123 @@ fn shared_compile_emits_amod_and_links_cleanly() {
 }
 
 #[test]
+fn shared_libraries_share_process_runtime_state() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=shared_libraries_share_process_runtime_state count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    if armfortas::testing::native_macho_toolchain_support().is_err() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=shared_libraries_share_process_runtime_state count=1 reason=\"Mach-O dylib flow only\""
+        );
+        return;
+    }
+
+    let dir = unique_dir("shared_runtime_state");
+    let runtime_cache = dir.join("runtime-cache");
+    let opener_src = write_program_in(
+        &dir,
+        "opener.f90",
+        "module opener_mod\n  implicit none\ncontains\n  subroutine open_output(unit, status)\n    integer, intent(out) :: unit, status\n    open(newunit=unit, file='shared-runtime.txt', status='replace', action='write', iostat=status)\n  end subroutine\nend module\n",
+    );
+    let writer_src = write_program_in(
+        &dir,
+        "writer.f90",
+        "module writer_mod\n  implicit none\ncontains\n  subroutine write_output(unit, status)\n    integer, intent(in) :: unit\n    integer, intent(out) :: status\n    write(unit, '(a)', iostat=status) 'shared runtime'\n    if (status == 0) flush(unit, iostat=status)\n  end subroutine\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use opener_mod, only: open_output\n  use writer_mod, only: write_output\n  implicit none\n  integer :: unit, status\n  call open_output(unit, status)\n  if (status /= 0) error stop 1\n  call write_output(unit, status)\n  if (status /= 0) error stop 2\n  close(unit, iostat=status)\n  if (status /= 0) error stop 3\nend program\n",
+    );
+
+    for (source, output, install_name) in [
+        (
+            &opener_src,
+            dir.join("libopener.dylib"),
+            "@rpath/libopener.dylib",
+        ),
+        (
+            &writer_src,
+            dir.join("libwriter.dylib"),
+            "@rpath/libwriter.dylib",
+        ),
+    ] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .env("AFS_LD", "0")
+            .env_remove("AFS_LD_PATH")
+            .env_remove("AFS_RUNTIME_PATH")
+            .env_remove("AFS_RUNTIME_DYLIB_PATH")
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
+            .args([
+                "-dynamiclib",
+                source.to_str().unwrap(),
+                "-install_name",
+                install_name,
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("shared-runtime dylib compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "shared-runtime dylib compile failed for {}: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let executable = dir.join("shared-runtime");
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .env("AFS_LD", "0")
+        .env_remove("AFS_LD_PATH")
+        .env_remove("AFS_RUNTIME_PATH")
+        .env_remove("AFS_RUNTIME_DYLIB_PATH")
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .args([
+            "-I",
+            dir.to_str().unwrap(),
+            "-L",
+            dir.to_str().unwrap(),
+            "-rpath",
+            dir.to_str().unwrap(),
+            "-lopener",
+            "-lwriter",
+            main_src.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("shared-runtime executable link failed to spawn");
+    assert!(
+        link.status.success(),
+        "shared-runtime executable link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&executable)
+        .current_dir(&dir)
+        .output()
+        .expect("shared-runtime executable failed to run");
+    assert!(
+        run.status.success(),
+        "cross-dylib runtime state was split: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        fs::read(dir.join("shared-runtime.txt")).unwrap(),
+        b"shared runtime\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn dynamiclib_driver_spelling_forwards_darwin_linker_flags() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -38052,12 +38169,20 @@ fn afs_runtime_path_env_overrides_runtime_discovery() {
         );
         return;
     }
-    // Point $AFS_RUNTIME_PATH at a directory that DOES contain the
-    // real runtime and verify compilation still succeeds — exercises
-    // the override branch end-to-end without hiding the real runtime.
-    let rt = armfortas::testing::built_runtime_archive()
-        .expect("libarmfortas_rt.a not built for this test profile");
-    let rt_dir = rt.parent().unwrap().to_path_buf();
+    // Point $AFS_RUNTIME_PATH at a directory that DOES contain the runtime
+    // artifact selected for this host and verify the override end-to-end.
+    let rt_dir = unique_dir("rtpath_runtime");
+    if cfg!(target_os = "macos") {
+        fs::write(
+            rt_dir.join("libarmfortas_rt.dylib"),
+            armfortas_rt::bundled_dylib().expect("Mach-O runtime dylib payload"),
+        )
+        .expect("write runtime dylib override");
+    } else {
+        let rt = armfortas::testing::built_runtime_archive()
+            .expect("libarmfortas_rt.a not built for this test profile");
+        fs::copy(rt, rt_dir.join("libarmfortas_rt.a")).expect("copy runtime archive override");
+    }
     let src = write_program("program p\n  print *, 11\nend program\n", "f90");
     let out = unique_path("rtpath", "bin");
     let result = Command::new(compiler("armfortas"))
@@ -38070,8 +38195,16 @@ fn afs_runtime_path_env_overrides_runtime_discovery() {
         "AFS_RUNTIME_PATH-directed compile failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let run = Command::new(&out)
+        .output()
+        .expect("runtime override output failed to run");
+    assert!(
+        run.status.success(),
+        "runtime override output failed: {run:?}"
+    );
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_dir_all(&rt_dir);
 }
 
 #[test]

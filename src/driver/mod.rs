@@ -20,7 +20,7 @@ use crate::lexer::{detect_source_form, tokenize_source_view, SourceForm, Span};
 use crate::parser::Parser;
 use crate::runtime::artifact::{
     find_source_workspace_from, fresh_runtime_lib, materialize_bundled_runtime,
-    runtime_lib_candidate, RuntimeArchive, RuntimeProfile,
+    materialize_bundled_runtime_dylib, runtime_lib_candidate, RuntimeArchive, RuntimeProfile,
 };
 use crate::sema::{resolve, validate};
 
@@ -3041,7 +3041,7 @@ fn link_inputs(
         return link_inputs_with_afs_ld(&linker, inputs, output, opts, bundled_runtime);
     }
 
-    let runtime = find_runtime_lib(bundled_runtime)?;
+    let runtime = find_macho_runtime(opts, bundled_runtime)?;
     let sdk = Command::new("xcrun")
         .args(["--show-sdk-path"])
         .output()
@@ -3069,9 +3069,10 @@ fn link_inputs(
         "-e".into(),
         "_main".into(),
     ]);
+    push_macho_runtime_rpath(&mut args, &runtime);
     if !opts.shared {
-        // The Rust static runtime is packaged in coarse archive members. Let
-        // Apple ld trim unused runtime surfaces from final executables.
+        // Trim unused compiler-generated and user-object surfaces from final
+        // executables. The shared runtime is a separate image and unaffected.
         args.push("-dead_strip".into());
     }
     push_macho_tail_link_flags(&mut args, opts);
@@ -3106,7 +3107,7 @@ fn link_inputs_with_afs_ld(
         return Err("AFS_LD override does not yet support static-link mode".into());
     }
 
-    let runtime = find_runtime_lib(bundled_runtime)?;
+    let runtime = find_macho_runtime(opts, bundled_runtime)?;
     let sysroot = find_macos_sdk_root()?;
     let libsystem_tbd = find_libsystem_tbd(&sysroot)?;
     let mut args: Vec<String> = vec!["-arch".into(), "arm64".into()];
@@ -3132,6 +3133,7 @@ fn link_inputs_with_afs_ld(
     }
     args.push(runtime.path().to_string_lossy().into_owned());
     args.push(libsystem_tbd);
+    push_macho_runtime_rpath(&mut args, &runtime);
     push_afs_ld_tail_link_flags(&mut args, opts);
 
     if opts.verbose {
@@ -3184,9 +3186,8 @@ fn print_verbose_command_line(program: &str, args: &[String]) {
 
 fn push_afs_ld_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
     if !opts.shared {
-        // Match the default Apple ld route: the runtime archive intentionally
-        // groups several entry points per member, so executable links must
-        // discard the unused surfaces pulled in with a referenced member.
+        // Match the default Apple ld route by trimming unused executable
+        // surfaces. The shared runtime is a separate image and unaffected.
         args.push("-dead_strip".into());
     }
     for path in &opts.rpath {
@@ -3194,6 +3195,45 @@ fn push_afs_ld_tail_link_flags(args: &mut Vec<String>, opts: &Options) {
         args.push(path.to_string_lossy().into_owned());
     }
     args.extend(opts.extra_link_args.iter().cloned());
+}
+
+enum MachoRuntime {
+    Static(RuntimeArchive),
+    Dynamic(PathBuf),
+}
+
+impl MachoRuntime {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Static(archive) => archive.path(),
+            Self::Dynamic(dylib) => dylib,
+        }
+    }
+
+    fn dylib_directory(&self) -> Option<&Path> {
+        match self {
+            Self::Static(_) => None,
+            Self::Dynamic(dylib) => dylib.parent(),
+        }
+    }
+}
+
+fn push_macho_runtime_rpath(args: &mut Vec<String>, runtime: &MachoRuntime) {
+    let Some(directory) = runtime.dylib_directory() else {
+        return;
+    };
+    args.push("-rpath".into());
+    args.push(directory.to_string_lossy().into_owned());
+}
+
+fn find_macho_runtime(
+    opts: &Options,
+    bundled_runtime: Option<&'static [u8]>,
+) -> Result<MachoRuntime, String> {
+    if opts.static_link {
+        return find_runtime_lib(bundled_runtime).map(MachoRuntime::Static);
+    }
+    find_runtime_dylib().map(MachoRuntime::Dynamic)
 }
 
 /// ELF assembler routing (x14). `None` means the in-process afs-as
@@ -3549,6 +3589,47 @@ fn find_runtime_lib(bundled_runtime: Option<&'static [u8]>) -> Result<RuntimeArc
         .into())
 }
 
+/// Find the single process-wide runtime used by ordinary Mach-O links.
+///
+/// A static runtime inside each dylib gives every image its own Fortran unit
+/// table and other supposedly process-wide state. Keep the override explicit,
+/// then prefer the payload built into this exact compiler binary.
+fn find_runtime_dylib() -> Result<PathBuf, String> {
+    if let Some(path) = env_override("AFS_RUNTIME_DYLIB_PATH") {
+        let dylib = PathBuf::from(&path);
+        if dylib.is_file() {
+            return Ok(dylib);
+        }
+        return Err(format!(
+            "AFS_RUNTIME_DYLIB_PATH points to missing path '{}'",
+            dylib.display()
+        ));
+    }
+
+    if let Some(path) = env_override("AFS_RUNTIME_PATH") {
+        let requested = PathBuf::from(&path);
+        let dylib = if requested.is_dir() {
+            requested.join("libarmfortas_rt.dylib")
+        } else {
+            requested.clone()
+        };
+        if dylib.is_file() && dylib.extension().and_then(|ext| ext.to_str()) == Some("dylib") {
+            return Ok(dylib);
+        }
+        return Err(format!(
+            "AFS_RUNTIME_PATH '{}' does not provide libarmfortas_rt.dylib for a dynamic Mach-O link; set AFS_RUNTIME_DYLIB_PATH or use -static",
+            requested.display()
+        ));
+    }
+
+    if let Some(bytes) = armfortas_rt::bundled_dylib() {
+        return materialize_bundled_runtime_dylib(bytes);
+    }
+
+    Err("this compiler does not carry a Mach-O libarmfortas_rt.dylib payload; set AFS_RUNTIME_DYLIB_PATH"
+        .into())
+}
+
 fn find_macos_sdk_root() -> Result<String, String> {
     let sdk = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
@@ -3629,7 +3710,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn afs_ld_executables_dead_strip_coarse_runtime_members() {
+    fn afs_ld_enables_dead_strip_only_for_executables() {
         let mut executable_args = Vec::new();
         push_afs_ld_tail_link_flags(&mut executable_args, &Options::default());
         assert_eq!(executable_args, ["-dead_strip"]);

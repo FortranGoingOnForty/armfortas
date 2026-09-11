@@ -1095,6 +1095,7 @@ fn verbose_link_only_darwin_line_exposes_runtime_for_cmake() {
     let link = Command::new(compiler("armfortas"))
         .env_remove("AFS_LD")
         .env_remove("AFS_LD_PATH")
+        .env("AFS_RUNTIME_CACHE", dir.join("runtime-cache"))
         .args([
             "-v",
             "-Wl,-v",
@@ -1114,8 +1115,8 @@ fn verbose_link_only_darwin_line_exposes_runtime_for_cmake() {
         stderr
             .lines()
             .any(|line| line.trim_start().starts_with("ld ")
-                && line.contains("libarmfortas_rt.a")),
-        "verbose link output should expose an ld command line with the runtime archive for CMake implicit-link parsing:\n{}",
+                && line.contains("libarmfortas_rt.dylib")),
+        "verbose link output should expose an ld command line with the runtime dylib for CMake implicit-link parsing:\n{}",
         stderr
     );
     let _ = std::fs::remove_dir_all(&dir);
