@@ -725,12 +725,16 @@ impl<'a> FormatParser<'a> {
     fn parse_number(&mut self) -> Result<Option<usize>, FormatError> {
         let mut value = 0usize;
         let mut found = false;
-        while let Some(digit) = self
-            .chars
-            .peek()
-            .filter(|digit| digit.is_ascii_digit())
-            .map(|digit| *digit as usize - '0' as usize)
-        {
+        loop {
+            self.skip_spaces();
+            let Some(digit) = self
+                .chars
+                .peek()
+                .filter(|digit| digit.is_ascii_digit())
+                .map(|digit| *digit as usize - '0' as usize)
+            else {
+                break;
+            };
             self.chars.next();
             value = value
                 .checked_mul(10)
@@ -762,6 +766,7 @@ impl<'a> FormatParser<'a> {
     }
 
     fn peek_uppercase(&mut self) -> Option<char> {
+        self.skip_spaces();
         self.chars.peek().map(|c| c.to_ascii_uppercase())
     }
 
@@ -2157,6 +2162,40 @@ mod tests {
             }
         ));
         assert!(matches!(descs[2], FormatDesc::Character { width: None }));
+    }
+
+    #[test]
+    fn blanks_inside_edit_descriptors_are_ignored() {
+        let descs = valid_format("(B N, G 1 2 . 4 E 3, I 5 . 2, E S 1 5 . 8, 2 X, T R 3)");
+        assert!(matches!(
+            descs[0],
+            FormatDesc::BlankMode(BlankInterpretation::Null)
+        ));
+        assert!(matches!(
+            descs[1],
+            FormatDesc::RealG {
+                width: 12,
+                decimals: 4,
+                exp_width: Some(3)
+            }
+        ));
+        assert!(matches!(
+            descs[2],
+            FormatDesc::IntegerI {
+                width: 5,
+                min_digits: Some(2)
+            }
+        ));
+        assert!(matches!(
+            descs[3],
+            FormatDesc::RealES {
+                width: 15,
+                decimals: 8,
+                exp_width: None
+            }
+        ));
+        assert!(matches!(descs[4], FormatDesc::Skip { count: 2 }));
+        assert!(matches!(descs[5], FormatDesc::TabRight { count: 3 }));
     }
 
     #[test]
