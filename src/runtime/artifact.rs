@@ -7,6 +7,9 @@ use std::time::SystemTime;
 
 static NEXT_BUNDLED_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
+const MACHO_64_LE_MAGIC: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];
+const MACHO_64_BE_MAGIC: [u8; 4] = [0xfe, 0xed, 0xfa, 0xcf];
+
 pub(crate) struct RuntimeArchive {
     path: PathBuf,
     cleanup_dir: Option<PathBuf>,
@@ -97,6 +100,126 @@ pub(crate) fn materialize_bundled_runtime(bytes: &[u8]) -> Result<RuntimeArchive
         "cannot create a unique bundled runtime directory under '{}'",
         base.display()
     ))
+}
+
+fn bundled_runtime_fingerprint(bytes: &[u8]) -> u64 {
+    // FNV-1a is deliberately implemented here rather than delegated to
+    // DefaultHasher, whose output is not a stable persistence contract.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn default_runtime_dylib_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("AFS_RUNTIME_CACHE").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("armfortas")
+            .join("runtime");
+    }
+    std::env::temp_dir().join("armfortas-runtime-cache")
+}
+
+fn materialize_bundled_runtime_dylib_in(
+    bytes: &[u8],
+    cache_root: &Path,
+) -> Result<PathBuf, String> {
+    if !bytes.starts_with(&MACHO_64_LE_MAGIC) && !bytes.starts_with(&MACHO_64_BE_MAGIC) {
+        return Err("bundled libarmfortas_rt.dylib is not a valid 64-bit Mach-O image".into());
+    }
+
+    let fingerprint = bundled_runtime_fingerprint(bytes);
+    let version_dir = cache_root.join(format!("{fingerprint:016x}-{}", bytes.len()));
+    fs::create_dir_all(&version_dir).map_err(|err| {
+        format!(
+            "cannot create shared runtime directory '{}': {err}",
+            version_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&version_dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
+            format!(
+                "cannot secure shared runtime directory '{}': {err}",
+                version_dir.display()
+            )
+        })?;
+    }
+
+    let dylib = version_dir.join("libarmfortas_rt.dylib");
+    if dylib.exists() {
+        let installed = fs::read(&dylib)
+            .map_err(|err| format!("cannot verify shared runtime '{}': {err}", dylib.display()))?;
+        if installed == bytes {
+            return Ok(dylib);
+        }
+        return Err(format!(
+            "shared runtime cache entry '{}' does not match the compiler payload",
+            dylib.display()
+        ));
+    }
+
+    let temporary = version_dir.join(format!(
+        ".libarmfortas_rt.dylib.{}.{}",
+        std::process::id(),
+        NEXT_BUNDLED_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o500);
+    }
+    let write_result = options
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(bytes));
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot write shared runtime '{}': {err}",
+            temporary.display()
+        ));
+    }
+    match fs::rename(&temporary, &dylib) {
+        Ok(()) => Ok(dylib),
+        Err(err) if dylib.exists() => {
+            let _ = fs::remove_file(&temporary);
+            let installed = fs::read(&dylib).map_err(|verify_err| {
+                format!(
+                    "cannot verify concurrently installed shared runtime '{}': {verify_err}",
+                    dylib.display()
+                )
+            })?;
+            if installed == bytes {
+                Ok(dylib)
+            } else {
+                Err(format!(
+                    "cannot install shared runtime '{}': {err}",
+                    dylib.display()
+                ))
+            }
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&temporary);
+            Err(format!(
+                "cannot install shared runtime '{}': {err}",
+                dylib.display()
+            ))
+        }
+    }
+}
+
+pub(crate) fn materialize_bundled_runtime_dylib(bytes: &[u8]) -> Result<PathBuf, String> {
+    materialize_bundled_runtime_dylib_in(bytes, &default_runtime_dylib_root())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,5 +527,26 @@ mod tests {
             .err()
             .expect("invalid bytes must fail");
         assert!(err.contains("not a valid archive"), "{err}");
+    }
+
+    #[test]
+    fn bundled_runtime_dylib_is_persistent_and_content_addressed() {
+        let root = temp_root("dylib-cache");
+        let mut dylib = MACHO_64_LE_MAGIC.to_vec();
+        dylib.extend_from_slice(b"shared runtime payload");
+        let first = materialize_bundled_runtime_dylib_in(&dylib, &root).unwrap();
+        let second = materialize_bundled_runtime_dylib_in(&dylib, &root).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), dylib);
+        assert!(first.starts_with(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_runtime_dylib_rejects_non_macho_bytes() {
+        let root = temp_root("invalid-dylib");
+        let err = materialize_bundled_runtime_dylib_in(b"not Mach-O", &root).unwrap_err();
+        assert!(err.contains("not a valid 64-bit Mach-O image"), "{err}");
+        assert!(!root.exists());
     }
 }

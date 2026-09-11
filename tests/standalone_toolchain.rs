@@ -31,6 +31,13 @@ fn runtime_archive() -> PathBuf {
         .expect("libarmfortas_rt.a not built for this test profile")
 }
 
+fn runtime_artifact_dir() -> PathBuf {
+    runtime_archive()
+        .parent()
+        .expect("runtime archive has no parent directory")
+        .to_path_buf()
+}
+
 fn libsystem_tbd() -> PathBuf {
     let output = Command::new("xcrun")
         .args(["--sdk", "macosx", "--show-sdk-path"])
@@ -225,7 +232,7 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
     let armfortas = binary("armfortas");
     let afs_as = binary("afs-as");
     let afs_ld = binary("afs-ld");
-    let runtime = runtime_archive();
+    let runtime_dir = runtime_artifact_dir();
     let libsystem = libsystem_tbd();
 
     let source = workspace_root().join("test_programs/hello.f90");
@@ -252,7 +259,7 @@ fn hello_world_runs_through_driver_with_standalone_tool_overrides() {
         &[
             ("AFS_AS_PATH", &afs_as),
             ("AFS_LD_PATH", &afs_ld),
-            ("AFS_RUNTIME_PATH", &runtime),
+            ("AFS_RUNTIME_PATH", &runtime_dir),
             ("AFS_LIBSYSTEM_TBD", &libsystem),
         ],
         "standalone armfortas compile",
@@ -288,7 +295,7 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
     let armfortas = binary("armfortas");
     let afs_as = binary("afs-as");
     let _afs_ld = binary("afs-ld");
-    let runtime = runtime_archive();
+    let runtime_dir = runtime_artifact_dir();
     let libsystem = libsystem_tbd();
 
     let source = workspace_root().join("test_programs/hello.f90");
@@ -303,7 +310,7 @@ fn hello_world_runs_through_driver_with_afs_ld_enable_flag() {
         &standalone_bin,
         &[
             ("AFS_AS_PATH", &afs_as),
-            ("AFS_RUNTIME_PATH", &runtime),
+            ("AFS_RUNTIME_PATH", &runtime_dir),
             ("AFS_LIBSYSTEM_TBD", &libsystem),
         ],
         &[("AFS_LD", "1")],
@@ -328,7 +335,7 @@ fn driver_standalone_linker_resolves_sdk_library_names() {
     let armfortas = binary("armfortas");
     let afs_as = binary("afs-as");
     let afs_ld = binary("afs-ld");
-    let runtime = runtime_archive();
+    let runtime_dir = runtime_artifact_dir();
     let libsystem = libsystem_tbd();
     let source = workspace_root().join("test_programs/hello.f90");
     let dir = unique_dir("driver_standalone_sdk_library");
@@ -341,7 +348,7 @@ fn driver_standalone_linker_resolves_sdk_library_names() {
         &[
             ("AFS_AS_PATH", &afs_as),
             ("AFS_LD_PATH", &afs_ld),
-            ("AFS_RUNTIME_PATH", &runtime),
+            ("AFS_RUNTIME_PATH", &runtime_dir),
             ("AFS_LIBSYSTEM_TBD", &libsystem),
         ],
         &["-lc++"],
@@ -365,7 +372,7 @@ fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
     }
     let armfortas = binary("armfortas");
     let afs_as = binary("afs-as");
-    let runtime = runtime_archive();
+    let runtime_dir = runtime_artifact_dir();
 
     let source = workspace_root().join("test_programs/hello.f90");
     assert!(source.exists(), "hello.f90 missing at {}", source.display());
@@ -377,7 +384,7 @@ fn hello_world_keeps_apple_ld_path_with_afs_ld_zero() {
         &armfortas,
         &source,
         &apple_ld_bin,
-        &[("AFS_AS_PATH", &afs_as), ("AFS_RUNTIME_PATH", &runtime)],
+        &[("AFS_AS_PATH", &afs_as), ("AFS_RUNTIME_PATH", &runtime_dir)],
         &[("AFS_LD", "0")],
         &[],
         "AFS_LD=0 armfortas compile",
@@ -400,7 +407,7 @@ fn shared_library_runs_through_driver_with_standalone_linker_override() {
     let armfortas = binary("armfortas");
     let afs_as = binary("afs-as");
     let afs_ld = binary("afs-ld");
-    let runtime = runtime_archive();
+    let runtime_dir = runtime_artifact_dir();
     let libsystem = libsystem_tbd();
 
     let dir = unique_dir("driver_standalone_shared");
@@ -422,7 +429,7 @@ fn shared_library_runs_through_driver_with_standalone_linker_override() {
         Command::new(&armfortas)
             .env("AFS_AS_PATH", &afs_as)
             .env("AFS_LD_PATH", &afs_ld)
-            .env("AFS_RUNTIME_PATH", &runtime)
+            .env("AFS_RUNTIME_PATH", &runtime_dir)
             .env("AFS_LIBSYSTEM_TBD", &libsystem)
             .arg("-shared")
             .arg(&lib_src)
@@ -442,7 +449,7 @@ fn shared_library_runs_through_driver_with_standalone_linker_override() {
         Command::new(&armfortas)
             .env("AFS_AS_PATH", &afs_as)
             .env("AFS_LD_PATH", &afs_ld)
-            .env("AFS_RUNTIME_PATH", &runtime)
+            .env("AFS_RUNTIME_PATH", &runtime_dir)
             .env("AFS_LIBSYSTEM_TBD", &libsystem)
             .arg("-I")
             .arg(dir_str)
@@ -637,7 +644,7 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
     let armfortas = binary("armfortas");
     let afs_as = binary("afs-as");
     let afs_ld = binary("afs-ld");
-    let runtime = runtime_archive();
+    let runtime_dir = runtime_artifact_dir();
     let libsystem = libsystem_tbd();
 
     let root = workspace_root();
@@ -674,7 +681,7 @@ fn sprint18_program_matrix_runs_through_driver_standalone_overrides() {
             &[
                 ("AFS_AS_PATH", &afs_as),
                 ("AFS_LD_PATH", &afs_ld),
-                ("AFS_RUNTIME_PATH", &runtime),
+                ("AFS_RUNTIME_PATH", &runtime_dir),
                 ("AFS_LIBSYSTEM_TBD", &libsystem),
             ],
             &format!("standalone armfortas compile for {name}"),
