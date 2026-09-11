@@ -3363,8 +3363,7 @@ pub(crate) fn lower_expr_full(
                                 internal_funcs,
                                 contained_host_refs,
                                 descriptor_params,
-                            )
-                            .or_else(|| layout.bound_proc(component));
+                            );
                             // Procedure-pointer component (not a TBP):
                             // lower as an indirect call.  Common in
                             // stdlib_hashmaps where `map % hasher(key)`
@@ -3999,8 +3998,7 @@ pub(crate) fn lower_expr_full(
                                             internal_funcs,
                                             contained_host_refs,
                                             descriptor_params,
-                                        )
-                                        .or_else(|| layout.bound_proc(component));
+                                        );
                                         if let Some(bp) = bp {
                                             let target_key =
                                                 abi_key_for_link_name(st, &bp.target_name)

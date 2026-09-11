@@ -57238,6 +57238,100 @@ fn bound_generic_dispatch_rejects_specific_missing_extra_actuals() {
 }
 
 #[test]
+fn type_bound_generic_rejects_integer_kind_mismatches() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=type_bound_generic_rejects_integer_kind_mismatches count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let cases = [
+        (
+            "subroutine",
+            r#"module m
+  use, intrinsic :: iso_fortran_env, only : int64
+  implicit none
+  type :: t
+  contains
+    procedure :: take_i64
+    procedure :: take_name
+    generic :: take => take_i64, take_name
+  end type
+contains
+  subroutine take_i64(self, value)
+    class(t), intent(inout) :: self
+    integer(int64), intent(in) :: value
+  end subroutine
+  subroutine take_name(self, value)
+    class(t), intent(inout) :: self
+    character(len=*), intent(in) :: value
+  end subroutine
+end module
+program p
+  use m
+  implicit none
+  type(t) :: object
+  call object%take(1)
+end program
+"#,
+            "take",
+        ),
+        (
+            "function",
+            r#"module m
+  use, intrinsic :: iso_fortran_env, only : int64
+  implicit none
+  type :: t
+  contains
+    procedure :: value_i64
+    procedure :: value_name
+    generic :: value => value_i64, value_name
+  end type
+contains
+  integer function value_i64(self, input)
+    class(t), intent(in) :: self
+    integer(int64), intent(in) :: input
+    value_i64 = int(input)
+  end function
+  integer function value_name(self, input)
+    class(t), intent(in) :: self
+    character(len=*), intent(in) :: input
+    value_name = len(input)
+  end function
+end module
+program p
+  use m
+  implicit none
+  type(t) :: object
+  integer :: result
+  result = object%value(1)
+end program
+"#,
+            "value",
+        ),
+    ];
+
+    for (label, source, generic_name) in cases {
+        let src = write_program(source, "f90");
+        let result = diagnostic_output(&src, &[]);
+        assert!(
+            !result.status.success(),
+            "type-bound generic {label} must reject an integer kind mismatch"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "no specific type-bound procedure of '{generic_name}' on type 't' matches the actual arguments"
+            )),
+            "missing unmatched type-bound generic {label} diagnostic:\n{stderr}"
+        );
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+#[test]
 fn generic_type_bound_subroutine_dispatch_uses_matching_specific() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
