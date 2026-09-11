@@ -65,6 +65,25 @@ pub(super) fn selected_char_kind_value(name: &str) -> i128 {
     }
 }
 
+pub(super) fn eval_real_math_intrinsic(name: &str, value: f64) -> Option<f64> {
+    match name {
+        "sqrt" | "dsqrt" => Some(value.sqrt()),
+        "exp" | "dexp" => Some(value.exp()),
+        "log" | "dlog" => Some(value.ln()),
+        "log10" | "dlog10" => Some(value.log10()),
+        "sin" | "dsin" => Some(value.sin()),
+        "cos" | "dcos" => Some(value.cos()),
+        "tan" | "dtan" => Some(value.tan()),
+        "asin" | "dasin" => Some(value.asin()),
+        "acos" | "dacos" => Some(value.acos()),
+        "atan" | "datan" => Some(value.atan()),
+        "sinh" | "dsinh" => Some(value.sinh()),
+        "cosh" | "dcosh" => Some(value.cosh()),
+        "tanh" | "dtanh" => Some(value.tanh()),
+        _ => None,
+    }
+}
+
 pub(super) fn eval_const_scalar(
     e: &crate::ast::expr::SpannedExpr,
     param_consts: &HashMap<String, ConstScalar>,
@@ -349,22 +368,7 @@ pub(super) fn eval_const_scalar(
                     | "acos" | "dacos" | "atan" | "datan" | "sinh" | "dsinh" | "cosh" | "dcosh"
                     | "tanh" | "dtanh" => {
                         let v = first_arg?.to_float();
-                        let r = match key.as_str() {
-                            "sqrt" | "dsqrt" => v.sqrt(),
-                            "exp" | "dexp" => v.exp(),
-                            "log" | "dlog" => v.ln(),
-                            "log10" | "dlog10" => v.log10(),
-                            "sin" | "dsin" => v.sin(),
-                            "cos" | "dcos" => v.cos(),
-                            "tan" | "dtan" => v.tan(),
-                            "asin" | "dasin" => v.asin(),
-                            "acos" | "dacos" => v.acos(),
-                            "atan" | "datan" => v.atan(),
-                            "sinh" | "dsinh" => v.sinh(),
-                            "cosh" | "dcosh" => v.cosh(),
-                            "tanh" | "dtanh" => v.tanh(),
-                            _ => return None,
-                        };
+                        let r = eval_real_math_intrinsic(key.as_str(), v)?;
                         Some(ConstScalar::Float(r))
                     }
                     "atan2" | "datan2" => {

@@ -22,8 +22,8 @@ use std::io::Write;
 use std::rc::Rc;
 
 use super::const_scalar::{
-    clamp_const_to_type, const_scalar_ir_type, eval_const_scalar, materialize_const_scalar,
-    selected_char_kind_value, ConstScalar,
+    clamp_const_to_type, const_scalar_ir_type, eval_const_scalar, eval_real_math_intrinsic,
+    materialize_const_scalar, selected_char_kind_value, ConstScalar,
 };
 use super::ctx::{
     active_block_scopes, active_block_uses, current_proc_scope, current_smp_extra_host,
@@ -5870,6 +5870,12 @@ fn collect_const_array_binary_op(
     match (left_array, right_array) {
         (Some(left_values), Some(right_values)) => {
             if left_values.len() != right_values.len() {
+                if let Some(scalar) = eval_const_scalar(left, param_consts) {
+                    return const_array_binary_scalar(op, right_values, scalar, elem_ty, true);
+                }
+                if let Some(scalar) = eval_const_scalar(right, param_consts) {
+                    return const_array_binary_scalar(op, left_values, scalar, elem_ty, false);
+                }
                 return None;
             }
             left_values
@@ -5888,6 +5894,51 @@ fn collect_const_array_binary_op(
         }
         (None, None) => None,
     }
+}
+
+fn collect_const_array_real_math_intrinsic(
+    name: &str,
+    args: &[crate::ast::expr::Argument],
+    elem_ty: &IrType,
+    param_array_consts: &HashMap<String, Vec<ConstScalar>>,
+    param_array_elem_tys: &HashMap<String, IrType>,
+) -> Option<Vec<ConstScalar>> {
+    if args.len() != 1 {
+        return None;
+    }
+    let arg = args.first()?;
+    if arg
+        .keyword
+        .as_deref()
+        .is_some_and(|keyword| !keyword.eq_ignore_ascii_case("x"))
+    {
+        return None;
+    }
+    let source = const_arg_element(arg)?;
+    let source_name = match &source.node {
+        Expr::Name { name } => name.to_lowercase(),
+        Expr::ParenExpr { inner } => match &inner.node {
+            Expr::Name { name } => name.to_lowercase(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let source_ty = param_array_elem_tys.get(&source_name)?;
+    if !matches!(source_ty, IrType::Float(_)) {
+        return None;
+    }
+
+    let intrinsic = name.to_ascii_lowercase();
+    eval_real_math_intrinsic(&intrinsic, 0.0)?;
+    let mut out = Vec::new();
+    for value in param_array_consts.get(&source_name)? {
+        let folded = eval_real_math_intrinsic(&intrinsic, value.to_float())?;
+        out.extend(coerce_scalar_to_array_lanes(
+            ConstScalar::Float(folded),
+            elem_ty,
+        ));
+    }
+    Some(out)
 }
 
 fn collect_const_array_unary_op(
@@ -6007,6 +6058,15 @@ pub(super) fn collect_const_array_scalars(
                     args,
                     elem_ty,
                     param_consts,
+                    param_array_consts,
+                    param_array_elem_tys,
+                ) {
+                    return Some(values);
+                }
+                if let Some(values) = collect_const_array_real_math_intrinsic(
+                    name,
+                    args,
+                    elem_ty,
                     param_array_consts,
                     param_array_elem_tys,
                 ) {
@@ -20423,7 +20483,19 @@ pub(super) fn lowered_scope_symbol_name(
                     internal_funcs,
                 )),
                 crate::sema::symtab::ScopeKind::Module(module_name) => {
-                    Some(module_procedure_symbol_name(module_name, name))
+                    let is_external_interface = parent_scope
+                        .symbols
+                        .get(&name.to_lowercase())
+                        .is_some_and(|symbol| {
+                            symbol.attrs.external
+                                && !symbol.attrs.is_separate_module_interface
+                                && !symbol.attrs.is_separate_module_procedure
+                        });
+                    if is_external_interface {
+                        Some(name.clone())
+                    } else {
+                        Some(module_procedure_symbol_name(module_name, name))
+                    }
                 }
                 crate::sema::symtab::ScopeKind::Submodule(submod_name) => {
                     // F2018 §11.2.3: a separate-module-procedure body
@@ -20538,6 +20610,16 @@ pub(crate) fn symbol_abi_metadata_name(
     st: &SymbolTable,
     sym: &crate::sema::symtab::Symbol,
 ) -> String {
+    // An ordinary interface body inside a module describes an external
+    // procedure. Its host supplies visibility and characteristics, not linker
+    // ownership. MODULE-prefixed interfaces are the separate-module-procedure
+    // exception and keep the ancestor module's link identity.
+    if sym.attrs.external
+        && !sym.attrs.is_separate_module_interface
+        && !sym.attrs.is_separate_module_procedure
+    {
+        return sym.name.clone();
+    }
     if matches!(
         sym.kind,
         crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine

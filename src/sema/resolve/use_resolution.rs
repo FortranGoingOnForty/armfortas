@@ -926,6 +926,7 @@ fn install_external_interface(
             pointer: proc.result_pointer,
             pure: proc.pure,
             elemental: proc.elemental,
+            external: proc.external,
             abstract_interface: proc.abstract_interface,
             is_separate_module_interface: proc.is_separate_module_interface,
             is_separate_module_procedure: proc.is_separate_module_procedure,

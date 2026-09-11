@@ -329,6 +329,45 @@ fn store_complex_scalar_initializer(
     );
 }
 
+fn store_const_complex_array_initializer(
+    b: &mut FuncBuilder,
+    info: &LocalInfo,
+    scalars: &[ConstScalar],
+) -> bool {
+    let total: i64 = info.dims.iter().map(|(_, size)| *size).product();
+    let Some(storage_total) = total.checked_mul(2) else {
+        return false;
+    };
+    if total < 0 {
+        return false;
+    }
+    if total == 0 {
+        return scalars.is_empty();
+    }
+    let scalar_broadcast = total > 1 && scalars.len() == 2;
+    if !scalar_broadcast && scalars.len() != storage_total as usize {
+        return false;
+    }
+
+    let float_width = complex_float_width(&info.ty);
+    let lane_ty = IrType::Float(float_width);
+    let lane_bytes = b.const_i64(if float_width == FloatWidth::F64 { 8 } else { 4 });
+    let zero = b.const_i64(0);
+    for index in 0..total as usize {
+        let lane_index = if scalar_broadcast { 0 } else { index * 2 };
+        let lanes = &scalars[lane_index..lane_index + 2];
+        let index = b.const_i64(index as i64);
+        let element = b.gep(info.addr, vec![index], info.ty.clone());
+        let real_addr = b.gep(element, vec![zero], IrType::Int(IntWidth::I8));
+        let imag_addr = b.gep(element, vec![lane_bytes], IrType::Int(IntWidth::I8));
+        let real = materialize_const_scalar(b, lanes[0], &lane_ty);
+        let imag = materialize_const_scalar(b, lanes[1], &lane_ty);
+        b.store(real, real_addr);
+        b.store(imag, imag_addr);
+    }
+    true
+}
+
 /// Lower initializer expressions for declared variables.
 ///
 /// Handles two AST shapes:
@@ -623,15 +662,27 @@ pub(crate) fn init_decls(
                                 }
                             }
                         } else if is_complex_ty(&info.ty) {
-                            let _ = store_named_parameter_array_init(
-                                b,
-                                locals,
-                                info,
+                            let stored = collect_const_array_scalars(
                                 init_expr,
-                                st,
-                                proc_scope_id,
+                                &info.ty,
                                 &param_consts,
-                            );
+                                &param_array_consts,
+                                &param_array_elem_tys,
+                            )
+                            .is_some_and(|scalars| {
+                                store_const_complex_array_initializer(b, info, &scalars)
+                            });
+                            if !stored {
+                                let _ = store_named_parameter_array_init(
+                                    b,
+                                    locals,
+                                    info,
+                                    init_expr,
+                                    st,
+                                    proc_scope_id,
+                                    &param_consts,
+                                );
+                            }
                         } else {
                             if let Some(mut scalars) = collect_const_array_scalars(
                                 init_expr,
