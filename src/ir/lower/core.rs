@@ -20322,6 +20322,10 @@ pub(super) fn module_procedure_symbol_name(module_name: &str, proc_name: &str) -
     crate::sema::symtab::module_procedure_link_name(module_name, proc_name)
 }
 
+fn canonical_fortran_external_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 pub(super) fn sanitize_internal_host_symbol(host_link_name: &str) -> String {
     host_link_name
         .chars()
@@ -20358,7 +20362,7 @@ pub(super) fn lowered_procedure_symbol_name(
     if let Some(module_name) = host_module {
         return module_procedure_symbol_name(module_name, name);
     }
-    name.to_string()
+    canonical_fortran_external_name(name)
 }
 
 pub(super) fn scope_matches_procedure_name(scope: &crate::sema::symtab::Scope, name: &str) -> bool {
@@ -20665,7 +20669,7 @@ pub(crate) fn symbol_abi_metadata_name(
         && !sym.attrs.is_separate_module_interface
         && !sym.attrs.is_separate_module_procedure
     {
-        return sym.name.clone();
+        return canonical_fortran_external_name(&sym.name);
     }
     if matches!(
         sym.kind,
@@ -20692,7 +20696,7 @@ pub(crate) fn symbol_abi_metadata_name(
             _ => {}
         }
     }
-    sym.name.clone()
+    canonical_fortran_external_name(&sym.name)
 }
 
 pub(crate) fn symbol_link_name(st: &SymbolTable, sym: &crate::sema::symtab::Symbol) -> String {
@@ -20964,7 +20968,10 @@ pub(super) fn resolved_symbol_call_target(
         // to an unrelated same-named local procedure in the current unit.
         return (call_name, key.to_string());
     }
-    (fallback_name.to_string(), key.to_string())
+    (
+        canonical_fortran_external_name(fallback_name),
+        key.to_string(),
+    )
 }
 
 fn resolved_linkable_symbol_from_scope<'a>(
@@ -20994,7 +21001,12 @@ fn resolved_symbol_call_target_from_scope(
 ) -> (String, String) {
     resolved_linkable_symbol_from_scope(st, scope_id, key)
         .map(|sym| (symbol_link_name(st, sym), key.to_string()))
-        .unwrap_or_else(|| (fallback_name.to_string(), key.to_string()))
+        .unwrap_or_else(|| {
+            (
+                canonical_fortran_external_name(fallback_name),
+                key.to_string(),
+            )
+        })
 }
 
 /// Resolve a bare call name preferring the caller's own scope over a global

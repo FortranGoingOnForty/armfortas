@@ -31667,6 +31667,76 @@ fn huge_intrinsic_over_array_actual_folds_at_compile_time() {
 }
 
 #[test]
+fn external_procedure_names_are_case_insensitive_across_files() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=external_procedure_names_are_case_insensitive_across_files count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    // Fortran identifiers are case-insensitive, including across separately
+    // compiled external procedures. Preserve exact BIND(C) labels, but give
+    // ordinary Fortran externals one canonical object-symbol spelling.
+    let dir = unique_dir("external_proc_case");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "subroutine Mixed_Case(value)\n  implicit none\n  integer, intent(out) :: value\n  value = 42\nend subroutine Mixed_Case\n\ninteger function lower_value()\n  implicit none\n  lower_value = 7\nend function lower_value\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program p\n  implicit none\n  integer :: value\n  integer, external :: LOWER_VALUE\n  call mixed_case(value)\n  if (value /= 42) error stop 1\n  if (LOWER_VALUE() /= 7) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+
+    for (source, object) in [(&provider, "provider.o"), (&consumer, "consumer.o")] {
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args(["-c", source.file_name().unwrap().to_str().unwrap()])
+            .args(["-o", object])
+            .output()
+            .expect("external procedure case compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "compiling {} should succeed: {}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args(["provider.o", "consumer.o", "-o", "external_proc_case.bin"])
+        .output()
+        .expect("external procedure case link failed to spawn");
+    assert!(
+        link.status.success(),
+        "case-equivalent external procedure names should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(dir.join("external_proc_case.bin"))
+        .output()
+        .expect("external procedure case run failed");
+    assert!(
+        run.status.success(),
+        "case-equivalent external procedure calls should run: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "expected ok marker: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn type_bound_procedure_target_with_uppercase_name_links_correctly() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
