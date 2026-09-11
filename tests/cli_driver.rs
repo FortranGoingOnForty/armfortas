@@ -59413,6 +59413,99 @@ fn spacing_parameter_values_round_trip_through_amod() {
 }
 
 #[test]
+fn storage_size_parameter_values_round_trip_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=storage_size_parameter_values_round_trip_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("storage_size_parameter_amod");
+    let provider = write_program_in(
+        &dir,
+        "storage_size_provider.f90",
+        "module storage_size_provider\n  implicit none\n  integer, parameter :: int_bits = storage_size(1, kind=kind(1))\n  integer, parameter :: logical_bits = storage_size(.true., kind=kind(1))\n  integer, parameter :: real_bits = storage_size(1.0_8, kind=kind(1))\nend module storage_size_provider\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "storage_size_consumer.f90",
+        "program p\n  use storage_size_provider, only: int_bits, logical_bits, real_bits\n  implicit none\n  if (int_bits /= 32) error stop 1\n  if (logical_bits /= 32) error stop 2\n  if (real_bits /= 64) error stop 3\n  print *, 'ok'\nend program p\n",
+    );
+
+    let provider_obj = dir.join("storage_size_provider.o");
+    let compile_provider = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("storage_size parameter provider compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "storage_size parameter provider compile failed: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("storage_size_provider.amod"))
+        .expect("missing storage_size_provider.amod");
+    assert!(
+        amod.contains("@param int_bits : integer = 32")
+            && amod.contains("@param logical_bits : integer = 32")
+            && amod.contains("@param real_bits : integer = 64"),
+        "storage_size parameter values must be concrete across translation units: {amod}"
+    );
+
+    let consumer_obj = dir.join("storage_size_consumer.o");
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("storage_size parameter consumer compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "storage_size parameter consumer compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    let out = dir.join("storage_size_parameter.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            provider_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("storage_size parameter link failed to spawn");
+    assert!(
+        link.status.success(),
+        "storage_size parameter link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("storage_size parameter run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "storage_size parameter run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

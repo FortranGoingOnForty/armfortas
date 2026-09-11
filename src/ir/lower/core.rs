@@ -9307,6 +9307,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
                     | "range"
                     | "digits"
                     | "bit_size"
+                    | "storage_size"
                     | "radix"
                     | "maxexponent"
                     | "minexponent"
@@ -10029,6 +10030,9 @@ fn const_inquiry_for_ir_type(key: &str, ty: &IrType) -> Option<ConstScalar> {
             };
             Some(ConstScalar::Int(bits))
         }
+        "storage_size" => Some(ConstScalar::Int(
+            super::helpers::storage_size_bits_for_ir_type(ty) as i128,
+        )),
         "radix" => Some(ConstScalar::Int(2)),
         "maxexponent" => match ty {
             IrType::Float(FloatWidth::F64) => Some(ConstScalar::Int(1024)),
@@ -10240,7 +10244,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
                 }
                 "huge" | "tiny" | "epsilon" | "precision" | "range" | "digits" | "radix"
-                | "bit_size" | "maxexponent" | "minexponent" => {
+                | "bit_size" | "storage_size" | "maxexponent" | "minexponent" => {
                     let arg = args.first()?;
                     let arg_expr = const_call_arg_expr(arg)?;
                     if let Some(fold) = enum_const_inquiry(&key, arg_expr, decls, st) {
