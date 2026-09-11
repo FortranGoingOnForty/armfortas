@@ -23059,6 +23059,114 @@ fn polymorphic_component_type_bound_call_dispatches_through_scalar_allocatable_d
 }
 
 #[test]
+fn polymorphic_array_component_logical_bound_result_uses_declared_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=polymorphic_array_component_logical_bound_result_uses_declared_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        r#"module m
+  implicit none
+  type, abstract :: value_t
+    character(len=:), allocatable :: key
+  contains
+    procedure :: match_key
+    procedure(destroy_i), deferred :: destroy
+  end type
+  abstract interface
+    subroutine destroy_i(self)
+      import :: value_t
+      class(value_t), intent(inout) :: self
+    end subroutine
+  end interface
+  type, extends(value_t) :: concrete_value_t
+  contains
+    procedure :: destroy => destroy_value
+  end type
+  type :: node_t
+    class(value_t), allocatable :: val
+  end type
+  type :: map_t
+    integer :: n = 0
+    type(node_t), allocatable :: list(:)
+  contains
+    procedure :: contains_key
+  end type
+contains
+  pure logical function match_key(self, key) result(matches)
+    class(value_t), intent(in) :: self
+    character(len=*), intent(in) :: key
+    if (allocated(self%key)) then
+      matches = key == self%key
+    else
+      matches = .false.
+    end if
+  end function
+  subroutine destroy_value(self)
+    class(concrete_value_t), intent(inout) :: self
+  end subroutine
+  logical function contains_key(self, key) result(found)
+    class(map_t), intent(in) :: self
+    character(len=*), intent(in) :: key
+    integer :: i
+    found = .false.
+    do i = 1, self%n
+      if (allocated(self%list(i)%val)) then
+        if (self%list(i)%val%match_key(key)) then
+          found = .true.
+          exit
+        end if
+      end if
+    end do
+  end function
+end module
+program p
+  use m
+  implicit none
+  type(map_t) :: map
+  allocate(map%list(1))
+  allocate(concrete_value_t :: map%list(1)%val)
+  map%n = 1
+  map%list(1)%val%key = 'needle'
+  if (.not. map%contains_key('needle')) error stop 1
+  if (map%contains_key('other')) error stop 2
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let out = unique_path("polymorphic_array_component_logical_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "polymorphic array-component logical bound result should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success(),
+        "polymorphic array-component logical bound result should run: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected logical bound-result output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn typed_allocate_class_component_sets_runtime_type_tag_for_dispatch() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
