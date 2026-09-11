@@ -67686,6 +67686,45 @@ fn fixed_form_complex_star_16_uses_double_components() {
 }
 
 #[test]
+fn fixed_form_implicit_main_can_begin_with_type_declaration() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_implicit_main_can_begin_with_type_declaration count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      INTEGER N\n      N = 1\n      PRINT *, N, ' implicit main ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_implicit_main_type_decl", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("implicit-main compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "implicit-main compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("implicit-main executable failed to run");
+    assert!(
+        run.status.success()
+            && String::from_utf8_lossy(&run.stdout).contains('1')
+            && String::from_utf8_lossy(&run.stdout).contains("implicit main ok"),
+        "implicit-main run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_if_keyword_can_name_assignment_targets() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -67714,6 +67753,43 @@ fn fixed_form_if_keyword_can_name_assignment_targets() {
     assert!(
         run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
         "fixed-form IF-designator run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
+fn stop_keyword_can_name_assignment_designators() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stop_keyword_can_name_assignment_designators count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer stop ; stop = 1 ; do while (stop .eq. 0) ; end do\n  if (stop /= 1) error stop 1\n  print *, 'stop identifier ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("stop_identifier", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("STOP-identifier compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "STOP-identifier compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("STOP-identifier executable failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("stop identifier ok"),
+        "STOP-identifier run failed: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr),

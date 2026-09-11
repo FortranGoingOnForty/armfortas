@@ -150,6 +150,7 @@ impl<'a> Parser<'a> {
     ) -> Result<SpannedUnit, ParseError> {
         self.skip_newlines();
         let start = self.current_span();
+        let unit_start_pos = self.pos;
 
         // Prefixes and a single optional return-type spec may appear in
         // any order before `function` / `subroutine` / `procedure`.
@@ -280,9 +281,17 @@ impl<'a> Parser<'a> {
             "interface" | "abstract" => self.parse_interface_block(start),
             _ => {
                 if return_type.is_some() {
-                    // Had a type spec — must be a function.
+                    // A leading type spec is either a function result prefix
+                    // or the first declaration of an implicit main program.
                     if self.peek_text().eq_ignore_ascii_case("function") {
                         self.parse_function(start, prefixes, return_type)
+                    } else if !allow_module_prefix && prefixes.is_empty() {
+                        // A main-program may omit PROGRAM and begin directly
+                        // with a type declaration. Rewind the speculative
+                        // function result type so its declaration parser sees
+                        // the complete statement.
+                        self.pos = unit_start_pos;
+                        self.parse_implicit_program(start)
                     } else {
                         Err(self.error("expected 'function' after type specifier".into()))
                     }
@@ -1776,6 +1785,26 @@ mod tests {
             assert!(!body.is_empty());
         } else {
             panic!("not Program");
+        }
+    }
+
+    #[test]
+    fn implicit_main_can_begin_with_a_type_declaration() {
+        let free = parse_unit("integer :: n\nn = 1\nend\n");
+        let fixed = parse_fixed_unit("      INTEGER N\n      N = 1\n      END\n");
+
+        for unit in [free, fixed] {
+            let ProgramUnit::Program {
+                name, decls, body, ..
+            } = unit.node
+            else {
+                panic!("not an implicit main program");
+            };
+            assert!(name.is_none());
+            assert_eq!(decls.len(), 1);
+            assert!(
+                matches!(body.as_slice(), [stmt] if matches!(stmt.node, Stmt::Assignment { .. }))
+            );
         }
     }
 

@@ -113,6 +113,9 @@ impl<'a> Parser<'a> {
                     self.parse_assignment_or_call(start)
                 }
             }
+            "stop" if self.leading_designator_is_assignment() => {
+                self.parse_assignment_or_call(start)
+            }
             "stop" => {
                 self.advance();
                 self.parse_stop(start, false)
@@ -2439,6 +2442,22 @@ mod tests {
     fn stop_with_code() {
         let s = parse_one("stop 1\n");
         assert!(matches!(s.node, Stmt::Stop { code: Some(_), .. }));
+    }
+
+    #[test]
+    fn stop_keyword_can_be_an_assignment_designator() {
+        assert!(matches!(
+            parse_one("stop = 3\n").node,
+            Stmt::Assignment { .. }
+        ));
+        assert!(matches!(
+            parse_one("stop(i) = 4\n").node,
+            Stmt::Assignment { .. }
+        ));
+        assert!(matches!(
+            parse_one("stop(i)%value = 5\n").node,
+            Stmt::Assignment { .. }
+        ));
     }
 
     #[test]
