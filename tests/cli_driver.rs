@@ -67762,6 +67762,43 @@ fn fixed_form_if_keyword_can_name_assignment_targets() {
 }
 
 #[test]
+fn stop_keyword_can_name_assignment_designators() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=stop_keyword_can_name_assignment_designators count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  integer stop ; stop = 1 ; do while (stop .eq. 0) ; end do\n  if (stop /= 1) error stop 1\n  print *, 'stop identifier ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("stop_identifier", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("STOP-identifier compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "STOP-identifier compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("STOP-identifier executable failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("stop identifier ok"),
+        "STOP-identifier run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_exponent_accepts_double_precision_argument() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
