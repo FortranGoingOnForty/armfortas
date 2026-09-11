@@ -20291,6 +20291,133 @@ fn imported_type_bound_alias_preserves_absent_optional_slots() {
 }
 
 #[test]
+fn imported_type_bound_singleton_calls_validate_integer_kinds() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=imported_type_bound_singleton_calls_validate_integer_kinds count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("imported_tbp_singleton_kinds");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        r#"module singleton_tbp_m
+  use, intrinsic :: iso_fortran_env, only : int64
+  implicit none
+  type :: box_t
+    integer(int64) :: total = 0_int64
+  contains
+    procedure :: take => take_i64
+    procedure :: choose_i64
+    generic :: choose => choose_i64
+  end type
+contains
+  subroutine take_i64(self, value)
+    class(box_t), intent(inout) :: self
+    integer(int64), intent(in) :: value
+    self%total = self%total + value
+  end subroutine
+  subroutine choose_i64(self, value)
+    class(box_t), intent(inout) :: self
+    integer(int64), intent(in) :: value
+    self%total = self%total + value
+  end subroutine
+end module
+"#,
+    );
+    let provider_obj = dir.join("provider.o");
+    let provider_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("singleton type-bound provider compile failed to spawn");
+    assert!(
+        provider_compile.status.success(),
+        "singleton type-bound provider compile failed: {}",
+        String::from_utf8_lossy(&provider_compile.stderr)
+    );
+
+    for (label, method) in [("direct", "take"), ("generic", "choose")] {
+        let source = format!(
+            "program p\n  use singleton_tbp_m\n  implicit none\n  type(box_t) :: box\n  call box%{method}(1)\nend program\n"
+        );
+        let consumer = write_program_in(&dir, &format!("invalid_{label}.f90"), &source);
+        let consumer_obj = dir.join(format!("invalid_{label}.o"));
+        let compile = Command::new(compiler("armfortas"))
+            .current_dir(&dir)
+            .args([
+                "-c",
+                consumer.to_str().unwrap(),
+                "-I",
+                dir.to_str().unwrap(),
+                "-J",
+                dir.to_str().unwrap(),
+                "-o",
+                consumer_obj.to_str().unwrap(),
+            ])
+            .output()
+            .expect("invalid singleton type-bound consumer compile failed to spawn");
+        assert!(
+            !compile.status.success(),
+            "imported singleton type-bound {label} call must reject an integer kind mismatch"
+        );
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "no specific type-bound procedure of '{method}' on type 'box_t' matches the actual arguments"
+            )),
+            "missing imported singleton type-bound {label} diagnostic:\n{stderr}"
+        );
+    }
+
+    let valid = write_program_in(
+        &dir,
+        "valid.f90",
+        r#"program p
+  use singleton_tbp_m
+  use, intrinsic :: iso_fortran_env, only : int64
+  implicit none
+  type(box_t) :: box
+  call box%take(1_int64)
+  call box%choose(2_int64)
+end program
+"#,
+    );
+    let valid_obj = dir.join("valid.o");
+    let valid_compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            valid.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            valid_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("valid singleton type-bound consumer compile failed to spawn");
+    assert!(
+        valid_compile.status.success(),
+        "matching imported singleton type-bound calls must compile: {}",
+        String::from_utf8_lossy(&valid_compile.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn imported_type_bound_register_ignores_unrelated_optional_register_mask() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
