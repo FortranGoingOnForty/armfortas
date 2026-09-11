@@ -6800,7 +6800,7 @@ fn parse_formatted_integer_field(desc: &FormatDesc, field: &str) -> Option<i128>
         (false, trimmed.as_str())
     };
     let radix = match desc {
-        FormatDesc::IntegerI { .. } => 10,
+        FormatDesc::IntegerI { .. } | FormatDesc::RealG { .. } => 10,
         FormatDesc::IntegerB { .. } => 2,
         FormatDesc::IntegerO { .. } => 8,
         FormatDesc::IntegerZ { .. } => 16,
@@ -7090,7 +7090,8 @@ pub extern "C" fn afs_fmt_read_int(
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
-        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field))
+        | Ok((desc @ FormatDesc::RealG { .. }, field)) => {
             let field_text = String::from_utf8_lossy(&field);
             match parse_formatted_integer_field(&desc, &field_text)
                 .and_then(|v| i32::try_from(v).ok())
@@ -7143,7 +7144,8 @@ pub extern "C" fn afs_fmt_read_int64(
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
-        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field))
+        | Ok((desc @ FormatDesc::RealG { .. }, field)) => {
             let field_text = String::from_utf8_lossy(&field);
             match parse_formatted_integer_field(&desc, &field_text)
                 .and_then(|v| i64::try_from(v).ok())
@@ -7183,7 +7185,8 @@ pub extern "C" fn afs_fmt_read_int128(
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
-        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field))
+        | Ok((desc @ FormatDesc::RealG { .. }, field)) => {
             let field_text = String::from_utf8_lossy(&field);
             match parse_formatted_integer_field(&desc, &field_text) {
                 Some(v) => {
@@ -7315,7 +7318,8 @@ pub extern "C" fn afs_fmt_read_int_internal(
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
-        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field))
+        | Ok((desc @ FormatDesc::RealG { .. }, field)) => {
             let field_text = String::from_utf8_lossy(&field);
             match parse_formatted_integer_field(&desc, &field_text)
                 .and_then(|v| i32::try_from(v).ok())
@@ -7370,7 +7374,8 @@ pub extern "C" fn afs_fmt_read_int64_internal(
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
-        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field))
+        | Ok((desc @ FormatDesc::RealG { .. }, field)) => {
             let field_text = String::from_utf8_lossy(&field);
             match parse_formatted_integer_field(&desc, &field_text)
                 .and_then(|v| i64::try_from(v).ok())
@@ -7411,7 +7416,8 @@ pub extern "C" fn afs_fmt_read_int128_internal(
         Ok((desc @ FormatDesc::IntegerI { .. }, field))
         | Ok((desc @ FormatDesc::IntegerB { .. }, field))
         | Ok((desc @ FormatDesc::IntegerO { .. }, field))
-        | Ok((desc @ FormatDesc::IntegerZ { .. }, field)) => {
+        | Ok((desc @ FormatDesc::IntegerZ { .. }, field))
+        | Ok((desc @ FormatDesc::RealG { .. }, field)) => {
             let field_text = String::from_utf8_lossy(&field);
             match parse_formatted_integer_field(&desc, &field_text) {
                 Some(v) => {
@@ -10023,6 +10029,26 @@ mod tests {
 
         assert_eq!(iostat, 1);
         assert_eq!(value, 1234);
+    }
+
+    #[test]
+    fn dynamic_g_format_reads_integer_item_with_embedded_blanks() {
+        let input = b"10";
+        let format = "(BN,G    2.0)";
+        let mut value = -1;
+        let mut iostat = -99;
+
+        afs_fmt_read_int_internal(
+            input.as_ptr(),
+            input.len() as i64,
+            format.as_ptr(),
+            format.len() as i64,
+            0,
+            &mut value,
+            &mut iostat,
+        );
+
+        assert_eq!((value, iostat), (10, 0));
     }
 
     #[test]
