@@ -15818,9 +15818,6 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
     if candidates.is_empty() {
         return None;
     }
-    if candidates.len() == 1 {
-        return Some(candidates[0]);
-    }
 
     let actual_type_infos: Vec<Option<crate::sema::symtab::TypeInfo>> = args
         .iter()
@@ -15991,8 +15988,9 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
 /// `None` is significant when a generic has multiple candidates: it means no
 /// specific matches the actual arguments. Callers must not replace that result
 /// with `TypeLayout::bound_proc`, which would silently choose the first binding
-/// and can create an ABI-mismatched call. Direct bindings still use the
-/// singleton fast path in `resolve_bound_proc_actuals`.
+/// and can create an ABI-mismatched call. `resolve_bound_proc_actuals`
+/// validates singleton bindings as well as multi-specific generics so direct
+/// type-bound calls cannot bypass declared argument compatibility.
 pub(super) fn resolved_bound_proc_for_call<'a>(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
