@@ -21,7 +21,7 @@ use crate::ir::lower::ModuleGlobalInfo;
 use crate::sema::symtab::*;
 use crate::sema::type_layout::{TypeLayout, TypeLayoutRegistry};
 
-const AMOD_VERSION: u32 = 14;
+const AMOD_VERSION: u32 = 15;
 const AMOD_TYPE_ACCESS_VERSION: u32 = 9;
 const AMOD_FIELD_ACCESS_VERSION: u32 = 10;
 const AMOD_FINAL_ELEMENTAL_VERSION: u32 = 12;
@@ -1081,6 +1081,9 @@ fn emit_procedure(
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
     }
+    if sym.attrs.external {
+        write!(out, ", external").unwrap();
+    }
     if sym.attrs.abstract_interface {
         write!(out, ", abstract_interface").unwrap();
     }
@@ -1668,6 +1671,9 @@ pub struct AmodProc {
     pub result_array_bounds: Option<String>,
     pub pure: bool,
     pub elemental: bool,
+    /// The declaration is an explicit interface for an external procedure,
+    /// not a procedure implemented by the module that publishes this file.
+    pub external: bool,
     /// The declaration came from an ABSTRACT INTERFACE body and cannot be
     /// used as a callable designator or procedure-pointer target.
     pub abstract_interface: bool,
@@ -2452,6 +2458,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
     let attr_chunks = split_attrs_top_level(attrs_str);
     let pure = attr_chunks.iter().any(|a| a == "pure");
     let elemental = attr_chunks.iter().any(|a| a == "elemental");
+    let external = attr_chunks.iter().any(|a| a == "external");
     let abstract_interface = attr_chunks.iter().any(|a| a == "abstract_interface");
     let is_separate_module_interface = attr_chunks.iter().any(|a| a == "module_interface");
     let is_separate_module_procedure = attr_chunks.iter().any(|a| a == "module_procedure");
@@ -2540,6 +2547,7 @@ fn parse_proc(header: &str, lines: &mut std::iter::Peekable<std::str::Lines>) ->
         result_array_bounds,
         pure,
         elemental,
+        external,
         abstract_interface,
         is_separate_module_interface,
         is_separate_module_procedure,
@@ -3220,6 +3228,20 @@ fn procedure_abi_owner<'a>(iface: &'a ModuleInterface, proc: &AmodProc) -> &'a s
     }
 }
 
+fn procedure_abi_link_name(iface: &ModuleInterface, proc: &AmodProc) -> String {
+    if proc.external && !proc.is_separate_module_interface && !proc.is_separate_module_procedure {
+        return proc
+            .binding_label
+            .clone()
+            .unwrap_or_else(|| proc.name.to_ascii_lowercase());
+    }
+    format!(
+        "afs_modproc_{}_{}",
+        procedure_abi_owner(iface, proc).to_lowercase(),
+        proc.name.to_lowercase()
+    )
+}
+
 /// Extract optional-parameter masks from a loaded ModuleInterface.
 pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<bool>> {
     let mut out = HashMap::new();
@@ -3227,14 +3249,7 @@ pub fn extract_optional_params(iface: &ModuleInterface) -> HashMap<String, Vec<b
         let visible_args: Vec<&AmodArg> = proc.args.iter().filter(|a| !a.hidden).collect();
         let flags: Vec<bool> = visible_args.iter().map(|a| a.optional).collect();
         let key = proc.name.to_lowercase();
-        out.insert(
-            format!(
-                "afs_modproc_{}_{}",
-                procedure_abi_owner(iface, proc).to_lowercase(),
-                key
-            ),
-            flags.clone(),
-        );
+        out.insert(procedure_abi_link_name(iface, proc), flags.clone());
         if flags.iter().any(|flag| *flag) {
             out.insert(key, flags);
         }
@@ -3275,14 +3290,7 @@ pub fn extract_char_len_star_params(iface: &ModuleInterface) -> HashMap<String, 
         if !flags.is_empty() {
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
-            out.insert(
-                format!(
-                    "afs_modproc_{}_{}",
-                    procedure_abi_owner(iface, proc).to_lowercase(),
-                    key
-                ),
-                flags,
-            );
+            out.insert(procedure_abi_link_name(iface, proc), flags);
         }
     }
     out
@@ -3299,14 +3307,7 @@ pub fn extract_descriptor_params(iface: &ModuleInterface) -> HashMap<String, Vec
         if !flags.is_empty() {
             let key = proc.name.to_lowercase();
             out.insert(key.clone(), flags.clone());
-            out.insert(
-                format!(
-                    "afs_modproc_{}_{}",
-                    procedure_abi_owner(iface, proc).to_lowercase(),
-                    key
-                ),
-                flags,
-            );
+            out.insert(procedure_abi_link_name(iface, proc), flags);
         }
     }
     out
@@ -3535,7 +3536,7 @@ mod tests {
 
     #[test]
     fn current_default_access_header_is_required_and_preserved() {
-        let private = r#"#!amod 14
+        let private = r#"#!amod 15
 # module: private_facade
 # default-access: private
 
@@ -3553,7 +3554,7 @@ mod tests {
             ]
         );
 
-        let missing = r#"#!amod 14
+        let missing = r#"#!amod 15
 # module: missing_default_access
 
 @uses provider
@@ -3578,7 +3579,7 @@ mod tests {
 
     #[test]
     fn dotted_relational_operator_interface_loads_with_canonical_name() {
-        let text = r#"#!amod 14
+        let text = r#"#!amod 15
 # module: operators
 # default-access: public
 
@@ -4022,7 +4023,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("amod_cache_test_{}.amod", std::process::id()));
         let text = add_integrity_headers(
-            r#"#!amod 14
+            r#"#!amod 15
 # module: cache_test
 # default-access: public
 # source: cache_test.f90
@@ -4055,7 +4056,7 @@ mod tests {
             std::process::id()
         ));
         let cached_text = add_integrity_headers(
-            r#"#!amod 14
+            r#"#!amod 15
 # module: cached_parent
 # default-access: public
 # source: cached_parent.f90
@@ -4069,7 +4070,7 @@ mod tests {
         assert_eq!(cached.module_name, "cached_parent");
 
         let supplied_text = add_integrity_headers(
-            r#"#!amod 14
+            r#"#!amod 15
 # module: supplied_parent
 # default-access: private
 # ancestor-module: supplied_root
@@ -4103,7 +4104,7 @@ mod tests {
     #[test]
     fn ancestor_owned_procedure_metadata_uses_root_link_name() {
         let text = add_integrity_headers(
-            r#"#!amod 14
+            r#"#!amod 15
 # module: child
 # default-access: public
 # ancestor-module: root
@@ -4203,7 +4204,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert!(
-            err.contains("incompatible .amod version 6 (compiler requires 14)")
+            err.contains("incompatible .amod version 6 (compiler requires 15)")
                 && err.contains("rebuild the provider module"),
             "unexpected error: {err}"
         );

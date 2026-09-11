@@ -2052,6 +2052,106 @@ fn explicit_interface_names_must_not_collide_with_local_entities() {
 }
 
 #[test]
+fn external_interface_body_preserves_external_link_name_across_units() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=external_interface_body_preserves_external_link_name_across_units count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("external_interface_link_name");
+    let provider = write_program_in(
+        &dir,
+        "provider.f90",
+        "module transform_api\n  implicit none\n  interface\n    pure subroutine transform(value)\n      integer, intent(inout) :: value\n    end subroutine transform\n  end interface\nend module transform_api\n",
+    );
+    let provider_object = dir.join("provider.o");
+    let provider_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "-J",
+            dir.to_str().unwrap(),
+            provider.to_str().unwrap(),
+            "-o",
+            provider_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("external-interface provider failed to spawn");
+    assert!(
+        provider_result.status.success(),
+        "external-interface provider should compile: {}",
+        String::from_utf8_lossy(&provider_result.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("transform_api.amod"))
+        .expect("external-interface provider did not publish .amod");
+    assert!(
+        amod.contains("@subroutine transform, pure, external"),
+        "external procedure characteristics were not serialized: {amod}"
+    );
+
+    let implementation = write_program_in(
+        &dir,
+        "implementation.f90",
+        "pure subroutine transform(value)\n  implicit none\n  integer, intent(inout) :: value\n  value = value + 9\nend subroutine transform\n",
+    );
+    let implementation_object = dir.join("implementation.o");
+    let implementation_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            "-c",
+            implementation.to_str().unwrap(),
+            "-o",
+            implementation_object.to_str().unwrap(),
+        ])
+        .output()
+        .expect("external-interface implementation failed to spawn");
+    assert!(
+        implementation_result.status.success(),
+        "external implementation should compile: {}",
+        String::from_utf8_lossy(&implementation_result.stderr)
+    );
+
+    let consumer = write_program_in(
+        &dir,
+        "consumer.f90",
+        "program consume_transform\n  use transform_api, only: transform\n  implicit none\n  integer :: value\n  value = 33\n  call transform(value)\n  if (value /= 42) error stop 1\nend program consume_transform\n",
+    );
+    let executable = dir.join("consumer");
+    let consumer_result = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            consumer.to_str().unwrap(),
+            provider_object.to_str().unwrap(),
+            implementation_object.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .expect("external-interface consumer failed to spawn");
+    assert!(
+        consumer_result.status.success(),
+        "external interface should retain the external implementation link name: {}",
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+    let run = Command::new(&executable)
+        .output()
+        .expect("external-interface consumer failed to run");
+    assert!(
+        run.status.success(),
+        "external-interface consumer failed: status={:?} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn same_scope_module_interface_body_compiles_across_units() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -3864,7 +3964,7 @@ fn stale_amod_requests_provider_rebuild() {
     let amod_path = dir.join("stale_provider.amod");
     let stale = fs::read_to_string(&amod_path)
         .expect("missing provider .amod")
-        .replacen("#!amod 14\n", "#!amod 13\n", 1);
+        .replacen("#!amod 15\n", "#!amod 14\n", 1);
     fs::write(&amod_path, stale).expect("cannot make provider .amod stale");
 
     let consumer = write_program_in(
@@ -3891,7 +3991,7 @@ fn stale_amod_requests_provider_rebuild() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("incompatible .amod version 13 (compiler requires 14)")
+        stderr.contains("incompatible .amod version 14 (compiler requires 15)")
             && stderr.contains("rebuild the provider module"),
         "stale .amod diagnostic must request a clean provider rebuild: {stderr}"
     );
@@ -40646,7 +40746,7 @@ fn amod_only_edges_preserve_filtered_reexports() {
 
     let facade_amod = fs::read_to_string(dir.join("filtered_facade.amod"))
         .expect("missing filtered facade .amod");
-    assert!(facade_amod.starts_with("#!amod 14\n"), "{facade_amod}");
+    assert!(facade_amod.starts_with("#!amod 15\n"), "{facade_amod}");
     let use_records = |amod: &str| {
         amod.lines()
             .filter(|line| line.starts_with("@use"))

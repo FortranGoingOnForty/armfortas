@@ -20423,7 +20423,19 @@ pub(super) fn lowered_scope_symbol_name(
                     internal_funcs,
                 )),
                 crate::sema::symtab::ScopeKind::Module(module_name) => {
-                    Some(module_procedure_symbol_name(module_name, name))
+                    let is_external_interface = parent_scope
+                        .symbols
+                        .get(&name.to_lowercase())
+                        .is_some_and(|symbol| {
+                            symbol.attrs.external
+                                && !symbol.attrs.is_separate_module_interface
+                                && !symbol.attrs.is_separate_module_procedure
+                        });
+                    if is_external_interface {
+                        Some(name.clone())
+                    } else {
+                        Some(module_procedure_symbol_name(module_name, name))
+                    }
                 }
                 crate::sema::symtab::ScopeKind::Submodule(submod_name) => {
                     // F2018 §11.2.3: a separate-module-procedure body
@@ -20538,6 +20550,16 @@ pub(crate) fn symbol_abi_metadata_name(
     st: &SymbolTable,
     sym: &crate::sema::symtab::Symbol,
 ) -> String {
+    // An ordinary interface body inside a module describes an external
+    // procedure. Its host supplies visibility and characteristics, not linker
+    // ownership. MODULE-prefixed interfaces are the separate-module-procedure
+    // exception and keep the ancestor module's link identity.
+    if sym.attrs.external
+        && !sym.attrs.is_separate_module_interface
+        && !sym.attrs.is_separate_module_procedure
+    {
+        return sym.name.clone();
+    }
     if matches!(
         sym.kind,
         crate::sema::symtab::SymbolKind::Function | crate::sema::symtab::SymbolKind::Subroutine

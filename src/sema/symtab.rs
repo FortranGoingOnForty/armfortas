@@ -94,7 +94,14 @@ impl ScopeIndex {
             let parent = &scopes[parent_id];
             let parent_symbol = parent.symbols.get(&name_key);
             let module_owner = match &parent.kind {
-                ScopeKind::Module(module_name) => Some(module_name.as_str()),
+                ScopeKind::Module(module_name) => {
+                    let is_external_interface = parent_symbol.is_some_and(|symbol| {
+                        symbol.attrs.external
+                            && !symbol.attrs.is_separate_module_interface
+                            && !symbol.attrs.is_separate_module_procedure
+                    });
+                    (!is_external_interface).then_some(module_name.as_str())
+                }
                 ScopeKind::Submodule(submodule_name) => {
                     let is_separate = parent_symbol.is_some_and(|symbol| {
                         symbol.attrs.is_separate_module_procedure
