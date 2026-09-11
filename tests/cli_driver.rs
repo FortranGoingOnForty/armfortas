@@ -67799,6 +67799,44 @@ fn stop_keyword_can_name_assignment_designators() {
 }
 
 #[test]
+fn fixed_form_stop_codes_split_at_action_boundaries() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=fixed_form_stop_codes_split_at_action_boundaries count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "      PROGRAM FIXEDSTOP\n      INTEGER STOP1, ERRORSTOP2\n      STOP1 = 7\n      ERRORSTOP2 = 9\n      IF (STOP1 .NE. 7) STOP 1\n      IF (ERRORSTOP2 .NE. 9) ERROR STOP 2\n      PRINT *, 'fixed stop codes ok'\n      END\n",
+        "f",
+    );
+    let out = unique_path("fixed_stop_codes", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("fixed-form STOP-code compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "fixed-form STOP-code compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("fixed-form STOP-code binary failed to run");
+    assert!(
+        run.status.success()
+            && String::from_utf8_lossy(&run.stdout).contains("fixed stop codes ok"),
+        "fixed-form STOP-code run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let _ = fs::remove_file(&out);
+    let _ = fs::remove_file(&src);
+}
+
+#[test]
 fn fixed_form_exponent_accepts_double_precision_argument() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
