@@ -1543,6 +1543,21 @@ fn namelist_group_name(ctrl: &IoControl) -> Option<String> {
     from_expr(&ctrl.value)
 }
 
+fn namelist_control<'a>(controls: &'a [IoControl], ctx: &LowerCtx<'_>) -> Option<&'a IoControl> {
+    if let Some(ctrl) = io_control_by_keyword(controls, "nml") {
+        return Some(ctrl);
+    }
+
+    let ctrl = controls.iter().filter(|c| c.keyword.is_none()).nth(1)?;
+    let group_name = namelist_group_name(ctrl)?;
+    let key = group_name.to_lowercase();
+    let symbol = ctx
+        .st
+        .lookup_local_then_any(ctx.proc_scope_id, &key)
+        .or_else(|| ctx.st.find_symbol_any_scope(&key))?;
+    (symbol.kind == crate::sema::symtab::SymbolKind::Namelist).then_some(ctrl)
+}
+
 fn namelist_unit_control(controls: &[IoControl]) -> Option<&IoControl> {
     controls.iter().find(|c| {
         c.keyword
@@ -1854,7 +1869,7 @@ fn lower_namelist_read_stmt(
     iomsg_ptr: ValueId,
     iomsg_len: ValueId,
 ) -> (bool, Option<BlockId>) {
-    let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
+    let Some(nml_ctrl) = namelist_control(controls, ctx) else {
         return (false, None);
     };
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
@@ -1902,7 +1917,7 @@ fn lower_namelist_write_stmt(
     iomsg_ptr: ValueId,
     iomsg_len: ValueId,
 ) -> (bool, Option<BlockId>) {
-    let Some(nml_ctrl) = io_control_by_keyword(controls, "nml") else {
+    let Some(nml_ctrl) = namelist_control(controls, ctx) else {
         return (false, None);
     };
     let Some(group_name) = namelist_group_name(nml_ctrl) else {
