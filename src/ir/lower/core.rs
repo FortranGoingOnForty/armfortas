@@ -65456,15 +65456,16 @@ pub(super) fn lower_sequence_array_actual(
     // not equivalent: `arr(1)%mpr` in MPFUN is one 146-word component, while
     // the rank-2 dummy intentionally continues through ten adjacent SEQUENCE
     // records.  A four/146-element temporary leaves the callee walking past
-    // its allocation.  Projected, pointer, and descriptor-backed components
-    // remain on the conservative copy path below.
+    // its allocation. Allocatable components are also contiguous by contract,
+    // so their descriptor's base address can be passed directly. Projected
+    // sections and pointer components remain on the conservative copy path.
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(info) =
             type_layouts.and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
         {
             if !info.dims.is_empty()
-                && !local_uses_array_descriptor(&info)
                 && !info.is_pointer
+                && (!local_uses_array_descriptor(&info) || info.allocatable)
                 && sequence_supported_elem_ty(&info.ty)
             {
                 return Some(array_data_ptr_for_call(b, &info));
@@ -68304,6 +68305,37 @@ end subroutine
         assert!(
             !ir.contains("call @afs_allocate_like_with_elem_size("),
             "the fused RHS should not allocate array temporaries:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_whole_allocatable_component_to_explicit_shape_without_copy() {
+        let (_, ir) = lower_and_verify(
+            "\
+module m
+  implicit none
+  type :: container
+    real(8), allocatable :: values(:)
+  end type
+contains
+  subroutine pass_component(c)
+    type(container), intent(inout) :: c
+    call touch(c%values)
+  end subroutine
+  subroutine touch(values)
+    real(8), intent(inout) :: values(4)
+    values(1) = 42.0_8
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like_with_elem_size("),
+            "a whole allocatable component is contiguous and must not be copied for an explicit-shape dummy:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_copy_array_data_no_realloc("),
+            "a direct allocatable-component actual needs no copy-back temporary:\n{ir}"
         );
     }
 
