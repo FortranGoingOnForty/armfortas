@@ -65473,7 +65473,7 @@ pub(super) fn lower_sequence_array_actual(
         }
     }
 
-    if proven_contiguous_sequence_section_actual(locals, expr) {
+    if proven_contiguous_sequence_section_actual(locals, expr, st) {
         let (source_desc, elem_ty) = lower_array_expr_descriptor(
             b,
             locals,
@@ -65567,7 +65567,7 @@ pub(super) fn lower_sequence_char_array_actual(
         return None;
     }
 
-    let desc = if proven_contiguous_sequence_section_actual(locals, expr) {
+    let desc = if proven_contiguous_sequence_section_actual(locals, expr, st) {
         source_desc
     } else {
         let tmp_desc = allocate_like_array_temp_descriptor_with_elem_type(b, source_desc, &elem_ty);
@@ -65595,6 +65595,7 @@ pub(super) fn lower_sequence_char_array_actual(
 fn proven_contiguous_sequence_section_actual(
     locals: &HashMap<String, LocalInfo>,
     expr: &crate::ast::expr::SpannedExpr,
+    st: &SymbolTable,
 ) -> bool {
     let Expr::FunctionCall { callee, args } = &expr.node else {
         return false;
@@ -65610,10 +65611,14 @@ fn proven_contiguous_sequence_section_actual(
     }
     // A unit triplet describes logical positions in the source descriptor;
     // it does not prove adjacent positions are adjacent in memory. POINTER
-    // and assumed-shape/assumed-rank descriptors may carry arbitrary runtime
-    // strides, so their sections need the conservative copy path. Allocatable
-    // storage and ordinary explicit-shape locals are contiguous by contract.
-    if info.is_pointer || (info.descriptor_arg && !info.allocatable) {
+    // and ordinary assumed-shape/assumed-rank descriptors may carry arbitrary
+    // runtime strides, so their sections need the conservative copy path.
+    // CONTIGUOUS assumed-shape dummies, allocatable storage, and ordinary
+    // explicit-shape locals are contiguous by contract.
+    let declared_contiguous = current_proc_scope()
+        .and_then(|scope_id| st.lookup_in(scope_id, &name.to_lowercase()))
+        .is_some_and(|symbol| symbol.attrs.contiguous);
+    if info.is_pointer || (info.descriptor_arg && !info.allocatable && !declared_contiguous) {
         return false;
     }
     if args.len() == 1 {
@@ -68336,6 +68341,36 @@ end module
         assert!(
             !ir.contains("call @afs_copy_array_data_no_realloc("),
             "a direct allocatable-component actual needs no copy-back temporary:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_contiguous_assumed_shape_column_to_explicit_shape_without_copy() {
+        let (_, ir) = lower_and_verify(
+            "\
+module m
+  implicit none
+contains
+  subroutine outer(values)
+    integer, contiguous, intent(in) :: values(:,:)
+    call consume(4, values(:,1))
+  contains
+    subroutine consume(n, chunk)
+      integer, value :: n
+      integer, intent(in) :: chunk(4,n)
+      if (chunk(4,4) /= 44) error stop 1
+    end subroutine
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like_with_elem_size("),
+            "a CONTIGUOUS assumed-shape column keeps its sequence storage for an explicit-shape dummy:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_copy_array_data("),
+            "a CONTIGUOUS assumed-shape column must not be truncated to a rank-one copy:\n{ir}"
         );
     }
 

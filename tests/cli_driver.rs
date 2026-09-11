@@ -29591,6 +29591,97 @@ end program
 }
 
 #[test]
+fn contiguous_assumed_shape_column_keeps_sequence_storage() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=contiguous_assumed_shape_column_keeps_sequence_storage count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // A CONTIGUOUS assumed-shape dummy can safely participate in sequence
+    // association. Copying only `values(:,1)` into a rank-one temporary leaves
+    // the explicit-shape callee reading past that temporary into poisoned data.
+    let src = write_program(
+        r#"
+module m
+  implicit none
+contains
+  subroutine outer(values)
+    integer, contiguous, intent(in) :: values(:,:)
+    call consume(4, values(:,1))
+  contains
+    subroutine consume(n, chunk)
+      integer, value :: n
+      integer, intent(in) :: chunk(4,n)
+      if (chunk(1,2) /= 21) error stop 1
+      if (chunk(4,4) /= 44) error stop 2
+    end subroutine
+  end subroutine
+end module
+
+program p
+  use m
+  implicit none
+  integer :: values(4,4), i, j
+  do j = 1, 4
+    do i = 1, 4
+      values(i,j) = 10*j+i
+    end do
+  end do
+  call outer(values)
+  print *, 'ok'
+end program
+"#,
+        "f90",
+    );
+    let ir = unique_path("contiguous_assumed_shape_sequence", "ir");
+    let emit_ir = Command::new(compiler("armfortas"))
+        .args([
+            src.to_str().unwrap(),
+            "--emit-ir",
+            "-o",
+            ir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("CONTIGUOUS assumed-shape sequence emit-ir failed to spawn");
+    assert!(
+        emit_ir.status.success(),
+        "CONTIGUOUS assumed-shape sequence should emit IR: {}",
+        String::from_utf8_lossy(&emit_ir.stderr)
+    );
+    let ir_text = fs::read_to_string(&ir).expect("read CONTIGUOUS assumed-shape sequence IR");
+    assert!(
+        !ir_text.contains("call @afs_copy_array_data("),
+        "CONTIGUOUS assumed-shape section must not use a short copy temporary:\n{}",
+        ir_text
+    );
+
+    let out = unique_path("contiguous_assumed_shape_sequence", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("CONTIGUOUS assumed-shape sequence compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "CONTIGUOUS assumed-shape sequence should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out).output().expect("run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "CONTIGUOUS assumed-shape sequence failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&ir);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn assumed_size_dummy_skips_bounds_check_on_last_dim() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
