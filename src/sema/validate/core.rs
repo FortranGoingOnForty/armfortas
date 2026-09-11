@@ -10871,6 +10871,7 @@ fn intrinsic_arity(name: &str) -> Option<(usize, Option<usize>)> {
         | "erfc"
         | "fraction"
         | "exponent"
+        | "spacing"
         | "trim"
         | "adjustl"
         | "adjustr"
@@ -11327,7 +11328,7 @@ fn check_intrinsic_call_types(ctx: &mut Ctx<'_>, span: Span, name: &str, args: &
     validate_character_intrinsic_call(ctx, span, &key, args);
 
     match key.as_str() {
-        "fraction" | "exponent" => {
+        "fraction" | "exponent" | "spacing" => {
             require_intrinsic_argument_type(
                 ctx,
                 span,
@@ -11593,7 +11594,7 @@ pub fn is_intrinsic_name(name: &str) -> bool {
         "matmul" | "dot_product" | "transpose" |
         "huge" | "tiny" | "epsilon" | "precision" | "range" | "radix" |
         "maxexponent" | "minexponent" | "digits" | "bit_size" | "storage_size" |
-        "floor" | "ceiling" | "fraction" | "exponent" | "scale" |
+        "floor" | "ceiling" | "fraction" | "exponent" | "spacing" | "scale" |
         "gamma" | "log_gamma" | "erf" | "erfc" |
         "ibset" | "ibclr" | "ibits" | "btest" | "iand" | "ior" | "ieor" | "not" |
         "ishft" | "ishftc" | "shiftl" | "shiftr" | "shifta" |
@@ -13834,11 +13835,12 @@ program p
   real :: x
   x = fraction(i)
   i = exponent(i)
+  x = spacing(i)
   x = scale(x, x)
 end program
 ",
         );
-        for intrinsic in ["fraction", "exponent", "scale"] {
+        for intrinsic in ["fraction", "exponent", "spacing", "scale"] {
             assert!(
                 errs.iter()
                     .any(|err| err.contains(intrinsic) && err.contains("argument type")),
@@ -13855,9 +13857,10 @@ program p
   implicit none
   double precision :: x, y
   integer :: e
-  intrinsic fraction, exponent, scale
+  intrinsic fraction, exponent, spacing, scale
   y = fraction(x)
   e = exponent(x)
+  y = spacing(x)
   y = scale(x, e)
 end program
 ",

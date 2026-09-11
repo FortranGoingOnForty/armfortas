@@ -59284,6 +59284,135 @@ fn fraction_exponent_and_scale_lower_scalar_and_array_values() {
 }
 
 #[test]
+fn spacing_is_elemental_and_allowed_in_pure_procedures() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=spacing_is_elemental_and_allowed_in_pure_procedures count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "program p\n  implicit none\n  real(4), parameter :: constant4 = spacing(3.0_4)\n  real(8), parameter :: constant8 = spacing(3.0_8)\n  real(4) :: x4(4), s4(4), sub4\n  real(8) :: x8(4), s8(4), sub8\n  sub4 = tiny(1.0_4) * epsilon(1.0_4)\n  sub8 = tiny(1.0_8) * epsilon(1.0_8)\n  x4 = [0.0_4, sub4, 1.0_4, 3.0_4]\n  x8 = [0.0_8, sub8, 1.0_8, 3.0_8]\n  s4 = spacing(x4)\n  s8 = spacing(x8)\n  if (any(s4 /= [tiny(1.0_4), tiny(1.0_4), scale(1.0_4, -23), scale(1.0_4, -22)])) error stop 1\n  if (any(s8 /= [tiny(1.0_8), tiny(1.0_8), scale(1.0_8, -52), scale(1.0_8, -51)])) error stop 2\n  if (retreat4(3.0_4) /= 3.0_4 - 2.0_4 * scale(1.0_4, -22)) error stop 3\n  if (retreat8(3.0_8) /= 3.0_8 - 2.0_8 * scale(1.0_8, -51)) error stop 4\n  if (constant4 /= scale(1.0_4, -22)) error stop 5\n  if (constant8 /= scale(1.0_8, -51)) error stop 6\n  print *, 'ok'\ncontains\n  pure elemental real(4) function retreat4(x) result(y)\n    real(4), intent(in) :: x\n    y = x - 2.0_4 * spacing(x)\n  end function\n  pure elemental real(8) function retreat8(x) result(y)\n    real(8), intent(in) :: x\n    y = x - 2.0_8 * spacing(x)\n  end function\nend program\n",
+        "f90",
+    );
+    let out = unique_path("spacing_intrinsic", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spacing intrinsic compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "spacing intrinsic compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("spacing intrinsic run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "spacing intrinsic run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn spacing_parameter_values_round_trip_through_amod() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=spacing_parameter_values_round_trip_through_amod count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let dir = unique_dir("spacing_parameter_amod");
+    let provider = write_program_in(
+        &dir,
+        "spacing_provider.f90",
+        "module spacing_provider\n  implicit none\n  real(4), parameter :: spacing4 = spacing(3.0_4)\n  real(8), parameter :: spacing8 = spacing(3.0_8)\nend module spacing_provider\n",
+    );
+    let consumer = write_program_in(
+        &dir,
+        "spacing_consumer.f90",
+        "program p\n  use spacing_provider, only: spacing4, spacing8\n  implicit none\n  if (spacing4 /= scale(1.0_4, -22)) error stop 1\n  if (spacing8 /= scale(1.0_8, -51)) error stop 2\n  print *, 'ok'\nend program p\n",
+    );
+
+    let provider_obj = dir.join("spacing_provider.o");
+    let compile_provider = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            provider.to_str().unwrap(),
+            "-J",
+            dir.to_str().unwrap(),
+            "-o",
+            provider_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spacing parameter provider compile failed to spawn");
+    assert!(
+        compile_provider.status.success(),
+        "spacing parameter provider compile failed: {}",
+        String::from_utf8_lossy(&compile_provider.stderr)
+    );
+
+    let amod = std::fs::read_to_string(dir.join("spacing_provider.amod"))
+        .expect("missing spacing_provider.amod");
+    assert!(
+        amod.contains("@param spacing4 : real(4) =")
+            && amod.contains("@param spacing8 : real(8) ="),
+        "spacing parameter values must be concrete across translation units: {amod}"
+    );
+
+    let consumer_obj = dir.join("spacing_consumer.o");
+    let compile_consumer = Command::new(compiler("armfortas"))
+        .args([
+            "-c",
+            consumer.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            consumer_obj.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spacing parameter consumer compile failed to spawn");
+    assert!(
+        compile_consumer.status.success(),
+        "spacing parameter consumer compile failed: {}",
+        String::from_utf8_lossy(&compile_consumer.stderr)
+    );
+
+    let out = dir.join("spacing_parameter.bin");
+    let link = Command::new(compiler("armfortas"))
+        .args([
+            provider_obj.to_str().unwrap(),
+            consumer_obj.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spacing parameter link failed to spawn");
+    assert!(
+        link.status.success(),
+        "spacing parameter link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("spacing parameter run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "spacing parameter run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn user_op_dispatch_recognises_derived_type_constructor_as_scalar() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

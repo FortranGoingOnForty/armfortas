@@ -9321,6 +9321,12 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 let ty = const_expr_ir_type_from_any_scope(arg_expr, param_consts, st)?;
                 return const_inquiry_for_ir_type(&key, &ty);
             }
+            if key == "spacing" {
+                let arg_expr = const_call_arg_expr(args.first()?)?;
+                let ty = const_expr_ir_type_from_any_scope(arg_expr, param_consts, st)?;
+                let value = eval_const_scalar_with_any_scope(arg_expr, param_consts, st)?;
+                return const_spacing_for_ir_type(value, &ty);
+            }
             if matches!(key.as_str(), "real" | "dble" | "dfloat" | "float") {
                 if let Some(bits) = args.first().and_then(boz_arg_bits) {
                     // BOZ transfers the bit pattern (16.9.160).
@@ -10038,6 +10044,18 @@ fn const_inquiry_for_ir_type(key: &str, ty: &IrType) -> Option<ConstScalar> {
     }
 }
 
+fn const_spacing_for_ir_type(value: ConstScalar, ty: &IrType) -> Option<ConstScalar> {
+    match ty {
+        IrType::Float(FloatWidth::F32) => Some(ConstScalar::Float(
+            armfortas_rt::ieee::afs_spacing_r4(value.to_float() as f32) as f64,
+        )),
+        IrType::Float(FloatWidth::F64) => Some(ConstScalar::Float(
+            armfortas_rt::ieee::afs_spacing_r8(value.to_float()),
+        )),
+        _ => None,
+    }
+}
+
 fn eval_const_minmax_with_any_scope(
     key: &str,
     args: &[crate::ast::expr::Argument],
@@ -10230,6 +10248,13 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     }
                     let ty = decl_scope_const_ir_type(arg_expr, decls, param_consts, st)?;
                     const_inquiry_for_ir_type(&key, &ty)
+                }
+                "spacing" => {
+                    let arg_expr = const_call_arg_expr(args.first()?)?;
+                    let ty = decl_scope_const_ir_type(arg_expr, decls, param_consts, st)?;
+                    let value =
+                        eval_const_scalar_with_decl_scope(arg_expr, decls, param_consts, st)?;
+                    const_spacing_for_ir_type(value, &ty)
                 }
                 "real" | "dble" | "dfloat" | "float" => {
                     if let Some(bits) = args.first().and_then(boz_arg_bits) {

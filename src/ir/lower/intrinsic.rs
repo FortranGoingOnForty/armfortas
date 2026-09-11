@@ -1136,6 +1136,22 @@ pub(crate) fn lower_intrinsic(
                 ty,
             )
         }),
+        "spacing" => args.first().map(|arg| {
+            let ty = b
+                .func()
+                .value_type(*arg)
+                .unwrap_or(IrType::Float(FloatWidth::F64));
+            let suffix = if matches!(ty, IrType::Float(FloatWidth::F32)) {
+                "r4"
+            } else {
+                "r8"
+            };
+            b.call(
+                FuncRef::External(format!("afs_spacing_{suffix}")),
+                vec![*arg],
+                ty,
+            )
+        }),
         "exponent" => args.first().map(|arg| {
             let suffix = if matches!(
                 b.func().value_type(*arg),
