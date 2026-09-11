@@ -3183,7 +3183,16 @@ fn process_decls(st: &mut SymbolTable, decls: &[SpannedDecl]) -> Result<(), Sema
                         }
                     });
 
-                if sym_attrs.external {
+                // The parser represents `PROCEDURE(iface)` as TYPE(iface)
+                // plus explicit PROCEDURE and EXTERNAL markers.  A genuine
+                // `TYPE(t) :: fun` followed by `EXTERNAL :: fun` has the same
+                // type/EXTERNAL pair but names the function's derived result,
+                // not an explicit procedure interface.
+                if sym_attrs.external
+                    && attrs
+                        .iter()
+                        .any(|attr| matches!(attr, Attribute::Procedure))
+                {
                     if let TypeSpec::Type(iface_name) = type_spec {
                         sym_attrs.procedure_iface = Some(iface_name.clone());
                         if sym_attrs.pointer {
@@ -5924,6 +5933,41 @@ end program declarations
             .expect("standalone INTRINSIC symbol");
         assert_eq!(intrinsic.kind, SymbolKind::IntrinsicProc);
         assert!(intrinsic.attrs.intrinsic);
+    }
+
+    #[test]
+    fn typed_derived_external_keeps_result_type_without_procedure_interface() {
+        let st = resolve_source(
+            "\
+program typed_external
+  implicit none
+  type :: box_t
+    integer :: value
+  end type box_t
+  type(box_t) :: local, make_box
+  external :: make_box
+end program typed_external
+",
+        );
+        let program = st
+            .scopes
+            .iter()
+            .find(
+                |scope| matches!(&scope.kind, ScopeKind::Program(name) if name == "typed_external"),
+            )
+            .expect("missing program scope");
+
+        let local = program.symbols.get("local").expect("local derived object");
+        assert_eq!(local.type_info, Some(TypeInfo::Derived("box_t".into())));
+        assert!(!local.attrs.external);
+
+        let make_box = program
+            .symbols
+            .get("make_box")
+            .expect("typed external function");
+        assert_eq!(make_box.type_info, Some(TypeInfo::Derived("box_t".into())));
+        assert!(make_box.attrs.external);
+        assert_eq!(make_box.attrs.procedure_iface, None);
     }
 
     #[test]

@@ -23901,6 +23901,110 @@ fn merged_operator_keeps_private_same_named_specifics_scoped_to_owner_module() {
 }
 
 #[test]
+fn merged_defined_assignment_keeps_private_same_named_specifics_scoped_to_owner_module() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=merged_defined_assignment_keeps_private_same_named_specifics_scoped_to_owner_module count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MPFUN's facade module re-exports full- and medium-precision
+    // ASSIGNMENT(=) interfaces whose private specifics intentionally share
+    // names.  The owner scope is part of a specific's identity: retaining
+    // only the first `assign_real` makes REAL-array-element = medium_t fall
+    // through to an impossible intrinsic pointer-to-f64 store.
+    let dir = unique_dir("merged_defined_assignment_private_owner_scope");
+    let standard_src = write_program_in(
+        &dir,
+        "standard_assign.f90",
+        "module standard_assign\n  implicit none\n  private :: assign_real\n  type :: full_t\n    integer :: tag = 11\n  end type\n  interface assignment(=)\n    module procedure :: assign_real\n  end interface\ncontains\n  subroutine assign_real(lhs, rhs)\n    real(8), intent(out) :: lhs\n    type(full_t), intent(in) :: rhs\n    lhs = real(rhs%tag, 8) + 0.25_8\n  end subroutine\nend module\n",
+    );
+    let medium_src = write_program_in(
+        &dir,
+        "medium_assign.f90",
+        "module medium_assign\n  use standard_assign\n  implicit none\n  private :: assign_real\n  type :: medium_t\n    integer :: tag = 22\n  end type\n  interface assignment(=)\n    module procedure :: assign_real\n  end interface\ncontains\n  subroutine assign_real(lhs, rhs)\n    real(8), intent(out) :: lhs\n    type(medium_t), intent(in) :: rhs\n    lhs = real(rhs%tag, 8) + 0.5_8\n  end subroutine\nend module\n",
+    );
+    let facade_src = write_program_in(
+        &dir,
+        "assign_facade.f90",
+        "module assign_facade\n  use standard_assign\n  use medium_assign\n  implicit none\nend module\n",
+    );
+    let main_src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  use assign_facade\n  implicit none\n  real(8) :: values(2)\n  type(full_t) :: full\n  type(medium_t) :: medium\n  values = 0.0_8\n  values(1) = full\n  values(2) = medium\n  if (values(1) /= 11.25_8) error stop 1\n  if (values(2) /= 22.5_8) error stop 2\n  print *, 'ok'\nend program\n",
+    );
+
+    let standard_obj = dir.join("standard_assign.o");
+    let medium_obj = dir.join("medium_assign.o");
+    let facade_obj = dir.join("assign_facade.o");
+    let main_obj = dir.join("main.o");
+    let exe = dir.join("merged_defined_assignment_private_owner_scope.bin");
+
+    for (src, obj, needs_i) in [
+        (&standard_src, &standard_obj, false),
+        (&medium_src, &medium_obj, true),
+        (&facade_src, &facade_obj, true),
+        (&main_src, &main_obj, true),
+    ] {
+        let mut cmd = Command::new(compiler("armfortas"));
+        cmd.current_dir(&dir).arg("-c");
+        if needs_i {
+            cmd.args(["-I", dir.to_str().unwrap()]);
+        }
+        cmd.args([
+            "-J",
+            dir.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let compile = cmd.output().expect("compile spawn failed");
+        assert!(
+            compile.status.success(),
+            "merged defined-assignment owner-scope compile failed for {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let link = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([
+            standard_obj.to_str().unwrap(),
+            medium_obj.to_str().unwrap(),
+            facade_obj.to_str().unwrap(),
+            main_obj.to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("merged defined-assignment owner-scope link spawn failed");
+    assert!(
+        link.status.success(),
+        "merged defined-assignment owner-scope should link: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let run = Command::new(&exe).output().expect("run spawn failed");
+    assert!(
+        run.status.success(),
+        "merged defined-assignment owner-scope run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected merged defined-assignment owner-scope output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn intrinsic_len_falls_back_when_visible_generic_len_does_not_match() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
@@ -25498,6 +25602,50 @@ fn typed_header_derived_function_result_uses_hidden_result_abi() {
         stdout.contains("3.0000000E0"),
         "unexpected typed-header derived result output: {}",
         stdout
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn typed_derived_external_function_result_uses_implicit_interface_abi() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=typed_derived_external_function_result_uses_implicit_interface_abi count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module box_types\n  implicit none\n  type :: box_t\n    integer :: value\n  end type box_t\nend module box_types\n\nprogram p\n  use box_types\n  implicit none\n  type(box_t) :: got, make_box\n  external :: make_box\n  got = make_box(41)\n  if (got%value /= 42) error stop 1\n  print *, 'ok'\nend program p\n\nfunction make_box(value) result(out)\n  use box_types\n  implicit none\n  integer, intent(in) :: value\n  type(box_t) :: out\n  out%value = value + 1\nend function make_box\n",
+        "f90",
+    );
+    let out = unique_path("typed_derived_external_result", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("typed derived external result compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "typed derived external result compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("typed derived external result run failed");
+    assert!(
+        run.status.success(),
+        "typed derived external result run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected typed derived external result output: {}",
+        String::from_utf8_lossy(&run.stdout)
     );
 
     let _ = std::fs::remove_file(&out);
@@ -35230,6 +35378,51 @@ fn explicit_shape_dummy_runtime_bound_materializes_descriptor_extent() {
     assert!(
         run.status.success(),
         "explicit-shape runtime bound should pass: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("ok"), "expected ok marker, got: {}", stdout);
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn explicit_shape_dummy_runtime_lower_bound_preserves_sequence_mapping() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=explicit_shape_dummy_runtime_lower_bound_preserves_sequence_mapping count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // MPFUN's doublep kernel sequence-associates a one-based actual with an
+    // explicit-shape dummy declared `poly(-n/2:n/2)`. Both bounds depend on
+    // another dummy. The upper bound was already lowered at runtime, but the
+    // lower bound silently fell back to one, shifting writes before the actual
+    // array and leaving its latter half uninitialized.
+    let src = write_program(
+        "module m\n  implicit none\n  type :: box_t\n    integer :: value\n  end type\ncontains\n  subroutine fill(n, values)\n    integer, intent(in) :: n\n    type(box_t), intent(inout) :: values(-n/2:n/2)\n    integer :: k\n    if (lbound(values, 1) /= -n/2) error stop 1\n    if (ubound(values, 1) /= n/2) error stop 2\n    if (size(values) /= n) error stop 3\n    do k = -n/2, n/2\n      values(k)%value = 100 + k\n    end do\n  end subroutine\nend module\nprogram p\n  use m\n  implicit none\n  integer :: i\n  type(box_t) :: actual(5)\n  actual%value = -1\n  call fill(5, actual)\n  do i = 1, 5\n    if (actual(i)%value /= 97 + i) error stop 4\n  end do\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("explicit_shape_dummy_runtime_lower", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("explicit-shape runtime lower-bound compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "explicit-shape runtime lower-bound should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("explicit-shape runtime lower-bound run failed");
+    assert!(
+        run.status.success(),
+        "explicit-shape runtime lower-bound should pass: status={:?} stdout={} stderr={}",
         run.status,
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -60085,6 +60278,51 @@ fn defined_assignment_derived_dummy_lhs_loads_caller_storage_through_slot() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn intrinsic_array_element_uses_defined_assignment_for_derived_rhs() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=intrinsic_array_element_uses_defined_assignment_for_derived_rhs count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // F2018 10.2.1.4: defined assignment may have an intrinsic LHS when
+    // the RHS is derived.  The array-element path used to attempt overload
+    // resolution only for a derived LHS, so `values(2) = make_box(42)`
+    // fell through to an intrinsic REAL store and tried to coerce the
+    // derived-result pointer to f64.  MPFUN's mp_eqdr assignment exposes
+    // this shape while initializing its double-precision work arrays.
+    let src = write_program(
+        "module boxes\n  implicit none\n  type :: box_t\n    integer :: value = 0\n  end type box_t\n  interface assignment(=)\n    module procedure assign_real_from_box\n  end interface\ncontains\n  subroutine assign_real_from_box(lhs, rhs)\n    real(8), intent(out) :: lhs\n    type(box_t), intent(in) :: rhs\n    lhs = real(rhs%value, 8) + 0.5_8\n  end subroutine assign_real_from_box\n\n  function make_box(value) result(box)\n    integer, intent(in) :: value\n    type(box_t) :: box\n    box%value = value\n  end function make_box\nend module boxes\n\nprogram p\n  use boxes\n  implicit none\n  real(8) :: values(2)\n  values = 0.0_8\n  values(2) = make_box(42)\n  if (values(1) /= 0.0_8) error stop 1\n  if (values(2) /= 42.5_8) error stop 2\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("intrinsic_array_element_defined_assignment", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("intrinsic array element defined assignment compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "intrinsic array element defined assignment compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("intrinsic array element defined assignment run failed");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "intrinsic array element defined assignment run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&src);
 }

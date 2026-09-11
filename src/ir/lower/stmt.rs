@@ -3959,17 +3959,19 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                         Some(ctx.type_layouts),
                                     );
                                 } else {
-                                    if info.derived_type.is_some()
-                                        && args.iter().all(|arg| {
-                                            matches!(
-                                                arg.value,
-                                                crate::ast::expr::SectionSubscript::Element(_)
-                                            )
-                                        })
-                                        && try_defined_assignment_for_array_element(
-                                            b, ctx, &akey, &info, args, value,
+                                    // Defined assignment is not restricted to
+                                    // a derived LHS: F2018 10.2.1.4 also
+                                    // permits an intrinsic LHS when the RHS is
+                                    // derived.  MPFUN relies on this for
+                                    // REAL-array-element = mp_real-expression.
+                                    if args.iter().all(|arg| {
+                                        matches!(
+                                            arg.value,
+                                            crate::ast::expr::SectionSubscript::Element(_)
                                         )
-                                    {
+                                    }) && try_defined_assignment_for_array_element(
+                                        b, ctx, &akey, &info, args, value,
+                                    ) {
                                         return;
                                     }
                                     let arr_val = super::expr::lower_expr_ctx(b, ctx, value);
