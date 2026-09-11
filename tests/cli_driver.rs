@@ -46715,6 +46715,56 @@ fn allocatable_result_helper_assignment_uses_resolved_symbol() {
 }
 
 #[test]
+fn allocatable_array_result_generic_preserves_omitted_optional_slot() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=allocatable_array_result_generic_preserves_omitted_optional_slot count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    let src = write_program(
+        "module m\n  implicit none\n  type :: error_t\n    integer :: code = 0\n  end type\n  interface split\n    module procedure :: split_bool\n    module procedure :: split_error\n    module procedure :: split_joined_bool\n    module procedure :: split_joined_error\n  end interface\ncontains\n  function split_bool(pattern, success) result(list)\n    character(*), intent(in) :: pattern\n    logical, optional, intent(out) :: success\n    character(len=:), allocatable :: list(:)\n    allocate(character(len=len(pattern)) :: list(1))\n    list(1) = pattern\n    if (present(success)) success = .true.\n  end function\n  function split_error(pattern, error) result(list)\n    character(*), intent(in) :: pattern\n    type(error_t), intent(out) :: error\n    character(len=:), allocatable :: list(:)\n    allocate(character(len=len(pattern)) :: list(1))\n    list(1) = pattern\n    error%code = 0\n  end function\n  function split_joined_bool(pattern, join_spaced, keep_quotes, success) result(list)\n    character(*), intent(in) :: pattern\n    logical, intent(in) :: join_spaced\n    logical, optional, intent(in) :: keep_quotes\n    logical, intent(out) :: success\n    character(len=:), allocatable :: list(:)\n    allocate(character(len=len(pattern)) :: list(1))\n    list(1) = pattern\n    success = .true.\n  end function\n  function split_joined_error(pattern, join_spaced, keep_quotes, error) result(list)\n    character(*), intent(in) :: pattern\n    logical, intent(in) :: join_spaced\n    logical, optional, intent(in) :: keep_quotes\n    type(error_t), intent(out) :: error\n    character(len=:), allocatable :: list(:)\n    allocate(character(len=len(pattern)) :: list(1))\n    list(1) = pattern\n    error%code = 0\n  end function\nend module\nprogram p\n  use m, only : split\n  implicit none\n  character(len=:), allocatable :: words(:)\n  logical :: ok\n  words = split('abc')\n  if (size(words) /= 1 .or. words(1) /= 'abc') error stop 1\n  words = split('xyz', ok)\n  if (.not. ok) error stop 2\n  if (size(words) /= 1 .or. words(1) /= 'xyz') error stop 3\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+
+    for opt in ["-O0", "-O3"] {
+        let out = unique_path(
+            &format!("alloc_array_generic_optional_{}", &opt[1..]),
+            "bin",
+        );
+        let compile = Command::new(compiler("armfortas"))
+            .args([opt, src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .expect("allocatable array generic optional compile failed to spawn");
+        assert!(
+            compile.status.success(),
+            "allocatable array generic optional should compile at {opt}: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = Command::new(&out)
+            .output()
+            .expect("allocatable array generic optional run failed");
+        assert!(
+            run.status.success(),
+            "allocatable array generic optional should run at {opt}: status={:?} stdout={} stderr={}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("ok"),
+            "unexpected allocatable array generic optional output at {opt}: {}",
+            String::from_utf8_lossy(&run.stdout)
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn allocatable_derived_array_function_result_assignment_runs() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

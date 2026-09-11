@@ -22716,11 +22716,6 @@ pub(super) fn lower_alloc_return_call_into_desc(
     );
 
     let key = callee_name.to_lowercase();
-    let arg_slots = reorder_args_by_keyword_slots(args, &key, ctx.st);
-    let present_args: Vec<crate::ast::expr::Argument> =
-        arg_slots.iter().flatten().cloned().collect();
-    let args: &[crate::ast::expr::Argument] = &present_args;
-
     let intrinsic_arg_vals: Vec<ValueId> = args
         .iter()
         .map(|a| match &a.value {
@@ -22738,7 +22733,7 @@ pub(super) fn lower_alloc_return_call_into_desc(
         })
         .collect();
 
-    let (call_name, callee_key) = match resolve_generic_call_actuals(
+    let resolved_generic = resolve_generic_call_actuals(
         ctx.st,
         b,
         Some(&ctx.locals),
@@ -22746,8 +22741,9 @@ pub(super) fn lower_alloc_return_call_into_desc(
         args,
         &intrinsic_arg_vals,
         Some(ctx.type_layouts),
-    ) {
-        Some(candidate) => resolved_symbol_call_target_for_candidate(ctx.st, &candidate),
+    );
+    let (call_name, callee_key) = match resolved_generic.as_ref() {
+        Some(candidate) => resolved_symbol_call_target_for_candidate(ctx.st, candidate),
         None => {
             let resolved_name = callee_name.to_string();
             let resolved_key = resolved_name.to_lowercase();
@@ -22760,6 +22756,14 @@ pub(super) fn lower_alloc_return_call_into_desc(
         .first()
         .map(String::as_str)
         .unwrap_or(callee_key.as_str());
+    // A generic name does not have one authoritative formal list: its
+    // specifics can differ in arity and optional positions. Build ABI slots
+    // from the selected specific so omitted optionals remain explicit holes
+    // ahead of hidden character lengths.
+    let arg_slots = resolved_generic
+        .as_ref()
+        .and_then(|candidate| reorder_args_for_specific_candidate(ctx.st, candidate, args))
+        .unwrap_or_else(|| reorder_args_by_keyword_slots(args, abi_primary_key, ctx.st));
 
     let callee_value_args =
         first_procedure_lookup(&abi_lookup_keys, |k| callee_value_arg_mask(ctx.st, k));
