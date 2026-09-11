@@ -5457,7 +5457,6 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder, ctx: &mut LowerCtx, stmt: &Spanned
                                 Some(ctx.contained_host_refs),
                                 Some(ctx.descriptor_params),
                             )
-                            .or_else(|| layout.bound_proc(component))
                             .unwrap_or_else(|| {
                                 fail_unmatched_bound_proc_resolution(callee.span, layout, component)
                             });

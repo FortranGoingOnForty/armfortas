@@ -15986,6 +15986,13 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
     Some(matched[0])
 }
 
+/// Resolve one concrete binding for this call.
+///
+/// `None` is significant when a generic has multiple candidates: it means no
+/// specific matches the actual arguments. Callers must not replace that result
+/// with `TypeLayout::bound_proc`, which would silently choose the first binding
+/// and can create an ABI-mismatched call. Direct bindings still use the
+/// singleton fast path in `resolve_bound_proc_actuals`.
 pub(super) fn resolved_bound_proc_for_call<'a>(
     b: &mut FuncBuilder,
     locals: &HashMap<String, LocalInfo>,
@@ -21740,7 +21747,6 @@ pub(super) fn emit_bound_function_call(
         contained_host_refs,
         descriptor_params,
     )
-    .or_else(|| layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, layout, component));
     let returns_owned_character_temp = bound_proc_returns_owned_character_temp(st, layout, bp);
     if let Some(desc) = hidden_result.filter(|_| returns_owned_character_temp) {
@@ -22275,7 +22281,6 @@ pub(super) fn emit_dynamic_bound_proc_lookup_dispatch(
         contained_host_refs,
         descriptor_params,
     )
-    .or_else(|| base_layout.bound_proc(component))
     .unwrap_or_else(|| fail_unmatched_bound_proc_resolution(call_span, base_layout, component));
     let slot_index = base_layout.bound_procs.iter().position(|bp| {
         bp.method_name.eq_ignore_ascii_case(component)
@@ -27895,8 +27900,7 @@ pub(super) fn lower_string_expr_full(
                                     internal_funcs,
                                     contained_host_refs,
                                     descriptor_params,
-                                )
-                                .or_else(|| layout.bound_proc(component));
+                                );
                                 if let Some(bp) = bp {
                                     let target_key = abi_key_for_link_name(st, &bp.target_name)
                                         .unwrap_or_else(|| bp.abi_name.clone());
@@ -47705,8 +47709,7 @@ pub(super) fn array_function_result_elem_type(
                 None,
                 None,
                 None,
-            )
-            .or_else(|| layout.bound_proc(component))?;
+            )?;
             let target_key =
                 abi_key_for_link_name(st, &bp.target_name).unwrap_or_else(|| bp.abi_name.clone());
             let abi_lookup_keys =
@@ -48986,8 +48989,7 @@ pub(super) fn lower_rank1_elemental_call_descriptor(
                 internal_funcs,
                 contained_host_refs,
                 descriptor_params,
-            )
-            .or_else(|| layout.bound_proc(component))?;
+            )?;
             if !bound_proc_target_is_elemental(st, layout, bp) {
                 return None;
             }
