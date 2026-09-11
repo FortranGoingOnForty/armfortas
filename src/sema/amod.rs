@@ -1081,7 +1081,10 @@ fn emit_procedure(
     if sym.attrs.elemental {
         write!(out, ", elemental").unwrap();
     }
-    if sym.attrs.external {
+    if sym.attrs.external
+        && !sym.attrs.is_separate_module_interface
+        && !sym.attrs.is_separate_module_procedure
+    {
         write!(out, ", external").unwrap();
     }
     if sym.attrs.abstract_interface {
