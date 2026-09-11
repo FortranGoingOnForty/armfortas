@@ -45068,6 +45068,46 @@ fn contained_parameter_array_initializes_from_host_parameter() {
 }
 
 #[test]
+fn elemental_intrinsic_parameter_array_initializer_is_folded() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=elemental_intrinsic_parameter_array_initializer_is_folded count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // FFTPACK declares a real parameter array with an implied-do initializer,
+    // then initializes real and complex parameter arrays with 3 + COS(array).
+    // Dropping the elemental initialization leaves stack garbage for both.
+    let src = write_program(
+        "program p\n  implicit none\n  integer :: j\n  integer, parameter :: n = 4\n  real(8), parameter :: pi = acos(-1.0d0)\n  real(8), parameter :: x(0:n-1) = [(pi*dble(j)/dble(n-1), j=0,n-1)]\n  real(8), parameter :: real_values(0:n-1) = 3.0d0 + cos(x)\n  complex(8), parameter :: complex_values(0:n-1) = 3.0d0 + cos(x)\n  if (abs(real_values(0) - 4.0d0) > 1.0d-12) error stop 1\n  if (abs(real_values(3) - 2.0d0) > 1.0d-12) error stop 2\n  if (abs(real(complex_values(0)) - 4.0d0) > 1.0d-12) error stop 3\n  if (abs(aimag(complex_values(3))) > 1.0d-12) error stop 4\n  print *, 'ok'\nend program p\n",
+        "f90",
+    );
+    let out = unique_path("elemental_intrinsic_parameter_array_init", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-O0", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("elemental parameter array compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "elemental parameter array should compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = Command::new(&out)
+        .output()
+        .expect("elemental parameter array failed to run");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "elemental parameter array failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn contained_subroutine_materializes_host_character_parameter() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
