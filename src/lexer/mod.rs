@@ -511,7 +511,7 @@ fn display_source_view_error(src: &str, mut error: LexError) -> LexError {
 
 /// Fortran free-form lexer.
 pub struct Lexer<'a> {
-    src: &'a [u8],
+    src: &'a str,
     pos: usize,
     line: u32,
     col: u32,
@@ -521,7 +521,7 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str, file_id: u32) -> Self {
         Self {
-            src: src.as_bytes(),
+            src,
             pos: 0,
             line: 1,
             col: 1,
@@ -568,7 +568,7 @@ impl<'a> Lexer<'a> {
 
     fn peek(&self) -> u8 {
         if self.pos < self.src.len() {
-            self.src[self.pos]
+            self.src.as_bytes()[self.pos]
         } else {
             0
         }
@@ -576,16 +576,14 @@ impl<'a> Lexer<'a> {
 
     fn peek2(&self) -> u8 {
         if self.pos + 1 < self.src.len() {
-            self.src[self.pos + 1]
+            self.src.as_bytes()[self.pos + 1]
         } else {
             0
         }
     }
 
     fn char_at(&self, pos: usize) -> Option<char> {
-        std::str::from_utf8(&self.src[pos..])
-            .ok()
-            .and_then(|rest| rest.chars().next())
+        self.src.get(pos..).and_then(|rest| rest.chars().next())
     }
 
     fn advance(&mut self) -> u8 {
@@ -809,7 +807,7 @@ impl<'a> Lexer<'a> {
                                 // is_cont true.
                 let mut is_cont = false;
                 let mut scan = self.pos;
-                let src_bytes = self.src;
+                let src_bytes = self.src.as_bytes();
                 while scan < src_bytes.len() {
                     let c = src_bytes[scan];
                     if c == b' ' || c == b'\t' || c == b'\r' {
@@ -932,7 +930,7 @@ impl<'a> Lexer<'a> {
                 // Lookahead past the e/d: if next is digit or +/-, it's an exponent.
                 // If it's another letter (like 'q' in 'eq'), it's a dot-operator.
                 let after_ed = if self.pos + 2 < self.src.len() {
-                    self.src[self.pos + 2]
+                    self.src.as_bytes()[self.pos + 2]
                 } else {
                     0
                 };
@@ -1540,6 +1538,13 @@ mod tests {
         let toks = kinds("x ! this is a comment\n");
         assert_eq!(toks.len(), 3); // identifier, comment, newline
         assert!(toks[1] == TokenKind::Comment);
+    }
+
+    #[test]
+    fn comment_utf8_preserves_multibyte_codepoints() {
+        let toks = toks("! café λ\n");
+        assert_eq!(toks[0].kind, TokenKind::Comment);
+        assert_eq!(toks[0].text, "! café λ");
     }
 
     // ---- Newlines ----
