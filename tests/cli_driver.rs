@@ -49951,6 +49951,55 @@ fn any_reduction_accepts_allocatable_component_array_projection() {
 }
 
 #[test]
+fn rank2_strided_allocatable_component_comparison_uses_section_rank() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=rank2_strided_allocatable_component_comparison_uses_section_rank count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    // The stdlib SELL-C constructor checks rank-2 allocatable components
+    // through sections such as `matrix%col(2:4,:)`. The parser represents
+    // that section as a FunctionCall whose callee is a ComponentAccess.
+    // Losing the section's rank made array comparison lowering apply only
+    // the first descriptor stride and read modified elements from row one.
+    let src = write_program(
+        "program p\n  implicit none\n  type :: matrix_t\n    integer, allocatable :: col(:,:)\n    real, allocatable :: data(:,:)\n  end type\n  type(matrix_t) :: matrix\n  allocate(matrix%col(4,4), source=1)\n  allocate(matrix%data(4,4), source=0.0)\n  matrix%col(1,1:3) = [2, 3, 4]\n  matrix%data(1,1:3) = [2.0, 3.0, 4.0]\n  if (any(matrix%col(2:4,:) /= 1)) error stop 1\n  if (.not. all(matrix%col(2:4,:) == 1)) error stop 2\n  if (count(matrix%col(2:4,:) == 1) /= 12) error stop 3\n  if (any(matrix%data(2:4,:) /= 0.0)) error stop 4\n  if (.not. all(matrix%data(2:4,:) == 0.0)) error stop 5\n  if (count(matrix%data(2:4,:) == 0.0) /= 12) error stop 6\n  print *, 'ok'\nend program\n",
+        "f90",
+    );
+    let out = unique_path("rank2_strided_component_compare", "bin");
+    let compile = Command::new(compiler("armfortas"))
+        .args([src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .expect("rank-2 strided component comparison compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "rank-2 strided component comparison compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&out)
+        .output()
+        .expect("rank-2 strided component comparison run failed");
+    assert!(
+        run.status.success(),
+        "rank-2 strided component comparison run failed: status={:?} stdout={} stderr={}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "unexpected rank-2 strided component comparison output: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn any_reduction_accepts_elemental_type_bound_array_receiver() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

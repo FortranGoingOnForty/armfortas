@@ -14916,6 +14916,22 @@ fn component_access_declared_rank(
         .or(Some(0))
 }
 
+fn array_section_result_rank(
+    args: &[crate::ast::expr::Argument],
+    locals: &HashMap<String, LocalInfo>,
+    st: &SymbolTable,
+    type_layouts: Option<&crate::sema::type_layout::TypeLayoutRegistry>,
+) -> usize {
+    args.iter()
+        .filter(|arg| match &arg.value {
+            crate::ast::expr::SectionSubscript::Range { .. } => true,
+            crate::ast::expr::SectionSubscript::Element(expr) => {
+                actual_expr_rank(expr, locals, st, type_layouts).is_some_and(|rank| rank > 0)
+            }
+        })
+        .count()
+}
+
 fn has_reduction_dim_arg(
     args: &[crate::ast::expr::Argument],
     locals: &HashMap<String, LocalInfo>,
@@ -15053,18 +15069,8 @@ pub(super) fn actual_expr_rank(
                 let key = name.to_lowercase();
                 if let Some(info) = locals.get(&key) {
                     if local_is_array_like(info) {
-                        let section_rank = args
-                            .iter()
-                            .filter(|a| match &a.value {
-                                crate::ast::expr::SectionSubscript::Range { .. } => true,
-                                crate::ast::expr::SectionSubscript::Element(e) => {
-                                    actual_expr_rank(e, locals, st, type_layouts)
-                                        .is_some_and(|rank| rank > 0)
-                                }
-                            })
-                            .count();
                         if !args.is_empty() {
-                            return Some(section_rank);
+                            return Some(array_section_result_rank(args, locals, st, type_layouts));
                         }
                         return Some(local_declared_rank(info));
                     }
@@ -15278,6 +15284,18 @@ pub(super) fn actual_expr_rank(
                     function_call_declared_result_rank(st, locals, name, args, type_layouts)
                 {
                     return Some(rank);
+                }
+            }
+            // An array component section is represented by the same
+            // call-shaped AST as a name-based section, but its callee is a
+            // ComponentAccess (`matrix%col(2:4,:)`). Distinguish it from a
+            // type-bound procedure call by requiring a declared array field.
+            if let Expr::ComponentAccess { .. } = &callee.node {
+                if type_layouts.is_some_and(|tl| {
+                    component_access_declared_rank(locals, callee, st, tl)
+                        .is_some_and(|rank| rank > 0)
+                }) {
+                    return Some(array_section_result_rank(args, locals, st, type_layouts));
                 }
             }
             None
