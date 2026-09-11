@@ -1309,6 +1309,7 @@ pub(crate) fn is_elemental_intrinsic(name: &str) -> bool {
             | "log_gamma"
             | "fraction"
             | "exponent"
+            | "spacing"
             | "scale"
             | "erf"
             | "erfc"
@@ -1438,7 +1439,7 @@ pub fn intrinsic_result_type(name: &str, args: &[FortranType]) -> Option<Fortran
         }
         "max" | "min" => args.first().cloned(),
         "sign" | "mod" | "modulo" => args.first().cloned(),
-        "fraction" => match args.first()? {
+        "fraction" | "spacing" => match args.first()? {
             FortranType::Real { kind } => Some(FortranType::Real { kind: *kind }),
             _ => None,
         },

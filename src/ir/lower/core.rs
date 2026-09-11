@@ -9307,6 +9307,7 @@ pub(super) fn eval_const_scalar_with_any_scope(
                     | "range"
                     | "digits"
                     | "bit_size"
+                    | "storage_size"
                     | "radix"
                     | "maxexponent"
                     | "minexponent"
@@ -9320,6 +9321,12 @@ pub(super) fn eval_const_scalar_with_any_scope(
                 }
                 let ty = const_expr_ir_type_from_any_scope(arg_expr, param_consts, st)?;
                 return const_inquiry_for_ir_type(&key, &ty);
+            }
+            if key == "spacing" {
+                let arg_expr = const_call_arg_expr(args.first()?)?;
+                let ty = const_expr_ir_type_from_any_scope(arg_expr, param_consts, st)?;
+                let value = eval_const_scalar_with_any_scope(arg_expr, param_consts, st)?;
+                return const_spacing_for_ir_type(value, &ty);
             }
             if matches!(key.as_str(), "real" | "dble" | "dfloat" | "float") {
                 if let Some(bits) = args.first().and_then(boz_arg_bits) {
@@ -10023,6 +10030,9 @@ fn const_inquiry_for_ir_type(key: &str, ty: &IrType) -> Option<ConstScalar> {
             };
             Some(ConstScalar::Int(bits))
         }
+        "storage_size" => Some(ConstScalar::Int(
+            super::helpers::storage_size_bits_for_ir_type(ty) as i128,
+        )),
         "radix" => Some(ConstScalar::Int(2)),
         "maxexponent" => match ty {
             IrType::Float(FloatWidth::F64) => Some(ConstScalar::Int(1024)),
@@ -10034,6 +10044,18 @@ fn const_inquiry_for_ir_type(key: &str, ty: &IrType) -> Option<ConstScalar> {
             IrType::Float(FloatWidth::F32) => Some(ConstScalar::Int(-125)),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn const_spacing_for_ir_type(value: ConstScalar, ty: &IrType) -> Option<ConstScalar> {
+    match ty {
+        IrType::Float(FloatWidth::F32) => Some(ConstScalar::Float(
+            armfortas_rt::ieee::afs_spacing_r4(value.to_float() as f32) as f64,
+        )),
+        IrType::Float(FloatWidth::F64) => Some(ConstScalar::Float(
+            armfortas_rt::ieee::afs_spacing_r8(value.to_float()),
+        )),
         _ => None,
     }
 }
@@ -10222,7 +10244,7 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     eval_selected_char_kind_with_decl_scope(args, decls, param_consts)
                 }
                 "huge" | "tiny" | "epsilon" | "precision" | "range" | "digits" | "radix"
-                | "bit_size" | "maxexponent" | "minexponent" => {
+                | "bit_size" | "storage_size" | "maxexponent" | "minexponent" => {
                     let arg = args.first()?;
                     let arg_expr = const_call_arg_expr(arg)?;
                     if let Some(fold) = enum_const_inquiry(&key, arg_expr, decls, st) {
@@ -10230,6 +10252,13 @@ pub(super) fn eval_const_scalar_with_decl_scope(
                     }
                     let ty = decl_scope_const_ir_type(arg_expr, decls, param_consts, st)?;
                     const_inquiry_for_ir_type(&key, &ty)
+                }
+                "spacing" => {
+                    let arg_expr = const_call_arg_expr(args.first()?)?;
+                    let ty = decl_scope_const_ir_type(arg_expr, decls, param_consts, st)?;
+                    let value =
+                        eval_const_scalar_with_decl_scope(arg_expr, decls, param_consts, st)?;
+                    const_spacing_for_ir_type(value, &ty)
                 }
                 "real" | "dble" | "dfloat" | "float" => {
                     if let Some(bits) = args.first().and_then(boz_arg_bits) {
@@ -65427,15 +65456,16 @@ pub(super) fn lower_sequence_array_actual(
     // not equivalent: `arr(1)%mpr` in MPFUN is one 146-word component, while
     // the rank-2 dummy intentionally continues through ten adjacent SEQUENCE
     // records.  A four/146-element temporary leaves the callee walking past
-    // its allocation.  Projected, pointer, and descriptor-backed components
-    // remain on the conservative copy path below.
+    // its allocation. Allocatable components are also contiguous by contract,
+    // so their descriptor's base address can be passed directly. Projected
+    // sections and pointer components remain on the conservative copy path.
     if matches!(expr.node, Expr::ComponentAccess { .. }) {
         if let Some(info) =
             type_layouts.and_then(|tl| component_intrinsic_local_info(b, locals, expr, st, tl))
         {
             if !info.dims.is_empty()
-                && !local_uses_array_descriptor(&info)
                 && !info.is_pointer
+                && (!local_uses_array_descriptor(&info) || info.allocatable)
                 && sequence_supported_elem_ty(&info.ty)
             {
                 return Some(array_data_ptr_for_call(b, &info));
@@ -68275,6 +68305,37 @@ end subroutine
         assert!(
             !ir.contains("call @afs_allocate_like_with_elem_size("),
             "the fused RHS should not allocate array temporaries:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn lower_whole_allocatable_component_to_explicit_shape_without_copy() {
+        let (_, ir) = lower_and_verify(
+            "\
+module m
+  implicit none
+  type :: container
+    real(8), allocatable :: values(:)
+  end type
+contains
+  subroutine pass_component(c)
+    type(container), intent(inout) :: c
+    call touch(c%values)
+  end subroutine
+  subroutine touch(values)
+    real(8), intent(inout) :: values(4)
+    values(1) = 42.0_8
+  end subroutine
+end module
+",
+        );
+        assert!(
+            !ir.contains("call @afs_allocate_like_with_elem_size("),
+            "a whole allocatable component is contiguous and must not be copied for an explicit-shape dummy:\n{ir}"
+        );
+        assert!(
+            !ir.contains("call @afs_copy_array_data_no_realloc("),
+            "a direct allocatable-component actual needs no copy-back temporary:\n{ir}"
         );
     }
 

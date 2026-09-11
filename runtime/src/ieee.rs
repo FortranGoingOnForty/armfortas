@@ -311,6 +311,37 @@ pub extern "C" fn afs_fraction_r4(x: f32) -> f32 {
 }
 
 #[no_mangle]
+pub extern "C" fn afs_spacing_r8(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    let significand = bits & 0x000f_ffff_ffff_ffff;
+    if exponent == 0x7ff {
+        return if significand == 0 { f64::NAN } else { x };
+    }
+
+    // For binary64, SPACING(X) is 2**(e - p), where e is the model
+    // exponent and p=53.  In biased IEEE exponent form that is E-52.
+    // Values below the normal model range clamp to TINY(X), as required
+    // by F2018 16.9.180.
+    let result_exponent = exponent.saturating_sub(52).max(1);
+    f64::from_bits(result_exponent << 52)
+}
+
+#[no_mangle]
+pub extern "C" fn afs_spacing_r4(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exponent = (bits >> 23) & 0xff;
+    let significand = bits & 0x007f_ffff;
+    if exponent == 0xff {
+        return if significand == 0 { f32::NAN } else { x };
+    }
+
+    // binary32 has p=24, so the result's biased exponent is E-23.
+    let result_exponent = exponent.saturating_sub(23).max(1);
+    f32::from_bits(result_exponent << 23)
+}
+
+#[no_mangle]
 pub extern "C" fn afs_exponent_r8(x: f64) -> i32 {
     let bits = x.to_bits();
     let exponent = ((bits >> 52) & 0x7ff) as i32;
@@ -1411,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn fraction_and_exponent_cover_model_edges() {
+    fn fraction_exponent_and_spacing_cover_model_edges() {
         assert_eq!(afs_fraction_r8(3.0), 0.75);
         assert_eq!(afs_fraction_r8(-6.5), -0.8125);
         assert_eq!(afs_exponent_r8(3.0), 2);
@@ -1430,5 +1461,27 @@ mod tests {
         assert!(afs_fraction_r8(f64::NAN).is_nan());
         assert_eq!(afs_exponent_r8(f64::INFINITY), i32::MAX);
         assert_eq!(afs_exponent_r8(f64::NAN), i32::MAX);
+
+        assert_eq!(afs_spacing_r4(0.0).to_bits(), f32::MIN_POSITIVE.to_bits());
+        assert_eq!(
+            afs_spacing_r4(subnormal_r4).to_bits(),
+            f32::MIN_POSITIVE.to_bits()
+        );
+        assert_eq!(afs_spacing_r4(1.0).to_bits(), 0x3400_0000);
+        assert_eq!(afs_spacing_r4(3.0).to_bits(), 0x3480_0000);
+        assert_eq!(afs_spacing_r4(f32::MAX).to_bits(), 0x7380_0000);
+        assert!(afs_spacing_r4(f32::INFINITY).is_nan());
+        assert!(afs_spacing_r4(f32::NAN).is_nan());
+
+        assert_eq!(afs_spacing_r8(0.0).to_bits(), f64::MIN_POSITIVE.to_bits());
+        assert_eq!(
+            afs_spacing_r8(subnormal_r8).to_bits(),
+            f64::MIN_POSITIVE.to_bits()
+        );
+        assert_eq!(afs_spacing_r8(1.0).to_bits(), 0x3cb0_0000_0000_0000);
+        assert_eq!(afs_spacing_r8(3.0).to_bits(), 0x3cc0_0000_0000_0000);
+        assert_eq!(afs_spacing_r8(f64::MAX).to_bits(), 0x7ca0_0000_0000_0000);
+        assert!(afs_spacing_r8(f64::INFINITY).is_nan());
+        assert!(afs_spacing_r8(f64::NAN).is_nan());
     }
 }
