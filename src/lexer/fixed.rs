@@ -909,14 +909,20 @@ fn split_fixed_keyword_prefix(
         let suffix = &run[prefix_len..];
         let suffix_first = suffix.as_bytes()[0];
 
-        let is_fixed_keyword = prefix_lower == "endtype" || is_keyword(prefix).is_some();
+        let is_contextual_error_stop = prefix_lower == "error"
+            && at_action_start
+            && suffix
+                .get(..4)
+                .is_some_and(|head| head.eq_ignore_ascii_case("stop"));
+        let is_fixed_keyword =
+            prefix_lower == "endtype" || is_keyword(prefix).is_some() || is_contextual_error_stop;
         if !is_fixed_keyword {
             continue;
         }
 
         if suffix_first.is_ascii_digit() {
             let permits_numeric_suffix = matches!(prefix_lower.as_str(), "goto" | "call")
-                || (prefix_lower == "print" && at_action_start);
+                || (matches!(prefix_lower.as_str(), "print" | "stop") && at_action_start);
             if !permits_numeric_suffix {
                 continue;
             }
@@ -1015,6 +1021,11 @@ fn identifier_precedes_assignment(text: &str, run_end: usize) -> bool {
 fn at_fixed_action_statement_start(prior_tokens: &[Token]) -> bool {
     if prior_tokens.is_empty() {
         return true;
+    }
+    if prior_tokens.last().is_some_and(|token| {
+        token.kind == TokenKind::Identifier && token.text.eq_ignore_ascii_case("error")
+    }) {
+        return at_fixed_action_statement_start(&prior_tokens[..prior_tokens.len() - 1]);
     }
     if prior_tokens.len() == 2
         && prior_tokens[0].kind == TokenKind::Identifier
@@ -2172,6 +2183,40 @@ C     Hello World
             texts,
             vec!["IF", "(", "I", ".GT.", "0", ")", "PRINT", "100", ",", "I"],
             "got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn stop_codes_split_at_fixed_action_boundaries() {
+        assert_eq!(fixed_texts("      STOP 12\n"), ["STOP", "12"]);
+        assert_eq!(
+            fixed_texts("      IF (I.GT.0) STOP 13\n"),
+            ["IF", "(", "I", ".GT.", "0", ")", "STOP", "13"]
+        );
+        assert_eq!(
+            fixed_texts("      ERROR STOP 14\n"),
+            ["ERROR", "STOP", "14"]
+        );
+        assert_eq!(
+            fixed_texts("      IF (I.GT.0) ERROR STOP 15\n"),
+            ["IF", "(", "I", ".GT.", "0", ")", "ERROR", "STOP", "15"]
+        );
+    }
+
+    #[test]
+    fn stop_code_spellings_stay_names_outside_action_boundaries() {
+        assert_eq!(
+            fixed_texts("      INTEGER STOP1, ERRORSTOP2\n"),
+            ["INTEGER", "STOP1", ",", "ERRORSTOP2"]
+        );
+        assert_eq!(fixed_texts("      STOP1 = 7\n"), ["STOP1", "=", "7"]);
+        assert_eq!(
+            fixed_texts("      ERRORSTOP2(I) = 9\n"),
+            ["ERRORSTOP2", "(", "I", ")", "=", "9"]
+        );
+        assert_eq!(
+            fixed_texts("      CALL STOP1(ERRORSTOP2)\n"),
+            ["CALL", "STOP1", "(", "ERRORSTOP2", ")"]
         );
     }
 
