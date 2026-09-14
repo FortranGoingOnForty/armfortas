@@ -341,10 +341,10 @@ fn gnu_depfile_flags_write_make_dependency_file() {
 }
 
 #[test]
-fn required_frame_pointer_flag_preserves_arm64_frames() {
+fn required_frame_pointer_flag_preserves_backend_frames() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
-            "\nHARNESS_SKIP suite=driver_link_compat test=required_frame_pointer_flag_preserves_arm64_frames count=1 reason=\"{}\"",
+            "\nHARNESS_SKIP suite=driver_link_compat test=required_frame_pointer_flag_preserves_backend_frames count=1 reason=\"{}\"",
             reason
         );
         return;
@@ -373,8 +373,15 @@ fn required_frame_pointer_flag_preserves_arm64_frames() {
         String::from_utf8_lossy(&result.stderr)
     );
     let assembly = std::fs::read_to_string(&asm).expect("missing assembly output");
+    let preserves_required_frame = if cfg!(target_arch = "aarch64") {
+        assembly.contains("stp x29, x30") && assembly.contains("ldp x29, x30")
+    } else if cfg!(target_arch = "x86_64") {
+        assembly.contains("pushq %rbp") && assembly.contains("popq %rbp")
+    } else {
+        false
+    };
     assert!(
-        assembly.contains("stp x29, x30") && assembly.contains("ldp x29, x30"),
+        preserves_required_frame,
         "the backend must preserve its required frame: {assembly}"
     );
     let _ = std::fs::remove_dir_all(&dir);
