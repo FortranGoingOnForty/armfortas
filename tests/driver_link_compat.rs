@@ -1154,8 +1154,9 @@ fn verbose_link_only_darwin_line_exposes_runtime_for_cmake() {
         stderr
             .lines()
             .any(|line| line.trim_start().starts_with("ld ")
-                && line.contains("libarmfortas_rt.dylib")),
-        "verbose link output should expose an ld command line with the runtime dylib for CMake implicit-link parsing:\n{}",
+                && line.contains("-L")
+                && line.contains("-larmfortas_rt")),
+        "verbose link output should expose searchable runtime arguments for CMake implicit-link parsing:\n{}",
         stderr
     );
     let _ = std::fs::remove_dir_all(&dir);
