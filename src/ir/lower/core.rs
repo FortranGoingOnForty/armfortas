@@ -18044,6 +18044,14 @@ pub(super) fn array_expr_elem_type_only(
                     "shape" => {
                         return Some(IrType::Int(IntWidth::I32));
                     }
+                    "lbound" | "ubound" if bounds_intrinsic_dim_expr(args).is_none() => {
+                        return Some(size_or_bounds_intrinsic_result_type(
+                            args,
+                            locals,
+                            st,
+                            type_layouts,
+                        ));
+                    }
                     "conjg" | "dconjg" => {
                         if let Some(arg) = args.first() {
                             if let crate::ast::expr::SectionSubscript::Element(e) = &arg.value {
@@ -51394,71 +51402,47 @@ pub(super) fn lower_array_expr_descriptor(
                         return Some(result);
                     }
                 }
-                // F2018 §16.9.207: SHAPE returns a fresh rank-1 integer
-                // array of the input's extents. Routes through
-                // lower_array_intrinsic which allocates and fills it,
-                // so callers like `minval(shape(A))` get a descriptor
-                // instead of an unresolved external `_shape` call.
-                if name.eq_ignore_ascii_case("shape") {
-                    if let Some(first_arg) = args.first() {
-                        if let crate::ast::expr::SectionSubscript::Element(first_expr) =
-                            &first_arg.value
-                        {
-                            if lower_array_expr_descriptor(
-                                b,
-                                locals,
-                                first_expr,
-                                st,
-                                type_layouts,
-                                internal_funcs,
-                                contained_host_refs,
-                                descriptor_params,
-                            )
-                            .is_some()
-                                || locals
-                                    .get(&if let Expr::Name { name } = &first_expr.node {
-                                        name.to_lowercase()
+                // SHAPE(array), LBOUND(array), and UBOUND(array) return
+                // fresh rank-1 integer arrays. Route them through the array
+                // intrinsic dispatcher so value-context lowering does not
+                // fall through to unresolved external procedure symbols.
+                let inquiry_name = name.to_ascii_lowercase();
+                let inquiry_returns_array = inquiry_name == "shape"
+                    || (matches!(inquiry_name.as_str(), "lbound" | "ubound")
+                        && bounds_intrinsic_dim_expr(args).is_none());
+                if inquiry_returns_array {
+                    if let Some(desc) = lower_array_intrinsic(
+                        b,
+                        locals,
+                        &inquiry_name,
+                        args,
+                        st,
+                        type_layouts,
+                        internal_funcs,
+                        contained_host_refs,
+                        descriptor_params,
+                    ) {
+                        let elem_ty = if inquiry_name == "shape" {
+                            let kind_is_i64 = args.get(1).and_then(|a| {
+                                if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
+                                    if let Expr::IntegerLiteral { text, .. } = &e.node {
+                                        text.split('_').next().and_then(|s| s.parse::<i64>().ok())
                                     } else {
-                                        String::new()
-                                    })
-                                    .map(local_is_array_like)
-                                    .unwrap_or(false)
-                            {
-                                if let Some(desc) = lower_array_intrinsic(
-                                    b,
-                                    locals,
-                                    "shape",
-                                    args,
-                                    st,
-                                    type_layouts,
-                                    internal_funcs,
-                                    contained_host_refs,
-                                    descriptor_params,
-                                ) {
-                                    let kind_is_i64 = args.get(1).and_then(|a| {
-                                        if let crate::ast::expr::SectionSubscript::Element(e) =
-                                            &a.value
-                                        {
-                                            if let Expr::IntegerLiteral { text, .. } = &e.node {
-                                                text.split('_')
-                                                    .next()
-                                                    .and_then(|s| s.parse::<i64>().ok())
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    }) == Some(8);
-                                    let elem_ty = if kind_is_i64 {
-                                        IrType::Int(IntWidth::I64)
-                                    } else {
-                                        IrType::Int(IntWidth::I32)
-                                    };
-                                    return Some((desc, elem_ty));
+                                        None
+                                    }
+                                } else {
+                                    None
                                 }
-                            }
-                        }
+                            }) == Some(8);
+                            IrType::Int(if kind_is_i64 {
+                                IntWidth::I64
+                            } else {
+                                IntWidth::I32
+                            })
+                        } else {
+                            size_or_bounds_intrinsic_result_type(args, locals, st, type_layouts)
+                        };
+                        return Some((desc, elem_ty));
                     }
                 }
             }
@@ -59059,7 +59043,7 @@ fn lower_direct_real_dim_reduction_expr(
     Some((result_desc, result_ty))
 }
 
-fn size_intrinsic_result_type(
+fn size_or_bounds_intrinsic_result_type(
     args: &[crate::ast::expr::Argument],
     locals: &HashMap<String, LocalInfo>,
     st: &SymbolTable,
@@ -59070,6 +59054,59 @@ fn size_intrinsic_result_type(
     int_width_from_kind_value(i64::from(kind))
         .map(IrType::Int)
         .unwrap_or(IrType::Int(IntWidth::I32))
+}
+
+fn bounds_intrinsic_dim_expr(
+    args: &[crate::ast::expr::Argument],
+) -> Option<&crate::ast::expr::SpannedExpr> {
+    args.iter()
+        .enumerate()
+        .find_map(|(index, arg)| match arg.keyword.as_deref() {
+            Some(keyword) if keyword.eq_ignore_ascii_case("dim") => {
+                if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+                    Some(expr)
+                } else {
+                    None
+                }
+            }
+            Some(_) => None,
+            None if index == 1 => {
+                if let crate::ast::expr::SectionSubscript::Element(expr) = &arg.value {
+                    Some(expr)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        })
+}
+
+fn lower_bounds_vector_descriptor(
+    b: &mut FuncBuilder,
+    source_desc: ValueId,
+    result_type: &IrType,
+    lower: bool,
+) -> ValueId {
+    let result_desc = b.alloca(IrType::Array(Box::new(IrType::Int(IntWidth::I8)), 392));
+    let zero = b.const_i32(0);
+    let descriptor_bytes = b.const_i64(392);
+    b.call(
+        FuncRef::External("memset".into()),
+        vec![result_desc, zero, descriptor_bytes],
+        IrType::Ptr(Box::new(IrType::Int(IntWidth::I8))),
+    );
+    let elem_size = b.const_i64(ir_scalar_byte_size(result_type, b.layout));
+    let runtime = if lower {
+        "afs_array_lbound_vector"
+    } else {
+        "afs_array_ubound_vector"
+    };
+    b.call(
+        FuncRef::External(runtime.into()),
+        vec![result_desc, source_desc, elem_size],
+        IrType::Void,
+    );
+    result_desc
 }
 
 /// A rank-one reduction with DIM=1 still has a scalar result. Recognize only
@@ -59165,8 +59202,8 @@ pub(super) fn lower_array_intrinsic(
             None
         }
     })?;
-    let size_result_type =
-        (name == "size").then(|| size_intrinsic_result_type(args, locals, st, type_layouts));
+    let integer_inquiry_result_type = matches!(name, "size" | "lbound" | "ubound")
+        .then(|| size_or_bounds_intrinsic_result_type(args, locals, st, type_layouts));
     if matches!(name, "sum" | "maxval" | "minval")
         && (args.len() == 1 || rank1_scalar_reduction_has_dim_one(args, locals, st, type_layouts))
     {
@@ -59285,13 +59322,7 @@ pub(super) fn lower_array_intrinsic(
                                 None => None,
                             })
                     }
-                    "lbound" | "ubound" => args.get(1).and_then(|a| {
-                        if let crate::ast::expr::SectionSubscript::Element(e) = &a.value {
-                            Some(e)
-                        } else {
-                            None
-                        }
-                    }),
+                    "lbound" | "ubound" => bounds_intrinsic_dim_expr(args),
                     _ => None,
                 }?;
                 eval_const_int(dim_expr)
@@ -59305,7 +59336,9 @@ pub(super) fn lower_array_intrinsic(
                             return Some(coerce_to_type(
                                 b,
                                 r64,
-                                size_result_type.as_ref().expect("SIZE result type"),
+                                integer_inquiry_result_type
+                                    .as_ref()
+                                    .expect("SIZE result type"),
                             ));
                         }
                     } else if !args.iter().enumerate().any(|(index, arg)| {
@@ -59320,7 +59353,9 @@ pub(super) fn lower_array_intrinsic(
                         return Some(coerce_to_type(
                             b,
                             r64,
-                            size_result_type.as_ref().expect("SIZE result type"),
+                            integer_inquiry_result_type
+                                .as_ref()
+                                .expect("SIZE result type"),
                         ));
                     }
                 }
@@ -59329,7 +59364,13 @@ pub(super) fn lower_array_intrinsic(
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
                             let (lower, extent) = info.dims[dim as usize - 1];
                             let r64 = b.const_i64(static_array_lbound(lower, extent));
-                            return Some(b.int_trunc(r64, IntWidth::I32));
+                            return Some(coerce_to_type(
+                                b,
+                                r64,
+                                integer_inquiry_result_type
+                                    .as_ref()
+                                    .expect("LBOUND result type"),
+                            ));
                         }
                     }
                 }
@@ -59338,7 +59379,13 @@ pub(super) fn lower_array_intrinsic(
                         if dim >= 1 && (dim as usize) <= info.dims.len() {
                             let (lower, extent) = info.dims[dim as usize - 1];
                             let r64 = b.const_i64(static_array_ubound(lower, extent));
-                            return Some(b.int_trunc(r64, IntWidth::I32));
+                            return Some(coerce_to_type(
+                                b,
+                                r64,
+                                integer_inquiry_result_type
+                                    .as_ref()
+                                    .expect("UBOUND result type"),
+                            ));
                         }
                     }
                 }
@@ -59445,7 +59492,9 @@ pub(super) fn lower_array_intrinsic(
                     Some(coerce_to_type(
                         b,
                         result64,
-                        size_result_type.as_ref().expect("SIZE result type"),
+                        integer_inquiry_result_type
+                            .as_ref()
+                            .expect("SIZE result type"),
                     ))
                 }
             } else {
@@ -59471,98 +59520,118 @@ pub(super) fn lower_array_intrinsic(
                 Some(coerce_to_type(
                     b,
                     result64,
-                    size_result_type.as_ref().expect("SIZE result type"),
+                    integer_inquiry_result_type
+                        .as_ref()
+                        .expect("SIZE result type"),
                 ))
             }
         }
         "lbound" => {
             // Sprint 09: static fold handled by the early-return block
             // at the top of `lower_array_intrinsic`.
-            if args.len() >= 2 {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
-                    let dim = super::expr::lower_expr(b, locals, e, st);
-                    let result64 = if let Some(info) = first_arg_info.as_ref() {
-                        if !desc_from_expr && !local_uses_array_descriptor(info) {
-                            let raw_dim = match b.func().value_type(dim) {
-                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
-                                _ => dim,
-                            };
-                            let one = b.const_i32(1);
-                            let default = b.const_i64(1);
-                            let idx0 = b.isub(raw_dim, one);
-                            let mut result = default;
-                            for (idx, (lower, extent)) in info.dims.iter().enumerate() {
-                                let cond_idx = b.const_i32(idx as i32);
-                                let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                                let lower_val = b.const_i64(static_array_lbound(*lower, *extent));
-                                result = b.select(is_match, lower_val, result);
-                            }
-                            result
-                        } else {
-                            b.call(
-                                FuncRef::External("afs_array_lbound".into()),
-                                vec![desc, dim],
-                                IrType::Int(IntWidth::I64),
-                            )
+            if let Some(e) = bounds_intrinsic_dim_expr(args) {
+                let dim = super::expr::lower_expr(b, locals, e, st);
+                let result64 = if let Some(info) = first_arg_info.as_ref() {
+                    if !desc_from_expr && !local_uses_array_descriptor(info) {
+                        let raw_dim = match b.func().value_type(dim) {
+                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                            _ => dim,
+                        };
+                        let one = b.const_i32(1);
+                        let default = b.const_i64(1);
+                        let idx0 = b.isub(raw_dim, one);
+                        let mut result = default;
+                        for (idx, (lower, extent)) in info.dims.iter().enumerate() {
+                            let cond_idx = b.const_i32(idx as i32);
+                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                            let lower_val = b.const_i64(static_array_lbound(*lower, *extent));
+                            result = b.select(is_match, lower_val, result);
                         }
+                        result
                     } else {
                         b.call(
                             FuncRef::External("afs_array_lbound".into()),
                             vec![desc, dim],
                             IrType::Int(IntWidth::I64),
                         )
-                    };
-                    Some(b.int_trunc(result64, IntWidth::I32))
+                    }
                 } else {
-                    None
-                }
+                    b.call(
+                        FuncRef::External("afs_array_lbound".into()),
+                        vec![desc, dim],
+                        IrType::Int(IntWidth::I64),
+                    )
+                };
+                Some(coerce_to_type(
+                    b,
+                    result64,
+                    integer_inquiry_result_type
+                        .as_ref()
+                        .expect("LBOUND result type"),
+                ))
             } else {
-                None
+                Some(lower_bounds_vector_descriptor(
+                    b,
+                    desc,
+                    integer_inquiry_result_type
+                        .as_ref()
+                        .expect("LBOUND result type"),
+                    true,
+                ))
             }
         }
         "ubound" => {
             // Sprint 09: static fold handled by the early-return block
             // at the top of `lower_array_intrinsic`.
-            if args.len() >= 2 {
-                if let crate::ast::expr::SectionSubscript::Element(e) = &args[1].value {
-                    let dim = super::expr::lower_expr(b, locals, e, st);
-                    let result64 = if let Some(info) = first_arg_info.as_ref() {
-                        if !desc_from_expr && !local_uses_array_descriptor(info) {
-                            let raw_dim = match b.func().value_type(dim) {
-                                Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
-                                _ => dim,
-                            };
-                            let one = b.const_i32(1);
-                            let default = b.const_i64(0);
-                            let idx0 = b.isub(raw_dim, one);
-                            let mut result = default;
-                            for (idx, (lower, extent)) in info.dims.iter().enumerate() {
-                                let cond_idx = b.const_i32(idx as i32);
-                                let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
-                                let upper_val = b.const_i64(static_array_ubound(*lower, *extent));
-                                result = b.select(is_match, upper_val, result);
-                            }
-                            result
-                        } else {
-                            b.call(
-                                FuncRef::External("afs_array_ubound".into()),
-                                vec![desc, dim],
-                                IrType::Int(IntWidth::I64),
-                            )
+            if let Some(e) = bounds_intrinsic_dim_expr(args) {
+                let dim = super::expr::lower_expr(b, locals, e, st);
+                let result64 = if let Some(info) = first_arg_info.as_ref() {
+                    if !desc_from_expr && !local_uses_array_descriptor(info) {
+                        let raw_dim = match b.func().value_type(dim) {
+                            Some(IrType::Int(IntWidth::I64)) => b.int_trunc(dim, IntWidth::I32),
+                            _ => dim,
+                        };
+                        let one = b.const_i32(1);
+                        let default = b.const_i64(0);
+                        let idx0 = b.isub(raw_dim, one);
+                        let mut result = default;
+                        for (idx, (lower, extent)) in info.dims.iter().enumerate() {
+                            let cond_idx = b.const_i32(idx as i32);
+                            let is_match = b.icmp(CmpOp::Eq, idx0, cond_idx);
+                            let upper_val = b.const_i64(static_array_ubound(*lower, *extent));
+                            result = b.select(is_match, upper_val, result);
                         }
+                        result
                     } else {
                         b.call(
                             FuncRef::External("afs_array_ubound".into()),
                             vec![desc, dim],
                             IrType::Int(IntWidth::I64),
                         )
-                    };
-                    Some(b.int_trunc(result64, IntWidth::I32))
+                    }
                 } else {
-                    None
-                }
+                    b.call(
+                        FuncRef::External("afs_array_ubound".into()),
+                        vec![desc, dim],
+                        IrType::Int(IntWidth::I64),
+                    )
+                };
+                Some(coerce_to_type(
+                    b,
+                    result64,
+                    integer_inquiry_result_type
+                        .as_ref()
+                        .expect("UBOUND result type"),
+                ))
             } else {
-                None
+                Some(lower_bounds_vector_descriptor(
+                    b,
+                    desc,
+                    integer_inquiry_result_type
+                        .as_ref()
+                        .expect("UBOUND result type"),
+                    false,
+                ))
             }
         }
         "allocated" => {
