@@ -3061,8 +3061,8 @@ fn link_inputs(
             LinkOperand::Library(name) => args.push(format!("-l{name}")),
         }
     }
+    push_macho_runtime_link_input(&mut args, &runtime);
     args.extend([
-        runtime.path().to_string_lossy().into_owned(),
         "-lSystem".into(),
         "-syslibroot".into(),
         sysroot,
@@ -3131,7 +3131,7 @@ fn link_inputs_with_afs_ld(
             }
         }
     }
-    args.push(runtime.path().to_string_lossy().into_owned());
+    push_macho_runtime_link_input(&mut args, &runtime);
     args.push(libsystem_tbd);
     push_macho_runtime_rpath(&mut args, &runtime);
     push_afs_ld_tail_link_flags(&mut args, opts);
@@ -3216,6 +3216,28 @@ impl MachoRuntime {
             Self::Dynamic(dylib) => dylib.parent(),
         }
     }
+}
+
+fn push_macho_runtime_link_input(args: &mut Vec<String>, runtime: &MachoRuntime) {
+    let MachoRuntime::Dynamic(dylib) = runtime else {
+        args.push(runtime.path().to_string_lossy().into_owned());
+        return;
+    };
+    let Some(directory) = dylib.parent().filter(|path| !path.as_os_str().is_empty()) else {
+        args.push(dylib.to_string_lossy().into_owned());
+        return;
+    };
+    if dylib.file_name().and_then(|name| name.to_str()) != Some("libarmfortas_rt.dylib") {
+        args.push(dylib.to_string_lossy().into_owned());
+        return;
+    }
+
+    // Keep the actual link line parseable by build systems such as CMake.
+    // An absolute dylib operand links correctly, but CMake intentionally
+    // ignores it while extracting a compiler's implicit link libraries.
+    args.push("-L".into());
+    args.push(directory.to_string_lossy().into_owned());
+    args.push("-larmfortas_rt".into());
 }
 
 fn push_macho_runtime_rpath(args: &mut Vec<String>, runtime: &MachoRuntime) {
@@ -3722,6 +3744,36 @@ mod tests {
         };
         push_afs_ld_tail_link_flags(&mut shared_args, &shared);
         assert!(shared_args.is_empty());
+    }
+
+    #[test]
+    fn conventional_dynamic_runtime_uses_searchable_link_arguments() {
+        let runtime =
+            MachoRuntime::Dynamic(PathBuf::from("/opt/armfortas/lib/libarmfortas_rt.dylib"));
+        let mut args = Vec::new();
+
+        push_macho_runtime_link_input(&mut args, &runtime);
+
+        assert_eq!(args, ["-L", "/opt/armfortas/lib", "-larmfortas_rt"]);
+    }
+
+    #[test]
+    fn custom_named_and_static_runtimes_keep_exact_paths() {
+        let mut custom_args = Vec::new();
+        push_macho_runtime_link_input(
+            &mut custom_args,
+            &MachoRuntime::Dynamic(PathBuf::from("/opt/armfortas/lib/custom-runtime.dylib")),
+        );
+        assert_eq!(custom_args, ["/opt/armfortas/lib/custom-runtime.dylib"]);
+
+        let mut static_args = Vec::new();
+        push_macho_runtime_link_input(
+            &mut static_args,
+            &MachoRuntime::Static(RuntimeArchive::external(PathBuf::from(
+                "/opt/armfortas/lib/libarmfortas_rt.a",
+            ))),
+        );
+        assert_eq!(static_args, ["/opt/armfortas/lib/libarmfortas_rt.a"]);
     }
 
     #[test]

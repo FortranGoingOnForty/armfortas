@@ -131,6 +131,8 @@ fn main() {
         command
             .arg("-C")
             .arg("link-arg=-Wl,-install_name,@rpath/libarmfortas_rt.dylib")
+            .arg("-C")
+            .arg("link-arg=-Wl,-headerpad_max_install_names")
             .arg("-o")
             .arg(&output_dylib);
         let output = command
