@@ -98,7 +98,7 @@ on 2026-06-10.
 | split_2 | run, default flags; UCS-4 SPLIT | FLAGS f2023; EXIT_CODE 0; XFAIL-006 | rejected because `SELECTED_CHAR_KIND('ISO_10646')` returns `-1` | nondefault character kinds unsupported |
 | split_3 | run + dg-shouldfail "Fortran runtime error" (POS out of range) | FLAGS f2023; EXIT_CODE 1 (armfortas runtime-error convention, provisional until l04) | `-S` clean, unresolvable `_split` | SPLIT missing (l04) |
 | split_4 | run + dg-shouldfail (BACK at string start) | FLAGS f2023; EXIT_CODE 1 (provisional) | `-S` clean, unresolvable `_split` | SPLIT missing (l04) |
-| c_f_pointer_shape_tests_7 | run, -std=f2023; LOWER= honored | FLAGS f2023; EXIT_CODE 0 | `-S` clean but emits external `bl _lbound`/`bl _ubound` (matrix laxness #4) → cannot link; LOWER honoring unverified | C_F_POINTER LOWER= missing (l06) |
+| c_f_pointer_shape_tests_7 | run, -std=f2023; LOWER= honored | FLAGS f2023; EXIT_CODE 0 | passes; whole-array LBOUND/UBOUND preserve C_F_POINTER's nondefault lower bounds | none — LOWER= and whole-array bounds are verified end to end |
 | c_f_pointer_shape_tests_8 | compile, -std=f2023; 2 dg-errors (LOWER type/rank) | FLAGS f2023; ERROR_EXPECTED `LOWER` (bare module, ERROR_EXPECTED-only) | `-S` clean — no validation of the LOWER argument | C_F_POINTER LOWER validation missing (l06) |
 | do_concurrent_8_f2023 | compile, -std=gnu; 2 dg-errors (var in SHARED and REDUCE) | FLAGS f2023 (`-std=gnu` has no equivalent, dropped); ERROR_EXPECTED `locality-spec` | `-S` clean — duplicate-locality diagnostic absent | DO CONCURRENT REDUCE duplicate-locality diagnostic missing (l01) |
 

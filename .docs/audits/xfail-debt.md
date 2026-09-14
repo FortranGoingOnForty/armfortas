@@ -23,13 +23,14 @@ Semantic validation does not yet reject `ALLOCATE` or `DEALLOCATE` in a PURE
 procedure when the affected allocatable is host-associated, as required by
 Fortran 2018 section 15.7. The paired diagnostic fixtures cover both statements.
 
-## XFAIL-003 - Whole-array bounds intrinsics are not lowered
+## XFAIL-003 - Whole-array bounds intrinsics are not lowered [FIXED 2026-09-14]
 
-**Status:** Active compiler defect.
+**Status:** Fixed.
 
-The no-`dim` forms of `LBOUND` and `UBOUND` are left as unresolved external
-symbols instead of being lowered for arrays. The imported `C_F_POINTER` fixture
-exposes the general intrinsic gap while checking pointer lower bounds.
+The no-`dim` forms of `LBOUND` and `UBOUND` now produce rank-one runtime
+descriptors for static, allocatable, pointer, and zero-extent arrays. The result
+honors the selected integer `KIND`; the imported `C_F_POINTER` fixture now runs
+without an XFAIL while checking its nondefault pointer lower bounds.
 
 ## XFAIL-004 - Conditional diagnostics do not match imported oracles
 

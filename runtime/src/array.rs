@@ -2765,6 +2765,56 @@ mod tests {
     }
 
     #[test]
+    fn array_bound_vectors_preserve_bounds_for_every_integer_width() {
+        fn values(desc: &ArrayDescriptor) -> [i64; 2] {
+            let read = |index: usize| unsafe {
+                let ptr = desc.base_addr.add(index * desc.elem_size as usize);
+                match desc.elem_size {
+                    1 => *(ptr as *const i8) as i64,
+                    2 => *(ptr as *const i16) as i64,
+                    4 => *(ptr as *const i32) as i64,
+                    8 => *(ptr as *const i64),
+                    16 => *(ptr as *const i128) as i64,
+                    other => panic!("unexpected integer element size {other}"),
+                }
+            };
+            [read(0), read(1)]
+        }
+
+        let mut source = ArrayDescriptor::zeroed();
+        source.rank = 2;
+        source.dims[0] = DimDescriptor {
+            lower_bound: -4,
+            upper_bound: -5,
+            stride: 1,
+        };
+        source.dims[1] = DimDescriptor {
+            lower_bound: 7,
+            upper_bound: 9,
+            stride: 1,
+        };
+
+        for elem_size in [1, 2, 4, 8, 16] {
+            let mut lower = ArrayDescriptor::zeroed();
+            let mut upper = ArrayDescriptor::zeroed();
+            afs_array_lbound_vector(&mut lower, &source, elem_size);
+            afs_array_ubound_vector(&mut upper, &source, elem_size);
+
+            for result in [&lower, &upper] {
+                assert_eq!(result.rank, 1);
+                assert_eq!(result.elem_size, elem_size);
+                assert_eq!(result.dims[0].lower_bound, 1);
+                assert_eq!(result.dims[0].upper_bound, 2);
+            }
+            assert_eq!(values(&lower), [1, 7]);
+            assert_eq!(values(&upper), [0, 9]);
+
+            afs_deallocate_array(&mut lower, ptr::null_mut());
+            afs_deallocate_array(&mut upper, ptr::null_mut());
+        }
+    }
+
+    #[test]
     fn allocate_1d() {
         let mut desc = ArrayDescriptor::zeroed();
         afs_allocate_1d(&mut desc, 4, 10);
@@ -4448,6 +4498,73 @@ pub extern "C" fn afs_array_shape_int8(dst: *mut ArrayDescriptor, src: *const Ar
             base.add(i).write(s.dims[i].extent());
         }
     }
+}
+
+fn write_bound_vector_element(base: *mut u8, index: usize, elem_size: i64, value: i64) {
+    let byte_offset = index * elem_size as usize;
+    let ptr = unsafe { base.add(byte_offset) };
+    unsafe {
+        match elem_size {
+            1 => (ptr as *mut i8).write(value as i8),
+            2 => (ptr as *mut i16).write(value as i16),
+            4 => (ptr as *mut i32).write(value as i32),
+            8 => (ptr as *mut i64).write(value),
+            16 => (ptr as *mut i128).write(value as i128),
+            _ => unreachable!("validated integer element size"),
+        }
+    }
+}
+
+fn afs_array_bound_vector(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+    elem_size: i64,
+    lower: bool,
+) {
+    if dst.is_null() || src.is_null() || !matches!(elem_size, 1 | 2 | 4 | 8 | 16) {
+        return;
+    }
+    let source = unsafe { &*src };
+    let rank = i64::from(source.rank.max(0));
+    let dim = DimDescriptor {
+        lower_bound: 1,
+        upper_bound: rank,
+        stride: 1,
+    };
+    afs_allocate_array(dst, elem_size, 1, &dim, ptr::null_mut());
+    let base = unsafe { (*dst).base_addr };
+    if base.is_null() {
+        return;
+    }
+    for index in 0..rank as usize {
+        let dim = index as i32 + 1;
+        let value = if lower {
+            afs_array_lbound(src, dim)
+        } else {
+            afs_array_ubound(src, dim)
+        };
+        write_bound_vector_element(base, index, elem_size, value);
+    }
+}
+
+/// LBOUND(array) -> fresh rank-1 integer array with one value per dimension.
+#[no_mangle]
+pub extern "C" fn afs_array_lbound_vector(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+    elem_size: i64,
+) {
+    afs_array_bound_vector(dst, src, elem_size, true);
+}
+
+/// UBOUND(array) -> fresh rank-1 integer array with one value per dimension.
+#[no_mangle]
+pub extern "C" fn afs_array_ubound_vector(
+    dst: *mut ArrayDescriptor,
+    src: *const ArrayDescriptor,
+    elem_size: i64,
+) {
+    afs_array_bound_vector(dst, src, elem_size, false);
 }
 
 /// LBOUND(array, dim) — lower bound along dimension `dim` (1-based).
