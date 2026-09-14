@@ -260,4 +260,27 @@ mod tests {
         afs_as::assemble::assemble_source(&asm)
             .expect("afs-as must encode the emitted ARM64 wide-switch assembly");
     }
+
+    #[test]
+    fn arm64_modules_preserve_function_boundaries_as_macho_subsections() {
+        let target = TargetSpec::parse("arm64-macos").unwrap();
+        let module = wide_switch_module(&target);
+        let opts = Options {
+            target,
+            ..Options::default()
+        };
+        let asm = emit_module(&module, &opts).unwrap();
+
+        assert!(
+            asm.starts_with(".subsections_via_symbols\n"),
+            "ARM64 assembly must advertise independently-linkable functions:\n{asm}"
+        );
+        let object = afs_as::assemble::assemble_source(&asm)
+            .expect("afs-as must assemble the Mach-O subsection directive");
+        assert_eq!(
+            object.flags & afs_as::macho::MH_SUBSECTIONS_VIA_SYMBOLS,
+            afs_as::macho::MH_SUBSECTIONS_VIA_SYMBOLS,
+            "Mach-O object must carry MH_SUBSECTIONS_VIA_SYMBOLS"
+        );
+    }
 }
