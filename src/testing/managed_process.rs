@@ -386,9 +386,11 @@ pub fn run_with_limits(
         limits.capture_limit,
         Arc::clone(&output_limit_exceeded),
     );
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    let mut exit_observer = ChildExitObserver::start(process_group);
 
     enum StopReason {
-        Exited(ExitStatus),
+        Exited,
         TimedOut,
         Cancelled,
         OutputLimitExceeded,
@@ -403,9 +405,13 @@ pub fn run_with_limits(
         if output_limit_exceeded.load(Ordering::Acquire) {
             break StopReason::OutputLimitExceeded;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break StopReason::Exited(status),
-            Ok(None) => {}
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+        let child_exited = exit_observer.poll();
+        #[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "macos")))]
+        let child_exited = child.try_wait().map(|status| status.is_some());
+        match child_exited {
+            Ok(true) => break StopReason::Exited,
+            Ok(false) => {}
             Err(error) => break StopReason::Monitor(error),
         }
         let now = Instant::now();
@@ -416,31 +422,55 @@ pub fn run_with_limits(
     };
 
     let (status, timed_out, cancelled, output_limited, mut monitor_error) = match reason {
-        StopReason::Exited(status) => {
-            let cleanup_error = kill_lingering_group(process_group).err();
-            (Some(status), false, false, false, cleanup_error)
-        }
+        StopReason::Exited => match reap_exited_process_group(&mut child, process_group) {
+            Ok(status) => (Some(status), false, false, false, None),
+            Err(error) => (None, false, false, false, Some(error)),
+        },
         StopReason::TimedOut => {
-            match terminate_and_reap(&mut child, process_group, limits.kill_grace) {
+            match terminate_and_reap(
+                &mut child,
+                process_group,
+                limits.kill_grace,
+                #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+                &mut exit_observer,
+            ) {
                 Ok(status) => (Some(status), true, false, false, None),
                 Err(error) => (None, true, false, false, Some(error)),
             }
         }
         StopReason::Cancelled => {
-            match terminate_and_reap(&mut child, process_group, limits.kill_grace) {
+            match terminate_and_reap(
+                &mut child,
+                process_group,
+                limits.kill_grace,
+                #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+                &mut exit_observer,
+            ) {
                 Ok(status) => (Some(status), false, true, false, None),
                 Err(error) => (None, false, true, false, Some(error)),
             }
         }
         StopReason::OutputLimitExceeded => {
-            match terminate_and_reap(&mut child, process_group, limits.kill_grace) {
+            match terminate_and_reap(
+                &mut child,
+                process_group,
+                limits.kill_grace,
+                #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+                &mut exit_observer,
+            ) {
                 Ok(status) => (Some(status), false, false, true, None),
                 Err(error) => (None, false, false, true, Some(error)),
             }
         }
         StopReason::Monitor(error) => {
-            let cleanup_error =
-                terminate_and_reap(&mut child, process_group, limits.kill_grace).err();
+            let cleanup_error = terminate_and_reap(
+                &mut child,
+                process_group,
+                limits.kill_grace,
+                #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+                &mut exit_observer,
+            )
+            .err();
             (
                 None,
                 false,
@@ -623,6 +653,8 @@ fn terminate_and_reap(
     child: &mut std::process::Child,
     process_group: u32,
     grace: Duration,
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    exit_observer: &mut ChildExitObserver,
 ) -> io::Result<ExitStatus> {
     let mut lifecycle_error = None;
     #[cfg(unix)]
@@ -651,28 +683,150 @@ fn terminate_and_reap(
     #[cfg(not(unix))]
     let _ = child.kill();
 
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    if let Err(error) = exit_observer.wait(grace) {
+        if lifecycle_error.is_none() {
+            lifecycle_error = Some(error);
+        }
+    }
+
     // Always reap the direct child, including when signaling reported an
     // error, so callers never inherit a zombie owned by the harness itself.
     let status = child.wait()?;
-    if let Some(error) = lifecycle_error {
-        // Darwin can report EPERM when the only remaining group member is the
-        // unreaped leader. Reaping releases that zombie; suppress the signal
-        // error only when a non-signaling probe then proves the group is gone.
-        // A live or inaccessible group remains a hard cleanup failure.
-        #[cfg(unix)]
-        match process_group_is_absent(process_group) {
-            Ok(true) => {}
-            Ok(false) => return Err(error),
-            Err(probe_error) => {
-                return Err(io::Error::other(format!(
-                    "process-tree cleanup failed: {error}; cannot verify process-group exit: {probe_error}"
-                )));
-            }
-        }
-        #[cfg(not(unix))]
-        return Err(error);
-    }
+    verify_group_cleanup(process_group, lifecycle_error)?;
     Ok(status)
+}
+
+fn reap_exited_process_group(
+    child: &mut std::process::Child,
+    process_group: u32,
+) -> io::Result<ExitStatus> {
+    // On supported Unix hosts the exit observer uses waitid(WNOWAIT), so the
+    // group leader is still an unreaped zombie here. Its PID therefore cannot
+    // be reused between this signal and Child::wait(). Other hosts retain the
+    // previous best-effort behavior.
+    let cleanup_error = kill_lingering_group(process_group).err();
+    let status = child.wait()?;
+    verify_group_cleanup(process_group, cleanup_error)?;
+    Ok(status)
+}
+
+fn verify_group_cleanup(process_group: u32, cleanup_error: Option<io::Error>) -> io::Result<()> {
+    let Some(error) = cleanup_error else {
+        return Ok(());
+    };
+
+    // Darwin can report EPERM when the only remaining group member is the
+    // unreaped leader. Reaping releases that zombie; suppress the signal
+    // error only when a non-signaling probe then proves the group is gone.
+    // A live or inaccessible group remains a hard cleanup failure.
+    #[cfg(unix)]
+    match process_group_is_absent(process_group) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(error),
+        Err(probe_error) => Err(io::Error::other(format!(
+            "process-tree cleanup failed: {error}; cannot verify process-group exit: {probe_error}"
+        ))),
+    }
+    #[cfg(not(unix))]
+    Err(error)
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+struct ChildExitObserver {
+    completion: mpsc::Receiver<io::Result<()>>,
+    observed: bool,
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+impl ChildExitObserver {
+    fn start(pid: u32) -> Self {
+        let (sender, completion) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(wait_for_child_exit_without_reaping(pid));
+        });
+        Self {
+            completion,
+            observed: false,
+        }
+    }
+
+    fn poll(&mut self) -> io::Result<bool> {
+        if self.observed {
+            return Ok(true);
+        }
+        match self.completion.try_recv() {
+            Ok(result) => {
+                // The observer thread is finished even when waitid failed. A
+                // later cleanup path must not wait on this drained channel and
+                // hide the original monitoring error.
+                self.observed = true;
+                result?;
+                Ok(true)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other(
+                "child exit observer terminated without reporting a status",
+            )),
+        }
+    }
+
+    fn wait(&mut self, timeout: Duration) -> io::Result<()> {
+        if self.observed {
+            return Ok(());
+        }
+        match self.completion.recv_timeout(timeout) {
+            Ok(result) => {
+                self.observed = true;
+                result?;
+                Ok(())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child did not become waitable after process-group termination",
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+                "child exit observer terminated without reporting a status",
+            )),
+        }
+    }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+#[repr(C, align(16))]
+struct OpaqueSiginfo([u8; 256]);
+
+#[cfg(target_os = "freebsd")]
+const WAITID_P_PID: u32 = 0;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const WAITID_P_PID: u32 = 1;
+#[cfg(target_os = "macos")]
+const WAITID_EXITED_NOWAIT: i32 = 0x04 | 0x20;
+#[cfg(target_os = "linux")]
+const WAITID_EXITED_NOWAIT: i32 = 0x04 | 0x0100_0000;
+#[cfg(target_os = "freebsd")]
+const WAITID_EXITED_NOWAIT: i32 = 0x10 | 0x08;
+
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+fn wait_for_child_exit_without_reaping(pid: u32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn waitid(idtype: u32, id: u32, info: *mut OpaqueSiginfo, options: i32) -> i32;
+    }
+
+    loop {
+        let mut info = std::mem::MaybeUninit::<OpaqueSiginfo>::zeroed();
+        // SAFETY: `info` is over-aligned and larger than siginfo_t on every
+        // supported target. P_PID makes `id` the direct child's process ID,
+        // and WNOWAIT explicitly leaves that child waitable by Child::wait.
+        let result = unsafe { waitid(WAITID_P_PID, pid, info.as_mut_ptr(), WAITID_EXITED_NOWAIT) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn kill_lingering_group(process_group: u32) -> io::Result<()> {
@@ -758,6 +912,36 @@ mod tests {
         assert!(current_group > 0);
         assert!(!process_group_is_absent(current_group as u32).unwrap());
         assert!(process_group_is_absent(i32::MAX as u32).unwrap());
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exit_observer_leaves_the_child_waitable() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process_group = child.id();
+        let mut observer = ChildExitObserver::start(process_group);
+
+        observer.wait(Duration::from_secs(2)).unwrap();
+        assert!(observer.poll().unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+        assert!(process_group_is_absent(process_group).unwrap());
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn managed_command_preserves_nonzero_exit_status() {
+        let output = run_with_limits(
+            Command::new("/bin/sh").args(["-c", "exit 7"]),
+            short_limits(1024),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(7));
     }
 
     #[cfg(unix)]
