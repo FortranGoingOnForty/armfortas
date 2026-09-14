@@ -342,14 +342,6 @@ fn gnu_depfile_flags_write_make_dependency_file() {
 
 #[test]
 fn required_frame_pointer_flag_preserves_backend_frames() {
-    if let Err(reason) = armfortas::testing::native_e2e_support() {
-        eprintln!(
-            "\nHARNESS_SKIP suite=driver_link_compat test=required_frame_pointer_flag_preserves_backend_frames count=1 reason=\"{}\"",
-            reason
-        );
-        return;
-    }
-
     let dir = unique_dir("required_frame_pointer_flag");
     let src = write_program_in(
         &dir,
