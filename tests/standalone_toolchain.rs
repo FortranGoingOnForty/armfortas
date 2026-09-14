@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -32,10 +33,20 @@ fn runtime_archive() -> PathBuf {
 }
 
 fn runtime_artifact_dir() -> PathBuf {
-    runtime_archive()
-        .parent()
-        .expect("runtime archive has no parent directory")
-        .to_path_buf()
+    static RUNTIME_DIR: OnceLock<PathBuf> = OnceLock::new();
+    RUNTIME_DIR
+        .get_or_init(|| {
+            let dir = unique_dir("runtime_artifacts");
+            fs::copy(runtime_archive(), dir.join("libarmfortas_rt.a"))
+                .expect("copy runtime archive into explicit artifact directory");
+            fs::write(
+                dir.join("libarmfortas_rt.dylib"),
+                armfortas_rt::bundled_dylib().expect("Mach-O runtime dylib payload"),
+            )
+            .expect("write runtime dylib into explicit artifact directory");
+            dir
+        })
+        .clone()
 }
 
 fn libsystem_tbd() -> PathBuf {
