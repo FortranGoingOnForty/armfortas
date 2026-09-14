@@ -3,7 +3,8 @@
 //! Provides C-ABI functions called by generated Fortran code:
 //! I/O, memory management, string operations, program lifecycle.
 //!
-//! Built as a static library (.a) linked into every produced binary.
+//! Built as a static archive for ELF/static links and as a shared library for
+//! ordinary Mach-O links.
 
 // All public functions in this crate are `extern "C"` FFI entry points called
 // from generated assembly. They accept raw pointers by design and cannot be
@@ -16,7 +17,7 @@
 mod bundle;
 
 #[cfg(not(armfortas_staticlib_payload))]
-pub use bundle::bundled_archive;
+pub use bundle::{bundled_archive, bundled_dylib};
 
 pub mod array;
 mod decimal_input;

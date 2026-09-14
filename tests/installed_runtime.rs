@@ -62,6 +62,7 @@ fn isolated_compiler_binaries_carry_their_runtime_archive() {
     let outside = root.as_ref().join("outside");
     let runtime_tmp = root.as_ref().join("runtime-tmp");
     let alternate_runtime_tmp = root.as_ref().join("runtime-tmp-alternate");
+    let runtime_cache = root.as_ref().join("runtime-cache");
     fs::create_dir_all(&prefix_bin).expect("create clean install prefix");
     fs::create_dir_all(&outside).expect("create outside-checkout directory");
     fs::create_dir_all(&runtime_tmp).expect("create private runtime temp directory");
@@ -86,8 +87,10 @@ fn isolated_compiler_binaries_carry_their_runtime_archive() {
         let compile = Command::new(&installed)
             .current_dir(&outside)
             .env_remove("AFS_RUNTIME_PATH")
+            .env_remove("AFS_RUNTIME_DYLIB_PATH")
             .env_remove("CARGO_TARGET_DIR")
             .env("TMPDIR", &runtime_tmp)
+            .env("AFS_RUNTIME_CACHE", &runtime_cache)
             .arg(&source)
             .arg("-o")
             .arg(&executable)
@@ -145,6 +148,21 @@ fn isolated_compiler_binaries_carry_their_runtime_archive() {
         !prefix_bin.join("libarmfortas_rt.a").exists(),
         "test prefix must not provide an external runtime archive"
     );
+    assert!(
+        !prefix_bin.join("libarmfortas_rt.dylib").exists(),
+        "test prefix must not provide an external runtime dylib"
+    );
+    if cfg!(target_os = "macos") {
+        let dylibs = fs::read_dir(&runtime_cache)
+            .expect("inspect shared runtime cache")
+            .flat_map(|entry| fs::read_dir(entry.expect("runtime cache entry").path()).unwrap())
+            .filter(|entry| entry.as_ref().unwrap().file_name() == "libarmfortas_rt.dylib")
+            .count();
+        assert_eq!(
+            dylibs, 1,
+            "installed compilers must reuse one runtime dylib"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -224,12 +242,17 @@ fn successful_runtime_rebuild_diagnostics_reach_compiler_stderr() {
     )
     .expect("write runtime rebuild source");
     let executable = workspace.join("hello");
-    let compile = Command::new(&copied_compiler)
+    let mut compile_command = Command::new(&copied_compiler);
+    compile_command
         .current_dir(&workspace)
         .env_remove("AFS_RUNTIME_PATH")
         .env_remove("CARGO_TARGET_DIR")
         .env("CARGO", &fake_cargo)
-        .env("AR38_REAL_RUNTIME", &real_runtime)
+        .env("AR38_REAL_RUNTIME", &real_runtime);
+    if cfg!(target_os = "macos") {
+        compile_command.arg("-static").env("AFS_LD", "0");
+    }
+    let compile = compile_command
         .arg(&source)
         .arg("-o")
         .arg(&executable)
@@ -264,6 +287,7 @@ fn installed_compiler_ignores_unrelated_cargo_runtime_trees() {
     let root = TestDir::new("unrelated-workspace");
     let prefix_bin = root.as_ref().join("install/bin");
     let runtime_tmp = root.as_ref().join("runtime-tmp");
+    let runtime_cache = root.as_ref().join("runtime-cache");
     fs::create_dir_all(&prefix_bin).expect("create clean install prefix");
     fs::create_dir_all(&runtime_tmp).expect("create private runtime temp directory");
 
@@ -331,9 +355,11 @@ fn installed_compiler_ignores_unrelated_cargo_runtime_trees() {
             let compile = Command::new(&installed)
                 .current_dir(&workspace)
                 .env_remove("AFS_RUNTIME_PATH")
+                .env_remove("AFS_RUNTIME_DYLIB_PATH")
                 .env_remove("CARGO_TARGET_DIR")
                 .env("CARGO", workspace.join("cargo-must-not-run"))
                 .env("TMPDIR", &runtime_tmp)
+                .env("AFS_RUNTIME_CACHE", &runtime_cache)
                 .arg(opt)
                 .arg(&source)
                 .arg("-o")
