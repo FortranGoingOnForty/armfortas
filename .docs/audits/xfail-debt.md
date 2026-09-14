@@ -15,13 +15,14 @@ I/O begins. The byte-preservation test remains active on other hosts and is
 expected to fail only on macOS. The original platform qualification is recorded
 in `.docs/audits/x86-campaign-log.md`.
 
-## XFAIL-002 - PURE host-associated allocation is not rejected
+## XFAIL-002 - PURE host-associated allocation is not rejected [FIXED 2026-09-14]
 
-**Status:** Active compiler defect.
+**Status:** Fixed.
 
-Semantic validation does not yet reject `ALLOCATE` or `DEALLOCATE` in a PURE
-procedure when the affected allocatable is host-associated, as required by
-Fortran 2018 section 15.7. The paired diagnostic fixtures cover both statements.
+Semantic validation now rejects `ALLOCATE` and `DEALLOCATE` in a PURE procedure
+when the affected allocation object is host- or use-associated, as required by
+Fortran 2018 section 15.7. Local allocation objects remain valid. The paired
+diagnostic fixtures cover both statements.
 
 ## XFAIL-003 - Whole-array bounds intrinsics are not lowered [FIXED 2026-09-14]
 

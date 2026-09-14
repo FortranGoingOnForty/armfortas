@@ -5687,6 +5687,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "ALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
+                reject_pure_nonlocal_definition(ctx, item, item.span, "ALLOCATE");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
                 }
@@ -5707,6 +5708,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "DEALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
+                reject_pure_nonlocal_definition(ctx, item, item.span, "DEALLOCATE");
             }
         }
 
@@ -18053,6 +18055,47 @@ end module
             errs.is_empty(),
             "pure local pointer reassoc should be legal, got {:?}",
             errs
+        );
+    }
+
+    #[test]
+    fn pure_host_associated_allocation_objects_error() {
+        let errs = errors_from(
+            "\
+program p
+  integer, allocatable :: host_values(:)
+contains
+  pure subroutine mutate_allocation_status()
+    allocate(host_values(2))
+    deallocate(host_values)
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("host_values")
+                    && error.contains("host or use association"))
+                .count(),
+            2,
+            "both PURE allocation-status changes must be rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_local_allocation_objects_ok() {
+        let errs = errors_from(
+            "\
+pure subroutine manage_local_allocation()
+  integer, allocatable :: local_values(:)
+  allocate(local_values(2))
+  deallocate(local_values)
+end subroutine
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "PURE procedures may change local allocation status: {errs:?}"
         );
     }
 
