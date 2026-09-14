@@ -73,6 +73,13 @@ pub fn emit_module(ir_module: &Module, opts: &Options) -> String {
 
     // Emit assembly.
     let mut asm_text = String::new();
+    // Each MachineFunction has its own symbol and may be laid out, stripped,
+    // or thunked independently.  Tell Mach-O assemblers to preserve those
+    // function boundaries as linker atoms.  Without this flag, one large
+    // source unit becomes a single __text atom, leaving afs-ld nowhere to
+    // place a branch island when that atom exceeds ARM64's +/-128 MiB BL
+    // reach.
+    asm_text.push_str(".subsections_via_symbols\n");
     asm_text.push_str(".section __TEXT,__text,regular,pure_instructions\n");
     for mf in &allocated {
         // Re-emit __TEXT section before each function in case the previous
