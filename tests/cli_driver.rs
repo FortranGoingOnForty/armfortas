@@ -20418,6 +20418,91 @@ end program
 }
 
 #[test]
+fn nopass_singleton_type_bound_call_accepts_omitted_optional_pointer_dummies() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=cli_driver test=nopass_singleton_type_bound_call_accepts_omitted_optional_pointer_dummies count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("nopass_tbp_omitted_optional_pointers");
+    let source = write_program_in(
+        &dir,
+        "main.f90",
+        r#"module nopass_pointer_m
+  implicit none
+  type :: node_t
+    integer :: value = 0
+  end type
+  type :: core_t
+  contains
+    procedure, nopass :: clone
+  end type
+contains
+  subroutine invoke(core, source, target)
+    class(core_t), intent(inout) :: core
+    type(node_t), pointer :: source, target
+    call core%clone(source, target)
+  end subroutine
+
+  subroutine clone(source, target, parent, previous, tail)
+    type(node_t), pointer :: source, target
+    type(node_t), pointer, optional :: parent, previous
+    logical, optional :: tail
+    target => source
+  end subroutine
+end module
+
+program p
+  use nopass_pointer_m
+  implicit none
+  type(core_t) :: core
+  type(node_t), pointer :: source, target
+  allocate(source)
+  source%value = 42
+  nullify(target)
+  call invoke(core, source, target)
+  if (.not. associated(target)) error stop 1
+  if (target%value /= 42) error stop 2
+  print *, 'ok'
+  deallocate(source)
+  nullify(target)
+end program
+"#,
+    );
+    let exe = dir.join("main");
+    let compile = Command::new(compiler("armfortas"))
+        .current_dir(&dir)
+        .args([source.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("NOPASS optional-pointer test compile failed to spawn");
+    assert!(
+        compile.status.success(),
+        "NOPASS call must accept omitted optional pointer dummies: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("NOPASS optional-pointer test binary failed to spawn");
+    assert!(
+        run.status.success(),
+        "NOPASS optional-pointer test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("ok"),
+        "missing NOPASS optional-pointer success marker: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn imported_type_bound_register_ignores_unrelated_optional_register_mask() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(
