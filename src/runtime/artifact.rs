@@ -2,6 +2,8 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -9,6 +11,8 @@ static NEXT_BUNDLED_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 
 const MACHO_64_LE_MAGIC: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];
 const MACHO_64_BE_MAGIC: [u8; 4] = [0xfe, 0xed, 0xfa, 0xcf];
+#[cfg(target_os = "macos")]
+const LC_ID_DYLIB: u32 = 0xd;
 
 pub(crate) struct RuntimeArchive {
     path: PathBuf,
@@ -158,13 +162,15 @@ fn materialize_bundled_runtime_dylib_in(
     if dylib.exists() {
         let installed = fs::read(&dylib)
             .map_err(|err| format!("cannot verify shared runtime '{}': {err}", dylib.display()))?;
-        if installed == bytes {
+        if cached_runtime_dylib_matches(&installed, bytes, &dylib) {
             return Ok(dylib);
         }
-        return Err(format!(
-            "shared runtime cache entry '{}' does not match the compiler payload",
-            dylib.display()
-        ));
+        if installed != bytes {
+            return Err(format!(
+                "shared runtime cache entry '{}' does not match the compiler payload",
+                dylib.display()
+            ));
+        }
     }
 
     let temporary = version_dir.join(format!(
@@ -177,7 +183,7 @@ fn materialize_bundled_runtime_dylib_in(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o500);
+        options.mode(0o700);
     }
     let write_result = options
         .open(&temporary)
@@ -189,6 +195,21 @@ fn materialize_bundled_runtime_dylib_in(
             temporary.display()
         ));
     }
+    if let Err(err) = prepare_cached_runtime_dylib(&temporary, &dylib) {
+        let _ = fs::remove_file(&temporary);
+        return Err(err);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o500)).map_err(|err| {
+            let _ = fs::remove_file(&temporary);
+            format!(
+                "cannot secure shared runtime '{}': {err}",
+                temporary.display()
+            )
+        })?;
+    }
     match fs::rename(&temporary, &dylib) {
         Ok(()) => Ok(dylib),
         Err(err) if dylib.exists() => {
@@ -199,7 +220,7 @@ fn materialize_bundled_runtime_dylib_in(
                     dylib.display()
                 )
             })?;
-            if installed == bytes {
+            if cached_runtime_dylib_matches(&installed, bytes, &dylib) {
                 Ok(dylib)
             } else {
                 Err(format!(
@@ -216,6 +237,87 @@ fn materialize_bundled_runtime_dylib_in(
             ))
         }
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cached_runtime_dylib_matches(installed: &[u8], payload: &[u8], _path: &Path) -> bool {
+    installed == payload
+}
+
+#[cfg(target_os = "macos")]
+fn cached_runtime_dylib_matches(installed: &[u8], payload: &[u8], path: &Path) -> bool {
+    if installed == payload {
+        return false;
+    }
+    let expected = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    macho_dylib_install_name(installed).is_some_and(|name| name == expected)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_cached_runtime_dylib(_temporary: &Path, _installed: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_cached_runtime_dylib(temporary: &Path, installed: &Path) -> Result<(), String> {
+    // Mixed-language build systems preserve a compiler's implicit libraries
+    // and search directories, but not its implicit rpaths. Give the persistent,
+    // content-versioned cache entry a self-sufficient identity so a C/C++ link
+    // driver can consume it without silently producing an unloadable program.
+    let output = Command::new("/usr/bin/install_name_tool")
+        .arg("-id")
+        .arg(installed)
+        .arg(temporary)
+        .output()
+        .map_err(|err| format!("cannot launch install_name_tool for shared runtime: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "install_name_tool failed while preparing shared runtime '{}':\n{}",
+            installed.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macho_dylib_install_name(bytes: &[u8]) -> Option<&[u8]> {
+    let read_u32 = if bytes.starts_with(&MACHO_64_LE_MAGIC) {
+        u32::from_le_bytes
+    } else if bytes.starts_with(&MACHO_64_BE_MAGIC) {
+        u32::from_be_bytes
+    } else {
+        return None;
+    };
+    let ncmds = read_u32(bytes.get(16..20)?.try_into().ok()?);
+    let mut offset = 32_usize;
+    for _ in 0..ncmds {
+        let cmd = read_u32(bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?);
+        let cmdsize = read_u32(
+            bytes
+                .get(offset.checked_add(4)?..offset.checked_add(8)?)?
+                .try_into()
+                .ok()?,
+        ) as usize;
+        if cmdsize < 8 {
+            return None;
+        }
+        let end = offset.checked_add(cmdsize)?;
+        let command = bytes.get(offset..end)?;
+        if cmd == LC_ID_DYLIB {
+            if command.len() < 24 {
+                return None;
+            }
+            let name_offset = read_u32(command.get(8..12)?.try_into().ok()?) as usize;
+            let name = command.get(name_offset..)?;
+            return Some(&name[..name.iter().position(|byte| *byte == 0)?]);
+        }
+        offset = end;
+    }
+    None
 }
 
 pub(crate) fn materialize_bundled_runtime_dylib(bytes: &[u8]) -> Result<PathBuf, String> {
@@ -532,11 +634,25 @@ mod tests {
     #[test]
     fn bundled_runtime_dylib_is_persistent_and_content_addressed() {
         let root = temp_root("dylib-cache");
+        #[cfg(target_os = "macos")]
+        let dylib = armfortas_rt::bundled_dylib().unwrap().to_vec();
+        #[cfg(not(target_os = "macos"))]
         let mut dylib = MACHO_64_LE_MAGIC.to_vec();
+        #[cfg(not(target_os = "macos"))]
         dylib.extend_from_slice(b"shared runtime payload");
         let first = materialize_bundled_runtime_dylib_in(&dylib, &root).unwrap();
         let second = materialize_bundled_runtime_dylib_in(&dylib, &root).unwrap();
         assert_eq!(first, second);
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let installed = fs::read(&first).unwrap();
+            assert_eq!(
+                macho_dylib_install_name(&installed),
+                Some(first.as_os_str().as_bytes())
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(fs::read(&first).unwrap(), dylib);
         assert!(first.starts_with(&root));
         fs::remove_dir_all(root).unwrap();

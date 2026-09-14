@@ -1161,3 +1161,85 @@ fn verbose_link_only_darwin_line_exposes_runtime_for_cmake() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cached_runtime_runs_when_cxx_owns_the_final_link() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=cached_runtime_runs_when_cxx_owns_the_final_link count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+    if armfortas::testing::native_macho_toolchain_support().is_err() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=cached_runtime_runs_when_cxx_owns_the_final_link count=1 reason=\"Mach-O link flow only\""
+        );
+        return;
+    }
+
+    let dir = unique_dir("cxx_link_runtime");
+    let runtime_cache = dir.join("runtime-cache");
+    let src = write_program_in(&dir, "p.f90", "program p\n  print *, 'ok'\nend program\n");
+    let obj = dir.join("p.o");
+    let compile = Command::new(compiler("armfortas"))
+        .args(["-c", src.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .output()
+        .expect("object compile spawn failed");
+    assert!(
+        compile.status.success(),
+        "object compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let seed_exe = dir.join("seed");
+    let seed = Command::new(compiler("armfortas"))
+        .env_remove("AFS_LD")
+        .env_remove("AFS_LD_PATH")
+        .env("AFS_RUNTIME_CACHE", &runtime_cache)
+        .args([obj.to_str().unwrap(), "-o", seed_exe.to_str().unwrap()])
+        .output()
+        .expect("runtime materialization link failed to spawn");
+    assert!(
+        seed.status.success(),
+        "runtime materialization link failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let version_dir = std::fs::read_dir(&runtime_cache)
+        .expect("inspect runtime cache")
+        .next()
+        .expect("runtime cache should contain one version")
+        .expect("inspect runtime cache version")
+        .path();
+    assert!(
+        version_dir.join("libarmfortas_rt.dylib").is_file(),
+        "runtime cache should contain its shared library"
+    );
+
+    let cxx_exe = dir.join("cxx-linked");
+    let cxx_link = Command::new("/usr/bin/clang++")
+        .arg(&obj)
+        .arg(format!("-L{}", version_dir.display()))
+        .arg("-larmfortas_rt")
+        .arg("-o")
+        .arg(&cxx_exe)
+        .output()
+        .expect("C++-owned link failed to spawn");
+    assert!(
+        cxx_link.status.success(),
+        "C++-owned link failed: {}",
+        String::from_utf8_lossy(&cxx_link.stderr)
+    );
+
+    let run = Command::new(&cxx_exe)
+        .output()
+        .expect("C++-linked Fortran executable failed to spawn");
+    assert!(
+        run.status.success(),
+        "C++-linked Fortran executable failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b" ok\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
