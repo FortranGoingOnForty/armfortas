@@ -2200,6 +2200,30 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             if let Some(mask) = mask {
                 validate_const_int_expr_tree(ctx, mask);
             }
+            // A variable may appear in only one locality-spec in a
+            // concurrent-header. Enforce this before lowering, whose
+            // construct-entity setup deliberately ignores duplicates after
+            // semantic validation has diagnosed them.
+            let mut localized_names = std::collections::HashSet::new();
+            for spec in locality {
+                let names = match spec {
+                    LocalitySpec::Local(names)
+                    | LocalitySpec::LocalInit(names)
+                    | LocalitySpec::Shared(names)
+                    | LocalitySpec::Reduce { vars: names, .. } => names,
+                    LocalitySpec::DefaultNone => continue,
+                };
+                for name in names {
+                    if !localized_names.insert(name.to_lowercase()) {
+                        ctx.error(
+                            stmt.span,
+                            format!(
+                                "variable '{name}' has already been specified in a locality-spec"
+                            ),
+                        );
+                    }
+                }
+            }
             // F2023 C1133: a variable referenced in the concurrent-header
             // (loop bounds, step, mask) must not appear in a LOCAL
             // locality-spec — a LOCAL variable is undefined on entry, so
@@ -5687,6 +5711,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "ALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "allocate");
+                reject_pure_nonlocal_definition(ctx, item, item.span, "ALLOCATE");
                 if !has_source && !has_mold && allocate_item_needs_explicit_shape(ctx, item) {
                     ctx.error(item.span, "array ALLOCATE requires bounds or SOURCE=/MOLD=");
                 }
@@ -5707,6 +5732,7 @@ fn validate_stmt(ctx: &mut Ctx, stmt: &SpannedStmt) {
             validate_distinct_allocation_objects(ctx, items, "DEALLOCATE");
             for item in items {
                 validate_allocatable_item(ctx, item, "deallocate");
+                reject_pure_nonlocal_definition(ctx, item, item.span, "DEALLOCATE");
             }
         }
 
@@ -18057,6 +18083,47 @@ end module
     }
 
     #[test]
+    fn pure_host_associated_allocation_objects_error() {
+        let errs = errors_from(
+            "\
+program p
+  integer, allocatable :: host_values(:)
+contains
+  pure subroutine mutate_allocation_status()
+    allocate(host_values(2))
+    deallocate(host_values)
+  end subroutine
+end program
+",
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("host_values")
+                    && error.contains("host or use association"))
+                .count(),
+            2,
+            "both PURE allocation-status changes must be rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn pure_local_allocation_objects_ok() {
+        let errs = errors_from(
+            "\
+pure subroutine manage_local_allocation()
+  integer, allocatable :: local_values(:)
+  allocate(local_values(2))
+  deallocate(local_values)
+end subroutine
+",
+        );
+        assert!(
+            errs.is_empty(),
+            "PURE procedures may change local allocation status: {errs:?}"
+        );
+    }
+
+    #[test]
     fn pure_intent_out_dummy_ok() {
         let errs = errors_from(
             "\
@@ -18729,6 +18796,54 @@ end program
 ",
         );
         assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_duplicate_locality_variables_are_rejected() {
+        let errs = errors_with_std(
+            "\
+program test
+  implicit none
+  integer :: i, first, second, third
+  do concurrent (i = 1:2) shared(first) reduce(+:FIRST)
+  end do
+  do concurrent (i = 1:2) local(second, second)
+  end do
+  do concurrent (i = 1:2) local(third) local_init(third)
+  end do
+end program
+",
+            FortranStandard::F2023,
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("already been specified in a locality-spec"))
+                .count(),
+            3,
+            "every repeated locality variable must be rejected case-insensitively: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nested_do_concurrent_constructs_have_independent_locality_sets() {
+        let errs = errors_with_std(
+            "\
+program test
+  implicit none
+  integer :: i, j, shared_value
+  do concurrent (i = 1:2) shared(shared_value)
+    do concurrent (j = 1:2) shared(shared_value)
+      shared_value = i + j
+    end do
+  end do
+end program
+",
+            FortranStandard::F2023,
+        );
+        assert!(
+            !errs.iter().any(|error| error.contains("locality-spec")),
+            "nested concurrent constructs must validate locality independently: {errs:?}"
+        );
     }
 
     #[test]
