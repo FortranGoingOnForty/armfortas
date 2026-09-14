@@ -15879,8 +15879,12 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
             .iter()
             .enumerate()
             .filter(|(idx, _)| *idx >= formal_skip)
-            .all(
-                |(idx, declared_arg)| match declared_arg.type_info.as_ref() {
+            .all(|(idx, declared_arg)| {
+                let actual_supplied = arg_slots.get(idx).is_some_and(Option::is_some);
+                if !actual_supplied {
+                    return declared_arg.attrs.optional;
+                }
+                match declared_arg.type_info.as_ref() {
                     Some(declared_type) => {
                         if actual_is_procedure_slots.get(idx).copied().unwrap_or(false) {
                             return declared_arg_accepts_procedure_actual(declared_arg);
@@ -15904,8 +15908,8 @@ pub(super) fn resolve_bound_proc_actuals<'a>(
                         )
                     }
                     None => true,
-                },
-            );
+                }
+            });
         let ir_match = generic_candidate_matches_slots_with_proc(
             b,
             &declared_args,
