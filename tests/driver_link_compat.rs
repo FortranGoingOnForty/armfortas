@@ -341,6 +341,46 @@ fn gnu_depfile_flags_write_make_dependency_file() {
 }
 
 #[test]
+fn required_frame_pointer_flag_preserves_arm64_frames() {
+    if let Err(reason) = armfortas::testing::native_e2e_support() {
+        eprintln!(
+            "\nHARNESS_SKIP suite=driver_link_compat test=required_frame_pointer_flag_preserves_arm64_frames count=1 reason=\"{}\"",
+            reason
+        );
+        return;
+    }
+
+    let dir = unique_dir("required_frame_pointer_flag");
+    let src = write_program_in(
+        &dir,
+        "main.f90",
+        "program p\n  implicit none\n  print *, 'ok'\nend program p\n",
+    );
+    let asm = dir.join("main.s");
+    let result = Command::new(compiler("armfortas"))
+        .args([
+            "-fno-omit-frame-pointer",
+            "-S",
+            src.to_str().unwrap(),
+            "-o",
+            asm.to_str().unwrap(),
+        ])
+        .output()
+        .expect("assembly compile spawn failed");
+    assert!(
+        result.status.success(),
+        "assembly compile failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let assembly = std::fs::read_to_string(&asm).expect("missing assembly output");
+    assert!(
+        assembly.contains("stp x29, x30") && assembly.contains("ldp x29, x30"),
+        "the backend must preserve its required frame: {assembly}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn compile_and_link_publishes_dependency_file_after_success() {
     if let Err(reason) = armfortas::testing::native_e2e_support() {
         eprintln!(

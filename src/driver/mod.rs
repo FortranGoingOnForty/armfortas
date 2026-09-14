@@ -815,7 +815,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<ParsedCli, String> {
             "-fimplicit-none" => opts.force_implicit_none = true,
             "-frecursive" => opts.recursive_default = true,
             "-fno-stack-arrays" => opts.no_stack_arrays_compat = true,
-            "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => {}
+            "-fPIC" | "-fpic" | "-fPIE" | "-fpie" | "-fno-omit-frame-pointer" => {}
             "-fpreprocessed" | "-nocpp" => {}
             "-fbackslash" => opts.backslash_escapes = true,
             "-fno-backslash" => opts.backslash_escapes = false,
@@ -3990,6 +3990,24 @@ mod tests {
                 "-fbacktrace is accepted, but runtime backtrace control is not yet implemented"
             )),
             "expected a compatibility warning for -fbacktrace, got {:?}",
+            opts.cli_warnings
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_required_frame_pointer_flag() {
+        let args = vec![
+            "-fno-omit-frame-pointer".to_string(),
+            "hello.f90".to_string(),
+        ];
+        let ParsedCli::Compile(opts) =
+            parse_cli(&args).expect("driver should accept its required frame-pointer mode")
+        else {
+            panic!("expected compile options");
+        };
+        assert!(
+            opts.cli_warnings.is_empty(),
+            "the requested mode is already guaranteed: {:?}",
             opts.cli_warnings
         );
     }
