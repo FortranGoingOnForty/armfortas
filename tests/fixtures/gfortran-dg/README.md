@@ -100,7 +100,7 @@ on 2026-06-10.
 | split_4 | run + dg-shouldfail (BACK at string start) | FLAGS f2023; EXIT_CODE 1 (provisional) | `-S` clean, unresolvable `_split` | SPLIT missing (l04) |
 | c_f_pointer_shape_tests_7 | run, -std=f2023; LOWER= honored | FLAGS f2023; EXIT_CODE 0 | passes; whole-array LBOUND/UBOUND preserve C_F_POINTER's nondefault lower bounds | none — LOWER= and whole-array bounds are verified end to end |
 | c_f_pointer_shape_tests_8 | compile, -std=f2023; 2 dg-errors (LOWER type/rank) | FLAGS f2023; ERROR_EXPECTED `LOWER` (bare module, ERROR_EXPECTED-only) | `-S` clean — no validation of the LOWER argument | C_F_POINTER LOWER validation missing (l06) |
-| do_concurrent_8_f2023 | compile, -std=gnu; 2 dg-errors (var in SHARED and REDUCE) | FLAGS f2023 (`-std=gnu` has no equivalent, dropped); ERROR_EXPECTED `locality-spec` | `-S` clean — duplicate-locality diagnostic absent | DO CONCURRENT REDUCE duplicate-locality diagnostic missing (l01) |
+| do_concurrent_8_f2023 | compile, -std=gnu; 2 dg-errors (var in SHARED and REDUCE) | FLAGS f2023 (`-std=gnu` has no equivalent, dropped); ERROR_EXPECTED `locality-spec` | rejected with 2 duplicate-locality diagnostics | none — SHARED+REDUCE conflicts are diagnosed semantically |
 
 Files skipped: none of the listed l00 batch; `conditional_1.f90` through
 `conditional_9.f90` all exist upstream and all were imported (23 files

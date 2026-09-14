@@ -4,11 +4,10 @@
 ! Conversion notes: tests/fixtures/gfortran-dg/README.md
 ! dg-options "-std=gnu" has no armfortas equivalent; REDUCE is F2023, so
 ! the fixture uses --std=f2023 instead. Wanted diagnostic: a variable may
-! not appear in both SHARED and REDUCE locality-specs. Today armfortas
-! accepts the file with no diagnostic, so the XFAIL fires.
+! not appear in both SHARED and REDUCE locality-specs. Armfortas diagnoses
+! both conflicts during semantic validation.
 ! FLAGS: --std=f2023
 ! ERROR_EXPECTED: locality-spec
-! XFAIL: XFAIL-005 f2023 DO CONCURRENT REDUCE duplicate-locality diagnostic not implemented (l01); see .docs/audits/f2023-feature-matrix.md
 program do_concurrent_complex
   implicit none
   integer :: i, j, k, sum, product

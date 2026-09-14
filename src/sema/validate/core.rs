@@ -2200,6 +2200,30 @@ fn validate_stmt_const_int_exprs(ctx: &mut Ctx<'_>, stmt: &SpannedStmt) {
             if let Some(mask) = mask {
                 validate_const_int_expr_tree(ctx, mask);
             }
+            // A variable may appear in only one locality-spec in a
+            // concurrent-header. Enforce this before lowering, whose
+            // construct-entity setup deliberately ignores duplicates after
+            // semantic validation has diagnosed them.
+            let mut localized_names = std::collections::HashSet::new();
+            for spec in locality {
+                let names = match spec {
+                    LocalitySpec::Local(names)
+                    | LocalitySpec::LocalInit(names)
+                    | LocalitySpec::Shared(names)
+                    | LocalitySpec::Reduce { vars: names, .. } => names,
+                    LocalitySpec::DefaultNone => continue,
+                };
+                for name in names {
+                    if !localized_names.insert(name.to_lowercase()) {
+                        ctx.error(
+                            stmt.span,
+                            format!(
+                                "variable '{name}' has already been specified in a locality-spec"
+                            ),
+                        );
+                    }
+                }
+            }
             // F2023 C1133: a variable referenced in the concurrent-header
             // (loop bounds, step, mask) must not appear in a LOCAL
             // locality-spec — a LOCAL variable is undefined on entry, so
@@ -18772,6 +18796,54 @@ end program
 ",
         );
         assert!(!errs.iter().any(|e| e.contains("C1133")));
+    }
+
+    #[test]
+    fn do_concurrent_duplicate_locality_variables_are_rejected() {
+        let errs = errors_with_std(
+            "\
+program test
+  implicit none
+  integer :: i, first, second, third
+  do concurrent (i = 1:2) shared(first) reduce(+:FIRST)
+  end do
+  do concurrent (i = 1:2) local(second, second)
+  end do
+  do concurrent (i = 1:2) local(third) local_init(third)
+  end do
+end program
+",
+            FortranStandard::F2023,
+        );
+        assert_eq!(
+            errs.iter()
+                .filter(|error| error.contains("already been specified in a locality-spec"))
+                .count(),
+            3,
+            "every repeated locality variable must be rejected case-insensitively: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nested_do_concurrent_constructs_have_independent_locality_sets() {
+        let errs = errors_with_std(
+            "\
+program test
+  implicit none
+  integer :: i, j, shared_value
+  do concurrent (i = 1:2) shared(shared_value)
+    do concurrent (j = 1:2) shared(shared_value)
+      shared_value = i + j
+    end do
+  end do
+end program
+",
+            FortranStandard::F2023,
+        );
+        assert!(
+            !errs.iter().any(|error| error.contains("locality-spec")),
+            "nested concurrent constructs must validate locality independently: {errs:?}"
+        );
     }
 
     #[test]

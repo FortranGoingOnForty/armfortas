@@ -42,12 +42,14 @@ compiler can emit the diagnostic substrings expected by the imported gfortran
 fixtures. The fixtures remain expected failures until their error oracle can be
 matched without relying on source-line echoing.
 
-## XFAIL-005 - Duplicate DO CONCURRENT locality is accepted
+## XFAIL-005 - Duplicate DO CONCURRENT locality is accepted [FIXED 2026-09-14]
 
-**Status:** Active compiler defect.
+**Status:** Fixed.
 
-Semantic validation does not reject a variable that appears in both `SHARED`
-and `REDUCE` locality specifications on the same `DO CONCURRENT` construct.
+Semantic validation now rejects a variable repeated within or across `LOCAL`,
+`LOCAL_INIT`, `SHARED`, and `REDUCE` locality specifications on the same
+`DO CONCURRENT` construct. Locality sets remain independent across nested
+constructs.
 
 ## XFAIL-006 - ISO_10646 character kind is unsupported
 
