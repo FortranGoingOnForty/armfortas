@@ -34,9 +34,7 @@ pub fn emit_function_into(out: &mut String, mf: &MachineFunction) {
 
         for inst in &block.insts {
             out.push_str("    ");
-            if !emit_common_inst_into(out, inst, mf) {
-                out.push_str(&emit_inst(inst, mf));
-            }
+            emit_inst_into(out, inst, mf);
             out.push('\n');
         }
     }
@@ -347,11 +345,13 @@ fn address_scratch(avoid: &[&str]) -> &'static str {
         .expect("memory access cannot occupy every reserved GP scratch")
 }
 
-/// Emit a single machine instruction as assembly text. Public so the
-/// branch-relaxation pass can count emit-time instruction bytes
-/// directly rather than re-deriving each opcode's expansion rules.
-pub fn emit_inst_text(inst: &MachineInst, mf: &MachineFunction) -> String {
-    emit_inst(inst, mf)
+/// Append one machine instruction to a caller-owned buffer. Branch relaxation
+/// clears and reuses that buffer so it can count emit-time instruction bytes
+/// without re-deriving pseudo-instruction expansion rules.
+pub(super) fn emit_inst_into(out: &mut String, inst: &MachineInst, mf: &MachineFunction) {
+    if !emit_common_inst_into(out, inst, mf) {
+        out.push_str(&emit_inst(inst, mf));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2204,6 +2204,22 @@ mod tests {
                 instruction.opcode
             );
             assert!(output.is_empty(), "fallback left partial output: {output}");
+        }
+    }
+
+    #[test]
+    fn instruction_writer_appends_common_and_fallback_text() {
+        let mf = MachineFunction::new("test".into());
+        let instructions = [
+            machine_inst(ArmOpcode::AddReg, vec![gp(0), gp(1), gp(2)]),
+            machine_inst(ArmOpcode::FcvtSD, vec![fp32(0), fp(1)]),
+        ];
+
+        for instruction in &instructions {
+            let expected = emit_inst(instruction, &mf);
+            let mut output = String::from("existing prefix:");
+            emit_inst_into(&mut output, instruction, &mf);
+            assert_eq!(output, format!("existing prefix:{expected}"));
         }
     }
 
