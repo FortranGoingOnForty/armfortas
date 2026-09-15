@@ -142,8 +142,8 @@ fn write_gp_imm_into<D, B>(
     dest_is_sp: bool,
     n: i64,
 ) where
-    D: fmt::Display + Copy,
-    B: fmt::Display + Copy,
+    D: AppendAssemblyText,
+    B: AppendAssemblyText,
 {
     let (op, magnitude) = if n >= 0 {
         (op, n as u64)
@@ -157,13 +157,20 @@ fn write_gp_imm_into<D, B>(
     };
 
     if magnitude <= 4095 {
-        write!(out, "{} {}, {}, #{}", op, dest, base, magnitude).unwrap();
+        append_gp_imm_line(out, op, dest, base, magnitude, false);
         return;
     }
 
     if !dest_base_alias && !dest_is_sp {
         write_u64_imm_into(out, dest, magnitude);
-        write!(out, "\n    {} {}, {}, {}", op, dest, base, dest).unwrap();
+        out.push_str("\n    ");
+        out.push_str(op);
+        out.push(' ');
+        dest.append_to(out);
+        out.push_str(", ");
+        base.append_to(out);
+        out.push_str(", ");
+        dest.append_to(out);
         return;
     }
 
@@ -177,9 +184,9 @@ fn write_gp_imm_into<D, B>(
         let chunk = (remaining >> 12).min(4095);
         if wrote_line {
             out.push_str("\n    ");
-            write!(out, "{} {}, {}, #{}, lsl #12", op, dest, dest, chunk).unwrap();
+            append_gp_imm_line(out, op, dest, dest, chunk, true);
         } else {
-            write!(out, "{} {}, {}, #{}, lsl #12", op, dest, base, chunk).unwrap();
+            append_gp_imm_line(out, op, dest, base, chunk, true);
             wrote_line = true;
         }
         remaining -= chunk << 12;
@@ -187,10 +194,33 @@ fn write_gp_imm_into<D, B>(
     if remaining > 0 {
         if wrote_line {
             out.push_str("\n    ");
-            write!(out, "{} {}, {}, #{}", op, dest, dest, remaining).unwrap();
+            append_gp_imm_line(out, op, dest, dest, remaining, false);
         } else {
-            write!(out, "{} {}, {}, #{}", op, dest, base, remaining).unwrap();
+            append_gp_imm_line(out, op, dest, base, remaining, false);
         }
+    }
+}
+
+fn append_gp_imm_line<D, B>(
+    out: &mut String,
+    op: &str,
+    dest: D,
+    base: B,
+    magnitude: u64,
+    shift_12: bool,
+) where
+    D: AppendAssemblyText,
+    B: AppendAssemblyText,
+{
+    out.push_str(op);
+    out.push(' ');
+    dest.append_to(out);
+    out.push_str(", ");
+    base.append_to(out);
+    out.push_str(", #");
+    append_u64_decimal(out, magnitude);
+    if shift_12 {
+        out.push_str(", lsl #12");
     }
 }
 
@@ -222,7 +252,7 @@ fn fmt_u64_imm(reg: &str, value: u64) -> String {
     out
 }
 
-fn write_u64_imm_into<R: fmt::Display + Copy>(out: &mut String, reg: R, value: u64) {
+fn write_u64_imm_into<R: AppendAssemblyText>(out: &mut String, reg: R, value: u64) {
     let mut wrote_part = false;
     for shift in [0u32, 16, 32, 48] {
         let chunk = ((value >> shift) & 0xFFFF) as u16;
@@ -230,19 +260,45 @@ fn write_u64_imm_into<R: fmt::Display + Copy>(out: &mut String, reg: R, value: u
             continue;
         }
         if wrote_part {
-            write!(out, "\n    movk {}, #{}, lsl #{}", reg, chunk, shift).unwrap();
+            out.push_str("\n    movk ");
+            reg.append_to(out);
+            out.push_str(", #");
+            append_u64_decimal(out, chunk as u64);
+            out.push_str(", lsl #");
+            append_u64_decimal(out, shift as u64);
         } else {
-            if shift == 0 {
-                write!(out, "movz {}, #{}", reg, chunk).unwrap();
-            } else {
-                write!(out, "movz {}, #{}, lsl #{}", reg, chunk, shift).unwrap();
+            out.push_str("movz ");
+            reg.append_to(out);
+            out.push_str(", #");
+            append_u64_decimal(out, chunk as u64);
+            if shift != 0 {
+                out.push_str(", lsl #");
+                append_u64_decimal(out, shift as u64);
             }
             wrote_part = true;
         }
     }
     if !wrote_part {
-        write!(out, "movz {}, #0", reg).unwrap();
+        out.push_str("movz ");
+        reg.append_to(out);
+        out.push_str(", #0");
     }
+}
+
+fn append_u64_decimal(out: &mut String, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut cursor = digits.len();
+    loop {
+        cursor -= 1;
+        digits[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // Every initialized byte is constructed in the ASCII digit range.
+    let text = unsafe { std::str::from_utf8_unchecked(&digits[cursor..]) };
+    out.push_str(text);
 }
 
 fn fmt_mov_imm(reg: &str, value: i64) -> String {
@@ -300,6 +356,39 @@ pub fn emit_inst_text(inst: &MachineInst, mf: &MachineFunction) -> String {
 
 #[derive(Clone, Copy)]
 struct OperandText<'a>(&'a MachineOperand);
+
+trait AppendAssemblyText: Copy {
+    fn append_to(self, out: &mut String);
+}
+
+impl AppendAssemblyText for &str {
+    fn append_to(self, out: &mut String) {
+        out.push_str(self);
+    }
+}
+
+impl AppendAssemblyText for OperandText<'_> {
+    fn append_to(self, out: &mut String) {
+        match self.0 {
+            MachineOperand::VReg(id) => {
+                out.push('v');
+                append_u64_decimal(out, id.0 as u64);
+            }
+            MachineOperand::PhysReg(PhysReg::Sp) => out.push_str("sp"),
+            MachineOperand::PhysReg(PhysReg::Xzr) => out.push_str("xzr"),
+            MachineOperand::PhysReg(PhysReg::Wzr) => out.push_str("wzr"),
+            MachineOperand::PhysReg(PhysReg::Gp(n)) => {
+                out.push('x');
+                append_u64_decimal(out, *n as u64);
+            }
+            MachineOperand::PhysReg(PhysReg::Gp32(n)) => {
+                out.push('w');
+                append_u64_decimal(out, *n as u64);
+            }
+            _ => write!(out, "{self}").unwrap(),
+        }
+    }
+}
 
 impl fmt::Display for OperandText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1931,6 +2020,27 @@ mod tests {
         for (operand, expected) in &operands {
             assert_eq!(operand_text(operand).to_string(), *expected);
             assert_eq!(op_str(operand), *expected);
+            let mut appended = String::new();
+            operand_text(operand).append_to(&mut appended);
+            assert_eq!(appended, *expected);
+        }
+    }
+
+    #[test]
+    fn decimal_appender_covers_full_u64_domain() {
+        for value in [
+            0,
+            9,
+            10,
+            4095,
+            u16::MAX as u64,
+            u32::MAX as u64,
+            i64::MAX as u64,
+            u64::MAX,
+        ] {
+            let mut appended = String::new();
+            append_u64_decimal(&mut appended, value);
+            assert_eq!(appended, value.to_string());
         }
     }
 
