@@ -14,6 +14,13 @@ use crate::ir::types::IrType;
 use crate::ir::walk::{compute_immediate_dominators, dominator_tree_children};
 use std::collections::{HashMap, VecDeque};
 
+#[cfg(test)]
+std::thread_local! {
+    static WRAPPER_SCAN_INSTRUCTION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 pub struct Gvn;
 
 impl Pass for Gvn {
@@ -366,68 +373,114 @@ fn pointer_param_is_read_only_scalar(func: &Function, param_id: ValueId) -> bool
     true
 }
 
+struct WrapperAllocaState {
+    stored_value: Option<ValueId>,
+    invalid: bool,
+    last_use_site: usize,
+}
+
 fn wrapper_alloca_values(
     func: &Function,
     pure_calls: &[PureCallPolicy],
 ) -> HashMap<ValueId, ValueId> {
-    let mut wrappers = HashMap::new();
-    let candidates: Vec<ValueId> = func
+    let mut candidates: HashMap<ValueId, WrapperAllocaState> = func
         .blocks
         .iter()
         .flat_map(|block| block.insts.iter())
         .filter_map(|inst| match &inst.kind {
-            InstKind::Alloca(inner_ty) if is_scalar_type(inner_ty) => Some(inst.id),
+            InstKind::Alloca(inner_ty) if is_scalar_type(inner_ty) => Some((
+                inst.id,
+                WrapperAllocaState {
+                    stored_value: None,
+                    invalid: false,
+                    last_use_site: 0,
+                },
+            )),
             _ => None,
         })
         .collect();
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
 
-    'candidate: for alloca_id in candidates {
-        let mut stored_value = None;
+    // Classify all scalar allocas in one function scan. The earlier
+    // candidate-at-a-time walk was O(allocas * instructions) and allocated an
+    // operand Vec for every visited instruction, even though almost every
+    // operand was unrelated to the current candidate.
+    let mut use_site = 0usize;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            use_site += 1;
+            #[cfg(test)]
+            WRAPPER_SCAN_INSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
 
-        for scan_block in &func.blocks {
-            for scan_inst in &scan_block.insts {
-                let uses = super::util::inst_uses(&scan_inst.kind);
-                if !uses.contains(&alloca_id) {
-                    continue;
+            super::util::for_each_operand(&inst.kind, |used| {
+                let Some(candidate) = candidates.get_mut(&used) else {
+                    return;
+                };
+                // An instruction may use the same alloca in multiple operand
+                // slots. The old contains-based scan classified that
+                // instruction once, so retain that behavior.
+                if candidate.last_use_site == use_site {
+                    return;
                 }
-                match &scan_inst.kind {
-                    InstKind::Store(value, addr) if *addr == alloca_id => {
-                        if stored_value.replace(*value).is_some() {
-                            continue 'candidate;
+                candidate.last_use_site = use_site;
+                if candidate.invalid {
+                    return;
+                }
+
+                match &inst.kind {
+                    InstKind::Store(value, addr) if *addr == used => {
+                        if candidate.stored_value.replace(*value).is_some() {
+                            candidate.invalid = true;
                         }
                     }
                     InstKind::Call(FuncRef::Internal(idx), args) => {
-                        let Some(policy) = pure_calls.get(*idx as usize) else {
-                            continue 'candidate;
-                        };
-                        if !policy.reusable {
-                            continue 'candidate;
-                        }
-                        let valid_arg = args.iter().enumerate().any(|(arg_idx, arg)| {
-                            *arg == alloca_id
-                                && policy.arg_policies.get(arg_idx).copied()
-                                    == Some(PureArgPolicy::ReadOnlyWrapperPtr)
+                        let valid_arg = pure_calls.get(*idx as usize).is_some_and(|policy| {
+                            policy.reusable
+                                && args.iter().enumerate().any(|(arg_idx, arg)| {
+                                    *arg == used
+                                        && policy.arg_policies.get(arg_idx).copied()
+                                            == Some(PureArgPolicy::ReadOnlyWrapperPtr)
+                                })
                         });
                         if !valid_arg {
-                            continue 'candidate;
+                            candidate.invalid = true;
                         }
                     }
-                    _ => continue 'candidate,
+                    _ => candidate.invalid = true,
                 }
-            }
-            if let Some(term) = &scan_block.terminator {
-                if super::util::terminator_uses(term).contains(&alloca_id) {
-                    continue 'candidate;
-                }
-            }
+            });
         }
 
-        if let Some(value) = stored_value {
-            wrappers.insert(alloca_id, value);
+        if let Some(term) = &block.terminator {
+            super::util::for_each_terminator_operand(term, |used| {
+                if let Some(candidate) = candidates.get_mut(&used) {
+                    candidate.invalid = true;
+                }
+            });
         }
     }
 
-    wrappers
+    candidates
+        .into_iter()
+        .filter_map(|(alloca, candidate)| {
+            (!candidate.invalid)
+                .then_some(candidate.stored_value)
+                .flatten()
+                .map(|value| (alloca, value))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn reset_wrapper_scan_instruction_count() {
+    WRAPPER_SCAN_INSTRUCTION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn wrapper_scan_instruction_count() -> usize {
+    WRAPPER_SCAN_INSTRUCTION_COUNT.with(std::cell::Cell::get)
 }
 
 fn resolve_value(map: &HashMap<ValueId, ValueId>, mut value: ValueId) -> ValueId {
@@ -1724,6 +1777,114 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_alloca_values_reject_overwritten_observed_and_escaping_slots() {
+        let pure_calls = vec![
+            PureCallPolicy {
+                reusable: true,
+                arg_policies: vec![PureArgPolicy::ReadOnlyWrapperPtr],
+            },
+            PureCallPolicy {
+                reusable: true,
+                arg_policies: vec![PureArgPolicy::ByValue],
+            },
+        ];
+        let mut caller = Function::new(
+            "main".into(),
+            vec![],
+            IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+        );
+        let entry = caller.entry;
+        let c1 = push_inst(
+            &mut caller,
+            entry,
+            InstKind::ConstInt(6, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let c2 = push_inst(
+            &mut caller,
+            entry,
+            InstKind::ConstInt(7, IntWidth::I32),
+            IrType::Int(IntWidth::I32),
+        );
+        let make_wrapper = |caller: &mut Function| {
+            push_inst(
+                caller,
+                entry,
+                InstKind::Alloca(IrType::Int(IntWidth::I32)),
+                IrType::Ptr(Box::new(IrType::Int(IntWidth::I32))),
+            )
+        };
+
+        let valid = make_wrapper(&mut caller);
+        push_inst(&mut caller, entry, InstKind::Store(c1, valid), IrType::Void);
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Internal(0), vec![valid]),
+            IrType::Int(IntWidth::I32),
+        );
+
+        let overwritten = make_wrapper(&mut caller);
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Store(c1, overwritten),
+            IrType::Void,
+        );
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Store(c2, overwritten),
+            IrType::Void,
+        );
+
+        let observed = make_wrapper(&mut caller);
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Store(c1, observed),
+            IrType::Void,
+        );
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Load(observed),
+            IrType::Int(IntWidth::I32),
+        );
+
+        let wrong_policy = make_wrapper(&mut caller);
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Store(c1, wrong_policy),
+            IrType::Void,
+        );
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Call(FuncRef::Internal(1), vec![wrong_policy]),
+            IrType::Int(IntWidth::I32),
+        );
+
+        let escaping = make_wrapper(&mut caller);
+        push_inst(
+            &mut caller,
+            entry,
+            InstKind::Store(c1, escaping),
+            IrType::Void,
+        );
+        caller.block_mut(entry).terminator = Some(Terminator::Return(Some(escaping)));
+
+        let wrappers = wrapper_alloca_values(&caller, &pure_calls);
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers.get(&valid), Some(&c1));
+        assert!(!wrappers.contains_key(&overwritten));
+        assert!(!wrappers.contains_key(&observed));
+        assert!(!wrappers.contains_key(&wrong_policy));
+        assert!(!wrappers.contains_key(&escaping));
+    }
+
+    #[test]
     fn gvn_reuses_pure_calls_through_scalar_wrapper_allocas() {
         let mut m = Module::new("test".into(), crate::target::TargetLayout::LP64);
 
@@ -1867,9 +2028,20 @@ mod tests {
             pure_calls[0].arg_policies,
             vec![PureArgPolicy::ReadOnlyWrapperPtr]
         );
+        reset_wrapper_scan_instruction_count();
+        let caller_instruction_count = m.functions[1]
+            .blocks
+            .iter()
+            .map(|block| block.insts.len())
+            .sum();
         let wrappers = wrapper_alloca_values(&m.functions[1], &pure_calls);
         assert_eq!(wrappers.get(&wrap1), Some(&c2));
         assert_eq!(wrappers.get(&wrap2), Some(&c4));
+        assert_eq!(
+            wrapper_scan_instruction_count(),
+            caller_instruction_count,
+            "multiple wrapper candidates should share one instruction scan"
+        );
 
         let mut replacements = HashMap::new();
         replacements.insert(c2, c1);
