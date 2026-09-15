@@ -15,7 +15,7 @@
 #[allow(unused_imports)]
 pub use crate::ir::walk::{
     compute_dominance_frontiers, compute_dominators, compute_immediate_dominators,
-    dominator_tree_children, find_natural_loops, for_each_operand_mut,
-    for_each_terminator_operand_mut, inst_uses, predecessors, prune_unreachable, substitute_uses,
-    terminator_targets, terminator_uses, NaturalLoop,
+    dominator_tree_children, find_natural_loops, for_each_operand, for_each_operand_mut,
+    for_each_terminator_operand, for_each_terminator_operand_mut, inst_uses, predecessors,
+    prune_unreachable, substitute_uses, terminator_targets, terminator_uses, NaturalLoop,
 };

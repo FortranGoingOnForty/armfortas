@@ -20,8 +20,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 //                     Operand enumeration (read-only)
 // =====================================================================
 
-/// All `ValueId`s consumed as operands by an instruction.
-pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
+/// Visit every `ValueId` consumed as an operand by an instruction.
+///
+/// Hot analyses should prefer this callback form so they do not allocate a
+/// temporary vector for every instruction they inspect. [`inst_uses`] remains
+/// the convenient collecting API and delegates here so operand classification
+/// still has one canonical implementation.
+pub fn for_each_operand(kind: &InstKind, mut visit: impl FnMut(ValueId)) {
     match kind {
         InstKind::ConstInt(..)
         | InstKind::ConstFloat(..)
@@ -29,39 +34,58 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::ConstString(..)
         | InstKind::Undef(..)
         | InstKind::Alloca(..)
-        | InstKind::GlobalAddr(..) => vec![],
+        | InstKind::GlobalAddr(..) => {}
 
         InstKind::IAdd(a, b)
         | InstKind::ISub(a, b)
         | InstKind::IMul(a, b)
         | InstKind::IDiv(a, b)
-        | InstKind::IMod(a, b) => vec![*a, *b],
-        InstKind::INeg(a) => vec![*a],
+        | InstKind::IMod(a, b) => {
+            visit(*a);
+            visit(*b);
+        }
+        InstKind::INeg(a) => visit(*a),
 
         InstKind::FAdd(a, b)
         | InstKind::FSub(a, b)
         | InstKind::FMul(a, b)
         | InstKind::FDiv(a, b)
-        | InstKind::FPow(a, b) => vec![*a, *b],
-        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => vec![*a],
+        | InstKind::FPow(a, b) => {
+            visit(*a);
+            visit(*b);
+        }
+        InstKind::FNeg(a) | InstKind::FAbs(a) | InstKind::FSqrt(a) => visit(*a),
 
-        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => vec![*a, *b],
+        InstKind::ICmp(_, a, b) | InstKind::FCmp(_, a, b) => {
+            visit(*a);
+            visit(*b);
+        }
 
-        InstKind::And(a, b) | InstKind::Or(a, b) => vec![*a, *b],
-        InstKind::Not(a) => vec![*a],
+        InstKind::And(a, b) | InstKind::Or(a, b) => {
+            visit(*a);
+            visit(*b);
+        }
+        InstKind::Not(a) => visit(*a),
 
-        InstKind::Select(c, t, f) => vec![*c, *t, *f],
+        InstKind::Select(c, t, f) => {
+            visit(*c);
+            visit(*t);
+            visit(*f);
+        }
 
         InstKind::BitAnd(a, b)
         | InstKind::BitOr(a, b)
         | InstKind::BitXor(a, b)
         | InstKind::Shl(a, b)
         | InstKind::LShr(a, b)
-        | InstKind::AShr(a, b) => vec![*a, *b],
+        | InstKind::AShr(a, b) => {
+            visit(*a);
+            visit(*b);
+        }
         InstKind::BitNot(a)
         | InstKind::CountLeadingZeros(a)
         | InstKind::CountTrailingZeros(a)
-        | InstKind::PopCount(a) => vec![*a],
+        | InstKind::PopCount(a) => visit(*a),
 
         InstKind::IntToFloat(v, _)
         | InstKind::FloatToInt(v, _)
@@ -70,25 +94,37 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::IntExtend(v, _, _)
         | InstKind::IntTrunc(v, _)
         | InstKind::PtrToInt(v)
-        | InstKind::IntToPtr(v, _) => vec![*v],
+        | InstKind::IntToPtr(v, _) => visit(*v),
 
-        InstKind::Load(a) | InstKind::VolatileLoad(a) => vec![*a],
-        InstKind::Store(v, a) | InstKind::VolatileStore(v, a) => vec![*v, *a],
+        InstKind::Load(a) | InstKind::VolatileLoad(a) => visit(*a),
+        InstKind::Store(v, a) | InstKind::VolatileStore(v, a) => {
+            visit(*v);
+            visit(*a);
+        }
         InstKind::GetElementPtr(base, idxs) => {
-            let mut uses = vec![*base];
-            uses.extend(idxs);
-            uses
+            visit(*base);
+            for &index in idxs {
+                visit(index);
+            }
         }
 
         InstKind::Call(FuncRef::Indirect(target), args) => {
-            let mut uses = vec![*target];
-            uses.extend(args);
-            uses
+            visit(*target);
+            for &arg in args {
+                visit(arg);
+            }
         }
-        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => args.clone(),
+        InstKind::Call(_, args) | InstKind::RuntimeCall(_, args) => {
+            for &arg in args {
+                visit(arg);
+            }
+        }
 
-        InstKind::ExtractField(agg, _) => vec![*agg],
-        InstKind::InsertField(agg, _, val) => vec![*agg, *val],
+        InstKind::ExtractField(agg, _) => visit(*agg),
+        InstKind::InsertField(agg, _, val) => {
+            visit(*agg);
+            visit(*val);
+        }
 
         // ---- SIMD vector ops ----
         InstKind::VAdd(a, b)
@@ -96,7 +132,10 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::VMul(a, b)
         | InstKind::VDiv(a, b)
         | InstKind::VMin(a, b)
-        | InstKind::VMax(a, b) => vec![*a, *b],
+        | InstKind::VMax(a, b) => {
+            visit(*a);
+            visit(*b);
+        }
         InstKind::VNeg(a)
         | InstKind::VAbs(a)
         | InstKind::VSqrt(a)
@@ -106,34 +145,72 @@ pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
         | InstKind::VBroadcast(a)
         | InstKind::VReduceSum(a)
         | InstKind::VReduceMin(a)
-        | InstKind::VReduceMax(a) => vec![*a],
-        InstKind::VFma(a, b, c) => vec![*a, *b, *c],
-        InstKind::VSelect(m, t, f) => vec![*m, *t, *f],
-        InstKind::VICmp(_, a, b) | InstKind::VFCmp(_, a, b) => vec![*a, *b],
-        InstKind::VStore(v, p) => vec![*v, *p],
-        InstKind::VInsert(v, _, s) => vec![*v, *s],
+        | InstKind::VReduceMax(a) => visit(*a),
+        InstKind::VFma(a, b, c) => {
+            visit(*a);
+            visit(*b);
+            visit(*c);
+        }
+        InstKind::VSelect(m, t, f) => {
+            visit(*m);
+            visit(*t);
+            visit(*f);
+        }
+        InstKind::VICmp(_, a, b) | InstKind::VFCmp(_, a, b) => {
+            visit(*a);
+            visit(*b);
+        }
+        InstKind::VStore(v, p) => {
+            visit(*v);
+            visit(*p);
+        }
+        InstKind::VInsert(v, _, s) => {
+            visit(*v);
+            visit(*s);
+        }
     }
 }
 
-/// All `ValueId`s consumed by a terminator.
-pub fn terminator_uses(term: &Terminator) -> Vec<ValueId> {
+/// All `ValueId`s consumed as operands by an instruction.
+pub fn inst_uses(kind: &InstKind) -> Vec<ValueId> {
+    let mut uses = Vec::new();
+    for_each_operand(kind, |value| uses.push(value));
+    uses
+}
+
+/// Visit every `ValueId` consumed by a terminator.
+pub fn for_each_terminator_operand(term: &Terminator, mut visit: impl FnMut(ValueId)) {
     match term {
-        Terminator::Return(None) | Terminator::Unreachable => vec![],
-        Terminator::Return(Some(v)) => vec![*v],
-        Terminator::Branch(_, args) => args.clone(),
+        Terminator::Return(None) | Terminator::Unreachable => {}
+        Terminator::Return(Some(v)) => visit(*v),
+        Terminator::Branch(_, args) => {
+            for &arg in args {
+                visit(arg);
+            }
+        }
         Terminator::CondBranch {
             cond,
             true_args,
             false_args,
             ..
         } => {
-            let mut uses = vec![*cond];
-            uses.extend(true_args);
-            uses.extend(false_args);
-            uses
+            visit(*cond);
+            for &arg in true_args {
+                visit(arg);
+            }
+            for &arg in false_args {
+                visit(arg);
+            }
         }
-        Terminator::Switch { selector, .. } => vec![*selector],
+        Terminator::Switch { selector, .. } => visit(*selector),
     }
+}
+
+/// All `ValueId`s consumed by a terminator.
+pub fn terminator_uses(term: &Terminator) -> Vec<ValueId> {
+    let mut uses = Vec::new();
+    for_each_terminator_operand(term, |value| uses.push(value));
+    uses
 }
 
 /// All successor `BlockId`s of a terminator.
@@ -1026,6 +1103,36 @@ mod walk_tests {
             end: p,
             file_id: 0,
         }
+    }
+
+    #[test]
+    fn read_only_operand_visitors_preserve_dynamic_operand_order() {
+        let indirect = InstKind::Call(FuncRef::Indirect(ValueId(1)), vec![ValueId(2), ValueId(3)]);
+        let mut visited = Vec::new();
+        for_each_operand(&indirect, |value| visited.push(value));
+        assert_eq!(visited, vec![ValueId(1), ValueId(2), ValueId(3)]);
+        assert_eq!(inst_uses(&indirect), visited);
+
+        let gep = InstKind::GetElementPtr(ValueId(4), vec![ValueId(5), ValueId(6)]);
+        visited.clear();
+        for_each_operand(&gep, |value| visited.push(value));
+        assert_eq!(visited, vec![ValueId(4), ValueId(5), ValueId(6)]);
+        assert_eq!(inst_uses(&gep), visited);
+
+        let terminator = Terminator::CondBranch {
+            cond: ValueId(7),
+            true_dest: BlockId(1),
+            true_args: vec![ValueId(8), ValueId(9)],
+            false_dest: BlockId(2),
+            false_args: vec![ValueId(10)],
+        };
+        visited.clear();
+        for_each_terminator_operand(&terminator, |value| visited.push(value));
+        assert_eq!(
+            visited,
+            vec![ValueId(7), ValueId(8), ValueId(9), ValueId(10)]
+        );
+        assert_eq!(terminator_uses(&terminator), visited);
     }
 
     /// Build a diamond CFG:
