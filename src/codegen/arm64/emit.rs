@@ -120,6 +120,31 @@ fn fmt_sp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
 /// Late expansion cannot see physical-register liveness, so it must only clobber
 /// the explicit destination.
 fn fmt_gp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
+    let mut out = String::new();
+    write_gp_imm_into(
+        &mut out,
+        op,
+        dest,
+        base,
+        gp_regs_alias(dest, base),
+        dest == "sp",
+        n,
+    );
+    out
+}
+
+fn write_gp_imm_into<D, B>(
+    out: &mut String,
+    op: &str,
+    dest: D,
+    base: B,
+    dest_base_alias: bool,
+    dest_is_sp: bool,
+    n: i64,
+) where
+    D: fmt::Display + Copy,
+    B: fmt::Display + Copy,
+{
     let (op, magnitude) = if n >= 0 {
         (op, n as u64)
     } else {
@@ -132,34 +157,41 @@ fn fmt_gp_imm(op: &str, dest: &str, base: &str, n: i64) -> String {
     };
 
     if magnitude <= 4095 {
-        return format!("{} {}, {}, #{}", op, dest, base, magnitude);
+        write!(out, "{} {}, {}, #{}", op, dest, base, magnitude).unwrap();
+        return;
     }
 
-    if !gp_regs_alias(dest, base) && dest != "sp" {
-        let imm = fmt_u64_imm(dest, magnitude);
-        return format!("{}\n    {} {}, {}, {}", imm, op, dest, base, dest);
+    if !dest_base_alias && !dest_is_sp {
+        write_u64_imm_into(out, dest, magnitude);
+        write!(out, "\n    {} {}, {}, {}", op, dest, base, dest).unwrap();
+        return;
     }
 
     assert!(
         magnitude <= u32::MAX as u64,
         "immediate arithmetic offset exceeds the frame-size domain"
     );
-    let mut lines = Vec::new();
     let mut remaining = magnitude;
-    let mut current_base = base;
+    let mut wrote_line = false;
     while remaining >= 4096 {
         let chunk = (remaining >> 12).min(4095);
-        lines.push(format!(
-            "{} {}, {}, #{}, lsl #12",
-            op, dest, current_base, chunk
-        ));
-        current_base = dest;
+        if wrote_line {
+            out.push_str("\n    ");
+            write!(out, "{} {}, {}, #{}, lsl #12", op, dest, dest, chunk).unwrap();
+        } else {
+            write!(out, "{} {}, {}, #{}, lsl #12", op, dest, base, chunk).unwrap();
+            wrote_line = true;
+        }
         remaining -= chunk << 12;
     }
     if remaining > 0 {
-        lines.push(format!("{} {}, {}, #{}", op, dest, current_base, remaining));
+        if wrote_line {
+            out.push_str("\n    ");
+            write!(out, "{} {}, {}, #{}", op, dest, dest, remaining).unwrap();
+        } else {
+            write!(out, "{} {}, {}, #{}", op, dest, base, remaining).unwrap();
+        }
     }
-    lines.join("\n    ")
 }
 
 fn fmt_stack_alloc(frame_size: i64) -> String {
@@ -185,26 +217,31 @@ fn fmt_stack_alloc(frame_size: i64) -> String {
 }
 
 fn fmt_u64_imm(reg: &str, value: u64) -> String {
-    let mut parts = Vec::new();
+    let mut out = String::new();
+    write_u64_imm_into(&mut out, reg, value);
+    out
+}
+
+fn write_u64_imm_into<R: fmt::Display + Copy>(out: &mut String, reg: R, value: u64) {
+    let mut wrote_part = false;
     for shift in [0u32, 16, 32, 48] {
         let chunk = ((value >> shift) & 0xFFFF) as u16;
         if chunk == 0 {
             continue;
         }
-        if parts.is_empty() {
-            if shift == 0 {
-                parts.push(format!("movz {}, #{}", reg, chunk));
-            } else {
-                parts.push(format!("movz {}, #{}, lsl #{}", reg, chunk, shift));
-            }
+        if wrote_part {
+            write!(out, "\n    movk {}, #{}, lsl #{}", reg, chunk, shift).unwrap();
         } else {
-            parts.push(format!("movk {}, #{}, lsl #{}", reg, chunk, shift));
+            if shift == 0 {
+                write!(out, "movz {}, #{}", reg, chunk).unwrap();
+            } else {
+                write!(out, "movz {}, #{}, lsl #{}", reg, chunk, shift).unwrap();
+            }
+            wrote_part = true;
         }
     }
-    if parts.is_empty() {
-        format!("movz {}, #0", reg)
-    } else {
-        parts.join("\n    ")
+    if !wrote_part {
+        write!(out, "movz {}, #0", reg).unwrap();
     }
 }
 
@@ -261,6 +298,7 @@ pub fn emit_inst_text(inst: &MachineInst, mf: &MachineFunction) -> String {
     emit_inst(inst, mf)
 }
 
+#[derive(Clone, Copy)]
 struct OperandText<'a>(&'a MachineOperand);
 
 impl fmt::Display for OperandText<'_> {
@@ -304,6 +342,14 @@ fn gp_operand_width(op: &MachineOperand) -> Option<u8> {
     }
 }
 
+fn gp_operands_alias(lhs: &MachineOperand, rhs: &MachineOperand) -> bool {
+    let index = |operand: &MachineOperand| match operand {
+        MachineOperand::PhysReg(PhysReg::Gp(n) | PhysReg::Gp32(n)) => Some(*n),
+        _ => None,
+    };
+    matches!((index(lhs), index(rhs)), (Some(a), Some(b)) if a == b)
+}
+
 /// Write the common single-line scalar instructions without allocating an
 /// intermediate instruction String. Complex and uncommon forms fall back to
 /// the canonical emitter below.
@@ -323,21 +369,41 @@ fn emit_common_inst_into(out: &mut String, inst: &MachineInst, mf: &MachineFunct
         ArmOpcode::AdcReg => emitted!("adc {}, {}, {}", op(0), op(1), op(2)),
         ArmOpcode::AddImm => {
             let imm = match &inst.operands[2] {
-                MachineOperand::FrameSlot(off) if (0..=4095).contains(off) => *off as i64,
-                MachineOperand::Imm(v) if (0..=4095).contains(v) => *v,
+                MachineOperand::FrameSlot(off) => *off as i64,
+                MachineOperand::Imm(-1) => return false,
+                MachineOperand::Imm(v) => *v,
                 _ => return false,
             };
-            emitted!("add {}, {}, #{}", op(0), op(1), imm)
+            write_gp_imm_into(
+                out,
+                "add",
+                op(0),
+                op(1),
+                gp_operands_alias(&inst.operands[0], &inst.operands[1]),
+                matches!(inst.operands[0], MachineOperand::PhysReg(PhysReg::Sp)),
+                imm,
+            );
+            true
         }
         ArmOpcode::SubReg => emitted!("sub {}, {}, {}", op(0), op(1), op(2)),
         ArmOpcode::SubsReg => emitted!("subs {}, {}, {}", op(0), op(1), op(2)),
         ArmOpcode::SbcReg => emitted!("sbc {}, {}, {}", op(0), op(1), op(2)),
         ArmOpcode::SubImm => {
             let imm = match &inst.operands[2] {
-                MachineOperand::Imm(v) if (0..=4095).contains(v) => *v,
+                MachineOperand::Imm(-1) => return false,
+                MachineOperand::Imm(v) => *v,
                 _ => return false,
             };
-            emitted!("sub {}, {}, #{}", op(0), op(1), imm)
+            write_gp_imm_into(
+                out,
+                "sub",
+                op(0),
+                op(1),
+                gp_operands_alias(&inst.operands[0], &inst.operands[1]),
+                matches!(inst.operands[0], MachineOperand::PhysReg(PhysReg::Sp)),
+                imm,
+            );
+            true
         }
         ArmOpcode::Mul => emitted!("mul {}, {}, {}", op(0), op(1), op(2)),
         ArmOpcode::Sdiv => emitted!("sdiv {}, {}, {}", op(0), op(1), op(2)),
@@ -1881,10 +1947,28 @@ mod tests {
             machine_inst(ArmOpcode::AddsReg, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::AdcReg, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::AddImm, vec![gp(0), gp(1), imm(4095)]),
+            machine_inst(ArmOpcode::AddImm, vec![gp(9), gp(8), imm(65_537)]),
+            machine_inst(ArmOpcode::AddImm, vec![gp(9), gp(8), imm(-4096)]),
+            machine_inst(ArmOpcode::AddImm, vec![gp(9), gp(8), imm(i64::MIN)]),
+            machine_inst(
+                ArmOpcode::AddImm,
+                vec![gp(9), gp(8), MachineOperand::FrameSlot(-8193)],
+            ),
             machine_inst(ArmOpcode::SubReg, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::SubsReg, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::SbcReg, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::SubImm, vec![gp(0), gp(1), imm(17)]),
+            machine_inst(ArmOpcode::SubImm, vec![gp(8), gp(29), imm(10_632)]),
+            machine_inst(ArmOpcode::SubImm, vec![gp(12), gp(12), imm(10_632)]),
+            machine_inst(
+                ArmOpcode::SubImm,
+                vec![
+                    MachineOperand::PhysReg(PhysReg::Sp),
+                    MachineOperand::PhysReg(PhysReg::Sp),
+                    imm(10_632),
+                ],
+            ),
+            machine_inst(ArmOpcode::SubImm, vec![gp(12), gp32(12), imm(4096)]),
             machine_inst(ArmOpcode::Mul, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::Sdiv, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::Madd, vec![gp(0), gp(1), gp(2), gp(3)]),
@@ -1985,8 +2069,9 @@ mod tests {
             ),
             machine_inst(
                 ArmOpcode::SubImm,
-                vec![gp(0), gp(1), MachineOperand::Imm(5000)],
+                vec![gp(0), gp(1), MachineOperand::Imm(-1)],
             ),
+            machine_inst(ArmOpcode::AddImm, vec![gp(0), gp(1), gp(2)]),
             machine_inst(ArmOpcode::MovReg, vec![gp(0), gp32(1)]),
             machine_inst(ArmOpcode::MovReg, vec![gp(0), fp(1)]),
             machine_inst(
